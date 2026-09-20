@@ -6614,6 +6614,7 @@ fn render_lane(
                 io: &mut io.key_io,
             }),
         
+            plan.stems_dry.then(|| &mut io.dry_io[..]),
             at,
         );
         // **And bays 3..5, over what bays 0..2 just left.** Six bays
@@ -6637,6 +6638,7 @@ fn render_lane(
                 io: &mut io.key_io,
             }),
         
+            None,
             at,
         );
     }
@@ -6682,6 +6684,10 @@ fn run_extra_rack(
     // folders, the buses, the master, the pads - renders the block the
     // callback is on, and says so with the sentinel rather than by
     // repeating the load.
+    // **Forwarded to the voice road in `run_rack`.** Bays 3..5 are the same
+    // chain as 0..2 and a voice may sit in any of them, so the dry stem has
+    // to be reachable from here too. See `run_rack`'s `dry`.
+    mut dry: Option<&mut [Vec<f32>]>,
     pos: u64,
 ) {
     if is_folder {
@@ -6710,6 +6716,7 @@ fn run_extra_rack(
         sample,
         key,
     
+            dry.as_deref_mut(),
             pos,
         );
 }
@@ -6753,6 +6760,27 @@ fn run_rack(
     // folders, the buses, the master, the pads - renders the block the
     // callback is on, and says so with the sentinel rather than by
     // repeating the load.
+    // **Where a VOICE bay's output belongs before the bays after it touch
+    // it**, or `None` on every pass that is not exporting a dry stem.
+    //
+    // The lane's dry tap is a copy of `fx_in` taken before this function is
+    // called, which holds the clips and the BUILT-IN instrument summed
+    // together. That is the whole of the dry signal for an effects rack and
+    // none of it for a voice: the analog, the sampler and every hosted
+    // instrument are bay TENANTS, so their audio is born in here, after the
+    // tap has already been taken. A MIDI lane played by one of them exported
+    // SILENCE as its dry stem - reported as "exporting dry stems leaves out
+    // the analog plugin, only goes on processed".
+    //
+    // So a voice writes here as well, REPLACING rather than mixing, on the
+    // same argument the copy-back below makes: a MIDI channel's signal IS
+    // its instrument, and whatever the tap caught before it is silence or an
+    // upstream voice being superseded. Only the lane pass passes `Some`; the
+    // pads keep their own dry sum, which they must, because a kit's racks run
+    // inside its walk and there is no instant at which the summed kit exists
+    // un-processed.
+    mut dry: Option<&mut [Vec<f32>]>,
+
     pos: u64,
 ) {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
@@ -7034,6 +7062,19 @@ fn run_rack(
                 continue;
             };
             dst[..frames].copy_from_slice(&src[..frames]);
+        }
+        // **And the dry stem, for a voice only**, taken from `planar` for the
+        // reason the line below takes its tap there: it is the one buffer
+        // holding what actually leaves this bay whatever width games the
+        // backend played. See the `dry` parameter.
+        if p.voice {
+            if let Some(dst_all) = dry.as_deref_mut() {
+                for (c, dst) in dst_all.iter_mut().enumerate() {
+                    let Some(src) = planar.get(c) else { continue };
+                    let n = frames.min(dst.len()).min(src.len());
+                    dst[..n].copy_from_slice(&src[..n]);
+                }
+            }
         }
         // **The armed bay's POST audio, read after the copy-back** — `planar`
         // is the one buffer that holds what actually leaves this bay,
@@ -8281,6 +8322,7 @@ impl Renderer {
                 io: &mut self.key_io,
             }),
         
+            None,
             u64::MAX,
         );
         let dst = if buf_is_aux {
@@ -9400,6 +9442,7 @@ impl Renderer {
                         // keys a cue. See `KeyFeed`.
                         None,
                     
+            None,
             u64::MAX,
         );
                     // **NOT-A-CHANNEL:** and bays 3..5 of the same cue strip,
@@ -9420,6 +9463,7 @@ impl Renderer {
                         None,
                         None,
                     
+            None,
             u64::MAX,
         );
                 }
@@ -9627,6 +9671,7 @@ impl Renderer {
                             // detector at twice real time. See `KeyFeed`.
                             None,
                         
+            None,
             u64::MAX,
         );
                     }
@@ -10970,6 +11015,7 @@ impl Renderer {
                         // monitor run. See `KeyFeed`.
                             None,
                         
+            None,
             u64::MAX,
         );
                         // And bays 3..5, over what bays 0..2 just left — the
@@ -10993,6 +11039,7 @@ impl Renderer {
                                 .and_then(Option::as_ref),
                             None,
                         
+            None,
             u64::MAX,
         );
                     }
@@ -12033,6 +12080,7 @@ impl Renderer {
                     // from the key picker. See `KeyFeed`.
                     None,
                 
+            None,
             u64::MAX,
         );
                 for c in 0..TAP_CHANNELS.min(2) {
@@ -12131,6 +12179,7 @@ impl Renderer {
                 // second pass folders need. See `KeyFeed`.
                 None,
             
+            None,
             u64::MAX,
         );
         }
@@ -14388,6 +14437,7 @@ fn run_board(
                 // the channel's own rack. See `KeyFeed`.
                 None,
             
+            None,
             u64::MAX,
         );
         }
@@ -14552,6 +14602,7 @@ impl Renderer {
                     // not make yet. See `KeyFeed`.
                     None,
                 
+            None,
             u64::MAX,
         );
             }
@@ -14588,6 +14639,7 @@ impl Renderer {
                         // first rack above. See `KeyFeed`.
                         None,
                     
+            None,
             u64::MAX,
         );
                 }
@@ -26139,6 +26191,71 @@ mod tests {
 
     // ── dry stems and processed stems ──────────────────────────────────────
 
+    /// **A voice in a BAY belongs in the dry stem, and did not reach it.**
+    ///
+    /// Reported from a real session: "exporting dry stems on demo 2 leaves
+    /// out the analog plugin - only goes on processed."
+    ///
+    /// The dry tap copies `fx_in`, which holds the clips and the BUILT-IN
+    /// instrument summed together, and it is taken before the lane's rack
+    /// runs. That is right for an effect and wrong for a voice: the analog,
+    /// the sampler and every hosted instrument are bay TENANTS, so their
+    /// audio is born inside `run_rack`, after the tap has already been
+    /// taken. A MIDI lane played by one of them therefore exported SILENCE
+    /// as its dry stem while its processed stem was correct - which reads
+    /// like the dry export is broken rather than like the instrument is
+    /// missing from it.
+    ///
+    /// Measured against the PROCESSED stem of the same desk rather than
+    /// against a constant, so the test says "the dry stem has the
+    /// instrument in it" and not "the analog is this loud".
+    #[test]
+    fn a_voice_in_a_bay_reaches_the_dry_stem() {
+        use std::sync::Arc;
+        const CH: usize = 2;
+        let run = |dry: bool| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                .expect("the analog must load")
+                .expect("a load reports what it seated");
+            e.set_channel_gain(CH, 0.8);
+            e.set_master_gain(1.0);
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: CH,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 110 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; 512 * 2];
+            let mut drained: Vec<f32> = Vec::new();
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            let wide = CHANNELS * 2;
+            (0..drained.len() / wide)
+                .map(|f| drained[f * wide + CH * 2].abs())
+                .fold(0.0f32, f32::max)
+        };
+        let dry = run(true);
+        let processed = run(false);
+        assert!(
+            processed > 0.002,
+            "the fixture never made sound at all: {processed}"
+        );
+        assert!(
+            dry > 0.0,
+            "the dry stem of a lane played by a bay voice is SILENT \
+             ({dry}) while its processed stem peaked at {processed}"
+        );
+    }
+
     /// **The two stem modes are two different files.**
     ///
     /// The failure this item most risks shipping is a pair of labels that
@@ -32321,6 +32438,7 @@ mod sampler_road {
                 &mut rack, &mut planar, NOW, &mut out, &notes, &[], &params, &shared, 0, None,
                 None,
             
+            None,
             u64::MAX,
         );
             for (c, b) in planar.iter().enumerate() {
@@ -32399,6 +32517,7 @@ mod sampler_road {
                 sample,
                 None,
             
+            None,
             u64::MAX,
         );
             // The last frame, past the five-millisecond default attack.
@@ -32419,6 +32538,7 @@ mod sampler_road {
         run_rack(
             &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, 0, None, None,
         
+            None,
             u64::MAX,
         );
         assert!(

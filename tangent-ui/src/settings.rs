@@ -1997,7 +1997,13 @@ impl Default for Settings {
             drums_pan: 0.0,
             auto_palette: true,
             palette_choice: 0,
-            render_ahead_ms: 0.0,
+            // **AUTO, not off.** The owner's ruling once the knob had been
+            // measured: a negative is the auto sentinel and the engine
+            // resolves it per callback from the buffer size, landing on the
+            // best fixed value at every buffer and never worse. Off was the
+            // right default only while the feature was new and unproven.
+            // See `Settings::render_ahead_ms` and `Renderer::resolve_grain`.
+            render_ahead_ms: -1.0,
             open_view: 0,
             palette_auto: true,
             // **Channel 0 ships as the DRUMPAD, channel 1 as the DX7.** The
@@ -8561,6 +8567,41 @@ mod tests {
         let s = Settings::from_json(&json);
         assert_eq!(s.channel_icons[1], 0, "the piano wears a drum badge");
         assert_eq!(s.channel_icons[7], 1, "the drumpad lost its badge");
+    }
+
+    /// **A first launch opens on the system's own everything, and AUTO.**
+    ///
+    /// The owner: "the setup options should default to system and auto
+    /// render ahead". Four separate fields spell "system" four different
+    /// ways in this file - an empty string, a `None`, and two zeroes that
+    /// each mean "whatever the device says" - so the rule is easy to break
+    /// one field at a time and impossible to see broken by reading any one
+    /// of them. Asserted together, in the words the Setup dialog uses.
+    ///
+    /// Render ahead is the one that actually moved: it defaulted to OFF
+    /// while the feature was new, and a negative is the AUTO sentinel the
+    /// engine resolves per callback.
+    #[test]
+    fn a_first_launch_is_system_everything_and_auto_render_ahead() {
+        let s = Settings::default();
+        assert_eq!(s.audio_system(), None, "the audio system is not the platform's");
+        assert_eq!(s.record_audio_device, None, "the input device is not the system's");
+        assert_eq!(s.buffer_frames(), None, "the buffer is not the device's own");
+        assert_eq!(s.sample_rate(), None, "the rate is not the device's own");
+        assert!(
+            s.render_ahead_ms < 0.0,
+            "render ahead is not AUTO: {}",
+            s.render_ahead_ms
+        );
+        // And the sentinel survives a round trip through the file, which is
+        // the half a default can quietly lose: the clamp on the way in reads
+        // any negative as auto and must not flatten it to zero.
+        let back = Settings::from_json(&serde_json::to_string(&s.to_map()).expect("to_json"));
+        assert!(
+            back.render_ahead_ms < 0.0,
+            "auto did not survive a save and load: {}",
+            back.render_ahead_ms
+        );
     }
 
     /// **Unknown keys keep the FILE's order.** `settings_version` sits
