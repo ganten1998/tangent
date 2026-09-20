@@ -32509,7 +32509,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // No stream reopens and no latency is added, so unlike the
                 // buffer this one is safe to move while a take is rolling.
                 // The engine picks it up on the next publish.
-                self.settings.render_ahead_ms = ms.clamp(0.0, 50.0);
+                // **Through the shared rule, NOT a bare clamp.** This line
+                // was `ms.clamp(0.0, 50.0)`, which folded the negative the
+                // panel sends for Auto straight onto zero - so choosing Auto
+                // set OFF and the mode could never be made to stick.
+                self.settings.render_ahead_ms = Settings::sane_render_ahead(ms);
                 self.save_settings();
             }
             DialogAction::SetBufferFrames(frames) => {
@@ -44990,6 +44994,56 @@ mod tests {
         assert_eq!(app.settings.strip_muted, muted, "the mute did not come back");
         assert_eq!(app.settings.strip_soloed, soloed, "the solo did not come back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Choosing Auto for render ahead makes Auto stick.**
+    ///
+    /// Reported as "render ahead is a setting that does not stick on". The
+    /// panel sends a NEGATIVE for Auto and this handler clamped it to
+    /// `0.0..=50.0`, so the value that arrived meaning "work it out from the
+    /// buffer" was written as zero, which means OFF. The mode could be
+    /// picked, the chip would light, and the next read had lost it.
+    ///
+    /// Driven through `DialogAction`, which is the road the panel actually
+    /// takes - a test that set the field directly would have passed on the
+    /// broken build, because the field was never the thing that was wrong.
+    #[test]
+    fn choosing_auto_render_ahead_makes_auto_stick() {
+        use crate::dialogs::DialogAction;
+        let (_, mut app) = headless(Caps::DESKTOP);
+
+        app.apply_dialog_action(DialogAction::SetRenderAhead(-1.0));
+        assert!(
+            app.render_ahead_ms() < 0.0,
+            "Auto was stored as {} - a negative is the sentinel and it did \
+             not survive the handler",
+            app.render_ahead_ms()
+        );
+
+        // The fixed values still behave, including the ends of the range and
+        // a figure past it, which is what the clamp was there for.
+        app.apply_dialog_action(DialogAction::SetRenderAhead(5.0));
+        assert!((app.render_ahead_ms() - 5.0).abs() < 1e-9, "5 ms did not stick");
+        app.apply_dialog_action(DialogAction::SetRenderAhead(0.0));
+        assert!(app.render_ahead_ms().abs() < 1e-9, "Off did not stick");
+        app.apply_dialog_action(DialogAction::SetRenderAhead(9999.0));
+        assert!(
+            (app.render_ahead_ms() - 50.0).abs() < 1e-9,
+            "a figure past the panel's range was not clamped: {}",
+            app.render_ahead_ms()
+        );
+
+        // And Auto comes back from the file, which is the other half of
+        // "sticks": the loader and this handler have to agree, and they did
+        // not before - that disagreement is the whole defect.
+        app.apply_dialog_action(DialogAction::SetRenderAhead(-1.0));
+        let json = format!(r#"{{"render_ahead_ms": {}}}"#, app.render_ahead_ms());
+        let back = Settings::from_json(&json);
+        assert!(
+            back.render_ahead_ms < 0.0,
+            "Auto did not survive the round trip: {}",
+            back.render_ahead_ms
+        );
     }
 
     /// **The mute and the solo answer the arm's three gestures.**

@@ -3284,12 +3284,7 @@ impl Settings {
             .and_then(|v| v.as_f64())
             .filter(|v| v.is_finite())
         {
-            // **Negative is AUTO** and is kept as one value, so the clamp
-            // has to let it through: the engine reads a negative as "work
-            // the grain out from the buffer" (`GRAIN_AUTO`). Anything below
-            // -1 folds onto -1 so a hand-edited file cannot invent a second
-            // spelling of the same mode.
-            s.render_ahead_ms = if v < 0.0 { -1.0 } else { v.clamp(0.0, 50.0) };
+            s.render_ahead_ms = Self::sane_render_ahead(v);
         }
         if let Some(n) = map.shift_remove("open_view").and_then(|v| v.as_i64()) {
             // Anything that is not one of the three reads as the piano,
@@ -5768,6 +5763,28 @@ impl Settings {
         crate::recorder::SAMPLE_RATE_CHOICES
             .into_iter()
             .find(|c| *c == want)
+    }
+
+    /// **The one rule for what a render-ahead figure may be**, because it
+    /// was written twice and the two copies disagreed.
+    ///
+    /// A NEGATIVE is AUTO and must survive: the engine reads it as "work the
+    /// grain out from the buffer" (`GRAIN_AUTO`). Anything below -1 folds
+    /// onto -1 so no file can invent a second spelling of the same mode, and
+    /// anything positive is clamped to the range the panel offers.
+    ///
+    /// The loader had this right from the day Auto shipped. The DIALOG did
+    /// not: it clamped to `0.0..=50.0`, which turned the Auto the panel had
+    /// just sent into OFF, so the mode could be chosen and never stuck -
+    /// reported as "render ahead is a setting that does not stick on". One
+    /// function now, called from both, because a rule spelled in two places
+    /// is a rule that drifts.
+    #[must_use]
+    pub fn sane_render_ahead(ms: f64) -> f64 {
+        if !ms.is_finite() {
+            return 0.0;
+        }
+        if ms < 0.0 { -1.0 } else { ms.clamp(0.0, 50.0) }
     }
 
     /// The audio system, or `None` for the platform's own.
