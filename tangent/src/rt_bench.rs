@@ -33,7 +33,7 @@ use crate::builtin_fx::{
     ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH, IR_PATH,
     PLATE_PATH, TAPE_PATH,
 };
-use crate::instrument::{ClipNote, Engine, Placed, PlacedMidi};
+use crate::instrument::{ClipNote, ClipPedal, Engine, Placed, PlacedMidi};
 
 /// The block every shape is measured at: the middle of the three sizes the
 /// article names, and the one REAPER is configured for on this machine.
@@ -1947,6 +1947,133 @@ fn a_lane_with_a_tail_insert_is_the_same_grained() {
                 first.map(|i| i / 2)
             );
         }
+    }
+}
+
+/// **The damper pedal, on a grained lane.**
+///
+/// The hole every instrument test above left: all of them pass
+/// `pedal: Arc::new(Vec::new())`, so the pedal has never once been fed to a
+/// lane that renders in grains.
+///
+/// It is read as a LEVEL - "where does this stand at frame N" - which is
+/// what makes it immune to a locate and a loop wrap. A grained lane asks
+/// that question **once per grain, at the grain's start**, instead of once
+/// per callback at the playhead, and the answer is then applied to the
+/// instrument as state for the whole grain. So an edge that lands part way
+/// through a grain is late by up to a grain, and an up-and-down inside one
+/// is not seen at all.
+///
+/// The notes here are short and the pedal is held across them, so whether
+/// the damper arrived is the difference between a chord that rings and a
+/// chord that stops. The no-pedal control is what gives the test teeth.
+#[test]
+fn the_damper_pedal_reaches_a_grained_lane() {
+    fn pedal_desk(edges: &[(u64, u8)]) -> Engine {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        // Short notes: without a damper each one stops well before the next.
+        let notes: Arc<Vec<ClipNote>> = Arc::new(
+            (0..12)
+                .map(|i| ClipNote {
+                    at: 1_009 + (i as u64) * 2_003,
+                    dur: 400,
+                    key: 48 + ((i * 7) % 20) as u8,
+                    vel: 100,
+                })
+                .collect(),
+        );
+        let pedal: Arc<Vec<ClipPedal>> = Arc::new(
+            edges.iter().map(|(at, value)| ClipPedal { at: *at, cc: 64, value: *value }).collect(),
+        );
+        e.set_midi_clips(
+            (0..4)
+                .map(|lane| PlacedMidi {
+                    strip: lane,
+                    start: 0,
+                    len: u64::from(RATE) * 60,
+                    notes: Arc::clone(&notes),
+                    pedal: Arc::clone(&pedal),
+                })
+                .collect(),
+        );
+        seat(&mut e, 4, &[ANALOG_PATH]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    fn render(e: &mut Engine, blocks: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let mut all = Vec::with_capacity(blocks * BLOCK * 2);
+        for _ in 0..blocks {
+            e.render_offline(&mut out);
+            all.extend_from_slice(&out);
+        }
+        all
+    }
+    // Edges at awkward frames: none on a block boundary, none on a grain
+    // boundary, and one pair close enough together to fall inside a single
+    // grain.
+    let held: &[(u64, u8)] = &[(701, 127), (9_001, 0), (11_003, 127), (19_997, 0), (20_101, 127)];
+    let none: &[(u64, u8)] = &[];
+
+    let dry = render(&mut pedal_desk(none), 300);
+    let wet = render(&mut pedal_desk(held), 300);
+    let peak = wet.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak > 0.001, "the pedal desk was silent");
+    // **Teeth**: the pedal has to be doing something, or the comparison
+    // below is comparing two renders of nothing.
+    let (moved, _) = worst_diff(&dry, &wet);
+    assert!(
+        dbfs(moved) > dbfs(peak) - 20.0,
+        "holding the damper changed the sound by only {:.1} dBFS against a \
+         peak of {:.1}, so this desk does not hear the pedal and the test \
+         below would prove nothing",
+        dbfs(moved),
+        dbfs(peak)
+    );
+
+    // **The control**: the same desk with NO pedal at all has to be
+    // bit-exact grained, or the comparison below is measuring the grain
+    // render in general rather than the pedal.
+    for grain in [240.0f64, 256.0, 512.0] {
+        let mut g = pedal_desk(none);
+        g.set_grain_ms(1000.0 * grain / f64::from(RATE));
+        let zs = render(&mut g, 300);
+        let (d, first) = worst_diff(&dry, &zs);
+        assert!(
+            d == 0.0,
+            "the control moved: with NO pedal at all, a {grain:.0}-frame grain \
+             differs by {:.1} dBFS at frame {:?}, so what follows is not about \
+             the pedal",
+            dbfs(d),
+            first.map(|i| i / 2)
+        );
+    }
+    for grain in [240.0f64, 256.0, 512.0] {
+        let mut grained = pedal_desk(held);
+        grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+        let ys = render(&mut grained, 300);
+        let (worst, first) = worst_diff(&wet, &ys);
+        let (total, window) = energy_gap(&wet, &ys, peak * 0.001);
+        if std::env::var_os("TANGENT_GRAINSURVEY").is_some() {
+            println!(
+                "  {grain:.0}-frame grain: worst {:.1} dBFS, total energy \
+                 {total:.3} dB, worst window {window:.2} dB, first at {:?}",
+                dbfs(worst),
+                first.map(|i| i / 2)
+            );
+        }
+        let _ = (total, window);
+        assert!(
+            worst == 0.0,
+            "at a {grain:.0}-frame grain the damper lands differently: the two \
+             renders differ by {:.1} dBFS, first at frame {:?}",
+            dbfs(worst),
+            first.map(|i| i / 2)
+        );
     }
 }
 

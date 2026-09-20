@@ -12400,7 +12400,8 @@ impl Renderer {
                     // Clipping that to nothing is what made the straddling
                     // block silent.
                     let want = Self::to_grid(from, grain.max(need));
-                    self.lane_len[ch] = Self::clip_grain(from, want, loop_b).max(need);
+                    let len = Self::clip_grain(from, want, loop_b).max(need);
+                    self.lane_len[ch] = self.clip_pedal(ch, at, frames, from, len, need);
                 }
                 // Served from the newest grain, so the older slot is free.
                 // Look ahead when this lane's phase has come up.
@@ -12414,7 +12415,8 @@ impl Renderer {
                     if into >= phase && end > at && g.next_is_free(at) {
                         self.lane_at[ch] = end;
                         let want = Self::to_grid(end, grain);
-                        self.lane_len[ch] = Self::clip_grain(end, want, loop_b);
+                        let len = Self::clip_grain(end, want, loop_b);
+                        self.lane_len[ch] = self.clip_pedal(ch, at, frames, end, len, 0);
                     } else {
                         self.lane_skip[ch] = true;
                     }
@@ -12427,6 +12429,72 @@ impl Renderer {
                 self.lane_skip[ch] = true;
             }
         }
+    }
+
+    /// **The next pedal edge on this lane after `from`**, as an absolute
+    /// frame, or `None` if the lane has none ahead of it.
+    ///
+    /// The edges are clip-relative and sorted, so this is a binary search
+    /// per clip and it only runs for a lane that is about to be grained.
+    fn next_pedal_edge(clips: &[PlacedMidi], ch: usize, from: u64) -> Option<u64> {
+        let mut soonest: Option<u64> = None;
+        for mc in clips {
+            if mc.strip.min(CHANNELS - 1) != ch {
+                continue;
+            }
+            let end = mc.start.saturating_add(mc.len);
+            if end <= from {
+                continue;
+            }
+            // Where `from` falls inside this clip, or its head if the clip
+            // has not started yet.
+            let rel = from.saturating_sub(mc.start);
+            let i = mc.pedal.partition_point(|e| e.at <= rel);
+            let Some(e) = mc.pedal.get(i) else {
+                continue;
+            };
+            let at = mc.start.saturating_add(e.at);
+            if at > from && at < end {
+                soonest = Some(soonest.map_or(at, |s: u64| s.min(at)));
+            }
+        }
+        soonest
+    }
+
+    /// **A grain stops at the block the next pedal edge lands in.**
+    ///
+    /// The pedal is read as a LEVEL once per rendered span, at the span's
+    /// start, and applied to the instrument as state for the whole of it.
+    /// That is exact while a span is a callback. It is not once a span is a
+    /// GRAIN: an edge part way through one is applied up to a grain early
+    /// or late, and a press and release inside a single grain is never seen
+    /// at all. Measured on four Analog lanes with a held damper: 3.2 dBFS
+    /// of wrong audio, and a real take's pedal moves as fast as six
+    /// milliseconds apart, which a 5 ms grain walks straight over.
+    ///
+    /// Stopping at the BLOCK the edge lands in rather than at the edge
+    /// itself is what keeps this bit-exact: the chunked desk reads the
+    /// pedal at that same frame, so the grained lane sees the same level
+    /// sequence rather than a better one. Never shorter than the span the
+    /// fold is owed, which bounds the worst case at exactly the
+    /// quantisation a chunked desk already has.
+    fn clip_pedal(&self, ch: usize, at: u64, frames: usize, from: u64, len: usize, need: usize) -> usize {
+        let Some(edge) = Self::next_pedal_edge(&self.midi_clips, ch, from) else {
+            return len;
+        };
+        // **The first block boundary strictly PAST the edge**, which is
+        // where a chunked desk first reads the new level: it samples at
+        // every block start, and the start of the block the edge lands in
+        // is still before it. Rounding down instead lands the grain on the
+        // block that cannot see the edge yet, and the grain then swallows
+        // the one that can.
+        let frames = frames.max(1) as u64;
+        let past = edge.saturating_sub(at).div_ceil(frames) * frames;
+        let block = at.saturating_add(past);
+        if block <= from {
+            return len;
+        }
+        len.min(usize::try_from(block - from).unwrap_or(len)).max(need)
     }
 
     /// **Push a grain's end out to the next [`GRAIN_GRID`] line.**
@@ -12720,6 +12788,49 @@ impl Renderer {
         let builtin_mask = self.shared.builtin_strips.load(Ordering::Relaxed);
         let keys_mask = self.shared.keys_strips.load(Ordering::Relaxed);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
+        // ── THE GRAIN CLOCK ──────────────────────────────────────────────
+        //
+        // Runs BEFORE BOTH walks, and the order is the point. The pedal
+        // walk below tells each instrument what its damper is doing, and
+        // the note walk after it builds a lane's notes and advances what
+        // that instrument has been told - all of it for ONE span. A
+        // grained lane's span is not the chunk's, so the clock has to have
+        // decided it before any of that happens.
+        //
+        // **It sat between the two**, which is how the damper pedal broke:
+        // the pedal walk read `lane_skip` and `lane_at` from the PREVIOUS
+        // block, so a grained lane sampled its pedal at a stale position
+        // and an edge landed on the wrong side of a note. Measured on four
+        // Analog lanes with a held damper: eight to ten decibels quiet for
+        // as long as the pedal was down, and exact again the moment it
+        // lifted.
+        {
+            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
+            let free = if grain > frames {
+                let mut free = !pinned_lanes(
+                    &self.shared,
+                    &self.folder_is,
+                    receives,
+                    self.room_rack | self.board_live,
+                    self.keys_live,
+                );
+                // **An audition pins its own lane.** It is a LEVEL
+                // reconciled against the playhead once a chunk - the key is
+                // held, not scheduled - and there is no such thing for a
+                // span the playhead has not reached yet.
+                for ch in 0..CHANNELS {
+                    let held = self.shared.audition[ch].load(Ordering::Relaxed) != u32::MAX;
+                    if held || self.audition_on[ch].is_some() || self.audition_rang[ch] {
+                        free &= !(1u32 << ch);
+                    }
+                }
+                free
+            } else {
+                0
+            };
+            self.plan_grains(at, frames, rolling, grain, free);
+        }
+
         // This block's pedal moves, refilled from scratch: it is a list of
         // CHANGES and last block's are not this block's.
         self.lane_pedal_out.clear();
@@ -12812,6 +12923,13 @@ impl Renderer {
                     continue;
                 }
                 self.lane_pedal_sent[ch][slot] = pedal_now[slot];
+                #[cfg(test)]
+                if ch == 0 && std::env::var_os("TANGENT_PEDALTRACE").is_some() {
+                    eprintln!(
+                        "PT lane {ch} cc {cc} -> {} at frame {at} (span {} frames)",
+                        pedal_now[slot], self.lane_len[ch]
+                    );
+                }
                 if self.lane_pedal_out.len() < self.lane_pedal_out.capacity() {
                     self.lane_pedal_out.push((
                         ch as u8,
@@ -12842,42 +12960,6 @@ impl Renderer {
         // and left the block beginning up to one buffer past the loop's
         // head. Everything in that gap is still owed. See
         // `pending_wrap_from`.
-        // ── THE GRAIN CLOCK ──────────────────────────────────────────────
-        //
-        // Runs BEFORE the walk, not after it, and the order is the point.
-        // The walk builds a lane's notes, tells its instrument what its
-        // pedal is doing and advances what that instrument has been told -
-        // all of it for ONE span. A grained lane's span is not the chunk's,
-        // so the clock has to have decided it before any of that happens.
-        //
-        // It also decides which lanes have nothing to do at all, which is
-        // most of them on most callbacks and is where the saving is.
-        {
-            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
-            let free = if grain > frames {
-                let mut free = !pinned_lanes(
-                    &self.shared,
-                    &self.folder_is,
-                    receives,
-                    self.room_rack | self.board_live,
-                    self.keys_live,
-                );
-                // **An audition pins its own lane.** It is a LEVEL
-                // reconciled against the playhead once a chunk - the key is
-                // held, not scheduled - and there is no such thing for a
-                // span the playhead has not reached yet.
-                for ch in 0..CHANNELS {
-                    let held = self.shared.audition[ch].load(Ordering::Relaxed) != u32::MAX;
-                    if held || self.audition_on[ch].is_some() || self.audition_rang[ch] {
-                        free &= !(1u32 << ch);
-                    }
-                }
-                free
-            } else {
-                0
-            };
-            self.plan_grains(at, frames, rolling, grain, free);
-        }
         self.probe_walk_pins = 0;
         self.probe_clip_pins = 0;
         self.probe_inst_pins = 0;
