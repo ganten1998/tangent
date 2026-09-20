@@ -5627,12 +5627,51 @@ struct LaneIo<'a> {
 
 /// **How many grains of one lane's audio the ring holds.**
 ///
-/// Two, and two is enough by construction: a lane either renders the grain
-/// it is about to start consuming, or one grain ahead of the one it is
-/// consuming, and never further than that. A third slot would only be
-/// reachable by a lane that had fallen two grains behind, which is a lane
-/// that has missed its deadline twice and has a different problem.
-const GRAIN_SLOTS: usize = 2;
+/// Three, and the third one is the LOOP's. Two looked like enough by
+/// construction - a lane renders the grain it is about to consume or one
+/// ahead of it, never further - and that argument is sound for a desk
+/// playing straight on. It is wrong at a loop end, which is the workflow
+/// this feature is for.
+///
+/// A grain may not cross `loop_b`, so the last grain of a lap is cut short
+/// at the boundary: 48 frames, in the case that found this. The block that
+/// straddles the boundary then needs THREE spans at once - the tail of the
+/// full grain before the short one, the short one, and the frames past
+/// `loop_b` that the straddling block still plays - and with two slots the
+/// render of the third destroyed the first. Measured on a bare clip desk:
+/// the second lap's straddling block came out 2.5 dB wrong, and only the
+/// SECOND, because on the first lap the slot that got reused happened not
+/// to be one the fold was standing on.
+///
+/// Three bounds it: the fold's span is assembled from at most two grains
+/// already in the ring plus the one being rendered, so the slot the next
+/// render takes is always the one nothing is owed out of.
+const GRAIN_SLOTS: usize = 3;
+
+/// **The grid every grain boundary is pushed out to.**
+///
+/// A built-in instrument recomputes its per-chunk coefficients every
+/// [`crate::analog::voice::CHUNK`] frames off an ABSOLUTE counter, so a
+/// chunk never crosses a grid line - unless a render span ends part way
+/// through one, which splits that chunk into two shorter ones and computes
+/// every per-chunk quantity twice. The quantities are all scaled by the
+/// real length, so the two halves come to very nearly the same thing:
+/// measured at -75.1 dBFS on an Analog lane with a 240-frame grain against
+/// a 64-frame callback, which is 63 dB under the part it is wrong about
+/// and nothing anybody would hear.
+///
+/// Nearly is not the standard the rest of this is held to, and the fix is
+/// free: 5 ms at 48 kHz is 240 frames, 240 is not a multiple of 32, and
+/// rounding the grain's END up to the grid costs 16 frames of look-ahead
+/// and makes the whole thing bit-exact again. The knob keeps saying 5 ms
+/// because 5 ms is what it asks for; what it lands on is the next grid
+/// line after it.
+///
+/// A boundary the LOOP cuts short is the one exception, and it is left
+/// alone: a grain may not cross `loop_b` under any circumstances, so the
+/// last grain of a lap ends where the loop does and the lap's one
+/// straddling chunk carries the residual.
+const GRAIN_GRID: u64 = crate::analog::voice::CHUNK as u64;
 
 
 /// **What a slot of [`LaneGrains`] says about the audio in it.**
@@ -11234,12 +11273,15 @@ impl Renderer {
             // a superseded grain around: the next span could fall entirely
             // inside the old one and be answered from it.
             //
-            // A wrap is deliberately NOT here. It arms `pending_flush`
-            // below, and the position it lands on is one the loop's own
-            // arithmetic produced, so the grains either side of it are both
-            // still the timeline's. Throwing them away would make a
-            // practised two-bar loop pay a full-desk catch-up every lap,
-            // which is the one workflow this whole overhaul is for.
+            // **A wrap empties them as well**, a few lines down, and the
+            // first draft of this said it did not have to. That was wrong
+            // and `a_loop_wraps_the_same_way_grained_as_chunked` measured
+            // it: a wrap moves `at` BACKWARDS, so every grain in the ring
+            // is then ahead of the playhead on a lap that has not been
+            // played yet. `newest` answers one of those, the catch-up
+            // computes a start past the span the fold is asking for, and
+            // the lane renders nothing at all. The lap after a wrap came
+            // out SILENT.
             for g in &mut self.lane_grain {
                 g.clear();
             }
@@ -11252,6 +11294,21 @@ impl Renderer {
         // the last block's wrap and never its own. A SEEK clears it: landing
         // somewhere by hand is not a wrap and owes the loop's head nothing.
         let wrap_from = self.pending_wrap_from.take().filter(|_| !seek);
+        // **The wrap's own flush of the grain rings**, taken here rather
+        // than where the wrap is armed, because the block that ARMS it is
+        // the one that straddles the loop end and that block is still
+        // owed the audio either side of the boundary out of the ring it
+        // already has. By the time this is consumed, `at` is the wrapped
+        // position and everything in the ring belongs to the lap behind
+        // it. The cost is one catch-up a lap, which the first draft of
+        // this rejected and which the silence it shipped instead was not
+        // worth: a practised two-bar loop pays one full-desk block every
+        // few seconds, and `grain_ab` with `TANGENT_AB_LOOP` measures what that is.
+        if wrap_from.is_some() {
+            for g in &mut self.lane_grain {
+                g.clear();
+            }
+        }
         let rolling = self.shared.rolling.load(Ordering::Relaxed);
         let at = self.pos;
         if rolling {
@@ -12210,7 +12267,17 @@ impl Renderer {
         // not knowable; a stems export takes a dry copy at render and reads
         // it at consumption. Each of these already zeroes the eligibility
         // probe's masks, and for the same reasons.
-        if grain <= frames || !rolling || self.stems_live || self.varispeed_ratio().is_some() {
+        //
+        // **And each of them takes the rings with it.** A parked playhead
+        // served out of a grain would PLAY at a stopped transport, which is
+        // the one thing a stopped transport must never do; the other two
+        // break the contract the ring's key is written against. Clearing
+        // costs one catch-up on the way back in, which is the same catch-up
+        // starting the transport already pays.
+        if !rolling || self.stems_live || self.varispeed_ratio().is_some() {
+            for g in &mut self.lane_grain {
+                g.clear();
+            }
             return;
         }
         // **A grain may not cross the loop's end.** The wrap folds the
@@ -12227,9 +12294,6 @@ impl Renderer {
             (b > a && at < b).then_some(b)
         };
         for ch in 0..CHANNELS {
-            if !self.grain_ok(ch, free) {
-                continue;
-            }
             let Some(g) = self.lane_grain.get(ch) else {
                 continue;
             };
@@ -12237,6 +12301,44 @@ impl Renderer {
             // being served from it rather than from the one behind it.
             let newest = g.newest();
             let holds = g.covers(at, frames);
+            // **A lane that has stopped being grained still owes the fold
+            // whatever its rack has already produced**, and this is the
+            // third time the same rule has been learnt the hard way. A
+            // lane's rack is a stateful chain walking forward through the
+            // song; a reverb's delay lines and a compressor's envelope
+            // cannot be rewound, so audio the rack has already been
+            // through must be SERVED and never rendered again.
+            //
+            // Three ways in, all of them measured:
+            //
+            // - the knob turned down or off mid-roll, which the audio setup
+            //   dialog allows at any time (0.7 dBFS wrong),
+            // - a callback that arrives WIDER than the grain, which makes
+            //   `grain <= frames` true for that block alone (2.4 dBFS),
+            // - a lane leaving the eligible set because it was armed,
+            //   punched, or had a plugin face opened on it, which is what
+            //   the insert tap does (15.9 dBFS wrong, and arming a track
+            //   mid-take is not an unusual thing to do).
+            //
+            // In all three the ring is ahead of the playhead and the lane
+            // was rendering the chunk anyway. Serve while the ring can
+            // answer, then go live from where it ENDS.
+            if grain <= frames || !self.grain_ok(ch, free) {
+                if holds {
+                    self.lane_skip[ch] = true;
+                } else if let Some(end) = newest
+                    .map(|k| k.at + u64::from(k.frames))
+                    .filter(|end| *end > at && *end < at + frames as u64)
+                {
+                    self.lane_at[ch] = end;
+                    self.lane_len[ch] = (at + frames as u64 - end) as usize;
+                }
+                // A ring that is ahead of the span without covering it has
+                // a hole in it, which only a locate can leave and a locate
+                // clears the ring. The chunk is rendered whole, as it was
+                // before any of this existed.
+                continue;
+            }
             match (holds, newest) {
                 // The ring cannot answer: render the chunk's span, widened
                 // to a grain so the next callbacks are served from it.
@@ -12274,7 +12376,17 @@ impl Renderer {
                     )
                     .unwrap_or(frames);
                     self.lane_at[ch] = from;
-                    self.lane_len[ch] = Self::clip_grain(from, grain.max(need), loop_b);
+                    // **The clip may shorten the look-ahead and never the
+                    // span the fold is owed.** The wrap is taken at BLOCK
+                    // granularity - `run_transport` folds `pos` back only
+                    // once the whole block is out - so the block that
+                    // straddles the loop end really does play up to a
+                    // block past `loop_b`, and a lane whose grain was cut
+                    // short at the boundary has to render the rest of it.
+                    // Clipping that to nothing is what made the straddling
+                    // block silent.
+                    let want = Self::to_grid(from, grain.max(need));
+                    self.lane_len[ch] = Self::clip_grain(from, want, loop_b).max(need);
                 }
                 // Served from the newest grain, so the older slot is free.
                 // Look ahead when this lane's phase has come up.
@@ -12287,7 +12399,8 @@ impl Renderer {
                     // See `LaneGrains::next_is_free`.
                     if into >= phase && end > at && g.next_is_free(at) {
                         self.lane_at[ch] = end;
-                        self.lane_len[ch] = Self::clip_grain(end, grain, loop_b);
+                        let want = Self::to_grid(end, grain);
+                        self.lane_len[ch] = Self::clip_grain(end, want, loop_b);
                     } else {
                         self.lane_skip[ch] = true;
                     }
@@ -12299,6 +12412,20 @@ impl Renderer {
             if self.lane_len[ch] == 0 {
                 self.lane_skip[ch] = true;
             }
+        }
+    }
+
+    /// **Push a grain's end out to the next [`GRAIN_GRID`] line.**
+    ///
+    /// Lengthening only, so a span that has to cover `need` still covers
+    /// it, and the loop clip still gets the last word.
+    fn to_grid(from: u64, len: usize) -> usize {
+        let end = from + len as u64;
+        let over = end % GRAIN_GRID;
+        if over == 0 {
+            len
+        } else {
+            len + (GRAIN_GRID - over) as usize
         }
     }
 
@@ -19348,7 +19475,7 @@ fn output_delay_ns(info: &cpal::OutputCallbackInfo) -> Nanos {
 /// good feature and it is not this change's to add: two clock reads per block is
 /// a change to the hot path that nothing in the product asks for yet.
 #[cfg(unix)]
-fn cpu_seconds() -> Option<f64> {
+pub(crate) fn cpu_seconds() -> Option<f64> {
     // SAFETY: `rusage` is a plain C struct of integers, so an all-zero bit
     // pattern is a valid value of it, and `getrusage` overwrites the whole thing
     // before anything below reads it. Zeroed rather than `MaybeUninit` because a
@@ -19368,7 +19495,7 @@ fn cpu_seconds() -> Option<f64> {
 /// Windows has `GetProcessTimes` and no `libc`; the probe says "not measured"
 /// rather than growing a second platform path for a developer tool.
 #[cfg(not(unix))]
-fn cpu_seconds() -> Option<f64> {
+pub(crate) fn cpu_seconds() -> Option<f64> {
     None
 }
 

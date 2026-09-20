@@ -42,12 +42,29 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 ### Fixed
 
 - **A track's effects could be run over the same audio twice.** Only with
-  render-ahead on, and only at a setting whose length was not a whole
-  number of audio buffers - which the 5 ms setting is at most buffer sizes.
-  A reverb or a compressor handed the same stretch of sound a second time
-  carries the wrong tail out of it; measured at up to 14 dB of wrong
-  signal. Effects with nothing to remember, and tracks with no effects at
-  all, were unaffected, which is why it survived the first round of tests.
+  render-ahead on. A reverb or a compressor handed the same stretch of
+  sound a second time carries the wrong tail out of it. Effects with
+  nothing to remember, and tracks with no effects at all, were unaffected,
+  which is why the first round of tests missed all of this.
+
+  Five ways in, all of them found by measurement and all of them fixed:
+
+  - at a setting whose length was not a whole number of audio buffers,
+    which the 5 ms setting is at most buffer sizes (up to 14 dB wrong);
+  - when a track stopped being rendered ahead while the music played,
+    which is what arming it, punching in, or opening a plugin's window on
+    it does (up to 16 dB wrong);
+  - when the render-ahead setting itself was changed while the music
+    played, including turning it off;
+  - when the sound card handed over a buffer longer than the render-ahead
+    setting;
+  - and at a loop's end, where a lap could come out silent or, on the
+    second lap onward, plainly wrong.
+
+  Looping is also why the setting now costs a little more than it did: the
+  track's rendered-ahead sound is dropped at every loop end and rebuilt on
+  the other side, because sound rendered past the loop's end belongs to a
+  bar that is not played next.
 
 - **The Analog instrument sounded different at different buffer sizes.**
   Not a little: on a track of notes it rendered a 128-frame buffer and a
