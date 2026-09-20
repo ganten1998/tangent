@@ -301,11 +301,13 @@ pub fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
 
 /// The people the app is for, in the order they are read.
 ///
-/// **A blank line between every one**, because six names in a stack read as a
-/// list of parts and six names with air between them read as six people. The
-/// card is small and the space is the whole of what makes it feel like thanks
-/// rather than credits.
+/// **A blank line between every one**, because a stack of names reads as a
+/// list of parts and the same names with air between them read as people.
+/// The card is small and the space is the whole of what makes it feel like
+/// thanks rather than credits.
 pub const THANKS: &[&str] = &[
+    "Ale",
+    "Clau",
     "Omer",
     "Hatsu",
     "Oto",
@@ -422,7 +424,8 @@ mod thanks_tests {
     /// The card stays on screen wherever the heart is, and says what it is for.
     #[test]
     fn the_thanks_card_names_everyone_and_stays_on_screen() {
-        assert_eq!(THANKS.len(), 6);
+        assert_eq!(THANKS.len(), 8);
+        assert_eq!(THANKS.first(), Some(&"Ale"));
         assert_eq!(THANKS.last(), Some(&"My wonderful mother"));
         // Nobody twice, and nobody blank.
         for (i, n) in THANKS.iter().enumerate() {
