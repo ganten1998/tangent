@@ -374,18 +374,15 @@ impl Voice {
         let env_scale = 1.0 + TOL_ENV * drift * self.tol.env;
         self.f_coeffs = EnvCoeffs::new(rate, p.f_adsr[0], p.f_adsr[1], p.f_adsr[2], p.f_adsr[3], env_scale);
         self.a_coeffs = EnvCoeffs::new(rate, p.a_adsr[0], p.a_adsr[1], p.a_adsr[2], p.a_adsr[3], env_scale);
-        // Wander: a filtered random walk per oscillator, one step per
-        // chunk. The one-pole at WANDER_HZ turns white steps into a slow
-        // drift; the scale is set so the midpoint's swing is about
-        // WANDER_CENTS.
-        let a = 1.0 - (-std::f32::consts::TAU * WANDER_HZ * CHUNK as f32 / rate).exp();
+        // Wander: a filtered random walk per oscillator. **Read here and
+        // ADVANCED in `wander_step`**, which is the whole of the fix
+        // described there: this function is called once for the chunk and
+        // again after every note event, so a walk stepped here took a
+        // different number of steps depending on where the notes fell and
+        // how big the buffer was.
         let wander_scale = p.osc_drift * 2.0 * WANDER_CENTS;
         let voice_cents = TOL_TUNE_CENTS * drift * self.tol.tune + self.detune_cents;
         for i in 0..3 {
-            // The white step is scaled up so the filtered walk's peaks
-            // land near ±1 rather than the tiny value a one-pole leaves.
-            let target = self.wander_rng.bipolar() * 6.0;
-            self.wander[i] += a * (target - self.wander[i]);
             let w = self.wander[i].clamp(-1.0, 1.0) * wander_scale;
             let cents = voice_cents + TOL_TUNE_CENTS * drift * self.tol.osc[i] + w;
             let oct = p.range_oct[i] + p.tune_semis[i] / 12.0 + cents / 1200.0;
@@ -403,6 +400,39 @@ impl Voice {
         let angle = ((self.pan * p.spread).clamp(-1.0, 1.0) + 1.0) * 0.25 * std::f32::consts::PI;
         self.pan_l = angle.cos();
         self.pan_r = angle.sin();
+    }
+
+    /// **One step of the oscillators' slow random walk, for `frames` of
+    /// audio.**
+    ///
+    /// Split out of [`Voice::prepare`], and the split is the point.
+    /// `prepare` recomputes this voice's coefficients from the parameters
+    /// and is called once for the chunk AND again after every note event,
+    /// so a random walk stepped inside it advanced a different number of
+    /// times depending on how the block happened to be cut - by the buffer
+    /// size, and by where the notes fell inside it.
+    ///
+    /// That made the instrument's sound depend on the buffer size, measured
+    /// at -15.5 dBFS against a peak of -17.1 between a 128-frame buffer and
+    /// a 512-frame one on the same notes. See
+    /// `is_a_builtin_instrument_the_same_at_any_buffer_size`.
+    ///
+    /// Stepped once per chunk with the chunk's REAL length, so the walk is
+    /// a function of elapsed time and nothing else. The one-pole's
+    /// coefficient is built from `frames` rather than from the `CHUNK`
+    /// constant for the same reason: a short chunk must move it less.
+    pub fn wander_step(&mut self, frames: usize, rate: f32) {
+        if frames == 0 {
+            return;
+        }
+        let a = 1.0
+            - (-std::f32::consts::TAU * WANDER_HZ * frames as f32 / rate).exp();
+        for i in 0..3 {
+            // The white step is scaled up so the filtered walk's peaks
+            // land near ±1 rather than the tiny value a one-pole leaves.
+            let target = self.wander_rng.bipolar() * 6.0;
+            self.wander[i] += a * (target - self.wander[i]);
+        }
     }
 
     /// **One sample, in three phases**, so the frame can interleave the

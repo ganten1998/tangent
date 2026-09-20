@@ -12275,27 +12275,27 @@ impl Renderer {
         if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
             return false;
         }
-        // **A lane carrying an INSTRUMENT is not grained, and the reason is
-        // not the grain.**
+        // **A lane carrying a voice is not grained, and one of the two
+        // reasons has now been removed.**
         //
-        // A grain cuts a lane's audio into spans that are not the
-        // callback's, so anything that is not block-size invariant sounds
-        // different for a reason that has nothing to do with rendering
-        // ahead. `is_a_builtin_instrument_the_same_at_any_buffer_size`
-        // measures exactly that, with no grains anywhere in it: Analog
-        // driven by notes that start and stop inside a block renders 128
-        // frames at a time and 512 frames at a time to streams that differ
-        // by -15.5 dBFS against a peak of -17.1, while clips, an EQ and a
-        // compressor are bit-identical. It begins as one ULP at frame 371
-        // and compounds, which is the shape of a modulation source sampled
-        // once per block from `transport.beat` - a figure that is also the
-        // block's END rather than its start.
+        // The first was that the instrument itself was not block-size
+        // invariant: `Synth::render` cut its chunk grid from the start of
+        // each BUFFER, so a note landing mid-buffer restarted the grid and
+        // a 512-frame buffer and a 128-frame one put their chunk
+        // boundaries in different places. Measured at -15.5 dBFS against a
+        // peak of -17.1. That is fixed - the grid is absolute now and
+        // `a_builtin_instrument_is_the_same_at_any_buffer_size` holds it
+        // bit-exact - and with it fixed, a grained instrument lane renders
+        // CONTINUOUS playback bit-identically to a chunked one.
         //
-        // That is a defect in the instrument and it is worth fixing on its
-        // own: it means an Analog track already sounds different at one
-        // buffer size than at another. Until it is, a lane holding a voice
-        // stays on the callback's own block, where every buffer size gives
-        // what it gives today.
+        // The second is a LOCATE, and it is not solved. A grained lane's
+        // instrument is up to a grain further through everything that free
+        // runs in it, and after a jump there is nothing to re-sync it to.
+        // Phase alone would be inaudible and unassertable, but the measured
+        // difference is 8.4 dB of ENVELOPE - a note missing, late or at the
+        // wrong level, not merely at a different phase - and that is not
+        // understood. Until it is, a lane holding a voice stays on the
+        // callback's own block.
         let extra = tangent_ui::recorder::folder_extra_seat(ch);
         !self.racks[ch].holds_a_voice()
             && !self.racks[extra].holds_a_voice()

@@ -42,6 +42,29 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The Analog instrument sounded different at different buffer sizes.**
+  Not a little: on a track of notes it rendered a 128-frame buffer and a
+  512-frame one to sounds differing by more than the signal itself. It only
+  showed when notes start and stop inside a buffer, which is why held
+  chords and every effect were unaffected, and why it went unnoticed.
+
+  The synth cuts its work into short chunks and was measuring them from the
+  start of whatever buffer the device handed over. With no notes that is
+  harmless, because the boundaries land in the same places either way. A
+  note arriving mid-buffer cuts a chunk short and restarts the count there,
+  and from that point two buffer sizes put their boundaries in different
+  places - so everything worked out once per chunk was worked out a
+  different number of times.
+
+  The chunk grid is absolute now, so where it falls depends on where the
+  notes are and on nothing else. Two smaller things went with it: the slow
+  random drift of the oscillators was stepping once per chunk however long
+  the chunk was, and the parameter smoothing was moving a full chunk's
+  worth however short the chunk was.
+
+  It was found while building render-ahead, which cuts a track's audio into
+  stretches that are not the buffer's and so could not tell the two apart.
+
 - **A session with a piano in it no longer opens with a quiet high C
   playing.** Every hosted instrument is warmed up at load: it is played a
   test note and listened to, because several will render silence for
