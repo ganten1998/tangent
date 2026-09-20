@@ -1498,3 +1498,83 @@ The reason it cannot help is probably the fork: spreading the rebuild over
 more blocks lowers the peak per block but also leaves fewer lanes with
 work on each of them, and the pool wants four to fill it. The two effects
 cancel, which is the same tension `GRAIN_AUTO_BLOCKS` is balanced on.
+
+---
+
+# 2026-09-20: the verification pass, and two errors it found in the section above
+
+The owner asked whether the headline deserved a closer look. It did, and
+it was wrong in two ways that both flattered Tangent. Both are corrected
+here rather than edited out of the table above, because the table above is
+what was believed at the time.
+
+## Error 1: REAPER's figure included launching REAPER
+
+`-renderproject` launches the application, loads the project, renders,
+writes the file and quits, and `/usr/bin/time` was timing all of it.
+Tangent's bench times render calls after a warm-up and nothing else.
+
+The scale series answers it without needing to separate launch from render
+by hand: render the same project at 0, 3, 12, 24, 48 and 96 plugins and fit
+a line. The slope is the per-plugin cost and the intercept absorbs whatever
+is fixed.
+
+    plugins   wall     CPU
+          0   1.72 s   1.52 s
+          3   1.90     1.56
+         12   1.94     3.21
+         24   2.63     5.81
+         48   3.51    11.83
+         96   5.52    26.45
+
+    wall: 39.8 ms per plugin, intercept 1.66 s
+    CPU:  262.9 ms per plugin, intercept 0.38 s
+
+**So REAPER's render is 3.82 s of wall, not 5.55.** The other 1.66 s was
+the application starting up. Its CPU figure barely moves - 25.24 s against
+26.45 measured - because launching costs wall clock and almost no CPU.
+
+Re-measured on the quiet machine, three runs, output confirmed 48 kHz and
+12.0 s: 5.51, 6.13, 5.55 s. The afternoon's 5.61 s was sound. The error
+was in what it was compared against, not in the number.
+
+## Error 2: Tangent's export does not use the fan-out at all
+
+The comparison put Tangent's LIVE, FORKED throughput beside REAPER's
+OFFLINE render and called it a win. But `Engine::offline` builds no pool -
+`let pool = (!offline || fanout_mode() == Fanout::Force)` - so the export
+and the freeze render on ONE core.
+
+Measured, same desk, the export's own 512-frame blocks, quiet machine:
+
+| | wall / 12 s | CPU / 12 s | cores used |
+|---|---:|---:|---:|
+| REAPER, render only | **3.82 s** | 25.24 s | 6.6 |
+| Tangent export, as it ships | **13.11 s** | 13.32 s | 1.0 |
+| Tangent export, fan-out forced | **3.79 s** | 17.96 s | 4.7 |
+
+**REAPER bounces this desk 3.4x faster than Tangent does today**, and the
+reason is not the DSP: Tangent does the same work for half the processor
+time (13.32 s against 25.24 s). It is that the exporter is single
+threaded while REAPER's is not.
+
+With the pool it already has, the same export is 3.79 s against REAPER's
+3.82 s - level - on 29% less CPU. `the_fork_renders_what_the_single_walk_
+rendered` already holds that the forked walk is bit-identical to the
+serial one, so the correctness argument is made; what is missing is a
+reason for `Engine::offline` to be given a pool, and a byte-comparison of
+a real exported file with and against it before anybody's bounces change.
+
+## What survives
+
+Everything about LIVE playback, which is what render-ahead is for and what
+every deadline number measures. At a 64-frame buffer this desk went from
+83% of the deadline and 140 late blocks in 4200 to 36% and none; at 32
+frames, from every block late to none. Those are Tangent against itself on
+one machine and no part of them depends on REAPER.
+
+What does not survive is "Tangent renders it faster than REAPER". On
+throughput the honest statement is: **Tangent's engine does the same work
+for a third to a half less processor time, and REAPER finishes sooner
+because it spreads that work over more cores. Tangent's exporter spreads
+it over one.**
