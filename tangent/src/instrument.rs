@@ -12217,14 +12217,28 @@ impl Renderer {
         out
     }
 
-    /// **How many lanes share one refill phase.**
+    /// **How many refill phases the desk is spread over.**
     ///
-    /// Eight, so at a 64-frame callback and a 512-frame grain each callback
-    /// refills about an eighth of the desk rather than all of it at once.
-    /// The number is a spread, not a schedule: a lane refills when the
-    /// playhead has passed its share of the grain it is consuming, so a
-    /// callback of any size lands somewhere sensible.
-    const GRAIN_PHASES: u64 = 8;
+    /// **One per callback the grain spans**, which is the only number that
+    /// makes the spread mean anything: a lane refills when the playhead has
+    /// passed its share of the grain it is consuming, so with `grain /
+    /// frames` phases every callback in a grain's life gets its own share
+    /// of the desk and no callback gets two.
+    ///
+    /// It was a flat eight, and at a 64-frame callback with a 512-frame
+    /// grain eight is exactly right - which is why it looked right. At a
+    /// 32-frame callback the same grain spans SIXTEEN callbacks, eight
+    /// phases put two boundaries on one block, and the measurement is
+    /// blunt: 74.9% of the deadline and 270 late blocks in 4200 at a
+    /// 512-frame grain, against 58.4% and 26 at a 256-frame one. A bigger
+    /// grain came out WORSE, on a desk where it used less CPU - the
+    /// throughput was fine and the work was lumpy.
+    ///
+    /// Capped at the lane count, past which extra phases only leave empty
+    /// slots, and at least one, which is the un-staggered behaviour.
+    fn grain_phases(grain: usize, frames: usize) -> u64 {
+        ((grain / frames.max(1)) as u64).clamp(1, CHANNELS as u64)
+    }
 
     /// **Decide what span each lane renders this chunk.**
     ///
@@ -12392,8 +12406,8 @@ impl Renderer {
                 // Look ahead when this lane's phase has come up.
                 (true, Some(key)) if at >= key.at => {
                     let into = at - key.at;
-                    let phase = (ch as u64 % Self::GRAIN_PHASES) * grain as u64
-                        / Self::GRAIN_PHASES;
+                    let phases = Self::grain_phases(grain, frames);
+                    let phase = (ch as u64 % phases) * grain as u64 / phases;
                     let end = key.at + u64::from(key.frames);
                     // **And only into a slot nothing still owes the fold.**
                     // See `LaneGrains::next_is_free`.

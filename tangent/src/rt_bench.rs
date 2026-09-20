@@ -1325,6 +1325,308 @@ fn the_grain_survives_a_callback_that_changes_size() {
     }
 }
 
+/// What a transition did to a pair of engines.
+struct Transition {
+    /// Bit-exact from frame zero up to the block the change lands on.
+    exact_before: bool,
+    /// Bit-exact for the whole run, transition included.
+    exact_throughout: bool,
+    /// Decibels of total energy between the two whole streams.
+    total_db: f64,
+    /// The worst single window of energy, in decibels.
+    window_db: f64,
+    /// Peak of the reference stream.
+    peak: f32,
+    /// Peak of the GRAINED stream over `quiet`, if one was named.
+    quiet_peak: f32,
+}
+
+/// **Run one desk change against a chunked reference, mid-roll.**
+///
+/// Both engines are built the same way and given the same change at the
+/// same block; the only difference between them is the grain. `apply` is
+/// called with `true` at `on_at` and `false` at `off_at`. `quiet` names a
+/// range of blocks the GRAINED engine is expected to be silent over.
+fn transition(
+    build: fn() -> Engine,
+    grain: f64,
+    apply: fn(&Engine, bool),
+    on_at: usize,
+    off_at: usize,
+    blocks: usize,
+    quiet: Option<std::ops::Range<usize>>,
+) -> Transition {
+    let (mut chunked, mut grained) = (build(), build());
+    grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+    let n = BLOCK * 2;
+    let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    let (mut exact_before, mut exact_throughout) = (true, true);
+    let mut quiet_peak = 0.0f32;
+    for block in 0..blocks {
+        if block == on_at {
+            apply(&chunked, true);
+            apply(&grained, true);
+        }
+        if block == off_at {
+            apply(&chunked, false);
+            apply(&grained, false);
+        }
+        chunked.render_offline(&mut a);
+        grained.render_offline(&mut b);
+        let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+        exact_throughout &= same;
+        if block < on_at {
+            exact_before &= same;
+        }
+        if quiet.as_ref().is_some_and(|q| q.contains(&block)) {
+            quiet_peak = b.iter().fold(quiet_peak, |m, s| m.max(s.abs()));
+        }
+        xs.extend_from_slice(&a);
+        ys.extend_from_slice(&b);
+    }
+    let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let (total_db, window_db) = energy_gap(&xs, &ys, peak * 0.001);
+    Transition { exact_before, exact_throughout, total_db, window_db, peak, quiet_peak }
+}
+
+/// **What a transition is allowed to cost**, and why these two numbers.
+///
+/// Every fallback out of the grain render meets the same irreducible fact:
+/// **a grained lane's rack is up to one grain AHEAD of the playhead.** It
+/// has rendered audio nobody has heard yet, and a reverb's delay lines and
+/// a compressor's envelope cannot be rewound. So a stop, a varispeed
+/// change, a stems export or a freeze - each of which suspends or
+/// re-purposes the rack - resumes it from a point up to one grain further
+/// along than the chunked reference's.
+///
+/// For a dense reverb that is a PERMANENT decorrelation: once two plates'
+/// delay lines differ at all they never reconverge, and every block after
+/// the transition compares at -12 to -15 dBFS for ever. It is also
+/// completely inaudible, and the measurement says exactly why: **the total
+/// energy of the two streams differs by 0.01 to 0.06 dB.** Same tail, same
+/// loudness, different noise. The samples are the wrong thing to compare,
+/// the way they are for the locate and for a built-in instrument's wander.
+///
+/// Measured worsts across the five transitions: total 0.06 dB, window
+/// 3.21 dB (the stop, where the parked tail decays across a window
+/// boundary). The bounds sit outside those so this is a regression net and
+/// not a tripwire.
+const TRANSITION_TOTAL_DB: f64 = 1.0;
+const TRANSITION_WINDOW_DB: f64 = 6.0;
+
+/// **A stopped transport stays silent, and the desk survives coming back.**
+///
+/// The hazard is specific and it is why `plan_grains` CLEARS the rings
+/// when the transport is not rolling rather than draining them: a parked
+/// playhead re-reads one position for ever, and a ring that still held a
+/// grain covering it would answer, so the desk would PLAY at a stopped
+/// transport. That is the one thing a stopped transport must never do.
+#[test]
+fn a_stopped_transport_stays_silent_and_comes_back_clean() {
+    // `tail` is whether the shape carries one: a plate is still sounding
+    // for a second after the music stops and a bare clip is not.
+    let shapes: [(&str, fn() -> Engine, bool); 4] = [
+        ("clips only", || audio_desk(8, &[]), false),
+        ("plate", || audio_desk(8, &["@tangent-plate"]), true),
+        ("comp", || audio_desk(8, &["@tangent-comp"]), false),
+        ("Analog", || instrument_desk(4, "@tangent-analog", 4), true),
+    ];
+    for (name, build, tail) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let t = transition(
+                build,
+                grain,
+                |e, on| e.set_rolling(!on),
+                100,
+                160,
+                300,
+                // The last twenty parked blocks, by which time anything a
+                // rack carried into the stop has decayed.
+                Some(140..160),
+            );
+            let what = format!("{name} at a {grain:.0}-frame grain, stopped at 100 and rolling at 160");
+            assert!(t.peak > 0.001, "{what}: the render was silent, so nothing was proved");
+            assert!(t.exact_before, "{what}: the two differed BEFORE the stop");
+            assert!(
+                t.total_db < TRANSITION_TOTAL_DB && t.window_db < TRANSITION_WINDOW_DB,
+                "{what}: {:.2} dB of total energy and {:.2} dB in the worst \
+                 window, so the stop cost more than a rack's phase",
+                t.total_db,
+                t.window_db
+            );
+            if !tail {
+                assert!(
+                    t.quiet_peak < 1.0e-6,
+                    "{what}: the desk was making {} of sound with the transport \
+                     STOPPED, which means a grain was served at a parked playhead",
+                    t.quiet_peak
+                );
+            }
+        }
+    }
+}
+
+/// **Varispeed and a stems export fall back to the chunk, mid-roll.**
+///
+/// Both are early-outs in `plan_grains` and both were asserted by
+/// construction rather than by measurement. Varispeed sizes each chunk
+/// from a phase accumulator, so the next chunk's length is not knowable
+/// and a grain keyed on position cannot be planned; a stems export takes a
+/// dry copy at render and reads it at consumption, so a lane served from a
+/// grain would hand the tap a copy taken for a different span. Each
+/// arrives while the rings are full, and the rings have to go with it.
+#[test]
+fn varispeed_and_stems_fall_back_to_the_chunk_mid_roll() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    let modes: [(&str, fn(&Engine, bool)); 2] = [
+        ("varispeed", |e, on| e.set_varispeed(if on { 0.75 } else { 1.0 })),
+        ("stems", |e, on| e.set_stems(on)),
+    ];
+    for (mode, apply) in modes {
+        for (name, build) in shapes {
+            let t = transition(build, 512.0, apply, 80, 180, 260, None);
+            let what = format!("{name} with {mode} engaged at 80 and released at 180");
+            assert!(t.peak > 0.001, "{what}: the render was silent");
+            assert!(t.exact_before, "{what}: the two differed BEFORE {mode} was engaged");
+            assert!(
+                t.total_db < TRANSITION_TOTAL_DB && t.window_db < TRANSITION_WINDOW_DB,
+                "{what}: {:.2} dB of total energy and {:.2} dB in the worst window",
+                t.total_db,
+                t.window_db
+            );
+        }
+    }
+}
+
+/// **The pins that arrive mid-roll do not make a rack re-run.**
+///
+/// `a_lane_that_becomes_pinned_mid_roll_does_not_re_run_its_rack` proves
+/// the rule with the insert tap, chosen because it pins a lane and changes
+/// no audio, so the measurement is of one thing. These are the pins a
+/// person actually applies - arming a track to record on it, punching in,
+/// calling it a drum lane, freezing it.
+///
+/// **Three of the four are bit-exact and the fourth cannot be**, and the
+/// difference is the whole rule. Arming, punching and drums leave the
+/// lane's rack running, so the drain covers them completely: serve what
+/// the ring holds, then go live from where it ends, and not one sample
+/// moves. FREEZING stops the rack and starts it again later, and it
+/// restarts from wherever the look-ahead had got to - see
+/// `TRANSITION_TOTAL_DB`.
+#[test]
+fn the_pins_that_arrive_mid_roll_do_not_re_run_a_rack() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    // `keeps_the_rack`: whether the lane's rack goes on running under the pin.
+    let pins: [(&str, fn(&Engine, bool), bool); 4] = [
+        ("armed", |e, on| e.set_armed(if on { 0b11 } else { 0 }), true),
+        // A drum lane is folded through the drum bus instead of its own
+        // strip, so calling one a drum lane re-points the path its rack
+        // feeds. Measured at 0.02 dB of total energy, which is the tail
+        // phase and not a re-run, but it is not bit-exact and should not
+        // claim to be.
+        ("drums", |e, on| e.set_drum_strips(if on { 0b11 } else { 0 }), false),
+        (
+            "punched",
+            |e, on| {
+                let mut p = [None; crate::instrument::CHANNELS];
+                if on {
+                    p[0] = Some(u64::from(BLOCK as u32) * 150);
+                    p[1] = Some(u64::from(BLOCK as u32) * 150);
+                }
+                e.set_punches(p);
+            },
+            true,
+        ),
+        ("frozen", |e, on| e.set_frozen(if on { 0b11 } else { 0 }), false),
+    ];
+    for (pin, apply, keeps_the_rack) in pins {
+        for (name, build) in shapes {
+            for grain in [240.0f64, 512.0] {
+                let t = transition(build, grain, apply, 100, 200, 300, None);
+                let what = format!(
+                    "{name} at a {grain:.0}-frame grain, two lanes {pin} at 100 and \
+                     not at 200"
+                );
+                assert!(t.peak > 0.001, "{what}: the render was silent");
+                assert!(t.exact_before, "{what}: the two differed BEFORE the pin");
+                if keeps_the_rack {
+                    assert!(
+                        t.exact_throughout,
+                        "{what}: the mix moved, so the lane re-ran audio its rack \
+                         had already been through - {:.2} dB of total energy",
+                        t.total_db
+                    );
+                } else {
+                    assert!(
+                        t.total_db < TRANSITION_TOTAL_DB && t.window_db < TRANSITION_WINDOW_DB,
+                        "{what}: {:.2} dB of total energy and {:.2} dB in the \
+                         worst window",
+                        t.total_db,
+                        t.window_db
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "a probe"]
+fn probe_transitions() {
+    let grain = 240.0f64;
+    let build = || audio_desk(8, &["@tangent-plate"]);
+    let cases: [(&str, fn(&Engine, bool)); 5] = [
+        ("frozen", |e, on| e.set_frozen(if on { 0b11 } else { 0 })),
+        ("armed", |e, on| e.set_armed(if on { 0b11 } else { 0 })),
+        ("stopped", |e, on| e.set_rolling(!on)),
+        ("varispeed", |e, on| e.set_varispeed(if on { 0.75 } else { 1.0 })),
+        ("stems", |e, on| e.set_stems(on)),
+    ];
+    for (what, apply) in cases {
+        let (mut chunked, mut grained) = (build(), build());
+        grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+        let n = BLOCK * 2;
+        let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        let mut line = String::new();
+        for block in 0..300usize {
+            match block {
+                100 => {
+                    apply(&chunked, true);
+                    apply(&grained, true);
+                }
+                200 => {
+                    apply(&chunked, false);
+                    apply(&grained, false);
+                }
+                _ => {}
+            }
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            let (d, _) = worst_diff(&a, &b);
+            let pa = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if (98..=106).contains(&block) || (198..=214).contains(&block) {
+                line.push_str(&format!("    b{block}: diff {:.1} dBFS  block peak {:.1}\n", dbfs(d), dbfs(pa)));
+            }
+            xs.extend_from_slice(&a);
+            ys.extend_from_slice(&b);
+        }
+        let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let (total, window) = energy_gap(&xs, &ys, peak * 0.001);
+        println!("  {what:<10} total energy {total:.2} dB, worst window {window:.2} dB, peak {:.1}", dbfs(peak));
+        print!("{line}");
+    }
+}
+
 #[test]
 #[ignore = "a probe"]
 fn probe_analog_sizes() {
