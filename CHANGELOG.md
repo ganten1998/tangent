@@ -69,6 +69,20 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A frozen track's effects now look and behave frozen.** They are already
+  in the rendered file, so swapping, bypassing or deleting one changed
+  nothing anybody could hear until the track thawed - and the press landed
+  anyway. It is refused now, with a line saying how to thaw, exactly as a
+  frozen track's clips have always refused an edit. Copying an effect off a
+  frozen track still works, because that changes nothing on it.
+
+  The frost over the bays was being painted UNDER the plugin's name and the
+  loaded tab, in both the mixer and the arrangement's track header, so a
+  frozen track's effects went on reading as live. It goes on last now, over
+  the bays and the input button, which are the two things on a frozen track
+  that do nothing until it thaws.
+
+
 - **A track's effects could be run over the same audio twice.** Only with
   render-ahead on. A reverb or a compressor handed the same stretch of
   sound a second time carries the wrong tail out of it. Effects with

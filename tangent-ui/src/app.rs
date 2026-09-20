@@ -5657,6 +5657,32 @@ impl TangentApp {
         // here, which is what makes recording a pass a hook rather than a
         // gesture reimplemented three times.
         self.record_automation_move(hit, v);
+        // **A frozen lane's rack is not for touching.**
+        //
+        // Its inserts are already IN the file the lane is playing, so a
+        // swap, a bypass, a delete or a sidechain changes nothing anybody
+        // can hear until it thaws. Letting the press land and quietly do
+        // nothing audible is a worse lie than refusing it, and the clips
+        // on the same lane have refused edits this way since freeze
+        // shipped - see `frozen_refuses`, which says how to thaw.
+        //
+        // Dismiss is let through because closing a menu is not an edit,
+        // and so is Copy: carrying an effect OFF a frozen lane changes
+        // nothing on it.
+        if let Some(ch) = Self::hit_channel(hit) {
+            let edits_the_rack = match hit {
+                H::Insert(..) => true,
+                H::FxMenu(_, _, action) => !matches!(
+                    action,
+                    crate::mixer_panel::FxAction::Dismiss
+                        | crate::mixer_panel::FxAction::Copy
+                ),
+                _ => false,
+            };
+            if edits_the_rack && self.frozen_refuses(ch) {
+                return;
+            }
+        }
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
             // **The click's sound button opens the metronome panel** — the
@@ -44992,6 +45018,57 @@ mod tests {
             app.armed_mask(),
             1 << 3,
             "shift+arm flipped the whole selection when the hand meant one of it"
+        );
+    }
+
+    /// **A frozen lane's inserts refuse the edit until it thaws**, the way
+    /// its clips already do.
+    ///
+    /// The owner, on the build that shipped the freeze: "i can still
+    /// interact with the fx inserts and they still dont look frozen to me".
+    /// They are in the rendered file, so a delete, a bypass or a swap
+    /// changes nothing anybody can hear until the lane thaws - and a press
+    /// that lands and does nothing audible is a worse lie than one that is
+    /// refused and says why.
+    ///
+    /// Copy is let through: carrying an effect OFF a frozen lane changes
+    /// nothing on it, and it is the one road to duplicating a setting into
+    /// a track that is not frozen.
+    #[test]
+    fn a_frozen_lanes_inserts_refuse_the_edit_until_it_thaws() {
+        use crate::mixer_panel::{FxAction, Hit};
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(0, 1, Some("/x/Grand 8.vst3"));
+        app.note_frozen(0, "media/frozen-01-1.wav".into(), 3.0);
+
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        assert!(
+            app.insert(0, 1).is_some(),
+            "delete took a frozen lane's plugin out of a bay that is already \
+             in the rendered file"
+        );
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        assert!(
+            !app.insert_bypassed(0, 1),
+            "bypass flipped a frozen lane's bay, which changes nothing until \
+             it thaws"
+        );
+        app.apply_mixer_hit(Hit::Insert(Column(0), 1), 0.0);
+        assert!(
+            !matches!(app.dialog, Some(Dialog::PluginPicker { .. })),
+            "pressing a frozen lane's bay opened the picker"
+        );
+
+        // And the thaw gives all of it back.
+        app.unfreeze_track(0);
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        assert_eq!(
+            app.insert(0, 1),
+            None,
+            "the bay still refused after the lane thawed"
         );
     }
 

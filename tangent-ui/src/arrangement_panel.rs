@@ -6626,6 +6626,25 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 type_size,
             );
         }
+        // **The frost goes OVER the bays and the input, not under them.**
+        //
+        // The header panel is washed with `FROST_TINT` further up this
+        // function, and then this row paints its chips on top of it at full
+        // strength - so the two things on a frozen lane that do not apply
+        // went on reading as live. The owner: "i can still interact with
+        // the fx inserts and they still dont look frozen to me".
+        //
+        // The bays are in the rendered file, and a frozen lane records
+        // nothing, so neither the plugins nor the input do anything until
+        // it thaws. `apply_mixer_hit_one` refuses the press; this is the
+        // half that says so before the press is made.
+        if lane.frozen {
+            for r in row.bays.iter().chain(std::iter::once(&row.input)) {
+                if r.is_positive() {
+                    painter.rect_filled(*r, 2.0, FROST_TINT);
+                }
+            }
+        }
         // ROUTING, under the dials: the same door the mixer's button opens,
         // wearing the same chip the bays do so the header reads as one row
         // of pressable things rather than two idioms.

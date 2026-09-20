@@ -2961,18 +2961,6 @@ fn strip(
             } else {
                 p.lit
             };
-            if v.frozen {
-                painter.rect_filled(*cell, 1.0, crate::arrangement_panel::FROST_TINT);
-                if n == 0 {
-                    let r = (cell.height() * 0.3).clamp(3.0, 6.0);
-                    crate::arrangement_panel::snowflake(
-                        painter,
-                        Pos2::new(cell.right() - r - 2.0, cell.center().y),
-                        r,
-                        crate::arrangement_panel::FROST_INK,
-                    );
-                }
-            }
             painter.rect_filled(
                 Rect::from_min_max(
                     cell.min,
@@ -3022,6 +3010,30 @@ fn strip(
                 crate::fonts::courier_bold(),
             );
             centred(painter, *cell, "+", plus, p.engrave.gamma_multiply(0.45));
+        }
+        // **The frost goes on LAST, over the bay and not under it.**
+        //
+        // It was painted first, before the loaded tab and before the
+        // plugin's name, so the two things a bay actually says were drawn
+        // on top of it at full strength and the bay went on reading as
+        // live. The owner's words: "i can still interact with the fx
+        // inserts and they still dont look frozen to me" - and half of
+        // that was this.
+        //
+        // The arrangement's own frost has always gone over its clips, for
+        // the reason written there: what is under it should read as "here,
+        // but not for touching".
+        if v.frozen {
+            painter.rect_filled(*cell, 1.0, crate::arrangement_panel::FROST_TINT);
+            if n == 0 {
+                let r = (cell.height() * 0.3).clamp(3.0, 6.0);
+                crate::arrangement_panel::snowflake(
+                    painter,
+                    Pos2::new(cell.right() - r - 2.0, cell.center().y),
+                    r,
+                    crate::arrangement_panel::FROST_INK,
+                );
+            }
         }
     }
 
