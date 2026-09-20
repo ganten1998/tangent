@@ -43,6 +43,7 @@ Install Tangent — the application, the VST3 plugin, or both.
   ./install.sh --no-desktop    the binary only, no menu entry
   ./install.sh --deps          install missing video-acceleration packages
   ./install.sh --no-deps       never touch the package manager, just advise
+  ./install.sh --no-rt         skip the real-time scheduling grant
   ./install.sh --uninstall     take it all back out
   ./install.sh --dry-run       print what would happen and do nothing
 
@@ -86,6 +87,12 @@ DRY=0
 UNINSTALL=0
 MODE=user
 PREFIX=""
+# **The real-time grant.** On by default for a system install, because
+# without it Tangent renders every track on one core and sounds like a slow
+# computer rather than like a missing permission. See `grant_realtime`.
+RT=1
+RT_LIMITS=/etc/security/limits.d/99-tangent-realtime.conf
+RT_GROUP=audio
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -100,6 +107,7 @@ while [ $# -gt 0 ]; do
         --user)      MODE=user ;;
         --prefix)    shift; [ $# -gt 0 ] || { echo "--prefix needs a directory" >&2; exit 2; }
                      PREFIX="$1"; MODE=prefix ;;
+        --no-rt)     RT=0 ;;
         --uninstall) UNINSTALL=1 ;;
         --dry-run|-n) DRY=1 ;;
         -h|--help)   usage; exit 0 ;;
@@ -140,6 +148,117 @@ run() {
     else
         "$@"
     fi
+}
+
+# ── Real-time scheduling ────────────────────────────────────────────────────
+#
+# **Tangent's render workers ask the kernel for SCHED_FIFO, and a worker that
+# cannot get it does not count.** `rtwork.rs` is explicit about the answer to
+# a refused policy: stop forking and render serially. So a desktop without
+# this permission does not fail, it renders every track on the callback
+# thread and sounds exactly like a slow computer. Nothing in the interface
+# can tell the user which one they have, which is precisely why the grant
+# belongs in an installer rather than in a troubleshooting page.
+#
+# The mechanism is the audio group plus an `rtprio` line in `limits.d`.
+# Group membership ALONE is usually not enough: on most distributions the
+# group exists and nothing grants it anything, and the `limits.d` line is
+# what `pam_limits` turns into an actual `RLIMIT_RTPRIO`. That is why this
+# writes the file rather than only running `usermod`.
+#
+# `memlock` is deliberately NOT granted. Tangent never calls `mlock` — the
+# source has no `mlock`, `MCL_CURRENT` or `memlock` anywhere — so asking for
+# it would be taking a privilege the program does not use.
+#
+# 95 rather than 99: a real-time thread that outranks the kernel's own
+# watchdogs is how a scheduling grant turns a glitch into a lockup. JACK and
+# PipeWire both settle here for the same reason.
+#
+# Its own file rather than a marked block in limits.conf, because a file is
+# what `limits.d` is for and removing it is the whole uninstall. The user we
+# added is recorded inside it, so `--uninstall` gives back exactly what this
+# granted and leaves alone anyone who was in the audio group already.
+
+# Who to grant to. `sudo`/`doas` re-exec as root, so `$USER` is root by then.
+rt_target_user() {
+    for rt_v in "${SUDO_USER:-}" "${DOAS_USER:-}"; do
+        if [ -n "$rt_v" ] && [ "$rt_v" != root ]; then
+            printf '%s\n' "$rt_v"; return 0
+        fi
+    done
+    rt_v=$(logname 2>/dev/null || true)
+    if [ -n "$rt_v" ] && [ "$rt_v" != root ]; then
+        printf '%s\n' "$rt_v"; return 0
+    fi
+    return 1
+}
+
+grant_realtime() {
+    [ "$RT" = "1" ] || return 0
+    # Only a system install can do this; a home install has no root and
+    # should say so rather than look like it worked.
+    if [ "$MODE" != system ]; then
+        return 0
+    fi
+    if [ "$(id -u)" != 0 ]; then
+        echo "  (not root, so the real-time grant was skipped)"
+        return 0
+    fi
+    rt_user=$(rt_target_user || true)
+    if [ -z "$rt_user" ]; then
+        echo "  Could not tell which user to grant real-time scheduling to."
+        echo "  Run this yourself, then log out and back in:"
+        echo "      sudo usermod -aG $RT_GROUP <your-username>"
+        return 0
+    fi
+    echo "Granting real-time scheduling to $rt_user"
+    # The group first. Only add, and only record it if we DID add, so the
+    # uninstall cannot take away something that was there before us.
+    rt_added=0
+    if getent group "$RT_GROUP" >/dev/null 2>&1; then
+        if id -nG "$rt_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$RT_GROUP"; then
+            echo "  already in the $RT_GROUP group; leaving it alone"
+        else
+            run usermod -aG "$RT_GROUP" "$rt_user" && rt_added=1
+        fi
+    else
+        echo "  no '$RT_GROUP' group on this system; writing the limit anyway"
+    fi
+    # And the limit, which is what actually grants it.
+    if [ "$DRY" = "1" ]; then
+        printf '  would: write %s\n' "$RT_LIMITS"
+    else
+        mkdir -p "$(dirname "$RT_LIMITS")"
+        {
+            echo "# --- Tangent real-time scheduling (installer) ---"
+            echo "# Written by Tangent's installer. Remove with ./install.sh --uninstall"
+            echo "# tangent-granted-user: $rt_user"
+            echo "# tangent-added-to-group: $rt_added"
+            echo "@$RT_GROUP   -   rtprio   95"
+        } > "$RT_LIMITS"
+        chmod 0644 "$RT_LIMITS"
+    fi
+    echo "  Log out and back in for this to take effect — a process keeps the"
+    echo "  groups and limits it started with."
+}
+
+ungrant_realtime() {
+    [ "$(id -u)" = 0 ] || return 0
+    [ -f "$RT_LIMITS" ] || return 0
+    grep -q "Tangent real-time scheduling (installer)" "$RT_LIMITS" 2>/dev/null || {
+        echo "  $RT_LIMITS is not ours; leaving it alone"
+        return 0
+    }
+    rt_user=$(sed -n 's/^# tangent-granted-user: //p' "$RT_LIMITS" | head -1)
+    rt_added=$(sed -n 's/^# tangent-added-to-group: //p' "$RT_LIMITS" | head -1)
+    run rm -f "$RT_LIMITS"
+    # Only if WE put them there.
+    if [ "$rt_added" = "1" ] && [ -n "$rt_user" ]; then
+        if command -v gpasswd >/dev/null 2>&1; then
+            run gpasswd -d "$rt_user" "$RT_GROUP" >/dev/null 2>&1 || true
+        fi
+    fi
+    echo "  real-time scheduling grant removed"
 }
 
 # ── Hardware video acceleration ─────────────────────────────────────────────
@@ -497,6 +616,7 @@ fi
 
 if [ "$UNINSTALL" = "1" ]; then
     echo "Removing $NAME"
+    ungrant_realtime
     run rm -f  "$BIN_DIR/tangent"
     run rm -f  "$BIN_DIR/tangent-ffmpeg"
     run rm -rf "$VST3_DIR/$NAME.vst3"
@@ -685,6 +805,26 @@ if [ "$WANT_APP" = "1" ] && ! have_lilv; then
         *)      echo "          (install your distribution's lilv package)" ;;
     esac
     echo
+fi
+# **Before the dry-run exit**, so `--dry-run` reports the grant like it
+# reports every other write. It was below it at first, which made the one
+# option whose whole job is "tell me what you would do" silent about the
+# only step that touches the system outside Tangent's own files.
+#
+# A grant is about the machine rather than the install, so it comes after
+# the files are in place; and it prints a "log out and back in" that should
+# be the last thing read rather than the first thing scrolled past.
+grant_realtime
+if [ "$RT" = "1" ] && [ "$MODE" != system ]; then
+    echo
+    echo "NOTE: Tangent spreads track rendering across cores, and the kernel"
+    echo "      only allows that for users granted real-time scheduling."
+    echo "      Without it every track renders on one core. A home install"
+    echo "      cannot grant it; either re-run with --system, or:"
+    echo "          sudo usermod -aG audio \"${USER:-$(id -un)}\""
+    echo "          echo '@audio   -   rtprio   95' |"
+    echo "            sudo tee /etc/security/limits.d/99-tangent-realtime.conf"
+    echo "      then log out and back in."
 fi
 if [ "$DRY" = "1" ]; then
     echo "Nothing was written. Drop --dry-run to install."

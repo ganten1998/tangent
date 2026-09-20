@@ -4899,7 +4899,16 @@ mod engine_parts {
         // The callback itself renders a lane, so the pool is the other
         // cores, and a machine too small to have any gets none at all.
         assert!(peers < cores.max(1), "the pool claimed every core");
-        assert_eq!(peers == 0, cores < 3);
+        // **One peer is worth having.** The floor used to be three cores,
+        // on the reasoning that a single peer made the pool pointless; it
+        // measured 1.66x to 1.81x on the machine that reasoning excluded.
+        assert_eq!(peers == 0, cores < 2);
+        // And never more threads than the machine has: five on four is a
+        // cliff, not a plateau. See `fanout_peers`.
+        assert!(
+            peers + 1 <= std::thread::available_parallelism().map_or(4, |n| n.get()).max(cores),
+            "the callback plus its peers outnumber the machine's own CPUs"
+        );
     }
 
     /// **No two lanes share a seat**, which is the whole argument that lets
@@ -5447,11 +5456,30 @@ fn pinned_lanes(
 /// on and wrong everywhere else: the same four peers face ten cores on an
 /// M4 Max and sixteen on an Ultra, so the biggest desks run on the machines
 /// that leave the most silicon idle. [`LanePool::new`] clamps the answer to
-/// sixteen, and one peer means the pool is pointless, so a machine that
-/// reports two cores or fewer gets none and takes the serial road.
+/// sixteen.
+///
+/// **The floor was two cores and is now one peer, because the old floor was
+/// measured wrong.** It said "one peer means the pool is pointless", and the
+/// tester swept it on a 4-thread Ivy Bridge box: one peer is worth 1.66x on
+/// `16 lanes x [EQ, comp, plate]` and 1.81x on `8 lanes x Analog`, and three
+/// peers 2.02x and 2.06x. A floor that answers zero below three cores was
+/// not protecting small machines, it was taxing them - that box built no
+/// pool at all and rendered every lane on the callback thread.
+///
+///     peers   16 x [EQ,comp,plate]   8 x Analog
+///       0        1.00x (control)       1.00x
+///       1        1.66x                 1.81x
+///       2        1.73x                 1.81x
+///       3        2.02x                 2.06x     <- logical - 1
+///       4        1.07x                 1.45x     <- more threads than CPUs
+///
+/// Four peers on four logical CPUs is a cliff, not a plateau: five threads
+/// for four, and `8 lanes x Analog` went from 83 missed blocks in 2000 to
+/// 1441. So the count must never exceed what the machine actually has, and
+/// `available_parallelism` is the figure that means that.
 fn fanout_peers() -> usize {
     let cores = performance_cores();
-    if cores < 3 { 0 } else { cores - 1 }
+    if cores < 2 { 0 } else { cores - 1 }
 }
 
 /// **How many peers a BOUNCE should use**, which is a different question.
@@ -5527,9 +5555,28 @@ fn performance_cores() -> usize {
     4
 }
 
+/// **Off macOS, every core the machine admits to, and NOT half of them.**
+///
+/// This halved `available_parallelism` to guess past hyperthreading, which
+/// is wrong twice over. On the tester's 4-thread box (2 physical + HT) it
+/// answered 2, the old floor then answered zero peers, and the fan-out
+/// never ran at all - while the measured optimum on that same box was
+/// three peers, the logical count less one. And on a machine with four
+/// REAL cores and no SMT the same halving throws away half of a correct
+/// answer.
+///
+/// The halving was defensible reasoning - two threads on one core are not
+/// two cores - and the measurement disagrees with it: SMT siblings are not
+/// worth a full core each, but they are worth more than nothing, and the
+/// block waits for the slowest hand either way.
+///
+/// macOS keeps its own answer because it has a kind of core this does not:
+/// an efficiency core in a real-time fan-out is slower than not forking,
+/// which is why `hw.perflevel0.physicalcpu` is the right question there and
+/// the whole count is the right question here.
 #[cfg(not(target_os = "macos"))]
 fn performance_cores() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(2))
+    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
 }
 
 /// One lane's whole render, gathered so that the fork can hold thirty-two of
