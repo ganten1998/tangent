@@ -30,9 +30,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   to the chosen number of milliseconds late. Faders, sends, mute and solo
   are applied at the moment the audio is played and are unaffected.
 
-  Measured here on thirty-two tracks carrying three reverbs each, at a
-  64-frame buffer: the worst block goes from 132% of the deadline to 65%,
-  and from 41 misses in 2000 blocks to one. At 128 frames, 84% to 52%.
+  Measured here on thirty-two tracks carrying three FabFilter Pro-R 2
+  reverbs each - ninety-six of them - with other work running on the
+  machine, so the figures are if anything gloomy:
+
+  | buffer | off | at 5 ms | at 10.7 ms |
+  |---|---|---|---|
+  | 32 frames | every block late | 2 late in 4200 | 28 late |
+  | 64 frames | 2607 late in 4200 | none late | none late |
+  | 128 frames | none late | none late | none late |
+
+  Twelve seconds of that desk takes 4.9 seconds to render at a 64-frame
+  buffer with this on, against 12.4 with it off.
+
+  **A 32-frame buffer becomes possible at all**, which it was not before:
+  without this, every single block on that desk was late. At 32 frames the
+  5 ms setting is the better one and 10.7 ms is not, which is the one place
+  the largest value is not the best: the longer stretches cannot be spread
+  finely enough across so short a buffer.
 
   Armed tracks, tracks listening to live MIDI, folders, send destinations,
   sidechained tracks and anything being auditioned always run on the
