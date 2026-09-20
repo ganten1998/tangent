@@ -2257,19 +2257,29 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
     if peak <= 0.0005 {
         println!("  {name}: silent at its defaults, so nothing was compared");
     } else if control > 0.0 {
-        // The plugin disagrees with itself on one thread. All the fork can
-        // be held to is not making it WORSE.
+        // **The plugin disagrees with itself on one thread**, so samples are
+        // the wrong metric and so is the control's own worst sample: that
+        // figure swings between -26 and -41 dBFS from run to run, which
+        // makes any margin built on it either useless or a tripwire.
+        //
+        // ENERGY is the invariant that survives. A reverb modulating its
+        // delay lines with noise produces a different tail every time and
+        // the same amount of it, so the question the fork has to answer is
+        // whether the sound is as loud, not whether it is the same sound.
+        // The same bar the transition tests use.
+        let (total, window) = energy_gap(&xs, &ys, peak * 0.001);
+        let (ctl_total, _) = energy_gap(&xs, &ctl, peak * 0.001);
         println!(
             "  {LANES} x {name} is not deterministic: two serial renders differ \
-             by {:.1} dBFS, so the fork is held to that bar and not to bits",
+             by {:.1} dBFS of sample and {ctl_total:.2} dB of energy, so the \
+             fork is held to energy",
             dbfs(control)
         );
         assert!(
-            worst <= control * 4.0,
-            "{LANES} x {name}: the forked, grained walk differs by {:.1} dBFS \
-             where the plugin's own run-to-run spread is {:.1}",
-            dbfs(worst),
-            dbfs(control)
+            total < 1.0 && window < 4.0,
+            "{LANES} x {name}: the forked, grained walk differs by {total:.2} dB \
+             of total energy and {window:.2} dB in the worst window, where two \
+             serial renders differ by {ctl_total:.2} dB"
         );
     } else {
         assert!(
@@ -2804,6 +2814,12 @@ fn grain_ab() {
         .map_or_else(|| plugin.clone(), |s| s.to_string_lossy().into_owned());
     if loop_frames > 0 {
         e.set_loop(0, loop_frames as u64);
+    }
+    // **`TANGENT_AB_OFFLINE_FANOUT=1` spreads it the way an EXPORT does**,
+    // which is a different width from the live one: every core less one
+    // rather than the performance cores less one. See `offline_peers`.
+    if std::env::var_os("TANGENT_AB_OFFLINE_FANOUT").is_some() {
+        e.set_offline_fanout(true);
     }
     let deadline = deadline_us(frames);
     println!(
