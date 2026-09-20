@@ -1094,6 +1094,540 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
     }
 }
 
+// ── the grain render, under the conditions the desk actually meets ───────
+//
+// The three tests above prove the grain render is the same audio as the
+// chunked one on a desk that rolls forward from zero at one buffer size and
+// never changes. A desk does none of those things for long. What follows is
+// the rest of it: a loop, a callback whose size moves, a lane that stops
+// being eligible while the transport rolls, and the knob itself being
+// turned mid-roll.
+
+/// Render `blocks` callbacks whose sizes cycle through `sizes`, appending
+/// every sample rendered to `into`.
+///
+/// A real driver does not promise one size for ever: CoreAudio may hand a
+/// different count when the device is reconfigured under load, and the
+/// offline exporter splits at `MAX_BLOCK` whatever it was asked for. The
+/// grain clock is keyed on absolute position rather than on a block index
+/// precisely so that this is a non-event, and this is what says so.
+fn render_sizes(e: &mut Engine, sizes: &[usize], blocks: usize, into: &mut Vec<f32>) {
+    let widest = sizes.iter().copied().max().unwrap_or(BLOCK);
+    let mut buf = vec![0.0f32; widest * 2];
+    for b in 0..blocks {
+        let n = sizes[b % sizes.len()] * 2;
+        e.render_offline(&mut buf[..n]);
+        into.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// The worst absolute difference between two streams, and where it is.
+fn worst_diff(xs: &[f32], ys: &[f32]) -> (f32, Option<usize>) {
+    let n = xs.len().min(ys.len());
+    let first = xs[..n].iter().zip(&ys[..n]).position(|(x, y)| x.to_bits() != y.to_bits());
+    let worst = xs[..n].iter().zip(&ys[..n]).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+    (worst, first)
+}
+
+fn dbfs(v: f32) -> f64 {
+    20.0 * f64::from(v.max(1e-12)).log10()
+}
+
+/// **A loop wraps the same way grained as chunked.**
+///
+/// `clip_grain` is the one line of the plan that had never been run: a grain
+/// may not cross `loop_b`, because the wrap folds the overshoot back to
+/// `loop_a` and audio rendered past the end is audio of a bar that will not
+/// be played next. The alternative - flushing every lane on every wrap -
+/// costs a full-desk catch-up a lap in exactly the workflow the feature is
+/// for, so the grain is cut short at the loop end instead and the lane picks
+/// up again on the other side.
+///
+/// The loop is 3000 frames on purpose: 23.4 blocks, 12.5 grains at 240 and
+/// 5.86 at 512, so the wrap lands mid-block and mid-grain rather than on a
+/// boundary that would make the clipping a no-op.
+#[test]
+fn a_loop_wraps_the_same_way_grained_as_chunked() {
+    const LOOP_B: u64 = 3000;
+    let shapes: [(&str, fn() -> Engine); 4] = [
+        ("clips only", || audio_desk(8, &[])),
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    for (name, build) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            chunked.set_loop(0, LOOP_B);
+            grained.set_loop(0, LOOP_B);
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let mut peak = 0.0f32;
+            // 240 blocks is 30720 frames, which is ten laps of this loop.
+            for block in 0..240 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert!(
+                        x.to_bits() == y.to_bits(),
+                        "{name} looping 0..{LOOP_B} at a {grain:.0}-frame grain: \
+                         block {block} sample {i} gave {x} chunked and {y} grained"
+                    );
+                }
+                peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            // **Proof the loop actually wrapped.** Ten laps of a 3000-frame
+            // loop is 30720 frames of playing; a transport that ran straight
+            // through would be far past the end, and a test that compared
+            // two renders of an un-looped desk would prove nothing about
+            // `clip_grain` at all.
+            for (what, e) in [("chunked", &chunked), ("grained", &grained)] {
+                assert!(
+                    e.transport_position() < LOOP_B,
+                    "{name}: the {what} transport is at {} after ten laps of a \
+                     {LOOP_B}-frame loop, so it never wrapped",
+                    e.transport_position()
+                );
+            }
+            assert!(peak > 0.001, "{name}: the looped render was silent");
+        }
+    }
+}
+
+/// **The energy of two streams, window by window**, as decibels of
+/// difference: the total, and the worst single window.
+///
+/// The metric for a shape whose samples cannot be compared. Two copies of
+/// one tone at different phases differ by as much as the tone itself, and a
+/// peak taken there reports a catastrophe where a note is in fact landing
+/// on the same frame at the same level. Energy over a window as long as the
+/// note spacing averages the phase out and leaves "was a note played, when,
+/// and how loud".
+fn energy_gap(xs: &[f32], ys: &[f32], floor: f32) -> (f64, f64) {
+    let w = 700usize;
+    let e = |v: &[f32], k: usize| -> f32 {
+        let s: f32 = v[k * w * 2..((k + 1) * w * 2).min(v.len())].iter().map(|x| x * x).sum();
+        (s / (w * 2) as f32).sqrt()
+    };
+    let windows = (xs.len().min(ys.len()) / 2 / w).saturating_sub(1);
+    let (mut tot_a, mut tot_b, mut worst) = (0.0f32, 0.0f32, 0.0f64);
+    for k in 0..windows {
+        if e(xs, k) < floor {
+            continue;
+        }
+        worst = worst.max((dbfs(e(xs, k)) - dbfs(e(ys, k))).abs());
+        tot_a += e(xs, k) * e(xs, k);
+        tot_b += e(ys, k) * e(ys, k);
+    }
+    ((dbfs(tot_a.sqrt()) - dbfs(tot_b.sqrt())).abs(), worst)
+}
+
+/// **The grain render is the same audio at any callback size, including one
+/// that changes from block to block.**
+///
+/// The grain clock is keyed on absolute sample position, not on a count of
+/// callbacks, which is what makes this true - and which is exactly the
+/// property `Synth::render` turned out not to have.
+///
+/// **On the grid and off it**, and the difference is not the grain's. A
+/// built-in instrument recomputes its per-chunk work every
+/// `GRAIN_GRID` frames off an absolute
+/// counter, and one of those per-chunk quantities is a random draw: the
+/// oscillators' slow wander, three cents of it, stepped once per chunk.
+/// Split a chunk in two and the walk draws twice, which is the same
+/// instrument with different dice - a detune of a fraction of a cent, which
+/// beats against the other render and shows up in a sample-by-sample
+/// comparison as loudly as the note itself.
+///
+/// Measured, with NO grain render involved at all: an Analog desk fed
+/// 17/128/80/33/256-frame callbacks differs from the same desk fed 128s by
+/// -14.3 dBFS against a -13.9 peak, and is bit-exact against 64s, 512s or
+/// any other sequence of multiples of 32. See `probe_analog_sizes`.
+///
+/// So the bar is split. Every shape is bit-exact wherever every span ends
+/// on the grid, which is every buffer size a device actually hands over and
+/// every span the grain render produces - `Renderer::to_grid` sees to the
+/// second. Off the grid, audio lanes stay bit-exact and an instrument lane
+/// is held to the energy of its notes instead.
+#[test]
+fn the_grain_survives_a_callback_that_changes_size() {
+    struct Shape {
+        name: &'static str,
+        build: fn() -> Engine,
+        samples_compare: bool,
+    }
+    let shapes = [
+        Shape { name: "plate", build: || audio_desk(8, &["@tangent-plate"]), samples_compare: true },
+        Shape { name: "comp", build: || audio_desk(8, &["@tangent-comp"]), samples_compare: true },
+        Shape {
+            name: "Analog",
+            build: || midi_pattern_desk(4, "@tangent-analog"),
+            samples_compare: false,
+        },
+    ];
+    // `on_grid` is whether every size is a multiple of the instrument chunk.
+    let runs: [(&str, &[usize], bool); 6] = [
+        ("64 frames", &[64], true),
+        ("256 frames", &[256], true),
+        ("512 frames", &[512], true),
+        ("a size that moves", &[64, 128, 96, 256, 32, 512, 160, 128], true),
+        ("a size that moves, off grid", &[64, 128, 96, 256, 32, 512, 48, 128], false),
+        ("a size that moves, awkwardly", &[17, 128, 80, 33, 256], false),
+    ];
+    for Shape { name, build, samples_compare } in shapes {
+        for (what, sizes, on_grid) in runs {
+            for grain in [240.0f64, 512.0] {
+                let (mut chunked, mut grained) = (build(), build());
+                grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+                let (mut xs, mut ys) = (Vec::new(), Vec::new());
+                render_sizes(&mut chunked, sizes, 160, &mut xs);
+                render_sizes(&mut grained, sizes, 160, &mut ys);
+                let (worst, first) = worst_diff(&xs, &ys);
+                let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                assert!(peak > 0.001, "{name} with {what}: the render was silent");
+                if std::env::var_os("TANGENT_GRAINSURVEY").is_some() {
+                    println!(
+                        "  {name:<8} {what:<30} grain {grain:>4.0}  worst {:>7.1} dBFS  \
+                         peak {:>6.1}  first {:?}",
+                        dbfs(worst),
+                        dbfs(peak),
+                        first.map(|i| i / 2)
+                    );
+                    continue;
+                }
+                if samples_compare || on_grid {
+                    assert!(
+                        worst == 0.0,
+                        "{name} at a {grain:.0}-frame grain with {what}: the two \
+                         renders differ by {:.1} dBFS, first at frame {:?}",
+                        dbfs(worst),
+                        first.map(|i| i / 2)
+                    );
+                    continue;
+                }
+                // Off the grid, and an instrument: the notes, not the samples.
+                let (total, window) = energy_gap(&xs, &ys, peak * 0.001);
+                assert!(
+                    total < 1.0,
+                    "{name} at a {grain:.0}-frame grain with {what}: the two \
+                     renders differ by {total:.2} dB of total energy, so a note \
+                     is missing or at the wrong level rather than merely drifting"
+                );
+                assert!(
+                    window < 4.0,
+                    "{name} at a {grain:.0}-frame grain with {what}: one window's \
+                     energy differs by {window:.1} dB, which is more than the \
+                     oscillator wander can account for"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "a probe"]
+fn probe_analog_sizes() {
+    let fixed: &[usize] = &[128];
+    for sizes in [
+        &[64usize][..],
+        &[512][..],
+        &[64, 128, 96, 256, 32, 512, 48, 128][..],
+        &[17, 128, 80, 33, 256][..],
+        &[32, 64, 96][..],
+    ] {
+        for (name, build) in [
+            ("Analog", (|| midi_pattern_desk(4, "@tangent-analog")) as fn() -> Engine),
+            ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ] {
+            let (mut a, mut b) = (build(), build());
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            render_sizes(&mut a, fixed, 640, &mut xs);
+            render_sizes(&mut b, sizes, 640, &mut ys);
+            let (worst, first) = worst_diff(&xs, &ys);
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            println!(
+                "  NO GRAIN {name:<7} 128 vs {sizes:?}: worst {:>7.1} dBFS peak {:>6.1} first {:?}",
+                dbfs(worst),
+                dbfs(peak),
+                first.map(|i| i / 2)
+            );
+        }
+    }
+}
+
+/// **A lane that stops being eligible mid-roll does not re-run its rack.**
+///
+/// Opening a plugin face aims the insert tap at that lane, and the tap pins
+/// the lane: `pinned_lanes` says so on its second line. The tap changes no
+/// audio at all - it copies what the bay produced into a ring the UI drains
+/// - so aiming it is the cleanest probe there is for a lane leaving the
+/// eligible set while the transport rolls. Arming, punching and dragging a
+/// send all do the same thing to the mask, and all of them also change what
+/// the lane sounds like, which would make the measurement two things at
+/// once.
+///
+/// What must NOT happen is the shape of the catch-up bug: the lane's rack
+/// has already rendered forward to the end of its newest grain, and if the
+/// lane now renders the chunk at the playhead, that rack is handed audio it
+/// has already been through. A reverb's delay lines and a compressor's
+/// envelope cannot be rewound, so the only correct answer is to serve the
+/// ring until it is empty and go live after it.
+#[test]
+fn a_lane_that_becomes_pinned_mid_roll_does_not_re_run_its_rack() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    for (name, build) in shapes {
+        let (mut chunked, mut grained) = (build(), build());
+        grained.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+        let n = BLOCK * 2;
+        let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let (mut worst, mut peak) = (0.0f32, 0.0f32);
+        let mut at_block = None;
+        for block in 0..300usize {
+            // A face opened on lane 0, moved to lane 1, then closed.
+            let aim = match block {
+                60 => Some(Some((0, 0))),
+                140 => Some(Some((1, 0))),
+                220 => Some(None),
+                _ => None,
+            };
+            if let Some(aim) = aim {
+                chunked.set_insert_tap(aim);
+                grained.set_insert_tap(aim);
+            }
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            let (d, _) = worst_diff(&a, &b);
+            if d > worst {
+                worst = d;
+                at_block = Some(block);
+            }
+            peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        assert!(peak > 0.001, "{name}: the render was silent");
+        assert!(
+            worst == 0.0,
+            "{name}: aiming the insert tap at a rolling lane changed the mix \
+             by {:.1} dBFS against a peak of {:.1}, worst at block {at_block:?} \
+             - the lane re-ran audio its rack had already been through",
+            dbfs(worst),
+            dbfs(peak)
+        );
+    }
+}
+
+/// **The knob may be turned while the transport rolls.**
+///
+/// It is in the audio setup dialog, which is openable mid-session, so this
+/// is not a hypothetical. Turning it DOWN or OFF is the interesting
+/// direction and it is the same defect shape as the test above: every lane
+/// stops being grained at once while every ring still holds audio the racks
+/// have already produced.
+#[test]
+fn the_grain_knob_may_be_turned_while_the_transport_rolls() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    // Off, the two knob settings that straddle a block, and back to off.
+    let turns: [(usize, f64); 5] =
+        [(40, 512.0), (90, 240.0), (140, 0.0), (190, 512.0), (240, 120.0)];
+    for (name, build) in shapes {
+        let (mut chunked, mut grained) = (build(), build());
+        let n = BLOCK * 2;
+        let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let (mut worst, mut peak) = (0.0f32, 0.0f32);
+        let mut at_block = None;
+        for block in 0..300usize {
+            if let Some((_, frames)) = turns.iter().find(|(b, _)| *b == block) {
+                grained.set_grain_ms(1000.0 * frames / f64::from(RATE));
+            }
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            let (d, _) = worst_diff(&a, &b);
+            if d > worst {
+                worst = d;
+                at_block = Some(block);
+            }
+            peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        assert!(peak > 0.001, "{name}: the render was silent");
+        assert!(
+            worst == 0.0,
+            "{name}: turning the grain knob mid-roll changed the mix by \
+             {:.1} dBFS against a peak of {:.1}, worst at block {at_block:?}",
+            dbfs(worst),
+            dbfs(peak)
+        );
+    }
+}
+
+/// **The grain render's A/B, paired, for a machine that is not quiet.**
+///
+/// The rung rows in `rt_bench` are absolute microseconds, and an absolute
+/// microsecond is only worth having on an idle machine. This was written
+/// after a sweep taken during a video call, where the row the grain cannot
+/// touch (512 frames, which is `MAX_BLOCK`, so the grain can never exceed
+/// the callback) held to 2% across four runs while the 128-frame row moved
+/// 37%. Between-run drift of that size buries the effect.
+///
+/// So this measures the conditions INTERLEAVED: within one repeat, every
+/// grain setting is timed back to back on the same engine, and the ratio is
+/// taken inside the repeat before anything is averaged across repeats.
+/// Whatever the rest of the machine was doing, it was doing it to both
+/// sides of each ratio.
+///
+/// Doors, all optional: `TANGENT_GATE_PLUGIN` and `TANGENT_GATE_STATE` as
+/// the rung uses them, `TANGENT_AB_FRAMES` (the callback, default 64),
+/// `TANGENT_AB_GRAINS` (frames, comma separated, default `0,240,512`),
+/// `TANGENT_AB_REPEATS` (default 7) and `TANGENT_AB_BLOCKS` (default 400).
+#[test]
+#[ignore = "a bench: run it deliberately with --ignored --nocapture"]
+fn grain_ab() {
+    let env_num = |k: &str, d: usize| -> usize {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let frames = env_num("TANGENT_AB_FRAMES", 64);
+    let repeats = env_num("TANGENT_AB_REPEATS", 7);
+    let blocks = env_num("TANGENT_AB_BLOCKS", 400);
+    // **A loop, so the wrap's catch-up is IN the figure.** A wrap empties
+    // every lane's ring, so the block after one is a full-desk catch-up:
+    // the one cost this feature pays that the straight-through rows do not
+    // show. `TANGENT_AB_LOOP=96000` is a two-second loop at 48 kHz.
+    let loop_frames = env_num("TANGENT_AB_LOOP", 0);
+    let grains: Vec<usize> = std::env::var("TANGENT_AB_GRAINS")
+        .unwrap_or_else(|_| "0,240,512".to_owned())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let plugin = std::env::var("TANGENT_GATE_PLUGIN")
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3".to_owned());
+    let state: Option<Vec<u8>> = std::env::var("TANGENT_GATE_STATE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|raw| match raw.iter().position(|b| *b == 0) {
+            Some(at) if raw[..at].starts_with(b"/") => raw[at + 1..].to_vec(),
+            _ => raw,
+        });
+    if !Path::new(&plugin).exists() {
+        println!("no {plugin}: nothing to A/B");
+        return;
+    }
+    let mut e = audio_desk(32, &[]);
+    for lane in 0..32 {
+        for bay in 0..3 {
+            match e.load_insert(lane, bay, Some(Path::new(&plugin)), state.as_deref()) {
+                Ok(Some(_)) => {}
+                other => {
+                    println!("the A/B plugin would not seat: {other:?}");
+                    return;
+                }
+            }
+        }
+    }
+    let name = Path::new(&plugin)
+        .file_stem()
+        .map_or_else(|| plugin.clone(), |s| s.to_string_lossy().into_owned());
+    if loop_frames > 0 {
+        e.set_loop(0, loop_frames as u64);
+    }
+    let deadline = deadline_us(frames);
+    println!(
+        "\n96 bays x {name}, {frames}-frame callback, deadline {deadline:.0} us\n\
+         {repeats} repeats x {blocks} blocks, conditions interleaved within each repeat{}\n",
+        if loop_frames > 0 {
+            format!(", looping 0..{loop_frames}")
+        } else {
+            String::new()
+        }
+    );
+    // [grain][repeat] -> p50 us
+    let mut p50s: Vec<Vec<f64>> = vec![Vec::new(); grains.len()];
+    let mut overs: Vec<usize> = vec![0; grains.len()];
+    // [grain][repeat] -> process CPU seconds for `blocks` blocks.
+    let mut cpu: Vec<Vec<f64>> = vec![Vec::new(); grains.len()];
+    let mut out = vec![0.0f32; frames * 2];
+    for _ in 0..repeats {
+        for (gi, g) in grains.iter().enumerate() {
+            e.set_grain_ms(if *g == 0 { 0.0 } else { 1000.0 * *g as f64 / f64::from(RATE) });
+            let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+            e.set_transport(generation, 0);
+            for _ in 0..200 {
+                e.render_offline(&mut out);
+            }
+            // **Process CPU across the window, as well as the wall clock.**
+            // Wall is what a deadline is made of and is the first thing a
+            // busy machine ruins; CPU seconds to render a fixed amount of
+            // audio is throughput, survives contention, and is the figure
+            // another host's render can be put beside - REAPER reports
+            // exactly this for an offline render.
+            let cpu0 = crate::instrument::cpu_seconds();
+            let mut us = Vec::with_capacity(blocks);
+            for _ in 0..blocks {
+                let t = Instant::now();
+                e.render_offline(&mut out);
+                us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+            }
+            if let (Some(a), Some(b)) = (cpu0, crate::instrument::cpu_seconds()) {
+                cpu[gi].push(b - a);
+            }
+            overs[gi] += us.iter().filter(|v| **v > deadline).count();
+            us.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));
+            p50s[gi].push(us[us.len() / 2]);
+        }
+    }
+    let med = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        v[v.len() / 2]
+    };
+    println!(
+        "{:<12} {:>10} {:>10} {:>12} {:>13} {:>8}",
+        "grain", "p50 us", "% of dl", "wall / 12 s", "CPU / 12 s", "over"
+    );
+    for (gi, g) in grains.iter().enumerate() {
+        let p50 = med(p50s[gi].clone());
+        // Blocks in twelve seconds of audio, at this callback size.
+        let per_12 = 12.0 * f64::from(RATE) / frames as f64;
+        let cpu_12 = if cpu[gi].is_empty() {
+            f64::NAN
+        } else {
+            med(cpu[gi].clone()) * per_12 / blocks as f64
+        };
+        println!(
+            "{:<12} {p50:>10.1} {:>9.1}% {:>11.2}s {:>12.2}s {:>8}",
+            if *g == 0 { "off".to_owned() } else { format!("{g} frames") },
+            p50 / deadline * 100.0,
+            p50 * per_12 / 1.0e6,
+            cpu_12,
+            overs[gi],
+        );
+    }
+    // **The ratio taken INSIDE each repeat**, which is the whole point.
+    if let Some(base) = p50s.first() {
+        for (gi, g) in grains.iter().enumerate().skip(1) {
+            let ratios: Vec<f64> =
+                base.iter().zip(&p50s[gi]).map(|(off, on)| off / on).collect();
+            let lo = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "  {g} frames is {:.2}x the throughput of off (per-repeat range {lo:.2} to {hi:.2})",
+                med(ratios.clone()),
+            );
+        }
+    }
+    for lane in 0..32 {
+        for bay in 0..3 {
+            let _ = e.load_insert(lane, bay, None, None);
+        }
+    }
+}
+
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn rt_bench() {

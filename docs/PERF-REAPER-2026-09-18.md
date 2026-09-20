@@ -1064,3 +1064,106 @@ Until that is fixed a lane holding a voice stays on the callback's own
 block, where every buffer size gives what it gives today. It is written
 down here rather than worked around quietly, because the fix belongs to the
 instrument and would be worth making on its own account.
+
+---
+
+# 2026-09-20: making it hermetic, and the four defects that found
+
+The grain render shipped with three equivalence tests, all of them run on a
+desk that rolls forward from zero, at one buffer size, with nothing
+changing. A desk does none of those things for long. Four tests were
+written for the conditions it actually meets, and all four failed on the
+first run, on the build that had already been installed.
+
+## The four
+
+**1. A loop.** `clip_grain` - a grain may not cross `loop_b` - was the one
+line of the plan that had never been executed. Two separate faults in it:
+
+- The clip cut the catch-up as well as the look-ahead. The wrap is taken at
+  BLOCK granularity (`run_transport` folds `pos` back only once the whole
+  block is out), so the block that straddles the loop end really does play
+  up to a block past `loop_b`. A lane whose grain was cut short at the
+  boundary had nothing to render the rest of it with, and the straddling
+  block came out SILENT. The clip now shortens the look-ahead and never the
+  span the fold is owed.
+- The ring kept its grains across the wrap, on the reasoning that both
+  sides of the boundary are still the timeline's. They are, but a wrap
+  moves `at` BACKWARDS, so every grain in the ring is then ahead of a
+  playhead on a lap that has not been played. A wrap now empties the rings,
+  consumed on the block after the wrap rather than the one that arms it,
+  because that block is still owed the audio either side of the boundary.
+
+**2. The ring needed a third slot.** With grains clipped at the loop end, a
+lap's last grain is short - 48 frames, in the case that found this - and a
+128-frame block then needs THREE spans at once: the tail of the full grain,
+the short one, and the frames past `loop_b`. With two slots the render of
+the third destroyed the first, and only on the SECOND lap, because on the
+first the reused slot happened not to be one the fold was standing on.
+`GRAIN_SLOTS` is 3. Three bounds it: at most two grains already in the ring
+plus the one being rendered.
+
+**3. A lane that stops being eligible mid-roll re-ran its rack.** 15.9 dBFS
+wrong, measured with the insert tap, which pins a lane and changes no audio
+at all and is therefore the cleanest probe there is. Arming a track,
+punching in and opening a plugin's face all do the same thing to the mask.
+The lane's rack had already rendered forward to the end of its newest
+grain; rendering the chunk at the playhead handed it audio it had already
+been through.
+
+**4. The knob itself.** Same shape, 0.7 dBFS, and one more way in: a
+callback that arrives WIDER than the grain makes `grain <= frames` true for
+that block alone, which turned the feature off for one block without
+draining the ring (2.4 dBFS).
+
+3 and 4 are one fix: **a lane never renders a span its ring already holds.**
+Serve while the ring can answer, then go live from where it ENDS - which is
+the rule the catch-up bug taught in the first place, applied to the
+ineligible path as well.
+
+## And one thing that is not a defect
+
+`the_grain_survives_a_callback_that_changes_size` measured an Analog lane
+14.9 dBFS away from its reference against a -13.9 peak, which reads like a
+disaster. **With no grain render involved at all**: an Analog desk fed
+17/128/80/33/256-frame callbacks differs from the same desk fed 128s by
+that much, and is bit-exact against 64s, 512s, or any sequence of multiples
+of 32.
+
+The synth recomputes its per-chunk work every 32 frames off an absolute
+counter, and one of those per-chunk quantities is a random draw: the
+oscillators' slow wander, three cents of it. A span that ends off the grid
+splits a chunk, the walk draws twice, and the two renders detune by a
+fraction of a cent and beat against each other. Same instrument, different
+dice. It is inaudible as a defect and it is not the grain's.
+
+It did change the design, though. Grain ends are now pushed out to the next
+32-frame line (`Renderer::to_grid`), which costs at most 31 frames of extra
+look-ahead and makes every grain the feature produces land on the grid. 5 ms
+at 48 kHz asks for 240 frames and gets 256. Every shape is then bit-exact at
+every callback size a device can actually hand over.
+
+## What is now held
+
+| Test | What it holds |
+|---|---|
+| `a_grained_lane_renders_what_the_chunked_lane_rendered` | five shapes, bit-exact, and the locate |
+| `a_grain_that_is_not_a_whole_number_of_blocks_is_the_same_audio` | eight grain lengths against a 128-frame block |
+| `a_builtin_instrument_is_the_same_at_any_buffer_size` | 128 against 512, four shapes |
+| `a_loop_wraps_the_same_way_grained_as_chunked` | four shapes, two grains, ten laps of a 3000-frame loop, and that it wrapped |
+| `the_grain_survives_a_callback_that_changes_size` | three shapes, two grains, six callback patterns |
+| `a_lane_that_becomes_pinned_mid_roll_does_not_re_run_its_rack` | the tap on, moved, and off, while rolling |
+| `the_grain_knob_may_be_turned_while_the_transport_rolls` | five turns including off, mid-roll |
+| `grain_ab` (a bench) | paired A/B, drift-proof, wall AND process CPU |
+| `probe_analog_sizes` (a probe) | the instrument's own block-size landscape |
+
+## Still not held
+
+- **Stems, varispeed and a stopped transport** clear the rings and fall
+  back to the chunk, which is asserted by construction and not by a test.
+- **Frozen lanes, folders and sends** are pinned, so they are covered by
+  the pin test only in the sense that they take the same path.
+- **Offline export and freeze** do not set a grain at all.
+- **A device that changes buffer size mid-stream** is tested offline, where
+  the engine sees the same sequence of spans. The driver's own
+  reconfiguration path is not.
