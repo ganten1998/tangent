@@ -670,16 +670,77 @@ fn midi_pattern_desk(lanes: usize, unit: &str) -> Engine {
     e
 }
 
-/// **Is a built-in instrument the same sound at any buffer size?**
-///
-/// Asked because the grain render cuts a lane's audio into spans that are
-/// not the callback's, so anything that is not block-size invariant would
-/// differ for a reason that is nothing to do with the grain. No grains here
-/// at all: two engines with the same notes, one fed 128-frame buffers and
-/// one fed 512, compared as one stream.
+/// Bisect the buffer-size dependence down to one lane and one note.
 #[test]
 #[ignore = "a diagnostic, not an assertion"]
-fn is_a_builtin_instrument_the_same_at_any_buffer_size() {
+fn where_the_buffer_size_dependence_comes_from() {
+    fn one_note(dur: u64, at: u64) -> Engine {
+        let mut e =
+            Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 0,
+            start: 0,
+            len: u64::from(RATE) * 60,
+            notes: Arc::new(vec![ClipNote { at, dur, key: 60, vel: 100 }]),
+            pedal: Arc::new(Vec::new()),
+        }]);
+        seat(&mut e, 1, &["@tangent-analog"]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    for (what, dur, at) in [
+        ("one note, on at 0, never ends", u64::from(RATE) * 60, 0),
+        ("one note, on at 0, off at 500", 500, 0),
+        ("one note, on at 300, off at 800", 500, 300),
+        ("one note, on at 0, off at 5000", 5000, 0),
+    ] {
+        let (mut small, mut big) = (one_note(dur, at), one_note(dur, at));
+        let (mut sa, mut bb) = (vec![0.0f32; 128 * 2], vec![0.0f32; 512 * 2]);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..200 {
+            small.render_offline(&mut sa);
+            xs.extend_from_slice(&sa);
+        }
+        for _ in 0..50 {
+            big.render_offline(&mut bb);
+            ys.extend_from_slice(&bb);
+        }
+        let n = xs.len().min(ys.len());
+        let first = xs[..n].iter().zip(&ys[..n]).position(|(x, y)| x.to_bits() != y.to_bits());
+        let worst = xs[..n].iter().zip(&ys[..n]).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        let db = |v: f32| 20.0 * v.max(1e-12).log10();
+        println!(
+            "  {what:<34} worst {:>7.1} dBFS   first differs at frame {}",
+            db(worst),
+            first.map_or("never".to_owned(), |i| (i / 2).to_string())
+        );
+    }
+}
+
+/// **A built-in instrument is the same sound at any buffer size.**
+///
+/// It was not, and the grain render is what found it. No grains here at
+/// all: two engines with the same notes, one fed 128-frame buffers and one
+/// fed 512, compared as one stream.
+///
+/// Before the fix, Analog driven by notes that start and stop INSIDE a
+/// block rendered the two to streams differing by **-15.5 dBFS against a
+/// peak of -17.1** - louder than the signal. Held notes were bit-exact,
+/// and so were clips, an EQ and a compressor, which is what made it
+/// puzzling until the bisection: `Synth::render` cut its chunk grid from
+/// the start of each BUFFER, so a note landing mid-buffer restarted the
+/// grid there and from that point a 512-frame buffer and a 128-frame one
+/// put their chunk boundaries in different places. Every per-chunk
+/// quantity was then computed a different number of times.
+///
+/// Asserted bit-exact, because that is what it now is, and because
+/// anything less would let it drift back.
+#[test]
+fn a_builtin_instrument_is_the_same_at_any_buffer_size() {
     for (name, build) in [
         ("Analog, notes held", (|| instrument_desk(4, "@tangent-analog", 4)) as fn() -> Engine),
         ("Analog, a note every 700 frames", || midi_pattern_desk(4, "@tangent-analog")),
@@ -719,11 +780,15 @@ fn is_a_builtin_instrument_the_same_at_any_buffer_size() {
             .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
         let peak = xs[..n].iter().fold(0.0f32, |m, s| m.max(s.abs()));
         let db = |v: f32| 20.0 * v.max(1e-12).log10();
-        println!(
-            "  {name:<34} 128 vs 512 frames: worst {:.1} dBFS against a peak of {:.1}",
+        assert!(
+            worst == 0.0,
+            "{name}: 128-frame buffers and 512-frame ones render this to \
+             streams differing by {:.1} dBFS against a peak of {:.1}, so the \
+             instrument's sound depends on the buffer size",
             db(worst),
             db(peak)
         );
+        assert!(peak > 0.001, "{name}: silence agreeing with silence proves nothing");
     }
 }
 
@@ -789,12 +854,11 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
         // cursor, and what the instrument has been told advances in step
         // with whichever span feeds it - so a grain covering a different
         // span must still articulate every note on the same frame.
-        // **The instrument lanes, which today must NOT be grained**, and
-        // this is where that is checked: `grain_ok` refuses a lane holding a
-        // voice, so these two come out bit-identical because they are on the
-        // callback's own block in both engines. See `grain_ok` for why, and
-        // `is_a_builtin_instrument_the_same_at_any_buffer_size` for the
-        // measurement behind it.
+        // **The instrument lanes, which `grain_ok` still refuses**, so
+        // these come out bit-identical because they are on the callback's
+        // own block in both engines. They are here to hold that refusal in
+        // place: the day a voice is grained, these two go red and the
+        // locate numbers in `grain_ok` are what they go red about.
         Shape {
             name: "8 lanes x Analog, notes held",
             build: || instrument_desk(8, "@tangent-analog", 4),
@@ -838,6 +902,9 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
             e.set_transport(2, at);
         }
         let (mut worst, mut tail) = (0.0f32, 0.0f32);
+        // The two envelopes, a block at a time, for the shapes where the
+        // samples themselves cannot be compared.
+        let (mut env_a, mut env_b) = (Vec::new(), Vec::new());
         for block in 0..80 {
             chunked.render_offline(&mut a);
             grained.render_offline(&mut b);
@@ -849,6 +916,8 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
             if block >= 60 {
                 tail = tail.max(d);
             }
+            env_a.push(a.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            env_b.push(b.iter().fold(0.0f32, |m, s| m.max(s.abs())));
         }
         let db = |v: f32| 20.0 * v.max(1e-12).log10();
         // The numbers are MEASURED, not chosen: the effects desk starts at
@@ -865,13 +934,34 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
                 db(worst)
             );
         }
-        assert!(
-            db(tail) < -65.0,
-            "{name}: a fifth of a second after the locate the two renders \
-             still differ by {:.1} dBFS, so the discarded grain is not \
-             decaying out of the lane the way it should",
-            db(tail)
-        );
+        if locate_bounded {
+            assert!(
+                db(tail) < -65.0,
+                "{name}: a fifth of a second after the locate the two \
+                 renders still differ by {:.1} dBFS, so the discarded grain \
+                 is not decaying out of the lane the way it should",
+                db(tail)
+            );
+        } else {
+            // **The ENVELOPE, because the samples cannot agree and should
+            // not be asked to.** A grained instrument is permanently up to
+            // a grain further through its own free-running modulation - its
+            // chorus phase, its oscillator phase - and after a locate there
+            // is nothing to re-sync it to. What must still hold is that the
+            // NOTES land in the same places at the same loudness, which a
+            // per-block peak envelope says and a sample comparison cannot.
+            let worst_env = env_a
+                .iter()
+                .zip(&env_b)
+                .skip(4)
+                .fold(0.0f32, |m, (x, y)| m.max((db(*x) - db(*y)).abs()));
+            assert!(
+                worst_env < 6.0,
+                "{name}: after the locate the two renders' envelopes differ \
+                 by {worst_env:.1} dB, so a note is missing, late or at the \
+                 wrong level rather than merely at a different phase"
+            );
+        }
     }
 }
 

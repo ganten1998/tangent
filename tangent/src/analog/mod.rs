@@ -428,6 +428,11 @@ pub struct Analog {
     /// The continuous dials, smoothed; the stepped ones, copied.
     smooth: [f32; PARAM_SLOTS],
     smooth_coef: f32,
+    /// **Where the absolute chunk grid stands**, as a frame count modulo
+    /// [`CHUNK`]. See [`Synth::render`]: without it the grid is measured
+    /// from the start of each buffer and the instrument's sound depends on
+    /// the buffer size.
+    grid: usize,
     voices: Vec<Voice>,
     corpses: Vec<Corpse>,
     taps: Taps,
@@ -470,6 +475,7 @@ impl Analog {
             vals,
             smooth: vals,
             smooth_coef: 1.0 - (-(CHUNK as f32) / (SMOOTH_SECS * rate)).exp(),
+            grid: 0,
             voices: (0..MAX_VOICES).map(|i| Voice::new(i, rate)).collect(),
             corpses: Vec::with_capacity(CORPSES),
             taps: Taps::new(),
@@ -882,8 +888,34 @@ impl Analog {
             } else {
                 frames
             };
-            let len = (until - pos).min(CHUNK);
+            // **The chunk grid is ABSOLUTE, not per call**, and that is the
+            // whole of why this instrument used to sound different at
+            // different buffer sizes.
+            //
+            // The cut used to be `(until - pos).min(CHUNK)` with `pos`
+            // starting at zero on every call, so the grid was measured from
+            // the start of whatever buffer the device happened to hand
+            // over. With no events that is harmless, because 128 and 512
+            // are both multiples of CHUNK and the boundaries land on the
+            // same absolute frames either way. A note landing mid-buffer
+            // breaks it: the chunk is cut short at the event and the grid
+            // restarts there, so from that point on a 512-frame buffer and
+            // a 128-frame one put their boundaries in different places -
+            // and every per-chunk quantity in `render_chunk` is then
+            // computed a different number of times.
+            //
+            // Measured before this: one note starting mid-buffer diverged
+            // at -119 dBFS, and a track of them at -15.5 dBFS against a
+            // peak of -17.1. See
+            // `is_a_builtin_instrument_the_same_at_any_buffer_size`.
+            //
+            // `grid` is the absolute frame counter modulo CHUNK, so a
+            // chunk never crosses a grid line and the boundary SET depends
+            // only on where the notes are - which is a fact about the
+            // music, not about the device.
+            let len = (until - pos).min(CHUNK - self.grid);
             self.render_chunk(out, channels, pos, len);
+            self.grid = (self.grid + len) % CHUNK;
             pos += len;
         }
     }
@@ -975,10 +1007,21 @@ impl Analog {
 
     fn render_chunk(&mut self, out: &mut [f32], channels: usize, at: usize, len: usize) {
         // Smooth the continuous dials toward where they were set.
+        //
+        // **By the chunk's own length**, not by a coefficient built for a
+        // full one: a chunk cut short by a note event covers less time and
+        // must move the dials less, or how fast a knob arrives depends on
+        // how busy the music is. The full-length coefficient is still the
+        // one that is stored, and a full chunk uses it unchanged.
+        let coef = if len >= CHUNK {
+            self.smooth_coef
+        } else {
+            1.0 - (1.0 - self.smooth_coef).powf(len as f32 / CHUNK as f32)
+        };
         for p in PARAMS {
             if p.steps == 0 {
                 let i = p.id as usize;
-                self.smooth[i] += self.smooth_coef * (self.vals[i] - self.smooth[i]);
+                self.smooth[i] += coef * (self.vals[i] - self.smooth[i]);
             }
         }
         // The arpeggiator, first: its notes land inside this chunk.
@@ -997,13 +1040,20 @@ impl Analog {
         self.arp.run(&ap, t, len, &mut self.arp_out);
 
         let vp = self.voice_params();
+        // **The slow random walk, stepped ONCE for this chunk and by its
+        // real length.** `prepare` reads the walk; it must not advance it,
+        // because it runs again after every note event and the number of
+        // events is a fact about the music rather than about time. See
+        // `Voice::wander_step`.
         for v in &mut self.voices {
             if v.active() {
+                v.wander_step(len, self.rate);
                 v.prepare(&vp, self.rate);
             }
         }
         for c in &mut self.corpses {
             if c.left > 0 {
+                c.voice.wander_step(len, self.rate);
                 c.voice.prepare(&vp, self.rate);
             }
         }
