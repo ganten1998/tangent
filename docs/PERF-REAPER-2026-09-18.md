@@ -1397,3 +1397,82 @@ MIDI. Tail inserts, including an empty lane whose only live rack is the
 tail seat - which is what moscow1's lane 16 is. A hosted VST3 instrument
 seated from a real sidecar. None of them reproduced it, and all of them
 are now held.
+
+---
+
+# 2026-09-20: the quiet run, and the knob that picks itself
+
+The owner cleared the machine. Load 1.98, no call, no Tangent, no
+`appstoreagent` loop. These are the numbers everything above was
+approximating, and the per-repeat ranges say so: 1.64 to 1.64 at 128
+frames, against ranges four times as wide on the busy runs.
+
+## 96 x Pro-R 2, forked, 4200 blocks per condition
+
+| callback | render ahead | p50 us | % of deadline | wall / 12 s | CPU / 12 s | late |
+|---|---|---:|---:|---:|---:|---:|
+| 32 fr | off | 825.3 | 123.8% | 14.86 s | 70.65 s | 4200 |
+| 32 fr | 5.3 ms (256) | 317.7 | **47.7%** | 5.72 s | 23.20 s | 0 |
+| 32 fr | 10.7 ms (512) | 417.8 | 62.7% | 7.52 s | 16.76 s | 0 |
+| 64 fr | off | 1108.2 | 83.1% | 9.97 s | 47.25 s | 140 |
+| 64 fr | 5.3 ms | 619.1 | 46.4% | 5.57 s | 24.03 s | 0 |
+| 64 fr | 10.7 ms | 482.0 | **36.1%** | 4.34 s | 17.39 s | 0 |
+| 128 fr | off | 1553.1 | 58.2% | 6.99 s | 32.87 s | 0 |
+| 128 fr | 5.3 ms | 1215.1 | 45.6% | 5.47 s | 23.54 s | 0 |
+| 128 fr | 10.7 ms | 946.6 | **35.5%** | 4.26 s | 18.69 s | 0 |
+| 256 fr | off | 2164.1 | 40.6% | 4.87 s | 22.86 s | 0 |
+| 256 fr | 5.3 ms | 2166.5 | 40.6% | 4.87 s | 22.91 s | 0 |
+| 256 fr | 10.7 ms | 1871.7 | **35.1%** | 4.21 s | 18.09 s | 0 |
+
+The 256-frame row at a 256-frame grain is the harness auditing itself: the
+grain cannot exceed the callback, so the feature is off by construction and
+the ratio comes out 1.00x with a per-repeat range of 0.99 to 1.00.
+
+## Against REAPER
+
+REAPER, same project, offline: **5.61 s wall, 25.5 s CPU** per 12 s.
+
+| Tangent, LIVE buffer | wall | CPU |
+|---|---:|---:|
+| 128 fr at 10.7 ms | 4.26 s | 18.69 s |
+| 64 fr at 10.7 ms | 4.34 s | 17.39 s |
+| 32 fr at 5.3 ms | 5.72 s | 23.20 s |
+
+At 64 and 128 frames Tangent renders this desk in three quarters of
+REAPER's wall clock and two thirds of its CPU, while holding a deadline an
+offline render does not have. **At 32 frames it is level** - 5.72 s against
+5.61 s, and less CPU - which is the row that did not exist this morning,
+because at 32 frames without this every single block was late.
+
+## The eight is measured, and the knob now applies it itself
+
+The winner at every buffer is the setting nearest **eight callbacks**: 8x32
+= 256, 8x64 = 512, and past that the 512-frame cap. It is the same eight
+`grain_phases` divides by, and that is not a coincidence - eight phases
+across thirty-two lanes puts four lanes on each callback, which is about
+what the fan-out has cores for. Fewer and the pool idles; more and two
+boundaries land on one block.
+
+A bigger grain is still cheaper in TOTAL - at 32 frames a 512-frame grain
+costs 16.76 s of CPU against 23.20 - and it is the PEAK that is worse. A
+deadline is made of peaks.
+
+So the panel has an **Auto**, which is a negative in the setting and is
+resolved per callback by the engine rather than fixed when it is chosen.
+Measured end to end against the fixed settings it lands on the best one
+every time and is never worse:
+
+| callback | auto picks | auto | best fixed |
+|---|---|---:|---:|
+| 32 fr | 256 fr | **47.9%** | 48.2% |
+| 64 fr | 512 fr | **36.1%** | 36.1% |
+| 128 fr | 512 fr | **35.7%** | 35.7% |
+
+`auto_picks_the_grain_the_measurements_picked` writes that table into an
+assertion, so the rule and the numbers that justify it cannot drift apart.
+
+## What a loop costs, on a quiet machine
+
+At 64 frames with a one-second loop: **8 late blocks in 4200 at 5.3 ms and
+7 at 10.7 ms**, against 0 with no loop and 133 with the feature off. One
+late block a lap, and the ungrained desk is no better off for looping.

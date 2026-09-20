@@ -5673,6 +5673,54 @@ const GRAIN_SLOTS: usize = 3;
 /// straddling chunk carries the residual.
 const GRAIN_GRID: u64 = crate::analog::voice::CHUNK as u64;
 
+/// **The stored grain that means "work it out from the buffer".**
+///
+/// `u32::MAX` rather than a flag, because the grain is one relaxed atomic
+/// the callback already reads and a second word would be a second thing to
+/// keep in step.
+const GRAIN_AUTO: u32 = u32::MAX;
+
+/// **How many callbacks a grain should span when the setting is AUTO.**
+///
+/// Eight, and it is measured rather than chosen. On 96 hosted reverbs,
+/// forked, on a quiet machine, the worst p50 as a share of the deadline:
+///
+/// | callback | off | 5.3 ms (256 fr) | 10.7 ms (512 fr) |
+/// |---|---|---|---|
+/// | 32 fr | 123.8% | **47.7%** | 62.7% |
+/// | 64 fr | 83.1% | 46.4% | **36.1%** |
+/// | 128 fr | 58.2% | 45.6% | **35.5%** |
+/// | 256 fr | 40.6% | 40.6% | **35.1%** |
+///
+/// The winner at every buffer is the setting nearest eight callbacks:
+/// 8x32 = 256, 8x64 = 512, and past that the cap. It is the same eight
+/// `grain_phases` divides by, and that is not a coincidence - eight phases
+/// over thirty-two lanes puts four lanes on each callback, which is about
+/// what the fan-out has cores for. Fewer and the pool sits idle; more and
+/// two boundaries land on one block.
+///
+/// A bigger grain is still CHEAPER in total: at 32 frames a 512-frame
+/// grain costs 16.76 s of CPU per twelve seconds against 23.20 s. It is
+/// the PEAK that is worse, and a peak is what a deadline is made of.
+const GRAIN_AUTO_BLOCKS: usize = 8;
+
+/// **The grain to render in, from the stored setting and this callback.**
+///
+/// The one place the auto rule is spelled, so the callback that uses it and
+/// the test that pins it cannot drift apart.
+fn resolve_grain(stored: u32, frames: usize) -> usize {
+    match stored {
+        GRAIN_AUTO => (frames * GRAIN_AUTO_BLOCKS).min(MAX_BLOCK as usize),
+        g => g as usize,
+    }
+}
+
+/// [`resolve_grain`], asked of a live engine. Tests only.
+#[cfg(test)]
+pub(crate) fn grain_for(e: &Engine, frames: usize) -> usize {
+    resolve_grain(e.shared.grain.load(Ordering::Relaxed), frames)
+}
+
 
 /// **What a slot of [`LaneGrains`] says about the audio in it.**
 ///
@@ -12805,7 +12853,7 @@ impl Renderer {
         // as long as the pedal was down, and exact again the moment it
         // lifted.
         {
-            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
+            let grain = resolve_grain(self.shared.grain.load(Ordering::Relaxed), frames);
             let free = if grain > frames {
                 let mut free = !pinned_lanes(
                     &self.shared,
@@ -15297,7 +15345,11 @@ impl Engine {
     /// knob, an automation edit and a clip edit are not.
     pub fn set_grain_ms(&self, ms: f64) {
         let rate = f64::from(self.output.sample_rate.max(1));
-        let frames = if ms > 0.0 {
+        let frames = if ms < 0.0 {
+            // **Negative is AUTO**, resolved per callback against the
+            // buffer the device actually hands over. See `GRAIN_AUTO`.
+            GRAIN_AUTO
+        } else if ms > 0.0 {
             ((ms / 1000.0 * rate) as u32).min(MAX_BLOCK as u32)
         } else {
             0

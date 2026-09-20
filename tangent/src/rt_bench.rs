@@ -2077,6 +2077,43 @@ fn the_damper_pedal_reaches_a_grained_lane() {
     }
 }
 
+/// **Auto picks the grain the measurements picked.**
+///
+/// The rule is one line - eight callbacks' worth, capped at `MAX_BLOCK` -
+/// and the whole of its authority is a table taken on a quiet machine, so
+/// the table is written into the assertion rather than left in a document
+/// that can drift away from the code.
+///
+/// 96 hosted reverbs, forked, worst p50 as a share of the deadline:
+///
+/// | callback | off | 256 frames | 512 frames | auto lands on |
+/// |---|---|---|---|---|
+/// | 32 | 123.8% | **47.7%** | 62.7% | 256 |
+/// | 64 | 83.1% | 46.4% | **36.1%** | 512 |
+/// | 128 | 58.2% | 45.6% | **35.5%** | 512 (capped) |
+/// | 256 | 40.6% | 40.6% | **35.1%** | 512 (capped) |
+#[test]
+fn auto_picks_the_grain_the_measurements_picked() {
+    let e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+    e.set_grain_ms(-1.0);
+    for (callback, want) in [(32usize, 256usize), (64, 512), (128, 512), (256, 512), (512, 512)] {
+        assert_eq!(
+            crate::instrument::grain_for(&e, callback),
+            want,
+            "auto at a {callback}-frame callback"
+        );
+    }
+    // Off and a fixed setting are untouched by any of it.
+    e.set_grain_ms(0.0);
+    assert_eq!(crate::instrument::grain_for(&e, 64), 0, "auto leaked into off");
+    e.set_grain_ms(1000.0 * 256.0 / f64::from(RATE));
+    assert_eq!(
+        crate::instrument::grain_for(&e, 64),
+        256,
+        "a fixed setting stopped being fixed"
+    );
+}
+
 /// What a transition did to a pair of engines.
 struct Transition {
     /// Bit-exact from frame zero up to the block the change lands on.
@@ -2554,7 +2591,11 @@ fn grain_ab() {
     // the one cost this feature pays that the straight-through rows do not
     // show. `TANGENT_AB_LOOP=96000` is a two-second loop at 48 kHz.
     let loop_frames = env_num("TANGENT_AB_LOOP", 0);
-    let grains: Vec<usize> = std::env::var("TANGENT_AB_GRAINS")
+    // **`-1` is AUTO**, the setting the engine works out per callback. It
+    // has to come through as a signed value or it is silently dropped and
+    // the row simply does not appear, which is how the first run of this
+    // reported three conditions and looked entirely normal.
+    let grains: Vec<i64> = std::env::var("TANGENT_AB_GRAINS")
         .unwrap_or_else(|_| "0,240,512".to_owned())
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
@@ -2609,7 +2650,11 @@ fn grain_ab() {
     let mut out = vec![0.0f32; frames * 2];
     for _ in 0..repeats {
         for (gi, g) in grains.iter().enumerate() {
-            e.set_grain_ms(if *g == 0 { 0.0 } else { 1000.0 * *g as f64 / f64::from(RATE) });
+            e.set_grain_ms(match *g {
+                0 => 0.0,
+                g if g < 0 => -1.0,
+                g => 1000.0 * g as f64 / f64::from(RATE),
+            });
             let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
             e.set_transport(generation, 0);
             for _ in 0..200 {
@@ -2655,7 +2700,11 @@ fn grain_ab() {
         };
         println!(
             "{:<12} {p50:>10.1} {:>9.1}% {:>11.2}s {:>12.2}s {:>8}",
-            if *g == 0 { "off".to_owned() } else { format!("{g} frames") },
+            match *g {
+                0 => "off".to_owned(),
+                g if g < 0 => format!("auto ({} fr)", crate::instrument::grain_for(&e, frames)),
+                g => format!("{g} frames"),
+            },
             p50 / deadline * 100.0,
             p50 * per_12 / 1.0e6,
             cpu_12,
@@ -2670,7 +2719,8 @@ fn grain_ab() {
             let lo = ratios.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             println!(
-                "  {g} frames is {:.2}x the throughput of off (per-repeat range {lo:.2} to {hi:.2})",
+                "  {} is {:.2}x the throughput of off (per-repeat range {lo:.2} to {hi:.2})",
+                if *g < 0 { "auto".to_owned() } else { format!("{g} frames") },
                 med(ratios.clone()),
             );
         }

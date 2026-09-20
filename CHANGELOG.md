@@ -43,6 +43,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Twelve seconds of that desk takes 4.9 seconds to render at a 64-frame
   buffer with this on, against 12.4 with it off.
 
+  **Auto is the setting to use.** It works the length out from the buffer
+  size every callback - eight buffers' worth, up to 10.7 ms - and measured
+  against every fixed value at every buffer size it lands on the best one
+  and is never worse. A fixed value is still there if you want one.
+
   **What it does not affect: anything you export.** Bouncing a mix and
   freezing a track build their own renderer and never render ahead, so a
   file you make is the same file whether this is on or off.

@@ -9935,14 +9935,21 @@ fn show_on(
                                     }
                                 };
                                 pick(ui, "Off", 0.0);
+                                // **Auto is a negative**, resolved by the
+                                // engine against the buffer the device
+                                // hands over rather than fixed here: eight
+                                // callbacks, capped at 10.7 ms, which is
+                                // the setting that measured best at every
+                                // buffer size. See `GRAIN_AUTO_BLOCKS`.
+                                pick(ui, "Auto", -1.0);
                                 for ms in [2.5_f64, 5.0, 10.7] {
                                     pick(ui, &format!("{ms:.1} ms"), ms);
                                 }
                             });
                             ui.label(
                                 RichText::new(
-                                    "more headroom at a small buffer; a plugin knob lands \
-                                     up to this late",
+                                    "Auto takes eight buffers' worth. More headroom at a \
+                                     small buffer; a plugin knob lands up to this late",
                                 )
                                 .font(plain(10.0))
                                 .color(dim),
