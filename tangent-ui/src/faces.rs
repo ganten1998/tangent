@@ -1620,6 +1620,26 @@ pub fn ir_parent(dir: &str) -> String {
 /// path arithmetic. `Path::starts_with` compares COMPONENTS, which is what
 /// makes `IRs-old` not a child of `IRs`; a `str::starts_with` here would
 /// have quietly said it was.
+/// **Two paths naming the same place, whatever they are spelled with.**
+///
+/// The sibling of [`ir_under_root`] and for the same reason: a plain `==` on
+/// these strings compares SPELLING, and on Windows the same place has two
+/// spellings. `Path` equality compares COMPONENTS, and Windows treats both
+/// `/` and `\` as separators, so the two agree there and nothing changes on
+/// Unix, where only one of them is a separator in the first place.
+///
+/// This is not hypothetical here. Every path the browser builds comes out of
+/// `PathBuf::join`, which spells with the platform's separator — but
+/// `ir_path` is a PERSISTED plugin parameter, so a session saved on macOS or
+/// Linux carries `/` into a Windows machine that spells its own `\`. The
+/// impulse still LOADS, because `wavread` goes through `Path` and Windows
+/// accepts either; what broke was every comparison downstream of it, so the
+/// row would not show as loaded and Delete's confirmation would not know it
+/// was about to remove the impulse currently playing.
+pub fn ir_same(a: &str, b: &str) -> bool {
+    std::path::Path::new(a) == std::path::Path::new(b)
+}
+
 pub fn ir_under_root(path: &str, root: &str) -> bool {
     if path.is_empty() || root.is_empty() {
         // Before the app has said where home is, nothing is home. A default
@@ -1699,7 +1719,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
             tip: format!("{path}\n\nremove this file from the disk — there is no undo"),
             ask: Some(IrMenuAsk::Delete {
                 path: path.clone(),
-                loaded: path == loaded,
+                loaded: ir_same(&path, loaded),
             }),
         },
         (Some(_), false) => dead(
@@ -1756,7 +1776,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
 /// path is the only honest answer — that is the case where a hand needs to
 /// know exactly where it has walked to.
 pub fn ir_where(dir: &str, root: &str) -> String {
-    if dir == root {
+    if ir_same(dir, root) {
         return "IRs".to_owned();
     }
     if !root.is_empty() {
@@ -1998,7 +2018,7 @@ fn draw_ir_browser(
                 .on_hover_text(tip)
                 .clicked()
         };
-    let at_root = live.ir_dir == live.ir_root;
+    let at_root = ir_same(&live.ir_dir, &live.ir_root);
     let parent = ir_parent(&live.ir_dir);
     if chip(
         ui,
@@ -2164,7 +2184,7 @@ fn draw_ir_browser(
             .join(&e.name)
             .to_string_lossy()
             .into_owned();
-        let here = !e.dir && path == loaded;
+        let here = !e.dir && ir_same(&path, loaded);
         let hit = (!menu_up)
             .then(|| ui.interact(*r, ui.id().with(("ir-row", i)), egui::Sense::click()));
         let hovered = hit.as_ref().is_some_and(egui::Response::hovered);
@@ -2666,6 +2686,58 @@ mod tests {
             assert!(!about.is_empty());
         }
         assert!(suite_unit("@tangent-nonsense").is_none());
+    }
+
+    /// **Build a fixture path the way the panel builds a real one.**
+    ///
+    /// The browser joins with `PathBuf::join`, which spells with the
+    /// PLATFORM's separator. A fixture written `format!("/m/IRs/{name}")`
+    /// spells with `/` on every platform, so on Windows the two disagreed and
+    /// four of these tests failed on their own fixture rather than on the
+    /// panel. Joining here the same way production joins is what makes the
+    /// comparison mean something on all four.
+    fn ir_join(dir: &str, name: &str) -> String {
+        std::path::Path::new(dir)
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// **A session carried from another platform still knows what is loaded.**
+    ///
+    /// `ir_path` is a persisted plugin parameter, so a song saved on macOS or
+    /// Linux arrives on Windows spelling its paths with `/` while everything
+    /// the browser builds there spells `\`. The impulse LOADS either way -
+    /// `wavread` goes through `Path` and Windows accepts both - so the bug was
+    /// invisible in the sound and visible only in the panel: the row would not
+    /// wear the loaded fill, the home chip would not know it was home, the
+    /// header would print an absolute path instead of `IRs`, and Delete's
+    /// confirmation would not know it was about to remove the impulse that was
+    /// playing.
+    ///
+    /// Written against [`ir_same`] directly rather than through the panel
+    /// because the mixed spelling only ARISES on Windows, and this has to
+    /// state the contract on the machine the suite is usually run on.
+    #[test]
+    fn a_path_from_another_platform_names_the_same_impulse() {
+        // The spelling a Windows browser builds, against the spelling a
+        // session saved elsewhere carries. On Unix these are already the same
+        // string and the test is a tautology; on Windows it is the whole bug.
+        let built = ir_join("/m/IRs", "Cabs");
+        assert!(ir_same(&built, "/m/IRs/Cabs"), "{built} is not /m/IRs/Cabs");
+        assert!(ir_same("/m/IRs", "/m/IRs"), "a path is not itself");
+
+        // And the three panel answers that hang off it.
+        assert_eq!(ir_where(&built, "/m/IRs"), "IRs/Cabs");
+        assert_eq!(ir_where("/m/IRs", "/m/IRs"), "IRs");
+        assert!(ir_under_root(&built, "/m/IRs"), "{built} is not under its root");
+
+        // Still not equal to a DIFFERENT place: the fix must not make every
+        // path match every other one, which is the way a separator-blind
+        // compare usually goes wrong.
+        assert!(!ir_same("/m/IRs/Cabs", "/m/IRs/Rooms"));
+        assert!(!ir_same("/m/IRs-old", "/m/IRs"));
+        assert!(!ir_under_root("/m/IRs-old/x.wav", "/m/IRs"), "IRs-old is not inside IRs");
     }
 
     // ── the panels fit the rooms they are given ─────────────────────────
@@ -3196,7 +3268,7 @@ mod tests {
         let mut live = a_full_face("@tangent-ir", 2);
         assert!(!live.ir_entries[2].dir, "the fixture's row 2 is not a file");
         let name = live.ir_entries[2].name.clone();
-        let want = format!("/m/IRs/{name}");
+        let want = ir_join("/m/IRs", &name);
         let asked = key_over(
             &ctx,
             &st,
@@ -3278,7 +3350,7 @@ mod tests {
         // Row 0 is the first folder — the listing is folders then files.
         assert!(live.ir_entries[0].dir);
         let _ = press(&ctx, &st, &mut live, size, rows[0].center());
-        assert_eq!(live.ir_dir, "/m/IRs/Cabs", "walking in went nowhere");
+        assert!(ir_same(&live.ir_dir, "/m/IRs/Cabs"), "walking in went nowhere: {}", live.ir_dir);
         assert_eq!(live.ir_scroll, 0, "the scroll came along into the new folder");
         // Up: out of the folder, then out of the IRs tree entirely, which
         // is the whole of "you load any irs there".
@@ -3305,7 +3377,7 @@ mod tests {
         let rows = l.browse_rows();
         // Row 2 is the first file; rows 0 and 1 are the folders.
         assert!(!live.ir_entries[2].dir);
-        let want = format!("/m/IRs/{}", live.ir_entries[2].name);
+        let want = ir_join("/m/IRs", &live.ir_entries[2].name);
         match press(&ctx, &st, &mut live, size, rows[2].center()) {
             Some(FaceAction::PickIr { path }) => assert_eq!(path, want),
             other => panic!(
@@ -3399,7 +3471,7 @@ mod tests {
         // Rows 0 and 1 are the folders; row 2 is the first impulse.
         assert!(!live.ir_entries[2].dir);
         let name = live.ir_entries[2].name.clone();
-        let want = format!("/m/IRs/{name}");
+        let want = ir_join("/m/IRs", &name);
 
         // **The menu opened by a press the clamp cannot reach.**
         //
@@ -3771,7 +3843,7 @@ mod tests {
         let at = live.ir_entries.len() - 1;
         let name = live.ir_entries[at].name.clone();
         assert!(at >= rows.len(), "the fixture is too short to test a scroll");
-        let path = format!("/m/IRs/{name}");
+        let path = ir_join("/m/IRs", &name);
         live.face.extra = vec![("ir_path".to_owned(), path)];
         live.ir_reveal = true;
         assert_eq!(live.ir_scroll, 0);
