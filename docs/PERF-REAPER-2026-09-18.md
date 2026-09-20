@@ -1476,3 +1476,25 @@ assertion, so the rule and the numbers that justify it cannot drift apart.
 At 64 frames with a one-second loop: **8 late blocks in 4200 at 5.3 ms and
 7 at 10.7 ms**, against 0 with no loop and 133 with the feature off. One
 late block a lap, and the ungrained desk is no better off for looping.
+
+## The post-wrap stagger: measured twice, dead both times
+
+Rebuilding each cold lane only as far as its own phase, so a desk coming
+back from a locate or a loop wrap does not do it all on one block, halves
+the post-wrap work on paper. It does nothing at all in fact.
+
+| | late / off control | share |
+|---|---|---|
+| without the stagger | 7 / 133 | 5.3% |
+| with it | 20 / 385 | 5.2% |
+
+The second run's machine was 2.9x worse by its own OFF control, and the
+stagger's late count is 2.9x higher. Normalised they are the same number
+to a tenth of a percent, which is the second time this has measured as
+exactly neutral - once on a busy machine, once on a quiet one. Reverted,
+and written down here so nobody spends an evening on it again.
+
+The reason it cannot help is probably the fork: spreading the rebuild over
+more blocks lowers the peak per block but also leaves fewer lanes with
+work on each of them, and the pool wants four to fill it. The two effects
+cancel, which is the same tension `GRAIN_AUTO_BLOCKS` is balanced on.
