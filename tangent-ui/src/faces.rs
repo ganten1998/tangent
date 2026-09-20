@@ -1636,6 +1636,35 @@ pub fn ir_parent(dir: &str) -> String {
 /// accepts either; what broke was every comparison downstream of it, so the
 /// row would not show as loaded and Delete's confirmation would not know it
 /// was about to remove the impulse currently playing.
+/// **Leave this as a `Path` comparison.** It is one line, and turning it into
+/// string work would throw away four normalisations that come free with it and
+/// that nobody would think to write by hand. Measured on Windows, rustc 1.97:
+///
+/// | | |
+/// |---|---|
+/// | `/m/IRs\Cabs` vs `/m/IRs/Cabs` | equal - the case this exists for |
+/// | `C:\m\IRs\` vs `C:\m\IRs` | equal - a trailing separator folds |
+/// | `C:\m\\IRs` vs `C:\m\IRs` | equal - a doubled separator folds |
+/// | `c:\m\IRs` vs `C:\m\IRs` | equal - `parse_drive` uppercases the letter |
+///
+/// That last one is deliberate in `std`, not luck: the Windows prefix parser
+/// ends `[drive, b':', ..] => Some(drive.to_ascii_uppercase())`.
+///
+/// **What it does NOT fold is CASE below the prefix**, because `Path` compares
+/// `OsStr` bytes: `C:\m\IRs` and `C:\m\irs` are different paths here and the
+/// same folder on Windows. Left alone on purpose - case-insensitive comparison
+/// is wrong on Linux and usually right on macOS, so the correct answer depends
+/// on the FILESYSTEM and no `cfg` can express it, and in practice both sides of
+/// every comparison in this panel come from one `read_dir` or one file dialog,
+/// which agree on casing.
+///
+/// **The one place that reasoning is thin is a UNC path.** `std` folds the disk
+/// prefix and does NOT fold a UNC one, so `\\srv\Share` and `\\SRV\SHARE`
+/// compare unequal while Windows treats them as one location - and an impulse
+/// library on a network share is an ordinary studio setup, where two machines
+/// can disagree on the casing with nobody hand-editing anything. The MECHANISM
+/// is demonstrated; a reachable path is not, so this is a flag rather than a
+/// defect. If an IR folder ever lives on a UNC path, start here.
 pub fn ir_same(a: &str, b: &str) -> bool {
     std::path::Path::new(a) == std::path::Path::new(b)
 }
