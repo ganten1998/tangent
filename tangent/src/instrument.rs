@@ -6418,6 +6418,8 @@ fn render_lane(
                 prev_frames: desk.key_prev_frames,
                 io: &mut io.key_io,
             }),
+        
+            at,
         );
         // **And bays 3..5, over what bays 0..2 just left.** Six bays
         // are one chain; see `run_extra_rack`, which holds the
@@ -6439,6 +6441,8 @@ fn render_lane(
                 prev_frames: desk.key_prev_frames,
                 io: &mut io.key_io,
             }),
+        
+            at,
         );
     }
     // **The lane does NOT wait here any more.** Its delay compensation used
@@ -6472,6 +6476,18 @@ fn run_extra_rack(
     controls: &[Control],
     sample: Option<&SamplerSample>,
     key: Option<KeyFeed<'_>>,
+
+    // **The absolute sample position this rack is rendering**, or
+    // `u64::MAX` for "wherever the playhead is".
+    //
+    // Only the LANE pass passes a real one, and it has to: a grained lane
+    // renders a span up to a grain ahead of the playhead, and an
+    // arpeggiator handed the playhead's beat for a future block would run
+    // early by exactly that much. Every other caller - the room, the
+    // folders, the buses, the master, the pads - renders the block the
+    // callback is on, and says so with the sentinel rather than by
+    // repeating the load.
+    pos: u64,
 ) {
     if is_folder {
         return;
@@ -6498,7 +6514,9 @@ fn run_extra_rack(
         extra,
         sample,
         key,
-    );
+    
+            pos,
+        );
 }
 
 fn run_rack(
@@ -6529,6 +6547,18 @@ fn run_rack(
     // [`KeyFeed`]. Disarmed cost is nothing at all: the table is only read
     // when a feed was handed in.
     mut key: Option<KeyFeed<'_>>,
+
+    // **The absolute sample position this rack is rendering**, or
+    // `u64::MAX` for "wherever the playhead is".
+    //
+    // Only the LANE pass passes a real one, and it has to: a grained lane
+    // renders a span up to a grain ahead of the playhead, and an
+    // arpeggiator handed the playhead's beat for a future block would run
+    // early by exactly that much. Every other caller - the room, the
+    // folders, the buses, the master, the pads - renders the block the
+    // callback is on, and says so with the sentinel rather than by
+    // repeating the load.
+    pos: u64,
 ) {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
     // the entire disarmed cost; the seat comparison folds the armed-elsewhere
@@ -6558,7 +6588,13 @@ fn run_rack(
     let transport = {
         let bpm = f64::from_bits(shared.bpm.load(Ordering::Relaxed));
         let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
-        let pos = shared.transport_pos.load(Ordering::Relaxed) as f64;
+        // The span's own position, or the playhead when the caller said it
+        // is rendering the block the callback is on. See `pos`.
+        let pos = if pos == u64::MAX {
+            shared.transport_pos.load(Ordering::Relaxed)
+        } else {
+            pos
+        } as f64;
         crate::analog::arp::Transport {
             bpm,
             playing: shared.rolling.load(Ordering::Relaxed),
@@ -7449,6 +7485,11 @@ struct Renderer {
     /// own span unless the grain clock moved it. See `plan_grains`.
     lane_at: [u64; CHANNELS],
     lane_len: [usize; CHANNELS],
+    /// **This lane's audio for this chunk is already in its ring**, so the
+    /// deciding walk must not advance a single thing about it: not its
+    /// notes, not what its instrument has been told, not its pedal. The
+    /// grain that covers this chunk did all of that when it was rendered.
+    lane_skip: [bool; CHANNELS],
     /// Which lanes rendered something to fold this chunk. False for every
     /// way the render walked away: parked, fed by nothing, no rack and no
     /// audio, a bank too short, or an inactive instrument on a bare lane.
@@ -8044,6 +8085,8 @@ impl Renderer {
                 prev_frames: self.key_prev_frames,
                 io: &mut self.key_io,
             }),
+        
+            u64::MAX,
         );
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
@@ -9161,7 +9204,9 @@ impl Renderer {
                         // Not a key pass: the click is a cue, and nobody
                         // keys a cue. See `KeyFeed`.
                         None,
-                    );
+                    
+            u64::MAX,
+        );
                     // **NOT-A-CHANNEL:** and bays 3..5 of the same cue strip,
                     // over what bays 0..2 just left. The click wears six now
                     // (`recorder::bays_on`), seated past everything in
@@ -9179,7 +9224,9 @@ impl Renderer {
                         controls,
                         None,
                         None,
-                    );
+                    
+            u64::MAX,
+        );
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
                 // frame the take was not carrying stays absent however the
@@ -9384,7 +9431,9 @@ impl Renderer {
                             // fed; feeding it again would clock a keyed
                             // detector at twice real time. See `KeyFeed`.
                             None,
-                        );
+                        
+            u64::MAX,
+        );
                     }
                     let g = self.lane_gain[dest];
                     let (pl, pr) = pan_gains(self.lane_pan(dest));
@@ -10725,7 +10774,9 @@ impl Renderer {
                         // the lane pass in `mix_channels`; this is its
                         // monitor run. See `KeyFeed`.
                             None,
-                        );
+                        
+            u64::MAX,
+        );
                         // And bays 3..5, over what bays 0..2 just left — the
                         // room hears the whole chain or it hears half of it.
                         // Not a key pass either, for the same reason. Still
@@ -10746,7 +10797,9 @@ impl Renderer {
                                 .get(strip.index())
                                 .and_then(Option::as_ref),
                             None,
-                        );
+                        
+            u64::MAX,
+        );
                     }
                 }
             }
@@ -11766,7 +11819,9 @@ impl Renderer {
                     // Not a key pass in v1: a pad seat is not reachable
                     // from the key picker. See `KeyFeed`.
                     None,
-                );
+                
+            u64::MAX,
+        );
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
                     if let Some(dst) = self.fx_in.get_mut(c) {
@@ -11862,7 +11917,9 @@ impl Renderer {
                 // feed. Keying a comp ON a drum lane waits for the same
                 // second pass folders need. See `KeyFeed`.
                 None,
-            );
+            
+            u64::MAX,
+        );
         }
         // **The kit waits for the slowest chain, like every other source.**
         //
@@ -12124,6 +12181,7 @@ impl Renderer {
         for ch in 0..CHANNELS {
             self.lane_at[ch] = at;
             self.lane_len[ch] = frames;
+            self.lane_skip[ch] = false;
         }
         // **Off, or on a desk where a grain cannot mean anything.** A
         // stopped transport re-reads one position for ever; varispeed sizes
@@ -12148,7 +12206,7 @@ impl Renderer {
             (b > a && at < b).then_some(b)
         };
         for ch in 0..CHANNELS {
-            if !self.lane_wants[ch] || !self.grain_ok(ch, free) {
+            if !self.grain_ok(ch, free) {
                 continue;
             }
             let Some(g) = self.lane_grain.get(ch) else {
@@ -12175,15 +12233,15 @@ impl Renderer {
                         self.lane_at[ch] = end;
                         self.lane_len[ch] = Self::clip_grain(end, grain, loop_b);
                     } else {
-                        self.lane_wants[ch] = false;
+                        self.lane_skip[ch] = true;
                     }
                 }
                 // Served from the older slot: the look-ahead is already
                 // rendered and there is nothing to do.
-                (true, _) => self.lane_wants[ch] = false,
+                (true, _) => self.lane_skip[ch] = true,
             }
             if self.lane_len[ch] == 0 {
-                self.lane_wants[ch] = false;
+                self.lane_skip[ch] = true;
             }
         }
     }
@@ -12199,29 +12257,50 @@ impl Renderer {
 
     /// **May this lane be rendered a grain at a time?**
     ///
-    /// The stage-one rule, and it is deliberately narrow: a lane with NOTES
-    /// in the span may not, because the deciding walk builds a lane's note
-    /// list for the chunk it is on and a grain covering a different span
-    /// would be handed the wrong notes. That is the next piece of work and
-    /// it is not this one.
+    /// `free` is the complement of the pin set, and the pin set is the
+    /// answer: `pinned_lanes` already excludes every lane that is armed,
+    /// listening to live MIDI, punched, frozen, a folder, a send
+    /// destination, a drum lane, sidechain-keyed, room-owned or named by
+    /// the insert tap. An auditioning lane is added to it by the caller,
+    /// because an audition is a LEVEL reconciled against the playhead and
+    /// there is no such thing for a span the playhead has not reached.
     ///
-    /// Everything else the lane needs is already a pure function of the
-    /// position it is asked about: `pull_lane_clips` takes the span, and
-    /// automation is answered by `automation_now` for whatever second it is
-    /// given. Those two are what steps two and three of this overhaul were
-    /// for.
+    /// Everything a lane that survives that needs is a pure function of the
+    /// position it is asked about: `pull_lane_clips` takes the span, the
+    /// note walk finds its notes by where the block is rather than by a
+    /// cursor, `clip_pedal_level` reads a LEVEL at a frame, and automation
+    /// is answered by `automation_now` for whatever second it is given.
+    /// Those are exactly what steps two and three of this overhaul built.
     fn grain_ok(&self, ch: usize, free: u32) -> bool {
-        self.lane_note_bank
-            .get(ch)
-            .is_none_or(|n| n.is_empty())
-            && self
-                .lane_ctl_bank
-                .get(ch)
-                .is_none_or(|c| c.is_empty())
-            && !self.lane_prep[ch].is_folder
-            && !self.lane_prep[ch].room_owns
-            && !self.lane_prep[ch].armed
-            && free & (1u32 << ch.min(CHANNELS - 1)) != 0
+        if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
+            return false;
+        }
+        // **A lane carrying an INSTRUMENT is not grained, and the reason is
+        // not the grain.**
+        //
+        // A grain cuts a lane's audio into spans that are not the
+        // callback's, so anything that is not block-size invariant sounds
+        // different for a reason that has nothing to do with rendering
+        // ahead. `is_a_builtin_instrument_the_same_at_any_buffer_size`
+        // measures exactly that, with no grains anywhere in it: Analog
+        // driven by notes that start and stop inside a block renders 128
+        // frames at a time and 512 frames at a time to streams that differ
+        // by -15.5 dBFS against a peak of -17.1, while clips, an EQ and a
+        // compressor are bit-identical. It begins as one ULP at frame 371
+        // and compounds, which is the shape of a modulation source sampled
+        // once per block from `transport.beat` - a figure that is also the
+        // block's END rather than its start.
+        //
+        // That is a defect in the instrument and it is worth fixing on its
+        // own: it means an Analog track already sounds different at one
+        // buffer size than at another. Until it is, a lane holding a voice
+        // stays on the callback's own block, where every buffer size gives
+        // what it gives today.
+        let extra = tangent_ui::recorder::folder_extra_seat(ch);
+        !self.racks[ch].holds_a_voice()
+            && !self.racks[extra].holds_a_voice()
+            && self.dx7s.get(ch).is_none_or(Option::is_none)
+            && self.keys_lanes.get(ch).is_none_or(Option::is_none)
     }
 
     fn run_lane_pdc(&mut self, ch: usize, frames: usize, pdc_max: u32) {
@@ -12460,6 +12539,14 @@ impl Renderer {
         // sound less expressive; a modelled piano loses its sympathetic wash
         // and half of what makes a jazz voicing hang together.
         for ch in 0..CHANNELS {
+            // **This lane's span, not the chunk's.** A grained lane's
+            // instrument is being fed for the grain it is about to render,
+            // which may be up to a grain ahead of the playhead. See
+            // `plan_grains`; for every other lane these are the chunk's own.
+            if self.lane_skip[ch] {
+                continue;
+            }
+            let at = self.lane_at[ch];
             let bit = 1u32 << ch.min(31);
             let armed_here = midi_off & u64::from(bit) == 0;
             // **What this lane's PEDAL is, live and recorded together.**
@@ -12563,11 +12650,66 @@ impl Renderer {
         // and left the block beginning up to one buffer past the loop's
         // head. Everything in that gap is still owed. See
         // `pending_wrap_from`.
-        let due_from = wrap_from.map_or(at, |a| a.min(at));
+        // ── THE GRAIN CLOCK ──────────────────────────────────────────────
+        //
+        // Runs BEFORE the walk, not after it, and the order is the point.
+        // The walk builds a lane's notes, tells its instrument what its
+        // pedal is doing and advances what that instrument has been told -
+        // all of it for ONE span. A grained lane's span is not the chunk's,
+        // so the clock has to have decided it before any of that happens.
+        //
+        // It also decides which lanes have nothing to do at all, which is
+        // most of them on most callbacks and is where the saving is.
+        {
+            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
+            let free = if grain > frames {
+                let mut free = !pinned_lanes(
+                    &self.shared,
+                    &self.folder_is,
+                    receives,
+                    self.room_rack | self.board_live,
+                    self.keys_live,
+                );
+                // **An audition pins its own lane.** It is a LEVEL
+                // reconciled against the playhead once a chunk - the key is
+                // held, not scheduled - and there is no such thing for a
+                // span the playhead has not reached yet.
+                for ch in 0..CHANNELS {
+                    let held = self.shared.audition[ch].load(Ordering::Relaxed) != u32::MAX;
+                    if held || self.audition_on[ch].is_some() || self.audition_rang[ch] {
+                        free &= !(1u32 << ch);
+                    }
+                }
+                free
+            } else {
+                0
+            };
+            self.plan_grains(at, frames, rolling, grain, free);
+        }
         self.probe_walk_pins = 0;
         self.probe_clip_pins = 0;
         self.probe_inst_pins = 0;
         for ch in 0..CHANNELS {
+            // **Nothing at all for a lane whose ring already holds this
+            // chunk.** Not its notes, not what its instrument has been told,
+            // not its pedal: the grain that covers this chunk did all of
+            // that when it was rendered, and doing it again here would tell
+            // the instrument about the same notes twice.
+            //
+            // The two latency terms are refreshed anyway, because the FOLD
+            // reads them at consumption for every lane it sums and they
+            // must answer for the desk's compensation now.
+            if self.lane_skip[ch] {
+                self.lane_prep[ch].folder_lat = self.folder_lat[ch];
+                self.lane_prep[ch].pedal_latency = self.pedal_latency(ch);
+                self.lane_wants[ch] = false;
+                continue;
+            }
+            // **This lane's span.** The chunk's own unless the grain clock
+            // moved it, and every `at`, `frames` and `due_from` below is
+            // this lane's rather than the walk's from here down.
+            let (at, frames) = (self.lane_at[ch], self.lane_len[ch]);
+            let due_from = wrap_from.map_or(at, |a| a.min(at));
             // Holding the sentinel is not enough: the INSTANCE has to have
             // arrived. Between the bay being filled and the ring delivering,
             // the lane is a lane with nothing loaded, exactly like a kit
@@ -13219,28 +13361,6 @@ impl Renderer {
         // before any of them is used. Three `split_at_mut`s and six
         // iterators, all of it safe: see `lane_seats` for the arithmetic
         // that makes the blocks disjoint.
-        // ── THE GRAIN CLOCK ──────────────────────────────────────────────
-        //
-        // Runs here, after the deciding walk has said which lanes want to
-        // render and before the render gathers them, because it answers a
-        // different question: not WHETHER a lane renders but WHAT SPAN it
-        // renders, and for most lanes on most callbacks the answer is that
-        // it has already been rendered and there is nothing to do.
-        {
-            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
-            let free = if grain > frames {
-                !pinned_lanes(
-                    &self.shared,
-                    &self.folder_is,
-                    receives,
-                    self.room_rack | self.board_live,
-                    self.keys_live,
-                )
-            } else {
-                0
-            };
-            self.plan_grains(at, frames, rolling, grain, free);
-        }
         let wanted: u32 = (0..CHANNELS).fold(0u32, |m, ch| {
             if self.lane_wants[ch] { m | (1u32 << ch) } else { m }
         });
@@ -13858,7 +13978,9 @@ fn run_board(
                 // NOT a key pass: the lane's one feed per chunk belongs to
                 // the channel's own rack. See `KeyFeed`.
                 None,
-            );
+            
+            u64::MAX,
+        );
         }
     }
 }
@@ -14020,7 +14142,9 @@ impl Renderer {
                     // bus comp IN a group is a second pass this feature does
                     // not make yet. See `KeyFeed`.
                     None,
-                );
+                
+            u64::MAX,
+        );
             }
             // **THE-FOLD: the folder's SECOND rack** - bays 3..5, seated
             // past everything (`folder_extra_seat`), run here and only here
@@ -14054,7 +14178,9 @@ impl Renderer {
                         // Not a key pass in v1, exactly as the folder's
                         // first rack above. See `KeyFeed`.
                         None,
-                    );
+                    
+            u64::MAX,
+        );
                 }
             }
             // **No wait here, and that is the point.** Everything in this
@@ -15359,6 +15485,7 @@ impl Engine {
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
+            lane_skip: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -21266,6 +21393,7 @@ mod tests {
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
+            lane_skip: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -31770,7 +31898,9 @@ mod sampler_road {
             run_rack(
                 &mut rack, &mut planar, NOW, &mut out, &notes, &[], &params, &shared, 0, None,
                 None,
-            );
+            
+            u64::MAX,
+        );
             for (c, b) in planar.iter().enumerate() {
                 assert!(
                     b.len() >= NOW,
@@ -31846,7 +31976,9 @@ mod sampler_road {
                 0,
                 sample,
                 None,
-            );
+            
+            u64::MAX,
+        );
             // The last frame, past the five-millisecond default attack.
             planar[0][511].abs()
         };
@@ -31864,6 +31996,8 @@ mod sampler_road {
         // **NOT-A-CHANNEL:** the same synthetic rack as above.
         run_rack(
             &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, 0, None, None,
+        
+            u64::MAX,
         );
         assert!(
             planar[0].iter().all(|s| *s == 0.0),

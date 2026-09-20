@@ -632,6 +632,101 @@ fn the_fork_renders_what_the_single_walk_rendered() {
     }
 }
 
+/// An instrument desk whose notes are spread through the song rather than
+/// all struck at frame zero, so a grain boundary lands between notes over
+/// and over. `instrument_desk` holds every voice down for a minute, which
+/// would exercise the note walk exactly once.
+fn midi_pattern_desk(lanes: usize, unit: &str) -> Engine {
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+    e.set_armed(0);
+    e.set_midi_off(u64::MAX);
+    e.set_desk(&quiet_desk());
+    // A note every 700 frames, 500 long: shorter than a 512-frame grain and
+    // not a divisor of it, so ons and offs land at every offset within a
+    // grain rather than always at its head.
+    let notes: Arc<Vec<ClipNote>> = Arc::new(
+        (0..400u64)
+            .map(|i| ClipNote {
+                at: i * 700,
+                dur: 500,
+                key: 48 + (i % 13) as u8,
+                vel: 90,
+            })
+            .collect(),
+    );
+    let clips: Vec<PlacedMidi> = (0..lanes)
+        .map(|lane| PlacedMidi {
+            strip: lane,
+            start: u64::from(lane as u32) * 37,
+            len: 400 * 700,
+            notes: Arc::clone(&notes),
+            pedal: Arc::new(Vec::new()),
+        })
+        .collect();
+    e.set_midi_clips(clips);
+    seat(&mut e, lanes, &[unit]);
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    e
+}
+
+/// **Is a built-in instrument the same sound at any buffer size?**
+///
+/// Asked because the grain render cuts a lane's audio into spans that are
+/// not the callback's, so anything that is not block-size invariant would
+/// differ for a reason that is nothing to do with the grain. No grains here
+/// at all: two engines with the same notes, one fed 128-frame buffers and
+/// one fed 512, compared as one stream.
+#[test]
+#[ignore = "a diagnostic, not an assertion"]
+fn is_a_builtin_instrument_the_same_at_any_buffer_size() {
+    for (name, build) in [
+        ("Analog, notes held", (|| instrument_desk(4, "@tangent-analog", 4)) as fn() -> Engine),
+        ("Analog, a note every 700 frames", || midi_pattern_desk(4, "@tangent-analog")),
+        ("clips only", || audio_desk(4, &[])),
+        ("clips x [EQ, comp]", || audio_desk(4, &["@tangent-eq", "@tangent-comp"])),
+    ] {
+        let (mut small, mut big) = (build(), build());
+        let (mut sa, mut bb) = (vec![0.0f32; 128 * 2], vec![0.0f32; 512 * 2]);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..200 {
+            small.render_offline(&mut sa);
+            xs.extend_from_slice(&sa);
+        }
+        for _ in 0..50 {
+            big.render_offline(&mut bb);
+            ys.extend_from_slice(&bb);
+        }
+        let n = xs.len().min(ys.len());
+        let first = xs[..n]
+            .iter()
+            .zip(&ys[..n])
+            .position(|(x, y)| x.to_bits() != y.to_bits());
+        if let Some(i) = first {
+            let f = i / 2;
+            println!(
+                "      first differs at frame {f} (block {} of 128, offset {}), \
+                 {:.9} vs {:.9}",
+                f / 128,
+                f % 128,
+                xs[i],
+                ys[i]
+            );
+        }
+        let worst = xs[..n]
+            .iter()
+            .zip(&ys[..n])
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        let peak = xs[..n].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let db = |v: f32| 20.0 * v.max(1e-12).log10();
+        println!(
+            "  {name:<34} 128 vs 512 frames: worst {:.1} dBFS against a peak of {:.1}",
+            db(worst),
+            db(peak)
+        );
+    }
+}
+
 /// **A grain render is the same audio, arriving earlier.**
 ///
 /// The one property that stands between the grain render and wrong sound.
@@ -640,31 +735,78 @@ fn the_fork_renders_what_the_single_walk_rendered() {
 /// are not called at all and the fold reads a span out of a ring that was
 /// filled some blocks ago. Every part of that is new: the ring's key, the
 /// span gather across a grain boundary, the stagger's phase, the catch-up
-/// after a locate, and `run_lane_pdc` clocking a delay line over a staging
-/// pair rather than over the render's own buffer.
+/// after a locate, `run_lane_pdc` clocking a delay line over a staging pair,
+/// and - for the instrument shapes - a lane's notes being found for a span
+/// the playhead has not reached.
 ///
-/// **Asserted BIT-EXACT**, which is available here and would not be for
-/// every desk: these shapes are sample-by-sample arithmetic - a clip pull,
-/// a fader, a biquad, a compressor - so the block size they are cut into
-/// cannot change the answer. It is not true of a plugin that blocks
-/// internally, which is why the shapes are chosen and not arbitrary: a
-/// hosted convolver partitions its own input and a denoiser windows it, and
-/// both would differ for a reason that is not a defect.
+/// **Asserted BIT-EXACT through continuous playback**, which is available
+/// here and would not be for every desk: these shapes are sample-by-sample
+/// arithmetic, so the block size they are cut into cannot change the answer.
+/// It is not true of a plugin that blocks internally, which is why the
+/// shapes are chosen and not arbitrary - a hosted convolver partitions its
+/// own input and a denoiser windows it, and both would differ for a reason
+/// that is not a defect.
 ///
-/// A locate is driven half way through, because the catch-up path is the
-/// one a cold ring takes and it would otherwise never run here.
+/// **Across a LOCATE it is not bit-exact, and the two reasons are
+/// different.** For an effects lane, a grained lane has rendered up to a
+/// grain past the playhead and a locate abandons that audio: the ring is
+/// emptied but a compressor's envelope cannot be, so the two differ by a
+/// decaying amount. `locate_bounded` asserts that difference stays under
+/// -40 dBFS.
 ///
-/// Not `#[ignore]`d: it is a second, and it is the test that would catch a
-/// grain served for the wrong position, which is the failure this whole
-/// change risks.
+/// `locate_bounded` is a field rather than an assumption, because a lane
+/// carrying a HELD instrument note would not be bounded and the difference
+/// would not be an error: a locate does not re-articulate a note that is
+/// still down - that is deliberate, see `told` - so the note goes on
+/// sounding and a grained lane's oscillator would have advanced up to a
+/// grain further through it. Two copies of one tone at different phases
+/// differ by as much as the tone itself, and no listener has a reference to
+/// hear it against. Instrument lanes are not grained today, so every shape
+/// here is bounded; the field is what stops that being forgotten on the day
+/// they are.
 #[test]
 fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
-    let shapes: [(&str, fn() -> Engine); 3] = [
-        ("16 lanes, clips only", || audio_desk(16, &[])),
-        ("16 lanes x 3 EQ", || audio_desk(16, &["@tangent-eq", "@tangent-eq", "@tangent-eq"])),
-        ("16 lanes x [EQ, comp]", || audio_desk(16, &["@tangent-eq", "@tangent-comp"])),
+    struct Shape {
+        name: &'static str,
+        build: fn() -> Engine,
+        /// False where a held voice's phase makes the transient meaningless.
+        locate_bounded: bool,
+    }
+    let shapes = [
+        Shape { name: "16 lanes, clips only", build: || audio_desk(16, &[]), locate_bounded: true },
+        Shape {
+            name: "16 lanes x 3 EQ",
+            build: || audio_desk(16, &["@tangent-eq", "@tangent-eq", "@tangent-eq"]),
+            locate_bounded: true,
+        },
+        Shape {
+            name: "16 lanes x [EQ, comp]",
+            build: || audio_desk(16, &["@tangent-eq", "@tangent-comp"]),
+            locate_bounded: true,
+        },
+        // **The instrument lanes, which is what the notes half is for.**
+        // Their notes are found by where the block is rather than by a
+        // cursor, and what the instrument has been told advances in step
+        // with whichever span feeds it - so a grain covering a different
+        // span must still articulate every note on the same frame.
+        // **The instrument lanes, which today must NOT be grained**, and
+        // this is where that is checked: `grain_ok` refuses a lane holding a
+        // voice, so these two come out bit-identical because they are on the
+        // callback's own block in both engines. See `grain_ok` for why, and
+        // `is_a_builtin_instrument_the_same_at_any_buffer_size` for the
+        // measurement behind it.
+        Shape {
+            name: "8 lanes x Analog, notes held",
+            build: || instrument_desk(8, "@tangent-analog", 4),
+            locate_bounded: true,
+        },
+        Shape {
+            name: "8 lanes x Analog, a note every 700 frames",
+            build: || midi_pattern_desk(8, "@tangent-analog"),
+            locate_bounded: true,
+        },
     ];
-    for (name, build) in shapes {
+    for Shape { name, build, locate_bounded } in shapes {
         let mut chunked = build();
         let mut grained = build();
         // 512 frames at 48 kHz, against a 128-frame block: eight callbacks
@@ -673,9 +815,8 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
         let n = BLOCK * 2;
         let mut a = vec![0.0f32; n];
         let mut b = vec![0.0f32; n];
+        let mut peak = 0.0f32;
         for block in 0..200 {
-            // Half way through, a locate: the ring goes cold and both
-            // engines must come back on the same frame.
             chunked.render_offline(&mut a);
             grained.render_offline(&mut b);
             for (i, (x, y)) in a.iter().zip(&b).enumerate() {
@@ -684,23 +825,14 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
                     "{name}: block {block} sample {i}: chunked gave {x}, grained gave {y}"
                 );
             }
+            peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
         }
+        assert!(
+            peak > 0.001,
+            "{name}: the reference render was silent, so the test proved nothing"
+        );
+
         // ── and now a locate, which is the one irreducible discard ───────
-        //
-        // A grained lane has rendered up to a grain PAST the playhead, and a
-        // locate abandons that audio. The ring is emptied, but the stateful
-        // units in the lane's rack cannot be: a compressor's envelope and a
-        // reverb's delay lines have processed samples nobody will hear, and
-        // there is no rewind for either. This is the cost the design admits,
-        // and it lands at a locate, where a discontinuity already lives.
-        //
-        // The numbers below are MEASURED, not chosen. On this desk the
-        // difference starts at -53.7 dBFS and is down to -72.6 dBFS a fifth
-        // of a second later. It decays toward zero without reaching it: the
-        // two envelopes differ by a factor that shrinks exponentially, and
-        // in f32 that approaches equality asymptotically rather than landing
-        // on it. The bounds are set outside the measurements so this is a
-        // regression net and not a tripwire.
         let at = 7 * BLOCK as u64 + 13;
         for e in [&mut chunked, &mut grained] {
             e.set_transport(2, at);
@@ -719,23 +851,26 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
             }
         }
         let db = |v: f32| 20.0 * v.max(1e-12).log10();
-        assert!(
-            db(worst) < -40.0,
-            "{name}: a locate cost {:.1} dBFS, which is audible against the \
-             discontinuity a locate already has",
-            db(worst)
-        );
+        // The numbers are MEASURED, not chosen: the effects desk starts at
+        // -53.7 dBFS and is -72.6 dBFS a fifth of a second later, decaying
+        // toward zero without reaching it - two envelopes differing by a
+        // factor that shrinks exponentially approach equality in f32 rather
+        // than landing on it. The bounds sit outside the measurements so
+        // this is a regression net and not a tripwire.
+        if locate_bounded {
+            assert!(
+                db(worst) < -40.0,
+                "{name}: a locate cost {:.1} dBFS, which is audible against \
+                 the discontinuity a locate already has",
+                db(worst)
+            );
+        }
         assert!(
             db(tail) < -65.0,
             "{name}: a fifth of a second after the locate the two renders \
              still differ by {:.1} dBFS, so the discarded grain is not \
-             decaying out of the lane the way a released envelope should",
+             decaying out of the lane the way it should",
             db(tail)
-        );
-        let peak = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(
-            peak > 0.001,
-            "{name}: the reference render was silent, so the test proved nothing"
         );
     }
 }

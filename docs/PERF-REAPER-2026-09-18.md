@@ -1002,3 +1002,65 @@ of rack state past the abandoned position". It deletes note-offs whose
 sent, and knob points already popped destructively off `ui_params` - so a
 locate would leave a stuck note, a stuck damper and a lost plugin edit. The
 decide walk's edge state has to commit at COLLECT, not at dispatch.
+
+---
+
+# 2026-09-19: the grain render, and a defect it uncovered
+
+## What shipped
+
+A lane eligible for it renders in grains of `render_ahead_ms` instead of
+once per callback, with the grain boundaries STAGGERED across lanes so each
+callback refills a share of the desk. Everything stays inside one callback
+under the existing fork and barrier: no worker outlives the callback that
+dispatched it, so there is no new ownership model, no second pool, no
+revoke handshake, and nothing this repository cannot test.
+
+    96 x FabFilter Pro-R 2, 64 frames    p99 1762 us -> 872 us
+                                         132.1% -> 65.4% of the deadline
+                                         41 blocks over 2000 -> 1
+    96 x FabFilter Pro-R 2, 128 frames   83.8% -> 52.1%
+
+The saving is arithmetic, not scheduling: the fixed cost of a block is
+per-INSTANCE. 96 plugins cost 765 us before a single frame is rendered and
+5.46 us a frame after it, so eight times fewer `process` calls for the same
+audio is the whole of it.
+
+## What is NOT eligible, and why each one
+
+`pinned_lanes` already refuses armed lanes, anything listening to live
+MIDI, punched lanes, frozen lanes, folders, send destinations, drum lanes,
+sidechain-keyed lanes, room-owned lanes and the lane the insert tap names.
+An auditioning lane is added to that list here: an audition is a LEVEL
+reconciled against the playhead, and there is no such thing for a span the
+playhead has not reached.
+
+**And a lane holding a VOICE, which is the one that is not about grains.**
+
+## The defect: a built-in instrument is not block-size invariant
+
+`is_a_builtin_instrument_the_same_at_any_buffer_size` has no grains in it
+at all. Two engines, the same notes, one fed 128-frame buffers and one fed
+512, compared as one stream:
+
+    Analog, notes held                 128 vs 512:  -240.0 dBFS  (bit-exact)
+    Analog, a note every 700 frames    128 vs 512:   -15.5 dBFS
+                                       against a peak of -17.1
+    clips only                         128 vs 512:  -240.0 dBFS  (bit-exact)
+    clips x [EQ, comp]                 128 vs 512:  -240.0 dBFS  (bit-exact)
+
+**An Analog track already sounds different at one buffer size than at
+another**, and the difference is louder than the signal. It only appears
+when notes start and stop INSIDE a block - held notes are bit-exact - and
+it begins as one ULP at frame 371 and compounds from there.
+
+That shape is a modulation source sampled once per block from
+`transport.beat` rather than accumulated per sample. Worth noting beside
+it: the beat handed to a rack comes from `Shared::transport_pos`, which
+`run_transport` stores AFTER advancing, so it is the block's END and not
+its start.
+
+Until that is fixed a lane holding a voice stays on the callback's own
+block, where every buffer size gives what it gives today. It is written
+down here rather than worked around quietly, because the fix belongs to the
+instrument and would be worth making on its own account.
