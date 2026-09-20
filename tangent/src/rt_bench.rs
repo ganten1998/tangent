@@ -2114,6 +2114,179 @@ fn auto_picks_the_grain_the_measurements_picked() {
     );
 }
 
+/// **The fork and the grain, together and apart, are one sound.**
+///
+/// Two features that each changed how a lane's audio is produced, and until
+/// now each was only ever tested against a desk where the other was off:
+/// `the_fork_renders_what_the_single_walk_rendered` runs no grain, and every
+/// grain test runs on one thread. A live session with render-ahead on runs
+/// BOTH, and nothing asserted that the pair agreed with either half.
+///
+/// All four corners against the same reference, bit for bit. The reference
+/// is the plain one - no fork, no grain - because that is what the engine
+/// did before either existed and what the golden clips were rendered from.
+#[test]
+fn the_fork_and_the_grain_are_one_sound() {
+    let shapes: [(&str, fn() -> Engine); 4] = [
+        ("16 lanes x [EQ, comp, plate]", || {
+            audio_desk(16, &["@tangent-eq", "@tangent-comp", "@tangent-plate"])
+        }),
+        ("16 lanes x drive", || audio_desk(16, &["@tangent-drive"])),
+        ("8 lanes x Analog", || instrument_desk(8, "@tangent-analog", 8)),
+        ("Analog, a note every 700 frames", || midi_pattern_desk(8, "@tangent-analog")),
+    ];
+    for (name, build) in shapes {
+        // The reference: one thread, one chunk at a time.
+        let mut plain = build();
+        plain.set_offline_fanout(false);
+        let n = BLOCK * 2;
+        let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let mut want = Vec::new();
+        for _ in 0..200 {
+            plain.render_offline(&mut a);
+            want.extend_from_slice(&a);
+        }
+        let peak = want.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.001, "{name}: the reference was silent");
+
+        for (what, fork, grain) in [
+            ("fork alone", true, 0.0f64),
+            ("grain alone", false, 512.0),
+            ("fork and grain", true, 512.0),
+            ("fork and an awkward grain", true, 240.0),
+        ] {
+            let mut e = build();
+            e.set_offline_fanout(fork);
+            if grain > 0.0 {
+                e.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            }
+            let mut got = Vec::new();
+            for _ in 0..200 {
+                e.render_offline(&mut b);
+                got.extend_from_slice(&b);
+            }
+            let (worst, first) = worst_diff(&want, &got);
+            assert!(
+                worst == 0.0,
+                "{name} with {what}: differs from the plain walk by {:.1} dBFS, \
+                 first at frame {:?}",
+                dbfs(worst),
+                first.map(|i| i / 2)
+            );
+        }
+    }
+}
+
+/// **The fork carries HOSTED plugins too.**
+///
+/// The built-ins are ours and we know they keep no shared state. A VST3 is
+/// somebody else's code, and an export that forks is now calling
+/// `process()` on ninety-six instances across several threads at once. Each
+/// instance is its own and no two threads ever touch one - that is what the
+/// lane carve guarantees - but the claim is worth one measurement against a
+/// real plugin rather than an argument.
+///
+/// Skipped with a line where the plugin is not installed, exactly as the
+/// gate rung is.
+#[test]
+fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
+    let plugin = std::env::var("TANGENT_GATE_PLUGIN")
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3".to_owned());
+    if !Path::new(&plugin).exists() {
+        println!("no {plugin}: the hosted fork case is not covered here");
+        return;
+    }
+    let state: Option<Vec<u8>> = std::env::var("TANGENT_GATE_STATE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|raw| match raw.iter().position(|b| *b == 0) {
+            Some(at) if raw[..at].starts_with(b"/") => raw[at + 1..].to_vec(),
+            _ => raw,
+        });
+    const LANES: usize = 8;
+    let build = || -> Option<Engine> {
+        let mut e = audio_desk(LANES, &[]);
+        for lane in 0..LANES {
+            match e.load_insert(lane, 0, Some(Path::new(&plugin)), state.as_deref()) {
+                Ok(Some(_)) => {}
+                other => {
+                    println!("the plugin would not seat in a test process: {other:?}");
+                    return None;
+                }
+            }
+        }
+        Some(e)
+    };
+    // **Three engines, because the plugin has to prove itself first.**
+    //
+    // A hosted reverb may modulate its delay lines with a noise source, and
+    // two instances of one that does will not agree with each other however
+    // they are scheduled. Asserting bit-exactness against such a plugin
+    // measures the plugin, not the fork. So: two SERIAL engines are the
+    // control, and the fork is only held to bit-exactness where the control
+    // earned it. Rev PLATE-140 does not - it differs from itself by -26 to
+    // -30 dBFS with the first difference landing on a different frame every
+    // run, which is what nondeterminism looks like - and FabFilter Pro-R 2
+    // does.
+    let (Some(mut one), Some(mut two), Some(mut many)) = (build(), build(), build()) else {
+        return;
+    };
+    one.set_offline_fanout(false);
+    two.set_offline_fanout(false);
+    many.set_offline_fanout(true);
+    // And the grain on top, because that is what a live session does.
+    many.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+    let n = BLOCK * 2;
+    let (mut a, mut b, mut c) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
+    let (mut xs, mut ctl, mut ys) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..200 {
+        one.render_offline(&mut a);
+        two.render_offline(&mut b);
+        many.render_offline(&mut c);
+        xs.extend_from_slice(&a);
+        ctl.extend_from_slice(&b);
+        ys.extend_from_slice(&c);
+    }
+    let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let name = Path::new(&plugin)
+        .file_stem()
+        .map_or_else(|| plugin.clone(), |s| s.to_string_lossy().into_owned());
+    let (control, _) = worst_diff(&xs, &ctl);
+    let (worst, first) = worst_diff(&xs, &ys);
+    if peak <= 0.0005 {
+        println!("  {name}: silent at its defaults, so nothing was compared");
+    } else if control > 0.0 {
+        // The plugin disagrees with itself on one thread. All the fork can
+        // be held to is not making it WORSE.
+        println!(
+            "  {LANES} x {name} is not deterministic: two serial renders differ \
+             by {:.1} dBFS, so the fork is held to that bar and not to bits",
+            dbfs(control)
+        );
+        assert!(
+            worst <= control * 4.0,
+            "{LANES} x {name}: the forked, grained walk differs by {:.1} dBFS \
+             where the plugin's own run-to-run spread is {:.1}",
+            dbfs(worst),
+            dbfs(control)
+        );
+    } else {
+        assert!(
+            worst == 0.0,
+            "{LANES} x {name}: two serial renders agree bit for bit, but the \
+             forked, grained walk differs by {:.1} dBFS, first at frame {:?}",
+            dbfs(worst),
+            first.map(|i| i / 2)
+        );
+    }
+    for lane in 0..LANES {
+        let _ = one.load_insert(lane, 0, None, None);
+        let _ = two.load_insert(lane, 0, None, None);
+        let _ = many.load_insert(lane, 0, None, None);
+    }
+}
+
 /// What a transition did to a pair of engines.
 struct Transition {
     /// Bit-exact from frame zero up to the block the change lands on.

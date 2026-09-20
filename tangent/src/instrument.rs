@@ -15303,25 +15303,33 @@ impl Engine {
         max.saturating_sub(r.folder_lat.get(lane).copied().unwrap_or(0))
     }
 
-    /// **Give this offline engine a pool, or take it away.** Tests only.
+    /// **Spread this offline engine's lanes over the other cores.**
     ///
-    /// `Engine::offline` builds none, because an export has no deadline and
-    /// wants every core for the render it is already running flat out. The
-    /// null test needs two engines that disagree about threading and agree
-    /// about audio, so it asks for one here rather than through the
-    /// environment, which is read once per process and cannot answer twice.
-    #[cfg(test)]
+    /// `Engine::offline` builds no pool, and the reason written here used
+    /// to be that "an export has no deadline and wants every core for the
+    /// render it is already running flat out". **It was not running flat
+    /// out.** Measured on 96 hosted reverbs at the exporter's own 512-frame
+    /// blocks: 13.11 s of wall for twelve seconds of audio against 13.32 s
+    /// of CPU, which is 1.0 cores. With this on, the same render is 3.79 s
+    /// on 17.96 s of CPU - 3.5x, for threads the app already knows how to
+    /// start.
+    ///
+    /// **No real-time plan**, deliberately: see [`LanePool::new`]. A bounce
+    /// must not outrank the user interface or a device that is still open,
+    /// and it has no deadline it could miss anyway.
+    ///
+    /// The fold sums lanes in ascending order whether or not the render was
+    /// forked, so the audio is bit-identical either way -
+    /// `the_fork_renders_what_the_single_walk_rendered` holds exactly that,
+    /// and `an_exported_file_is_the_same_whether_or_not_it_forked` holds it
+    /// for a whole file.
     pub fn set_offline_fanout(&mut self, on: bool) {
         let Some(r) = self.offline.as_mut() else {
             return;
         };
-        r.fanout = on
-            .then(|| RtPlan::for_block(256, 48_000))
-            .flatten()
-            .and_then(|plan| {
-                let peers = fanout_peers();
-                (peers > 0).then(|| LanePool::new(peers, None, plan))
-            });
+        r.fanout = on.then(fanout_peers).filter(|p| *p > 0).map(|peers| {
+            LanePool::new(peers, None, None)
+        });
         r.fanout_any = on;
     }
 
@@ -15701,7 +15709,7 @@ impl Engine {
                 let wg = crate::outpath::device_id(Some(&name))
                     .and_then(Workgroup::for_device)
                     .map(Arc::new);
-                Some(LanePool::new(peers, wg, plan))
+                Some(LanePool::new(peers, wg, Some(plan)))
             });
         let renderer = Renderer {
             shared: Arc::clone(&shared),

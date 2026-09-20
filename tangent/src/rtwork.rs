@@ -564,7 +564,16 @@ impl LanePool {
     /// Workers that cannot be made real-time, or cannot join, simply do not
     /// count toward [`Self::ready`], and a caller that checks it will never
     /// fork onto them.
-    pub fn new(width: usize, wg: Option<Arc<Workgroup>>, plan: RtPlan) -> Self {
+    ///
+    /// **`plan` is `None` for a bounce.** An offline render has no deadline
+    /// to miss, and making its workers real-time would be actively wrong:
+    /// they would outrank the user interface and any device that happens to
+    /// be open, to finish a file nobody is waiting on a millisecond for.
+    /// Plain threads running flat out are what it wants. They count toward
+    /// [`Self::ready`] unconditionally, because there is no grant that can
+    /// fail - which is also why an offline fan-out works on the platforms
+    /// where the live one cannot get a real-time grant at all.
+    pub fn new(width: usize, wg: Option<Arc<Workgroup>>, plan: Option<RtPlan>) -> Self {
         let width = width.clamp(1, 16);
         let gate = Arc::new(Gate {
             round: Mutex::new(0),
@@ -833,8 +842,10 @@ fn owed_word(round: u64, lanes: u32) -> u64 {
 /// because joining a workgroup from a timeshare thread succeeds and buys
 /// nothing. The membership is a local so that it leaves on THIS thread when
 /// the body returns, which is what the API requires.
-fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
-    let rt = realtime(plan);
+fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: Option<RtPlan>) {
+    // **No plan is a bounce.** Nothing to ask the kernel for, so nothing
+    // that can be refused: the thread is ordinary and it is ready.
+    let rt = plan.is_none_or(realtime);
     let joined = match wg.map(Workgroup::join) {
         Some(Ok(m)) => Some(m),
         // EALREADY (37) is this thread already in another device's
@@ -846,7 +857,9 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
     // one.** The workgroup is macOS's; Windows and the unixes have the
     // scheduler and nothing to join, so requiring a join there would mean
     // never forking at all. See the module header.
-    let counted = rt && (joined.is_some() || !HAS_WORKGROUP);
+    // A plan-less worker is counted on its own: there is no workgroup for a
+    // bounce to join and no policy for it to have been granted.
+    let counted = rt && (plan.is_none() || joined.is_some() || !HAS_WORKGROUP);
     if counted {
         gate.ready.0.fetch_add(1, Ordering::Relaxed);
     }
@@ -1017,7 +1030,7 @@ mod tests {
     #[test]
     fn every_lane_is_claimed_by_exactly_one_hand() {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
-        let pool = LanePool::new(4, None, plan);
+        let pool = LanePool::new(4, None, Some(plan));
         let counts: Vec<AtomicUsize> = (0..32).map(|_| AtomicUsize::new(0)).collect();
         let lanes = 0b1010_1111_0000_1111_0101_0101_1111_0000u32;
         for _ in 0..200 {
@@ -1040,7 +1053,7 @@ mod tests {
     #[test]
     fn a_pool_that_cannot_start_still_renders() {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
-        let pool = LanePool::new(1, None, plan);
+        let pool = LanePool::new(1, None, Some(plan));
         let seen = AtomicUsize::new(0);
         pool.run(0, &|_| {
             seen.fetch_add(1, Ordering::Relaxed);
@@ -1057,7 +1070,7 @@ mod tests {
     #[test]
     fn a_pool_with_no_workgroup_is_never_ready() {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
-        let pool = LanePool::new(4, None, plan);
+        let pool = LanePool::new(4, None, Some(plan));
         // **On macOS.** No workgroup was handed in, so no worker can be both
         // real-time and joined, whatever the scheduler said.
         //

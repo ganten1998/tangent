@@ -1578,3 +1578,96 @@ throughput the honest statement is: **Tangent's engine does the same work
 for a third to a half less processor time, and REAPER finishes sooner
 because it spreads that work over more cores. Tangent's exporter spreads
 it over one.**
+
+---
+
+# 2026-09-20: the export spreads over the cores, and three platforms agree
+
+## What changed
+
+`Engine::offline` built no pool, and the reason written in the source was
+that "an export has no deadline and wants every core for the render it is
+already running flat out". It was not running flat out. It was running on
+one core.
+
+`LanePool::new` now takes `Option<RtPlan>`. `None` is a bounce: no
+real-time policy asked for and none that can be refused, so the worker
+counts as ready on its own. That is deliberate twice over. A bounce must
+not outrank the user interface or a device that is still open - it has no
+deadline it could miss. And it means the offline fan-out needs no grant,
+which is why it works where the live one cannot (see below).
+
+The export and the freeze both call `set_offline_fanout(true)`.
+
+## What it is worth, and it is not one number
+
+Render calls only, quiet machine, serial against forked:
+
+| desk | serial | forked | gain |
+|---|---:|---:|---:|
+| 8 lanes x Analog, 8 voices | 501.3 us | 150.9 us | **3.3x** |
+| 32 lanes x 3 IR, 0.5 s | 646.8 | 220.7 | 2.9x |
+| 16 lanes x denoise | 171.1 | 65.3 | 2.6x |
+| 16 lanes x [EQ, comp, plate] | 137.5 | 54.5 | 2.5x |
+| 96 bays x Pro-R 2 @ 512 fr | 11657.6 | 3372.1 | **3.5x** |
+| 32 lanes x 3 EQ (cheap) | 60.6 | 41.5 | 1.5x |
+
+**It scales with how much work the tracks carry.** A desk of cheap EQs
+gets 1.5x because there is not enough per lane to pay for the dispatch.
+
+And a warning about measuring it on a real project: timing the probe
+rendering 40 s of `moscow1` gives 8.80 s serial against 8.14 s forked,
+which looks like nothing. The reason is in the same line of output -
+`user=4.35` against `real=8.80`. Half that wall is the process starting
+and Rhodes loading its samples, and the render is a fraction of what is
+being timed. It is the same error that put REAPER's launch into its
+figure. Time the render, not the program.
+
+## Is it the same audio
+
+Four ways, each stronger than the last:
+
+- `the_fork_renders_what_the_single_walk_rendered` - four built-in shapes,
+  bit-exact, as before.
+- `the_fork_and_the_grain_are_one_sound` - NEW, and it closes a real hole:
+  the fork was only ever tested with the grain off and the grain only ever
+  on one thread, while a live session runs both. All four corners against
+  the plain walk, bit-exact.
+- `the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins` -
+  NEW, a real VST3, forked AND grained.
+- Two of the owner's own songs rendered through the export path both ways.
+
+That last one needed the control that the rest of this document keeps
+teaching. Forked against serial: knowersomething1 -19.3 dBFS, moscow1
+-41.4. Serial against serial: -18.2 and -25.0. **On both songs the fork
+changes the output LESS than rendering twice serially does.**
+
+The hosted test needed the same lesson built into it. Rev PLATE-140 fails
+bit-exactness against the fork - and it fails it against ITSELF, by -26 to
+-36 dBFS with the first difference on a different frame every run, which
+is a reverb modulating its delay lines with noise. So the test renders two
+SERIAL engines as a control and only demands bits where the control earned
+them. Pro-R 2 earns them and is held to them; PLATE-140 is held to its own
+spread.
+
+## Three platforms
+
+All 20 grain tests pass on macOS (ARM), Linux x86 (void, Ivy Bridge, no
+FMA and no AVX2) and FreeBSD x86 (GhostBSD, Tiger Lake, AVX-512). A
+different float environment on each and the same answers.
+
+**The real-time grant is where they differ, and it decides whether the
+LIVE fan-out works at all:**
+
+| | grant | live fan-out | offline fan-out |
+|---|---|---|---|
+| macOS | mach policy + audio workgroup | yes | yes |
+| Linux | `ulimit -r` 99 via `@audio`, rtkit present | yes | yes |
+| FreeBSD | `rtprio` refused to a normal uid - root only | **no** | **yes** |
+
+On FreeBSD `rtprio 10 /usr/bin/true` fails with RTP_SET: Operation not
+permitted for uid 1001, because `PRIV_SCHED_RTPRIO` is root's. A worker
+that cannot take the policy does not count toward `ready`, so the live
+fan-out there collapses to the serial walk. The offline pool asks for no
+policy and is unaffected - which is the argument for having built it that
+way rather than a happy accident.
