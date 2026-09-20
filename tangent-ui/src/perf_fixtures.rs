@@ -372,6 +372,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             theme: s.theme_name.clone(),
             palette: s.palette_choice,
             palette_auto: s.palette_auto,
+            view: crate::app::TangentApp::view_word(s.open_view).to_owned(),
         }),
         take_name: Some(s.record_take_name.clone().unwrap_or_default()),
         feel: Some(crate::arrangement::Feel {

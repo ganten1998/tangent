@@ -96,6 +96,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   slow core doing some of the work beats it doing none. On this machine
   that is the difference between a bounce taking 3.8 seconds and 1.9.
 
+- **A session opens on the view you left it on.** Save a song with the
+  arrangement showing and it comes back on the arrangement; save it on the
+  mixer and it comes back on the mixer. It travels in the project file
+  beside the theme, so it follows the song rather than the machine.
+
 ### Fixed
 
 - **A frozen track's effects now look and behave frozen.** They are already
