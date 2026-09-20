@@ -1,0 +1,44 @@
+# **Line endings are LF in the working tree, on every platform.**
+#
+# Windows git defaults to `core.autocrlf=true`, which rewrites every line on
+# checkout. That is ordinarily harmless and here it is not: a cluster of tests
+# in `tangent/src/desktop.rs` and `tangent/src/instrument.rs` reads its OWN
+# SOURCE TEXT and asserts on byte offsets into it, because the thing being
+# checked is an ORDERING that no behavioural test can see (see
+# `a_device_change_forgets_what_the_decoder_refused`). One extra byte per line
+# moves every offset.
+#
+# Measured on Windows 11, same commit, the `tangent` binary only:
+#
+#     core.autocrlf=true    1009 passed; 16 failed
+#     core.autocrlf=false   1020 passed;  5 failed
+#
+# Eleven pure checkout artefacts, and the giveaway was an offset landing inside
+# a multi-byte character: "end byte index 162500 is not a char boundary; it is
+# inside '—'". Without this file a Windows contributor's first run is red for a
+# reason that has nothing to do with their change.
+* text=auto eol=lf
+
+# **The vendored copies keep the bytes upstream shipped.**
+#
+# `tangent-record/vendor/asio-sys` is stored CRLF in the index because that is
+# how upstream wrote it, and `vendor/README.md` turns byte-comparability with
+# upstream into the argument for every patch in these trees. Normalising them
+# would rewrite thirteen files and break exactly the property the vendor
+# READMEs rest on. `-text` means "never convert, in either direction".
+tangent-record/vendor/asio-sys/** -text
+tangent-record/vendor/cpal/.gitignore -text
+
+# Binary, so never transformed and never diffed as text.
+*.wav   binary
+*.aiff  binary
+*.flac  binary
+*.mp3   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.icns  binary
+*.ico   binary
+*.tan   binary
+*.vst3  binary
+*.pdf   binary

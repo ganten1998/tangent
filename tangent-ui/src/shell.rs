@@ -1734,8 +1734,21 @@ mod tests {
     /// cannot happen — one export window, one dialog slot — and `surface`
     /// says so out loud rather than degrading quietly into the old
     /// behaviour.
+    ///
+    /// **Debug builds only, and that is the honest shape of it.** The check it
+    /// is asserting on is a `debug_assert!`, which is compiled OUT of a release
+    /// build - so under `cargo test --release` this test does not panic, and a
+    /// `#[should_panic]` that does not panic FAILS. It failed that way on macOS,
+    /// Linux and Windows alike the first time anyone ran the suite in release;
+    /// the gate never saw it because the gate runs debug. Ignoring it in release
+    /// says "this cannot be checked here" instead of reporting a defect that is
+    /// not there.
     #[test]
     #[should_panic(expected = "two surfaces at Uncovered at once")]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "the check is a debug_assert!, compiled out of a release build"
+    )]
     fn two_surfaces_on_one_rung_is_caught() {
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
