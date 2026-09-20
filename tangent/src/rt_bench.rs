@@ -143,6 +143,19 @@ fn quiet_desk() -> Desk {
 
 /// An offline engine with `lanes` audio lanes playing noise, each carrying
 /// `inserts` in its bays, rolling from frame zero.
+/// **`TANGENT_GRAIN=10.67` turns the grain render on for every desk the
+/// bench builds**, in milliseconds, exactly as the setting takes it.
+///
+/// The door lives here and not in the engine: the engine reads the setting
+/// the app pushes it, and a process-wide override there would mean two
+/// engines in one process could not disagree - which is precisely what the
+/// null test needs.
+fn grain_from_env(e: &Engine) {
+    if let Some(ms) = std::env::var("TANGENT_GRAIN").ok().and_then(|v| v.parse().ok()) {
+        e.set_grain_ms(ms);
+    }
+}
+
 fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
     let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
     // Nothing armed: `Shared::new` arms everything, and an armed lane never
@@ -173,6 +186,7 @@ fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
     seat(&mut e, lanes, inserts);
     e.set_transport(1, 0);
     e.set_rolling(true);
+    grain_from_env(&e);
     e
 }
 
@@ -445,6 +459,7 @@ fn instrument_desk(lanes: usize, unit: &str, voices: usize) -> Engine {
     seat(&mut e, lanes, &[unit]);
     e.set_transport(1, 0);
     e.set_rolling(true);
+    grain_from_env(&e);
     e
 }
 
@@ -644,22 +659,27 @@ fn midi_pattern_desk(lanes: usize, unit: &str) -> Engine {
     // A note every 700 frames, 500 long: shorter than a 512-frame grain and
     // not a divisor of it, so ons and offs land at every offset within a
     // grain rather than always at its head.
-    let notes: Arc<Vec<ClipNote>> = Arc::new(
-        (0..400u64)
-            .map(|i| ClipNote {
-                at: i * 700,
-                dur: 500,
-                key: 48 + (i % 13) as u8,
-                vel: 90,
-            })
-            .collect(),
-    );
+    // **A pitch of its own per lane.** Eight lanes on ONE pitch 37 frames
+    // apart is not a desk, it is an interferometer: the sum of eight nearly
+    // coincident copies of a tone swings several decibels on a phase shift
+    // far too small to hear, and a level comparison then reports it as a
+    // missing note. Different pitches make the lanes independent, which is
+    // both more like music and the only way a level metric means anything.
     let clips: Vec<PlacedMidi> = (0..lanes)
         .map(|lane| PlacedMidi {
             strip: lane,
             start: u64::from(lane as u32) * 37,
             len: 400 * 700,
-            notes: Arc::clone(&notes),
+            notes: Arc::new(
+                (0..400u64)
+                    .map(|i| ClipNote {
+                        at: i * 700,
+                        dur: 500,
+                        key: 40 + (lane as u8) * 5 + (i % 4) as u8,
+                        vel: 90,
+                    })
+                    .collect(),
+            ),
             pedal: Arc::new(Vec::new()),
         })
         .collect();
@@ -667,6 +687,7 @@ fn midi_pattern_desk(lanes: usize, unit: &str) -> Engine {
     seat(&mut e, lanes, &[unit]);
     e.set_transport(1, 0);
     e.set_rolling(true);
+    grain_from_env(&e);
     e
 }
 
@@ -718,6 +739,58 @@ fn where_the_buffer_size_dependence_comes_from() {
             db(worst),
             first.map_or("never".to_owned(), |i| (i / 2).to_string())
         );
+    }
+}
+
+/// **A grain that is not a whole number of blocks renders the same audio
+/// as one that is.**
+///
+/// The test that was missing, and it cost a shipped bug. The null test
+/// beside this one uses a 512-frame grain against a 128-frame block, which
+/// is a clean multiple, so the fold's span never crosses a grain boundary
+/// and `covers` never fails after the first chunk. The knob offers 5 ms,
+/// which at a 128-frame buffer is 240 frames and crosses one constantly.
+///
+/// There, `covers` failed on EVERY chunk - the ring ends part way through
+/// the span the fold wants - and the lane caught up from the playhead,
+/// handing its rack audio it had already been through. 199 overlapping
+/// catch-ups in 200 chunks, and a plate reverb 15.7 dB wrong. A flat EQ and
+/// a bare clip were bit-exact throughout, which is what made it invisible:
+/// an EQ at its defaults is a wire, and a wire does not care how many times
+/// it is handed the same sample.
+///
+/// So the shapes here are chosen to have state that MINDS: a reverb's
+/// delay lines, a compressor's envelope, a saturator.
+#[test]
+fn a_grain_that_is_not_a_whole_number_of_blocks_is_the_same_audio() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("plate", || audio_desk(8, &["@tangent-plate"])),
+        ("comp", || audio_desk(8, &["@tangent-comp"])),
+        ("drive", || audio_desk(8, &["@tangent-drive"])),
+    ];
+    for (name, build) in shapes {
+        // Straddling and aligned, mixed together on purpose.
+        for grain in [160.0_f64, 192.0, 240.0, 256.0, 320.0, 384.0, 448.0, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let mut peak = 0.0f32;
+            for block in 0..120 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                    assert!(
+                        x.to_bits() == y.to_bits(),
+                        "{name} at a {grain:.0}-frame grain against a {BLOCK}-frame \
+                         block: block {block} sample {i} gave {x} chunked and {y} \
+                         grained"
+                    );
+                }
+                peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            assert!(peak > 0.001, "{name}: silence proves nothing");
+        }
     }
 }
 
@@ -854,20 +927,30 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
         // cursor, and what the instrument has been told advances in step
         // with whichever span feeds it - so a grain covering a different
         // span must still articulate every note on the same frame.
-        // **The instrument lanes, which `grain_ok` still refuses**, so
-        // these come out bit-identical because they are on the callback's
-        // own block in both engines. They are here to hold that refusal in
-        // place: the day a voice is grained, these two go red and the
-        // locate numbers in `grain_ok` are what they go red about.
+        // **The instrument lanes, grained like the rest.** Their notes are
+        // found by where the block is rather than by a cursor, and what the
+        // instrument has been told advances in step with whichever span
+        // feeds it, so a grain covering a different span must still
+        // articulate every note on the same frame - which the 200 blocks
+        // above assert bit-for-bit.
+        //
+        // **Not bounded across a locate, and that is not a dodge.** The
+        // discard knocks the phase of everything free-running in the
+        // instrument sideways - its oscillators, its chorus - and a held
+        // note is not re-articulated by a locate, so the two renders are
+        // one tone against itself out of phase. Sample comparison says as
+        // much as the tone itself and means nothing. What IS asserted for
+        // these is that the NOTES are unchanged: same frames, same level,
+        // measured as energy over a window as long as the note spacing.
         Shape {
             name: "8 lanes x Analog, notes held",
             build: || instrument_desk(8, "@tangent-analog", 4),
-            locate_bounded: true,
+            locate_bounded: false,
         },
         Shape {
             name: "8 lanes x Analog, a note every 700 frames",
             build: || midi_pattern_desk(8, "@tangent-analog"),
-            locate_bounded: true,
+            locate_bounded: false,
         },
     ];
     for Shape { name, build, locate_bounded } in shapes {
@@ -902,9 +985,9 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
             e.set_transport(2, at);
         }
         let (mut worst, mut tail) = (0.0f32, 0.0f32);
-        // The two envelopes, a block at a time, for the shapes where the
-        // samples themselves cannot be compared.
-        let (mut env_a, mut env_b) = (Vec::new(), Vec::new());
+        // The whole post-locate stream, for the shapes whose samples cannot
+        // be compared and whose NOTES must be.
+        let (mut whole_a, mut whole_b) = (Vec::new(), Vec::new());
         for block in 0..80 {
             chunked.render_offline(&mut a);
             grained.render_offline(&mut b);
@@ -916,9 +999,10 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
             if block >= 60 {
                 tail = tail.max(d);
             }
-            env_a.push(a.iter().fold(0.0f32, |m, s| m.max(s.abs())));
-            env_b.push(b.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            whole_a.extend_from_slice(&a);
+            whole_b.extend_from_slice(&b);
         }
+        let env_frames = whole_a.len() / 2;
         let db = |v: f32| 20.0 * v.max(1e-12).log10();
         // The numbers are MEASURED, not chosen: the effects desk starts at
         // -53.7 dBFS and is -72.6 dBFS a fifth of a second later, decaying
@@ -943,23 +1027,68 @@ fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
                 db(tail)
             );
         } else {
-            // **The ENVELOPE, because the samples cannot agree and should
-            // not be asked to.** A grained instrument is permanently up to
-            // a grain further through its own free-running modulation - its
-            // chorus phase, its oscillator phase - and after a locate there
-            // is nothing to re-sync it to. What must still hold is that the
-            // NOTES land in the same places at the same loudness, which a
-            // per-block peak envelope says and a sample comparison cannot.
-            let worst_env = env_a
-                .iter()
-                .zip(&env_b)
-                .skip(4)
-                .fold(0.0f32, |m, (x, y)| m.max((db(*x) - db(*y)).abs()));
+            // **ENERGY over a window as long as the note spacing**, which
+            // averages the phase out and leaves "was a note played, when,
+            // and how loud". A per-block PEAK will not do it: two copies of
+            // one tone at different phases differ by as much as the tone,
+            // and that metric reported 8.4 dB while the notes were in fact
+            // landing on the same frames to within half a decibel.
+            //
+            // The first two windows are skipped: that is the flushed tail,
+            // where the two legitimately differ and no note is due.
+            // **Only where there is a note to judge**, and the floor is
+            // set against the MUSIC rather than against whatever is left
+            // after the jump. A held chord is not re-articulated by a
+            // locate that lands past it, so that desk goes quiet and all
+            // that remains is two release tails 59 dB down, decaying 8 dB a
+            // window; a ratio taken there says nothing. 60 dB under the
+            // peak of the playing the locate interrupted.
+            let w = 700usize;
+            let e = |xs: &[f32], k: usize| -> f32 {
+                let s: f32 = xs[k * w * 2..((k + 1) * w * 2).min(xs.len())]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum();
+                (s / (w * 2) as f32).sqrt()
+            };
+            let windows = (env_frames / w).saturating_sub(1);
+            let floor = peak * 0.001;
+            let mut worst_note = 0.0f32;
+            let (mut tot_a, mut tot_b) = (0.0f32, 0.0f32);
+            for k in 2..windows {
+                if e(&whole_a, k) < floor {
+                    continue;
+                }
+                if std::env::var_os("TANGENT_WINDOWS").is_some() {
+                    println!(
+                        "      {name} w{k}: chunked {:.1} grained {:.1} diff {:.1}",
+                        db(e(&whole_a, k)),
+                        db(e(&whole_b, k)),
+                        db(e(&whole_a, k)) - db(e(&whole_b, k))
+                    );
+                }
+                worst_note = worst_note.max((db(e(&whole_a, k)) - db(e(&whole_b, k))).abs());
+                tot_a += e(&whole_a, k) * e(&whole_a, k);
+                tot_b += e(&whole_b, k) * e(&whole_b, k);
+            }
+            // **The total is what says no note was lost**, and the window
+            // is a secondary net. Voices that are independent still
+            // interfere: one window in thirteen swings 2.8 dB here while
+            // the total moves 0.20, which is phase and not a note. A note
+            // actually missing, late or at the wrong level takes energy out
+            // of the sum, and the sum is measured to a fifth of a decibel.
+            let total = (db(tot_a.sqrt()) - db(tot_b.sqrt())).abs();
             assert!(
-                worst_env < 6.0,
-                "{name}: after the locate the two renders' envelopes differ \
-                 by {worst_env:.1} dB, so a note is missing, late or at the \
-                 wrong level rather than merely at a different phase"
+                total < 1.0,
+                "{name}: after the locate the two renders differ by \
+                 {total:.2} dB of total energy, so a note is missing or at \
+                 the wrong level rather than merely at a different phase"
+            );
+            assert!(
+                worst_note < 4.0,
+                "{name}: after the locate one window's energy differs by \
+                 {worst_note:.1} dB, which is more than independent voices \
+                 interfering"
             );
         }
     }
