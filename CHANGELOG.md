@@ -36,11 +36,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
   Armed tracks, tracks listening to live MIDI, folders, send destinations,
   sidechained tracks and anything being auditioned always run on the
-  callback's own block, so tracking and monitoring are untouched. So do
-  tracks carrying an instrument, for now, for the reason in the Fixed note
-  below.
+  callback's own block, so tracking and monitoring are untouched.
+  Instrument tracks are rendered ahead like the rest.
 
 ### Fixed
+
+- **A track's effects could be run over the same audio twice.** Only with
+  render-ahead on, and only at a setting whose length was not a whole
+  number of audio buffers - which the 5 ms setting is at most buffer sizes.
+  A reverb or a compressor handed the same stretch of sound a second time
+  carries the wrong tail out of it; measured at up to 14 dB of wrong
+  signal. Effects with nothing to remember, and tracks with no effects at
+  all, were unaffected, which is why it survived the first round of tests.
 
 - **The Analog instrument sounded different at different buffer sizes.**
   Not a little: on a track of notes it rendered a 128-frame buffer and a

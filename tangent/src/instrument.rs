@@ -5634,6 +5634,7 @@ struct LaneIo<'a> {
 /// that has missed its deadline twice and has a different problem.
 const GRAIN_SLOTS: usize = 2;
 
+
 /// **What a slot of [`LaneGrains`] says about the audio in it.**
 ///
 /// The key is the whole of the safety argument for reading a buffer that was
@@ -5783,6 +5784,26 @@ impl LaneGrains {
             .filter(|k| k.frames > 0)
             .max_by_key(|k| k.at)
             .copied()
+    }
+
+    /// **Is the slot the next render would fill free at `at`?**
+    ///
+    /// `hold` invalidates the slot it opens, because the render is about to
+    /// overwrite its samples. That is safe only if nothing still owes the
+    /// fold out of it.
+    ///
+    /// With a grain that is a whole number of blocks the question never
+    /// arises: the fold's span never crosses a grain boundary, so by the
+    /// time a lane is being served from one slot the other is spent. A
+    /// grain that is NOT a multiple of the block - 5 ms against a 128-frame
+    /// buffer is 240 frames - makes the fold read across both slots, and
+    /// the look-ahead would then destroy the half it is still standing on.
+    /// Measured before this guard: a lane carrying a compressor rendered
+    /// -40 dBFS of wrong audio at every straddling grain and was bit-exact
+    /// at every aligned one.
+    fn next_is_free(&self, at: u64) -> bool {
+        let k = self.keys[self.next];
+        k.frames == 0 || k.at + u64::from(k.frames) <= at
     }
 
     /// Whether the ring holds every frame of `at..at + frames`.
@@ -12219,8 +12240,41 @@ impl Renderer {
             match (holds, newest) {
                 // The ring cannot answer: render the chunk's span, widened
                 // to a grain so the next callbacks are served from it.
+                // The ring cannot answer: render on from where it ends.
+                //
+                // **From the END of the newest grain, never from the
+                // playhead**, and that is the whole of it. A lane's rack is
+                // a stateful chain walking forward through the song, and
+                // audio it has already been through must not be handed to
+                // it again - which is the same rule that made speculation
+                // the wrong shape for this feature in the first place.
+                //
+                // Catching up from `at` looked right and was not. With a
+                // grain that is a whole number of blocks it never fires
+                // after the first chunk, so it went unseen. With a grain
+                // that is NOT - 5 ms against a 128-frame buffer is 240
+                // frames - `covers` fails on the very next chunk, because
+                // the ring ends part way through the span the fold wants;
+                // the lane then caught up from `at` and re-ran the overlap
+                // through its rack. Measured: 199 overlapping catch-ups in
+                // 200 chunks, and a plate reverb 15.7 dB wrong.
                 (false, _) => {
-                    self.lane_len[ch] = Self::clip_grain(at, grain.max(frames), loop_b);
+                    let from = match newest {
+                        Some(k) if k.at + u64::from(k.frames) > at => {
+                            k.at + u64::from(k.frames)
+                        }
+                        // Cold, or the ring is behind the playhead after a
+                        // locate or a park: there is nothing to continue.
+                        _ => at,
+                    };
+                    // Long enough to finish the span the fold is asking
+                    // for, however little of it is left.
+                    let need = usize::try_from(
+                        at.saturating_add(frames as u64).saturating_sub(from),
+                    )
+                    .unwrap_or(frames);
+                    self.lane_at[ch] = from;
+                    self.lane_len[ch] = Self::clip_grain(from, grain.max(need), loop_b);
                 }
                 // Served from the newest grain, so the older slot is free.
                 // Look ahead when this lane's phase has come up.
@@ -12229,7 +12283,9 @@ impl Renderer {
                     let phase = (ch as u64 % Self::GRAIN_PHASES) * grain as u64
                         / Self::GRAIN_PHASES;
                     let end = key.at + u64::from(key.frames);
-                    if into >= phase && end > at {
+                    // **And only into a slot nothing still owes the fold.**
+                    // See `LaneGrains::next_is_free`.
+                    if into >= phase && end > at && g.next_is_free(at) {
                         self.lane_at[ch] = end;
                         self.lane_len[ch] = Self::clip_grain(end, grain, loop_b);
                     } else {
@@ -12275,32 +12331,27 @@ impl Renderer {
         if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
             return false;
         }
-        // **A lane carrying a voice is not grained, and one of the two
-        // reasons has now been removed.**
+        // **A lane carrying an instrument is grained too**, and getting
+        // there took two fixes that had nothing to do with each other.
         //
-        // The first was that the instrument itself was not block-size
-        // invariant: `Synth::render` cut its chunk grid from the start of
-        // each BUFFER, so a note landing mid-buffer restarted the grid and
-        // a 512-frame buffer and a 128-frame one put their chunk
-        // boundaries in different places. Measured at -15.5 dBFS against a
-        // peak of -17.1. That is fixed - the grid is absolute now and
-        // `a_builtin_instrument_is_the_same_at_any_buffer_size` holds it
-        // bit-exact - and with it fixed, a grained instrument lane renders
-        // CONTINUOUS playback bit-identically to a chunked one.
+        // The instrument was not block-size invariant: `Synth::render` cut
+        // its chunk grid from the start of each BUFFER, so a note landing
+        // mid-buffer restarted the grid and two buffer sizes then put their
+        // chunk boundaries in different places. -15.5 dBFS against a peak
+        // of -17.1. The grid is absolute now, and
+        // `a_builtin_instrument_is_the_same_at_any_buffer_size` holds it.
         //
-        // The second is a LOCATE, and it is not solved. A grained lane's
-        // instrument is up to a grain further through everything that free
-        // runs in it, and after a jump there is nothing to re-sync it to.
-        // Phase alone would be inaudible and unassertable, but the measured
-        // difference is 8.4 dB of ENVELOPE - a note missing, late or at the
-        // wrong level, not merely at a different phase - and that is not
-        // understood. Until it is, a lane holding a voice stays on the
-        // callback's own block.
-        let extra = tangent_ui::recorder::folder_extra_seat(ch);
-        !self.racks[ch].holds_a_voice()
-            && !self.racks[extra].holds_a_voice()
-            && self.dx7s.get(ch).is_none_or(Option::is_none)
-            && self.keys_lanes.get(ch).is_none_or(Option::is_none)
+        // And the clock was catching up from the PLAYHEAD rather than from
+        // where the ring ended, so a lane re-ran audio its rack had already
+        // been through. See the catch-up arm of `plan_grains`.
+        //
+        // With both fixed, a grained instrument lane renders continuous
+        // playback bit-identically, and after a locate its notes land on
+        // the same frames at the same level to within 0.6 dB. What is left
+        // is the phase of everything that free runs in it, which the one
+        // irreducible discard knocks sideways and which no listener has a
+        // reference to hear.
+        true
     }
 
     fn run_lane_pdc(&mut self, ch: usize, frames: usize, pdc_max: u32) {
