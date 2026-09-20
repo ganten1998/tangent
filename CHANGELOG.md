@@ -43,6 +43,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Twelve seconds of that desk takes 4.9 seconds to render at a 64-frame
   buffer with this on, against 12.4 with it off.
 
+  **What it does not affect: anything you export.** Bouncing a mix and
+  freezing a track build their own renderer and never render ahead, so a
+  file you make is the same file whether this is on or off.
+
+  **On a sampled instrument you may hear a different take.** Starting
+  playback with this on perturbs the first moments enough that an
+  instrument which varies itself between notes - most sampled pianos and
+  keyboards do - picks a different set of samples from then on. Measured
+  on a five-track Rhodes session: a decibel and a half either way over
+  fifteen seconds, in both directions depending on where playback started.
+  It is a different performance of the same part, not a wrong one, and it
+  is the same thing those instruments do between any two takes.
+
   **A 32-frame buffer becomes possible at all**, which it was not before:
   without this, every single block on that desk was late. At 32 frames the
   5 ms setting is the better one and 10.7 ms is not, which is the one place
