@@ -2715,17 +2715,40 @@ mod tests {
     /// confirmation would not know it was about to remove the impulse that was
     /// playing.
     ///
-    /// Written against [`ir_same`] directly rather than through the panel
-    /// because the mixed spelling only ARISES on Windows, and this has to
-    /// state the contract on the machine the suite is usually run on.
+    /// **The mixed-spelling half of this asserts something DIFFERENT on each
+    /// platform, deliberately.** The Windows tester's point, and it was a fair
+    /// one: written only as "these two are equal", the whole test is a
+    /// tautology on macOS and Linux, where the two spellings are already the
+    /// same string - so it would read as coverage on the machine this suite is
+    /// usually run on while only Windows was actually checking anything.
+    ///
+    /// So the backslash case is asserted BOTH ways. On Windows `\` is a
+    /// separator and the two name one place. On Unix it is an ordinary
+    /// character in a filename, so they are genuinely different paths, and
+    /// asserting they stay different is worth as much: it is what would catch
+    /// somebody "fixing" this by normalising separators by hand, which would
+    /// silently merge two real, distinct Unix filenames.
     #[test]
     fn a_path_from_another_platform_names_the_same_impulse() {
         // The spelling a Windows browser builds, against the spelling a
-        // session saved elsewhere carries. On Unix these are already the same
-        // string and the test is a tautology; on Windows it is the whole bug.
+        // session saved elsewhere carries.
         let built = ir_join("/m/IRs", "Cabs");
         assert!(ir_same(&built, "/m/IRs/Cabs"), "{built} is not /m/IRs/Cabs");
         assert!(ir_same("/m/IRs", "/m/IRs"), "a path is not itself");
+
+        // The literal mixed spelling, which is the case that only ARISES on
+        // Windows - and the only assertion in here with teeth on both.
+        #[cfg(windows)]
+        assert!(
+            ir_same("/m/IRs\\Cabs", "/m/IRs/Cabs"),
+            "a backslash is a separator on Windows and these name one place"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !ir_same("/m/IRs\\Cabs", "/m/IRs/Cabs"),
+            "a backslash is a FILENAME character here; merging these would \
+             collapse two real and different paths"
+        );
 
         // And the three panel answers that hang off it.
         assert_eq!(ir_where(&built, "/m/IRs"), "IRs/Cabs");
