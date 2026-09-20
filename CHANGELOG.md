@@ -103,6 +103,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A track could lose its waveform and never get it back.** The clip stayed
+  drawn in the arrangement with nothing in it, and changing the buffer size
+  made it worse rather than better.
+
+  When a file will not decode, that answer is remembered so the app does not
+  try it again on every frame. Changing the audio device empties every cache
+  and re-reads every file in the session at once - and it was leaving those
+  refusals in place, so a file that lost that race once was skipped for the
+  rest of the session. Each later buffer change cleared the cache and left
+  the refusal standing, which is why it looked like the change caused it.
+
+  The refusals are forgotten with the caches now. The largest file in a
+  session is the likeliest to lose that race, which is why it tended to be
+  the same track every time.
+
+
 - **A frozen track's effects now look and behave frozen.** They are already
   in the rendered file, so swapping, bypassing or deleting one changed
   nothing anybody could hear until the track thawed - and the press landed

@@ -12665,6 +12665,27 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.stretch_cache.clear();
+                // **And every refusal, because a refusal belongs to the
+                // world it was made in.**
+                //
+                // `warm_refused` exists so a file that answered "no" is not
+                // asked again every pass, and within one rate that is right.
+                // Across a device change it is not: the caches below were
+                // just emptied, so `queue_warm` is about to ask for every
+                // file in the session at once - the worst decode in the app,
+                // by its own comment - and a file that loses that race once
+                // was skipped for the rest of the session. The clip stayed
+                // drawn in the arrangement with nothing to draw in it, and
+                // no later buffer change could bring it back, because each
+                // one cleared the cache and left the refusal standing.
+                //
+                // Reported on a 68 MB bass take, the largest file in the
+                // session and so the likeliest to be the one that lost.
+                // Clearing here costs one retry per device change, which is
+                // bounded; the per-frame refill the set was written against
+                // is not what this is.
+                self.warm_refused.clear();
+                self.refused_why.clear();
                 // Anything the crew is still decoding is at the OLD rate.
                 self.pool.invalidate();
                 self.warm.clear();
@@ -20404,6 +20425,53 @@ mod tests {
             (count.done, count.total),
             (work.len(), work.len()),
             "the meter reached full on the frame the work did"
+        );
+    }
+
+    /// **A device change forgets every refusal**, or one bad decode is
+    /// permanent.
+    ///
+    /// `warm_refused` stops a file that answered "no" being asked again
+    /// every pass, and within one sample rate that is right. Across a
+    /// device change it is not. `start_engine` empties the clip, stretch,
+    /// pad and sampler caches and raises `clips_owed`, so `queue_warm` then
+    /// asks for every file in the session at once - "the single worst
+    /// decode in the app", by the comment standing over it. A file that
+    /// lost that race once was skipped for the rest of the session: the
+    /// clip stayed drawn in the arrangement with nothing to draw in it, and
+    /// every later buffer change made it worse, because each cleared the
+    /// cache and left the refusal standing.
+    ///
+    /// Reported on a 68 MB bass take - the largest file in that session,
+    /// and so the likeliest to be the one that lost.
+    ///
+    /// A source scan, like its neighbours: `DesktopApp` cannot be built in
+    /// a test.
+    #[test]
+    fn a_device_change_forgets_what_the_decoder_refused() {
+        let src = include_str!("desktop.rs");
+        let at = src
+            .find("fn start_engine(&mut self, ctx: &egui::Context)")
+            .expect("start_engine is still called that");
+        let body = &src[at..];
+        let clears = body
+            .find("self.track_cache.clear();")
+            .expect("start_engine still empties the clip cache");
+        // The window between emptying the caches and raising the flag that
+        // refills them: whatever is forgotten has to be forgotten here.
+        let owed = body.find("self.clips_owed = true;").expect("and still raises the flag");
+        assert!(owed > clears, "the flag is raised after the caches are emptied");
+        let window = &body[clears..owed];
+        assert!(
+            window.contains("self.warm_refused.clear();"),
+            "a device change empties every cache and leaves the REFUSALS \
+             standing, so a file that failed one decode is skipped for the \
+             rest of the session and its clip never draws again"
+        );
+        assert!(
+            window.contains("self.refused_why.clear();"),
+            "the refusal went but its reason stayed, and the sweep that \
+             expires one keys off the other"
         );
     }
 
