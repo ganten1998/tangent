@@ -75,6 +75,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   callback's own block, so tracking and monitoring are untouched.
   Instrument tracks are rendered ahead like the rest.
 
+- **Bouncing and freezing now use every core.** They rendered on one,
+  because the code believed an export was "already running flat out on
+  every core it can reach" and it was not. Depending on how much work your
+  tracks carry it is 1.5 to 3.5 times faster - most on tracks with real
+  instruments and reverbs, least on a desk of simple EQs.
+
+  The file is the same file. The tracks are summed in the same order
+  whether or not the work was spread, and two of the owner's own songs
+  rendered both ways differ less than the same song rendered twice the old
+  way.
+
+  It also works on FreeBSD, where spreading live playback across cores
+  cannot: that needs a real-time scheduling grant the system only gives
+  root, and a bounce asks for no such thing.
+
 ### Fixed
 
 - **A frozen track's effects now look and behave frozen.** They are already
