@@ -1199,6 +1199,19 @@ pub struct Settings {
     /// 4200 to 36% and none; at 32 frames, from 124% and every block late
     /// to 48% and none.
     pub render_ahead_ms: f64,
+
+    /// **Which of the three views the window was left showing**, so opening
+    /// a session puts back the one it was saved with: 0 piano, 1 mixer,
+    /// 2 arrangement. Anything else reads as the piano.
+    ///
+    /// It lives here rather than on the app because the document's copy
+    /// travels through `DeskSnap::look`, and `App::desk_view` - the one
+    /// place a document is built - is handed the settings and nothing else.
+    /// Kept in step with `arrangement_open` and `mixer_open` once a frame
+    /// rather than at each of the seven places they move, because a sync
+    /// point that cannot be forgotten is worth more than one that is
+    /// cheaper.
+    pub open_view: u8,
     /// **Whether the palette FOLLOWS the theme.**
     ///
     /// On by default, which is what "auto" means in the track menu: every
@@ -1985,6 +1998,7 @@ impl Default for Settings {
             auto_palette: true,
             palette_choice: 0,
             render_ahead_ms: 0.0,
+            open_view: 0,
             palette_auto: true,
             // **Channel 0 ships as the DRUMPAD, channel 1 as the DX7.** The
             // two built-in instruments sit side by side in the first two
@@ -3271,6 +3285,12 @@ impl Settings {
             // spelling of the same mode.
             s.render_ahead_ms = if v < 0.0 { -1.0 } else { v.clamp(0.0, 50.0) };
         }
+        if let Some(n) = map.shift_remove("open_view").and_then(|v| v.as_i64()) {
+            // Anything that is not one of the three reads as the piano,
+            // which is what a settings file from before this says by
+            // saying nothing.
+            s.open_view = u8::try_from(n).unwrap_or(0).min(2);
+        }
         if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
             s.palette_choice =
                 n.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
@@ -4548,6 +4568,7 @@ impl Settings {
         map.insert("auto_palette".into(), Value::Bool(self.auto_palette));
         map.insert("palette_choice".into(), Value::from(self.palette_choice));
         map.insert("render_ahead_ms".into(), Value::from(self.render_ahead_ms));
+        map.insert("open_view".into(), Value::from(i64::from(self.open_view)));
         map.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
         map.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
         map.insert(
@@ -5230,6 +5251,8 @@ impl Settings {
         self.camera_pane_left = fresh.camera_pane_left;
         self.mixer_visible = fresh.mixer_visible;
         self.arr_visible = fresh.arr_visible;
+        // Which view is showing belongs with how many lanes it shows.
+        self.open_view = fresh.open_view;
         self.mixer_visible_at = fresh.mixer_visible_at;
         self.arr_visible_at = fresh.arr_visible_at;
         self.midi_keys_visible = fresh.midi_keys_visible;

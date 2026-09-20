@@ -1214,6 +1214,12 @@ pub struct Look {
     pub palette: i64,
     /// `palette_auto`: the palette follows the theme rather than a hand pick.
     pub palette_auto: bool,
+    /// **Which view the session was left showing**: `"piano"`, `"mixer"` or
+    /// `"arrange"`. A word rather than the settings' number, because this
+    /// one is written into somebody's project file and read by people.
+    /// Anything else, including the empty string a document from before
+    /// this carries, reads as the piano.
+    pub view: String,
 }
 
 /// **The count-in** — its length in bars, the legacy beats key that length
@@ -1466,6 +1472,8 @@ pub struct LookRef<'a> {
     pub theme: &'a str,
     pub palette: i64,
     pub palette_auto: bool,
+    /// See [`Look::view`].
+    pub view: &'a str,
 }
 
 /// [`Instruments`] borrowed — see [`DeskRef`].
@@ -1544,6 +1552,7 @@ impl DeskRef<'_> {
                 theme: l.theme.to_owned(),
                 palette: l.palette,
                 palette_auto: l.palette_auto,
+                view: l.view.to_owned(),
             }),
             take_name: self.take_name.map(str::to_owned),
             feel: self.feel,
@@ -1798,6 +1807,9 @@ impl DeskRef<'_> {
             f.str(l.theme);
             f.u64(l.palette as u64);
             f.bool(l.palette_auto);
+            // Appended, per the rule above: a term inserted among the
+            // others moves every existing document's hash.
+            f.str(l.view);
         }
     }
 }
@@ -1869,6 +1881,7 @@ impl DeskSnap {
                 theme: &l.theme,
                 palette: l.palette,
                 palette_auto: l.palette_auto,
+                view: &l.view,
             }),
             take_name: self.take_name.as_deref(),
             feel: self.feel,
@@ -2129,6 +2142,7 @@ impl DeskSnap {
             lm.insert("theme".into(), Value::String(l.theme.clone()));
             lm.insert("palette".into(), Value::Number(l.palette.into()));
             lm.insert("palette_auto".into(), Value::Bool(l.palette_auto));
+            lm.insert("view".into(), Value::String(l.view.to_owned()));
             m.insert("look".into(), Value::Object(lm));
         }
         if let Some(v) = self.take_name.as_ref() {
@@ -2502,6 +2516,14 @@ impl DeskSnap {
                     .get("palette_auto")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                // Missing is the empty string, which `App` reads as the
+                // piano - the view a build that did not know about this
+                // always opened on.
+                view: lm
+                    .get("view")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
             }),
             take_name: m.get("take_name").and_then(Value::as_str).map(str::to_owned),
             feel: m.get("feel").and_then(Value::as_object).map(|fm| {
@@ -4662,6 +4684,7 @@ mod tests {
                 theme: "Rhodes".into(),
                 palette: 6,
                 palette_auto: false,
+                view: "arrange".into(),
             }),
             take_name: Some("nocturne".into()),
             feel: Some(Feel {

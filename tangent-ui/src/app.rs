@@ -9672,6 +9672,17 @@ impl TangentApp {
     /// export spec's, and `tracks_added` is the settings' `i64` narrowed
     /// to the document's `u32`. A second copy of any of them is a second
     /// way for the asterisk and the quit prompt to disagree.
+    /// **The word a saved session carries for each view.** See
+    /// [`Settings::open_view`] for the number, and `arrangement::Look::view`
+    /// for why the document spells it out rather than storing the number.
+    pub fn view_word(v: u8) -> &'static str {
+        match v {
+            1 => "mixer",
+            2 => "arrange",
+            _ => "piano",
+        }
+    }
+
     fn desk_view(s: &Settings) -> crate::arrangement::DeskRef<'_> {
         let sig = s.time_signature();
         crate::arrangement::DeskRef {
@@ -9760,6 +9771,7 @@ impl TangentApp {
                 theme: &s.theme_name,
                 palette: s.palette_choice,
                 palette_auto: s.palette_auto,
+                view: Self::view_word(s.open_view),
             }),
             // **No name is the empty string here**, never a missing key:
             // `None` on this field means the DOCUMENT did not say, and a
@@ -10045,6 +10057,24 @@ impl TangentApp {
                     .palette
                     .rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
             }
+            // **And the view it was left showing.** The two flags are set
+            // here rather than through `settings.open_view` alone, because
+            // the frame sync reads the flags and would otherwise write the
+            // live view straight back over the document's before anybody
+            // saw it. An unknown word - including the empty string a
+            // document from before this carries - is the piano.
+            let (mixer, arrangement) = match l.view.as_str() {
+                "mixer" => (true, false),
+                "arrange" => (false, true),
+                _ => (false, false),
+            };
+            self.mixer_open = mixer;
+            self.arrangement_open = arrangement;
+            self.settings.open_view = match l.view.as_str() {
+                "mixer" => 1,
+                "arrange" => 2,
+                _ => 0,
+            };
         }
         if let Some(v) = d.transpose {
             self.settings.transpose =
@@ -33911,6 +33941,18 @@ impl TangentApp {
     }
 
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // **Which view is showing, kept where a saved session can reach
+        // it.** `desk_view` is handed the settings and nothing else, so the
+        // document's copy has to come from there; the flags move in seven
+        // places and a sync point that cannot be forgotten is worth more
+        // than one that is cheaper. A `u8` store a frame costs nothing.
+        self.settings.open_view = if self.arrangement_open {
+            2
+        } else if self.mixer_open {
+            1
+        } else {
+            0
+        };
         // **Before anything reads it**: whether this frame's click closed a
         // pair. One decision per frame, because it CONSUMES the anchor.
         self.decide_primary_pair(ctx);
@@ -59555,6 +59597,10 @@ mod folder_tests {
         crate::theme::by_name("Rhodes")
             .expect("Rhodes is a factory theme")
             .apply(s);
+        // Left showing the arrangement. The number is what the document
+        // carries; the flags are what the window is actually drawing, and
+        // `frame` keeps them in step in a running app.
+        s.open_view = 2;
         s.palette_auto = false;
         s.palette_choice = 6;
 
@@ -59601,6 +59647,12 @@ mod folder_tests {
         s.fretboard_tuning = "Standard".into();
         crate::theme::Theme::factory_default().apply(s);
         s.palette_auto = true;
+        // And the session that opens it disagrees: on the mixer, and the
+        // flags to match, so "it was already there" cannot pass for
+        // "the document put it back".
+        s.open_view = 1;
+        app.mixer_open = true;
+        app.arrangement_open = false;
 
         app.open_project(&doc);
 
@@ -59652,6 +59704,12 @@ mod folder_tests {
         );
         assert!(!s.palette_auto, "the hand-picked palette went back to auto");
         assert_eq!(s.palette_choice, 6, "the channel palette");
+        // **The view it was left showing, and that the WINDOW went there.**
+        // The number alone would pass with the mixer still on screen, which
+        // is the same fault the theme's colour check exists to catch.
+        assert_eq!(s.open_view, 2, "the view the session was left showing");
+        assert!(app.arrangement_open, "the arrangement did not come back on screen");
+        assert!(!app.mixer_open, "the mixer stayed open over the arrangement");
         assert!(!s.midi_snap, "the editor's magnet");
         assert_eq!(s.midi_grid_exp, -5, "the editor's grid");
         assert!(!s.midi_swing, "the swing switch");

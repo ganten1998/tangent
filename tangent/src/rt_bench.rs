@@ -2297,6 +2297,168 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
     }
 }
 
+/// **What a LOCATE costs the block it lands on.**
+///
+/// A locate empties every lane's grain ring, so every lane goes cold on the
+/// SAME callback and each one renders a whole grain at once. The steady
+/// state is staggered across `grain_phases`; the block after a locate is
+/// not staggered at all. At a 128-frame buffer with a 512-frame grain that
+/// is four times a normal block's work in one callback, and at 64 frames it
+/// is eight.
+///
+/// p50 cannot see this and neither can a count of late blocks over four
+/// thousand of them: one block in a thousand being eight times too long is
+/// a click the listener hears and a statistic nobody does. The figure here
+/// is the WORST block within a few of the locate, against the worst block
+/// of a desk left alone.
+#[test]
+#[ignore = "a measurement: run it deliberately with --ignored --nocapture"]
+fn what_a_locate_costs() {
+    let plugin = std::env::var("TANGENT_GATE_PLUGIN")
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3".to_owned());
+    let state: Option<Vec<u8>> = std::env::var("TANGENT_GATE_STATE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|raw| match raw.iter().position(|b| *b == 0) {
+            Some(at) if raw[..at].starts_with(b"/") => raw[at + 1..].to_vec(),
+            _ => raw,
+        });
+    let build = |bays: usize| -> Option<Engine> {
+        let mut e = audio_desk(32, &[]);
+        if Path::new(&plugin).exists() {
+            for lane in 0..32 {
+                for bay in 0..bays {
+                    if !matches!(
+                        e.load_insert(lane, bay, Some(Path::new(&plugin)), state.as_deref()),
+                        Ok(Some(_))
+                    ) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(e)
+    };
+    for frames in [64usize, 128, 256] {
+        let Some(mut e) = build(3) else {
+            println!("the plugin would not seat; nothing measured");
+            return;
+        };
+        for (what, grain) in [("off", 0.0f64), ("auto", -1.0)] {
+            e.set_grain_ms(grain);
+            let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+            e.set_transport(gen, 0);
+            let mut out = vec![0.0f32; frames * 2];
+            for _ in 0..400 {
+                e.render_offline(&mut out);
+            }
+            // Settled: the worst block of a desk nobody is touching.
+            let mut quiet = 0.0f64;
+            for _ in 0..600 {
+                let t = Instant::now();
+                e.render_offline(&mut out);
+                quiet = quiet.max(t.elapsed().as_nanos() as f64 / 1000.0);
+            }
+            // And now a locate, and the six blocks after it.
+            let mut worst = 0.0f64;
+            let mut at_block = 0usize;
+            for round in 0..8 {
+                let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+                e.set_transport(gen, u64::from(RATE) * (3 + round) + 271);
+                for b in 0..6 {
+                    let t = Instant::now();
+                    e.render_offline(&mut out);
+                    let us = t.elapsed().as_nanos() as f64 / 1000.0;
+                    if us > worst {
+                        worst = us;
+                        at_block = b;
+                    }
+                }
+            }
+            let dl = deadline_us(frames);
+            println!(
+                "  {frames:>3} fr, render ahead {what:<4}: settled worst {quiet:7.1} us \
+                 ({:5.1}% of deadline) | after a locate {worst:7.1} us ({:5.1}%) \
+                 on block +{at_block} = {:.1}x",
+                quiet / dl * 100.0,
+                worst / dl * 100.0,
+                worst / quiet.max(1.0)
+            );
+        }
+        for lane in 0..32 {
+            for bay in 0..3 {
+                let _ = e.load_insert(lane, bay, None, None);
+            }
+        }
+    }
+}
+
+/// **A desk where a few lanes cost far more than the rest.**
+///
+/// Every equivalence and timing test so far builds a desk of IDENTICAL
+/// lanes, and that hides the one thing the stagger assumes. `grain_phases`
+/// spreads lanes by COUNT - `ch % phases` - and a count is only a proxy for
+/// work when every lane costs the same. A real session is three heavy
+/// instruments and nine cheap audio tracks.
+///
+/// And `ch % phases` clusters with a stride of `phases`, which is 4 or 8
+/// and always a power of two. Lanes 2, 6 and 10 share a phase. Tracks that
+/// are alike tend to sit together in an arrangement, so the expensive ones
+/// landing on one phase is the common case rather than the unlucky one.
+///
+/// If that is what happens, the block carrying them renders three whole
+/// grains of expensive lane at once where a chunked desk would have spread
+/// that same work over every block, and the peak goes up rather than down.
+#[test]
+#[ignore = "a measurement: run it deliberately with --ignored --nocapture"]
+fn a_desk_of_uneven_lanes() {
+    // `heavy` lanes carry a convolver; the rest carry a flat EQ. The
+    // placement is the point, so it is spelled out rather than computed.
+    fn desk(lanes: usize, heavy: &[usize]) -> Engine {
+        let mut e = audio_desk(lanes, &["@tangent-eq"]);
+        let state = ir_state(0.5);
+        for lane in heavy {
+            let _ = e.load_insert(*lane, 1, Some(Path::new(IR_PATH)), Some(&state));
+            let _ = e.load_insert(*lane, 2, Some(Path::new(IR_PATH)), Some(&state));
+        }
+        e
+    }
+    for frames in [64usize, 128, 256] {
+        let dl = deadline_us(frames);
+        for (what, heavy) in [
+            ("spread over phases", vec![0usize, 1, 2]),
+            ("all on ONE phase", vec![2usize, 6, 10]),
+        ] {
+            let mut e = desk(12, &heavy);
+            for (mode, grain) in [("off", 0.0f64), ("auto", -1.0)] {
+                e.set_grain_ms(grain);
+                let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+                e.set_transport(gen, 0);
+                let mut out = vec![0.0f32; frames * 2];
+                for _ in 0..300 {
+                    e.render_offline(&mut out);
+                }
+                let mut us: Vec<f64> = Vec::with_capacity(1200);
+                for _ in 0..1200 {
+                    let t = Instant::now();
+                    e.render_offline(&mut out);
+                    us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+                }
+                us.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+                let p50 = us[us.len() / 2];
+                let worst = us[us.len() - 1];
+                println!(
+                    "  {frames:>3} fr, heavy {what:<19} ahead {mode:<4}: \
+                     p50 {p50:7.1} ({:5.1}%)  WORST {worst:7.1} ({:5.1}%)",
+                    p50 / dl * 100.0,
+                    worst / dl * 100.0
+                );
+            }
+        }
+    }
+}
+
 /// What a transition did to a pair of engines.
 struct Transition {
     /// Bit-exact from frame zero up to the block the change lands on.
