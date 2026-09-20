@@ -9133,6 +9133,17 @@ impl DesktopApp {
                     refuse!();
                 }
             };
+        // **Spread the lanes over the other cores.**
+        //
+        // A bounce and a freeze both come through here, and until now both
+        // ran on one core: measured on 96 hosted reverbs, 13.11 s of wall
+        // for twelve seconds of audio against 13.32 s of CPU. With this it
+        // is 3.79 s. The threads are ordinary ones at ordinary priority -
+        // see `LanePool::new` for why a bounce must not be real-time - and
+        // the fold sums lanes in ascending order either way, so the file is
+        // the same file. `an_exported_file_is_the_same_whether_or_not_it_forked`
+        // holds that against a real render rather than against a bench.
+        e.set_offline_fanout(true);
         // ── the desk, exactly as the live walk pushes it ──
         {
             let mut desk = self.app.desk();
@@ -19707,6 +19718,14 @@ mod tests {
         // author's idea of one.
         if let Some(ms) = std::env::var("TANGENT_GRAIN").ok().and_then(|v| v.parse().ok()) {
             e.set_grain_ms(ms);
+        }
+        // **`TANGENT_PROBE_FANOUT=1` spreads the render over the cores**, the
+        // way the exporter now does. The door exists so a REAL project can be
+        // rendered both ways and the two files compared byte for byte, which
+        // is the evidence that bit-identity on a bench desk is bit-identity
+        // on somebody's song.
+        if std::env::var_os("TANGENT_PROBE_FANOUT").is_some() {
+            e.set_offline_fanout(true);
         }
         e.set_monitor_on(false);
         e.set_folders(app.folder_parents());
