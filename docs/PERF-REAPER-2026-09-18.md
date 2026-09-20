@@ -1322,3 +1322,78 @@ REAPER, same project, offline, this afternoon: **5.61 s wall, 25.5 s CPU.**
 the one place the knob's largest value is not its best. Worth saying in the
 panel one day; not worth an automatic choice, because the right answer
 depends on the desk as well as the buffer.
+
+---
+
+# 2026-09-20: the feature run against the owner's own songs
+
+The bench desks are a bench author's idea of a session. These are the
+sessions. `the_master_has_no_discontinuities` gained a `TANGENT_GRAIN`
+door so a real project can be rendered both ways and the two files
+compared.
+
+## knowersomething1: clean, and the project is not deterministic
+
+| | total energy | worst 700-frame window |
+|---|---:|---:|
+| control, render-ahead off twice | +0.016 dB | 7.93 dB |
+| test, off against 5 ms | +0.022 dB | 9.33 dB |
+
+The feature adds nothing that the project does not already do to itself
+between two identical runs. **The control is the finding**: this song does
+not render the same twice, by 7.9 dB in a window, whatever the setting.
+
+## moscow1: a real difference, and it is not what it looks like
+
+Five Rhodes Anthology tracks. Soloing one and rendering 15 seconds of it:
+
+| start | off | 5 ms | difference |
+|---|---:|---:|---:|
+| 58 s | -24.65 dBFS | -23.05 dBFS | **+1.604 dB** |
+| 60 s | -24.10 dBFS | -25.78 dBFS | **-1.675 dB** |
+| 63 s | -23.84 dBFS | -22.25 dBFS | **+1.595 dB** |
+
+Real, reproducible, and **the sign flips with where the render starts**,
+which is the whole answer. A systematic gain error does not change sign. A
+one-time perturbation at the start of a render does, because Rhodes
+Anthology is a SAMPLED instrument: perturb it once and it picks a
+different round robin from then on, and the RMS of a different take over
+fifteen seconds lands a decibel and a half either way.
+
+Everything else agrees with that reading:
+
+- **The amount does not depend on the grain**: +1.433 dB at 128, 256 AND
+  512 frames, to three decimals. A span error would scale; a one-time
+  divergence does not.
+- **It is exactly 0.000 dB when the grain is below the callback**, where
+  the feature cannot engage. The harness is sound.
+- **The plugins are block-size invariant**: the same track through a
+  64-frame callback and a 256-frame one is +0.000 dB with no grain at all.
+  So the plugin is not the inconsistent one.
+- **Each mode is self-consistent**: two grained renders of the same span
+  agree to 0.48 dB in the worst second, two chunked ones to 0.58 dB.
+- **Rhodes on a grained lane, in isolation, is +0.000 and -0.011 dB** -
+  `a_hosted_instrument_is_the_same_grained`, seated from moscow1's own
+  sidecar. The instrument path is fine; it is the locate that perturbs it.
+
+And the thirteen seconds before the music starts, where the grained render
+has nothing and the chunked one has -50 dBFS, is the noise floor of
+plugins idling with no notes, gated differently. No note is lost: from the
+first note at 57.1 s the two agree.
+
+**What bounds it.** `set_grain_ms` has exactly two callers: `publish_routes`,
+which is the LIVE engine, and the probe's test door. Export and freeze
+build their own offline engine and never set a grain, so **nothing you
+bounce is affected by this setting**. It is a live-playback difference on
+sampled instruments, and it is the same class of difference those
+instruments already produce between any two performances.
+
+## Nine tests written chasing it, all of which pass
+
+Sends to the effects bus. Folders, including desks with so few children
+that whole callbacks render no lane at all. Delay compensation across
+lanes with unequal latency. Clips that start after a silence, audio and
+MIDI. Tail inserts, including an empty lane whose only live rack is the
+tail seat - which is what moscow1's lane 16 is. A hosted VST3 instrument
+seated from a real sidecar. None of them reproduced it, and all of them
+are now held.

@@ -19698,6 +19698,16 @@ mod tests {
         e.set_fx_return(gains.fx_return);
         e.set_tempo(app.tempo_bpm());
         e.set_metronome_enabled(false);
+        // **`TANGENT_GRAIN=5` renders the project with render-ahead on**, in
+        // milliseconds exactly as the setting takes it. The probe builds its
+        // app from `Settings::default()`, where the setting is off, so
+        // without this there is no way to render somebody's real song both
+        // ways and compare the two files - which is the only evidence that
+        // says the feature is safe on a real desk rather than on a bench
+        // author's idea of one.
+        if let Some(ms) = std::env::var("TANGENT_GRAIN").ok().and_then(|v| v.parse().ok()) {
+            e.set_grain_ms(ms);
+        }
         e.set_monitor_on(false);
         e.set_folders(app.folder_parents());
 

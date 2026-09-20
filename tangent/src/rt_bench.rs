@@ -476,6 +476,13 @@ fn seat(e: &mut Engine, lanes: usize, inserts: &[&str]) {
     }
 }
 
+/// One unit into one lane's first bay.
+fn seat_one(e: &mut Engine, lane: usize, unit: &str) {
+    e.load_insert(lane, 0, Some(Path::new(unit)), None)
+        .unwrap_or_else(|err| panic!("{unit} did not load into lane {lane}: {err}"))
+        .unwrap_or_else(|| panic!("{unit} loaded but the bay reports no tenant"));
+}
+
 /// The transport generation each reading claims, so a shape measured second
 /// on the same engine starts from frame zero like the first.
 static GENERATION: AtomicU64 = AtomicU64::new(2);
@@ -1321,6 +1328,624 @@ fn the_grain_survives_a_callback_that_changes_size() {
                      oscillator wander can account for"
                 );
             }
+        }
+    }
+}
+
+/// **A clip that STARTS after a silence, on a grained lane.**
+///
+/// Every equivalence test above plays from frame zero, and a real song does
+/// not. `moscow1` is five instrument lanes whose MIDI clips begin at 44.3,
+/// 46.8, 48.4, 49.3 and 52.9 seconds, and rendering it with render-ahead on
+/// lost **thirteen seconds of quiet playing entirely** - -143 dBFS against
+/// the chunked render's -50 - before catching up and matching for the rest
+/// of the song. That is the shape, reduced: silence, then a clip.
+///
+/// Audio lanes and instrument lanes both, because the two reach the fold by
+/// different roads - a clip is pulled for the lane's span, an instrument is
+/// TOLD about its notes - and only one of them was ever the suspect.
+#[test]
+fn a_clip_that_starts_after_a_silence_is_not_lost() {
+    fn audio_late(starts: &[u64]) -> Engine {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        let clip = noise(12.0);
+        let len = clip.frames() as u64;
+        e.set_clips(
+            starts
+                .iter()
+                .enumerate()
+                .map(|(lane, start)| Placed {
+                    clip: Arc::clone(&clip),
+                    strip: lane,
+                    start: *start,
+                    offset: 0,
+                    len,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 0.5,
+                })
+                .collect(),
+        );
+        seat(&mut e, starts.len(), &["@tangent-plate"]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    fn midi_late(starts: &[u64]) -> Engine {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        e.set_midi_clips(
+            starts
+                .iter()
+                .enumerate()
+                .map(|(lane, start)| PlacedMidi {
+                    strip: lane,
+                    start: *start,
+                    len: u64::from(RATE) * 60,
+                    notes: Arc::new(
+                        (0..4)
+                            .map(|v| ClipNote {
+                                at: (v as u64) * 4000,
+                                dur: 12_000,
+                                key: 48 + (v as u8) * 5,
+                                vel: 100,
+                            })
+                            .collect(),
+                    ),
+                    pedal: Arc::new(Vec::new()),
+                })
+                .collect(),
+        );
+        seat(&mut e, starts.len(), &["@tangent-analog"]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    // Staggered, none on a block boundary and none on a grain boundary:
+    // moscow1's are 2.5 seconds apart and arbitrary, and this is that.
+    const STARTS: [u64; 5] = [4_211, 7_777, 11_113, 14_401, 20_007];
+    let shapes: [(&str, fn() -> Engine, bool); 2] = [
+        ("audio clips x plate", || audio_late(&STARTS), true),
+        ("Analog, notes from a late clip", || midi_late(&STARTS), false),
+    ];
+    for (name, build, samples_compare) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for _ in 0..400 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                xs.extend_from_slice(&a);
+                ys.extend_from_slice(&b);
+            }
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let what = format!("{name} at a {grain:.0}-frame grain");
+            assert!(peak > 0.001, "{what}: the reference was silent");
+            // **The thing that actually went wrong**: the grained render
+            // produced nothing at all where the chunked one played.
+            let grained_energy: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let chunked_energy: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            assert!(
+                grained_energy > chunked_energy * 0.5,
+                "{what}: the grained render holds {:.1} dB less energy than the \
+                 chunked one, so a clip that starts after a silence is being lost",
+                10.0 * (chunked_energy / grained_energy.max(1e-30)).log10()
+            );
+            if samples_compare {
+                let (worst, first) = worst_diff(&xs, &ys);
+                assert!(
+                    worst == 0.0,
+                    "{what}: the two renders differ by {:.1} dBFS, first at frame {:?}",
+                    dbfs(worst),
+                    first.map(|i| i / 2)
+                );
+            } else {
+                let (total, window) = energy_gap(&xs, &ys, peak * 0.001);
+                assert!(
+                    total < 1.0 && window < 4.0,
+                    "{what}: {total:.2} dB of total energy and {window:.2} dB in \
+                     the worst window"
+                );
+            }
+        }
+    }
+}
+
+/// **A lane with a SEND, grained.**
+///
+/// The gap that a real song found. `moscow1` renders 1.4 dB louder on one
+/// soloed track with render-ahead on than with it off - and the plugins on
+/// it are not to blame, because the same track rendered through a 64-frame
+/// callback and a 256-frame one is bit-for-bit identical (+0.000 dB). The
+/// difference is this feature's, and the desk it appears on has sends and
+/// folders while every equivalence test above has neither.
+///
+/// The send is the suspect because it is the one customer that reads a
+/// lane's audio out of a buffer the FOLD fills, rather than out of the
+/// lane's own render: `stems_wanted` names the list, and a grained lane's
+/// fold runs for a span its render did not.
+#[test]
+fn a_lane_that_sends_to_the_effects_bus_is_the_same_grained() {
+    fn sending_desk(lanes: usize, inserts: &[&str], send: f32) -> Engine {
+        let e = audio_desk(lanes, inserts);
+        let mut desk = quiet_desk();
+        for lane in 0..lanes {
+            if let Some(s) = desk.send.get_mut(tangent_ui::recorder::Strip::Channel(lane).index()) {
+                *s = send;
+            }
+        }
+        e.set_desk(&desk);
+        e.set_fx_return(0.8);
+        e
+    }
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("clips, half sent", || sending_desk(8, &[], 0.5)),
+        ("plate, half sent", || sending_desk(8, &["@tangent-plate"], 0.5)),
+        ("comp, fully sent", || sending_desk(8, &["@tangent-comp"], 1.0)),
+    ];
+    for (name, build) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for _ in 0..300 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                xs.extend_from_slice(&a);
+                ys.extend_from_slice(&b);
+            }
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let what = format!("{name} at a {grain:.0}-frame grain");
+            assert!(peak > 0.001, "{what}: the reference was silent");
+            let ea: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let eb: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let level = 10.0 * (eb / ea.max(1e-30)).log10();
+            assert!(
+                level.abs() < 0.2,
+                "{what}: the grained render is {level:+.2} dB against the \
+                 chunked one, so the send is not folding the same audio"
+            );
+            let (worst, first) = worst_diff(&xs, &ys);
+            assert!(
+                worst == 0.0,
+                "{what}: the two renders differ by {:.1} dBFS, first at frame {:?}",
+                dbfs(worst),
+                first.map(|i| i / 2)
+            );
+        }
+    }
+}
+
+/// **Delay compensation across a grained desk.**
+///
+/// The one term in the whole feature that is clocked at CONSUMPTION rather
+/// than at render, because `DelayLine::run` advances its write cursor by
+/// `frames` unconditionally and cannot be rewound. Step one of the overhaul
+/// moved it there; nothing has ever tested it against a desk where lanes
+/// have DIFFERENT latencies, which is the only case where compensation
+/// does anything at all.
+///
+/// A convolver is the built-in that reports latency, so half the lanes
+/// carry one and half carry nothing: `pdc_max` is then the convolver's and
+/// the bare lanes are delayed to meet it. If the grain render clocks that
+/// delay line a different number of times, or over a different span, the
+/// two halves stop lining up - and two copies of the same music a few
+/// samples apart is a comb filter, which shows as a LEVEL change rather
+/// than as an obvious fault.
+#[test]
+fn delay_compensation_survives_a_grained_desk() {
+    fn mixed_latency(lanes: usize) -> Engine {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        let clip = noise(12.0);
+        let len = clip.frames() as u64;
+        e.set_clips(
+            (0..lanes)
+                .map(|lane| Placed {
+                    clip: Arc::clone(&clip),
+                    strip: lane,
+                    start: 0,
+                    offset: 0,
+                    len,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 0.5,
+                })
+                .collect(),
+        );
+        // Every other lane gets a convolver, so the desk has two latencies
+        // and the compensation has something to do.
+        let state = ir_state(0.25);
+        for lane in (0..lanes).step_by(2) {
+            let _ = e.load_insert(lane, 0, Some(Path::new(IR_PATH)), Some(&state));
+        }
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    for lanes in [8usize, 16] {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (mixed_latency(lanes), mixed_latency(lanes));
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for _ in 0..300 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                xs.extend_from_slice(&a);
+                ys.extend_from_slice(&b);
+            }
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let what = format!("{lanes} lanes, every other one compensated, at a {grain:.0}-frame grain");
+            assert!(peak > 0.001, "{what}: the reference was silent");
+            let ea: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let eb: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let level = 10.0 * (eb / ea.max(1e-30)).log10();
+            assert!(
+                level.abs() < 0.2,
+                "{what}: the grained render is {level:+.2} dB against the chunked \
+                 one, which is what two copies of the same music a few samples \
+                 apart look like"
+            );
+            // **Not bit-exact, and it should not be.** A convolver sums an
+            // FFT's worth of partitions, and a span cut in different places
+            // sums them in a different order: measured at -132.5 dBFS,
+            // which is the twenty-fourth bit of a float and not a
+            // difference in the audio. The LEVEL above is the assertion
+            // that matters, because two copies of the same music a few
+            // samples apart comb, and combing shows up there.
+            let (worst, _) = worst_diff(&xs, &ys);
+            assert!(
+                dbfs(worst) < -120.0,
+                "{what}: the two renders differ by {:.1} dBFS, which is more \
+                 than the order an FFT's partitions are summed in",
+                dbfs(worst)
+            );
+        }
+    }
+}
+
+/// **A desk with FOLDERS, grained.**
+///
+/// The last structure a real session has that no equivalence test had.
+/// `moscow1` is five instrument tracks inside groups, and it renders 1.4 dB
+/// louder on one soloed track with render-ahead on - with the plugins
+/// exonerated, because the same track through a 64-frame callback and a
+/// 256-frame one is identical to +0.000 dB.
+///
+/// A folder is pinned, so it renders on the callback's own block; its
+/// CHILDREN are not, so they render in grains and are then summed through
+/// the folder's rack at consumption. The two halves meet at
+/// `run_lane_pdc`'s `folder_lat`, which is read for every lane the fold
+/// sums, and the grain is exactly what makes "the span the fold is summing"
+/// different from "the span the child rendered".
+#[test]
+fn a_desk_of_folders_is_the_same_grained() {
+    fn foldered(children: usize, inserts: &[&str], folder_insert: Option<&str>) -> Engine {
+        // **The folder is lane 0.** `set_folders` refuses a parent whose
+        // index is not below its child's, which is the arrangement's own
+        // rule: a group sits above the tracks it holds.
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        let clip = noise(12.0);
+        let len = clip.frames() as u64;
+        e.set_clips(
+            (1..=children)
+                .map(|lane| Placed {
+                    clip: Arc::clone(&clip),
+                    strip: lane,
+                    start: 0,
+                    offset: 0,
+                    len,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 0.5,
+                })
+                .collect(),
+        );
+        for lane in 1..=children {
+            for (bay, path) in inserts.iter().enumerate() {
+                e.load_insert(lane, bay, Some(Path::new(path)), None)
+                    .unwrap_or_else(|err| panic!("{path} did not load into lane {lane}: {err}"))
+                    .unwrap_or_else(|| panic!("{path} loaded but bay {bay} reports no tenant"));
+            }
+        }
+        let mut parents = [-1i32; crate::instrument::CHANNELS];
+        for child in 1..=children {
+            parents[child] = 0;
+        }
+        assert!(e.set_folders(parents), "the desk took the folder layout");
+        if let Some(unit) = folder_insert {
+            seat_one(&mut e, 0, unit);
+        }
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+    // **Two children, not eight**, in half of these: with fewer lanes than
+    // the grain has phases there are callbacks on which NO lane renders at
+    // all, and `moscow1` - seven tracks, four phases - has one in every
+    // four. Anything the block pass does only when a lane rendered is
+    // skipped on those, and a folder's own rack is the obvious candidate.
+    let shapes: [(&str, fn() -> Engine); 6] = [
+        ("clips in a folder", || foldered(8, &[], None)),
+        ("plate in a folder", || foldered(8, &["@tangent-plate"], None)),
+        ("clips, folder carries a plate", || foldered(8, &[], Some("@tangent-plate"))),
+        ("comp in a folder that comps", || {
+            foldered(8, &["@tangent-comp"], Some("@tangent-comp"))
+        }),
+        ("two children, folder carries a plate", || {
+            foldered(2, &[], Some("@tangent-plate"))
+        }),
+        ("two children with plates, folder comps", || {
+            foldered(2, &["@tangent-plate"], Some("@tangent-comp"))
+        }),
+    ];
+    for (name, build) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for _ in 0..300 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                xs.extend_from_slice(&a);
+                ys.extend_from_slice(&b);
+            }
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let what = format!("{name} at a {grain:.0}-frame grain");
+            assert!(peak > 0.001, "{what}: the reference was silent");
+            let ea: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let eb: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let level = 10.0 * (eb / ea.max(1e-30)).log10();
+            assert!(
+                level.abs() < 0.2,
+                "{what}: the grained render is {level:+.2} dB against the chunked one"
+            );
+            let (worst, first) = worst_diff(&xs, &ys);
+            assert!(
+                worst == 0.0,
+                "{what}: the two renders differ by {:.1} dBFS, first at frame {:?}",
+                dbfs(worst),
+                first.map(|i| i / 2)
+            );
+        }
+    }
+}
+
+/// **A HOSTED instrument on a grained lane.**
+///
+/// The path `midi_pattern_desk` does not reach. A built-in is handed its
+/// notes as a list and renders them itself; a hosted VST3 is handed MIDI
+/// events with SAMPLE OFFSETS inside the block it is about to process, and
+/// a grain changes what that block is. Nothing tested it, and a real
+/// session found it: `moscow1` - five Rhodes Anthology tracks - renders
+/// 1.4 dB louder on one soloed track with render-ahead on, while the same
+/// track through a 64-frame callback and a 256-frame one is identical to
+/// +0.000 dB, so the plugin is not the one being inconsistent.
+///
+/// `TANGENT_INST_PLUGIN` names another, `TANGENT_INST_STATE` a sidecar to
+/// seat it with. Skipped with a line where the plugin is not installed or
+/// will not instantiate in a test process, exactly as the gate rung is.
+#[test]
+fn a_hosted_instrument_is_the_same_grained() {
+    let plugin = std::env::var("TANGENT_INST_PLUGIN")
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rhodes Anthology.vst3".to_owned());
+    if !Path::new(&plugin).exists() {
+        println!("no {plugin}: the hosted-instrument case is not covered here");
+        return;
+    }
+    let state: Option<Vec<u8>> = std::env::var("TANGENT_INST_STATE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|raw| match raw.iter().position(|b| *b == 0) {
+            Some(at) if raw[..at].starts_with(b"/") => raw[at + 1..].to_vec(),
+            _ => raw,
+        });
+    const LANES: usize = 3;
+    let build = || -> Option<Engine> {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+        e.set_armed(0);
+        e.set_midi_off(u64::MAX);
+        e.set_desk(&quiet_desk());
+        // Notes at awkward positions, none on a block or grain boundary, and
+        // starting after a silence the way a real take does.
+        let notes: Arc<Vec<ClipNote>> = Arc::new(
+            (0..24)
+                .map(|i| ClipNote {
+                    at: 3_001 + (i as u64) * 2_311,
+                    dur: 5_507,
+                    key: 48 + ((i * 5) % 24) as u8,
+                    vel: 90,
+                })
+                .collect(),
+        );
+        e.set_midi_clips(
+            (0..LANES)
+                .map(|lane| PlacedMidi {
+                    strip: lane,
+                    start: 1_777 * (lane as u64 + 1),
+                    len: u64::from(RATE) * 60,
+                    notes: Arc::clone(&notes),
+                    pedal: Arc::new(Vec::new()),
+                })
+                .collect(),
+        );
+        for lane in 0..LANES {
+            match e.load_insert(lane, 0, Some(Path::new(&plugin)), state.as_deref()) {
+                Ok(Some(_)) => {}
+                other => {
+                    println!("the instrument would not seat in a test process: {other:?}");
+                    return None;
+                }
+            }
+        }
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        Some(e)
+    };
+    let (Some(mut chunked), Some(mut grained)) = (build(), build()) else {
+        return;
+    };
+    for grain in [256.0f64, 512.0] {
+        for e in [&mut chunked, &mut grained] {
+            let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
+            e.set_transport(gen, 0);
+        }
+        chunked.set_grain_ms(0.0);
+        grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+        let n = BLOCK * 2;
+        let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..500 {
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            xs.extend_from_slice(&a);
+            ys.extend_from_slice(&b);
+        }
+        let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let name = Path::new(&plugin).file_stem().map_or_else(
+            || plugin.clone(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+        let what = format!("{name} on {LANES} lanes at a {grain:.0}-frame grain");
+        // **Skipped, not failed, unless BOTH engines sounded.**
+        //
+        // Rhodes Anthology loads its sample set from its STATE, so at its
+        // defaults in a test process it may be silent - and it is not
+        // reliably silent, because the licence check behind it answers
+        // differently from one instance to the next. Two engines are seated
+        // here and one has been seen to load while the other did not, which
+        // reads as "the grained render lost everything" and is nothing of
+        // the kind.
+        //
+        // Point `TANGENT_INST_STATE` at a sidecar to cover this properly:
+        // seated from moscow1's own it measures +0.000 dB at a 256-frame
+        // grain and -0.011 at 512.
+        let grained_peak = ys.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        if peak <= 0.0005 || grained_peak <= 0.0005 {
+            println!(
+                "  {what}: one of the two engines did not sound ({:.1} / {:.1} dBFS), \
+                 so nothing was compared",
+                dbfs(peak),
+                dbfs(grained_peak)
+            );
+            continue;
+        }
+        let ea: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        let eb: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        let level = 10.0 * (eb / ea.max(1e-30)).log10();
+        println!("  {what}: level {level:+.3} dB, peak {:.1} dBFS", dbfs(peak));
+        assert!(
+            level.abs() < 0.5,
+            "{what}: the grained render is {level:+.2} dB against the chunked \
+             one, so a hosted instrument is not being given its notes for the \
+             span it is about to render"
+        );
+    }
+    for lane in 0..LANES {
+        let _ = chunked.load_insert(lane, 0, None, None);
+        let _ = grained.load_insert(lane, 0, None, None);
+    }
+}
+
+/// **A lane with a TAIL insert, grained.**
+///
+/// Every lane wears two rack seats: its own, and an extra one past the
+/// whole bank (`folder_extra_seat`) that the arrangement calls the tail.
+/// `render_lane` runs the first through `run_rack` and the second through
+/// `run_extra_rack`, and BOTH gained a position argument when the grain
+/// render was built - which makes the tail exactly as able to be handed the
+/// wrong span as the head, and it is the one of the two that nothing tested.
+///
+/// `moscow1` wears one: Brusfri, a noise reducer, on the tail. It is also
+/// the project that renders 1.4 dB out with render-ahead on while every
+/// synthetic desk built so far renders identically.
+#[test]
+fn a_lane_with_a_tail_insert_is_the_same_grained() {
+    fn tailed(lanes: usize, head: &[&str], tail: Option<&str>) -> Engine {
+        tailed_from(lanes, lanes, head, tail)
+    }
+    /// `with_clips` lanes carry audio; the rest are EMPTY lanes whose only
+    /// live rack is the tail seat. `moscow1` has one of those - lane 16,
+    /// no clips, a noise reducer on its tail - and the decide walk's own
+    /// note says reading only seat `ch` is how such a lane "skipped the
+    /// whole block and its second rack never ran at all".
+    fn tailed_from(lanes: usize, with_clips: usize, head: &[&str], tail: Option<&str>) -> Engine {
+        let mut e = audio_desk(with_clips, head);
+        if let Some(unit) = tail {
+            for lane in 0..lanes {
+                let seat = tangent_ui::recorder::folder_extra_seat(lane);
+                e.load_insert(seat, 0, Some(Path::new(unit)), None)
+                    .unwrap_or_else(|err| panic!("{unit} did not load into the tail of lane {lane}: {err}"))
+                    .unwrap_or_else(|| panic!("{unit} loaded but the tail bay reports no tenant"));
+            }
+        }
+        e
+    }
+    let shapes: [(&str, fn() -> Engine); 7] = [
+        ("clips, tail plate", || tailed(8, &[], Some("@tangent-plate"))),
+        ("clips, tail comp", || tailed(8, &[], Some("@tangent-comp"))),
+        ("head plate, tail comp", || tailed(8, &["@tangent-plate"], Some("@tangent-comp"))),
+        ("head comp, tail drive", || tailed(8, &["@tangent-comp"], Some("@tangent-drive"))),
+        ("4 playing, 4 empty with tail plates", || {
+            tailed_from(8, 4, &[], Some("@tangent-plate"))
+        }),
+        ("4 playing, 4 empty with tail comps", || {
+            tailed_from(8, 4, &["@tangent-plate"], Some("@tangent-comp"))
+        }),
+        ("1 playing, 7 empty with tail drives", || {
+            tailed_from(8, 1, &[], Some("@tangent-drive"))
+        }),
+    ];
+    for (name, build) in shapes {
+        for grain in [240.0f64, 512.0] {
+            let (mut chunked, mut grained) = (build(), build());
+            grained.set_grain_ms(1000.0 * grain / f64::from(RATE));
+            let n = BLOCK * 2;
+            let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for _ in 0..300 {
+                chunked.render_offline(&mut a);
+                grained.render_offline(&mut b);
+                xs.extend_from_slice(&a);
+                ys.extend_from_slice(&b);
+            }
+            let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let what = format!("{name} at a {grain:.0}-frame grain");
+            assert!(peak > 0.001, "{what}: the reference was silent");
+            let ea: f64 = xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let eb: f64 = ys.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            let level = 10.0 * (eb / ea.max(1e-30)).log10();
+            assert!(
+                level.abs() < 0.2,
+                "{what}: the grained render is {level:+.2} dB against the chunked one"
+            );
+            let (worst, first) = worst_diff(&xs, &ys);
+            assert!(
+                worst == 0.0,
+                "{what}: the two renders differ by {:.1} dBFS, first at frame {:?}",
+                dbfs(worst),
+                first.map(|i| i / 2)
+            );
         }
     }
 }

@@ -13795,6 +13795,14 @@ impl Renderer {
             // gap a buffer out of step with the rest of the desk.
             self.lane_folds = [false; CHANNELS];
         }
+        if std::env::var_os("TANGENT_FOLDTRACE").is_some() {
+            let skip = (0..CHANNELS).fold(0u32, |m, c| if self.lane_skip[c] { m | 1 << c } else { m });
+            let folds = (0..CHANNELS).fold(0u32, |m, c| if self.lane_folds[c] { m | 1 << c } else { m });
+            eprintln!(
+                "FT at={at} f={frames} wanted={wanted:08x} folded={folds:08x} skip={skip:08x} lens={:?}",
+                (0..8).map(|c| self.lane_len[c]).collect::<Vec<_>>()
+            );
+        }
         if self.probe {
             self.note_eligibility(
                 wanted,
