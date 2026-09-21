@@ -3164,6 +3164,15 @@ fn stretched_clip_audio(
     path: &std::path::Path,
     cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
 ) -> Arc<tangent_record::decode::Clip> {
+    // **The WARP comes first, and it is a separate cache entry.**
+    //
+    // A warp is a set of per-segment ratios and a stretch is one ratio over
+    // the whole clip; a take can carry both, and the order matters. Warping
+    // first puts the attacks on the grid at the take's own tempo and the
+    // stretch then carries the whole result to the song's, which is what
+    // somebody who quantized a take and then changed the tempo means. The
+    // other order would quantize against a grid that no longer exists.
+    let decoded = warped_clip_audio(clip, decoded, path, cache);
     let Some((key, mode)) = stretch_key(clip, path) else {
         return decoded;
     };
@@ -3175,6 +3184,49 @@ fn stretched_clip_audio(
             made
         }
     }
+}
+
+/// **The clip as the warp map leaves it**, or the clip untouched when there
+/// is no map.
+///
+/// Shares the stretch cache and keys into it by the map's own extent and
+/// length, which is enough: two different maps over one file that agreed on
+/// their first anchor, their last, and how many they had would have to be
+/// the same map to matter, and the render is rebuilt whenever the document
+/// changes the list anyway.
+#[cfg(feature = "recorder")]
+fn warped_clip_audio(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: Arc<tangent_record::decode::Clip>,
+    path: &std::path::Path,
+    cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
+) -> Arc<tangent_record::decode::Clip> {
+    if clip.warp.len() < 2 {
+        return decoded;
+    }
+    let (f0, t0) = clip.warp[0];
+    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    let key: StretchKey = (
+        path.to_path_buf(),
+        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
+        format!("warp:{f0}:{t0}:{f1}:{t1}"),
+    );
+    if let Some(c) = cache.get(&key) {
+        return Arc::clone(c);
+    }
+    let anchors: Vec<crate::warp::Anchor> = clip
+        .warp
+        .iter()
+        .map(|&(from, to)| crate::warp::Anchor {
+            from: usize::try_from(from).unwrap_or(usize::MAX),
+            to: usize::try_from(to).unwrap_or(usize::MAX),
+        })
+        .collect();
+    // The material decides the algorithm, exactly as a stretch's does.
+    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
+    let made = Arc::new(crate::warp::warp(&decoded, &anchors, mode));
+    cache.insert(key, Arc::clone(&made));
+    made
 }
 
 /// The stretch cache's key for a clip and the mode it names; `None` for a
@@ -9883,6 +9935,10 @@ impl DesktopApp {
             Q::Template(name) => ("Saving template", Some(name.clone())),
             Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
             Q::ResetTemplate => ("Resetting the template", None),
+            // **No overlay for this one.** It is a detection pass over one
+            // clip that is already decoded and in memory - measured in
+            // milliseconds - and an overlay that flashes is worse than none.
+            Q::QuantizeClip { .. } => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
             // write one file per lane.
@@ -10045,6 +10101,14 @@ impl DesktopApp {
                     arr.save_to(&doc);
                 }
                 self.app.notify(Kind::Success, format!("Template saved - {name}"));
+            }
+            tangent_ui::ports::ProjectRequest::QuantizeClip {
+                id,
+                step_s,
+                swing,
+                strength,
+            } => {
+                self.quantize_clip(id, step_s, swing, strength);
             }
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 // Raised, not pushed: from here until the files land this is
@@ -11110,6 +11174,7 @@ impl DesktopApp {
                     stretch_mode: String::new(),
                     gain: 1.0,
                     extra: Default::default(),
+                    warp: Vec::new(),
                 };
                 span = span.max(decoded.clip.seconds());
                 placed.extend(audio_clip_passes(&whole, &decoded.clip, f64::from(rate), 1.0));
@@ -11616,6 +11681,80 @@ impl DesktopApp {
     /// happened".
     ///
     /// **And nothing is written to disk.** The gain is a number on the clip:
+    /// **Quantize one audio clip: find the attacks, decide where each
+    /// belongs, and write the warp map that puts them there.**
+    ///
+    /// The host does this because the UI cannot reach the samples. Nothing
+    /// is rendered here - the map is the edit, and `warped_clip_audio`
+    /// builds the audio from it on the next pass - so this is undoable and
+    /// survives the document exactly as a stretch ratio does.
+    ///
+    /// **Anchored in SOURCE frames, including the trim.** A clip's `offset_s`
+    /// means the file is entered part-way through, so a transient found at
+    /// file frame N is heard at timeline `start_s + (N - offset)`. Quantizing
+    /// against the raw file position would put every hit of a trimmed clip
+    /// out by the trim.
+    #[cfg(feature = "recorder")]
+    fn quantize_clip(&mut self, id: u64, step_s: f64, swing: Option<f64>, strength: f64) {
+        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let Some(grid) = tangent_ui::quantize::Grid::new(step_s, swing) else {
+            return;
+        };
+        let q = tangent_ui::quantize::Quantize { grid, strength, window: None };
+        let doc = self.app.arrangement().clone();
+        let Some(clip) = doc.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        if clip.kind != tangent_ui::arrangement::ClipKind::Audio {
+            return;
+        }
+        let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+        let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
+            self.app.notify(
+                Kind::Error,
+                "that clip is still loading — try again in a moment".to_owned(),
+            );
+            return;
+        };
+        let rate = decoded.rate.max(1);
+        let secs = |f: usize| f as f64 / f64::from(rate);
+        let frames = |s: f64| (s * f64::from(rate)).max(0.0).round() as usize;
+        let offset = frames(clip.offset_s);
+
+        let found = crate::transient::detect(&decoded, 0.5);
+        let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
+        for t in &found {
+            // Where this attack is heard, and where it should be heard.
+            let heard = clip.start_s + secs(t.at.saturating_sub(offset));
+            let want = q.place(heard);
+            let to = offset as f64 + (want - clip.start_s) * f64::from(rate);
+            if to < 0.0 {
+                continue;
+            }
+            let (f, to) = (t.at as u64, to.round() as u64);
+            // Ascending in both, which `warp` demands and the document's
+            // reader enforces again on the way back in.
+            if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
+                map.push((f, to));
+            }
+        }
+        if map.len() < 2 {
+            self.app.notify(
+                Kind::Error,
+                format!("nothing to quantize — {} attacks found", found.len()),
+            );
+            return;
+        }
+        let moved = map.iter().filter(|&&(f, t)| f != t).count();
+        self.app.set_clip_warp(id, map);
+        self.app.notify(
+            Kind::Info,
+            format!("quantized {moved} of {} attacks", found.len()),
+        );
+    }
+
     /// undoable, reversible, and the same file still under it.
     #[cfg(feature = "recorder")]
     fn normalize_clips(&mut self, ids: &[u64]) {
@@ -22142,6 +22281,7 @@ mod tests {
             stretch: 2.0,
             stretch_mode: "tape".to_owned(),
             gain: 1.0,
+            warp: Vec::new(),
         };
         let mut cache = std::collections::HashMap::new();
         let got = stretched_clip_audio(
@@ -22309,6 +22449,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 0.5,
+            warp: Vec::new(),
         };
         let decoded = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.0; 48_000 * 2 * 10],
@@ -23716,6 +23857,7 @@ mod tests {").expect("the tests module")];
             stretch_mode: String::new(),
             gain: 1.0,
             extra: Default::default(),
+            warp: Vec::new(),
         };
         let notes = midi_clip_notes(&tail, 1_000.0);
         assert_eq!(notes.len(), 1, "the tail sounds {} notes, not one", notes.len());

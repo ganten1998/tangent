@@ -2998,6 +2998,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
         stretch: 1.0,
         stretch_mode: String::new(),
         gain: 1.0,
+        warp: Vec::new(),
     }
 }
 
@@ -6365,6 +6366,7 @@ impl TangentApp {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -6386,6 +6388,7 @@ impl TangentApp {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -6407,6 +6410,7 @@ impl TangentApp {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -6445,6 +6449,7 @@ impl TangentApp {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         self.arrangement = arr;
         // **A tempo map and a signature change, for the row to have
@@ -9314,6 +9319,7 @@ impl TangentApp {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let _ = doc;
         self.arr_save_edits();
@@ -9481,6 +9487,7 @@ impl TangentApp {
                 stretch: 1.0,
                 stretch_mode: String::new(),
                 gain: 1.0,
+                warp: Vec::new(),
             });
             added = Some(id);
         }
@@ -15542,6 +15549,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         self.arr_multi.clear();
         self.arr_selected = None;
@@ -15583,6 +15591,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.clips_dirty = true;
             }
         }
+    }
+
+    /// **Write a clip's warp map**, which is the whole of an audio quantize.
+    ///
+    /// The host computes it - only the host can reach the samples - and the
+    /// rendered audio is derived from it, so this one assignment is the
+    /// edit, the undo point and the thing the document saves.
+    pub fn set_clip_warp(&mut self, id: u64, warp: Vec<(u64, u64)>) {
+        if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+            if c.warp != warp {
+                c.warp = warp;
+                self.clips_dirty = true;
+            }
+        }
+        self.undo_commit();
+    }
+
+    /// **Take a clip back to how it was played.** The map is the edit, so
+    /// dropping it is the undo that does not need the stack.
+    pub fn clear_clip_warp(&mut self, id: u64) {
+        self.set_clip_warp(id, Vec::new());
     }
 
     /// Put a clip's level back to unity.
@@ -16675,6 +16704,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 stretch: 1.0,
                 stretch_mode: String::new(),
                 gain: 1.0,
+                warp: Vec::new(),
             });
         }
         if tails.is_empty() {
@@ -24231,6 +24261,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         stretch: 1.0,
                         stretch_mode: String::new(),
                         gain: 1.0,
+                        warp: Vec::new(),
                     });
                     self.arr_save_edits();
                 }
@@ -39049,6 +39080,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         app.recorder.position_s = 0.0;
@@ -39275,6 +39307,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         let before: Vec<(f64, u8)> = app.arrangement.clips[0]
@@ -39386,6 +39419,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -39766,6 +39800,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             pedal: Vec::new(),
@@ -39829,6 +39864,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             pedal: Vec::new(),
@@ -39878,6 +39914,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -40197,6 +40234,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -40281,6 +40319,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         // Three notes at 1.0, 2.0 and 3.0 — DELIBERATELY unequal lengths, so
@@ -40388,6 +40427,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         app.note_clipboard = vec![crate::arrangement::ArrNote {
@@ -40473,6 +40513,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
 
         assert!(!app.track_on_clipboard());
@@ -40741,6 +40782,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.arr_selected = Some(id);
         app.arr_copy();
@@ -40781,6 +40823,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.open_midi_editor(id);
         // Two Cs with a GAP between them, and one E in the middle of it.
@@ -42305,6 +42348,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -42447,6 +42491,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.arr_save_edits();
@@ -46558,6 +46603,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -49258,6 +49304,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
@@ -49279,6 +49326,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -49335,6 +49383,7 @@ mod tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -50939,6 +50988,7 @@ mod tests {
                 stretch: 1.0,
                 stretch_mode: String::new(),
                 gain: 1.0,
+                warp: Vec::new(),
             })
         };
         let audio = add(ClipKind::Audio);
@@ -56762,6 +56812,7 @@ mod tests {").expect("the tests module")];
                 stretch: 1.0,
                 stretch_mode: String::new(),
                 gain: 1.0,
+                warp: Vec::new(),
             });
         }
         // Wound right in, so any fit at all shows up in the numbers.
@@ -56848,6 +56899,7 @@ mod tests {").expect("the tests module")];
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -57431,6 +57483,7 @@ mod tests {").expect("the tests module")];
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -57887,6 +57940,7 @@ mod tests {").expect("the tests module")];
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(ctx, app);
@@ -59362,6 +59416,7 @@ mod velocity_selection_tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -64703,6 +64758,7 @@ mod arrange_peaks_tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         }
     }
 
@@ -64804,6 +64860,7 @@ mod sampler_road_tests {
             stretch: 1.0,
             stretch_mode: String::new(),
             gain: 1.0,
+            warp: Vec::new(),
         }
     }
 
