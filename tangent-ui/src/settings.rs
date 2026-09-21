@@ -1608,6 +1608,30 @@ pub struct Settings {
     /// the figure somebody wants is a taste, not a default worth arguing
     /// about.
     pub midi_quantize_pct: f64,
+    /// **The quantize window's own grid**, which is deliberately NOT the
+    /// grid the editor or the arrangement is drawing.
+    ///
+    /// `Q` quantizes to what you can see, which is the fast road and the
+    /// right default. The window is the other one: somebody trying a 1/16
+    /// quantize on a take while the arrangement shows bars should not have
+    /// to move the arrangement's grid to do it, and should not accidentally
+    /// move it either.
+    pub quantize_grid_exp: i64,
+    /// Three in the space of the next size up, for the window's grid.
+    pub quantize_triplet: bool,
+    /// Where the off-beat of each pair sits, as a PERCENTAGE. 50 is
+    /// straight, which is how "no swing" is stored rather than as a
+    /// separate flag: there is one number and 50 means the thing it says.
+    pub quantize_swing_pct: f64,
+    /// **Leave an event further than this from every line alone**, in
+    /// milliseconds; 0 is off. See `crate::quantize::Quantize::window` for
+    /// what it is protecting - a grace note is not a late note.
+    pub quantize_window_ms: f64,
+    /// How readily the audio side calls something an attack, 0 to 1.
+    pub quantize_sensitivity: f64,
+    /// How a warped segment gets where it belongs - the binary's
+    /// `warp::Fit` by key. Empty is auto, which asks the material.
+    pub quantize_fit: String,
     pub midi_triplet: bool,
     /// **How far HUMANIZE may pull a note off the grid**, as a percentage of
     /// one grid step, and **how far it may push a velocity**, as a percentage
@@ -2152,6 +2176,12 @@ impl Default for Settings {
             me_dark: true,
             midi_swing_pct: 66.7,
             midi_quantize_pct: 100.0,
+            quantize_grid_exp: -3,
+            quantize_triplet: false,
+            quantize_swing_pct: 50.0,
+            quantize_window_ms: 0.0,
+            quantize_sensitivity: 0.5,
+            quantize_fit: String::new(),
             // A quiet default: enough to be heard as a hand rather than a
             // grid, not enough to be heard as a mistake.
             midi_humanize_timing: 25,
@@ -3596,6 +3626,26 @@ impl Settings {
             s.midi_grid_exp = n.clamp(-7, 3);
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
+        if let Some(n) = map.shift_remove("quantize_grid_exp").and_then(|v| v.as_i64()) {
+            s.quantize_grid_exp = n.clamp(-7, 3);
+        }
+        take_bool(&mut map, "quantize_triplet", &mut s.quantize_triplet);
+        for (key, slot, lo, hi) in [
+            ("quantize_swing_pct", &mut s.quantize_swing_pct, 50.0, 95.0),
+            ("quantize_window_ms", &mut s.quantize_window_ms, 0.0, 500.0),
+            ("quantize_sensitivity", &mut s.quantize_sensitivity, 0.0, 1.0),
+        ] {
+            if let Some(v) = map
+                .shift_remove(key)
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite())
+            {
+                *slot = v.clamp(lo, hi);
+            }
+        }
+        if let Some(Value::String(t)) = map.shift_remove("quantize_fit") {
+            s.quantize_fit = t;
+        }
         if let Some(v) = map
             .shift_remove("midi_quantize_pct")
             .and_then(|v| v.as_f64())
@@ -4667,6 +4717,12 @@ impl Settings {
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_quantize_pct".into(), Value::from(self.midi_quantize_pct));
+        map.insert("quantize_grid_exp".into(), Value::from(self.quantize_grid_exp));
+        map.insert("quantize_triplet".into(), Value::from(self.quantize_triplet));
+        map.insert("quantize_swing_pct".into(), Value::from(self.quantize_swing_pct));
+        map.insert("quantize_window_ms".into(), Value::from(self.quantize_window_ms));
+        map.insert("quantize_sensitivity".into(), Value::from(self.quantize_sensitivity));
+        map.insert("quantize_fit".into(), Value::from(self.quantize_fit.clone()));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
         map.insert("arr_dark".into(), Value::Bool(self.arr_dark));
         map.insert(
@@ -5315,6 +5371,15 @@ impl Settings {
         self.midi_swing = fresh.midi_swing;
         self.midi_swing_pct = fresh.midi_swing_pct;
         self.midi_triplet = fresh.midi_triplet;
+        // The quantize window's own knobs, here beside the grids they are
+        // the other road to. `midi_quantize_pct` is the strength for both.
+        self.midi_quantize_pct = fresh.midi_quantize_pct;
+        self.quantize_grid_exp = fresh.quantize_grid_exp;
+        self.quantize_triplet = fresh.quantize_triplet;
+        self.quantize_swing_pct = fresh.quantize_swing_pct;
+        self.quantize_window_ms = fresh.quantize_window_ms;
+        self.quantize_sensitivity = fresh.quantize_sensitivity;
+        self.quantize_fit = fresh.quantize_fit.clone();
         self.transpose = fresh.transpose;
         self.show_transpose = fresh.show_transpose;
     }

@@ -626,6 +626,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // editor it moves notes. Audio only, for the same reason
             // normalise is — a note is moved where notes are edited.
             ("Q", "quantise the selected audio clips to the grid"),
+            ("S-Q", "shift+Q: the quantize window - grid, strength, window, feel"),
             ("C-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
