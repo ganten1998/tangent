@@ -675,6 +675,9 @@ pub struct ArrClip {
     /// Frames rather than seconds because the anchors address SAMPLES of a
     /// particular file, and a tempo change must not move them.
     pub warp: Vec<(u64, u64)>,
+    /// **How each warped segment gets to where it belongs** - the binary's
+    /// `warp::Fit` by its key. Empty reads as auto, which asks the material.
+    pub warp_fit: String,
     /// The clip's own level, linear. 1.0 is untouched.
     ///
     /// **Where NORMALISE lives**, and why it is undoable: rewriting the file
@@ -739,6 +742,7 @@ impl Default for ArrClip {
             gain: 1.0,
             stretch_mode: String::new(),
             warp: Vec::new(),
+            warp_fit: String::new(),
             extra: Map::new(),
         }
     }
@@ -3197,6 +3201,14 @@ impl Arrangement {
                             out
                         })
                         .unwrap_or_default(),
+                    // Kept as whatever string is there, like `stretch_mode`
+                    // and for the same reason: a fit this build does not
+                    // know reads as auto, which is the right answer.
+                    warp_fit: c
+                        .get("warp_fit")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
                     stretch_mode: c
                         .get("stretch_mode")
                         .and_then(Value::as_str)
@@ -3619,6 +3631,9 @@ impl Arrangement {
                                         .collect(),
                                 ),
                             );
+                        }
+                        if !c.warp_fit.is_empty() && c.warp_fit != "auto" {
+                            m.insert("warp_fit".into(), Value::String(c.warp_fit.clone()));
                         }
                         if !c.stretch_mode.is_empty() && c.stretch_mode != "auto" {
                             m.insert(
@@ -4126,6 +4141,7 @@ mod tests {
             gain: 1.0,
             extra: Map::new(),
             warp: Vec::new(),
+            warp_fit: String::new(),
         }
     }
 
@@ -4576,6 +4592,7 @@ mod tests {
             gain: 0.5,
             extra: Map::new(),
             warp: Vec::new(),
+            warp_fit: String::new(),
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {
             panic!("the document did not parse as an object");
@@ -4851,6 +4868,7 @@ mod tests {
             gain: 0.75,
             extra,
             warp: Vec::new(),
+            warp_fit: String::new(),
         });
         a.add_clip(ArrClip {
             pedal: Vec::new(),

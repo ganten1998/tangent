@@ -3209,7 +3209,9 @@ fn warped_clip_audio(
     let key: StretchKey = (
         path.to_path_buf(),
         i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        format!("warp:{f0}:{t0}:{f1}:{t1}"),
+        // The FIT is in the key: without it, switching a clip from stretch
+        // to slice would hand back the render made the other way.
+        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
     );
     if let Some(c) = cache.get(&key) {
         return Arc::clone(c);
@@ -3222,9 +3224,13 @@ fn warped_clip_audio(
             to: usize::try_from(to).unwrap_or(usize::MAX),
         })
         .collect();
-    // The material decides the algorithm, exactly as a stretch's does.
+    // The material decides both the algorithm and whether it is used at
+    // all, exactly as a stretch's does. `Fit::Auto` asks
+    // `stretch::percussiveness` and answers Slice only for material a slice
+    // flatters - see `warp::Fit::pick`.
     let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
-    let made = Arc::new(crate::warp::warp(&decoded, &anchors, mode));
+    let fit = crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default();
+    let made = Arc::new(crate::warp::warp(&decoded, &anchors, mode, fit));
     cache.insert(key, Arc::clone(&made));
     made
 }
@@ -11175,6 +11181,7 @@ impl DesktopApp {
                     gain: 1.0,
                     extra: Default::default(),
                     warp: Vec::new(),
+                    warp_fit: String::new(),
                 };
                 span = span.max(decoded.clip.seconds());
                 placed.extend(audio_clip_passes(&whole, &decoded.clip, f64::from(rate), 1.0));
@@ -22282,6 +22289,7 @@ mod tests {
             stretch_mode: "tape".to_owned(),
             gain: 1.0,
             warp: Vec::new(),
+            warp_fit: String::new(),
         };
         let mut cache = std::collections::HashMap::new();
         let got = stretched_clip_audio(
@@ -22450,6 +22458,7 @@ mod tests {
             stretch_mode: String::new(),
             gain: 0.5,
             warp: Vec::new(),
+            warp_fit: String::new(),
         };
         let decoded = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.0; 48_000 * 2 * 10],
@@ -23858,6 +23867,7 @@ mod tests {").expect("the tests module")];
             gain: 1.0,
             extra: Default::default(),
             warp: Vec::new(),
+            warp_fit: String::new(),
         };
         let notes = midi_clip_notes(&tail, 1_000.0);
         assert_eq!(notes.len(), 1, "the tail sounds {} notes, not one", notes.len());

@@ -48,6 +48,77 @@ pub struct Anchor {
     pub to: usize,
 }
 
+/// **How a segment gets from where it was played to where it belongs.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fit {
+    /// **Listen to the material and decide.** The default, and what nearly
+    /// every clip should stay on: see [`Fit::pick`].
+    #[default]
+    Auto,
+    /// Stretch the segment to fill the distance. No gap, ever, and the cost
+    /// is whatever the stretcher does to a sustain.
+    Stretch,
+    /// **Move the segment and let it end where it ends** - REAPER's dynamic
+    /// split, as a mode rather than as a different feature.
+    ///
+    /// Nothing is processed at all, so the hit comes out bit for bit as it
+    /// was played. A segment that has to move later leaves silence behind
+    /// it; one that moves earlier is cut off by the hit in front. On
+    /// isolated percussion with small corrections that is the best sound
+    /// available, and on anything sustained it is a disaster - which is why
+    /// [`Fit::pick`] asks the material rather than offering a coin toss.
+    Slice,
+}
+
+impl Fit {
+    /// Every fit, in the order a menu should offer them.
+    pub const ALL: [Fit; 3] = [Fit::Auto, Fit::Stretch, Fit::Slice];
+
+    /// How it is written to the document, and read back. **Append-only.**
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Fit::Auto => "auto",
+            Fit::Stretch => "stretch",
+            Fit::Slice => "slice",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Fit> {
+        Fit::ALL.into_iter().find(|m| m.key() == key)
+    }
+
+    /// **Which one this material wants.**
+    ///
+    /// The same question [`stretch::Mode::pick`] asks and the same measure
+    /// it asks it of: [`stretch::percussiveness`], the crest factor of the
+    /// envelope. That is not a coincidence worth hiding - "does this have
+    /// edges in it" decides whether a splice is masked or exposed, and it is
+    /// the only thing that separates material a slice flatters from material
+    /// a slice ruins.
+    ///
+    /// The threshold is deliberately HIGHER than the stretcher's. Picking
+    /// the wrong stretch algorithm costs some smearing; picking a slice for
+    /// sustained material costs silence where the music was. When the answer
+    /// is not obvious, stretch.
+    #[must_use]
+    pub fn pick(self, clip: &Clip) -> Fit {
+        if self != Fit::Auto {
+            return self;
+        }
+        if stretch::percussiveness(clip) >= SLICE_AT {
+            Fit::Slice
+        } else {
+            Fit::Stretch
+        }
+    }
+}
+
+/// Above this, material is percussive enough that a slice is safe. Well
+/// above the stretcher's own 0.30: see [`Fit::pick`].
+const SLICE_AT: f32 = 0.55;
+
 /// The shortest segment worth stretching, in frames at any rate.
 ///
 /// Below this a segment is a handful of samples and the ratio it implies is
@@ -79,7 +150,7 @@ const ATTACK_FADE: usize = 240;
 /// ratio of the segment beside it, so a clip does not change character at
 /// its edges.
 #[must_use]
-pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode) -> Clip {
+pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     let frames = clip.frames();
     if frames == 0 || anchors.is_empty() {
         return clip.clone();
@@ -100,6 +171,10 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode) -> Clip {
     if pts.is_empty() {
         return clip.clone();
     }
+    // **Asked ONCE, of the whole clip.** Per segment it would answer
+    // differently for the quiet bars than for the loud ones and the take
+    // would change character halfway through.
+    let fit = fit.pick(clip);
 
     // **The cut list, in source frames**: the head, every anchor, the tail.
     // Segment `i` runs from `cuts[i]` to `cuts[i + 1]` and has to come out
@@ -133,6 +208,18 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode) -> Clip {
     outs.push(pts[pts.len() - 1].to + ((tail_src as f64) * tail_ratio).round() as usize);
 
     let mut samples: Vec<f32> = Vec::with_capacity(outs[outs.len() - 1] * 2);
+    // **A first attack that is at frame zero and has to move later needs
+    // silence in front of it**, because there is no material before the
+    // start of a file to stretch into the gap.
+    //
+    // Missed entirely at first: the head above only runs when there IS
+    // material before the first anchor, so a clip that opened on its
+    // downbeat had the whole shift quietly dropped and came out early by
+    // exactly the amount it was asked to move. Found by a slice test
+    // expecting the audio to have moved and getting back the source.
+    if pts[0].from == 0 && pts[0].to > 0 {
+        samples.resize(pts[0].to * 2, 0.0);
+    }
     for i in 0..cuts.len() - 1 {
         let (s0, s1) = (cuts[i], cuts[i + 1]);
         let want = outs[i + 1].saturating_sub(outs[i]);
@@ -147,6 +234,13 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode) -> Clip {
         };
         // **A scrap is copied, not stretched.** See `MIN_SEGMENT`.
         let piece = if src_len < MIN_SEGMENT || want < MIN_SEGMENT || want == 0 {
+            seg
+        } else if fit == Fit::Slice {
+            // **Moved, not fitted.** The segment is played as recorded and
+            // the trim or the pad below does the rest: short of its slot it
+            // leaves the silence a split would leave, long for it it is cut
+            // off by the hit in front, and either way nothing has been
+            // through an algorithm. See `Fit::Slice`.
             seg
         } else {
             keep_the_attack(&seg, stretch::stretch(&seg, want as f64 / src_len as f64, mode))
@@ -283,7 +377,7 @@ mod tests {
             .zip(grid.iter())
             .map(|(t, &g)| Anchor { from: t.at, to: (f64::from(RATE) * g) as usize })
             .collect();
-        let out = warp(&c, &anchors, Mode::Rhythmic);
+        let out = warp(&c, &anchors, Mode::Rhythmic, Fit::Stretch);
 
         let after = transient::detect(&out, 0.5);
         assert_eq!(
@@ -311,6 +405,72 @@ mod tests {
         }
     }
 
+    /// **A slice moves the hit and processes nothing.**
+    ///
+    /// The REAPER behaviour, as a mode. What proves it is a slice and not a
+    /// stretch is that the moved segment is BIT FOR BIT the source: a
+    /// stretched one at the same ratio is not.
+    #[test]
+    fn a_slice_moves_the_audio_without_touching_it() {
+        let c = clicks_at(2.0, &[0.0, 0.5, 1.0]);
+        // Every hit pulled 40 ms later: a real move, so the segments must
+        // shift rather than stay put.
+        let anchors: Vec<Anchor> = (0..3)
+            .map(|i| Anchor {
+                from: (48_000.0 * (i as f64 * 0.5)) as usize,
+                to: (48_000.0 * (i as f64 * 0.5 + 0.04)) as usize,
+            })
+            .collect();
+        let sliced = warp(&c, &anchors, Mode::Rhythmic, Fit::Slice);
+        let stretched = warp(&c, &anchors, Mode::Rhythmic, Fit::Stretch);
+
+        // The first segment of the slice is the source's own samples, from
+        // its own start, untouched. Compared past the anchor so the head
+        // pad cannot be what is being matched.
+        let head = (48_000.0 * 0.04) as usize;
+        let probe = 2_000;
+        let a = &sliced.samples[head * 2..(head + probe) * 2];
+        let b = &c.samples[..probe * 2];
+        assert_eq!(a, b, "a slice altered the audio it moved");
+
+        // And the two fits are genuinely different renders, or this test
+        // would pass with `Fit` doing nothing at all.
+        let s = &stretched.samples[head * 2..(head + probe) * 2];
+        assert_ne!(a, s, "slice and stretch produced the same audio");
+    }
+
+    /// **Auto asks the material, and it is deliberately shy of slicing.**
+    ///
+    /// A click track is what a slice is for; a held chord is what it would
+    /// ruin. Picking the wrong stretch algorithm costs some smearing,
+    /// picking a slice for sustained material costs silence where the music
+    /// was - so the threshold sits well above the stretcher's own.
+    #[test]
+    fn auto_slices_a_click_track_and_stretches_a_chord() {
+        let clicky = clicks_at(4.0, &[0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75]);
+        assert_eq!(Fit::Auto.pick(&clicky), Fit::Slice, "a click track did not want a slice");
+
+        let n = (48_000.0 * 4.0) as usize;
+        let held = clip_of(
+            (0..n)
+                .flat_map(|f| {
+                    let t = f as f64 / 48_000.0;
+                    let v = [220.0, 277.18, 329.63]
+                        .iter()
+                        .map(|hz| (std::f64::consts::TAU * hz * t).sin())
+                        .sum::<f64>() as f32
+                        * 0.2;
+                    [v, v]
+                })
+                .collect(),
+        );
+        assert_eq!(Fit::Auto.pick(&held), Fit::Stretch, "a held chord wanted a slice");
+
+        // A stated fit is returned unchanged - Auto is the only one that asks.
+        assert_eq!(Fit::Slice.pick(&held), Fit::Slice);
+        assert_eq!(Fit::Stretch.pick(&clicky), Fit::Stretch);
+    }
+
     /// **The result is exactly as long as the anchors demand.**
     ///
     /// Each segment is trimmed or padded to its asked-for length, so the
@@ -327,7 +487,7 @@ mod tests {
                 to: (f64::from(RATE) * (i as f64 * 0.54)) as usize,
             })
             .collect();
-        let out = warp(&c, &anchors, Mode::Rhythmic);
+        let out = warp(&c, &anchors, Mode::Rhythmic, Fit::Stretch);
         // The last anchor is at 3.78 s and the tail carries the same ratio:
         // 0.5 s of source left, times 1.08.
         let want = anchors[7].to + ((f64::from(RATE) * 0.5) as f64 * 1.08).round() as usize;
@@ -343,9 +503,9 @@ mod tests {
     #[test]
     fn nothing_to_do_is_a_clip_unchanged() {
         let c = clicks_at(1.0, &[0.0, 0.5]);
-        assert_eq!(warp(&c, &[], Mode::Rhythmic).samples, c.samples, "no anchors");
+        assert_eq!(warp(&c, &[], Mode::Rhythmic, Fit::Stretch).samples, c.samples, "no anchors");
         let empty = clip_of(Vec::new());
-        assert!(warp(&empty, &[Anchor { from: 0, to: 10 }], Mode::Rhythmic).samples.is_empty());
+        assert!(warp(&empty, &[Anchor { from: 0, to: 10 }], Mode::Rhythmic, Fit::Stretch).samples.is_empty());
     }
 
     /// **An anchor list that goes backwards is dropped, not reordered.**
@@ -358,7 +518,7 @@ mod tests {
             Anchor { from: 12_000, to: 30_000 }, // `from` goes back
             Anchor { from: 36_000, to: 20_000 }, // `to` goes back
         ];
-        let out = warp(&c, &bad, Mode::Rhythmic);
+        let out = warp(&c, &bad, Mode::Rhythmic, Fit::Stretch);
         assert!(out.frames() > 0, "a partly-bad list rendered nothing");
     }
 }
