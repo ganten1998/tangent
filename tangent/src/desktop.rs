@@ -9944,7 +9944,7 @@ impl DesktopApp {
             // **No overlay for this one.** It is a detection pass over one
             // clip that is already decoded and in memory - measured in
             // milliseconds - and an overlay that flashes is worse than none.
-            Q::QuantizeClip { .. } => ("Quantizing", None),
+            Q::QuantizeClips { .. } => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
             // write one file per lane.
@@ -10108,13 +10108,29 @@ impl DesktopApp {
                 }
                 self.app.notify(Kind::Success, format!("Template saved - {name}"));
             }
-            tangent_ui::ports::ProjectRequest::QuantizeClip {
-                id,
+            tangent_ui::ports::ProjectRequest::QuantizeClips {
+                ids,
                 step_s,
                 swing,
                 strength,
             } => {
-                self.quantize_clip(id, step_s, swing, strength);
+                let mut moved = 0usize;
+                let mut attacks = 0usize;
+                for id in ids {
+                    let (m, a) = self.quantize_clip(id, step_s, swing, strength);
+                    moved += m;
+                    attacks += a;
+                }
+                // **One message for the gesture, not one per clip.** Eight
+                // takes quantized at once is one thing somebody did.
+                self.app.notify(
+                    if moved > 0 { Kind::Success } else { Kind::Error },
+                    if attacks == 0 {
+                        "nothing to quantize — no attacks found".to_owned()
+                    } else {
+                        format!("quantized {moved} of {attacks} attacks")
+                    },
+                );
             }
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 // Raised, not pushed: from here until the files land this is
@@ -11702,28 +11718,30 @@ impl DesktopApp {
     /// against the raw file position would put every hit of a trimmed clip
     /// out by the trim.
     #[cfg(feature = "recorder")]
-    fn quantize_clip(&mut self, id: u64, step_s: f64, swing: Option<f64>, strength: f64) {
+    fn quantize_clip(
+        &mut self,
+        id: u64,
+        step_s: f64,
+        swing: Option<f64>,
+        strength: f64,
+    ) -> (usize, usize) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
-            return;
+            return (0, 0);
         };
         let Some(grid) = tangent_ui::quantize::Grid::new(step_s, swing) else {
-            return;
+            return (0, 0);
         };
         let q = tangent_ui::quantize::Quantize { grid, strength, window: None };
         let doc = self.app.arrangement().clone();
         let Some(clip) = doc.clips.iter().find(|c| c.id == id) else {
-            return;
+            return (0, 0);
         };
         if clip.kind != tangent_ui::arrangement::ClipKind::Audio {
-            return;
+            return (0, 0);
         }
         let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
         let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
-            self.app.notify(
-                Kind::Error,
-                "that clip is still loading — try again in a moment".to_owned(),
-            );
-            return;
+            return (0, 0);
         };
         let rate = decoded.rate.max(1);
         let secs = |f: usize| f as f64 / f64::from(rate);
@@ -11748,18 +11766,11 @@ impl DesktopApp {
             }
         }
         if map.len() < 2 {
-            self.app.notify(
-                Kind::Error,
-                format!("nothing to quantize — {} attacks found", found.len()),
-            );
-            return;
+            return (0, found.len());
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
         self.app.set_clip_warp(id, map);
-        self.app.notify(
-            Kind::Info,
-            format!("quantized {moved} of {} attacks", found.len()),
-        );
+        (moved, found.len())
     }
 
     /// undoable, reversible, and the same file still under it.
