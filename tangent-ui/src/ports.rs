@@ -866,8 +866,10 @@ pub enum ProjectRequest {
     /// aims at is the one that was on screen when somebody asked - a host
     /// that looked it up again could answer a different question than the
     /// one put to it. Seconds per step, and the swung off-beat's fraction.
-    QuantizeClip {
-        id: u64,
+    /// **Ids, not one id**, because `project_request` carries one request a
+    /// frame and a marquee over eight takes is one gesture.
+    QuantizeClips {
+        ids: Vec<u64>,
         step_s: f64,
         swing: Option<f64>,
         strength: f64,

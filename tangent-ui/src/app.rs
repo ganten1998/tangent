@@ -15564,6 +15564,58 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **Quantize the selected audio clips onto the arrangement's grid.**
+    ///
+    /// The audio twin of the editor's `Q`, and the same rule as every clip
+    /// action here: the marquee if there is one, otherwise the single
+    /// selection. MIDI clips are skipped rather than refused - a selection
+    /// of both means "quantize what can be quantized", and the MIDI editor
+    /// is where a note gets moved.
+    ///
+    /// The host does the work; this only says which clips and which grid.
+    /// The grid travels WITH the request for the reason
+    /// `ProjectRequest::QuantizeClips` gives: a host that looked it up again
+    /// could answer a different question than the one it was asked.
+    fn arr_quantize_selection(&mut self) {
+        let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
+        if let Some(one) = self.arr_selected {
+            if !ids.contains(&one) {
+                ids.push(one);
+            }
+        }
+        ids.retain(|id| {
+            self.arrangement
+                .clips
+                .iter()
+                .any(|c| c.id == *id && c.kind == crate::arrangement::ClipKind::Audio)
+        });
+        if ids.is_empty() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Nothing to quantize - select an audio clip first.",
+            );
+            return;
+        }
+        // **The arrangement's grid is straight**: it has no swing and no
+        // triplet, unlike the MIDI editor's. Passing `None` rather than
+        // inventing one is the honest answer - a swung audio quantize wants
+        // the editor's grid brought out here, which is a separate decision.
+        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
+        let sig = self.settings.time_signature();
+        let quarters = crate::arrangement_panel::grid_quarters(
+            self.settings.arr_grid_exp.clamp(-7, 3) as i8,
+            sig.beats,
+            sig.unit,
+        );
+        let step_s = quarters * (60.0 / bpm);
+        self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips {
+            ids,
+            step_s,
+            swing: None,
+            strength: self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0,
+        });
+    }
+
     /// **The set, or the one.** The same rule every clip action here follows:
     /// a marquee over eight takes means all eight.
     fn arr_normalize_selection(&mut self) {
@@ -24448,6 +24500,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }) {
                 self.freeze_selected();
             }
+        }
+        // **Q: quantize what you are looking at.**
+        //
+        // The same letter the MIDI editor uses, and deliberately: in the
+        // editor it moves notes, out here it moves audio. A hand that has
+        // learned one has learned the other, and the two can never fire at
+        // once because this is guarded on the editor being closed.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q))
+        {
+            self.arr_quantize_selection();
         }
         // **Ctrl/Cmd+Shift+N: normalise.**
         //
@@ -38731,6 +38795,61 @@ mod tests {
         assert_eq!(read.clips.len(), 2, "the explicit save did not carry the take");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **Q in the arrangement asks the host to quantize the selected AUDIO.**
+    ///
+    /// The UI cannot reach the samples, so all this does is name the clips
+    /// and the grid - which means the thing worth testing is that it names
+    /// them correctly. Checked: MIDI in the selection is skipped rather than
+    /// sent, and the grid travels as SECONDS worked out from the
+    /// arrangement's own exponent and the song's tempo, not as an exponent
+    /// the host would have to interpret for itself.
+    #[test]
+    fn quantizing_the_arrangement_asks_the_host_for_the_audio_clips_only() {
+        let root = project_scratch("arr-quantize");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.arr_grid_exp = -2; // quarters
+        app.settings.record_export.tempo_bpm = 120.0;
+
+        let audio = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "/x/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        let midi = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_multi = [audio, midi].into_iter().collect();
+
+        app.arr_quantize_selection();
+        match app.take_project_request() {
+            Some(crate::ports::ProjectRequest::QuantizeClips { ids, step_s, swing, strength }) => {
+                assert_eq!(ids, vec![audio], "the MIDI clip was sent to an audio quantize");
+                // A quarter at 120 bpm in 4/4 is half a second.
+                assert!((step_s - 0.5).abs() < 1e-9, "the grid went over as {step_s} s");
+                assert_eq!(swing, None, "the arrangement grid is straight");
+                assert!((strength - 1.0).abs() < 1e-9, "the default strength is not full");
+            }
+            other => panic!("Q asked for {:?}", other.map(|r| std::mem::discriminant(&r))),
+        }
+
+        // And a selection with no audio in it asks for nothing at all.
+        app.arr_multi = [midi].into_iter().collect();
+        app.arr_selected = None;
+        app.arr_quantize_selection();
+        assert!(
+            app.take_project_request().is_none(),
+            "a MIDI-only selection still asked the host to quantize audio"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 
      /// **Quantize puts what was played on the grid the editor is showing.**
     ///

@@ -621,6 +621,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // C-S-N, not C-N: the handler requires shift, and only audio
             // comes up — a note's velocity is a performance, not a level.
             ("C-S-N", "normalise the selected audio clips"),
+            // **The same letter as the editor's Q**, and the card says so
+            // on both sides: in here it moves audio onto the grid, in the
+            // editor it moves notes. Audio only, for the same reason
+            // normalise is — a note is moved where notes are edited.
+            ("Q", "quantise the selected audio clips to the grid"),
             ("C-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
