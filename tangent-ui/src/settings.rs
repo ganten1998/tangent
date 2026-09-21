@@ -1600,6 +1600,14 @@ pub struct Settings {
     /// Where the swung off-beat sits, percent of its pair: 66.7 is the
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
+    /// **How hard the editor's quantize pulls**, as a percentage.
+    ///
+    /// 100 puts a note on the line; 50 moves it half way and keeps half of
+    /// whatever the hand did. A setting rather than a constant because full
+    /// quantize is the special case - see `crate::quantize::Quantize` - and
+    /// the figure somebody wants is a taste, not a default worth arguing
+    /// about.
+    pub midi_quantize_pct: f64,
     pub midi_triplet: bool,
     /// **How far HUMANIZE may pull a note off the grid**, as a percentage of
     /// one grid step, and **how far it may push a velocity**, as a percentage
@@ -2143,6 +2151,7 @@ impl Default for Settings {
             // now, and its light face is the arrange view's greys.
             me_dark: true,
             midi_swing_pct: 66.7,
+            midi_quantize_pct: 100.0,
             // A quiet default: enough to be heard as a hand rather than a
             // grid, not enough to be heard as a mistake.
             midi_humanize_timing: 25,
@@ -3587,6 +3596,13 @@ impl Settings {
             s.midi_grid_exp = n.clamp(-7, 3);
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
+        if let Some(v) = map
+            .shift_remove("midi_quantize_pct")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+        {
+            s.midi_quantize_pct = v.clamp(0.0, 100.0);
+        }
         take_bool(&mut map, "arr_dark", &mut s.arr_dark);
         if let Some(v) = map.shift_remove("drumpad_page").and_then(|v| v.as_u64()) {
             s.drumpad_page = (v as u8).min(crate::recorder::DRUM_PAGES as u8 - 1);
@@ -4650,6 +4666,7 @@ impl Settings {
         );
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
+        map.insert("midi_quantize_pct".into(), Value::from(self.midi_quantize_pct));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
         map.insert("arr_dark".into(), Value::Bool(self.arr_dark));
         map.insert(
