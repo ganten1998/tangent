@@ -38,6 +38,7 @@ pub mod piano;
 pub mod peaks;
 pub mod ports;
 pub mod preset;
+pub mod quantize;
 pub mod recorder;
 pub mod analyzer;
 pub mod scope;
