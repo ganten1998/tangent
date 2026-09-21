@@ -560,25 +560,32 @@ pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     if !view.snap_on {
         return t.max(0.0);
     }
-    let step = grid_step_s(view);
-    if step <= 0.0 {
+    // **The magnet and QUANTIZE are one implementation**, and this is the
+    // line that makes that true rather than aspirational. `Grid::nearest`
+    // holds the arithmetic - straight, triplet and swung - so a note dropped
+    // by hand and a note moved by a quantize land on the same frame by
+    // construction instead of by two functions agreeing.
+    //
+    // What stays here is what belongs to the EDITOR and not to the grid:
+    // whether the magnet is armed at all, and that nothing is ever dragged
+    // before the start of the timeline.
+    let Some(grid) = view_grid(view) else {
         return t.max(0.0);
-    }
-    if view.swing && !view.triplet {
-        // Pairs of steps: the on-beat at the pair's head, the off-beat
-        // pushed late to SWING of the pair. Candidates straddle `t`.
-        let pair = step * 2.0;
-        let base = (t / pair).floor() * pair;
-        let mut best = base;
-        for c in [base, base + pair * view.swing_pct.clamp(0.5, 0.95), base + pair] {
-            if (t - c).abs() < (t - best).abs() {
-                best = c;
-            }
-        }
-        best.max(0.0)
-    } else {
-        ((t / step).round() * step).max(0.0)
-    }
+    };
+    grid.nearest(t).max(0.0)
+}
+
+/// **This view's grid**, or `None` when it does not describe one.
+///
+/// The bridge between the editor's loose terms - a bool for swing, a
+/// percentage beside it - and the value the rest of the app quantizes
+/// against. Triplet beats swing here because they are mutually exclusive in
+/// this app and the editor has always resolved them that way.
+pub fn view_grid(view: &MidiEditView<'_>) -> Option<crate::quantize::Grid> {
+    crate::quantize::Grid::new(
+        grid_step_s(view),
+        (view.swing && !view.triplet).then(|| view.swing_pct.clamp(0.5, 0.95)),
+    )
 }
 
 /// As [`snap_t`], but FLOOR: the grid line at or before `t`. Note
@@ -2267,6 +2274,69 @@ mod tests {
     }
 
     use super::*;
+
+    /// **The magnet and a full-strength quantize land on the same frame.**
+    ///
+    /// Not a coincidence to be checked but a wiring to be held: `snap_t`
+    /// delegates to `Grid::nearest`, and this is what notices if somebody
+    /// gives the editor a local implementation again. The app has already
+    /// paid once for a magnet that pointed somewhere the drawn lines did not
+    /// - the box said "1/2" and it snapped eighths - and a quantize that
+    /// disagreed with the magnet would be the same bug wearing a menu item.
+    ///
+    /// Swept across straight, triplet and swung grids: two implementations
+    /// agreeing on one number is luck, and agreeing across a sweep is a
+    /// contract.
+    #[test]
+    fn a_full_strength_quantize_lands_where_the_magnet_would() {
+        let notes: Vec<ArrNote> = Vec::new();
+        for (exp, triplet, swing) in [
+            (-2_i8, false, false),
+            (-3, false, false),
+            (-3, true, false),
+            (-3, false, true),
+            (-5, false, true),
+        ] {
+            let v = MidiEditView {
+                snap_on: true,
+                grid_exp: exp,
+                triplet,
+                swing,
+                swing_pct: 0.62,
+                bpm: 120.0,
+                ..view(&notes)
+            };
+            // **Built from the VIEW'S OWN FIELDS, not from `view_grid`.**
+            //
+            // Written first as `view_grid(&v)`, which made the whole test a
+            // tautology: both sides then read one function, so deleting
+            // swing from it broke them identically and the test still
+            // passed. Verified by doing exactly that. Deriving the expected
+            // grid independently here is what gives the comparison teeth -
+            // if `view_grid` stops carrying swing, or triplet, or the
+            // meter, the magnet moves and this does not.
+            let grid = crate::quantize::Grid::from_document(
+                v.grid_exp,
+                v.sig_top as u8,
+                v.sig_bottom as u8,
+                v.bpm,
+                v.triplet,
+                (v.swing && !v.triplet).then_some(v.swing_pct),
+            )
+            .expect("every rung describes a grid");
+            let q = crate::quantize::Quantize::full(grid);
+            for i in 0..400 {
+                let t = f64::from(i) * 0.011;
+                let magnet = snap_t(&v, t);
+                let quantized = q.place(t).max(0.0);
+                assert!(
+                    (magnet - quantized).abs() < 1e-9,
+                    "exp {exp} triplet {triplet} swing {swing} at {t}: \
+                     the magnet says {magnet}, quantize says {quantized}"
+                );
+            }
+        }
+    }
 
     pub(super) fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
