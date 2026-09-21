@@ -661,6 +661,20 @@ pub struct ArrClip {
     /// parameters make: this crate holds what somebody chose and the binary
     /// knows what it means.
     pub stretch_mode: String,
+    /// **Where this clip has been warped**, as `(source frame, result
+    /// frame)` pairs, ascending in both. Empty for a clip nobody has
+    /// quantized.
+    ///
+    /// The audio twin of a MIDI quantize: the host detects the attacks, this
+    /// says where each one was asked to land, and `warp::warp` renders the
+    /// clip that puts them there. A LIST rather than a single ratio because
+    /// that is the whole difference between warping and stretching - each
+    /// segment gets its own ratio, so a take that rushed one bar and dragged
+    /// the next is fixed in both directions at once.
+    ///
+    /// Frames rather than seconds because the anchors address SAMPLES of a
+    /// particular file, and a tempo change must not move them.
+    pub warp: Vec<(u64, u64)>,
     /// The clip's own level, linear. 1.0 is untouched.
     ///
     /// **Where NORMALISE lives**, and why it is undoable: rewriting the file
@@ -724,6 +738,7 @@ impl Default for ArrClip {
             stretch: 1.0,
             gain: 1.0,
             stretch_mode: String::new(),
+            warp: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -3159,6 +3174,29 @@ impl Arrangement {
                     // build does not know reads as auto — see the binary's
                     // `Mode::from_key` — which is the right answer and not
                     // an error.
+                    // **Anything out of order is dropped, not repaired.**
+                    // A warp map that goes backwards cannot be rendered and
+                    // guessing at what it meant would hide whoever wrote it.
+                    warp: c
+                        .get("warp")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            let mut out: Vec<(u64, u64)> = Vec::with_capacity(a.len());
+                            for p in a {
+                                let Some(p) = p.as_array() else { continue };
+                                let (Some(f), Some(t)) = (
+                                    p.first().and_then(Value::as_u64),
+                                    p.get(1).and_then(Value::as_u64),
+                                ) else {
+                                    continue;
+                                };
+                                if out.last().is_none_or(|&(lf, lt)| f > lf && t > lt) {
+                                    out.push((f, t));
+                                }
+                            }
+                            out
+                        })
+                        .unwrap_or_default(),
                     stretch_mode: c
                         .get("stretch_mode")
                         .and_then(Value::as_str)
@@ -3565,6 +3603,22 @@ impl Arrangement {
                             if let Some(n) = serde_json::Number::from_f64(c.gain) {
                                 m.insert("gain".into(), Value::Number(n));
                             }
+                        }
+                        if !c.warp.is_empty() {
+                            m.insert(
+                                "warp".into(),
+                                Value::Array(
+                                    c.warp
+                                        .iter()
+                                        .map(|&(f, t)| {
+                                            Value::Array(vec![
+                                                Value::Number(f.into()),
+                                                Value::Number(t.into()),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            );
                         }
                         if !c.stretch_mode.is_empty() && c.stretch_mode != "auto" {
                             m.insert(
@@ -4071,6 +4125,7 @@ mod tests {
             stretch_mode: String::new(),
             gain: 1.0,
             extra: Map::new(),
+            warp: Vec::new(),
         }
     }
 
@@ -4140,6 +4195,63 @@ mod tests {
             Arrangement::resolve(doc, "/elsewhere/x.wav"),
             std::path::Path::new("/elsewhere/x.wav")
         );
+    }
+
+    /// **A warp map survives the document, and a broken one does not.**
+    ///
+    /// The map is what makes an audio quantize outlive the session that made
+    /// it: the anchors are the edit, and the rendered audio is derived from
+    /// them every load. A map that did not round-trip would quietly un-do
+    /// somebody's quantize the next time they opened the song.
+    ///
+    /// The second half is the half worth having. A list that goes backwards
+    /// cannot be rendered - `warp::warp` refuses it - so the reader drops
+    /// what it cannot use rather than handing the host a map that will be
+    /// silently discarded further down.
+    #[test]
+    fn a_warp_map_round_trips_and_a_backwards_one_is_dropped() {
+        let text = r#"{"arrangement_version": 9, "clips": [
+            {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+             "warp": [[0, 0], [24000, 22050], [48000, 44100]]}]}"#;
+        let a = Arrangement::from_json(text);
+        assert_eq!(
+            a.clips[0].warp,
+            vec![(0, 0), (24_000, 22_050), (48_000, 44_100)],
+            "the warp map did not survive the read"
+        );
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(
+            back.clips[0].warp, a.clips[0].warp,
+            "the warp map did not survive a round trip"
+        );
+
+        // Backwards in `from`, backwards in `to`, and a pair that is not a
+        // pair: each dropped, and the ones around them kept.
+        //
+        // **Each is measured against the last KEPT anchor, not the last one
+        // read.** Written first with `[18000, 10000]` here, expecting it to
+        // be dropped - and it is not, correctly: once `[6000, 20000]` is
+        // gone the pair before it is `[12000, 9000]`, and 18000/10000
+        // ascends from that perfectly well. The fixture says 8000 now, which
+        // genuinely goes back.
+        let bad = r#"{"arrangement_version": 9, "clips": [
+            {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+             "warp": [[0, 0], [12000, 9000], [6000, 20000], [18000, 8000],
+                      [24000, 30000], [99]]}]}"#;
+        let c = Arrangement::from_json(bad);
+        assert_eq!(
+            c.clips[0].warp,
+            vec![(0, 0), (12_000, 9_000), (24_000, 30_000)],
+            "a backwards anchor was kept"
+        );
+
+        // And a clip nobody warped writes no key at all, which is the
+        // document's own rule about staying byte-for-byte.
+        let plain = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0}]}"#,
+        );
+        assert!(!plain.to_json().contains("warp"), "an unwarped clip wrote a warp key");
     }
 
     /// The span is the furthest clip end, trims and the zero sentinel both
@@ -4463,6 +4575,7 @@ mod tests {
             stretch_mode: "tonal".into(),
             gain: 0.5,
             extra: Map::new(),
+            warp: Vec::new(),
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {
             panic!("the document did not parse as an object");
@@ -4737,6 +4850,7 @@ mod tests {
             stretch_mode: "tonal".into(),
             gain: 0.75,
             extra,
+            warp: Vec::new(),
         });
         a.add_clip(ArrClip {
             pedal: Vec::new(),

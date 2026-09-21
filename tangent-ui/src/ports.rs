@@ -855,6 +855,23 @@ pub enum ProjectRequest {
     /// any whole project that has been copied inside it — and lets
     /// `seed_template` write a fresh one. The kit and its samples stay: a
     /// person's default drum kit is theirs and is not what went wrong.
+    /// **Quantize one audio clip onto the grid**, by its id.
+    ///
+    /// The host does the work because the UI cannot reach the samples: it
+    /// detects the attacks, asks where each should land, and writes the
+    /// result into the clip's `warp` map. The audio is re-rendered from that
+    /// map, so the edit is undoable and survives the document like any other.
+    ///
+    /// Carries the grid rather than reading one, because the grid a quantize
+    /// aims at is the one that was on screen when somebody asked - a host
+    /// that looked it up again could answer a different question than the
+    /// one put to it. Seconds per step, and the swung off-beat's fraction.
+    QuantizeClip {
+        id: u64,
+        step_s: f64,
+        swing: Option<f64>,
+        strength: f64,
+    },
     ResetTemplate,
 }
 
