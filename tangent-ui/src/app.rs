@@ -16883,6 +16883,77 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// MOVE the whole selection by the grabbed note's delta — every note
     /// keeps its distance from the hand, and the CLIP's edges clamp the
     /// set as one, so a chord cannot shear against its own notes.
+    /// **Quantize: put what was played on the grid the editor is showing.**
+    ///
+    /// The SELECTION if there is one, the whole clip if there is not - which
+    /// is what every desk means by the word and what a hand that has selected
+    /// nothing is asking for.
+    ///
+    /// Aimed at the grid the eye can see, because it goes through
+    /// `midi_edit_view` and therefore through the same `Grid` the magnet
+    /// snaps to. Straight, triplet or swung: a quantize on a swung grid lands
+    /// on the swung lines, which is the whole reason swing is a grid setting
+    /// and not a separate operation.
+    ///
+    /// **Clip-relative in, clip-relative out.** A note's `at_s` is measured
+    /// from the clip's own offset, and the grid is drawn on the TIMELINE, so
+    /// the arithmetic has to cross into absolute seconds and back. Getting
+    /// that wrong quantizes correctly against the wrong lines, which looks
+    /// almost right and is the kind of thing nobody notices until a clip is
+    /// moved off the bar.
+    fn me_quantize(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, selected) = (st.id, st.selected.clone());
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let Some(grid) = crate::midi_editor::view_grid(&self.midi_edit_view(st, clip)) else {
+            return;
+        };
+        let q = crate::quantize::Quantize {
+            grid,
+            strength: (self.settings.midi_quantize_pct.clamp(0.0, 100.0)) / 100.0,
+            window: None,
+        };
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
+        let mut moved = 0usize;
+        for (i, n) in clip.notes.iter_mut().enumerate() {
+            if !selected.is_empty() && selected.binary_search(&i).is_err() {
+                continue;
+            }
+            // Clip-relative -> timeline, quantize, and back.
+            let abs = c0 + (n.at_s - offset);
+            let want = q.place(abs);
+            // **The clip's own edges still hold.** A note cannot be pushed
+            // out of the clip that owns it, and the tail has to fit: the set
+            // clamps the same way a drag does.
+            let dur = n.dur_s.max(0.05);
+            let want = want.clamp(c0, (c1 - dur).max(c0));
+            let at = offset + (want - c0);
+            if (n.at_s - at).abs() > 1.0e-9 {
+                n.at_s = at;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            // Sorted by `at` is a contract of this list, and a quantize can
+            // reorder it: two notes a hair apart can cross when one is late
+            // and the other early. The selection is indices INTO that list,
+            // so it cannot survive the sort and is dropped rather than left
+            // pointing at whatever moved into the slot.
+            clip.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.selected.clear();
+            }
+            self.undo_commit();
+        }
+    }
+
     fn me_move_selection(
         &mut self,
         grabbed: usize,
@@ -21133,6 +21204,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the playhead past it so the next press lands after this one.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Enter)) {
                 self.me_insert_at_playhead();
+            }
+
+            // **Q quantizes**, the one letter every desk agrees on. Bare,
+            // because every modifier on it means something else here and a
+            // quantize is not a thing to make somebody reach for.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
+                self.me_quantize();
             }
 
             // **Delete deletes; Backspace also steps back.** See `me_backspace`.
@@ -38611,6 +38689,91 @@ mod tests {
         let read = crate::arrangement::Arrangement::load_from(&app.project_doc);
         assert_eq!(read.clips.len(), 2, "the explicit save did not carry the take");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+     /// **Quantize puts what was played on the grid the editor is showing.**
+    ///
+    /// Tangent had no quantize of any kind; this is the first one. Driven
+    /// through `me_quantize` on a clip whose notes are deliberately OFF the
+    /// grid, and checked against hand-computed positions rather than against
+    /// the quantizer's own arithmetic - a test that asked `Quantize` where a
+    /// note should go and then checked it went there would pass on any
+    /// implementation, correct or not.
+    ///
+    /// **The clip starts OFF the grid, deliberately.** At 8.25 s with a
+    /// quarter-note grid of half a second, the clip's own zero is not on a
+    /// line - so a quantize that forgot to cross into timeline seconds and
+    /// back would aim at lines 0.25 s from the real ones and this notices.
+    /// Written first with the clip at 8.0, where the bug is INVISIBLE
+    /// because eight seconds is itself on a line and both arithmetics agree;
+    /// confirmed by making that mistake on purpose and watching the test
+    /// stay green.
+    #[test]
+    fn quantize_puts_the_notes_on_the_grid_and_honours_its_strength() {
+        let root = project_scratch("me-quantize");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.midi_grid_exp = -2; // quarters
+        app.settings.midi_snap = true;
+        app.settings.midi_swing = false;
+        app.settings.midi_triplet = false;
+
+        // Three notes: 40 ms late, 60 ms early, and one already on a line.
+        let notes = vec![
+            // 8.54 on the timeline: 40 ms late of the 8.5 line.
+            crate::arrangement::ArrNote { at_s: 0.29, dur_s: 0.2, key: 60, vel: 100, muted: false },
+            // 9.44: 60 ms early of the 9.5 line.
+            crate::arrangement::ArrNote { at_s: 1.19, dur_s: 0.2, key: 62, vel: 100, muted: false },
+            // 10.00: already on a line, and must not move.
+            crate::arrangement::ArrNote { at_s: 1.75, dur_s: 0.2, key: 64, vel: 100, muted: false },
+        ];
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes,
+            lane: 1,
+            start_s: 8.25,
+            len_s: 4.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+
+        // FULL strength: every note on the nearest half second.
+        app.settings.midi_quantize_pct = 100.0;
+        app.me_quantize();
+        let at: Vec<f64> = app.arrangement.clips.iter()
+            .find(|c| c.id == id).expect("the clip")
+            .notes.iter().map(|n| n.at_s).collect();
+        for (got, want) in at.iter().zip([0.25, 1.25, 1.75]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "full quantize landed at {at:?}, wanted 0.25/1.25/1.75"
+            );
+        }
+
+        // HALF strength on a fresh take: half the distance, not all of it.
+        let id2 = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 0.29, dur_s: 0.2, key: 60, vel: 100, muted: false
+            }],
+            lane: 1,
+            start_s: 8.25,
+            len_s: 4.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id2);
+        app.settings.midi_quantize_pct = 50.0;
+        app.me_quantize();
+        let half = app.arrangement.clips.iter()
+            .find(|c| c.id == id2).expect("the clip")
+            .notes[0].at_s;
+        assert!(
+            (half - 0.27).abs() < 1e-9,
+            "half strength moved the note to {half}, wanted 0.27 - half of the 40 ms"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The editor works on SETS now.** Select-all takes every note;
