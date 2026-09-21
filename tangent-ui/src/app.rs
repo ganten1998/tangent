@@ -15564,6 +15564,111 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **Open the quantize window**, filled from what was last used.
+    pub fn open_quantize_window(&mut self) {
+        self.dialog = Some(Dialog::Quantize {
+            grid_exp: self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
+            triplet: self.settings.quantize_triplet,
+            swing_pct: self.settings.quantize_swing_pct.clamp(50.0, 95.0),
+            strength_pct: self.settings.midi_quantize_pct.clamp(0.0, 100.0),
+            window_ms: self.settings.quantize_window_ms.clamp(0.0, 500.0),
+            sensitivity: self.settings.quantize_sensitivity.clamp(0.0, 1.0),
+            fit: self.settings.quantize_fit.clone(),
+            target: self.quantize_target(),
+        });
+    }
+
+    /// **The quantize window's grid**, from what it is showing.
+    ///
+    /// `None` when the numbers do not describe a grid, which is the same
+    /// answer `Grid::new` gives and for the same reason: a caller that
+    /// computed nonsense has a bug, and handing it a working grid hides it.
+    fn quantize_window_grid(&self) -> Option<crate::quantize::Grid> {
+        let sig = self.settings.time_signature();
+        crate::quantize::Grid::from_document(
+            self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
+            sig.beats,
+            sig.unit,
+            f64::from(self.tempo_bpm()),
+            self.settings.quantize_triplet,
+            // 50 IS straight, so it is `None` rather than a swing of a half.
+            (self.settings.quantize_swing_pct > 50.5)
+                .then(|| self.settings.quantize_swing_pct / 100.0),
+        )
+    }
+
+    /// **What the window would act on**, in words, or `None`.
+    ///
+    /// The window asks so it can SAY, rather than leaving somebody to press
+    /// Apply and find out. The MIDI editor wins when it is open, which is
+    /// the same rule `Q` follows.
+    pub fn quantize_target(&self) -> Option<String> {
+        if let Some(st) = self.midi_edit.as_ref() {
+            let n = self
+                .arrangement
+                .clips
+                .iter()
+                .find(|c| c.id == st.id)
+                .map_or(0, |c| c.notes.len());
+            let sel = st.selected.len();
+            return Some(if sel > 0 {
+                format!("{sel} selected notes")
+            } else {
+                format!("all {n} notes in this clip")
+            });
+        }
+        let audio = self.arr_quantize_ids();
+        (!audio.is_empty()).then(|| match audio.len() {
+            1 => "1 audio clip".to_owned(),
+            n => format!("{n} audio clips"),
+        })
+    }
+
+    /// The audio clips a quantize would act on: the marquee, or the one.
+    fn arr_quantize_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
+        if let Some(one) = self.arr_selected {
+            if !ids.contains(&one) {
+                ids.push(one);
+            }
+        }
+        ids.retain(|id| {
+            self.arrangement
+                .clips
+                .iter()
+                .any(|c| c.id == *id && c.kind == crate::arrangement::ClipKind::Audio)
+        });
+        ids
+    }
+
+    /// **Apply the window**: notes if the editor is open, audio otherwise.
+    fn apply_quantize_window(&mut self) {
+        let Some(grid) = self.quantize_window_grid() else {
+            return;
+        };
+        let strength = self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0;
+        let window = (self.settings.quantize_window_ms > 0.0)
+            .then(|| self.settings.quantize_window_ms / 1000.0);
+        if self.midi_edit.is_some() {
+            self.me_quantize_with(crate::quantize::Quantize { grid, strength, window });
+            return;
+        }
+        let ids = self.arr_quantize_ids();
+        if ids.is_empty() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Nothing to quantize - select an audio clip first.",
+            );
+            return;
+        }
+        self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips {
+            ids,
+            step_s: grid.step(),
+            swing: grid.swing(),
+            strength,
+        });
+    }
+
     /// **Quantize the selected audio clips onto the arrangement's grid.**
     ///
     /// The audio twin of the editor's `Q`, and the same rule as every clip
@@ -16993,21 +17098,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// almost right and is the kind of thing nobody notices until a clip is
     /// moved off the bar.
     fn me_quantize(&mut self) {
+        // **`Q` aims at the grid on screen**, which is the fast road. The
+        // window is the other one and states its own - see
+        // `apply_quantize_window`.
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
-        let (id, selected) = (st.id, st.selected.clone());
-        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
             return;
         };
         let Some(grid) = crate::midi_editor::view_grid(&self.midi_edit_view(st, clip)) else {
             return;
         };
-        let q = crate::quantize::Quantize {
+        self.me_quantize_with(crate::quantize::Quantize {
             grid,
             strength: (self.settings.midi_quantize_pct.clamp(0.0, 100.0)) / 100.0,
-            window: None,
+            window: (self.settings.quantize_window_ms > 0.0)
+                .then(|| self.settings.quantize_window_ms / 1000.0),
+        });
+    }
+
+    /// [`me_quantize`](Self::me_quantize), told exactly what to do rather
+    /// than working it out from the view.
+    fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
         };
+        let (id, selected) = (st.id, st.selected.clone());
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
@@ -24500,6 +24617,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }) {
                 self.freeze_selected();
             }
+        }
+        // **The quantize window watches the selection.** It is not modal, so
+        // what it would act on changes under it; a window that said "1 audio
+        // clip" while three were selected would be lying.
+        // Asked BEFORE the window is borrowed: `quantize_target` reads the
+        // whole app and cannot run inside a mutable borrow of one field.
+        if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+            let now = self.quantize_target();
+            if let Some(Dialog::Quantize { target, .. }) = self.dialog.as_mut() {
+                if *target != now {
+                    *target = now;
+                }
+            }
+        }
+        // **Shift+Q: the quantize window**, where every knob lives. Checked
+        // before the bare Q below, which is the same letter without it.
+        if keys_ok
+            && ctx.input(|i| {
+                i.modifiers.shift
+                    && !i.modifiers.command
+                    && !i.modifiers.ctrl
+                    && i.key_pressed(egui::Key::Q)
+            })
+        {
+            self.open_quantize_window();
         }
         // **Q: quantize what you are looking at.**
         //
@@ -32688,6 +32830,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             DialogAction::BrowseTo(dir) => self.browse_request = Some(dir),
             DialogAction::Browsed { what, path } => self.finish_browse(what, path),
+            DialogAction::ApplyQuantize {
+                grid_exp,
+                triplet,
+                swing_pct,
+                strength_pct,
+                window_ms,
+                sensitivity,
+                fit,
+            } => {
+                // Remembered first, so the window comes back as it was left
+                // whether or not there was anything to act on.
+                self.settings.quantize_grid_exp = i64::from(grid_exp);
+                self.settings.quantize_triplet = triplet;
+                self.settings.quantize_swing_pct = swing_pct;
+                self.settings.midi_quantize_pct = strength_pct;
+                self.settings.quantize_window_ms = window_ms;
+                self.settings.quantize_sensitivity = sensitivity;
+                self.settings.quantize_fit = fit;
+                self.save_settings();
+                self.apply_quantize_window();
+            }
             DialogAction::SetRenderAhead(ms) => {
                 // No stream reopens and no latency is added, so unlike the
                 // buffer this one is safe to move while a take is rolling.
@@ -38795,6 +38958,82 @@ mod tests {
         assert_eq!(read.clips.len(), 2, "the explicit save did not carry the take");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **The quantize window says what it would act on, and Apply acts on
+    /// it.**
+    ///
+    /// Two things worth holding. The window is NOT modal, so the selection
+    /// moves under it and the target line has to follow - a window saying
+    /// "1 audio clip" while three are selected is lying about what the
+    /// button does. And Apply uses the WINDOW'S grid, not the view's, which
+    /// is the whole reason the window exists beside the bare `Q`.
+    #[test]
+    fn the_quantize_window_follows_the_selection_and_applies_its_own_grid() {
+        use crate::dialogs::{Dialog, DialogAction};
+        let root = project_scratch("quantize-window");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        // The ARRANGEMENT is showing bars; the WINDOW is set to eighths.
+        app.settings.arr_grid_exp = 0;
+        app.settings.quantize_grid_exp = -3;
+
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "/x/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(a);
+        app.open_quantize_window();
+        match app.dialog.as_ref() {
+            Some(Dialog::Quantize { target, grid_exp, .. }) => {
+                assert_eq!(target.as_deref(), Some("1 audio clip"));
+                assert_eq!(*grid_exp, -3, "the window did not open on its own grid");
+            }
+            other => panic!("the window did not open: {:?}", other.is_some()),
+        }
+
+        // A second clip joins the selection: the line follows without the
+        // window being reopened.
+        let b = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "/x/b.wav".to_owned(),
+            lane: 1,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_multi = [a, b].into_iter().collect();
+        let now = app.quantize_target();
+        assert_eq!(now.as_deref(), Some("2 audio clips"), "the target did not follow");
+
+        // Apply sends the WINDOW's grid - an eighth at 120 is 0.25 s - and
+        // not the arrangement's bar.
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -3,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 80.0,
+            window_ms: 30.0,
+            sensitivity: 0.5,
+            fit: "slice".to_owned(),
+        });
+        match app.take_project_request() {
+            Some(crate::ports::ProjectRequest::QuantizeClips { ids, step_s, swing, strength }) => {
+                assert_eq!(ids.len(), 2, "Apply did not act on the whole selection");
+                assert!((step_s - 0.25).abs() < 1e-9, "Apply used {step_s} s, not the window's eighth");
+                assert_eq!(swing, None, "50% is straight and must travel as None");
+                assert!((strength - 0.8).abs() < 1e-9, "the strength did not travel");
+            }
+            other => panic!("Apply asked for {:?}", other.map(|r| std::mem::discriminant(&r))),
+        }
+        // And the knobs are remembered, so the window comes back as left.
+        assert_eq!(app.settings.quantize_fit, "slice");
+        assert!((app.settings.quantize_window_ms - 30.0).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 
     /// **Q in the arrangement asks the host to quantize the selected AUDIO.**
     ///

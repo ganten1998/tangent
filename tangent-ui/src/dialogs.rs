@@ -524,6 +524,29 @@ pub enum Dialog {
     },
     /// Name the colours the app is wearing and write them to the user themes
     /// folder. Stays open on failure so the typed name is not lost.
+    /// **The quantize window**: every knob the feature has, in one place.
+    ///
+    /// Working copies, so a window somebody is fiddling with does not move
+    /// anything until Apply. The grid here is the WINDOW'S own - see
+    /// `Settings::quantize_grid_exp` - because `Q` already quantizes to the
+    /// grid you can see and this is the other road.
+    Quantize {
+        grid_exp: i8,
+        triplet: bool,
+        /// 50 is straight. One number, no separate flag.
+        swing_pct: f64,
+        strength_pct: f64,
+        /// Milliseconds; 0 is "move everything".
+        window_ms: f64,
+        /// Audio only: how readily a rise counts as an attack.
+        sensitivity: f64,
+        /// `warp::Fit` by key: "", "stretch" or "slice".
+        fit: String,
+        /// **What Apply would act on, worked out by the app**, so the
+        /// window can say so rather than leaving somebody to press and
+        /// find out. `None` when nothing is selected.
+        target: Option<String>,
+    },
     SaveTheme {
         name: String,
         message: Option<String>,
@@ -780,6 +803,11 @@ impl Dialog {
             | Dialog::PatchEditor { .. }
             | Dialog::PluginPicker { .. }
             | Dialog::InsertKeySource { .. }
+            // **Not modal, and it has to be**: the whole point of the
+            // window is to select a clip, press Apply, listen, select
+            // another. A modal one would make you close it to choose what
+            // it acts on.
+            | Dialog::Quantize { .. }
             | Dialog::IrWizard { .. } => false,
             Dialog::Cheated
             | Dialog::CheatFun
@@ -1685,6 +1713,20 @@ pub enum DialogAction {
     /// Milliseconds of render-ahead; zero is off. See
     /// `Settings::render_ahead_ms`.
     SetRenderAhead(f64),
+    /// **Quantize the current selection** with every knob stated.
+    ///
+    /// Stated rather than read, for the reason `ProjectRequest::QuantizeClips`
+    /// gives: the window is the question, and an app that looked the numbers
+    /// up again could answer a different one.
+    ApplyQuantize {
+        grid_exp: i8,
+        triplet: bool,
+        swing_pct: f64,
+        strength_pct: f64,
+        window_ms: f64,
+        sensitivity: f64,
+        fit: String,
+    },
     /// Sample rate for both streams, or `None` for the devices' own.
     /// Applies to both and reopens them, exactly as the buffer does.
     SetSampleRate(Option<u32>),
@@ -12399,6 +12441,178 @@ fn show_on(
                                         }
                                     },
                                 );
+                            });
+                        });
+                },
+            )
+        }
+        Dialog::Quantize {
+            grid_exp,
+            triplet,
+            swing_pct,
+            strength_pct,
+            window_ms,
+            sensitivity,
+            fit,
+            target,
+        } => {
+            let t = theme(face);
+            let dim = t.text.gamma_multiply(0.62);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Quantize",
+                Vec2::new(430.0, 430.0),
+                Vec2::new(380.0, 380.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.field_bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let head = |ui: &mut egui::Ui, s: &str| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(s).font(bold(11.0)).color(t.text));
+                        ui.add_space(3.0);
+                    };
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            // ── what it would act on ──────────────────────
+                            ui.label(
+                                RichText::new(match target.as_deref() {
+                                    Some(w) => w,
+                                    None => "nothing selected",
+                                })
+                                .font(bold(12.0))
+                                .color(if target.is_some() { t.text } else { dim }),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Open the MIDI editor to quantize notes; select audio \
+                                     clips in the arrangement to quantize takes.",
+                                )
+                                .font(bold(9.0))
+                                .color(dim),
+                            );
+
+                            // ── the grid ──────────────────────────────────
+                            head(ui, "GRID");
+                            ui.horizontal_wrapped(|ui| {
+                                for e in (-7_i8..=0).rev() {
+                                    let label = crate::arrangement_panel::grid_label_text(e, 4, 4);
+                                    if ui.selectable_label(*grid_exp == e, label).clicked() {
+                                        *grid_exp = e;
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(triplet, RichText::new("triplet").color(t.text));
+                                ui.add_space(10.0);
+                                // **Swing is one number and 50 means straight**, so
+                                // there is no flag that can disagree with it.
+                                ui.add(
+                                    egui::Slider::new(swing_pct, 50.0..=75.0)
+                                        .suffix("% swing")
+                                        .fixed_decimals(0),
+                                );
+                            });
+                            if *triplet && *swing_pct > 50.0 {
+                                ui.label(
+                                    RichText::new("triplet wins — a swung triplet is two answers to one question")
+                                        .font(bold(9.0))
+                                        .color(dim),
+                                );
+                            }
+
+                            // ── how hard ──────────────────────────────────
+                            head(ui, "STRENGTH");
+                            ui.add(
+                                egui::Slider::new(strength_pct, 0.0..=100.0)
+                                    .suffix("%")
+                                    .fixed_decimals(0),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "100 puts it on the line. Less keeps some of what was played.",
+                                )
+                                .font(bold(9.0))
+                                .color(dim),
+                            );
+
+                            head(ui, "WINDOW");
+                            ui.add(
+                                egui::Slider::new(window_ms, 0.0..=200.0)
+                                    .suffix(" ms")
+                                    .fixed_decimals(0),
+                            );
+                            ui.label(
+                                RichText::new(if *window_ms <= 0.0 {
+                                    "off — everything moves, ornaments included".to_owned()
+                                } else {
+                                    format!(
+                                        "anything more than {window_ms:.0} ms from a line is left alone"
+                                    )
+                                })
+                                .font(bold(9.0))
+                                .color(dim),
+                            );
+
+                            // ── audio only ────────────────────────────────
+                            head(ui, "AUDIO");
+                            ui.add(
+                                egui::Slider::new(sensitivity, 0.0..=1.0)
+                                    .text("detect")
+                                    .fixed_decimals(2),
+                            );
+                            ui.horizontal(|ui| {
+                                for (key, label) in
+                                    [("", "auto"), ("stretch", "stretch"), ("slice", "slice")]
+                                {
+                                    if ui.selectable_label(fit == key, label).clicked() {
+                                        *fit = key.to_owned();
+                                    }
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Auto asks the material: percussive takes a slice, \
+                                     sustained gets stretched.",
+                                )
+                                .font(bold(9.0))
+                                .color(dim),
+                            );
+
+                            // ── the buttons ───────────────────────────────
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        target.is_some(),
+                                        Button::new(RichText::new("Apply").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::ApplyQuantize {
+                                        grid_exp: *grid_exp,
+                                        triplet: *triplet,
+                                        swing_pct: *swing_pct,
+                                        strength_pct: *strength_pct,
+                                        window_ms: *window_ms,
+                                        sensitivity: *sensitivity,
+                                        fit: fit.clone(),
+                                    });
+                                    // **Stays open.** Quantizing is a thing
+                                    // somebody does repeatedly while
+                                    // listening, and a window that closed on
+                                    // Apply would have to be reopened for
+                                    // every attempt.
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Close").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
                             });
                         });
                 },
