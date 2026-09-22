@@ -3908,6 +3908,25 @@ impl Arrangement {
                 f.f64(v);
             }
             f.map(&c.extra);
+            // **APPENDED, at the end of the clip's own block**, which is the
+            // rule this walk lives by: it runs in declaration order, so a
+            // term put among the others moves every existing document's
+            // words for no reason.
+            //
+            // **And it had to be here at all.** A quantize writes ONLY these
+            // two fields, so without them the walk produced identical words
+            // and `undo_commit` decided nothing had happened - no undo entry,
+            // and, worse, `project_dirty` could not see it either. Normalise
+            // then quantize then Ctrl+Z took the NORMALISE away, which is how
+            // this was found, and a quantized take could have been closed
+            // without so much as an asterisk to say it was unsaved.
+            f.len(c.warp.len());
+            for &(from, to) in &c.warp {
+                f.u64(from);
+                f.u64(to);
+            }
+            // `""` and `"auto"` write the same nothing, as `stretch_mode`.
+            f.str(if c.warp_fit == "auto" { "" } else { &c.warp_fit });
         }
         // **A constant map is not written, so its VALUE is not in the
         // document.** One tempo all the way through lives on the desk
@@ -4211,6 +4230,55 @@ mod tests {
             Arrangement::resolve(doc, "/elsewhere/x.wav"),
             std::path::Path::new("/elsewhere/x.wav")
         );
+    }
+
+    /// **A quantize is a CHANGE**, and the walk has to say so.
+    ///
+    /// The words this produces are what undo compares and what
+    /// `project_dirty` compares, so a field missing from it is a field no
+    /// undo can reach and no asterisk can report. Found the hard way:
+    /// normalise, quantize, Ctrl+Z took the NORMALISE away, because the
+    /// quantize had never been recorded as a moment at all - and a
+    /// quantized take could have been closed with nothing to say it was
+    /// unsaved.
+    ///
+    /// Asserted for BOTH fields, because `warp_fit` alone moves no anchor
+    /// and would have been the easy one to leave out.
+    #[test]
+    fn a_warp_moves_the_words_that_undo_and_dirty_are_built_on() {
+        let words = |a: &Arrangement| {
+            let mut f = Fingerprint::recording(0);
+            a.hash_into_ref(None, &mut f);
+            f.finish_recorded().0
+        };
+        let mut a = Arrangement::default();
+        a.add_clip(ArrClip {
+            kind: ClipKind::Audio,
+            path: "/x/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        let bare = words(&a);
+
+        a.clips[0].warp = vec![(0, 0), (24_000, 22_050)];
+        let warped = words(&a);
+        assert_ne!(bare, warped, "a warp map left the words unchanged");
+
+        a.clips[0].warp = vec![(0, 0), (24_000, 26_000)];
+        let moved = words(&a);
+        assert_ne!(warped, moved, "moving an anchor left the words unchanged");
+
+        a.clips[0].warp_fit = "slice".to_owned();
+        assert_ne!(moved, words(&a), "the fit left the words unchanged");
+
+        // And "auto" is the same nothing as "", exactly as `stretch_mode`:
+        // a document that writes neither must not read as two documents.
+        let mut auto = a.clone();
+        auto.clips[0].warp_fit = "auto".to_owned();
+        let mut blank = a.clone();
+        blank.clips[0].warp_fit = String::new();
+        assert_eq!(words(&auto), words(&blank), "auto and empty parted ways");
     }
 
     /// **A warp map survives the document, and a broken one does not.**

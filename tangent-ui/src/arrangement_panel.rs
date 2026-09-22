@@ -163,6 +163,14 @@ pub struct ClipView<'a> {
     pub midi: bool,
     /// Being RECORDED right now: drawn hot, and no gesture lands on it.
     pub recording: bool,
+    /// **The clip's own level, and the picture wears it.**
+    ///
+    /// The waveform was drawn from the raw file's peaks, so normalising a
+    /// quiet take changed how it SOUNDED and not how it LOOKED - the one
+    /// place a level edit is supposed to be obvious. Reported as "when
+    /// normalizing, the clip's waveform should reflect the new volume to
+    /// visually see these things better".
+    pub gain: f32,
 }
 
 /// One automation lane's contents, pushed in.
@@ -5082,6 +5090,15 @@ fn wave_band(
             continue;
         }
         let (lo, hi) = peaks.minmax_s(src, src + dt);
+        // **Clamped, not just scaled.** A clip lifted past full scale would
+        // otherwise draw outside its own band and over its neighbour, and
+        // the picture would say "louder" by spilling rather than by being
+        // taller. Pinning at the edge is also what a hand expects from a
+        // take that has been pushed as far as it goes.
+        let (lo, hi) = (
+            (lo * clip.gain).clamp(-1.0, 1.0),
+            (hi * clip.gain).clamp(-1.0, 1.0),
+        );
         let y0 = mid - hi * half;
         let y1 = (mid - lo * half).max(y0 + 1.0);
         let top = mesh.vertices.len() as u32;
@@ -7541,6 +7558,7 @@ LaneView {
                 notes: &[],
                 offset_s: 0.0,
                 recording: false,
+                gain: 1.0,
             },
             ClipView {
                 id: 2,
@@ -7561,6 +7579,7 @@ LaneView {
                 notes: &[],
                 offset_s: 0.0,
                 recording: false,
+                gain: 1.0,
             },
         ]
     }
@@ -11387,6 +11406,7 @@ selected: false,
             selected: false,
             midi: true,
             recording: false,
+            gain: 1.0,
         }
     }
 
@@ -11806,6 +11826,59 @@ selected: false,
             }
         }
         got
+    }
+
+    /// **The waveform wears the clip's gain.**
+    ///
+    /// Reported: "when normalizing, the clip's waveform should reflect the
+    /// new volume to visually see these things better." It did not - the
+    /// picture came off the raw file's peaks, so a normalise changed how a
+    /// take SOUNDED and not how it LOOKED, which is the one place a level
+    /// edit is supposed to be obvious.
+    ///
+    /// Measured as the band's HEIGHT rather than as a pixel row, because
+    /// where the middle sits is the layout's business and how tall the wave
+    /// is is this one's.
+    #[test]
+    fn the_drawn_wave_follows_the_clips_gain() {
+        let area = rect();
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let notes: Vec<crate::arrangement::ArrNote> = Vec::new();
+        let base = ClipView {
+            peaks: Some(&peaks),
+            len_s: 4.0,
+            max_len_s: 8.0,
+            loop_s: 0.0,
+            ..a_looped_clip(&notes, 2.0, 2.0)
+        };
+        let height = |g: f32| -> f32 {
+            let clips = [ClipView { gain: g, ..base }];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = 8.0;
+            v.song_s = 12.0;
+            let r = clip_rect(area, &v, &clips[0]);
+            wave_columns_xy_in(&v, r)
+                .into_iter()
+                .map(|(_, top, bot)| bot - top)
+                .fold(0.0f32, f32::max)
+        };
+        let unity = height(1.0);
+        assert!(unity > 2.0, "the fixture drew no wave at all: {unity}");
+
+        // Quieter draws SHORTER, louder draws TALLER.
+        let quiet = height(0.25);
+        assert!(quiet < unity * 0.6, "a quarter gain drew {quiet} against {unity}");
+        let loud = height(2.0);
+        assert!(loud > unity, "twice the gain drew {loud}, no taller than {unity}");
+
+        // **And it stops at the band**, rather than spilling over the
+        // neighbouring lane to say "louder".
+        let huge = height(64.0);
+        assert!(
+            huge <= loud + 1.5,
+            "a gain of 64 drew {huge} and ran past the clamp at {loud}"
+        );
     }
 
     /// A pyramid over `seconds` of stereo audio at 48 kHz: a 5 kHz tone
@@ -12825,6 +12898,7 @@ mod miniature_cost_probe {
                 selected: false,
                 midi: true,
                 recording: false,
+                gain: 1.0,
             })
             .collect();
 
