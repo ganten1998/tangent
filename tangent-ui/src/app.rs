@@ -1204,6 +1204,11 @@ pub struct TangentApp {
     /// Per-clip pictures the host pushed after decoding: the PLAYED span's
     /// wave and the file's length in seconds, by clip id.
     clip_infos: HashMap<u64, crate::ports::ClipInfo>,
+    /// **Where the quantize window's detector says the attacks are, and
+    /// where they would land** - per clip, source-relative seconds, pushed
+    /// by the host while that window is open and empty the rest of the
+    /// time. See `quantize_preview`, which is the question these answer.
+    clip_marks: HashMap<u64, std::sync::Arc<Vec<(f32, f32)>>>,
     /// The window the clip pictures were last drawn FOR.
     ///
     /// **A waveform is drawn at a zoom**, and a picture computed once at
@@ -3887,6 +3892,7 @@ impl TangentApp {
             arr_pending: None,
             arrangement_rect: None,
             clip_infos: HashMap::new(),
+            clip_marks: HashMap::new(),
             arr_wave_at: None,
             open_insert_on_load: None,
             mixer_rect: None,
@@ -12717,6 +12723,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// The pictures the host made of each clip after decoding: the played
     /// span's wave, and the file's length in seconds.
+    /// **The marks the quantize window asked for**, whole - a clip missing
+    /// from the list has none. Replaced rather than merged, because the set
+    /// is the answer to one question and a leftover from the last one would
+    /// be a tick nothing put there.
+    pub fn set_clip_marks(&mut self, marks: Vec<(u64, Vec<(f32, f32)>)>) {
+        self.clip_marks = marks
+            .into_iter()
+            .map(|(id, m)| (id, std::sync::Arc::new(m)))
+            .collect();
+    }
+
+    /// Whether anything is marked, so the host can skip the push when it has
+    /// nothing to say and the app has nothing showing.
+    pub fn has_clip_marks(&self) -> bool {
+        !self.clip_marks.is_empty()
+    }
+
     pub fn set_clip_infos(&mut self, infos: Vec<crate::ports::ClipInfo>) {
         self.clip_infos = infos.into_iter().map(|i| (i.id, i)).collect();
     }
@@ -13248,6 +13271,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         || self.arr_multi.contains(&c.id),
                     midi: c.kind == crate::arrangement::ClipKind::Midi,
                     gain: c.gain as f32,
+                    marks: self.clip_marks.get(&c.id).map_or(&[][..], |m| m.as_slice()),
                 }
             })
             .collect();
@@ -13281,6 +13305,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         midi: *is_midi,
                         recording: true,
                         gain: 1.0,
+                        // A take still being recorded has no map to preview.
+                        marks: &[],
                     });
                 }
             }
@@ -15776,32 +15802,65 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         ids
     }
 
+    /// **What the window is currently asking for**, over the audio it would
+    /// act on, or `None` when the numbers do not describe a grid.
+    ///
+    /// The one place the seven knobs become a question, so the REQUEST and
+    /// the PREVIEW cannot ask different ones - see
+    /// [`crate::ports::QuantizeAsk`]. Read from the settings, which the
+    /// window writes as it is turned.
+    fn quantize_ask(&self) -> Option<crate::ports::QuantizeAsk> {
+        let grid = self.quantize_window_grid()?;
+        Some(crate::ports::QuantizeAsk {
+            ids: self.arr_quantize_ids(),
+            step_s: grid.step(),
+            swing: grid.swing(),
+            strength: self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0,
+            window: (self.settings.quantize_window_ms > 0.0)
+                .then(|| self.settings.quantize_window_ms / 1000.0),
+            sensitivity: self.settings.quantize_sensitivity.clamp(0.0, 1.0),
+            fit: self.settings.quantize_fit.clone(),
+        })
+    }
+
+    /// **What the host should MARK on the waveforms right now**, or `None`
+    /// when the quantize window is not open.
+    ///
+    /// The owner: "the waveform should have transient marks shown as the
+    /// different settings are tweaked in its menu". The detector is the
+    /// host's - only the host can reach the samples - so this is the app
+    /// stating the question and the host answering it in ticks.
+    pub fn quantize_preview(&self) -> Option<crate::ports::QuantizeAsk> {
+        if !matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+            return None;
+        }
+        self.quantize_ask().filter(|a| !a.ids.is_empty())
+    }
+
     /// **Apply the window**: notes if the editor is open, audio otherwise.
     fn apply_quantize_window(&mut self) {
-        let Some(grid) = self.quantize_window_grid() else {
+        let Some(ask) = self.quantize_ask() else {
             return;
         };
-        let strength = self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0;
-        let window = (self.settings.quantize_window_ms > 0.0)
-            .then(|| self.settings.quantize_window_ms / 1000.0);
         if self.midi_edit.is_some() {
-            self.me_quantize_with(crate::quantize::Quantize { grid, strength, window });
+            let Some(grid) = self.quantize_window_grid() else {
+                return;
+            };
+            self.me_quantize_with(crate::quantize::Quantize {
+                grid,
+                strength: ask.strength,
+                window: ask.window,
+            });
             return;
         }
-        let ids = self.arr_quantize_ids();
-        if ids.is_empty() {
+        if ask.ids.is_empty() {
             self.notify(
                 crate::notify::Kind::Info,
                 "Nothing to quantize - select an audio clip first.",
             );
             return;
         }
-        self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips {
-            ids,
-            step_s: grid.step(),
-            swing: grid.swing(),
-            strength,
-        });
+        self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips(ask));
     }
 
     /// **The set, or the one.** The same rule every clip action here follows:
@@ -15847,12 +15906,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// rendered audio is derived from it, so this one assignment is the
     /// edit, the undo point and the thing the document saves.
     pub fn set_clip_warp(&mut self, id: u64, warp: Vec<(u64, u64)>) {
+        let fit = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map_or_else(String::new, |c| c.warp_fit.clone());
+        self.set_clip_warp_with_fit(id, warp, fit);
+    }
+
+    /// The map and the FIT it was made under, which travel together: the
+    /// render is built from the pair, and the same anchors under `slice` and
+    /// under `stretch` are two different takes.
+    ///
+    /// **Commits nothing.** It used to end with `undo_commit`, which is one
+    /// moment per CLIP - so a marquee over eight takes left eight of them
+    /// and one Ctrl+Z undid a single take's quantize. The caller commits
+    /// once for the gesture, through `commit_undo_moment`.
+    pub fn set_clip_warp_with_fit(&mut self, id: u64, warp: Vec<(u64, u64)>, fit: String) {
         if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
-            if c.warp != warp {
+            if c.warp != warp || c.warp_fit != fit {
                 c.warp = warp;
+                c.warp_fit = fit;
                 self.clips_dirty = true;
             }
         }
+    }
+
+    /// **One moment, for a gesture the HOST carried out.** The door
+    /// `undo_commit` opens to the other side of the firewall: the app owns
+    /// the timeline, the host owns the samples, and a host-side edit still
+    /// has to land as one undoable step.
+    pub fn commit_undo_moment(&mut self) {
         self.undo_commit();
     }
 
@@ -15860,6 +15945,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// dropping it is the undo that does not need the stack.
     pub fn clear_clip_warp(&mut self, id: u64) {
         self.set_clip_warp(id, Vec::new());
+        // Its own gesture, so its own moment - the write no longer commits.
+        self.commit_undo_moment();
     }
 
     /// Put a clip's level back to unity.
@@ -17259,8 +17346,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     *i = where_now.get(*i).copied().unwrap_or(*i);
                 }
                 st.selected.sort_unstable();
+                // **Marked dirty so the clip reaches the ENGINE**, which is
+                // what `me_commit` is for. This ended with a bare
+                // `undo_commit`: the notes moved in the document and on the
+                // roll, the transport went on playing them where they were
+                // played, and the only way to hear a quantize was to touch
+                // the clip again afterwards. The same fault the pen-up note
+                // had, one gesture further along - see
+                // `a_note_written_with_the_pen_up_reaches_the_engine`.
+                st.dirty = true;
             }
-            self.undo_commit();
+            self.me_commit();
         }
     }
 
@@ -39127,11 +39223,28 @@ mod tests {
             fit: "slice".to_owned(),
         });
         match app.take_project_request() {
-            Some(crate::ports::ProjectRequest::QuantizeClips { ids, step_s, swing, strength }) => {
+            Some(crate::ports::ProjectRequest::QuantizeClips(
+                crate::ports::QuantizeAsk {
+                    ids,
+                    step_s,
+                    swing,
+                    strength,
+                    window,
+                    sensitivity,
+                    fit,
+                },
+            )) => {
                 assert_eq!(ids.len(), 2, "Apply did not act on the whole selection");
                 assert!((step_s - 0.25).abs() < 1e-9, "Apply used {step_s} s, not the window's eighth");
                 assert_eq!(swing, None, "50% is straight and must travel as None");
                 assert!((strength - 0.8).abs() < 1e-9, "the strength did not travel");
+                // **The three that used to be dropped on this step.** The
+                // Apply wrote them into settings and the request carried
+                // four of seven, so the sensitivity dial, the window and
+                // the fit were wired to nothing on the audio side.
+                assert_eq!(window, Some(0.030), "the window did not travel");
+                assert!((sensitivity - 0.5).abs() < 1e-9, "the sensitivity did not travel");
+                assert_eq!(fit, "slice", "the fit did not travel");
             }
             other => panic!("Apply asked for {:?}", other.map(|r| std::mem::discriminant(&r))),
         }
@@ -39141,6 +39254,160 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    /// **The window asks for marks while it is open, and for nothing when
+    /// it is not.**
+    ///
+    /// The app cannot detect an attack - it has no samples - so the marks
+    /// are a question it states and the host answers. What this pins is the
+    /// question: it carries the live knobs, it names the audio that Apply
+    /// would act on, and it goes away with the window rather than leaving
+    /// ticks on a waveform nobody is looking at.
+    #[test]
+    fn the_quantize_window_asks_for_marks_and_stops_when_it_shuts() {
+        let root = project_scratch("qmarks");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(a);
+
+        // Shut: nothing asked.
+        assert!(app.quantize_preview().is_none(), "a shut window asked for marks");
+
+        // Open, with the knobs somewhere deliberate.
+        app.settings.quantize_grid_exp = -3;
+        app.settings.quantize_sensitivity = 0.72;
+        app.settings.quantize_window_ms = 25.0;
+        app.settings.midi_quantize_pct = 60.0;
+        app.settings.quantize_fit = "slice".to_owned();
+        app.open_quantize_window();
+        let ask = app.quantize_preview().expect("an open window asks");
+        assert_eq!(ask.ids, vec![a], "the preview did not name the selection");
+        assert!((ask.step_s - 0.25).abs() < 1e-9, "an eighth at 120 is a quarter second");
+        assert!((ask.sensitivity - 0.72).abs() < 1e-9, "the dial did not reach the question");
+        assert_eq!(ask.window, Some(0.025), "the window did not reach the question");
+        assert!((ask.strength - 0.6).abs() < 1e-9, "the strength did not reach the question");
+        assert_eq!(ask.fit, "slice", "the fit did not reach the question");
+
+        // **Turning a dial changes the question**, which is what makes the
+        // ticks follow the hand.
+        app.settings.quantize_sensitivity = 0.20;
+        let moved = app.quantize_preview().expect("still open");
+        assert_ne!(moved, ask, "the dial moved and the question did not");
+
+        // The host's answer reaches the picture.
+        app.set_clip_marks(vec![(a, vec![(1.0, 1.25), (2.0, 2.0)])]);
+        let views = app.arr_clip_views();
+        let v = views.iter().find(|v| v.id == a).expect("the clip is drawn");
+        assert_eq!(v.marks, &[(1.0, 1.25), (2.0, 2.0)], "the marks did not reach the clip");
+
+        // Shut it: no question, and the ticks come down.
+        app.dialog = None;
+        assert!(app.quantize_preview().is_none(), "a shut window still asks");
+        app.set_clip_marks(Vec::new());
+        assert!(!app.has_clip_marks(), "the ticks stayed up");
+        let views = app.arr_clip_views();
+        let v = views.iter().find(|v| v.id == a).expect("the clip is drawn");
+        assert!(v.marks.is_empty(), "the clip kept its ticks");
+
+        // And a selection with no audio in it asks for nothing, so the host
+        // is never sent on a walk for marks nobody can see.
+        app.arr_selected = None;
+        app.arr_multi.clear();
+        app.open_quantize_window();
+        assert!(
+            app.quantize_preview().is_none(),
+            "an empty selection still asked for marks"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A quantize is one undoable step, and one for the whole gesture.**
+    ///
+    /// The owner: "quantizing is not subject to the undo redo process at
+    /// all". Two halves, and the second is the one that was really wrong.
+    ///
+    /// The map IS the edit - the audio is rendered from it - so `warp` and
+    /// `warp_fit` are in the fingerprint walk and a moment carries them.
+    /// That half held.
+    ///
+    /// The half that did not: `set_clip_warp` committed a moment ITSELF, so
+    /// a marquee over eight takes left eight moments and one Ctrl+Z undid a
+    /// single take's quantize and left the other seven standing. The write
+    /// commits nothing now and the caller commits once for the gesture -
+    /// see `TangentApp::commit_undo_moment`, the door the host uses.
+    #[test]
+    fn a_quantize_is_one_undoable_step_for_the_whole_gesture() {
+        let root = project_scratch("warpundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let mut ids = Vec::new();
+        for (lane, name) in [(0usize, "a.wav"), (1, "b.wav"), (2, "c.wav")] {
+            ids.push(app.arrangement.add_clip(crate::arrangement::ArrClip {
+                kind: crate::arrangement::ClipKind::Audio,
+                path: format!("media/{name}"),
+                lane,
+                len_s: 4.0,
+                ..Default::default()
+            }));
+        }
+        app.arr_save_edits();
+        let before = app.hist_at;
+        // Cleared, so the assertion below is about the WRITE rather than
+        // about the undo, which raises the flag on its own.
+        app.take_clips_dirty();
+
+        // The gesture: three clips warped, then ONE commit - which is what
+        // the host does with a whole selection.
+        for (n, &id) in ids.iter().enumerate() {
+            let shift = 100 * (n as u64 + 1);
+            app.set_clip_warp_with_fit(
+                id,
+                vec![(0, shift), (1000, 1000 + shift)],
+                "slice".to_owned(),
+            );
+        }
+        // **The engine is told by the WRITE.** A document that moved and a
+        // schedule that did not is a quantize you can see and not hear.
+        assert!(app.clips_dirty, "the map was written and the engine never heard");
+        app.commit_undo_moment();
+        assert_eq!(
+            app.hist_at,
+            before + 1,
+            "three clips in one gesture left {} moments",
+            app.hist_at - before
+        );
+
+        // ONE step back takes all three off.
+        app.undo();
+        for &id in &ids {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
+            assert!(c.warp.is_empty(), "a clip kept its warp through the undo");
+            assert!(c.warp_fit.is_empty(), "a clip kept its fit through the undo");
+        }
+        assert!(app.clips_dirty, "the undo never reached the engine");
+
+        // And one step forward puts all three back, fits included.
+        app.redo();
+        for (n, &id) in ids.iter().enumerate() {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
+            let shift = 100 * (n as u64 + 1);
+            assert_eq!(
+                c.warp,
+                vec![(0, shift), (1000, 1000 + shift)],
+                "the redo did not bring the map back"
+            );
+            assert_eq!(c.warp_fit, "slice", "the redo did not bring the fit back");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// **Q in the arrangement asks the host to quantize the selected AUDIO.**
     ///
@@ -39183,8 +39450,11 @@ mod tests {
             fit: String::new(),
         });
         match app.take_project_request() {
-            Some(crate::ports::ProjectRequest::QuantizeClips { ids, step_s, swing, strength }) => {
+            Some(crate::ports::ProjectRequest::QuantizeClips(
+                crate::ports::QuantizeAsk { ids, step_s, swing, strength, window, .. },
+            )) => {
                 assert_eq!(ids, vec![audio], "the MIDI clip was sent to an audio quantize");
+                assert_eq!(window, None, "a window of zero is OFF, not a window of zero");
                 // A quarter at 120 bpm in 4/4 is half a second.
                 assert!((step_s - 0.5).abs() < 1e-9, "the grid went over as {step_s} s");
                 assert_eq!(swing, None, "the arrangement grid is straight");

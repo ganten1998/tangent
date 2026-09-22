@@ -7237,6 +7237,53 @@ mod tests {
     /// **The metronome panel answers every control it draws.**
     ///
     /// It was an egui dialog and read as a foreign object — the owner's "it's
+    /// **A panel summoned at a point lands CENTRED on it, both ways.**
+    ///
+    /// `Cmd+M` hands the middle of the surface as a one-point anchor, and
+    /// the placement hung the panel BELOW whatever it was given - so it came
+    /// up across the middle horizontally and under it vertically. The
+    /// owner: "metronome menu is now horizontally but not vert centered on
+    /// cmd m. needs both to be in the middle of the screen."
+    ///
+    /// And the other half, which is what stops this being a one-line change
+    /// that moves the chip's panel too: a real button still gets a panel
+    /// hanging off it rather than one sitting on top of it.
+    #[test]
+    fn a_panel_summoned_at_a_point_is_centred_on_it() {
+        use super::met_popup_rect;
+        for (w, h) in [(1400.0_f32, 900.0_f32), (900.0, 600.0), (2560.0, 1440.0)] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+            let middle = screen.center();
+            let summoned = met_popup_rect(screen, Rect::from_center_size(middle, Vec2::splat(1.0)));
+            assert!(summoned.is_positive(), "the summoned panel has no room at {w}x{h}");
+            assert!(screen.contains_rect(summoned), "it hangs off the surface at {w}x{h}");
+            assert!(
+                (summoned.center().x - middle.x).abs() < 0.5,
+                "not centred across at {w}x{h}: {} against {}",
+                summoned.center().x,
+                middle.x
+            );
+            assert!(
+                (summoned.center().y - middle.y).abs() < 0.5,
+                "not centred DOWN at {w}x{h}: {} against {}",
+                summoned.center().y,
+                middle.y
+            );
+
+            // A button keeps its panel underneath it.
+            let chip = Rect::from_min_size(Pos2::new(w * 0.2, h * 0.1), Vec2::splat(22.0));
+            let hung = met_popup_rect(screen, chip);
+            assert!(
+                hung.top() >= chip.bottom(),
+                "a button's panel covered the button at {w}x{h}"
+            );
+            assert!(
+                (hung.center().x - chip.center().x).abs() < 0.5,
+                "a button's panel is no longer centred on it at {w}x{h}"
+            );
+        }
+    }
+
     /// cut off or looks wonky". Painted like the dials' own panels it is
     /// themed by construction, but a painted panel has to hit-test itself, so
     /// this walks every cell it draws and asks what is under it.
@@ -7843,11 +7890,11 @@ mod tests {
             assert!(!inside(&rolling, r), "{what} is on the red button's panel");
         }
         assert_eq!(
-            SetupShape::Rolling.tier_word(),
+            SetupShape::Rolling.title_word(),
             "RECORDING",
             "the red button's panel is headed as somebody else's"
         );
-        assert_eq!(SetupShape::Take.tier_word(), "TAKE");
+        assert_eq!(SetupShape::Take.title_word(), "TAKE");
 
         // And the machine tier belongs to the cog and is not on the take.
         for (what, m, t) in [
@@ -8006,8 +8053,12 @@ mod tests {
                     .fold(f32::MIN, f32::max)
                     / 0.82;
                 let slack = l.panel.bottom() - bottom;
+                // **Tight enough to catch half a row.** A heading counted
+                // for a shape that does not draw one is 0.55 of a row of
+                // nothing, which a looser bound waves through; every shape
+                // settles at 1.6 and the margin here is deliberate.
                 assert!(
-                    slack < pitch * 2.4,
+                    slack < pitch * 2.0,
                     "{shape:?} at {w}: {slack:.0}pt under the last control, {:.1} rows",
                     slack / pitch
                 );
@@ -8095,20 +8146,36 @@ mod tests {
             assert!(l.panel.contains_rect(r), "{what} ran off the cog's panel");
         }
 
-        // ── the capture button: TAKE, alone ──
+        // ── the capture button: TAKE, alone, and its name is the TITLE ──
+        //
+        // A one-tier panel headed SETTINGS over a heading reading TAKE wore
+        // its own name twice. The word moved up into the title band and the
+        // heading went with the rows it used to open; the rows start right
+        // under the title now.
+        for shape in [SetupShape::Take, SetupShape::Rolling] {
+            let t = SetupLayout::new(screen, anchor, shape);
+            assert_eq!(shape.title_word(), shape.tier_word());
+            assert!(
+                !t.panel.contains(t.take_head.center()),
+                "{shape:?} still draws a tier heading under its own name"
+            );
+            assert!(t.title.is_positive(), "{shape:?} has no title band");
+            assert!(t.panel.contains_rect(t.title), "{shape:?}'s title ran off its panel");
+        }
         let t = SetupLayout::new(screen, anchor, SetupShape::Take);
         assert!(
-            t.panel.contains(t.take_head.center()),
-            "the TAKE heading is not in the take panel"
-        );
-        assert!(
-            t.take_head.bottom() <= t.name.top(),
-            "the take rows do not start under their heading"
+            t.title.bottom() <= t.name.top(),
+            "the take rows do not start under the title"
         );
         assert!(
             t.name.top() >= t.panel.top(),
             "the take rows start above their own panel"
         );
+        // The cog keeps SETTINGS, because it is more than one tier.
+        assert_eq!(SetupShape::Machine.title_word(), "SETTINGS");
+        assert!(!SetupShape::Machine.title_names_its_tier());
+        assert!(SetupShape::Take.title_names_its_tier());
+        assert!(SetupShape::Rolling.title_names_its_tier());
     }
 
     /// No two controls in the panel share a pixel.
@@ -10793,6 +10860,33 @@ impl SetupShape {
             _ => "TAKE",
         }
     }
+
+    /// **What the panel is called, at the top of it.**
+    ///
+    /// The cog's panel is a list of tiers and SETTINGS is the honest name
+    /// for all of them. The other two are ONE tier, and a title that said
+    /// SETTINGS over a heading that said TAKE was a panel wearing its own
+    /// name twice - the owner's "Remove their headers and just put the
+    /// RECORDING and TAKE at the top instead". So the tier word IS the
+    /// title there, and [`SetupLayout`] lays the heading band out where
+    /// nothing can see it.
+    pub fn title_word(self) -> &'static str {
+        match self {
+            SetupShape::Machine => "SETTINGS",
+            other => other.tier_word(),
+        }
+    }
+
+    /// **Whether the panel's own title already names the tier it shows.**
+    ///
+    /// True for the two single-tier shapes, whose title IS their tier's
+    /// name, and false for the cog's, which shows several and names them
+    /// where they begin. It is what decides whether the TAKE tier still
+    /// gets a heading band: a panel headed TAKE over a heading reading TAKE
+    /// wore its own name twice.
+    fn title_names_its_tier(self) -> bool {
+        self != SetupShape::Machine
+    }
 }
 
 /// Every rectangle in the popup.
@@ -10911,8 +11005,8 @@ impl SetupLayout {
         let units_of = |heads: f32, rows: usize| HEAD * heads + rows as f32 + 1.0;
         let (heads, rows_shown) = match shape {
             SetupShape::Machine => (2.0, SETUP_MACHINE_ROWS),
-            SetupShape::Take => (1.0, SETUP_TAKE_ROWS),
-            SetupShape::Rolling => (1.0, SETUP_ROLLING_ROWS),
+            SetupShape::Take => (0.0, SETUP_TAKE_ROWS),
+            SetupShape::Rolling => (0.0, SETUP_ROLLING_ROWS),
         };
         let ref_h = w * SETUP_ASPECT * SETUP_REF_ROWS as f32 / SETUP_ROWS as f32;
         let ref_pad = (ref_h * 0.055).clamp(4.0, 16.0);
@@ -11037,9 +11131,11 @@ impl SetupLayout {
         // where nothing can see or reach it, exactly as the other shape's
         // rows are, so the red button's panel is two controls without being
         // a second copy of them.
-        // The heading over whichever tier this shape shows; the word is the
-        // shape's, and `draw_setup` picks it.
-        let take_head = band(HEAD, !machine);
+        // **AUDIO and MEDIA are the cog's headings; the other two shapes
+        // wear their tier's name as the panel's TITLE instead.** So this
+        // band is laid out where nothing can see it for them - see
+        // `SetupShape::title_word` - and the rows move up into the space.
+        let take_head = band(HEAD, (take || rolling) && !shape.title_names_its_tier());
         let r0 = band(1.0, take);
         let r1 = band(1.0, take);
         let note = {
@@ -11721,12 +11817,24 @@ impl MetLayout {
         let w = (screen.width() * MET_W.0)
             .clamp(MET_W.1.min(screen.width()), MET_W.2.min(screen.width()));
         let h = (w * MET_ASPECT).min(screen.height() * 0.85);
-        // Centred on the button rather than left-aligned to it, and clear of
-        // it — the same placement the effect panels use.
-        let mut panel = Rect::from_min_size(
-            Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.04),
-            Vec2::new(w, h),
-        );
+        // **A panel SUMMONED at a point is centred on it; one opened from a
+        // button hangs off the button.**
+        //
+        // Centred on the button horizontally and clear of it below - the
+        // same placement the effect panels use - which is right for the
+        // metronome chip and wrong for `Cmd+M`, whose anchor is the middle
+        // of the surface. That put the panel across the middle and BELOW it:
+        // the owner's "horizontally but not vert centered ... needs both to
+        // be in the middle of the screen". An anchor with no area is not a
+        // thing on screen to hang off, so it is a place to BE.
+        let mut panel = if anchor.width() <= 1.0 && anchor.height() <= 1.0 {
+            Rect::from_center_size(anchor.center(), Vec2::new(w, h))
+        } else {
+            Rect::from_min_size(
+                Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.04),
+                Vec2::new(w, h),
+            )
+        };
         let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
         let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
         panel = panel.translate(Vec2::new(dx, dy));
@@ -12610,12 +12718,13 @@ pub fn draw_setup(
     if l.title.is_positive() {
         // 0.34, was 0.50: at the grown card the headline read as SHOUTING —
         // the owner asked for both the word and the button beside it smaller.
-        let size = fit_text(l.title, "SETTINGS", l.title.height() * 0.34);
+        let word = shape.title_word();
+        let size = fit_text(l.title, word, l.title.height() * 0.34);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(l.title.left(), l.title.center().y),
                 Align2::LEFT_CENTER,
-                "SETTINGS",
+                word,
                 font_light(size),
                 p.ink,
             );
