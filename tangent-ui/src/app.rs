@@ -15919,8 +15919,130 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **What Q acts on when a TRACK is picked and no clip is.**
+    ///
+    /// The owner: "i need the q to work even if a clip isn't directly
+    /// selected. Clicking a track and pressing q should auto select that
+    /// tracks clips unless a specific clip is already selected."
+    ///
+    /// **It really SELECTS them**, rather than quietly widening what the
+    /// window acts on. That is what was asked for, and it is also the only
+    /// shape that stays honest while the window is open: the target line,
+    /// the marks and the clip rims are all derived per frame from the
+    /// selection, so a hidden second answer would have had to be threaded
+    /// through every one of them and would have drifted from the rims a
+    /// user can see.
+    ///
+    /// **Does the clip selection still belong to a track the hand has
+    /// picked?**
+    ///
+    /// True when there is a clip selection AND every selected clip sits on
+    /// a picked lane. A clip click and a marquee both reach
+    /// `arr_sync_tracks_to_clips`, which selects the lanes they touch, so
+    /// those always agree; a header click afterwards is what makes them
+    /// disagree, and that is the case Q has to notice.
+    ///
+    /// **A folder row counts as its children**, or picking a folder and
+    /// then aiming at one clip inside it would read as a disagreement.
+    fn clip_selection_is_on_a_picked_track(&self) -> bool {
+        let ids: Vec<u64> = self
+            .arr_selected
+            .into_iter()
+            .chain(self.arr_multi.iter().copied())
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        // **No track picked at all**: `lanes` is empty, nothing is on it,
+        // and `all` over a selection answers false - which then meets the
+        // adopter's own empty-lanes guard and changes nothing. One guard,
+        // in the place that acts.
+        let lanes = self.quantize_fallback_lanes();
+        ids.iter().all(|id| {
+            self.arrangement
+                .clips
+                .iter()
+                .any(|c| c.id == *id && lanes.contains(&c.lane))
+        })
+    }
+
+    /// **The lanes Q falls back to**: the picked tracks, a folder standing
+    /// for its children.
+    ///
+    /// A folder is a row with no clips of its own, so taking it literally
+    /// would answer "nothing" for the one gesture that most obviously means
+    /// "all of this".
+    fn quantize_fallback_lanes(&self) -> Vec<usize> {
+        let mut lanes: Vec<usize> = Vec::new();
+        for &n in &self.selected_tracks {
+            if self.is_folder(n) {
+                lanes.extend(self.folder_children(n));
+            } else {
+                lanes.push(n);
+            }
+        }
+        lanes
+    }
+
+    /// **The "unless" is not "a clip is selected" - it is "a clip on a
+    /// track you have picked".** Clicking a track HEADER does not clear the
+    /// clip selection (`select_track`, and `arr_sync_tracks_to_clips` only
+    /// runs the other way), so the literal reading strands the window on
+    /// the last clip: select a take on track 1, click track 2, press Q, and
+    /// it quantizes track 1. That is the exact gesture the owner described.
+    ///
+    /// So the clip selection wins while it AGREES with the track
+    /// selection - a clip click and a marquee both sync the tracks to the
+    /// lanes they touch, so they always agree - and the tracks win when it
+    /// does not, because then the header was the more recent thing the hand
+    /// did.
+    ///
+    /// Three refusals, in order:
+    /// - the EDITOR is open, so Q means notes and the arrangement's
+    ///   selection is not what it acts on;
+    /// - the selected clips already lie on the picked tracks, which is the
+    ///   "unless" in the ask;
+    /// - the tracks hold no audio, so there is nothing to adopt and the
+    ///   window should say "nothing to quantize" rather than lie.
+    fn adopt_track_clips_for_quantize(&mut self) {
+        if self.midi_edit.is_some() || self.clip_selection_is_on_a_picked_track() {
+            return;
+        }
+        let lanes = self.quantize_fallback_lanes();
+        if lanes.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| {
+                c.kind == crate::arrangement::ClipKind::Audio && lanes.contains(&c.lane)
+            })
+            .map(|c| c.id)
+            .collect();
+        // Nothing to adopt: leave whatever was selected, so the window says
+        // "nothing to quantize" rather than quietly emptying a selection.
+        if ids.is_empty() {
+            return;
+        }
+        // The earliest is the primary, so the rim lands somewhere a hand
+        // would have put it.
+        self.arr_selected = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| ids.contains(&c.id))
+            .min_by(|a, b| a.start_s.total_cmp(&b.start_s))
+            .map(|c| c.id);
+        self.arr_multi = ids;
+    }
+
     /// **Open the quantize window**, filled from what was last used.
     pub fn open_quantize_window(&mut self) {
+        // Before the window is filled, so its target line and its marks are
+        // built from the selection this just made.
+        self.adopt_track_clips_for_quantize();
         self.dialog = Some(Dialog::Quantize {
             grid_exp: self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
             triplet: self.settings.quantize_triplet,
@@ -32953,6 +33075,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.sampler_scan_gen = self.sampler_scan_gen.wrapping_add(1);
             }
             DialogAction::CycleTheme => self.cycle_theme(),
+            // **Space, from a window that owns the input while it is up.**
+            //
+            // The same body the main window's own Space runs, so the one key
+            // means the one thing wherever it is pressed: rolling stops,
+            // idle rolls from the edit cursor, and a take in progress is
+            // left alone - the recorder owns those frames and a window over
+            // it must not be a second way to interrupt them.
+            DialogAction::Transport => {
+                // **The main window's own conditions, all of them.** The bar
+                // that sent this answered "which key"; this is the half that
+                // answers "is it allowed", because every fact below lives
+                // here and not there:
+                //
+                // - the band has to be SHOWN, which is the consent the
+                //   keymap gates Space on - somebody who has never opened
+                //   the recorder must not start a take with the widest key
+                //   on the keyboard;
+                // - a take in progress is the recorder's, and a window over
+                //   it must not be a second way to interrupt one;
+                // - Space is PLAY only on the desk's surfaces. On the piano
+                //   view it is the chord audition, and a plugin face opened
+                //   from there must not quietly turn it into a transport.
+                if self.settings.show_recorder && !self.recorder.state.is_active() {
+                    if self.recorder.arr_recording || self.recorder.playing {
+                        self.request_recorder(recorder::RecorderRequest::Stop);
+                    } else if self.mixer_open || self.arrangement_open {
+                        self.request_recorder(recorder::RecorderRequest::Play);
+                    }
+                }
+            }
             DialogAction::SetInsertKeySource { strip, slot, from } => {
                 // A settings write and nothing else — the `SetRouteGain`
                 // pattern, not a request: the desktop publishes the whole
@@ -40250,6 +40402,178 @@ mod tests {
         assert!(got(&app).1.is_empty(), "the redo brought the quantize back too early");
         app.redo();
         assert_eq!(got(&app).1.len(), 2, "the redo never brought the quantize back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Q on a TRACK selects that track's clips.**
+    ///
+    /// The owner: "i need the q to work even if a clip isn't directly
+    /// selected. Clicking a track and pressing q should auto select that
+    /// tracks clips unless a specific clip is already selected."
+    ///
+    /// The "unless" is the half that matters: a clip already aimed at wins,
+    /// or a marquee over two takes on one track would silently grow to the
+    /// whole track the moment somebody pressed the key.
+    #[test]
+    fn q_on_a_track_takes_that_tracks_clips_unless_a_clip_is_aimed_at() {
+        let root = project_scratch("qtrack");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let mut made: Vec<(usize, u64)> = Vec::new();
+        for (lane, start_s, kind) in [
+            (1usize, 4.0, crate::arrangement::ClipKind::Audio),
+            (1, 0.0, crate::arrangement::ClipKind::Audio),
+            (2, 0.0, crate::arrangement::ClipKind::Audio),
+            // A MIDI clip on the same track: quantize is audio here, and
+            // the editor is where a note goes.
+            (1, 8.0, crate::arrangement::ClipKind::Midi),
+        ] {
+            let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+                kind,
+                path: "media/a.wav".to_owned(),
+                lane,
+                start_s,
+                len_s: 2.0,
+                ..Default::default()
+            });
+            made.push((lane, id));
+        }
+        let on = |lane: usize| -> Vec<u64> {
+            made.iter().filter(|(l, _)| *l == lane).map(|(_, id)| *id).collect()
+        };
+
+        // **A track picked, no clip**: Q takes that track's AUDIO.
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        let mut got = app.arr_multi.clone();
+        got.sort_unstable();
+        let mut want: Vec<u64> = on(1).into_iter().take(2).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "Q did not adopt the track's audio clips");
+        assert_eq!(
+            app.quantize_target().as_deref(),
+            Some("2 audio clips"),
+            "the window's line did not follow"
+        );
+        // **The primary is the EARLIEST**, where a hand would have put the
+        // rim - not the first one that happened to be added. Lane 1's clips
+        // were added at 4 s and then 0 s, so the two orders disagree and
+        // this can tell them apart.
+        let at_zero = made[1].1;
+        assert_eq!(
+            app.arr_selected,
+            Some(at_zero),
+            "the rim did not land on the earliest clip"
+        );
+
+        // **A clip aimed at ON A PICKED TRACK wins.** That is the
+        // "unless", and it is what a clip click or a marquee leaves behind:
+        // both sync the track selection to the lanes they touch.
+        app.arr_multi.clear();
+        let one = on(2)[0];
+        app.arr_selected = Some(one);
+        app.select_track(2, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert_eq!(
+            app.arr_quantize_ids(),
+            vec![one],
+            "a clip on the picked track lost to the whole track"
+        );
+
+        // A marquee on the picked track wins too.
+        app.arr_selected = None;
+        app.arr_multi = on(2);
+        app.select_track(2, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert_eq!(app.arr_quantize_ids(), on(2), "a marquee lost to its own track");
+
+        // **And a clip left over from ANOTHER track does NOT.**
+        //
+        // This is the gesture the owner described and the one the literal
+        // reading of "unless a clip is selected" gets wrong: clicking a
+        // track header does not clear the clip selection, so a take
+        // selected on track 2 would strand Q there for ever while the hand
+        // was pointing at track 1.
+        app.arr_selected = Some(one);
+        app.arr_multi.clear();
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        let mut got = app.arr_quantize_ids();
+        got.sort_unstable();
+        let mut want: Vec<u64> = on(1).into_iter().take(2).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "Q stayed on the clip the hand had moved off");
+
+        // With NO track picked at all the clip is all there is, so it wins.
+        app.arr_selected = Some(one);
+        app.arr_multi.clear();
+        app.selected_tracks.clear();
+        app.selected_channel = None;
+        app.open_quantize_window();
+        assert_eq!(
+            app.arr_quantize_ids(),
+            vec![one],
+            "a clip with no track picked lost to nothing at all"
+        );
+
+        // **A selection that STRADDLES the picked track is a disagreement,
+        // and the track wins.** Only a header click can make one - a
+        // marquee across two tracks picks both - and a header click is the
+        // hand saying where it is now.
+        app.arr_selected = None;
+        app.arr_multi = vec![on(1)[0], on(2)[0]];
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        let mut got = app.arr_quantize_ids();
+        got.sort_unstable();
+        let mut want: Vec<u64> = on(1).into_iter().take(2).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "a selection half off the picked track was kept whole");
+
+        // **Nothing selected at all**: nothing adopted, and the window says
+        // so rather than inventing a target.
+        app.arr_selected = None;
+        app.arr_multi.clear();
+        app.selected_tracks.clear();
+        app.selected_channel = None;
+        app.open_quantize_window();
+        assert!(app.arr_multi.is_empty(), "Q adopted clips with nothing picked");
+        assert_eq!(app.quantize_target(), None, "the window claimed a target");
+
+        // **A track with no audio on it adopts nothing**, rather than
+        // selecting its MIDI and then refusing to act on it.
+        app.select_track(3, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert!(app.arr_multi.is_empty(), "an empty track adopted something");
+
+        // **A FOLDER stands for its children**, which is the one gesture
+        // that most obviously means "all of this" and would otherwise
+        // answer nothing: a folder row holds no clips of its own.
+        app.set_is_folder(0, true);
+        app.set_in_folder(1, true);
+        app.set_in_folder(2, true);
+        app.arr_selected = None;
+        app.arr_multi.clear();
+        app.select_track(0, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        let mut got = app.arr_multi.clone();
+        got.sort_unstable();
+        let mut want: Vec<u64> = on(1).into_iter().take(2).chain(on(2)).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "a folder did not stand for its children");
+
+        // **And the editor wins over all of it.** Q means notes there.
+        let midi = made[3].1;
+        app.arr_selected = None;
+        app.arr_multi.clear();
+        app.open_midi_editor(midi);
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert!(
+            app.arr_multi.is_empty(),
+            "the editor's quantize adopted arrangement clips"
+        );
+        app.close_midi_editor();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -58786,6 +59110,116 @@ mod tests {").expect("the tests module")];
                 "{label}: the theme key closed the face"
             );
         }
+    }
+
+    /// **Space inside a plugin window rolls the transport ONCE.**
+    ///
+    /// The owner: "The quantize menu doesn't allow playback while it's
+    /// open." That window is not modal on purpose - "select a clip, press
+    /// Apply, LISTEN, select another" - and on the desktop it is a real
+    /// child window, so while it has focus the main one is unfocused and
+    /// `dialog_blocks_keys` swallowed every key including Space.
+    ///
+    /// `DialogAction::CycleTheme`'s twin, and the same vice: the desk and
+    /// the window both know the key, so exactly one of them must act. Two
+    /// shapes, as the theme test has them - the desktop, where the face's
+    /// window holds the keyboard and the main window is unfocused, and the
+    /// plugin canvas, where there is one keyboard and the layer on top owns
+    /// it. A Play followed by a Stop is a transport that looks broken
+    /// rather than merely flickering.
+    #[test]
+    fn the_transport_key_inside_a_plugin_window_rolls_once() {
+        for (label, caps, main_focused) in
+            [("desktop", Caps::DESKTOP, false), ("plugin", Caps::PLUGIN, true)]
+        {
+            let (ctx, mut app) = headless(caps);
+            // The band has to be SHOWN - that is the consent the keymap
+            // gates Space on, and the app re-checks it for a forwarded key.
+            app.settings.show_recorder = true;
+            app.arrangement_open = true;
+            app.open_unit_face(0, 0);
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let _ = app.take_recorder_request();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    focused: main_focused,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Space,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            // **Exactly one request.** `project_request`-style slots hold
+            // one a frame, so a second would have overwritten the first
+            // with its opposite - which is why the ASSERTION is that the
+            // one taken is a Play and that nothing follows it.
+            let first = app.take_recorder_request();
+            // **A plugin has no transport to roll.** `request_recorder`
+            // refuses every request where `caps.capture_devices` is false,
+            // because a plugin never drains the queue - so the observable
+            // half of "exactly once" there is that the key reached the app
+            // and left nothing behind, and the once-ness itself is pinned
+            // structurally by
+            // `dialogs::a_key_the_bar_saw_is_only_this_windows_when_the_desk_stood_down`.
+            let want = caps.capture_devices;
+            assert_eq!(
+                matches!(first, Some(recorder::RecorderRequest::Play)),
+                want,
+                "{label}: Space inside the face answered with {first:?}"
+            );
+            pointer_frame(&ctx, &mut app, Vec::new());
+            assert!(
+                app.take_recorder_request().is_none(),
+                "{label}: a second transport request followed the first"
+            );
+            assert!(
+                matches!(app.dialog, Some(Dialog::InsertFace { .. })),
+                "{label}: the transport key closed the face"
+            );
+        }
+    }
+
+    /// **And a forwarded Space obeys every rule the main window's own
+    /// Space obeys.**
+    ///
+    /// The bar that sends it answers "which key"; this is the half that
+    /// answers "is it allowed", and all of it lives here:
+    /// - the recorder band has to be SHOWN, which is the consent the keymap
+    ///   gates Space on - somebody who has never opened the recorder must
+    ///   not start a take with the widest key on the keyboard;
+    /// - Space is PLAY only on the desk's surfaces. On the piano view it is
+    ///   the chord audition, and a plugin face opened from there must not
+    ///   quietly turn it into a transport.
+    #[test]
+    fn a_forwarded_transport_key_keeps_the_main_windows_own_refusals() {
+        let roll = |show_recorder: bool, arrangement: bool| -> Option<recorder::RecorderRequest> {
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            app.settings.show_recorder = show_recorder;
+            app.arrangement_open = arrangement;
+            app.mixer_open = false;
+            let _ = app.take_recorder_request();
+            app.apply_dialog_action(DialogAction::Transport);
+            app.take_recorder_request()
+        };
+        assert!(
+            matches!(roll(true, true), Some(recorder::RecorderRequest::Play)),
+            "the fixture cannot roll at all"
+        );
+        assert!(
+            roll(false, true).is_none(),
+            "a forwarded Space rolled the transport with the band never opened"
+        );
+        assert!(
+            roll(true, false).is_none(),
+            "a forwarded Space rolled the transport from the piano view, \
+             where Space is the chord audition"
+        );
     }
 
     /// **And in the main window, with a face open, T still cycles — once.**

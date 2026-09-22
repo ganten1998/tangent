@@ -126,6 +126,9 @@ pub fn chrome_layout(rect: Rect, resizable: bool) -> ChromeLayout {
 struct ChromeGesture {
     close: bool,
     cycle_theme: bool,
+    /// The TRANSPORT key, pressed in a plugin window. See
+    /// [`SurfaceReport::transport`].
+    transport: bool,
     /// The primary button went down on the drag rect this frame.
     grab: bool,
     /// How far a held bar moved this frame.
@@ -177,14 +180,38 @@ fn draw_chrome_bar(
     if drag.dragged_by(egui::PointerButton::Primary) && !drag.drag_started() {
         g.moved = drag.drag_delta();
     }
-    // **The theme key, exactly as the main window reads it** — the keymap
-    // is the one table, so the bar does not grow a second idea of what T
-    // means. Not while a field in this window is being typed into: "t" in
-    // the picker's filter is a letter, and the main window has the same
-    // rule under `text_entry_active`.
-    g.cycle_theme = !ui.ctx().wants_keyboard_input()
-        && crate::keys::pressed(ui.ctx(), crate::keys::Gates::default())
-            == Some(crate::keys::KeyAction::CycleTheme);
+    // **The keys this window forwards, exactly as the main window reads
+    // them** — the keymap is the one table, so the bar does not grow a
+    // second idea of what a letter means. Not while a field in this window
+    // is being typed into: "t" in the picker's filter is a letter, and the
+    // main window has the same rule under `text_entry_active`.
+    //
+    // Asked ONCE, because `keys::pressed` answers with the single action
+    // this frame's press means and two calls would be two answers to one
+    // question.
+    //
+    // **Asked with the transport UNGATED**, and the app re-checks. The
+    // table gates Space on the recorder band being shown
+    // (`keys::available`), which is state this bar cannot see - asking with
+    // the default gates would simply never recognise the key and the
+    // forwarding would be a silent no-op. So the bar answers "which key",
+    // the app answers "is it allowed", which is where that state lives.
+    let key = (!ui.ctx().wants_keyboard_input())
+        .then(|| {
+            crate::keys::pressed(
+                ui.ctx(),
+                crate::keys::Gates { recorder_shown: true, ..Default::default() },
+            )
+        })
+        .flatten();
+    g.cycle_theme = key == Some(crate::keys::KeyAction::CycleTheme);
+    // **And the TRANSPORT**, which is what makes a window you leave open
+    // usable. The quantize window is not modal on purpose - "select a clip,
+    // press Apply, LISTEN, select another" - and on the desktop it is a real
+    // child window, so while it has focus the main one reports `!focused`
+    // and `dialog_blocks_keys` swallowed every key including Space. The
+    // owner: "The quantize menu doesn't allow playback while it's open."
+    g.transport = key == Some(crate::keys::KeyAction::StopRecording);
     g
 }
 
@@ -618,6 +645,12 @@ pub struct SurfaceReport {
     /// [`Chrome`] surface ever says so: it is the one whose input the main
     /// window cannot see, so somebody has to carry the key back.
     pub cycle_theme: bool,
+    /// **The transport key, pressed in a plugin window.** Space, through the
+    /// one keymap. A non-modal window is one you are meant to leave open
+    /// while you work, and on the desktop it is a real child window - so
+    /// without this the main window is unfocused for as long as it is up and
+    /// nothing can be played. See `chrome_gesture`.
+    pub transport: bool,
 }
 
 fn viewport_id(id: &str) -> egui::ViewportId {
@@ -814,6 +847,7 @@ pub fn surface(
                 let g = draw_chrome_bar(ui, chrome_id, spec.title, &l, c);
                 report.close |= g.close;
                 report.cycle_theme |= g.cycle_theme;
+                report.transport |= g.transport;
                 if g.grab {
                     // **The OS moves the window, from the press.** A
                     // borderless window has no bar its manager knows about,
@@ -991,6 +1025,7 @@ pub fn surface(
                 let g = draw_chrome_bar(ui, chrome_id, spec.title, &l, c);
                 report.close |= g.close;
                 report.cycle_theme |= g.cycle_theme;
+                report.transport |= g.transport;
                 if let Some(s) = state.as_mut() {
                     s.moved += g.moved;
                 }
@@ -2137,6 +2172,96 @@ mod tests {
         }]);
         assert!(r.cycle_theme, "the theme key was not carried back");
         assert!(!r.close, "the theme key closed the window");
+        assert!(!r.transport, "the theme key was read as a transport");
+
+        // **And SPACE comes back as the transport.** A window drawn with
+        // this bar is one you are meant to leave open while you work, and
+        // on the desktop it owns the input while it is focused - so without
+        // this the main window is unfocused for as long as it is up and
+        // nothing can be played. The owner met it on the quantize window:
+        // "The quantize menu doesn't allow playback while it's open."
+        //
+        // The key is asked for with the transport UNGATED, because the
+        // table gates Space on the recorder band being shown and this bar
+        // cannot see that; the app re-checks. A default-gated ask here
+        // would recognise nothing and forward nothing, silently.
+        let r = run(vec![egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(r.transport, "Space was not carried back");
+        assert!(!r.close, "Space closed the window");
+        assert!(!r.cycle_theme, "Space was read as a theme cycle");
+
+        // (A modified Space is refused by `keys::pressed` itself, which
+        // returns None for any chord - `RawInput.modifiers` is what it
+        // reads, and this harness does not set it, so the case belongs to
+        // that function's own tests rather than here.)
+        //
+        // A frame with no key at all carries nothing.
+        let r = run(vec![]);
+        assert!(!r.transport && !r.cycle_theme, "an idle frame carried a key");
+
+        // **Not while a field in this window is being TYPED into.** A space
+        // in a plugin picker's filter is a space and a `t` is a letter -
+        // the same rule the main window keeps under `text_entry_active`.
+        // This is the half that makes forwarding safe at all, so it is
+        // driven rather than asserted about the source.
+        let typed = |events: Vec<egui::Event>| -> SurfaceReport {
+            let mut report = SurfaceReport::default();
+            let mut text = String::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    report = surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                        let r = ui.text_edit_singleline(&mut text);
+                        r.request_focus();
+                    });
+                },
+            );
+            report
+        };
+        // The first pass puts the focus on; the second presses a key into a
+        // field that already has it.
+        typed(vec![]);
+        for (key, what) in [(egui::Key::Space, "Space"), (egui::Key::T, "the theme key")] {
+            let r = typed(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            assert!(
+                !r.transport && !r.cycle_theme,
+                "{what} typed into a field was forwarded as a shortcut"
+            );
+        }
+
+        // **Both chrome paths carry it.** The harness above runs on
+        // `Caps::PLUGIN`, which has no child windows and so exercises only
+        // the INLINE bar; the desktop's child-window path is the one the
+        // quantize window actually takes. A source scan, because driving a
+        // real child viewport needs a window server.
+        let src = include_str!("shell.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert_eq!(
+            body.matches("report.transport |= g.transport;").count(),
+            2,
+            "one of the two chrome paths drops the transport key"
+        );
+        assert_eq!(
+            body.matches("report.cycle_theme |= g.cycle_theme;").count(),
+            2,
+            "one of the two chrome paths drops the theme key"
+        );
 
         // A drag on the bar moves the window by what the hand moved.
         let grab = l.drag.center();
