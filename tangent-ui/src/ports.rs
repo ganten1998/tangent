@@ -294,6 +294,23 @@ pub trait AudioSetup: Send {
     /// way, so the panel says what this build has rather than what was hoped.
     fn systems(&self) -> Vec<String>;
 
+    /// **Every audio OUTPUT the chosen system offers**, in the backend's own
+    /// order, or empty when they cannot be reached.
+    ///
+    /// Asked when the panel OPENS, like [`Self::systems`] and [`Self::rates`]
+    /// and never per frame: under ASIO this loads and unloads every
+    /// registered driver in turn.
+    ///
+    /// **This exists because ASIO has no default.** cpal's ASIO host
+    /// implements `default_output_device` as, verbatim, "ASIO has no concept
+    /// of a default device, so just use the first" - the first key under
+    /// `HKLM\SOFTWARE\ASIO` that loads. A machine with FL Studio ASIO or
+    /// ASIO4ALL registered beside an interface therefore opened the wrapper
+    /// and never the interface, with no control anywhere to say otherwise.
+    /// Reported by a user whose Komplete Audio 6 MK2 was invisible here while
+    /// FL Studio offered it from a dropdown.
+    fn outputs(&self) -> Vec<String>;
+
     /// The rates the input device now selected will actually open at.
     ///
     /// Empty when nothing is selected or the device cannot be reached, and the

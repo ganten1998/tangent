@@ -2865,6 +2865,32 @@ impl LevelTracker {
 /// Not cached. An interface plugged in while the Recorder band is open must
 /// appear without a restart, and cpal has no change notification to hang a cache
 /// invalidation on.
+/// **Every audio OUTPUT this system offers, by name.**
+///
+/// Names and nothing else, and that restriction is the whole of why this is
+/// its own function rather than a `map` over `output_devices()`.
+///
+/// Under ASIO a `cpal::Device` holds its driver LOADED, and the shared host's
+/// guard refuses to load any other while one is held - so collecting devices
+/// would yield the first loadable driver and nothing after it, and the list
+/// would be one row long on a machine with four interfaces. Iterating and
+/// dropping each in turn is the only enumeration a single-client driver world
+/// permits. `instrument::resolve_output` takes the same care for the same
+/// reason and says so at greater length.
+///
+/// Asked when the Setup panel OPENS, never per frame: under ASIO this loads
+/// and unloads every registered driver in turn, which is seconds of work and
+/// exactly the "Not Responding" the reprobe exists to keep off the UI thread.
+pub fn output_device_names() -> Result<Vec<String>, AudioError> {
+    with_host(|host| {
+        Ok(host
+            .output_devices()
+            .map_err(|e| AudioError::Enumeration(e.to_string()))?
+            .map(|d| d.name().unwrap_or_else(|_| UNNAMED_DEVICE.to_string()))
+            .collect())
+    })
+}
+
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
     with_host(input_devices_on)
 }

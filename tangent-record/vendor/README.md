@@ -292,6 +292,43 @@ exists. Dead code there is a defect we want to hear about.
 macros compile varies by target, so an expectation fulfilled on FreeBSD/OSS
 would be unfulfilled — and so warn — somewhere else.
 
+## The sixth change: the ASIO backend stops printing its errors to nobody
+
+`src/host/asio/stream.rs`, the two `get_or_create_*_stream` tails (the input's
+and the output's). Both read:
+
+```rust
+.map_err(|ref e| {
+    println!("Error preparing stream: {}", e);
+    BuildStreamError::DeviceNotAvailable
+})
+```
+
+and now hand the sentence to the caller instead:
+
+```rust
+.map_err(|e| BackendSpecificError { description: e.to_string() }.into())
+```
+
+**The same finding as the other three, in a fourth hat.** A driver refusing a
+buffer size, a sample rate and an unsupported sample format are three different
+faults, and all three arrived at the host as `DeviceNotAvailable` — three words
+that say only "there is no device", which is the one thing that was not true.
+The sentence that named the real fault went to `stdout`, and a windowed Windows
+binary has no console attached: it was written to a handle nobody owns and lost.
+
+That is not a theoretical loss. It is how a user on a Komplete Audio 6 MK2 came
+to report only that "ASIO doesn't work" — nothing anywhere on his machine could
+have told him, or us, which of the three it was. `build_stream_err` twenty lines
+below already uses exactly this shape for every OTHER ASIO failure, so this is
+the file being made consistent with itself rather than a new idea.
+
+**Inside the discipline this directory is built on.** The ASIO host compiles
+only under `#[cfg(all(windows, feature = "asio"))]`, so macOS, Linux and FreeBSD
+build the same bytes they built from crates.io. Type-checked for
+`x86_64-pc-windows-msvc` with `--features recorder,asio` against the Steinberg
+SDK, which is the only configuration that compiles it at all.
+
 ## Upstream
 
 This should go back: <https://github.com/RustAudio/cpal>. FreeBSD is a

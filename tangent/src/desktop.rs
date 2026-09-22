@@ -415,6 +415,10 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
+    /// The output the streams were opened on, so a change to the choice
+    /// reopens them - the `system_open` shape, and for the same reason: a
+    /// setting nothing watches is a picker that does nothing until relaunch.
+    output_open: Option<String>,
     /// **The watch that keeps the interface in charge of its own rate.**
     ///
     /// See [`RateWatch`]. Held here rather than beside `rate_open` because
@@ -3972,6 +3976,7 @@ impl DesktopApp {
 
         let want_buffer = self.app.buffer_frames();
         let want_system = self.app.audio_system();
+        let want_output = self.app.audio_output_device();
         // **RAW, not resolved.** This used to resolve "Device" to a number
         // first, on the reasoning that the detector has to compare the rate
         // the streams will actually open at — and resolving it meant caching
@@ -3983,11 +3988,13 @@ impl DesktopApp {
         let want_rate = self.engine_rate();
         let path_changed = self.recorder.buffer_open != want_buffer
             || self.recorder.rate_open != want_rate
-            || self.recorder.system_open != want_system;
+            || self.recorder.system_open != want_system
+            || self.recorder.output_open != want_output;
         if path_changed && !self.recorder.session.is_recording() {
             self.recorder.buffer_open = want_buffer;
             self.recorder.rate_open = want_rate;
             self.recorder.system_open = want_system.clone();
+            self.recorder.output_open = want_output.clone();
             // The graph may have been reconfigured since the last open — by
             // the user editing PipeWire's config to fix exactly what this
             // reports, which is the case worth getting right.
@@ -13036,8 +13043,16 @@ impl DesktopApp {
         if set_aside {
             tangent_record::audio::set_system(None);
         }
+        // **The chosen output, or the system's own.** `None` here used to be
+        // unconditional, which under ASIO means "the first driver under
+        // HKLM\SOFTWARE\ASIO that loads" - cpal's ASIO host has no concept
+        // of a default and says so in those words. A machine with FL Studio
+        // ASIO or ASIO4ALL registered beside a real interface therefore
+        // opened the wrapper, and nothing in the app could say otherwise.
+        // See `Settings::audio_output_device`.
+        let want_out = self.app.audio_output_device();
         let mut started = crate::instrument::Engine::start_sized(
-            None,
+            want_out.as_deref(),
             self.recorder.session.timebase(),
             self.app.buffer_frames(),
             rate,
@@ -13113,6 +13128,12 @@ impl DesktopApp {
                      watched for"
                 );
                 tangent_record::audio::set_system(None);
+                // **And the output choice does NOT travel to the fallback.**
+                // The name came from the system that has just been set aside
+                // - an ASIO driver's name means nothing to WASAPI - so
+                // asking for it would fail a second time and land on the
+                // default anyway, two seconds later. The setting is left
+                // exactly as it was, like the system beside it.
                 started = crate::instrument::Engine::start_sized(
                     None,
                     self.recorder.session.timebase(),
@@ -17614,6 +17635,7 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
+                output_open: app.audio_output_device(),
                 rate_watch: RateWatch::default(),
                 out_block_logged: None,
                 rate_asked: None,
@@ -23027,6 +23049,66 @@ mod tests {
         assert!(
             scan.contains("let sig = ask.as_ref().map_or(0, |a| self.quantize_clip_sig(a));"),
             "the pusher no longer asks where the clips are"
+        );
+    }
+
+    /// **The chosen output is what gets opened, and changing it reopens.**
+    ///
+    /// Both engine-open sites passed `None`, which under ASIO means "the
+    /// first driver under HKLM\SOFTWARE\ASIO that loads" - cpal's ASIO host
+    /// has no concept of a default and says so in those words. A machine
+    /// with FL Studio ASIO or ASIO4ALL registered beside a real interface
+    /// therefore opened the wrapper, and nothing in the app could say
+    /// otherwise. Reported by a user whose Komplete Audio 6 MK2 was
+    /// invisible here while FL Studio offered it from a dropdown.
+    ///
+    /// A source scan, because `DesktopApp` cannot be built in a test - the
+    /// precedent is
+    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    /// What it pins is the three facts a picker that does nothing would
+    /// break: the choice is READ, it is WATCHED, and the fallback does not
+    /// carry it to a backend that has never heard of it.
+    #[test]
+    fn the_chosen_audio_output_is_the_one_that_opens() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+
+        // READ: the first open asks for it by name.
+        assert!(
+            scan.contains("let want_out = self.app.audio_output_device();"),
+            "the engine no longer asks which output to open"
+        );
+        assert!(
+            scan.contains("crate::instrument::Engine::start_sized(\n            want_out.as_deref(),"),
+            "the engine opens a device the setting did not name"
+        );
+
+        // WATCHED: a change to the choice reopens the streams, or the picker
+        // does nothing until the next launch.
+        assert!(
+            scan.contains("let want_output = self.app.audio_output_device();"),
+            "nothing reads the output choice per frame"
+        );
+        assert!(
+            scan.contains("|| self.recorder.output_open != want_output;"),
+            "a changed output no longer reopens the streams"
+        );
+        assert!(
+            scan.contains("self.recorder.output_open = want_output.clone();"),
+            "the reopen never records which output it opened, so it reopens for ever"
+        );
+
+        // NOT CARRIED: the fallback opens the platform default, and the name
+        // it was given belongs to the system that has just been set aside.
+        let fallback = {
+            let at = scan
+                .find("no audio output through ASIO")
+                .expect("the ASIO fallback");
+            &scan[at..at + 1600]
+        };
+        assert!(
+            fallback.contains("Engine::start_sized(\n                    None,"),
+            "the fallback asks the platform default for an ASIO driver's name"
         );
     }
 

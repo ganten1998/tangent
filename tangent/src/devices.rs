@@ -520,6 +520,13 @@ impl tangent_ui::ports::AudioSetup for Setup {
         tangent_record::audio::systems()
     }
 
+    /// Empty on failure, which the panel renders as "the system's own" and
+    /// nothing else - the same answer `rates` gives, and the honest one: a
+    /// host that cannot be enumerated has no names to offer.
+    fn outputs(&self) -> Vec<String> {
+        tangent_record::audio::output_device_names().unwrap_or_default()
+    }
+
     /// The graph's floor, where there is a graph to ask.
     ///
     /// Read every time rather than cached: a user who edits their PipeWire
