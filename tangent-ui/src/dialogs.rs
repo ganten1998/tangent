@@ -1956,6 +1956,16 @@ pub enum DialogAction {
     /// key, so the dialog carries it back and the app cycles exactly as it
     /// would from its own keymap. Appended at the END, the law.
     CycleTheme,
+    /// **The TRANSPORT key was pressed inside a plugin window** - Space,
+    /// through the one keymap, for the same reason [`Self::CycleTheme`]
+    /// exists: that window owns the input while it is focused.
+    ///
+    /// A non-modal window is one you are meant to leave open while you
+    /// work, and the quantize window is the case that proved it - "select a
+    /// clip, press Apply, LISTEN, select another" is its whole shape, and
+    /// on the desktop it took the focus and the music stopped. Appended at
+    /// the END, the law.
+    Transport,
     /// **Write this lane's MIDI clips out as a `.mid`.** Appended at the
     /// END, the law.
     ///
@@ -4913,6 +4923,9 @@ struct VpResult {
     close: bool,
     /// The theme key, pressed in a plugin window. See `DialogAction::CycleTheme`.
     cycle_theme: bool,
+    /// The transport key, pressed in a plugin window. See
+    /// `DialogAction::Transport` and `shell::SurfaceReport::transport`.
+    transport: bool,
 }
 
 /// Focus a text field and select everything in it, once.
@@ -5351,6 +5364,7 @@ fn show_dialog_viewport(
     let mut result = VpResult {
         close: false,
         cycle_theme: false,
+        transport: false,
     };
 
     // Window or layer — `shell::surface` decides, and it is the only thing in
@@ -5358,6 +5372,9 @@ fn show_dialog_viewport(
     // rounded fill on the inline path, because a layer has no title bar and no
     // window edge to tell it apart from the app behind it.
     let inline = !placement.caps.child_windows;
+    // Read BEFORE this frame's draw puts its own rect in memory, so it
+    // answers "was the desk already standing down when the key arrived".
+    let dialogs_drawn_inline_now = dialog_drawn_inline(ctx);
     // **A plugin window or a question.** The plugin windows (a face, the
     // Keys panel, their pickers) wear the in-house bar and leave the desk
     // live; everything else is modal and wears the OS's chrome. Both facts
@@ -5425,6 +5442,7 @@ fn show_dialog_viewport(
         let mut r = VpResult {
             close: false,
             cycle_theme: false,
+            transport: false,
         };
         content(ui, &mut r);
         if r.close {
@@ -5432,7 +5450,20 @@ fn show_dialog_viewport(
         }
     });
     result.close = report.close;
-    result.cycle_theme = report.cycle_theme;
+    // **A key the bar saw is this window's only while the desk has already
+    // stood down.**
+    //
+    // On the INLINE path there is no second window: the bar is a layer over
+    // the same context the app reads, so on the frame the dialog opens -
+    // before `inline_dialog_rect` is in memory and `dialog_blocks_keys`
+    // starts refusing - the main window reads the key AND the bar reports
+    // it, and it fires twice. The theme key has had this since it was
+    // written; the transport would have inherited it, and a doubled
+    // play/stop is a transport that looks broken rather than merely
+    // flickering.
+    let mine = !inline || dialogs_drawn_inline_now;
+    result.cycle_theme = report.cycle_theme && mine;
+    result.transport = report.transport && mine;
     result
 }
 
@@ -13980,11 +14011,49 @@ fn show_on(
     if result.cycle_theme {
         action = action.or(Some(DialogAction::CycleTheme));
     }
+    // **And the transport, so a window you are meant to leave open does not
+    // stop the music.** After the arm's own ask for the same reason the
+    // theme is: a control under the hand beats a key.
+    if result.transport {
+        action = action.or(Some(DialogAction::Transport));
+    }
     action
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// **A key the in-house bar saw fires ONCE.**
+    ///
+    /// On the inline path there is no second window: the bar is a layer
+    /// over the same context the app reads. On the frame a dialog opens -
+    /// before its rect is in memory and `dialog_blocks_keys` starts
+    /// refusing - the main window reads the key AND the bar reports it, so
+    /// it fires twice. The theme key has had this since it was written and
+    /// the transport would have inherited it; a doubled play/stop is a
+    /// transport that looks broken rather than merely flickering.
+    ///
+    /// A source scan, because the double needs a real inline dialog on its
+    /// opening frame with a key in the same input.
+    #[test]
+    fn a_key_the_bar_saw_is_only_this_windows_when_the_desk_stood_down() {
+        let src = include_str!("dialogs.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("let dialogs_drawn_inline_now = dialog_drawn_inline(ctx);"),
+            "the bar no longer asks whether the desk had already stood down"
+        );
+        assert!(
+            body.contains("let mine = !inline || dialogs_drawn_inline_now;"),
+            "the guard that makes a bar key this window's is gone"
+        );
+        for key in ["cycle_theme", "transport"] {
+            assert!(
+                body.contains(&format!("result.{key} = report.{key} && mine;")),
+                "the {key} key is carried back unguarded and can fire twice"
+            );
+        }
+    }
 
     /// **The OBS window keeps what was typed into it, however it is
     /// closed.**
