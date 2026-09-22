@@ -1456,6 +1456,12 @@ pub struct TangentApp {
     /// The Setup button was pressed; the menu opens after the frame, where the
     /// window origin needed to place it is known.
     setup_open: bool,
+    /// **Which shape the setup panel is standing in**, while it is open.
+    ///
+    /// The cog opens `Machine`; a right-press on the capture button opens
+    /// `Take`. One panel, two shapes - see `recorder_panel::SetupShape` for
+    /// why it is not two panels.
+    setup_shape: recorder_panel::SetupShape,
     /// **Hearing the live input. Session-only, and that is the whole point.**
     ///
     /// Not in `Settings` and never written anywhere — the field has no path
@@ -3939,6 +3945,7 @@ impl TangentApp {
             menu_over_recorder: false,
             menu_over_staff: false,
             setup_open: false,
+            setup_shape: recorder_panel::SetupShape::Machine,
             input_monitor: true,
             fx_open: None,
             vari_open: false,
@@ -7635,6 +7642,29 @@ impl TangentApp {
                         self.apply_recorder_hit(recorder_panel::Hit::ResetLufs);
                         return;
                     }
+                    // **The two take buttons carry the take's settings.**
+                    //
+                    // The owner's call, and the shape of it is the point: the
+                    // CAPTURE button opens the whole take tier, because that
+                    // is the button that makes a take and everything in that
+                    // tier is about the one it is about to make. The RECORD
+                    // button opens the same panel, because a count-in and a
+                    // signature are what somebody reaches for at the red
+                    // button and reaching twice for the same two settings is
+                    // the thing this is meant to stop.
+                    //
+                    // One panel for both rather than a smaller second one:
+                    // "only a copy of the Countin and Sig options" is what a
+                    // second panel would be FOR, and a copy is what drifts.
+                    // The take tier already leads with those two.
+                    match recorder_panel::hit_test(band, &view, pos) {
+                        Some(recorder_panel::Hit::Capture | recorder_panel::Hit::Record) => {
+                            self.setup_open = true;
+                            self.setup_shape = recorder_panel::SetupShape::Take;
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 // **And a right-click on a fader means nothing at all.** It
                 // has one number and one gesture set; opening a menu over it
@@ -7818,8 +7848,15 @@ impl TangentApp {
                 let band = recorder_rect.unwrap_or(Rect::NOTHING);
                 let view = self.recorder_layout_view();
                 let anchor = recorder_panel::setup_rect(band, &view);
-                let panel = recorder_panel::setup_popup_rect(ui.max_rect(), anchor);
-                match recorder_panel::setup_hit_test(ui.max_rect(), anchor, &view, pos) {
+                let panel =
+                    recorder_panel::setup_popup_rect(ui.max_rect(), anchor, self.setup_shape);
+                match recorder_panel::setup_hit_test(
+                    ui.max_rect(),
+                    anchor,
+                    &view,
+                    pos,
+                    self.setup_shape,
+                ) {
                     Some(hit) => self.apply_recorder_hit(hit),
                     None if !panel.contains(pos) => {
                         self.setup_open = false;
@@ -29335,7 +29372,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // values — a folder path you want to READ, a device that may say
             // "(not connected)", four ticks whose current state is the whole
             // question — and a menu row can show none of that.
-            Hit::OpenSetup => self.setup_open = true,
+            Hit::OpenSetup => {
+                self.setup_open = true;
+                self.setup_shape = recorder_panel::SetupShape::Machine;
+            }
             Hit::ProjectMenu => {
                 // **Blank until the session is saved.** The field carried
                 // "Untitled" — the scratch's prospective folder — which read
@@ -36651,9 +36691,22 @@ impl TangentApp {
                 recorder_panel::draw_setup(
                     ui.painter(),
                     ui.max_rect(),
-                    recorder_panel::setup_rect(rect, &view),
+                    // **The shape decides what it hangs off.** The machine
+                    // panel belongs under the cog that opened it; the take
+                    // panel belongs under the capture button, for the same
+                    // reason - a popup that appears somewhere other than the
+                    // thing pressed reads as a different window.
+                    match self.setup_shape {
+                        recorder_panel::SetupShape::Machine => {
+                            recorder_panel::setup_rect(rect, &view)
+                        }
+                        recorder_panel::SetupShape::Take => {
+                            recorder_panel::capture_rect(rect, &view)
+                        }
+                    },
                     &view,
                     &self.settings,
+                    self.setup_shape,
                 );
             } else {
                 // No band, no cog, no popup. Nothing can have opened it, and
@@ -46555,7 +46608,7 @@ mod tests {
         assert!(app.setup_open, "the cog did not open the popup");
 
         // The panel is on screen and has room for its controls.
-        let panel = recorder_panel::setup_popup_rect(screen, cog);
+        let panel = recorder_panel::setup_popup_rect(screen, cog, recorder_panel::SetupShape::Machine);
         assert!(panel.is_positive(), "the popup has no rectangle");
         assert!(screen.contains_rect(panel), "the popup hangs off the window");
 
@@ -46569,7 +46622,13 @@ mod tests {
             let mut x = panel.left();
             while x <= panel.right() {
                 if let Some(h) =
-                    recorder_panel::setup_hit_test(screen, cog, &view, Pos2::new(x, y))
+                    recorder_panel::setup_hit_test(
+                        screen,
+                        cog,
+                        &view,
+                        Pos2::new(x, y),
+                        recorder_panel::SetupShape::Machine,
+                    )
                 {
                     if !seen.contains(&h) {
                         seen.push(h);
@@ -46586,8 +46645,54 @@ mod tests {
             seen.iter().map(|h| h.label()).collect::<Vec<_>>()
         );
         assert!(seen.contains(&recorder_panel::Hit::CloseSetup), "no way out");
-        assert!(seen.contains(&recorder_panel::Hit::ChooseFolder));
-        assert!(seen.contains(&recorder_panel::Hit::ToggleHideElapsed));
+        // **The take's controls are NOT here any more**, and that is the
+        // point of the shape: they moved to the capture button. A cog that
+        // still offered them would mean the tier had been copied rather than
+        // moved, which is the failure this whole split exists to avoid.
+        assert!(
+            !seen.contains(&recorder_panel::Hit::ChooseFolder),
+            "the take's folder is still reachable from the cog"
+        );
+        assert!(
+            !seen.contains(&recorder_panel::Hit::ToggleHideElapsed),
+            "a take toggle is still reachable from the cog"
+        );
+
+        // …and they ARE reachable from the capture button's shape, swept the
+        // same way. A tier that vanished from one panel without appearing in
+        // the other would pass the two assertions above.
+        let capture = recorder_panel::capture_rect(band, &view);
+        let take_panel =
+            recorder_panel::setup_popup_rect(screen, capture, recorder_panel::SetupShape::Take);
+        let mut take_seen: Vec<recorder_panel::Hit> = Vec::new();
+        let (mut y, step) = (take_panel.top(), 2.0_f32);
+        while y <= take_panel.bottom() {
+            let mut x = take_panel.left();
+            while x <= take_panel.right() {
+                if let Some(h) = recorder_panel::setup_hit_test(
+                    screen,
+                    capture,
+                    &view,
+                    Pos2::new(x, y),
+                    recorder_panel::SetupShape::Take,
+                ) {
+                    if !take_seen.contains(&h) {
+                        take_seen.push(h);
+                    }
+                }
+                x += step;
+            }
+            y += step;
+        }
+        assert!(
+            take_seen.contains(&recorder_panel::Hit::ChooseFolder),
+            "the take's folder is reachable from neither panel: {:?}",
+            take_seen.iter().map(|h| h.label()).collect::<Vec<_>>()
+        );
+        assert!(
+            take_seen.contains(&recorder_panel::Hit::ToggleHideElapsed),
+            "a take toggle is reachable from neither panel"
+        );
 
         // DONE closes it, and so does the Setup hit coming round again.
         app.apply_recorder_hit(recorder_panel::Hit::CloseSetup);
