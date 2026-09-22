@@ -963,7 +963,6 @@ struct Layout {
     record: Rect,
     /// The steady red dot, which takes the record button's place while rolling.
     /// An indicator and not a control, so it is not a hit.
-    dot: Rect,
     stop: Rect,
     meter: Rect,
     /// The big readout. [`Rect::NOTHING`] when the clock is suppressed.
@@ -1141,7 +1140,6 @@ impl Layout {
             vari_label: Rect::NOTHING,
             play: Rect::NOTHING,
             record: Rect::NOTHING,
-            dot: Rect::NOTHING,
             stop: Rect::NOTHING,
             meter: Rect::NOTHING,
             timecode: Rect::NOTHING,
@@ -1484,7 +1482,11 @@ impl Layout {
         });
         let side = from_knob
             .map_or(bar.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
-            .min(bar.width() * 0.125);
+            .min(bar.width() * 0.125)
+            // Never so small that a button stops being one - see
+            // `TRANSPORT_MIN_SIDE`, and never taller than the row.
+            .max(TRANSPORT_MIN_SIDE)
+            .min(bar.height());
         // What stands in the row, left to right, by WIDTH. The knob keeps its
         // own cell width; the tap chip is a peer now rather than a passenger
         // in the knob's slack; every transport icon is one square.
@@ -1519,8 +1521,18 @@ impl Layout {
         // its width is 2.52 radii, and a cell exactly that wide leaves the
         // radius EXACTLY where it was: the shorter side is unchanged, so the
         // budget is unchanged. Same knob as the others, no dead air.
-        let knob_w = knob_face(head)
-            .map_or(head.width(), |f| (f.radius * 2.52).min(head.width()));
+        //
+        // **And never narrower than its own NAME.** Trimmed to the dial alone,
+        // the slot at 900 points was 14.0 wide and "TEMPO" needs 15.5 at the
+        // smallest size the band will set - so the word vanished from the one
+        // knob that is a transport control rather than a send. Widening the
+        // cell cannot shrink the knob: its radius is budgeted from the shorter
+        // side, and in a short band that is the height.
+        let caption_w = TEMPO_WORD.chars().count() as f32 * ADV * MIN_TEXT + 0.5;
+        let knob_w = knob_face(head).map_or(head.width(), |f| {
+            let name = if f.label_h > 0.0 { caption_w } else { 0.0 };
+            (f.radius * 2.52).max(name).min(head.width())
+        });
         widths.push(knob_w);
         widths.push(tap_w);
         for _ in 0..ICONS {
@@ -1606,14 +1618,25 @@ impl Layout {
             Vec2::new(self.tempo.width() * 0.88, self.tempo.height() * 0.42),
         );
         if rolling {
-            // No play and no record while rolling — pressing either would
-            // mean nothing, and a dead control is worse than no control. The
-            // steady dot stands where the record button stood, the stop where
-            // it always stands. No cog either: none of what it opens can be
-            // changed with an encoder running. The CASSETTE stays — it is
-            // the control that started this take, and the one that ends it.
-            self.dot = icon(0);
+            // **The whole transport, under a take as without one.** The take
+            // is the capture - a film of the window and the desk - and the
+            // owner's use for it is a project breakdown: play the song,
+            // stop, locate, record a part, all on camera. So record, play,
+            // stop and pause stay exactly where they are and do exactly what
+            // they do at rest; only the CASSETTE starts or ends the take.
+            // This row used to keep only a steady red dot, the stop and the
+            // cassette, on the ruling that "pressing either would mean
+            // nothing" - which was true only because the take drove the
+            // transport itself.
+            //
+            // No folder and no cog: everything they open is refused while a
+            // take is writing (the devices, the destination, another
+            // project), and a button that opens a panel of dead rows is
+            // worse than no button.
+            self.record = icon(0);
+            self.play = icon(1);
             self.stop = icon(2);
+            self.pause = icon(3);
             self.capture = icon(4);
         } else {
             self.record = icon(0);
@@ -1625,6 +1648,12 @@ impl Layout {
             // The cog LAST, by the owner's word: transport first, then the
             // session, then the place you go to change how it all works.
             self.setup = icon(6);
+            // Seated only where it can be SEEN. The floor under `side` keeps
+            // that true at every width the window allows; this is what keeps
+            // it true in a detached band dragged smaller than that.
+            if !cog_fits(self.setup) {
+                self.setup = Rect::NOTHING;
+            }
         }
     }
 
@@ -2184,6 +2213,15 @@ impl Layout {
         // measure against a rectangle that is still `NOTHING`.
         self.fill_transport(t);
         self.fill_faders(body, gap, true);
+        // **Except under a realtime EXPORT**, which is the one take that owns
+        // the transport: it is playing the song start to end into a file, and
+        // the host refuses a record, a play or a pause into it. Stop stays -
+        // it ends the export early, on purpose - and so does the cassette.
+        if view.exporting {
+            self.record = Rect::NOTHING;
+            self.play = Rect::NOTHING;
+            self.pause = Rect::NOTHING;
+        }
 
         // **The identical band, with the record button become the dot.** The
         // transport sits at the foot of the faders in both layouts, so the
@@ -3389,10 +3427,13 @@ pub fn camera_chip(rect: Rect, view: &RecorderView<'_>) -> Rect {
 /// the HAND — Ableton's gesture — and following in X alone is what forgives
 /// the vertical slop a hand dragging sideways always has. Clamped, so a
 /// drag off either end holds at the end rather than letting go. `None` on
-/// the faces where the timeline is not seekable: empty, or mid-take.
+/// the faces where the timeline is not seekable: empty. **Seekable
+/// mid-take** - the take films the window and does not own the transport,
+/// so moving the playhead under one is the breakdown video's ordinary
+/// gesture, not a torn file.
 pub fn timeline_fraction(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<f32> {
     let l = Layout::new(rect, view);
-    if l.rolling || !l.timeline_loaded || !l.timeline.is_positive() {
+    if !l.timeline_loaded || !l.timeline.is_positive() {
         return None;
     }
     Some(((pos.x - l.timeline.left()) / l.timeline.width()).clamp(0.0, 1.0))
@@ -3710,9 +3751,6 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
     // A square of side D beside a circle of diameter D looks BIGGER, because it
     // is 27% more ink. Equal AREA is the honest match: side = D * sqrt(pi)/2 =
     // 0.886 D, which is the inset used below.
-    if l.dot.is_positive() {
-        painter.circle_filled(l.dot.center(), l.dot.width() * 0.5, p.rec);
-    }
     if l.pause.is_positive() {
         // Two bars, the sign everything uses — dimmed like the resting
         // triangle, in its green so the pair read as one machine.
@@ -3748,7 +3786,10 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
         // measurements are not equal weight.
         const STOP_INSET: f32 = (1.0 - 0.886) * 0.5;
         let stop = l.stop.shrink(l.stop.width() * STOP_INSET);
-        painter.rect_filled(stop, 1.0, if l.rolling { p.ink } else { p.faint });
+        // Lit while there is something for it to stop - the transport or
+        // the arrangement record. Not the take: the cassette ends that.
+        let live = view.playing || view.arr_recording;
+        painter.rect_filled(stop, 1.0, if live { p.ink } else { p.faint });
         painter.rect_stroke(
             stop,
             1.0,
@@ -4149,7 +4190,7 @@ fn viewport_in(r: Rect, view: &RecorderView<'_>) -> Rect {
 /// The viewport against the LAID-OUT timeline, for the app.
 pub fn timeline_viewport_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     let l = Layout::new(rect, view);
-    if l.rolling || !l.timeline.is_positive() {
+    if !l.timeline.is_positive() {
         return Rect::NOTHING;
     }
     viewport_in(l.timeline, view)
@@ -5155,7 +5196,7 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
 /// instruction and the number the player needs is the one the click is playing.
 /// A countdown in seconds against a click in beats is two clocks disagreeing in
 /// front of the person trying to come in on time.
-fn readout_text(state: RecordState, position_s: f64) -> String {
+fn readout_text(state: RecordState, position_s: f64, elapsed_s: f64) -> String {
     match state {
         // Just the number. It said "3 OF 12" when the count was a running
         // total, and "3 OF 6" once it became a beat within the bar — at which
@@ -5165,11 +5206,17 @@ fn readout_text(state: RecordState, position_s: f64) -> String {
         // saying out loud, as large as the box will draw it.
         RecordState::CountIn { beat, .. } => beat.to_string(),
         RecordState::Finishing => "FINISHING".to_owned(),
-        // **The PLAYHEAD, not a stopwatch.** Click the waveform at 1:24 and
-        // this reads 1:24 before anything is pressed; press play or record
-        // and it counts up from there. Idle at zero it reads 0:00.0, which is
-        // also where stop puts it — one number, one meaning, every state.
-        RecordState::Rolling | RecordState::Idle => timecode(position_s),
+        // **The TAKE's own time while one runs.** This clock stands in the
+        // tempo knob's slot only during a take, and the LCD above it already
+        // shows the playhead in bars and seconds. It read the playhead too,
+        // which was the take's length only because a take used to drive the
+        // transport; now the song can be stopped, located or played in any
+        // order under a take, and a take clock that froze with the song
+        // would say nothing about how long the camera has been rolling.
+        RecordState::Rolling => timecode(elapsed_s),
+        // At rest there is no clock in the row (see `fill_faders`); the
+        // playhead is the only sensible thing for this to mean if one is.
+        RecordState::Idle => timecode(position_s),
     }
 }
 
@@ -5178,7 +5225,7 @@ fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     if !r.is_positive() {
         return;
     }
-    let text = readout_text(view.state, view.position_s);
+    let text = readout_text(view.state, view.position_s, view.elapsed_s);
     let colour = match view.state {
         RecordState::CountIn { .. } => p.rec,
         RecordState::Rolling | RecordState::Finishing => p.ink,
@@ -5304,13 +5351,15 @@ fn draw_cog(painter: &Painter, r: Rect, p: &Palette) {
     if !r.is_positive() {
         return;
     }
-    let c = r.center();
-    let rad = r.width().min(r.height()) * 0.5;
     // Below this the teeth merge into the body and it is a smudge of a circle,
     // so nothing is drawn at all rather than something that reads as a fault.
-    if rad < 5.0 {
+    // The layout asks the same question and does not seat a cog it would not
+    // draw - see `cog_fits`.
+    if !cog_fits(r) {
         return;
     }
+    let c = r.center();
+    let rad = r.width().min(r.height()) * 0.5;
     // The body: most of the circle. The teeth reach from inside it to the
     // edge, so they read as bumps ON it rather than as arms coming OFF it.
     let body = rad * 0.74;
@@ -6156,6 +6205,35 @@ const GAIN_CAP: Color32 = Color32::from_rgb(0xd8, 0x93, 0x2c);
 /// dial, button and meter up rather than empty wood between them.
 const TRANSPORT_SIDE: f32 = 0.82;
 
+/// **The smallest a transport button gets, in points.**
+///
+/// `TRANSPORT_SIDE` follows the tempo knob, and the knob follows the band's
+/// height, which follows the window's WIDTH - so a narrow window shrinks every
+/// button in the row together. At 900 points (the 100% window on a 1440-wide
+/// laptop screen, the owner's 2013 Air) that came to 9.1 points, and the cog,
+/// the one icon with a size below which it refuses to draw, disappeared while
+/// its click target stayed live: the most important button in the band was an
+/// invisible one. The floor keeps every icon a readable, pressable size. It is
+/// half a point over twice [`COG_MIN_R`], so rounding at the threshold cannot
+/// drop the cog, and it stays under the knob's diameter (11.1 at 900), so the
+/// row keeps its rule of buttons smaller than the dial beside them.
+const TRANSPORT_MIN_SIDE: f32 = 10.5;
+
+/// The smallest cog worth drawing, as a radius. Below it the teeth merge into
+/// the body - see [`draw_cog`].
+const COG_MIN_R: f32 = 5.0;
+
+/// **Whether the settings cog can be drawn in `r`.** The layout and the
+/// painter both ask, like [`knob_fits`]: a cog too small to paint must not be
+/// left behind as a click target over blank panel.
+fn cog_fits(r: Rect) -> bool {
+    r.is_positive() && r.width().min(r.height()) * 0.5 >= COG_MIN_R
+}
+
+/// The tempo knob's name, one spelling for the painter and for the layout that
+/// makes room for it.
+const TEMPO_WORD: &str = "TEMPO";
+
 /// The tempo box's share of the fader column's height.
 ///
 /// The faders' share of the middle group's width.
@@ -6372,19 +6450,43 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
     // knob, the READING always below it. The face takes what is left between
     // them, and the two strips are the same height so the dial stays centred
     // whichever way round they are.
-    let pad = if label_h > 0.0 { KNOB_TICK_ROOM } else { 0.0 };
-    let face = Rect::from_min_max(
-        Pos2::new(cell.left(), cell.top() + label_h + pad),
-        Pos2::new(cell.right(), cell.bottom() - label_h - pad),
-    );
-    if !face.is_positive() {
-        return None;
-    }
+    //
     // The SKIRT is part of the budget: ticks stand out to 1.26 of the
     // radius, and a face sized to the strip put its lower ticks under the
     // label — the owner watched REVERB overdraw them. The whole drawing,
     // ticks included, now fits the band between the value and the label.
-    let radius = face.width().min(face.height()) * 0.5 / 1.26;
+    let lay = |label_h: f32| {
+        let pad = if label_h > 0.0 { KNOB_TICK_ROOM } else { 0.0 };
+        let face = Rect::from_min_max(
+            Pos2::new(cell.left(), cell.top() + label_h + pad),
+            Pos2::new(cell.right(), cell.bottom() - label_h - pad),
+        );
+        let radius = face.width().min(face.height()) * 0.5 / 1.26;
+        (face, radius)
+    };
+    let (mut face, mut radius) = lay(label_h);
+    let mut label_h = label_h;
+    // **The word yields before the knob does, as the doc above promises.**
+    // It used to yield only when the WORD was under its own minimum, never
+    // when the word was what pushed the knob under ITS minimum - so between
+    // about 692 and 889 points of window every dial on the band vanished
+    // (eight sends, the pitch dial and the master), although a knob with a
+    // smaller caption, or none, had room to spare. Shrink the strips to what
+    // leaves the knob its minimum; if that is less than a readable word, drop
+    // the word and give the face the whole cell.
+    if label_h > 0.0 && (!face.is_positive() || radius < KNOB_MIN_R) {
+        // Aimed a hair ABOVE the minimum. Aimed at it exactly, the eight
+        // cells of the send grid - one height, but measured from two rows -
+        // came out either side of 5.5 by a float's last bit, and the grid
+        // is all eight or none.
+        let need = 2.0 * 1.26 * (KNOB_MIN_R + 0.01);
+        let shrunk = ((cell.height() - need) * 0.5 - KNOB_TICK_ROOM).min(label_h);
+        label_h = if shrunk >= lo { shrunk } else { 0.0 };
+        (face, radius) = lay(label_h);
+    }
+    if !face.is_positive() {
+        return None;
+    }
     (radius >= KNOB_MIN_R).then_some(KnobFace {
         face,
         radius,
@@ -6610,7 +6712,7 @@ fn draw_tempo(
         l.tempo,
         &Knob {
             value: tempo_to_knob(bpm),
-            label: "TEMPO",
+            label: TEMPO_WORD,
             typing,
             turning,
             reading: tempo_text(bpm),
@@ -6956,6 +7058,81 @@ fn painter_border(painter: &Painter, rect: Rect) {
         Stroke::new(1.0_f32, BORDER_COLOR),
         StrokeKind::Middle,
     );
+}
+
+/// **Everything in the band that a person can reach, drawn where it can be
+/// reached** - or the names of what is not.
+///
+/// The question the owner asked of the 100% window on a 1440-point laptop
+/// screen, as one predicate for the band's own sweep and for the app's
+/// default-size test, so the two cannot mean different things by "all of it".
+/// A control counts when the painter would draw it, not when its rectangle is
+/// merely positive: the cog used to have a live click target and no picture,
+/// and no test noticed because every one of them asked about rectangles.
+///
+/// Captions yield before knobs do (see `knob_face`), so a dial with no word
+/// over it is present. What is checked is that the tempo knob's word shows
+/// wherever the sends' words do: it went missing on its own at 900 points,
+/// while all eight of theirs stood.
+#[cfg(test)]
+pub(crate) fn every_control_drawn(rect: Rect, view: &RecorderView<'_>) -> Result<(), Vec<String>> {
+    let l = Layout::new(rect, view);
+    let mut missing = Vec::new();
+    let rolling = l.rolling;
+    let mut need = vec![
+        ("the camera preview", l.preview),
+        ("the clock", l.lcd),
+        ("the VU meters", l.meter),
+        ("the loudness meter", l.lufs_bar),
+        ("the master meter", l.master_bars),
+        ("record", l.record),
+        ("play", l.play),
+        ("stop", l.stop),
+        ("pause", l.pause),
+        ("the cassette", l.capture),
+    ];
+    if !rolling {
+        need.push(("TAP", l.tempo_tap));
+        need.push(("the project folder", l.project));
+    }
+    for (name, r) in need {
+        if !r.is_positive() {
+            missing.push(name.to_owned());
+        }
+    }
+    if !rolling && !cog_fits(l.setup) {
+        missing.push("the settings cog".to_owned());
+    }
+    if !rolling {
+        match knob_face(l.tempo) {
+            None => missing.push("the tempo knob".to_owned()),
+            Some(f) => {
+                let sends_named = l.fx.iter().any(|c| knob_face(*c).is_some_and(|k| k.label_h > 0.0));
+                let top = Rect::from_min_max(
+                    l.tempo.min,
+                    Pos2::new(l.tempo.right(), l.tempo.top() + f.label_h),
+                );
+                let named = f.label_h > 0.0 && fit_text(top, TEMPO_WORD, f.label_h * 0.9) >= MIN_TEXT;
+                if sends_named && !named {
+                    missing.push("the word TEMPO".to_owned());
+                }
+            }
+        }
+    }
+    for (i, c) in l.fx.iter().enumerate() {
+        if !knob_fits(*c) {
+            missing.push(format!("the {} dial", Fx::ALL[i].title()));
+        }
+    }
+    // By the painter's own face, which is stricter than `knob_fits`: it takes
+    // the PITCH CONT word's line out of the cell before it sizes the dial.
+    if vari_face(l.vari, l.vari_label).is_none() {
+        missing.push("the pitch dial".to_owned());
+    }
+    if !knob_fits(l.master_knob) {
+        missing.push("the master knob".to_owned());
+    }
+    if missing.is_empty() { Ok(()) } else { Err(missing) }
 }
 
 #[cfg(test)]
@@ -8379,6 +8556,79 @@ mod tests {
         }
     }
 
+    /// **Every control in the band is drawn at every width the window can
+    /// be, and the settings cog in particular.**
+    ///
+    /// The owner's report: at 100% on a 1440-point screen "the tangent window
+    /// spawns a bit too small and cuts off the last and arguably most
+    /// important button -- the settings". It was not cut off; at 900 points
+    /// every button shrank to 9.1 and `draw_cog` refused to paint under a
+    /// 5-point radius while the click target stayed live. Between 794 and 889
+    /// points the whole send grid was refused too, and took the master, the
+    /// pitch dial and the tempo knob with it (they are sized from its first
+    /// cell) - the default window on a 1280 or 1366 screen. Every point from
+    /// the window's floor to 2600, because the failures were a few points
+    /// wide and alternated.
+    #[test]
+    fn every_control_is_drawn_at_every_width_the_window_allows() {
+        let mut w = crate::settings::MIN_WINDOW.x;
+        while w <= 2600.0 {
+            if let Err(missing) = every_control_drawn(band(w), &idle()) {
+                panic!("at {w} points the band does not draw {missing:?}");
+            }
+            w += 1.0;
+        }
+    }
+
+    /// And the captions: from the width where the sends carry their words
+    /// on, the TEMPO knob carries its own. It is the one knob that is a
+    /// transport control, and at 900 points it was the one word missing.
+    #[test]
+    fn the_tempo_knob_is_named_at_the_100_percent_window_on_a_laptop() {
+        for w in [900.0_f32, 918.0, 945.0, 960.0] {
+            let l = Layout::new(band(w), &idle());
+            let f = knob_face(l.tempo).expect("the tempo knob");
+            assert!(f.label_h > 0.0, "at {w} the tempo knob has no caption strip");
+            let top = Rect::from_min_max(l.tempo.min, Pos2::new(l.tempo.right(), l.tempo.top() + f.label_h));
+            let size = fit_text(top, TEMPO_WORD, f.label_h * 0.9);
+            assert!(size >= MIN_TEXT, "at {w} the word TEMPO would be set at {size:.2}");
+        }
+    }
+
+    /// The cog is never a click target without a picture, in the band OR in
+    /// the detached window, which lays the same row out at a different
+    /// aspect.
+    #[test]
+    fn the_cog_is_never_pressable_where_it_is_not_drawn() {
+        let mut rects: Vec<Rect> = Vec::new();
+        let mut w = crate::settings::MIN_WINDOW.x;
+        while w <= 2600.0 {
+            rects.push(band(w));
+            w += 1.0;
+        }
+        let mut dw = 400.0_f32;
+        while dw <= 1400.0 {
+            let mut dh = 200.0_f32;
+            while dh <= 800.0 {
+                rects.push(Rect::from_min_size(Pos2::ZERO, Vec2::new(dw, dh)));
+                dh += 20.0;
+            }
+            dw += 20.0;
+        }
+        for r in rects {
+            let l = Layout::new(r, &idle());
+            assert!(
+                !l.setup.is_positive() || cog_fits(l.setup),
+                "at {r:?} the cog is pressable at {:?} but too small to draw",
+                l.setup
+            );
+        }
+        for d in [DETACHED_DEFAULT, DETACHED_MIN] {
+            let r = Rect::from_min_size(Pos2::ZERO, d);
+            assert!(cog_fits(Layout::new(r, &idle()).setup), "the detached window at {d:?} has no cog");
+        }
+    }
+
     /// An empty rack, which is what the app opens with.
     fn idle() -> RecorderView<'static> {
         RecorderView::empty()
@@ -9079,15 +9329,19 @@ mod tests {
     /// The controls that stay reachable once a take is live.
     ///
     /// The desk owns the per-channel levels now, so what survives in the BAND
-    /// is what leaves the room: the master, the effects, and the way of
-    /// putting the clip lamp out. The pickers and the import do not, because
-    /// each one opens a dialog over the one gesture that matters mid-take,
-    /// which is Stop.
-    const SURVIVORS: [Hit; 23] = [
+    /// is what leaves the room: the master, the effects, the way of putting
+    /// the clip lamp out - and the whole transport, because a take is capture
+    /// only and the song under it is still played, stopped and recorded from
+    /// these buttons. The pickers and the import do not: each one opens a
+    /// dialog over a take that cannot change its devices or its destination.
+    const SURVIVORS: [Hit; 26] = [
+        Hit::Record,
+        Hit::Play,
         Hit::Stop,
-        // The cassette started this take, and pressing it again is how a
-        // count-in is cancelled — the one control whose whole job is
-        // mid-take.
+        Hit::Pause,
+        // The cassette started this take, and pressing it again is how it
+        // ends, or how its count-in is cancelled - the one control that
+        // reaches the take at all.
         Hit::Capture,
         // The master most of all: it is the level control somebody reaches
         // for at 0:47, and a take is exactly when.
@@ -9408,35 +9662,57 @@ mod tests {
         }
     }
 
-    /// **And the same size DURING a take, too.**
+    /// **The transport row is the same row under a take: every button, in
+    /// the same place, answering the same press.**
     ///
-    /// The rolling layout draws a dot where the record button stood and the
-    /// stop button beside it. The dot was 0.30 of the row against stop's 1.0,
-    /// so it read as a speck next to a slab — two controls of vastly different
-    /// size, which is what they are not: one is the state and the other is the
-    /// way out of it.
+    /// The owner: "when active, the take button simply glows amber -- it is
+    /// now the only way to stop the take with a button. why? we need to be
+    /// able to record arrangements and or play them back on command ... the
+    /// main buttons need to be intact while recording takes." The take row
+    /// used to keep only a steady red dot, the stop and the cassette. Every
+    /// state, the widths the other layout tests sweep and the two detached
+    /// windows; only the cassette's colour says a take is running.
     #[test]
-    fn the_rolling_transport_is_the_same_size_as_itself() {
-        for w in [320.0_f32, 640.0, 1300.0, 2600.0] {
-            let r = band(w);
-            let v = RecorderView {
-                position_s: 0.0,
-                playing: false,
-                input_monitor: false,
-                state: RecordState::Rolling,
-                ..idle()
-            };
-            let l = Layout::new(r, &v);
-            if !l.dot.is_positive() || !l.stop.is_positive() {
-                continue;
+    fn the_transport_row_is_the_same_under_a_take() {
+        let mut rects: Vec<Rect> = [320.0_f32, 500.0, 560.0, 640.0, 900.0, 1300.0, 2600.0]
+            .iter()
+            .map(|w| band(*w))
+            .collect();
+        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT));
+        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_MIN));
+        for r in rects {
+            let at_rest = Layout::new(r, &idle());
+            for state in STATES {
+                let v = RecorderView {
+                    state,
+                    ..idle()
+                };
+                let l = Layout::new(r, &v);
+                for (name, a, b) in [
+                    ("record", at_rest.record, l.record),
+                    ("play", at_rest.play, l.play),
+                    ("stop", at_rest.stop, l.stop),
+                    ("pause", at_rest.pause, l.pause),
+                    ("the cassette", at_rest.capture, l.capture),
+                ] {
+                    assert_eq!(a, b, "{name} moved or went away in {state:?} at {r:?}");
+                }
+                for (hit, rect) in [
+                    (Hit::Record, l.record),
+                    (Hit::Play, l.play),
+                    (Hit::Stop, l.stop),
+                    (Hit::Pause, l.pause),
+                    (Hit::Capture, l.capture),
+                ] {
+                    if rect.is_positive() {
+                        assert_eq!(
+                            hit_test(r, &v, rect.center()),
+                            Some(hit),
+                            "in {state:?} at {r:?} a press on its centre is not {hit:?}"
+                        );
+                    }
+                }
             }
-            assert!(
-                (l.dot.width() - l.stop.width()).abs() < 0.51,
-                "at {w}: the dot is {} wide and stop is {}",
-                l.dot.width(),
-                l.stop.width()
-            );
-            assert!(!l.dot.intersects(l.stop), "at {w}: they overlap");
         }
     }
 
@@ -9901,14 +10177,17 @@ mod tests {
         // while the count was a running total against a total; now that it is
         // a beat WITHIN THE BAR — 1 2 3 4 5 6, 1 2 3 4 5 6 in 6/8 — the second
         // half carries nothing the SIG cell does not already say.
-        assert_eq!(readout_text(RecordState::CountIn { beat: 3, of: 4 }, 0.0), "3");
+        assert_eq!(readout_text(RecordState::CountIn { beat: 3, of: 4 }, 0.0, 0.0), "3");
         assert_eq!(
-            readout_text(RecordState::CountIn { beat: 5, of: 6 }, 91.0),
+            readout_text(RecordState::CountIn { beat: 5, of: 6 }, 91.0, 91.0),
             "5",
             "the elapsed clock does not leak into the count"
         );
-        assert_eq!(readout_text(RecordState::Finishing, 12.0), "FINISHING");
-        assert_eq!(readout_text(RecordState::Rolling, 252.0), "4:12");
+        assert_eq!(readout_text(RecordState::Finishing, 12.0, 12.0), "FINISHING");
+        // **The take's own time, not the playhead.** The song can sit still,
+        // or be located back, under a running take now; the clock in the
+        // take's slot says how long the camera has been rolling.
+        assert_eq!(readout_text(RecordState::Rolling, 30.0, 252.0), "4:12");
 
         let r = band(1300.0);
         for hide in [false, true] {
@@ -10000,15 +10279,37 @@ mod tests {
         }
     }
 
-    /// The transport is a picture of the state before it is anything else: a
-    /// round red button at rest, a steady dot while live, in the same place.
+    /// **An export is the exception**: it owns the transport, the host
+    /// refuses a record, play or pause into it, so the band does not seat
+    /// them. Stop (which ends it early, on purpose) and the cassette stay put.
     #[test]
-    fn the_record_button_becomes_the_dot_and_never_both() {
+    fn an_export_seats_only_stop_and_the_cassette() {
+        let r = band(1300.0);
+        let take = Layout::new(r, &rolling());
+        let export = Layout::new(
+            r,
+            &RecorderView {
+                exporting: true,
+                ..rolling()
+            },
+        );
+        for (name, rect) in [("record", export.record), ("play", export.play), ("pause", export.pause)] {
+            assert!(!rect.is_positive(), "{name} is seated over an export the host refuses it for");
+        }
+        assert_eq!(export.stop, take.stop, "Stop moved under an export");
+        assert_eq!(export.capture, take.capture, "the cassette moved under an export");
+    }
+
+    /// The record button is the ARRANGEMENT's and stays one under a take;
+    /// the take is told apart by the cassette's amber and the window's red
+    /// outline, not by the red button turning into a picture of itself.
+    #[test]
+    fn the_record_button_stays_a_button_under_a_take() {
         let r = band(1300.0);
         let at_rest = Layout::new(r, &idle());
-        assert!(at_rest.record.is_positive() && !at_rest.dot.is_positive());
+        assert!(at_rest.record.is_positive());
         let live = Layout::new(r, &rolling());
-        assert!(live.dot.is_positive() && !live.record.is_positive());
+        assert_eq!(live.record, at_rest.record, "the red button moved or went away");
         // **The clock is the one thing that moves, and it grows.** At rest it
         // says 0:00 and takes what is left of the transport's row; while a
         // take runs it is the number somebody reads from a piano bench, and
@@ -10266,6 +10567,7 @@ mod tests {
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,
+                                exporting: false,
                                 view_window: (0.0, 60.0),
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),

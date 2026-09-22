@@ -505,6 +505,31 @@ struct Recorder {
     /// The red button pressed, the COUNT-IN still clicking: the record
     /// begins on the downbeat.
     arr_rec_wait: bool,
+    /// **The cassette started the engine's count-in and it has not reached
+    /// its downbeat yet.**
+    ///
+    /// The engine has ONE count-in, and the take and the arrangement record
+    /// both use it. While a take drove the transport the two never met; now
+    /// they can run in any order, so each needs to know whether the other is
+    /// counting before it starts, restarts or cancels the click. The engine
+    /// cannot answer that - `count_in_done` is a latch that stays up long
+    /// after the count - so the host keeps one flag per owner, and a count is
+    /// running while either is set.
+    take_count_pending: bool,
+    /// When the ARRANGEMENT's count-in started, and how many beats it runs -
+    /// so a take started during it can count in from the same instant and
+    /// begin on the same downbeat, rather than at the press.
+    arr_count_from: Option<(std::time::Instant, u32)>,
+    /// **Play was pressed while a count-in was running**: the song starts on
+    /// the downbeat instead of under the count. Pressing TAKE and then Play
+    /// used to be "count me in, then the song plays" by force; this is that,
+    /// on purpose, and nothing clicks over a song on the wrong grid.
+    play_on_go: bool,
+    /// How long the next take's file will run before the music, decided at
+    /// the cassette's press from what the press actually did - see
+    /// `Manifest::head_seconds`. It was recomputed every frame from the
+    /// settings, which is wrong whenever the press skipped or joined a count.
+    take_head_s: f64,
     /// The realtime pass's delivery instructions, applied at the finish.
     pending_delivery: Option<tangent_ui::ports::ProjectExportSpec>,
 }
@@ -4463,6 +4488,7 @@ impl DesktopApp {
         // engine's own; with no engine the transport answers from its last
         // known truth, which is the whole reason it owns the number.
         state.playing = self.recorder.transport.playing();
+        state.exporting = self.recorder.bounce.is_some();
         state.position_s = {
             let engine = self.recorder.engine.as_ref();
             let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
@@ -4804,35 +4830,40 @@ impl DesktopApp {
                 self.recorder.armed_downbeat = Some(downbeat);
                 self.recorder.session.arm_at(downbeat);
             }
+            // Whoever started it, the count is over.
+            self.recorder.take_count_pending = false;
+            // And the song comes in on it, if Play was pressed during it.
+            if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {
+                self.recorder.transport.toggle_play();
+            }
         }
         // The count-in, which is the one thing here that animates with no input
         // at all — so it also has to ask for the next frame.
         if self.recorder.session.tick(&root, name.as_deref()) {
             ctx.request_repaint();
         }
-        // **The transport, reconciled AFTER the session has ticked** — the
-        // rolling level is derived from the session's state, and publishing it
-        // a frame early was how the take's first block started from the old
-        // position. Rolling during the take proper, never the count-in: the
-        // count-in is what counts you IN to the track, and a track that
-        // started under it would have its downbeat a bar from the one being
-        // clicked.
+        // **The transport, reconciled once a frame, and a take has no say in
+        // it.** It used to be ORed in here - the session's Rolling state made
+        // the engine roll whatever the play switch said - so pressing TAKE
+        // played the song, Play and Pause were refused for the whole take,
+        // and nothing could stop the song without ending the capture. The
+        // owner's use for a take is a project breakdown video: record parts,
+        // play them back, stop, locate, all on camera. The take is capture
+        // only now, and the transport is the play switch's alone - see
+        // `Transport::playing`.
         {
-            let session_rolling = matches!(
-                self.recorder.session.state(),
-                tangent_ui::recorder::RecordState::Rolling
-            );
             let engine = self.recorder.engine.as_ref();
-            self.recorder.transport.push(engine, session_rolling);
+            self.recorder.transport.push(engine);
             // **The loop region, pushed every frame from the time
             // selection.** Frames off the engine's own rate; cleared to
-            // (0,0) when there is no selection. Suppressed WHILE a take
-            // records — a loop that yanked the playhead back mid-take would
-            // overwrite what was just captured — the same guard the reorder
-            // and locate paths keep.
+            // (0,0) when there is no selection. Suppressed during a realtime
+            // EXPORT only - that one really is a take of a fixed span, and a
+            // loop would yank its playhead back over what it just wrote. An
+            // ordinary take films whatever the transport does, loop included.
             if let Some(e) = engine {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
-                match self.app.loop_region().filter(|_| !session_rolling) {
+                let exporting = self.recorder.bounce.is_some();
+                match self.app.loop_region().filter(|_| !exporting) {
                     Some((a, b)) => {
                         e.set_loop((a.max(0.0) * rate) as u64, (b.max(0.0) * rate) as u64);
                     }
@@ -5491,6 +5522,7 @@ impl DesktopApp {
         self.tick_offline_bounce(ctx);
         // The arrangement's count-in reaching its downbeat: begin.
         if self.recorder.arr_rec_wait
+            && self.recorder.bounce.is_none()
             && self
                 .recorder
                 .engine
@@ -5498,6 +5530,7 @@ impl DesktopApp {
                 .is_some_and(crate::instrument::Engine::count_in_done)
         {
             self.recorder.arr_rec_wait = false;
+            self.recorder.arr_count_from = None;
             self.start_arr_record();
         }
         if !self.recorder.session.is_recording() {
@@ -5545,17 +5578,28 @@ impl DesktopApp {
                 // `push_transport` is what carries it to the engine.
                 R::Play => {
                     // PLAY only — pausing is the pause button's job now.
-                    // Record owns the transport while a take is writing, and
-                    // the arrangement's record owns it the same way.
-                    if !self.recorder.session.is_recording()
+                    // The arrangement's record owns the transport while it
+                    // runs, and so does a realtime EXPORT, which is the one
+                    // take that plays a fixed span. An ordinary take does
+                    // not: it films whatever the transport does.
+                    if self.recorder.bounce.is_none()
                         && self.recorder.arr_rec.is_none()
                         && !self.recorder.transport.playing()
                     {
-                        self.recorder.transport.toggle_play();
+                        if self.recorder.take_count_pending || self.recorder.arr_rec_wait {
+                            // **A count is running: the song comes in on its
+                            // downbeat**, not under it. Rolling now put the
+                            // rest of the count on the press's grid over the
+                            // song, and began the song before the take it is
+                            // being filmed for.
+                            self.recorder.play_on_go = true;
+                        } else {
+                            self.recorder.transport.toggle_play();
+                        }
                     }
                 }
                 R::Pause => {
-                    if !self.recorder.session.is_recording()
+                    if self.recorder.bounce.is_none()
                         && self.recorder.arr_rec.is_none()
                         && self.recorder.transport.playing()
                     {
@@ -5563,21 +5607,40 @@ impl DesktopApp {
                     }
                 }
                 R::Locate(seconds) => {
-                    self.recorder.transport.locate(seconds);
+                    // Not under an export: it is rendering a span, and a
+                    // seek would write the wrong bars into the file.
+                    if self.recorder.bounce.is_none() {
+                        self.recorder.transport.locate(seconds);
+                    }
                 }
                 // **The red button is the ARRANGEMENT's.** Armed lanes in,
                 // clips out; the take machinery does not stir. The capture —
                 // the cassette — is where the old take toggle lives now.
                 R::Toggle => {
-                    if self.recorder.arr_rec_wait {
+                    if self.recorder.bounce.is_some() {
+                        // An export is playing the arrangement into a file;
+                        // recording into it at the same time is refused, as
+                        // an export is refused over a record.
+                    } else if self.recorder.arr_rec_wait {
                         // Pressed again mid-count: the count stops, nothing
-                        // records.
+                        // records - unless a take is counting on the same
+                        // click, which is then left to finish its own count.
                         self.recorder.arr_rec_wait = false;
-                        if let Some(e) = self.recorder.engine.as_ref() {
-                            e.cancel_count_in();
+                        self.recorder.arr_count_from = None;
+                        if !self.recorder.take_count_pending {
+                            self.recorder.play_on_go = false;
+                            if let Some(e) = self.recorder.engine.as_ref() {
+                                e.cancel_count_in();
+                            }
                         }
                     } else if self.recorder.arr_rec.is_some() {
                         self.finish_arr_record();
+                    } else if self.recorder.take_count_pending {
+                        // **A take is already counting in: JOIN its count.**
+                        // One click, one downbeat, both recordings start on
+                        // it. Restarting the count here used to restart the
+                        // take's too, a bar into it.
+                        self.recorder.arr_rec_wait = true;
                     } else {
                         // **The count-in counts the ARRANGEMENT in too** —
                         // the owner's ask: the bars from the settings click
@@ -5587,6 +5650,8 @@ impl DesktopApp {
                             if let Some(e) = self.recorder.engine.as_ref() {
                                 e.start_count_in(beats, self.app.tempo_bpm());
                                 self.recorder.arr_rec_wait = true;
+                                self.recorder.arr_count_from =
+                                    Some((std::time::Instant::now(), beats));
                             } else {
                                 self.start_arr_record();
                             }
@@ -5606,17 +5671,47 @@ impl DesktopApp {
                     // The click counts the take in, on the audio thread's own
                     // sample clock. Started here, at the press, so the first
                     // beat lands immediately rather than a frame later.
-                    let beats = self.app.count_in_beats();
                     let in_take = self.app.count_in_in_take();
+                    let starting = !self.recorder.session.is_recording();
+                    // **What this press does about a count-in.**
+                    //
+                    // - Over a song that is already PLAYING: none. The same
+                    //   rule the red button keeps: a count-in is how you come
+                    //   IN to a stopped song, and four beats counted over one
+                    //   that is playing put the click on the press's grid
+                    //   against the song's.
+                    // - Over the ARRANGEMENT's count: JOIN it. Its click is
+                    //   already going; the take counts in from the instant it
+                    //   started and begins on the same downbeat, so a take and
+                    //   an arrangement record started together share a start.
+                    // - Otherwise: its own, from the settings.
+                    let joined = if starting && self.recorder.arr_rec_wait {
+                        self.recorder.arr_count_from
+                    } else {
+                        None
+                    };
+                    let beats = if self.recorder.transport.playing() || self.recorder.arr_rec_wait {
+                        0
+                    } else {
+                        self.app.count_in_beats()
+                    };
                     if let Some(e) = self.recorder.engine.as_ref() {
                         // The click's own switch for the count, which is not
                         // `metronome_in_take` — see `Shared::count_in_in_take`.
                         e.set_count_in_in_take(in_take);
-                        if !self.recorder.session.is_recording() && beats > 0 {
+                        if starting && beats > 0 {
                             e.start_count_in(beats, self.app.tempo_bpm());
-                        } else {
+                            self.recorder.take_count_pending = true;
+                        } else if self.recorder.take_count_pending && !self.recorder.arr_rec_wait {
+                            // Ending or cancelling a take that is still
+                            // counting: the count was the take's, so it goes.
+                            // One the arrangement is waiting on stays.
                             e.cancel_count_in();
+                            self.recorder.play_on_go = false;
                         }
+                    }
+                    if !starting {
+                        self.recorder.take_count_pending = false;
                     }
                     // A fresh take starts with a clean clip latch on the
                     // instrument's meter, exactly as `LevelTracker::arm` does
@@ -5626,6 +5721,7 @@ impl DesktopApp {
                         e.clear_clip();
                     }
                     let spec = self.app.export_spec();
+                    let beat_s = self.app.time_signature().beat_seconds(self.app.tempo_bpm());
                     // **Zero when the count-in goes INSIDE the take.** The
                     // session's count-in is a delay before the file opens; the
                     // engine's is the click. Passing zero here starts writing
@@ -5633,10 +5729,33 @@ impl DesktopApp {
                     // is exactly "start instantly with the count-in in the
                     // export" — the count is at the head of the file to trim to
                     // or to keep.
-                    let wait = if in_take { 0 } else { beats };
+                    //
+                    // And the HEAD the file will carry, decided here from what
+                    // this press actually did: the whole count when the take's
+                    // own count goes in, what is LEFT of the arrangement's when
+                    // it joins one, nothing otherwise.
+                    let (wait, head) = match joined {
+                        Some((_, of)) if !in_take => (of, 0.0),
+                        Some((from, of)) => (
+                            0,
+                            (f64::from(of) * beat_s - from.elapsed().as_secs_f64()).max(0.0),
+                        ),
+                        None if in_take => (0, f64::from(beats) * beat_s),
+                        None => (beats, 0.0),
+                    };
+                    if starting {
+                        self.recorder.take_head_s = head;
+                        self.recorder.session.set_take_head(head);
+                    }
                     self.recorder
                         .session
                         .toggle(&root, name.as_deref(), wait, spec);
+                    // A joined count counts from when the ARRANGEMENT's began,
+                    // and the take now waits on that click like its own.
+                    if let Some((from, _)) = joined.filter(|_| !in_take) {
+                        self.recorder.session.count_in_began_at(from);
+                        self.recorder.take_count_pending = true;
+                    }
                 }
                 // **One stop for both machines.** The square ends whichever
                 // is running — the take by the session's own stop, the
@@ -5644,17 +5763,31 @@ impl DesktopApp {
                 // sends the playhead home. Play's own second press is a PAUSE
                 // now, so this is the only button that returns to 0:00.
                 R::Stop => {
-                    // A count-in still clicking dies quietly with the rest.
+                    // The arrangement's count-in still clicking dies quietly
+                    // with the rest - unless a take is counting on the same
+                    // click, which only the cassette may cancel.
                     if self.recorder.arr_rec_wait {
                         self.recorder.arr_rec_wait = false;
-                        if let Some(e) = self.recorder.engine.as_ref() {
-                            e.cancel_count_in();
+                        self.recorder.arr_count_from = None;
+                        if !self.recorder.take_count_pending {
+                            if let Some(e) = self.recorder.engine.as_ref() {
+                                e.cancel_count_in();
+                            }
                         }
                     }
+                    // Stop means the song does not start on any downbeat.
+                    self.recorder.play_on_go = false;
                     // The arrangement record first, while the playhead still
                     // says where the take ended — `Transport::stop` rewinds.
                     self.finish_arr_record();
-                    self.recorder.session.stop();
+                    // **Not the take.** Stop is the transport's; only the
+                    // cassette ends a take. The one exception is the realtime
+                    // EXPORT, which is a take of a span and which Stop has
+                    // always cut short - `tick_bounce` reads the session
+                    // ending as "the pass is over".
+                    if self.recorder.bounce.is_some() {
+                        self.recorder.session.stop();
+                    }
                     self.recorder.transport.stop();
                 }
                 // **Every latch, or the light does not go out.** The warning
@@ -8832,9 +8965,14 @@ impl DesktopApp {
                 return;
             }};
         }
+        // A count-in running is a recording about to start: the red button's
+        // would begin an arrangement record inside the export on its
+        // downbeat, and a take's would begin a take on the same machine.
         if self.recorder.bounce.is_some()
             || self.recorder.session.is_recording()
             || self.recorder.arr_rec.is_some()
+            || self.recorder.arr_rec_wait
+            || self.recorder.take_count_pending
         {
             refuse!();
         }
@@ -13270,6 +13408,14 @@ impl DesktopApp {
                 // here would re-announce the whole backlog as "+48 just now"
                 // after every reopen. `path_changed` already resets it on the
                 // edge where a genuinely new counter appears.
+                // **And no count-in is running on it.** These flags name a
+                // count on the engine this one replaces; left up, a stranded
+                // `arr_rec_wait` made the next cassette press skip its own
+                // count and the next red press a silent "cancel".
+                self.recorder.arr_rec_wait = false;
+                self.recorder.arr_count_from = None;
+                self.recorder.take_count_pending = false;
+                self.recorder.play_on_go = false;
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -13510,14 +13656,14 @@ impl DesktopApp {
             let engine = self.recorder.engine.as_ref();
             let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
             let timeline_start = self.recorder.transport.position_s(engine, rate);
-            let head = if self.app.count_in_in_take() {
-                let beats = f64::from(self.app.count_in_beats());
-                let bpm = self.app.tempo_bpm().max(1.0);
-                beats * 60.0 / bpm
-            } else {
-                // A pre-roll count-in delays the file, it is not IN it.
-                0.0
-            };
+            // Decided at the cassette's press from what it did - see
+            // `Recorder::take_head_s`. A pre-roll count-in delays the file,
+            // it is not IN it, so a pre-roll take's head is zero.
+            let head = self.recorder.take_head_s;
+            // Whether `timeline_start` places frame 0 at all: a take no
+            // longer rolls the transport, so a take over a stopped song has
+            // no single place on the timeline.
+            let rolling = self.recorder.transport.playing();
             let mask = |bits: &[bool]| {
                 bits.iter()
                     .enumerate()
@@ -13525,6 +13671,7 @@ impl DesktopApp {
             };
             self.recorder.session.set_take_facts(
                 timeline_start,
+                rolling,
                 head,
                 mask(&desk.muted),
                 mask(&desk.soloed),
@@ -17596,6 +17743,10 @@ impl DesktopApp {
                 bounce: None,
                 offline_bounce: None,
                 arr_rec_wait: false,
+                take_count_pending: false,
+                arr_count_from: None,
+                play_on_go: false,
+                take_head_s: 0.0,
                 pending_delivery: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
@@ -20696,6 +20847,124 @@ mod tests {
         e.set_clips(placed);
         e.set_midi_clips(midi_placed);
     }
+
+    /// **A take is capture only: every transport request answers the same
+    /// under one, and only the cassette reaches it.**
+    ///
+    /// The owner: "the take feature now shows the countdown, and when
+    /// active, the take button simply glows amber -- it is now the only way
+    /// to stop the take with a button. why? we need to be able to record
+    /// arrangements and or play them back on command ... the main buttons
+    /// need to be intact while recording takes." The host ORed the take into
+    /// the transport's rolling level, refused Play and Pause for the whole
+    /// take, switched the loop off under it, and let Stop end it. The one
+    /// take that genuinely is a span of the song - the realtime EXPORT - keeps
+    /// those guards, now keyed on the export itself.
+    ///
+    /// A source scan like its neighbours, because the arms need a
+    /// `DesktopApp` and an engine; each needle is bounded to its own arm.
+    #[test]
+    fn a_take_owns_no_transport_control() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let arm = |from: &str, to: &str| -> &str {
+            let a = src.find(from).unwrap_or_else(|| panic!("no arm {from}"));
+            let b = src[a..].find(to).map_or(src.len(), |b| a + b);
+            &src[a..b]
+        };
+        assert!(
+            !src.contains("session_rolling"),
+            "the transport still reads the take's state"
+        );
+        assert!(
+            src.contains("self.recorder.transport.push(engine);"),
+            "the transport's push is not the play switch's alone"
+        );
+        assert!(
+            src.contains("let exporting = self.recorder.bounce.is_some();")
+                && src.contains("loop_region().filter(|_| !exporting)"),
+            "the loop is suppressed by something other than an export"
+        );
+        for (name, body) in [
+            ("Play", arm("                R::Play => {", "                R::Pause => {")),
+            ("Pause", arm("                R::Pause => {", "                R::Locate(seconds) => {")),
+        ] {
+            assert!(
+                !body.contains("session.is_recording()"),
+                "{name} is refused under a take again"
+            );
+            assert!(
+                body.contains("self.recorder.bounce.is_none()"),
+                "{name} is not refused under an export"
+            );
+        }
+        let locate = arm("                R::Locate(seconds) => {", "                R::Toggle => {");
+        assert!(locate.contains("self.recorder.bounce.is_none()"), "a seek can land in an export");
+        let toggle = arm("                R::Toggle => {", "                R::Capture => {");
+        assert!(
+            toggle.contains("if self.recorder.bounce.is_some() {"),
+            "the red button can record over an export"
+        );
+        assert!(
+            toggle.contains("} else if self.recorder.take_count_pending {\n                        // **A take is already counting in: JOIN its count.**"),
+            "the red button restarts a take's count-in instead of joining it"
+        );
+        let stop = arm("                R::Stop => {", "                R::DismissClip => {");
+        let ends = stop.find("self.recorder.session.stop();").expect("Stop still ends an export");
+        assert_eq!(stop.matches("session.stop()").count(), 1, "Stop ends the session twice");
+        assert!(
+            stop[..ends].ends_with("if self.recorder.bounce.is_some() {\n                        "),
+            "Stop ends an ordinary take again"
+        );
+        let capture = arm("                R::Capture => {", "                R::Stop => {");
+        assert!(
+            capture.contains("} else if self.recorder.take_count_pending && !self.recorder.arr_rec_wait {\n"),
+            "the cassette can cancel a count-in the arrangement is waiting on"
+        );
+        assert!(
+            capture.contains("if self.recorder.transport.playing() || self.recorder.arr_rec_wait {"),
+            "the cassette counts in over a playing song or over the arrangement's count"
+        );
+        // A take joining the arrangement's count counts from when THAT began,
+        // and the head it writes is the one this press decided.
+        let set_head = capture.find("self.recorder.session.set_take_head(head);").expect("the press sets the head");
+        let toggles = capture.find(".toggle(&root, name.as_deref(), wait, spec);").expect("the press toggles");
+        assert!(set_head < toggles, "the head is set after an in-take begin already latched it");
+        assert!(
+            capture[toggles..].contains("self.recorder.session.count_in_began_at(from);"),
+            "a joined count is counted from the press, not from when it began"
+        );
+        assert!(
+            src.contains("let head = self.recorder.take_head_s;"),
+            "the per-frame facts recompute the head from the settings again"
+        );
+        // Play during a count waits for its downbeat.
+        let play = arm("                R::Play => {", "                R::Pause => {");
+        assert!(
+            play.contains("if self.recorder.take_count_pending || self.recorder.arr_rec_wait {\n")
+                && play.contains("self.recorder.play_on_go = true;"),
+            "Play rolls the song under a running count-in"
+        );
+        assert!(
+            src.contains("if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {"),
+            "a deferred Play never starts on the downbeat"
+        );
+        // An export is refused while either recording's count is running.
+        let bounce = arm("        if self.recorder.bounce.is_some()\n            || self.recorder.session.is_recording()", "            refuse!();");
+        assert!(
+            bounce.contains("|| self.recorder.arr_rec_wait") && bounce.contains("|| self.recorder.take_count_pending"),
+            "an export can start under a count whose downbeat then records into it"
+        );
+        // A new engine has no count running on it.
+        let birth = src
+            .find("// **The tap belongs to the ENGINE, so it is taken when the")
+            .expect("start_engine's tap handoff");
+        let before = &src[birth.saturating_sub(700)..birth];
+        for flag in ["arr_rec_wait = false", "take_count_pending = false", "play_on_go = false", "arr_count_from = None"] {
+            assert!(before.contains(flag), "an engine is born with {flag} left over from the last one");
+        }
+    }
+
 
     /// **A cover asks for its band; it never spells one.**
     ///

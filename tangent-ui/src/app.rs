@@ -3635,17 +3635,7 @@ impl TangentApp {
         // never populate, shrinking the piano to make room for a camera preview
         // that will never arrive. `fit_bands` cannot tell the difference
         // between a band that is empty and one that is off.
-        if !caps.capture_devices {
-            settings.show_recorder = false;
-            settings.recorder_detached = false;
-            // And the camera pane, for exactly the same reason and with the
-            // same failure: it is laid out from this flag alone with no caps
-            // term, so a plugin editor would give a third of its theory row to
-            // a camera it can never open — and the only menu row that turns it
-            // off is itself inside the capture-devices gate, so there would be
-            // no way back.
-            settings.show_camera_pane = false;
-        }
+        gate_to_caps(&mut settings, &caps);
         crate::fonts::install(
             ctx,
             crate::fonts::FontChoice::from_key(&settings.font_choice),
@@ -4891,7 +4881,8 @@ impl TangentApp {
         if folder >= CHANNELS || !self.is_folder(folder) {
             return;
         }
-        if self.recorder.state.is_active() || self.recorder.arr_recording {
+        // The same rule as `move_channel`, and for the same reason.
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         let mut group = self.drag_block(from);
@@ -7739,7 +7730,15 @@ impl TangentApp {
                             self.setup_shape = recorder_panel::SetupShape::Take;
                             return;
                         }
-                        Some(recorder_panel::Hit::Record) => {
+                        // Not under a take. The red button is live mid-take now,
+                        // but its panel's two rows - the count-in and the
+                        // signature - are refused while a take is writing
+                        // (see `recorder_panel::setup_hit_test`), and a panel
+                        // of rows that swallow every press is worse than the
+                        // band menu this right-click falls through to.
+                        Some(recorder_panel::Hit::Record)
+                            if !self.recorder.state.is_active() =>
+                        {
                             self.setup_open = true;
                             self.setup_shape = recorder_panel::SetupShape::Rolling;
                             return;
@@ -8497,7 +8496,11 @@ impl TangentApp {
         let down = focused
             && !self.text_entry_active()
             && !self.dialog_blocks_keys(ctx)
-            && !self.recorder.state.is_active()
+            // Not refused under a take: a take films the window, and a chord
+            // struck on the piano view is exactly what a breakdown video is
+            // showing. See `K::StopRecording`. An export is a file of the
+            // song alone, and a chord struck into it is not.
+            && !self.recorder.exporting
             // On the desk's surfaces Space belongs to the TRANSPORT; an
             // invisible piano auditioning under the mixer was the same
             // class of leak as the press-through the stand-down fixed.
@@ -11151,11 +11154,16 @@ impl TangentApp {
         if from >= CHANNELS || to >= CHANNELS || from == to {
             return;
         }
-        // Not under a live take OR an arrangement record: the host's
-        // recording lanes are indices, and a reorder mid-take would carve
-        // the wrong lane. `state.is_active` is the CAPTURE machine alone —
-        // the red button's arrangement record is its own flag.
-        if self.recorder.state.is_active() || self.recorder.arr_recording {
+        // Not under an arrangement record or a realtime export: the host's
+        // recording lanes and an export's stems are bound to lane INDICES,
+        // and a reorder under either would carve, or write, the wrong lane.
+        // **An ordinary take is not refused**: it films the window and the
+        // desk and holds no lane of its own, and a reorder is exactly the
+        // kind of thing a breakdown video shows. It was refused here on
+        // `state.is_active`, the take machine, which is also what an export
+        // runs on - so `exporting` is the half of that test that meant
+        // something.
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         // `order[new] = old` — a rotation of the span between.
@@ -11182,7 +11190,7 @@ impl TangentApp {
             self.move_channel(from, to);
             return;
         }
-        if self.recorder.state.is_active() || self.recorder.arr_recording {
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
@@ -15565,9 +15573,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// UNDO: commit whatever stands (so redo can return to it), then step
-    /// back one moment. Refused mid-take — the recorder owns those frames.
+    /// back one moment. Refused while the arrangement records or an export
+    /// plays - each owns the lanes it is writing. **Not under an ordinary
+    /// take**, which owns nothing: record a part on camera, hear it, press
+    /// Cmd+Z, is the breakdown video.
     fn undo(&mut self) {
-        if self.recorder.state.is_active() || self.recorder.arr_recording {
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         self.undo_commit();
@@ -15577,9 +15588,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.undo_apply(self.hist_at - 1);
     }
 
-    /// REDO: forward along the same line, while there is one.
+    /// REDO: forward along the same line, while there is one. The same
+    /// refusals as `undo`.
     fn redo(&mut self) {
-        if self.recorder.state.is_active() || self.recorder.arr_recording {
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         if self.hist_at + 1 >= self.history.len() {
@@ -16859,7 +16871,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         view: &recorder::RecorderView<'_>,
     ) -> Rect {
         match self.setup_shape {
-            recorder_panel::SetupShape::Machine => recorder_panel::setup_rect(band, view),
+            // The cog is not seated where it would be too small to draw (see
+            // `recorder_panel::cog_fits`), and a popup anchored to nothing
+            // would open at infinity - so it hangs off the cassette then,
+            // the one icon beside it that is always there.
+            recorder_panel::SetupShape::Machine => {
+                let cog = recorder_panel::setup_rect(band, view);
+                if cog.is_positive() {
+                    cog
+                } else {
+                    recorder_panel::capture_rect(band, view)
+                }
+            }
             recorder_panel::SetupShape::Take => recorder_panel::capture_rect(band, view),
             recorder_panel::SetupShape::Rolling => recorder_panel::record_rect(band, view),
         }
@@ -31808,11 +31831,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // menu row for it: pressing Record is what the BAND is for, and a
             // menu row that starts a take would be reachable from a right-click
             // over the piano with the recorder hidden.
-            // Toggle, not "start": pressing Enter during a count-in has to
-            // cancel it, which is what anybody who has just realised they came
-            // in wrong will try — and `Toggle` is where that already lives.
-            // Pressing it while a take is ROLLING does nothing, because Space
-            // is the key that ends a performance.
+            // Toggle, not "start": a press during the arrangement's count-in
+            // cancels it, which is what anybody who has just realised they
+            // came in wrong will try — and `Toggle` is where that lives.
             // **The ARRANGEMENT, always — never the take.**
             //
             // This used to send `Capture` (the take) whenever one was
@@ -31827,35 +31848,37 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.request_recorder(recorder::RecorderRequest::Toggle);
                 }
             }
-            // **One key, whichever meaning is live.** Space stops a take while
-            // one is running, which is what every transport the user owns is
-            // bound to. It is the obvious key for "let me hear that" and the
-            // rest of the time "stop" means nothing, so the rest of the time it
+            // **One key, whichever meaning is live.** Space stops whatever
+            // the transport is doing, which is what every transport the user
+            // owns is bound to; idle on the desk it plays. On the piano view
+            // it is the obvious key for "let me hear that", so there it
             // sounds whatever is lit.
             // Stop only. The audition half of this key is a HOLD and is
             // driven per frame by `audition_tick`, because a press repeats and
             // a held chord must not.
             K::StopRecording => {
-                // **A TAKE is the one thing Space cannot end.**
+                // **A TAKE is the one thing Space cannot end - and the one
+                // thing it does not wait for.**
                 //
-                // It used to stop that too, and the cost only shows up in
-                // the way the app is actually used: a take is when somebody
-                // is playing, and while it rolls the whole desk should still
-                // answer — Space included, doing whatever Space does on the
-                // surface they are looking at. The owner: "space no longer
-                // stops a take, so i can control the whole daw while I do a
-                // take -- for showcasing. Only the button should start it and
-                // stop it now." So while the take machine is running Space
-                // is INERT here: not a stop, and not a play either, because
-                // rolling the transport out from under a take is the same
-                // accident wearing the other name.
+                // It used to stop the take too, and then, when that was
+                // taken away, it was made INERT for the whole take on the
+                // ruling that rolling the transport under a take was an
+                // accident. The owner asked for the opposite: "space no
+                // longer stops a take, so i can control the whole daw while
+                // I do a take -- for showcasing. Only the button should start
+                // it and stop it now." A take is capture only now - it films
+                // the window and the desk and owns nothing else - so Space
+                // does here exactly what it does with no take running, and
+                // cannot reach the take at all: `Stop` no longer ends one on
+                // the host. Only the cassette does.
                 //
-                // The arrangement's red button is deliberately NOT in that
-                // exemption. It is a different control with a different
-                // meaning — recording INTO the timeline, where stop is the
-                // ordinary end of the gesture — and it was not what he asked
-                // about.
-                if self.recorder.state.is_active() {
+                // **The realtime EXPORT is the exception**, and why this is
+                // `exporting` and not the take state: it runs on the take
+                // machine but is a take of a span, and the host's Stop cuts
+                // it short on purpose. The band's own Stop button still
+                // does; the widest key on the keyboard, pressed out of habit
+                // during a four-minute pass, does not get to.
+                if self.recorder.exporting {
                     return;
                 }
                 // The arrangement's red button and the rolling transport:
@@ -32558,6 +32581,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // not touch it.
         let undoable = self.caps.persist_global_settings && self.settings.write_backup();
         self.settings.reset(scope);
+        gate_to_caps(&mut self.settings, &self.caps);
         // **And the explorer STANDING somewhere goes with the setting.**
         //
         // `take_devices` puts `media_default_dir` back to empty, which is the
@@ -32643,10 +32667,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The same two slots `MenuAction::SetSizePercent` uses, and for
             // the same reason: a host that owns the window has to be asked,
             // and the ask is recorded here for the binary that knows how.
+            //
+            // **The right way round.** The two branches were swapped against
+            // `SetSizePercent`'s: a desktop build (`window_sizing`) put its
+            // request in `pending_resize`, which only the plugin drains, so
+            // the reset changed nothing on screen until the next launch -
+            // and the next launch is where the window then opened at a size
+            // nobody had chosen.
             if self.caps.window_sizing {
-                self.pending_resize = Some(initial_window_size(&self.settings));
-            } else {
                 self.pending_window_size = Some(initial_window_size(&self.settings));
+            } else {
+                self.pending_resize = Some(initial_window_size(&self.settings));
             }
         }
 
@@ -32714,6 +32745,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::fonts::install(ctx, font, custom.as_deref());
         self.rebuild_voicing();
         self.request_natural_size();
+        // **And the window goes back too.** The reset resizes it to 100% on
+        // the spot now, so an Undo that restored the settings alone would
+        // leave a window whose size the file no longer names - and the
+        // geometry write-back would then overwrite the restored size with
+        // the reset one. The size it had, or the size its restored percent
+        // asks for, through the same two slots the reset used.
+        let size = self
+            .settings
+            .window_size_for_use()
+            .unwrap_or_else(|| initial_window_size(&self.settings));
+        if self.caps.window_sizing {
+            self.pending_window_size = Some(size);
+        } else {
+            self.pending_resize = Some(size);
+        }
         self.save_settings();
         self.desk_reload = true;
     }
@@ -33095,9 +33141,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             //
             // The same body the main window's own Space runs, so the one key
             // means the one thing wherever it is pressed: rolling stops,
-            // idle rolls from the edit cursor, and a take in progress is
-            // left alone - the recorder owns those frames and a window over
-            // it must not be a second way to interrupt them.
+            // idle rolls from the edit cursor. A take in progress is not a
+            // reason to refuse - it cannot be reached from here, because
+            // `Stop` does not end a take (only the cassette does).
             DialogAction::Transport => {
                 // **The main window's own conditions, all of them.** The bar
                 // that sent this answered "which key"; this is the half that
@@ -33108,12 +33154,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 //   keymap gates Space on - somebody who has never opened
                 //   the recorder must not start a take with the widest key
                 //   on the keyboard;
-                // - a take in progress is the recorder's, and a window over
-                //   it must not be a second way to interrupt one;
                 // - Space is PLAY only on the desk's surfaces. On the piano
                 //   view it is the chord audition, and a plugin face opened
                 //   from there must not quietly turn it into a transport.
-                if self.settings.show_recorder && !self.recorder.state.is_active() {
+                // Refused under an export, as the main window's Space is.
+                if self.settings.show_recorder && !self.recorder.exporting {
                     if self.recorder.arr_recording || self.recorder.playing {
                         self.request_recorder(recorder::RecorderRequest::Stop);
                     } else if self.mixer_open || self.arrangement_open {
@@ -34615,6 +34660,25 @@ fn default_mixer_visible(pane: Vec2) -> usize {
     // view, which is what the scroll is for.
     sensible_visible_count(run, COMFY_STRIP_PITCH, 4, recorder::FREE_CHANNELS)
 }
+/// **What a host without capture devices can never show**, turned off.
+///
+/// A plugin editor and the minimal host have no recorder band to populate
+/// and no camera to open, and both are laid out from these flags alone with
+/// no caps term - so a flag left on gives the window a band it cannot fill,
+/// and the only menu rows that turn them off are themselves inside the
+/// capture-devices gate, so there would be no way back.
+///
+/// Asked at construction AND after a reset: `Settings::reset` takes the
+/// layout from `first_launch`, which turns the recorder back on, and a Reset
+/// Everything in a plugin then asked the DAW to grow the editor to hold it.
+fn gate_to_caps(settings: &mut Settings, caps: &Caps) {
+    if !caps.capture_devices {
+        settings.show_recorder = false;
+        settings.recorder_detached = false;
+        settings.show_camera_pane = false;
+    }
+}
+
 
 /// Initial fixed window size for the ViewportBuilder, computed from settings
 /// before the event loop starts (spec §3.2).
@@ -47022,6 +47086,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Undo, redo and a track move work under a take, and not under an
+    /// export.** A take is capture only - the owner records a part on camera,
+    /// hears it, and reaches for Cmd+Z, all inside one take. The refusal was
+    /// keyed on the take machine, which an export also runs on; the export
+    /// is the half that owns something (its stems are bound to lane indices).
+    #[test]
+    fn undo_and_a_track_move_work_under_a_take_and_not_under_an_export() {
+        let root = project_scratch("undo-take");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.set_insert(2, 0, Some(dialogs::BUILTIN_PATH));
+        app.undo();
+        assert_eq!(app.insert(2, 0), None, "Cmd+Z did nothing under a take");
+        app.redo();
+        assert_eq!(app.insert(2, 0), Some(dialogs::BUILTIN_PATH), "redo did nothing under a take");
+        app.move_channel(2, 4);
+        assert_eq!(app.insert(4, 0), Some(dialogs::BUILTIN_PATH), "a track move was refused under a take");
+        assert_eq!(app.insert(2, 0), None, "the bay did not leave the row it moved from");
+
+        app.recorder.exporting = true;
+        app.move_channel(4, 2);
+        assert_eq!(
+            app.insert(4, 0),
+            Some(dialogs::BUILTIN_PATH),
+            "a track moved under an export, whose stems are bound to lane indices"
+        );
+        app.undo();
+        assert_eq!(app.insert(4, 0), Some(dialogs::BUILTIN_PATH), "Cmd+Z reached an export's lanes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The launch reopen seeds the undo baseline.** Reopening the
     /// remembered project used to skip `undo_reset`, so the FIRST edit of
     /// every session committed its own post-state as moment zero and
@@ -55702,17 +55799,28 @@ mod tests {
     fn a_focused_take_name_swallows_the_transport_key() {
         let (ctx, mut app) = recorder_app();
         app.settings.show_recorder = true;
-        // **A take rolling, Space does NOTHING** — the owner's rule, so the
-        // desk stays playable through a take and only the button ends one.
-        // Kept here because this test's own subject is which keys reach the
-        // transport at all, and "none of them, while a take is up" is now
-        // part of that answer.
+        // **A take rolling, Space still never reaches the TAKE** - only the
+        // cassette ends one - but it is the transport's as at rest: with the
+        // song playing it stops the song. (It used to be refused outright,
+        // which is the opposite of the owner's "so i can control the whole
+        // daw while I do a take".) And under an EXPORT it is refused: the
+        // host's Stop cuts an export short, and Space is too wide a key for
+        // that.
         app.recorder.state = recorder::RecordState::Rolling;
+        app.recorder.playing = true;
+        assert_eq!(
+            space(&ctx, &mut app),
+            Some(recorder::RecorderRequest::Stop),
+            "Space did not stop the song under a take"
+        );
+        app.recorder.exporting = true;
         assert_eq!(
             space(&ctx, &mut app),
             None,
-            "Space ended a take - only the button may do that"
+            "Space reached the transport during an export"
         );
+        app.recorder.exporting = false;
+        app.recorder.playing = false;
         app.recorder.state = recorder::RecordState::Idle;
         // Keytoggle on, because that is what "toggle notes on the neck" means
         // and it is the only way a placed note is one of the notes on screen.
@@ -59268,19 +59376,37 @@ mod tests {").expect("the tests module")];
     ///   quietly turn it into a transport.
     #[test]
     fn a_forwarded_transport_key_keeps_the_main_windows_own_refusals() {
-        let roll = |show_recorder: bool, arrangement: bool| -> Option<recorder::RecorderRequest> {
+        let roll_in = |show_recorder: bool,
+                       arrangement: bool,
+                       state: recorder::RecordState|
+         -> Option<recorder::RecorderRequest> {
             let (_ctx, mut app) = headless(Caps::DESKTOP);
             app.settings.show_recorder = show_recorder;
             app.arrangement_open = arrangement;
             app.mixer_open = false;
+            app.recorder.state = state;
             let _ = app.take_recorder_request();
             app.apply_dialog_action(DialogAction::Transport);
             app.take_recorder_request()
+        };
+        let roll = |show_recorder: bool, arrangement: bool| {
+            roll_in(show_recorder, arrangement, recorder::RecordState::Idle)
         };
         assert!(
             matches!(roll(true, true), Some(recorder::RecorderRequest::Play)),
             "the fixture cannot roll at all"
         );
+        // A take is not a refusal: a window over the desk plays the song
+        // under one exactly as the main window's own Space does.
+        for state in [
+            recorder::RecordState::Rolling,
+            recorder::RecordState::CountIn { beat: 1, of: 4 },
+        ] {
+            assert!(
+                matches!(roll_in(true, true, state), Some(recorder::RecorderRequest::Play)),
+                "a forwarded Space was refused under a take in {state:?}"
+            );
+        }
         assert!(
             roll(false, true).is_none(),
             "a forwarded Space rolled the transport with the band never opened"
@@ -60654,6 +60780,47 @@ mod tests {").expect("the tests module")];
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Reset Everything puts the DESKTOP window back to 100% on the spot.**
+    ///
+    /// The two slots were the wrong way round against `SetSizePercent`: a
+    /// desktop build parked the request in `pending_resize`, which only the
+    /// plugin drains, so the window kept its size until the next launch - and
+    /// then opened at a size nobody had just chosen.
+    #[test]
+    fn reset_everything_resizes_the_desktop_window_now() {
+        let (ctx, mut app) = headless_with_band(Caps { persist_global_settings: false, ..Caps::DESKTOP });
+        app.pending_window_size = None;
+        let _ = app.take_pending_resize();
+        app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        assert_eq!(
+            app.pending_window_size,
+            Some(initial_window_size(&app.settings)),
+            "the reset asked nothing of the desktop window"
+        );
+        assert_eq!(
+            app.take_pending_resize(),
+            None,
+            "the desktop request went to the plugin's slot"
+        );
+
+        let (ctx, mut plugin) = headless_with_band(Caps { persist_global_settings: false, ..Caps::PLUGIN });
+        plugin.pending_window_size = None;
+        let _ = plugin.take_pending_resize();
+        plugin.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        // **And never for a band it cannot use.** The reset takes the layout
+        // from `first_launch`, which turns the recorder on; a plugin has no
+        // capture devices, and the DAW was then asked to grow the editor to
+        // hold an empty transport.
+        assert!(!plugin.settings.show_recorder, "the reset gave a plugin a recorder band");
+        assert!(!plugin.settings.show_camera_pane, "the reset gave a plugin a camera pane");
+        assert_eq!(
+            plugin.take_pending_resize(),
+            Some(initial_window_size(&plugin.settings)),
+            "a plugin's host still has to be asked"
+        );
+        assert_eq!(plugin.pending_window_size, None);
+    }
+
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
     ///
     /// The chord the owner asked for — "Ctrl/CMD + S to save should summon a
@@ -60762,13 +60929,26 @@ mod tests {").expect("the tests module")];
     /// rolling, which is the state all three of them used to behave
     /// differently in. `Capture` is the take's request and it may not appear.
     ///
+    /// **And the transport's keys still work under one.** The owner, on the
+    /// same subject: "space no longer stops a take, so i can control the
+    /// whole daw while I do a take -- for showcasing." Space was made inert
+    /// for the whole take instead. On the desk, under a take in either live
+    /// state, Space asks exactly what it asks at rest: Play from a stopped
+    /// transport, Stop from a rolling one - and Stop cannot end a take, the
+    /// host's `R::Stop` leaves the session alone.
+    ///
     /// Revert-check performed: give `K::StartRecording` its `Capture` arm
     /// back and this goes red naming Enter.
     #[test]
     fn no_key_touches_a_take() {
-        let press = |key: egui::Key, mods: egui::Modifiers, state: recorder::RecordState| {
+        let press_on = |key: egui::Key,
+                        mods: egui::Modifiers,
+                        state: recorder::RecordState,
+                        playing: bool| {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
             app.settings.show_recorder = true;
+            app.arrangement_open = true;
+            app.recorder.playing = playing;
             app.recorder.state = state;
             while app.take_recorder_request().is_some() {}
             let _ = ctx.run(
@@ -60795,6 +60975,9 @@ mod tests {").expect("the tests module")];
             }
             out
         };
+        let press = |key: egui::Key, mods: egui::Modifiers, state: recorder::RecordState| {
+            press_on(key, mods, state, false)
+        };
         // **Both live states**, because the old code behaved differently in
         // each and only one of them exposes the fault: `Rolling` is
         // `is_writing`, which the take arm excluded, so Enter did nothing
@@ -60815,11 +60998,100 @@ mod tests {").expect("the tests module")];
                     !asked.contains(&recorder::RecorderRequest::Capture),
                     "{what} reached the take machine in {state:?}: {asked:?}"
                 );
-                assert!(
-                    !asked.contains(&recorder::RecorderRequest::Stop),
-                    "{what} stopped the take in {state:?}: {asked:?}"
-                );
             }
+            // Space under a take is the transport's, both ways round.
+            let space = |playing| press_on(egui::Key::Space, egui::Modifiers::NONE, state, playing);
+            assert_eq!(
+                space(false),
+                vec![recorder::RecorderRequest::Play],
+                "Space did not play the song under a take in {state:?}"
+            );
+            assert_eq!(
+                space(true),
+                vec![recorder::RecorderRequest::Stop],
+                "Space did not stop the song under a take in {state:?}"
+            );
+        }
+    }
+
+    /// **The red button's right-click opens its panel at rest, and falls
+    /// through to the band menu under a take** - the panel's two rows are
+    /// refused while a take writes, and a panel that swallows every press is
+    /// worse than none. The red button itself is live under a take now, so
+    /// this press reaches it where it used to land on a steady dot.
+    #[test]
+    fn the_red_buttons_panel_does_not_open_under_a_take() {
+        let open = |state: recorder::RecordState| {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.show_recorder = true;
+            app.recorder.state = state;
+            app.setup_open = false;
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let r = app.last_band;
+            assert!(r.is_positive(), "the band is not laid out");
+            let at = recorder_panel::record_rect(r, &app.recorder_layout_view()).center();
+            pointer_frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            app.setup_open
+        };
+        assert!(open(recorder::RecordState::Idle), "the fixture cannot open the panel at all");
+        assert!(
+            !open(recorder::RecordState::Rolling),
+            "the red button's panel of refused rows opened under a take"
+        );
+    }
+
+    /// **Space auditions the lit chord on the piano view under a take.** The
+    /// take films the window; a chord struck on camera is what a breakdown
+    /// video shows, and the audition was refused for the whole take.
+    #[test]
+    fn space_auditions_the_chord_under_a_take() {
+        let held = |state: recorder::RecordState| {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.show_recorder = true;
+            app.arrangement_open = false;
+            app.mixer_open = false;
+            app.recorder.state = state;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Space,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            app.audition_held
+        };
+        assert!(held(recorder::RecordState::Idle), "the fixture cannot audition at all");
+        for state in [
+            recorder::RecordState::Rolling,
+            recorder::RecordState::CountIn { beat: 1, of: 4 },
+        ] {
+            assert!(held(state), "Space did not audition the chord under a take in {state:?}");
         }
     }
 
@@ -65772,6 +66044,47 @@ mod aspect_snap_tests {
     /// licence on the machine running these tests is whatever it is, and a
     /// document that already carries work on every lane opens the whole desk
     /// for everybody (see `active_channels`).
+    /// **The window a laptop opens at shows the whole band.**
+    ///
+    /// The owner, on a 2013 MacBook Air running Linux at 1440x900: "at 100%
+    /// resolution (default) ... the tangent window spawns a bit too small and
+    /// cuts off the last and arguably most important button -- the
+    /// settings". The 100% window there is 900 points, and the fix is in the
+    /// band's layout rather than in the size: every rung of the ladder on
+    /// every one of these screens opens with every control drawn. The screens
+    /// are in POINTS, so the Retina Airs and a 1080p panel at 125% or 150%
+    /// scaling are all here.
+    #[test]
+    fn the_default_window_shows_the_whole_band_on_small_screens() {
+        for (mw, usable) in [
+            (1440, 851),
+            (1440, 900),
+            (1470, 919),
+            (1512, 944),
+            (1536, 824),
+            (1366, 697),
+            (1280, 752),
+            (1280, 648),
+            (1920, 1030),
+            (2560, 1378),
+        ] {
+            for pct in [75, 100, 125] {
+                let s = desk_on(mw, usable, pct);
+                let win = initial_window_size(&s);
+                assert!(win.x <= mw as f32, "{mw}x{usable} at {pct}%: {win:?} is wider than the screen");
+                let band = Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(win.x, recorder_panel::band_height(win.x)),
+                );
+                if let Err(missing) =
+                    recorder_panel::every_control_drawn(band, &recorder::RecorderView::empty())
+                {
+                    panic!("{mw}x{usable} at {pct}% opens {win:?} without {missing:?}");
+                }
+            }
+        }
+    }
+
     fn desk_on(w: i64, usable_h: i64, percent: i64) -> Settings {
         let mut s = Settings::first_launch();
         s.show_welcome = false;

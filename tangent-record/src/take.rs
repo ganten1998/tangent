@@ -1254,13 +1254,24 @@ pub struct Manifest {
     /// `T0` in the recorder's monotonic timebase, so a log line can be lined up
     /// against the manifest without going through the wall clock.
     pub t0_monotonic_ns: Nanos,
-    /// Where on the PROJECT timeline this take's frame 0 sits, in seconds.
+    /// Where the PLAYHEAD stood at this take's frame 0, in seconds.
     ///
     /// **Irrecoverable if not written now**: a take recorded at a playhead of
     /// 1:24 can only be placed on a lane afterwards if somebody wrote down
     /// where the playhead was, and nothing else did. Zero for every take made
     /// before locate existed, which is also where those takes belong.
+    ///
+    /// **It places frame 0 only when [`timeline_rolling`] is true.** A take
+    /// is capture only: it does not roll the transport, and the song under
+    /// it can be started, stopped, located or looped at any point. A take
+    /// begun over a stopped song has no single place on the timeline, and
+    /// this is then just where the playhead was waiting.
+    ///
+    /// [`timeline_rolling`]: Manifest::timeline_rolling
     pub timeline_start_seconds: f64,
+    /// Whether the transport was ROLLING at frame 0. See
+    /// [`timeline_start_seconds`](Manifest::timeline_start_seconds).
+    pub timeline_rolling: bool,
     /// How long the head of the FILE runs before the musical downbeat, in
     /// seconds. Zero unless the count-in was recorded into the take.
     ///
@@ -1300,6 +1311,7 @@ impl Manifest {
             started,
             t0_monotonic_ns: t0,
             timeline_start_seconds: 0.0,
+            timeline_rolling: false,
             head_seconds: 0.0,
             heard_muted: 0,
             heard_soloed: 0,
@@ -1376,6 +1388,7 @@ impl Manifest {
                     ),
                     ("monotonic_ns", Json::Int(self.t0_monotonic_ns)),
                     ("timeline_start_seconds", Json::Num(self.timeline_start_seconds)),
+                    ("timeline_rolling", Json::Bool(self.timeline_rolling)),
                     ("head_seconds", Json::Num(self.head_seconds)),
                     ("heard_muted", Json::Int(i64::from(self.heard_muted))),
                     ("heard_soloed", Json::Int(i64::from(self.heard_soloed))),
