@@ -1197,6 +1197,14 @@ pub struct TangentApp {
     drag_pointer: Option<Pos2>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
+    /// The arrangement's grid and window as they stood at the last moment,
+    /// so a frame that did not move them costs one compare. See
+    /// `commit_view_change`.
+    view_committed: Option<crate::arrangement::View>,
+    /// **How many batches are holding their moment back.** See
+    /// [`TangentApp::begin_one_moment`]: a gesture that reaches several
+    /// committing writers is still one thing somebody did.
+    undo_hold: u32,
     /// The MIDI item being drawn by cmd-drag: lane, from, to (ordered).
     arr_pending: Option<(usize, f64, f64)>,
     /// Where the arrangement was last drawn, for hit tests.
@@ -3889,6 +3897,8 @@ impl TangentApp {
             arr_drop_hover: false,
             drag_pointer: None,
             arr_gesture_dirty: false,
+            view_committed: None,
+            undo_hold: 0,
             arr_pending: None,
             arrangement_rect: None,
             clip_infos: HashMap::new(),
@@ -6182,6 +6192,17 @@ impl TangentApp {
     }
 
     fn remove_channel(&mut self, n: usize) {
+        // **ONE moment for the whole removal.** A track is clips, six bays,
+        // a sidechain table and a bypass table, and `arr_save_edits` and
+        // `set_insert` each commit their own - so deleting a track with
+        // three plugins in it took four Ctrl+Z, each one putting a
+        // different quarter of it back. See `begin_one_moment`.
+        self.begin_one_moment();
+        self.remove_channel_inner(n);
+        self.commit_undo_moment();
+    }
+
+    fn remove_channel_inner(&mut self, n: usize) {
         // **A folder takes its membership with it.**
         //
         // Membership is positional — "the nearest folder above me" — so
@@ -6300,6 +6321,9 @@ impl TangentApp {
             .insert_bypass
             .drop_seat(recorder::folder_extra_seat(at));
         self.save_settings();
+        // Inside the batch this is the removal's own moment; the hold above
+        // is what makes it the ONLY one.
+        self.undo_commit();
     }
 
     /// What the neck's interval column should say, or nothing when it is off.
@@ -11561,6 +11585,12 @@ impl TangentApp {
             *send = 0.0;
         }
         self.save_settings();
+        // **Its own moment.** Ctrl/Cmd+T, the header's circled plus and the
+        // keyboard's `HdrAdd` all end here and nowhere else, so without
+        // this a new track had no moment of its own and was folded into
+        // whatever the user did next. Inside a batch - the multi-file
+        // import makes a track per file - `one_moment` holds it.
+        self.undo_commit();
     }
 
     /// **Everything a track IS**, taken off one lane and put on another.
@@ -14476,7 +14506,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         m.at_s = to;
-        self.arr_save_edits();
+        // **One moment at the END of the carry**, like every other drag in
+        // this file. It used to call `arr_save_edits` here - a commit per
+        // FRAME - and with the magnet off `arr_snap_t` returns the raw
+        // time, so every pixel of travel was a distinct document. A
+        // two-second drag pushed a hundred and twenty moments into a
+        // hundred-moment history: the whole session's undo, spent carrying
+        // one flag. See the release at `arr_gesture_dirty`.
+        self.clips_dirty = true;
+        self.arr_gesture_dirty = true;
     }
 
     /// **Carry a signature to another bar.** Returns the bar it now starts
@@ -14514,8 +14552,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return None;
         }
         let sig = meter.sig_at_bar(bar);
-        self.set_meter_at(bar, None);
-        self.set_meter_at(to_bar, Some(sig));
+        // Quiet, both: a carry is one moment at its end, and the halfway
+        // state - the signature gone and not yet re-written - is one
+        // nobody should be able to land on.
+        self.set_meter_at_quiet(bar, None);
+        self.set_meter_at_quiet(to_bar, Some(sig));
+        self.clips_dirty = true;
+        self.arr_gesture_dirty = true;
         // A field open on the chip travels with it, or the next Enter would
         // write the signature back to the bar it just left.
         if let Some(e) = self.num_edit.as_mut() {
@@ -14635,26 +14678,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // thrown away on the very next read. Setting the band is what
         // actually moves bar zero, and it is right: bar one's signature is
         // the song's, and the song's is the one the band shows.
+        // **Bar zero, the clear-before-set, and the map itself all live in
+        // `set_meter_at_quiet`** - this is that plus the moment.
+        //
+        // The clear before the set is the whole of the owner's "I cannot
+        // change a signature": the push was unconditional, so setting a bar
+        // that already carried a change left two points on it, and
+        // `MeterMap::sanitised` keeps the FIRST of a duplicate pair - so the
+        // old one won every time and the new value was dropped on the floor
+        // one call later with nothing saying no.
+        self.set_meter_at_quiet(bar, sig);
+        self.arr_save_edits();
+    }
+
+    /// **`set_meter_at`'s work, without the moment.**
+    ///
+    /// Carrying a chip to another bar is a CLEAR and a SET - two calls -
+    /// and with the commit inside, every bar the pointer crossed pushed
+    /// two moments, the first of them a song whose signature had been
+    /// deleted and not yet re-written. A state that was never on screen,
+    /// and a Ctrl+Z that landed on it. The drag calls this twice and takes
+    /// its one moment at the end like every other drag here.
+    fn set_meter_at_quiet(&mut self, bar: u32, sig: Option<recorder::TimeSignature>) {
         if bar == 0 {
             if let Some(sig) = sig {
                 self.set_time_signature(sig);
             }
-            // Clearing bar zero does nothing, for the reason above the
-            // function: a song must have a signature from its first bar.
             return;
         }
         let mut pts = self.live_meter_map().points().to_vec();
         match sig {
-            // **The bar is CLEARED before the new point goes on, and that
-            // is the whole of the owner's "I cannot change a signature".**
-            // This pushed unconditionally, so setting a bar that already
-            // carried a change left two points on the same bar — and
-            // `MeterMap::sanitised` keeps the first of a duplicate pair, so
-            // the OLD one won every time. A signature could therefore be
-            // created on a bar that had none and never changed afterwards:
-            // open the chip, type 6/8, press Enter, and the strip still
-            // reads what it read before. Nothing said no; the new value was
-            // simply dropped on the floor one call later.
             Some(sig) => {
                 pts.retain(|p| p.at_bar != bar);
                 pts.push(crate::tempo::MeterPoint { at_bar: bar, sig });
@@ -14662,7 +14715,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             None => pts.retain(|p| p.at_bar != bar),
         }
         self.arrangement.meter = crate::tempo::MeterMap::sanitised(pts);
-        self.arr_save_edits();
     }
 
     /// Where a point at `at_s` sits in its curve now.
@@ -15266,9 +15318,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// words are the same walk the fingerprint is — so there is nothing
     /// left to buy by being approximate.
     fn undo_commit(&mut self) {
+        // **A batch is holding its moment**, and every write inside it is
+        // part of one thing somebody did. See `begin_one_moment`.
+        if self.undo_hold > 0 {
+            return;
+        }
         let state = self.undo_state();
         self.undo_commit_moment(state);
     }
+
 
     /// `undo_commit` with the moment already built — so `undo_reset`, which
     /// needs the same moment as its saved baseline AND as moment zero, walks
@@ -15810,16 +15868,53 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// [`crate::ports::QuantizeAsk`]. Read from the settings, which the
     /// window writes as it is turned.
     fn quantize_ask(&self) -> Option<crate::ports::QuantizeAsk> {
-        let grid = self.quantize_window_grid()?;
+        self.quantize_ask_of(
+            self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
+            self.settings.quantize_triplet,
+            self.settings.quantize_swing_pct,
+            self.settings.midi_quantize_pct,
+            self.settings.quantize_window_ms,
+            self.settings.quantize_sensitivity,
+            &self.settings.quantize_fit,
+        )
+    }
+
+    /// **The seven knobs, whoever is holding them, as one question.**
+    ///
+    /// Two callers with two sources: the Apply, which reads the settings it
+    /// has just written, and the PREVIEW, which reads the window's own
+    /// working copies while a hand is still on them. One derivation, so the
+    /// ticks drawn while a dial is turning and the warp written when it is
+    /// let go cannot mean different things.
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_ask_of(
+        &self,
+        grid_exp: i8,
+        triplet: bool,
+        swing_pct: f64,
+        strength_pct: f64,
+        window_ms: f64,
+        sensitivity: f64,
+        fit: &str,
+    ) -> Option<crate::ports::QuantizeAsk> {
+        let sig = self.settings.time_signature();
+        let grid = crate::quantize::Grid::from_document(
+            grid_exp.clamp(-7, 3),
+            sig.beats,
+            sig.unit,
+            f64::from(self.tempo_bpm()),
+            triplet,
+            // 50 IS straight, so it is `None` rather than a swing of a half.
+            (swing_pct > 50.5).then(|| swing_pct.clamp(50.0, 95.0) / 100.0),
+        )?;
         Some(crate::ports::QuantizeAsk {
             ids: self.arr_quantize_ids(),
             step_s: grid.step(),
             swing: grid.swing(),
-            strength: self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0,
-            window: (self.settings.quantize_window_ms > 0.0)
-                .then(|| self.settings.quantize_window_ms / 1000.0),
-            sensitivity: self.settings.quantize_sensitivity.clamp(0.0, 1.0),
-            fit: self.settings.quantize_fit.clone(),
+            strength: strength_pct.clamp(0.0, 100.0) / 100.0,
+            window: (window_ms > 0.0).then(|| window_ms.clamp(0.0, 500.0) / 1000.0),
+            sensitivity: sensitivity.clamp(0.0, 1.0),
+            fit: fit.to_owned(),
         })
     }
 
@@ -15831,10 +15926,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// host's - only the host can reach the samples - so this is the app
     /// stating the question and the host answering it in ticks.
     pub fn quantize_preview(&self) -> Option<crate::ports::QuantizeAsk> {
-        if !matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+        // **The WINDOW's own numbers, not the settings'.** The dialog holds
+        // working copies and writes them back only on Apply, so a preview
+        // built from settings does not move until the thing it is
+        // previewing has already happened. The owner: "i need live marker
+        // updates on the waveform when the quantize menu's buttons are
+        // turned."
+        let Some(Dialog::Quantize {
+            grid_exp,
+            triplet,
+            swing_pct,
+            strength_pct,
+            window_ms,
+            sensitivity,
+            fit,
+            ..
+        }) = self.dialog.as_ref()
+        else {
+            return None;
+        };
+        // **The editor quantizes NOTES**, and a note has no waveform to
+        // mark. Asking anyway would send the host detecting attacks in a
+        // file nobody is looking at.
+        if self.midi_edit.is_some() {
             return None;
         }
-        self.quantize_ask().filter(|a| !a.ids.is_empty())
+        self.quantize_ask_of(
+            *grid_exp,
+            *triplet,
+            *swing_pct,
+            *strength_pct,
+            *window_ms,
+            *sensitivity,
+            fit,
+        )
+        .filter(|a| !a.ids.is_empty())
     }
 
     /// **Apply the window**: notes if the editor is open, audio otherwise.
@@ -15938,7 +16064,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the timeline, the host owns the samples, and a host-side edit still
     /// has to land as one undoable step.
     pub fn commit_undo_moment(&mut self) {
+        // Ends a batch if one was begun. Saturating, so the ordinary
+        // caller - a host gesture that never held anything - just commits.
+        self.undo_hold = self.undo_hold.saturating_sub(1);
         self.undo_commit();
+    }
+
+    /// **Begin a batch that [`Self::commit_undo_moment`] will end.**
+    ///
+    /// The thing a batch needs that a per-call setter cannot give it. Most
+    /// of this file's writers are complete edits that commit their own
+    /// moment, which is right when a gesture reaches ONE of them and wrong
+    /// the moment a gesture reaches several. Picking four stems in the file
+    /// panel calls `import_audio_at` four times; that is one thing the user
+    /// did, and one Ctrl+Z has to undo all of it rather than leaving three
+    /// quarters of an import on screen.
+    ///
+    /// Nests, so a batch inside a batch is still one moment. **Every call
+    /// must be answered by a `commit_undo_moment`** - see
+    /// `every_held_moment_is_released`, which is what says so.
+    pub fn begin_one_moment(&mut self) {
+        self.undo_hold = self.undo_hold.saturating_add(1);
     }
 
     /// **Take a clip back to how it was played.** The map is the edit, so
@@ -27139,6 +27285,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         files: &[std::path::PathBuf],
         at: f64,
     ) -> Vec<String> {
+        // **One moment for the whole pick.** The panel is multi-select on
+        // purpose - four stems in one gesture - and each file goes through
+        // `import_audio_at`, which is a complete edit that commits. Without
+        // this, undoing that gesture took four Ctrl+Z and each one left a
+        // part-imported project on screen.
+        self.begin_one_moment();
+        let errors = self.insert_media_files_loop(lane, files, at);
+        self.commit_undo_moment();
+        errors
+    }
+
+    /// `insert_media_files`' loop, with the moment held around it.
+    fn insert_media_files_loop(
+        &mut self,
+        lane: usize,
+        files: &[std::path::PathBuf],
+        at: f64,
+    ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut lane = lane.min(recorder::CHANNELS - 1);
         for (i, path) in files.iter().enumerate() {
@@ -34621,6 +34785,50 @@ impl TangentApp {
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
         // ...and acted on after it, once every panel has had its turn.
         self.nudge_focused(ctx);
+        // **And the timeline's own grid and window, if one of them moved.**
+        // AFTER the paint, because that is where they are moved from. See
+        // `commit_view_change`.
+        self.commit_view_change();
+    }
+
+    /// **A change to the arrangement's grid or window is a moment.**
+    ///
+    /// Those nine settings became part of the document when the session
+    /// started carrying them (`arrangement::View`), which put them in the
+    /// undo fingerprint - and the fingerprint is what a moment is compared
+    /// by. But every gesture that changes one of them only saves the
+    /// settings file: the magnet button and its keyboard twin, the tempo
+    /// lane's, `Cmd+Shift+M`, the grid drag, the grid's arrow keys, the
+    /// lane-count wheel, the header's width drag. So each of them had NO
+    /// moment of its own and was folded into whatever the user did next -
+    /// one Ctrl+Z undoing two things, which is the fault the owner reported
+    /// against normalize and which this is the commoner trigger for.
+    ///
+    /// **Once a frame, not at each of the nine.** A tenth will be written,
+    /// and a rule that has to be remembered at a call site is one that gets
+    /// forgotten - this file has forty-three `arr_save_edits` call sites to
+    /// prove it. The comparison is exact and the commit is `undo_commit`,
+    /// which pushes nothing when the document has not moved, so an ordinary
+    /// frame costs one struct compare.
+    ///
+    /// **Not while a gesture is carrying.** The grid drag and the header
+    /// drag change their field on every frame of themselves and are one
+    /// moment at the end, exactly as a clip drag is; committing per frame
+    /// is how a marker drag used to drain the whole hundred-moment history.
+    fn commit_view_change(&mut self) {
+        let now = Self::desk_view(&self.settings).view;
+        if self.arr_drag.is_some() || self.arr_gesture_dirty {
+            // Whatever it is now is not what it will be when the hand lets
+            // go, so it is not remembered either - or the release would
+            // find nothing changed and commit nothing.
+            return;
+        }
+        let now = now.map(|v| v.to_view());
+        if self.view_committed == now {
+            return;
+        }
+        self.view_committed = now;
+        self.undo_commit();
     }
 
     /// One frame into a `Ui` that somebody else made.
@@ -39255,6 +39463,292 @@ mod tests {
     }
 
 
+    /// **A drag is one moment at its END, not one per frame.**
+    ///
+    /// `arr_drag_marker` called `arr_save_edits` - a commit - on every frame
+    /// of the carry, and with the magnet off `arr_snap_t` returns the raw
+    /// time, so every pixel of pointer travel was a distinct document. A
+    /// two-second drag at 60 fps pushes 120 moments into a 100-moment
+    /// history: the whole session's undo, spent carrying one flag.
+    ///
+    /// `arr_drag_meter` was worse in kind if not in count: it moves a
+    /// signature by clearing the old bar and setting the new one, and
+    /// `set_meter_at` committed on each - so the FIRST of every pair was a
+    /// song whose signature had been deleted and not yet re-written, a
+    /// state that was never on screen and that one Ctrl+Z landed on.
+    #[test]
+    fn a_carry_leaves_one_moment_and_no_half_written_document() {
+        let root = project_scratch("carry");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.arr_snap = false;
+        app.arrangement.markers.push(crate::arrangement::ArrMarker {
+            at_s: 1.0,
+            name: "A".to_owned(),
+        });
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+
+        // Sixty frames of a marker carry, each landing somewhere new.
+        for f in 1..=60 {
+            app.arr_drag_marker(0, 0.0, 1.0 + f64::from(f) * 0.01);
+        }
+        assert_eq!(app.hist_at, before, "the carry pushed {} moments", app.hist_at - before);
+        assert!(app.arr_gesture_dirty, "the carry never asked for its moment");
+        // The release, as the pointer-up handler does it.
+        app.arr_gesture_dirty = false;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, before + 1, "the release did not make one moment");
+        let moved = app.arrangement.markers[0].at_s;
+        assert!((moved - 1.60).abs() < 1e-9, "the marker ended at {moved}");
+        app.undo();
+        assert!(
+            (app.arrangement.markers[0].at_s - 1.0).abs() < 1e-9,
+            "one step back did not undo the whole carry"
+        );
+
+        // A signature carried across bars: no moment per bar, and never a
+        // document with the signature simply gone.
+        app.redo();
+        app.set_meter_at(4, Some(recorder::TimeSignature { beats: 6, unit: 8 }));
+        app.commit_view_change();
+        let before = app.hist_at;
+        let sig_at = |app: &TangentApp, bar: u32| app.live_meter_map().sig_at_bar(bar);
+        assert_eq!(sig_at(&app, 4), recorder::TimeSignature { beats: 6, unit: 8 });
+        // Driven through the drag itself, so this cannot pass on a pair of
+        // quiet calls the drag no longer makes.
+        let landed = app.arr_drag_meter(4, 0.0, 10.0);
+        assert_eq!(landed, Some(6), "the chip did not carry to bar 6: {landed:?}");
+        assert!(app.arr_gesture_dirty, "the carry never asked for its moment");
+        assert_eq!(app.hist_at, before, "the carry committed the half-written map");
+        app.arr_gesture_dirty = false;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, before + 1, "the carry is not one moment");
+        assert_eq!(sig_at(&app, 6), recorder::TimeSignature { beats: 6, unit: 8 });
+        app.undo();
+        assert_eq!(
+            sig_at(&app, 4),
+            recorder::TimeSignature { beats: 6, unit: 8 },
+            "one step back landed on the document with no signature at all"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Changing the timeline's grid or window is its own step back.**
+    ///
+    /// Those nine settings joined the document when the session started
+    /// carrying them, which put them in the undo fingerprint - and every
+    /// gesture that changes one only saves the settings file. So each had
+    /// NO moment of its own and was folded into whatever the user did
+    /// next: one Ctrl+Z undoing two things, which is the fault the owner
+    /// reported against normalize and this is the commoner trigger for.
+    ///
+    /// `commit_view_change` is one rule once a frame rather than a call at
+    /// each of the nine places, because a tenth will be written.
+    #[test]
+    fn a_change_to_the_timelines_grid_is_its_own_moment() {
+        let root = project_scratch("viewmoment");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+
+        // The magnet, as the toolbar button writes it.
+        app.settings.arr_snap = !app.settings.arr_snap;
+        app.commit_view_change();
+        assert_eq!(app.hist_at, before + 1, "the magnet left no moment of its own");
+        // A frame that changed nothing costs nothing.
+        app.commit_view_change();
+        assert_eq!(app.hist_at, before + 1, "an idle frame pushed a moment");
+
+        // Then an ordinary edit. One Ctrl+Z has to take THAT off and leave
+        // the magnet where the hand left it.
+        let was = app.settings.arr_snap;
+        app.set_clip_gain(a, 0.5);
+        app.commit_undo_moment();
+        app.undo();
+        assert_eq!(
+            app.settings.arr_snap, was,
+            "one Ctrl+Z undid the gain AND the magnet"
+        );
+        // And a second step back puts the magnet back too.
+        app.undo();
+        assert_eq!(app.settings.arr_snap, !was, "the magnet never came off");
+
+        // **Not while a gesture is carrying.** The grid drag moves the
+        // field on every frame of itself and is one moment at its end.
+        app.redo();
+        app.redo();
+        let at = app.hist_at;
+        app.arr_drag = Some(ArrDrag::GridStep { from_y: 0.0, start: app.settings.arr_grid_exp });
+        for step in 1..=4 {
+            app.settings.arr_grid_exp = -step;
+            app.commit_view_change();
+        }
+        assert_eq!(app.hist_at, at, "the grid drag pushed a moment per frame");
+        app.arr_drag = None;
+        app.commit_view_change();
+        assert_eq!(app.hist_at, at + 1, "the release left the drag uncommitted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **One gesture is one step back, however many writers it reaches.**
+    ///
+    /// The other half of the owner's report. Most writers in this file are
+    /// complete edits that commit their own moment - right when a gesture
+    /// reaches one of them, wrong the moment a gesture reaches several. A
+    /// multi-file import calls `import_audio_at` per file; a track removal
+    /// touches the clips and six bays; a plugin drag writes the destination
+    /// and then clears the source, and the moment BETWEEN those two is the
+    /// same plugin in both bays, a desk nobody made.
+    ///
+    /// `begin_one_moment` holds them all back and
+    /// `commit_undo_moment` lets one through.
+    #[test]
+    fn a_batch_of_writes_is_one_step_back() {
+        let root = project_scratch("onemoment");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        let before = app.hist_at;
+
+        // Three writers, each of which commits on its own.
+        app.begin_one_moment();
+        app.add_bare_track(3);
+        app.set_insert(3, 0, Some("/x/a.vst3"));
+        app.set_insert(3, 1, Some("/x/b.vst3"));
+        assert_eq!(app.hist_at, before, "a held batch pushed a moment anyway");
+        app.commit_undo_moment();
+        assert_eq!(app.hist_at, before + 1, "the batch is not one moment");
+
+        // And one step back takes the whole of it off.
+        app.undo();
+        assert_eq!(app.insert(3, 0), None, "a bay survived the undo");
+        assert_eq!(app.insert(3, 1), None, "the second bay survived the undo");
+        assert_eq!(app.settings.tracks_added & (1 << 3), 0, "the track survived the undo");
+        app.redo();
+        assert_eq!(app.insert(3, 1), Some("/x/b.vst3"), "the redo lost a bay");
+
+        // **Nests.** A batch inside a batch is still one moment.
+        let at = app.hist_at;
+        app.begin_one_moment();
+        app.begin_one_moment();
+        app.add_bare_track(5);
+        app.commit_undo_moment();
+        assert_eq!(app.hist_at, at, "the inner release let the moment out");
+        app.commit_undo_moment();
+        assert_eq!(app.hist_at, at + 1, "the outer release did not commit");
+
+        // **And a lone writer still commits.** The hold is the exception,
+        // not the rule - a gesture that reaches ONE writer must not have to
+        // know about any of this.
+        let at = app.hist_at;
+        app.add_bare_track(7);
+        assert_eq!(app.hist_at, at + 1, "a plain track add left no moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Every held moment is released**, in the same function that held it.
+    ///
+    /// `begin_one_moment` is a counter, so a path that raises it and returns
+    /// without lowering it silently stops the undo timeline for the rest of
+    /// the session - every edit after it folding into one moment that never
+    /// gets pushed. A source scan, because the imbalance is a property of
+    /// the TEXT rather than of any one run.
+    #[test]
+    fn every_held_moment_is_released() {
+        for (what, src) in [
+            ("the app", include_str!("app.rs")),
+            ("the host", include_str!("../../tangent/src/desktop.rs")),
+        ] {
+            // The definition and this test itself are not call sites.
+            let body = &src[..src.find("mod tests {").unwrap_or(src.len())];
+            let held = body.matches("begin_one_moment();").count();
+            let freed = body.matches("commit_undo_moment();").count();
+            assert!(
+                freed >= held,
+                "{what}: {held} moments held and only {freed} released"
+            );
+        }
+    }
+
+    /// **Two edits are two steps back, even when the host made them.**
+    ///
+    /// The owner, with the exact sequence: "Default template -> record
+    /// track 7 -> normalize -> quantize -> cmd+z == unquantize AND
+    /// unnormalize."
+    ///
+    /// Both edits are the HOST's - only it can reach the samples - and both
+    /// land through a setter that commits nothing. The quantize committed
+    /// once for its gesture and the normalize committed not at all, so the
+    /// normalize had no moment of its own: it was folded into the
+    /// quantize's, and one step back took off two things somebody did.
+    ///
+    /// **This is the app half of that**, driven through the same setters
+    /// the host calls. The host half - that `normalize_clips` actually
+    /// calls `commit_undo_moment` - is a source scan in desktop.rs, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_gain_edit_and_a_warp_edit_are_two_steps_back() {
+        let root = project_scratch("twosteps");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_save_edits();
+
+        // The normalize, as `normalize_clips` does it: a gain per clip and
+        // one commit for the gesture.
+        app.set_clip_gain(a, 0.5);
+        app.commit_undo_moment();
+        // The quantize, the same way.
+        app.set_clip_warp_with_fit(a, vec![(0, 100), (1000, 1100)], "slice".to_owned());
+        app.commit_undo_moment();
+
+        let got = |app: &TangentApp| {
+            let c = app.arrangement.clips.iter().find(|c| c.id == a).expect("the clip");
+            (c.gain, c.warp.clone())
+        };
+        assert_eq!(got(&app).1.len(), 2, "the fixture never warped");
+
+        // ONE step back takes the quantize off and LEAVES the normalize.
+        app.undo();
+        let (gain, warp) = got(&app);
+        assert!(warp.is_empty(), "the quantize survived its own undo");
+        assert!(
+            (gain - 0.5).abs() < 1e-9,
+            "one Ctrl+Z also undid the normalize: the gain is back to {gain}"
+        );
+
+        // A second step back takes the normalize off too.
+        app.undo();
+        let (gain, warp) = got(&app);
+        assert!(warp.is_empty());
+        assert!((gain - 1.0).abs() < 1e-9, "the normalize never came off: {gain}");
+
+        // And forward again, one at a time.
+        app.redo();
+        assert!((got(&app).0 - 0.5).abs() < 1e-9, "the redo skipped the normalize");
+        assert!(got(&app).1.is_empty(), "the redo brought the quantize back too early");
+        app.redo();
+        assert_eq!(got(&app).1.len(), 2, "the redo never brought the quantize back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The window asks for marks while it is open, and for nothing when
     /// it is not.**
     ///
@@ -39281,7 +39775,8 @@ mod tests {
         // Shut: nothing asked.
         assert!(app.quantize_preview().is_none(), "a shut window asked for marks");
 
-        // Open, with the knobs somewhere deliberate.
+        // Open, with the knobs somewhere deliberate. The window is filled
+        // from settings, so this is also what it comes up showing.
         app.settings.quantize_grid_exp = -3;
         app.settings.quantize_sensitivity = 0.72;
         app.settings.quantize_window_ms = 25.0;
@@ -39297,10 +39792,57 @@ mod tests {
         assert_eq!(ask.fit, "slice", "the fit did not reach the question");
 
         // **Turning a dial changes the question**, which is what makes the
-        // ticks follow the hand.
-        app.settings.quantize_sensitivity = 0.20;
+        // ticks follow the hand - and the dial is the WINDOW's, not the
+        // settings'. The dialog holds working copies and writes them back
+        // only on Apply, so a preview built from settings would not move
+        // until the thing it is previewing had already happened. The
+        // owner: "i need live marker updates on the waveform when the
+        // quantize menu's buttons are turned."
+        match app.dialog.as_mut() {
+            Some(Dialog::Quantize { sensitivity, grid_exp, fit, .. }) => {
+                *sensitivity = 0.20;
+                *grid_exp = -4;
+                *fit = "stretch".to_owned();
+            }
+            _ => panic!("the window is not open"),
+        }
         let moved = app.quantize_preview().expect("still open");
+        assert!(
+            (moved.sensitivity - 0.20).abs() < 1e-9,
+            "the window's dial did not reach the question: {}",
+            moved.sensitivity
+        );
+        assert_eq!(moved.fit, "stretch", "the window's fit did not reach the question");
+        assert!(
+            (moved.step_s - 0.125).abs() < 1e-9,
+            "the window's grid did not reach the question: {} s",
+            moved.step_s
+        );
         assert_ne!(moved, ask, "the dial moved and the question did not");
+        // **And the SETTINGS are untouched by turning it**, which is what
+        // makes Close mean cancel.
+        assert!(
+            (app.settings.quantize_sensitivity - 0.72).abs() < 1e-9,
+            "turning a dial wrote through to the settings"
+        );
+
+        // The MIDI editor quantizes NOTES, and a note has no waveform to
+        // mark - asking anyway would send the host detecting attacks in a
+        // file nobody is looking at.
+        let m = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.open_midi_editor(m);
+        assert!(app.midi_edit.is_some(), "the editor did not open");
+        assert!(
+            app.quantize_preview().is_none(),
+            "the editor's own quantize asked for waveform marks"
+        );
+        app.close_midi_editor();
+        assert!(app.quantize_preview().is_some(), "the question did not come back");
 
         // The host's answer reaches the picture.
         app.set_clip_marks(vec![(a, vec![(1.0, 1.25), (2.0, 2.0)])]);
