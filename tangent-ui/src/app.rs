@@ -29249,9 +29249,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// sixty times a second is the mistake `CaptureDevices::current_name`
     /// already exists to avoid.
     fn open_audio_setup(&mut self) {
-        let (systems, rates) = match self.audio_setup.as_ref() {
-            Some(s) => (s.systems(), s.rates()),
-            None => (Vec::new(), Vec::new()),
+        // **Asked at OPEN and never per frame.** Under ASIO `outputs()`
+        // loads and unloads every registered driver in turn - seconds of
+        // work, and exactly the "Not Responding" the reprobe exists to keep
+        // off this thread.
+        let (systems, rates, outputs) = match self.audio_setup.as_ref() {
+            Some(s) => (s.systems(), s.rates(), s.outputs()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         // **The name the OUTPUT is actually running under**, not the one the
         // settings asked for. They differ in the case that matters: the app
@@ -29280,6 +29284,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             rate: self.settings.sample_rate(),
             systems,
             system: self.settings.audio_system().map(str::to_owned),
+            outputs,
+            output: self.settings.audio_output_device.clone(),
             rates,
             exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
             // The DEVICE's width, not the open stream's: a stream with one
@@ -29428,6 +29434,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The audio system both streams should open through.
     pub fn audio_system(&self) -> Option<String> {
         self.settings.audio_system().map(str::to_owned)
+    }
+
+    /// **Which output to open**, by name, or `None` for the system's own.
+    /// See `Settings::audio_output_device` for why a name and not a uid.
+    pub fn audio_output_device(&self) -> Option<String> {
+        self.settings
+            .audio_output_device
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
     }
 
     /// The desk's routing table, for the host to hand to the engine.
@@ -33573,6 +33589,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             DialogAction::SetAudioSystem(name) => {
                 self.settings.audio_system = name.unwrap_or_default();
+                // **The output belongs to the system that offered it.**
+                // Every name in that list came from the old backend, and an
+                // ASIO driver name means nothing to WASAPI - carrying it
+                // across would ask for a device that cannot exist and land
+                // on the default anyway, with the panel still naming the
+                // one it could not open.
+                self.settings.audio_output_device = None;
+                self.save_settings();
+            }
+            // **Written and nothing else**, the `SetAudioSystem` shape: the
+            // host watches the setting and reopens the streams when it moves.
+            // See `DesktopApp`'s `path_changed`.
+            DialogAction::SetAudioOutput(name) => {
+                self.settings.audio_output_device = name;
                 self.save_settings();
             }
             DialogAction::SetInputChannels(picks) => {
@@ -40403,6 +40433,46 @@ mod tests {
         app.redo();
         assert_eq!(got(&app).1.len(), 2, "the redo never brought the quantize back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Picking an output writes it, and switching system forgets it.**
+    ///
+    /// The app half of the ASIO picker. The second assertion is the one
+    /// worth having: every name in that list came from one backend, and an
+    /// ASIO driver name means nothing to WASAPI - carrying it across would
+    /// ask for a device that cannot exist, land on the default anyway, and
+    /// leave the panel naming a box it never opened.
+    #[test]
+    fn choosing_an_output_writes_it_and_a_new_system_forgets_it() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert_eq!(app.audio_output_device(), None, "a fresh app has an output pinned");
+
+        app.apply_dialog_action(DialogAction::SetAudioOutput(Some(
+            "Komplete Audio 6 MK2".to_owned(),
+        )));
+        assert_eq!(
+            app.audio_output_device().as_deref(),
+            Some("Komplete Audio 6 MK2"),
+            "the chosen output was not written"
+        );
+
+        // Back to the system's own.
+        app.apply_dialog_action(DialogAction::SetAudioOutput(None));
+        assert_eq!(app.audio_output_device(), None, "there is no way back to the default");
+
+        // **And a system change drops it.**
+        app.apply_dialog_action(DialogAction::SetAudioOutput(Some("ASIO4ALL v2".to_owned())));
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("WASAPI".to_owned())));
+        assert_eq!(
+            app.audio_output_device(),
+            None,
+            "an ASIO driver name survived the switch to WASAPI"
+        );
+
+        // An empty string is not a device: it is what a hand-edited settings
+        // file leaves behind, and it must read as "the system's own".
+        app.settings.audio_output_device = Some("   ".to_owned());
+        assert_eq!(app.audio_output_device(), None, "whitespace was taken for a device");
     }
 
     /// **Q on a TRACK selects that track's clips.**

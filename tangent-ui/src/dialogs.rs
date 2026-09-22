@@ -435,6 +435,11 @@ pub enum Dialog {
         systems: Vec<String>,
         /// The one in use, or `None` for the platform's default.
         system: Option<String>,
+        /// Every output the chosen system offers. Snapshotted at open, like
+        /// `systems` and `rates` - see `ports::AudioSetup::outputs`.
+        outputs: Vec<String>,
+        /// The one to open, or `None` for the system's own default.
+        output: Option<String>,
         /// The rates the selected input device offers.
         rates: Vec<u32>,
         /// How many inputs the selected device has, so the channel row can say
@@ -1951,6 +1956,12 @@ pub enum DialogAction {
     /// "toggle", because a face and a menu that both toggled could disagree
     /// about the current state and cancel each other out.
     SetInsertBypass { strip: usize, slot: usize, on: bool },
+    /// **Open the audio on THIS output**, by name, or `None` for the
+    /// system's own default.
+    ///
+    /// A name rather than a uid because ASIO has nothing else: a driver's
+    /// identity is its registry description. Appended at the END, the law.
+    SetAudioOutput(Option<String>),
     /// The theme key was pressed inside a plugin window. On the desktop
     /// that window has its own input and the main window never sees the
     /// key, so the dialog carries it back and the app cycles exactly as it
@@ -9427,6 +9438,8 @@ fn show_on(
             ahead,
             systems,
             system,
+            outputs,
+            output,
             rates,
             input_channels,
             exposed,
@@ -9944,6 +9957,59 @@ fn show_on(
                                         .font(plain(10.0))
                                         .color(dim),
                                 );
+                            }
+                            ui.add_space(10.0);
+
+                            // ── which output ─────────────────────────────
+                            //
+                            // **ASIO has no default**, and that is the whole
+                            // reason this row exists. cpal's ASIO host takes
+                            // the first driver under `HKLM\SOFTWARE\ASIO`
+                            // that loads, so a machine with FL Studio ASIO or
+                            // ASIO4ALL registered beside a real interface
+                            // opened the wrapper - and there was no control
+                            // anywhere to say otherwise. Reported by a user
+                            // whose Komplete Audio 6 MK2 was invisible here
+                            // while FL Studio offered it from a dropdown.
+                            //
+                            // Offered on every backend, not only ASIO: a
+                            // machine with two interfaces has the same
+                            // question under CoreAudio and WASAPI, and a row
+                            // that appeared on one platform only is a row
+                            // nobody finds.
+                            ui.label(RichText::new("OUTPUT").font(bold(11.0)).color(t.text));
+                            if outputs.is_empty() {
+                                ui.label(
+                                    RichText::new("none reported")
+                                        .font(plain(11.0))
+                                        .color(dim),
+                                );
+                            } else {
+                                ui.horizontal_wrapped(|ui| {
+                                    // **"The system's own" is a real row**,
+                                    // not the absence of a choice: it is what
+                                    // every build before this one did, it is
+                                    // what follows the OS when somebody
+                                    // changes the default underneath, and a
+                                    // user who picked a box by hand has to be
+                                    // able to get back to it.
+                                    let on = output.is_none();
+                                    if ui.selectable_label(on, "the system's own").clicked() && !on
+                                    {
+                                        *output = None;
+                                        action = Some(DialogAction::SetAudioOutput(None));
+                                    }
+                                    for name in outputs.iter() {
+                                        let on = output.as_deref() == Some(name.as_str());
+                                        if ui.selectable_label(on, name).clicked() && !on {
+                                            *output = Some(name.clone());
+                                            action =
+                                                Some(DialogAction::SetAudioOutput(Some(
+                                                    name.clone(),
+                                                )));
+                                        }
+                                    }
+                                });
                             }
                             ui.add_space(10.0);
 
@@ -15659,6 +15725,110 @@ at: None,
     /// Revert-check: change the `(None, Some(a))` arm of `ask` back to a bare
     /// `format!("asked for {a}")` and the first block goes red on the missing
     /// attribution.
+    /// **The OUTPUT row offers every device and answers a press.**
+    ///
+    /// ASIO has no default: cpal's ASIO host takes the first driver under
+    /// `HKLM\SOFTWARE\ASIO` that loads, in those words, so a machine with
+    /// FL Studio ASIO or ASIO4ALL registered beside a real interface opened
+    /// the wrapper - and there was no control anywhere to say otherwise.
+    /// Reported by a user whose Komplete Audio 6 MK2 was invisible here
+    /// while FL Studio offered it from a dropdown.
+    ///
+    /// A drawn control that answers nothing is the fault this file's press
+    /// tests exist for, so this presses each row and reads what comes back.
+    #[test]
+    fn the_output_row_offers_every_device_and_a_press_lands() {
+        let mut slot = Slot::new(Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus::default(),
+            buffer: None,
+            ahead: 0.0,
+            rate: None,
+            systems: vec!["ASIO".to_owned(), "WASAPI".to_owned()],
+            system: Some("ASIO".to_owned()),
+            // The shape of a machine that has FL Studio installed, which is
+            // the one the report came from.
+            outputs: vec![
+                "ASIO4ALL v2".to_owned(),
+                "FL Studio ASIO".to_owned(),
+                "Komplete Audio 6 MK2".to_owned(),
+            ],
+            output: None,
+            rates: Vec::new(),
+            input_channels: 0,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        });
+        slot.settle();
+        assert!(slot.says("OUTPUT"), "the panel has no output row");
+        for name in ["ASIO4ALL v2", "FL Studio ASIO", "Komplete Audio 6 MK2"] {
+            assert!(slot.says(name), "the output row does not offer {name}");
+        }
+        // **"The system's own" is a real row**, not the absence of one: it
+        // is what every build before this did, and somebody who picked a box
+        // by hand has to be able to get back to it.
+        assert!(slot.says("the system's own"), "there is no way back to the default");
+
+        // Pressing a driver asks for THAT driver, by name.
+        // `DialogAction` is neither `PartialEq` nor `Debug` - it carries
+        // payloads that are neither - so the arm is matched, which is what
+        // every other press test in this file does.
+        match slot.click("Komplete Audio 6 MK2") {
+            Some(DialogAction::SetAudioOutput(Some(name))) => {
+                assert_eq!(name, "Komplete Audio 6 MK2", "the wrong output was asked for");
+            }
+            other => panic!(
+                "pressing an output asked for {:?}",
+                other.map(|a| std::mem::discriminant(&a))
+            ),
+        }
+        // And the window shows the choice without waiting for the app: the
+        // press writes the working copy too, or the chip would not light
+        // until the panel was closed and opened again.
+        match slot.dialog.as_ref() {
+            Some(Dialog::AudioSetup { output, .. }) => {
+                assert_eq!(output.as_deref(), Some("Komplete Audio 6 MK2"));
+            }
+            _ => panic!("the panel closed"),
+        }
+        // Back to the default is its own press.
+        slot.settle();
+        match slot.click("the system's own") {
+            Some(DialogAction::SetAudioOutput(None)) => {}
+            other => panic!(
+                "there is no way back to the system's own output: {:?}",
+                other.map(|a| std::mem::discriminant(&a))
+            ),
+        }
+
+        // **A system with no outputs says so**, rather than drawing an empty
+        // row that looks like a control that failed to load.
+        let mut bare = Slot::new(Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus::default(),
+            buffer: None,
+            ahead: 0.0,
+            rate: None,
+            // **Systems present on purpose.** The SYSTEM row says "none
+            // reported" too when ITS list is empty, so an empty one here
+            // would let the assertion below pass on the neighbour's words -
+            // which it did, and a mutation proved it.
+            systems: vec!["WASAPI".to_owned(), "ASIO".to_owned()],
+            system: Some("WASAPI".to_owned()),
+            outputs: Vec::new(),
+            output: None,
+            rates: Vec::new(),
+            input_channels: 0,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        });
+        bare.settle();
+        assert!(bare.says("OUTPUT"), "the row vanished with no devices");
+        assert!(bare.says("none reported"), "an empty output list said nothing");
+    }
+
     #[test]
     fn a_setup_panels_buffer_chip_and_its_readout_name_the_same_asker() {
         let out = crate::recorder::StreamStats {
@@ -15683,6 +15853,8 @@ at: None,
             rate: None,
             systems: Vec::new(),
             system: None,
+            outputs: Vec::new(),
+            output: None,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),
@@ -15781,6 +15953,8 @@ at: None,
             rate: None,
             systems: Vec::new(),
             system: None,
+            outputs: Vec::new(),
+            output: None,
             rates: Vec::new(),
             input_channels: 2,
             exposed: Vec::new(),
@@ -15860,6 +16034,8 @@ at: None,
             rate: None,
             systems: Vec::new(),
             system: None,
+            outputs: Vec::new(),
+            output: None,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),

@@ -574,9 +574,19 @@ impl Device {
                         *streams = new_streams;
                         bs
                     })
-                    .map_err(|ref e| {
-                        println!("Error preparing stream: {}", e);
-                        BuildStreamError::DeviceNotAvailable
+                    .map_err(|e| {
+                        // **The error goes to the CALLER, not to a console.**
+                        //
+                        // This was `println!` and then a bare
+                        // `DeviceNotAvailable`, which throws the only
+                        // sentence that says WHY down a stdout a windowed
+                        // Windows app does not have - so a driver refusing a
+                        // buffer size, a rate or a format all reached the
+                        // host as the same three words, and a user's report
+                        // could never be more specific than "ASIO doesn't
+                        // work". `build_stream_err` below already uses this
+                        // shape for every other ASIO failure.
+                        BackendSpecificError { description: e.to_string() }.into()
                     })
             }
         }
@@ -621,9 +631,19 @@ impl Device {
                         *streams = new_streams;
                         bs
                     })
-                    .map_err(|ref e| {
-                        println!("Error preparing stream: {}", e);
-                        BuildStreamError::DeviceNotAvailable
+                    .map_err(|e| {
+                        // **The error goes to the CALLER, not to a console.**
+                        //
+                        // This was `println!` and then a bare
+                        // `DeviceNotAvailable`, which throws the only
+                        // sentence that says WHY down a stdout a windowed
+                        // Windows app does not have - so a driver refusing a
+                        // buffer size, a rate or a format all reached the
+                        // host as the same three words, and a user's report
+                        // could never be more specific than "ASIO doesn't
+                        // work". `build_stream_err` below already uses this
+                        // shape for every other ASIO failure.
+                        BackendSpecificError { description: e.to_string() }.into()
                     })
             }
         }

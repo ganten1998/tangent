@@ -1051,6 +1051,24 @@ pub struct Settings {
     pub record_camera_uid: Option<String>,
     /// The audio input's stable UID. Same reasoning.
     pub record_audio_device: Option<String>,
+    /// **Which audio OUTPUT to open**, by NAME, or `None` for the system's
+    /// own default.
+    ///
+    /// A name and not a uid, unlike the input beside it: cpal identifies
+    /// outputs by name and ASIO has nothing else at all - a driver's identity
+    /// IS its registry description. `instrument::resolve_output` matches it
+    /// exactly first and then as a substring, so an interface whose driver
+    /// appends a version to its name still resolves.
+    ///
+    /// **This exists because ASIO has no default.** cpal's ASIO host takes
+    /// the first driver under `HKLM\SOFTWARE\ASIO` that loads, so a machine
+    /// with FL Studio ASIO or ASIO4ALL registered beside a real interface
+    /// opened the wrapper - and nothing in the app could say otherwise.
+    ///
+    /// A machine setting and NOT a desk field: which box the sound comes out
+    /// of belongs to this computer, not to the song. It is not in the undo
+    /// fingerprint for the same reason `record_audio_device` is not.
+    pub audio_output_device: Option<String>,
     /// Inputs of an interface the microphone picker offers as rows of their
     /// own, as uids.
     ///
@@ -2008,6 +2026,7 @@ impl Default for Settings {
             record_take_name: None,
             record_camera_uid: None,
             record_audio_device: None,
+            audio_output_device: None,
             record_input_channels: Vec::new(),
             auto_exposed: Vec::new(),
             unreadable: None,
@@ -3103,6 +3122,7 @@ impl Settings {
         take_opt_str(&mut map, "record_take_name", &mut s.record_take_name);
         take_opt_str(&mut map, "record_camera_uid", &mut s.record_camera_uid);
         take_opt_str(&mut map, "record_audio_device", &mut s.record_audio_device);
+        take_opt_str(&mut map, "audio_output_device", &mut s.audio_output_device);
         take_opt_str(&mut map, "bus_effect", &mut s.bus_effect);
         // **A NEW key, because the old one's numbers mean something else
         // now.** The palette went from eight colours to twenty-seven, which
@@ -4476,6 +4496,7 @@ impl Settings {
             ("record_take_name", &self.record_take_name),
             ("record_camera_uid", &self.record_camera_uid),
             ("record_audio_device", &self.record_audio_device),
+            ("audio_output_device", &self.audio_output_device),
             ("bus_effect", &self.bus_effect),
         ] {
             if let Some(v) = value {
@@ -5470,6 +5491,9 @@ impl Settings {
         self.record_dir = fresh.record_dir.clone();
         self.record_camera_uid = fresh.record_camera_uid.clone();
         self.record_audio_device = fresh.record_audio_device.clone();
+        // Which box the sound comes out of is the same kind of fact as which
+        // one it goes in through, and re-picking it is the same tedium.
+        self.audio_output_device = fresh.audio_output_device.clone();
         self.record_input_channels = fresh.record_input_channels.clone();
         self.record_extra_inputs = fresh.record_extra_inputs.clone();
         self.record_input_off = fresh.record_input_off;
