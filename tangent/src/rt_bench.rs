@@ -2229,30 +2229,59 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
     // -30 dBFS with the first difference landing on a different frame every
     // run, which is what nondeterminism looks like - and FabFilter Pro-R 2
     // does.
-    let (Some(mut one), Some(mut two), Some(mut many)) = (build(), build(), build()) else {
+    //
+    // **And TWO controls, not one, which cost a flaky gate to learn.** A
+    // single control pair answers "did these two agree THIS time", and for a
+    // plugin whose tail is made of noise that is a coin toss: Rev PLATE-140
+    // usually disagrees with itself, took the energy road, and passed - and
+    // once in a while the two serial renders happened to land bit for bit,
+    // at which point the test demanded bits from a forked, grained walk that
+    // has no reason to produce them. It failed in the gate at -24.2 dBFS and
+    // then passed three times in a row on its own, which is what a test
+    // measuring the weather looks like.
+    //
+    // Agreement has to be shown TWICE before it counts as determinism.
+    let (Some(mut one), Some(mut two), Some(mut three), Some(mut many)) =
+        (build(), build(), build(), build())
+    else {
         return;
     };
     one.set_offline_fanout(false);
     two.set_offline_fanout(false);
+    three.set_offline_fanout(false);
     many.set_offline_fanout(true);
     // And the grain on top, because that is what a live session does.
     many.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
     let n = BLOCK * 2;
-    let (mut a, mut b, mut c) = (vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]);
-    let (mut xs, mut ctl, mut ys) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut a, mut b, mut c, mut d) = (
+        vec![0.0f32; n],
+        vec![0.0f32; n],
+        vec![0.0f32; n],
+        vec![0.0f32; n],
+    );
+    let (mut xs, mut ctl, mut ctl2, mut ys) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..200 {
         one.render_offline(&mut a);
         two.render_offline(&mut b);
+        three.render_offline(&mut d);
         many.render_offline(&mut c);
         xs.extend_from_slice(&a);
         ctl.extend_from_slice(&b);
+        ctl2.extend_from_slice(&d);
         ys.extend_from_slice(&c);
     }
     let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     let name = Path::new(&plugin)
         .file_stem()
         .map_or_else(|| plugin.clone(), |s| s.to_string_lossy().into_owned());
-    let (control, _) = worst_diff(&xs, &ctl);
+    // **The worst of the two control pairs decides.** One agreement is luck;
+    // two is evidence. Any disagreement at all sends this down the energy
+    // road, which is the safe one - it is the bar a deterministic plugin
+    // also clears comfortably.
+    let (control_a, _) = worst_diff(&xs, &ctl);
+    let (control_b, _) = worst_diff(&xs, &ctl2);
+    let control = control_a.max(control_b);
     let (worst, first) = worst_diff(&xs, &ys);
     if peak <= 0.0005 {
         println!("  {name}: silent at its defaults, so nothing was compared");

@@ -3069,6 +3069,11 @@ pub fn setup_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).setup
 }
 
+/// The capture button, for the panel that hangs off it.
+pub fn capture_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    Layout::new(rect, view).capture
+}
+
 /// Everything in the band a keyboard can reach and a screen reader can say.
 ///
 /// **Built from `Layout::targets`, which already existed.** That list is the
@@ -7779,34 +7784,112 @@ mod tests {
             grounds.len()
         );
     }
+    /// **The two shapes divide the panel between them, and neither is
+    /// empty.**
+    ///
+    /// The cheap way to get this wrong is for a shape to lay out nothing at
+    /// all and quietly draw an empty box - `targets()` would still be
+    /// walkable, every assertion about "answers in its own shape" would hold
+    /// vacuously, and the panel would be blank. So this counts.
+    ///
+    /// It also pins the split itself: the take tier is in `Take` and NOT in
+    /// `Machine`, which is the whole of what the owner asked for. A change
+    /// that quietly left the take rows in the cog's panel would pass every
+    /// other test in this file.
+    #[test]
+    fn each_shape_shows_its_own_tier_and_only_its_own() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 480.0), Vec2::new(20.0, 20.0));
+        let machine = SetupLayout::new(screen, anchor, SetupShape::Machine);
+        let take = SetupLayout::new(screen, anchor, SetupShape::Take);
+        let inside = |l: &SetupLayout, r: Rect| l.panel.contains(r.center());
+
+        // The take tier belongs to Take and has left the cog entirely.
+        for (what, m, t) in [
+            ("count-in", machine.count_in, take.count_in),
+            ("signature", machine.time_sig, take.time_sig),
+            ("the take's name", machine.name, take.name),
+            ("the folder", machine.folder, take.folder),
+            ("open when done", machine.open_when_done, take.open_when_done),
+            ("count-in in take", machine.count_in_in_take, take.count_in_in_take),
+        ] {
+            assert!(inside(&take, t), "{what} is missing from the take panel");
+            assert!(!inside(&machine, m), "{what} is still in the cog's panel");
+        }
+
+        // And the machine tier belongs to the cog and is not on the take.
+        for (what, m, t) in [
+            ("the audio row", machine.audio, take.audio),
+            ("the project row", machine.project_row, take.project_row),
+            ("plugin folders", machine.plugin_folders, take.plugin_folders),
+        ] {
+            assert!(inside(&machine, m), "{what} is missing from the cog's panel");
+            assert!(!inside(&take, t), "{what} leaked onto the take panel");
+        }
+
+        // **The take panel is SHORTER**, because it shows fewer rows. A panel
+        // that kept the machine's height would be two thirds empty and read
+        // as one that failed to load.
+        assert!(
+            take.panel.height() < machine.panel.height(),
+            "the take panel is {} tall against the machine's {}",
+            take.panel.height(),
+            machine.panel.height()
+        );
+    }
+
+    /// **Every control answers, in the shape that shows it — and in no
+    /// other.**
+    ///
+    /// The panel has two shapes since the take tier moved onto the capture
+    /// button: the cog opens the machine and where things are kept, the
+    /// capture button opens the take. This walks BOTH and asserts the pair
+    /// of properties that keeps them honest.
+    ///
+    /// A control inside the panel answers with itself, which is the original
+    /// test. And a control belonging to the OTHER shape answers with nothing
+    /// at all — that is what proves the tier is really gone from the cog's
+    /// panel rather than merely painted over, and it is the half that would
+    /// fail if a band were laid out on top of another one.
     #[test]
     fn every_take_settings_control_can_actually_be_clicked() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
         let anchor = Rect::from_min_size(Pos2::new(40.0, 480.0), Vec2::new(20.0, 20.0));
-        let l = SetupLayout::new(screen, anchor);
         let v = idle();
-        for (rect, want) in l.targets() {
-            assert!(rect.is_positive(), "{want:?} has no rectangle at all");
-            let got = setup_hit_test(screen, anchor, &v, rect.center());
-            assert_eq!(got, Some(want), "clicking {want:?} landed on {got:?}");
+        let mut seen_in_some_shape = 0usize;
+        for shape in [SetupShape::Machine, SetupShape::Take] {
+            let l = SetupLayout::new(screen, anchor, shape);
+            for (rect, want) in l.targets() {
+                assert!(rect.is_positive(), "{want:?} has no rectangle at all in {shape:?}");
+                let got = setup_hit_test(screen, anchor, &v, rect.center(), shape);
+                if l.panel.contains(rect.center()) {
+                    assert_eq!(got, Some(want), "{shape:?}: clicking {want:?} landed on {got:?}");
+                    seen_in_some_shape += 1;
+                } else {
+                    // The other shape's tier, laid out where the clip and the
+                    // panel test cannot reach it. See `SetupShape`.
+                    assert_eq!(
+                        got, None,
+                        "{shape:?}: {want:?} belongs to the other shape and still answered"
+                    );
+                }
+            }
+            // The extras this panel alone reaches, each in its own shape.
+            for (want, rect) in [
+                (Hit::ToggleCountInInTake, l.count_in_in_take),
+                (Hit::ToggleHideElapsed, l.hide_elapsed),
+                (Hit::ShowAudioStatus, l.audio),
+            ] {
+                let got = setup_hit_test(screen, anchor, &v, rect.center(), shape);
+                if l.panel.contains(rect.center()) {
+                    assert_eq!(got, Some(want), "{shape:?}: {want:?} is not reachable");
+                }
+            }
         }
-        // The two that are only reachable here, and the way in to Setup.
-        for want in [
-            Hit::ToggleCountInInTake,
-            Hit::ToggleHideElapsed,
-            Hit::ShowAudioStatus,
-        ] {
-            let rect = match want {
-                Hit::ToggleCountInInTake => l.count_in_in_take,
-                Hit::ToggleHideElapsed => l.hide_elapsed,
-                _ => l.audio,
-            };
-            assert_eq!(
-                setup_hit_test(screen, anchor, &v, rect.center()),
-                Some(want),
-                "{want:?} is not reachable from the take settings"
-            );
-        }
+        assert!(
+            seen_in_some_shape > 0,
+            "neither shape showed a single control"
+        );
     }
 
     /// **The PLUGINS row still reads after the resync button took its right
@@ -7822,7 +7905,7 @@ mod tests {
         for w in [900.0_f32, 1280.0, 1920.0, 2560.0] {
             let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
             let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
-            let l = SetupLayout::new(screen, anchor);
+            let l = SetupLayout::new(screen, anchor, SetupShape::Machine);
             let r = l.plugin_folders;
             let inset = label_inset(r);
             let inner = Rect::from_min_max(
@@ -7844,20 +7927,23 @@ mod tests {
         }
     }
 
-    /// **AUDIO, then MEDIA, then TAKE** — the owner's order: the three tier
-    /// headings exist, each tier's rows sit under its own heading, and no
-    /// tier's rows reach into the next one.
+    /// **AUDIO then MEDIA in the cog, TAKE on its own** — the owner's order,
+    /// now split across two shapes: each tier's rows sit under its own
+    /// heading, and no tier's rows reach into the next one.
+    ///
+    /// The TAKE tier used to be the third band of this panel and is the
+    /// capture button's whole panel since the owner asked for it there. So
+    /// the ordering claim is made per SHAPE: the cog reads audio then media,
+    /// and the take panel reads its heading then its rows.
     #[test]
     fn the_settings_tiers_read_audio_then_media_then_take() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
         let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
-        let l = SetupLayout::new(screen, anchor);
-        for (name, r) in [
-            ("AUDIO heading", l.audio_head),
-            ("MEDIA heading", l.project_head),
-            ("TAKE heading", l.take_head),
-        ] {
-            assert!(r.is_positive(), "{name} has no band");
+
+        // ── the cog: AUDIO, then MEDIA ──
+        let l = SetupLayout::new(screen, anchor, SetupShape::Machine);
+        for (name, r) in [("AUDIO heading", l.audio_head), ("MEDIA heading", l.project_head)] {
+            assert!(l.panel.contains(r.center()), "{name} is not in the cog's panel");
         }
         assert!(
             l.audio_head.bottom() <= l.audio.top(),
@@ -7872,15 +7958,29 @@ mod tests {
             l.project_head.bottom() <= l.proj_dest.top(),
             "the media rows do not start under their heading"
         );
+        // And MEDIA is the last tier here now: its rows run to the floor
+        // rather than stopping short for a TAKE heading that has left.
+        for (what, r) in [
+            ("project dest", l.proj_dest),
+            ("export dest", l.export_dest),
+            ("IRs dest", l.irs_dest),
+        ] {
+            assert!(l.panel.contains_rect(r), "{what} ran off the cog's panel");
+        }
+
+        // ── the capture button: TAKE, alone ──
+        let t = SetupLayout::new(screen, anchor, SetupShape::Take);
         assert!(
-            l.proj_dest.bottom() <= l.take_head.top()
-                && l.export_dest.bottom() <= l.take_head.top()
-                && l.irs_dest.bottom() <= l.take_head.top(),
-            "the MEDIA tier does not end before TAKE begins"
+            t.panel.contains(t.take_head.center()),
+            "the TAKE heading is not in the take panel"
         );
         assert!(
-            l.take_head.bottom() <= l.name.top(),
+            t.take_head.bottom() <= t.name.top(),
             "the take rows do not start under their heading"
+        );
+        assert!(
+            t.name.top() >= t.panel.top(),
+            "the take rows start above their own panel"
         );
     }
 
@@ -7890,11 +7990,19 @@ mod tests {
     /// likely to have been laid over the one above it.
     #[test]
     fn the_take_settings_rows_do_not_overlap() {
-        for w in [900.0_f32, 1280.0, 1920.0] {
+        // **Both shapes, and only the rows each one shows.** The panel is
+        // two shapes since the take tier moved onto the capture button, and
+        // the tier a shape leaves out is laid out far below it - so "every
+        // row is inside the panel" is a claim about the rows that shape
+        // DRAWS, and the hidden ones are filtered out rather than excused.
+        for (w, shape) in [900.0_f32, 1280.0, 1920.0]
+            .into_iter()
+            .flat_map(|w| [(w, SetupShape::Machine), (w, SetupShape::Take)])
+        {
             let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
             let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
-            let l = SetupLayout::new(screen, anchor);
-            let zones: Vec<(&str, Rect)> = vec![
+            let l = SetupLayout::new(screen, anchor, shape);
+            let all: Vec<(&str, Rect)> = vec![
                 ("name", l.name),
                 ("project", l.project_row),
                 ("plugin folders", l.plugin_folders),
@@ -7917,6 +8025,13 @@ mod tests {
                 ("audio setup", l.audio),
                 ("close", l.close),
             ];
+            // What this shape actually shows. A row whose centre is outside
+            // the panel belongs to the other one.
+            let zones: Vec<(&str, Rect)> = all
+                .into_iter()
+                .filter(|(_, r)| l.panel.contains(r.center()))
+                .collect();
+            assert!(zones.len() > 3, "{shape:?} at {w} shows almost nothing");
             for i in 0..zones.len() {
                 for j in (i + 1)..zones.len() {
                     if !zones[i].1.is_positive() || !zones[j].1.is_positive() {
@@ -7924,7 +8039,7 @@ mod tests {
                     }
                     assert!(
                         !zones[i].1.intersects(zones[j].1),
-                        "{} and {} overlap at {w}",
+                        "{shape:?}: {} and {} overlap at {w}",
                         zones[i].0,
                         zones[j].0
                     );
@@ -7934,7 +8049,10 @@ mod tests {
             // pushing past the bottom edge is exactly how it would not be.
             for (what, z) in &zones {
                 if z.is_positive() {
-                    assert!(l.panel.contains_rect(*z), "{what} is outside the panel at {w}");
+                    assert!(
+                        l.panel.contains_rect(*z),
+                        "{shape:?}: {what} is outside the panel at {w}"
+                    );
                 }
             }
         }
@@ -10463,6 +10581,35 @@ const SETUP_ASPECT: f32 = 1.16;
 /// headers take about half a row each on top of these.)
 const SETUP_ROWS: usize = 11;
 
+/// How many of [`SETUP_ROWS`] each shape shows. They sum to the whole, and
+/// the headings each shape carries are counted with them.
+const SETUP_MACHINE_ROWS: usize = 8;
+const SETUP_TAKE_ROWS: usize = 6;
+
+/// **Which tiers of the setup panel a caller wants.**
+///
+/// One panel, two shapes, rather than two panels. The owner's call - "move
+/// the entire take section of the settings menu to summon when you right
+/// click the capture take button" - and the cheap way to honour it is not to
+/// build a second panel with its own copies of eleven controls. Copies
+/// drift: one of them gains a clamp, the other does not, and a year later
+/// two places disagree about what a count-in may be.
+///
+/// So the tier is a SHAPE of the same layout, drawn by the same code and
+/// hit-tested by the same table. The tier a shape leaves out is laid out
+/// far below the panel, where the clip cannot show it and
+/// [`setup_hit_test`]'s own "is it even in the panel" guard cannot reach it
+/// - which is why neither the draw nor the hit test needed a single guard
+/// of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetupShape {
+    /// The cog's panel: the machine and where things are kept.
+    #[default]
+    Machine,
+    /// The capture button's panel: the take being made right now.
+    Take,
+}
+
 /// Every rectangle in the popup.
 struct SetupLayout {
     panel: Rect,
@@ -10560,12 +10707,20 @@ impl SetupLayout {
     /// nicety: the cog sits near the left of a band that can be half a screen
     /// wide, and a panel that ran off the bottom would put the ticks where
     /// nobody could reach them.
-    fn new(screen: Rect, anchor: Rect) -> Self {
+    fn new(screen: Rect, anchor: Rect, shape: SetupShape) -> Self {
         if !screen.is_positive() {
             return Self::NONE;
         }
         let w = (screen.width() * SETUP_W.0).clamp(SETUP_W.1, SETUP_W.2.min(screen.width()));
-        let h = (w * SETUP_ASPECT).min(screen.height() * 0.80);
+        // **Each shape is as tall as the rows it actually shows.** A take
+        // panel with the machine's height would be two thirds empty, which
+        // reads as a panel that failed to load rather than as a short one.
+        let rows_shown = match shape {
+            SetupShape::Machine => SETUP_MACHINE_ROWS,
+            SetupShape::Take => SETUP_TAKE_ROWS,
+        };
+        let h = (w * SETUP_ASPECT * rows_shown as f32 / SETUP_ROWS as f32)
+            .min(screen.height() * 0.80);
         let mut panel = Rect::from_min_size(
             Pos2::new(anchor.left(), anchor.bottom() + h * 0.04),
             Vec2::new(w, h),
@@ -10606,9 +10761,40 @@ impl SetupLayout {
         // merely touch share a line of pixels and every overlap test in this
         // file fails there.
         const HEAD: f32 = 0.55;
-        let units = HEAD * 3.0 + SETUP_ROWS as f32 + 2.0;
+        // Two headings per shape, not three: `Machine` carries AUDIO and
+        // MEDIA, `Take` carries TAKE alone and therefore one.
+        let (heads, rows_shown) = match shape {
+            SetupShape::Machine => (2.0, SETUP_MACHINE_ROWS),
+            SetupShape::Take => (1.0, SETUP_TAKE_ROWS),
+        };
+        let units = HEAD * heads + rows_shown as f32 + 1.0;
         let pitch = rows.height() / units;
         let mut y = rows.top();
+        // **Where a band goes when this shape does not show it.**
+        //
+        // Far below the panel, which is what lets every draw call and the
+        // whole hit-test table stay unconditional: the painter is clipped to
+        // the panel, so nothing there is painted, and `setup_hit_test`
+        // returns early for any point outside the panel, so nothing there is
+        // reachable. A `Rect::NOTHING` would have done for the hit test and
+        // not for the paint - it is an INVERTED rect, and what a painter does
+        // with one is its own business rather than nothing.
+        // **Each hidden band gets its OWN strip**, stacked downward, rather
+        // than all of them sharing one rectangle. Sharing looked simpler and
+        // broke the panel's oldest invariant: no two rows overlap. Every
+        // hidden band sat exactly on top of every other, so
+        // `the_take_settings_rows_do_not_overlap` failed on a pair that is
+        // not on screen in either shape - a true failure of a test whose
+        // whole job is to catch rows landing on each other.
+        let mut y_gone = panel.bottom() + 10_000.0;
+        let mut gone = || {
+            let r = Rect::from_min_size(
+                Pos2::new(rows.left(), y_gone),
+                Vec2::new(rows.width(), pitch.max(1.0)),
+            );
+            y_gone += pitch.max(1.0) * 2.0;
+            r
+        };
         let mut band = |u: f32| {
             let r = Rect::from_min_max(
                 Pos2::new(rows.left(), y + pitch * u * 0.10),
@@ -10617,10 +10803,12 @@ impl SetupLayout {
             y += pitch * u;
             r
         };
-        let audio_head = band(HEAD);
-        let r6 = band(1.0);
-        let ra2 = band(1.0);
-        let ra3 = band(1.0);
+        let machine = shape == SetupShape::Machine;
+        let mut band = |u: f32, mine: bool| if mine { band(u) } else { gone() };
+        let audio_head = band(HEAD, machine);
+        let r6 = band(1.0, machine);
+        let ra2 = band(1.0, machine);
+        let ra3 = band(1.0, machine);
         // **MEDIA, second.** Where documents go and where exports land — two
         // questions that used to have no answer here at all, because both
         // folders were derived from the TAKE folder and moving one moved all
@@ -10628,21 +10816,21 @@ impl SetupLayout {
         // kind of question those rows do — where the app keeps things — and
         // the owner reads the panel top-down as machine, then storage, then
         // the take being made right now.
-        let project_head = band(HEAD);
-        let rp1 = band(1.0);
-        let rp2 = band(1.0);
-        let rp3 = band(1.0);
-        let rp4 = band(1.0);
-        let take_head = band(HEAD);
-        let r0 = band(1.0);
-        let r1 = band(1.0);
+        let project_head = band(HEAD, machine);
+        let rp1 = band(1.0, machine);
+        let rp2 = band(1.0, machine);
+        let rp3 = band(1.0, machine);
+        let rp4 = band(1.0, machine);
+        let take_head = band(HEAD, !machine);
+        let r0 = band(1.0, !machine);
+        let r1 = band(1.0, !machine);
         let note = {
-            let r = band(1.0);
+            let r = band(1.0, !machine);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
-        let r3 = band(1.0);
-        let r4 = band(1.0);
-        let r5 = band(1.0);
+        let r3 = band(1.0, !machine);
+        let r4 = band(1.0, !machine);
+        let r5 = band(1.0, !machine);
         Self {
             panel,
             title,
@@ -11953,8 +12141,8 @@ pub fn fx_value_at(screen: Rect, anchor: Rect, fx: Fx, key: &str, pos: Pos2) -> 
 /// [`Rect::NOTHING`] when there is no room for it. The app needs this to know
 /// whether a press landed inside the popup or outside it, which is the whole of
 /// "click away to dismiss".
-pub fn setup_popup_rect(screen: Rect, anchor: Rect) -> Rect {
-    SetupLayout::new(screen, anchor).panel
+pub fn setup_popup_rect(screen: Rect, anchor: Rect, shape: SetupShape) -> Rect {
+    SetupLayout::new(screen, anchor, shape).panel
 }
 
 /// What a press inside the popup means, or `None` for a press on its chrome.
@@ -11967,8 +12155,9 @@ pub fn setup_hit_test(
     anchor: Rect,
     view: &RecorderView<'_>,
     pos: Pos2,
+    shape: SetupShape,
 ) -> Option<Hit> {
-    let l = SetupLayout::new(screen, anchor);
+    let l = SetupLayout::new(screen, anchor, shape);
     if !l.panel.contains(pos) {
         return None;
     }
@@ -12168,8 +12357,9 @@ pub fn draw_setup(
     anchor: Rect,
     view: &RecorderView<'_>,
     s: &Settings,
+    shape: SetupShape,
 ) {
-    let l = SetupLayout::new(screen, anchor);
+    let l = SetupLayout::new(screen, anchor, shape);
     if !l.panel.is_positive() {
         return;
     }
@@ -12179,6 +12369,11 @@ pub fn draw_setup(
     // it is what makes a dialog drawn in the app's own ink read as being IN
     // FRONT of the window rather than as another band that appeared.
     painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    // **Clipped to the panel from here on**, which is what lets the tier this
+    // shape does not show be laid out off-panel and drawn anyway. The scrim
+    // above is the one thing that has to reach the whole window, so the clip
+    // starts after it. See `SetupShape`.
+    let painter = &painter.with_clip_rect(l.panel);
     painter.rect_filled(l.panel, 4.0, p.bg);
     painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
 
