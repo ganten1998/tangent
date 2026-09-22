@@ -873,6 +873,13 @@ pub struct DesktopApp {
     /// splash rather than walking the seat space a second time; see there.
     #[cfg(feature = "recorder")]
     insert_outstanding: usize,
+    /// **The racks are being REBUILT, not added to**: an engine was born
+    /// with every seat empty, or a session switch marked the whole desk for
+    /// reload. Only then may the room hold an armed input shut - see
+    /// `armed_racks_pending`. Cleared the frame the reconcile finds nothing
+    /// outstanding.
+    #[cfg(feature = "recorder")]
+    racks_restoring: bool,
     /// The MIDI port to open once the window is up: `Some(Some(name))` from
     /// `-p`, `Some(None)` for the priority chain, `None` once it has run.
     /// See where it is taken for why it is not done in the constructor.
@@ -3639,7 +3646,13 @@ impl DesktopApp {
         // frame rather than fetched when the panel opens: a rate that changed
         // under you is exactly what it is there to show.
         self.app.set_audio_status(tangent_ui::recorder::AudioStatus {
-            input: self.recorder.session.input_stats(),
+            // By the name the band and the strips use - see
+            // `devices::device_display_name` - so the SHORT NAME hint beside it
+            // names what the strips will show.
+            input: self.recorder
+                .session
+                .input_stats()
+                .map(|(n, st)| (crate::devices::device_display_name(&n), st)),
             output: self.recorder.engine.as_ref().map(|e| {
                 let o = e.output();
                 (
@@ -4331,6 +4344,8 @@ impl DesktopApp {
                 f.1 = slug;
             }
         }
+        // Read before the state is borrowed: the count's bar length.
+        let count_per_bar = u32::from(self.app.time_signature().beats.max(1));
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         if state.camera_name != camera_name {
@@ -4483,12 +4498,37 @@ impl DesktopApp {
         if state.folder_preview != frozen.folder.2 {
             state.folder_preview.clone_from(&frozen.folder.2);
         }
-        state.audio_name = open_name.or(audio_uid);
+        // Through the one decision that names it - see `band_device_name`:
+        // the owner's short name, a readable USB name, never a raw uid.
+        state.audio_name =
+            crate::devices::band_device_name(open_name.as_deref(), audio_uid.as_deref(), &alias);
         // The playhead and the audition, as plain data. The rate is the
         // engine's own; with no engine the transport answers from its last
         // known truth, which is the whole reason it owns the number.
         state.playing = self.recorder.transport.playing();
         state.exporting = self.recorder.bounce.is_some();
+        // Any count a take saved, or COULD save, something from - see
+        // `RecorderState::tempo_held`. The arrangement's count holds too even
+        // before a take has joined it: a take pressed halfway through works
+        // its head out from the tempo at the press, so a tempo moved earlier
+        // in the same count put that head off the downbeat. It is a bar or two.
+        state.take_counting = self.recorder.take_count_pending || self.recorder.arr_rec_wait;
+        // The count going INTO a take that is already writing: the engine's
+        // click is the only thing that knows its beat. `metronome_beat` is
+        // the running total, so it is folded into the bar the way the
+        // session folds its own count.
+        state.count_beat = if state.take_counting
+            && matches!(state.state, tangent_ui::recorder::RecordState::Rolling)
+        {
+            let per_bar = count_per_bar;
+            self.recorder
+                .engine
+                .as_ref()
+                .and_then(crate::instrument::Engine::metronome_beat)
+                .map(|n| (n.max(1) - 1) % per_bar + 1)
+        } else {
+            None
+        };
         state.position_s = {
             let engine = self.recorder.engine.as_ref();
             let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
@@ -4519,11 +4559,18 @@ impl DesktopApp {
                 let label = if device.is_empty() {
                     String::new()
                 } else {
-                    let head = if alias.is_empty() {
-                        device.as_str()
-                    } else {
-                        alias.as_str()
+                    // The same rules as the band's row: the short name only
+                    // for the interface it was given to, else the device as a
+                    // person would say it. See `devices::alias_for_open`.
+                    let head = match crate::devices::alias_for_open(
+                        Some(device.as_str()),
+                        audio_uid.as_deref(),
+                        &alias,
+                    ) {
+                        Some(a) => a.to_owned(),
+                        None => crate::devices::device_display_name(&device),
                     };
+                    let head = head.as_str();
                     if channel.is_empty() {
                         head.to_owned()
                     } else {
@@ -5323,6 +5370,7 @@ impl DesktopApp {
         // a settings/desk revision, gate this walk on it here.
         self.insert_outstanding = outstanding;
         if outstanding == 0 {
+            self.racks_restoring = false;
             // **The last bay lands as "8 of 8", not as "7 of 8".** The
             // reading is taken from what is still outstanding, so the frame
             // the work finishes on is the only one that can say it finished
@@ -10746,6 +10794,9 @@ impl DesktopApp {
     /// set to all-`None` whenever the engine goes, so a `None` here really
     /// does mean the engine's slot is empty and there is nothing to unload.
     fn force_insert_reload(&mut self) {
+        // A whole-desk change - a session switch or a template - is a
+        // rebuild, and the room may hold an armed input through it.
+        self.racks_restoring = true;
         let bays = tangent_ui::recorder::INSERTS;
         for i in 0..self.recorder.inserts_loaded.len() {
             let wanted = self.app.insert(i / bays, i % bays).is_some();
@@ -13374,6 +13425,9 @@ impl DesktopApp {
                 // reconcile below to fill the bays again.
                 self.recorder.inserts_loaded =
                     vec![None; tangent_ui::recorder::INSERT_SPACE];
+                // Every rack on the desk is empty and being rebuilt: the room
+                // may hold an armed input until its chain is back.
+                self.racks_restoring = true;
                 // **Engine-scoped like the resets above**, and AFTER all three
                 // of them on purpose: `a_restarted_engine_is_told_the_tempo_map_again`
                 // samples a fixed window over this function to check
@@ -17891,6 +17945,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             insert_outstanding: 0,
             #[cfg(feature = "recorder")]
+            racks_restoring: false,
+            #[cfg(feature = "recorder")]
             cartridge: None,
             #[cfg(feature = "recorder")]
             cartridges: std::collections::HashMap::new(),
@@ -19276,7 +19332,8 @@ impl DesktopApp {
         self.recorder.engine.is_some() && self.insert_outstanding > 0
     }
 
-    /// **Is a bay belonging to an ARMED strip still on its way?**
+    /// **Is an armed INPUT still waiting on a bay it is heard through, while
+    /// the racks are being rebuilt?**
     ///
     /// The narrow question behind holding the room shut while a project
     /// opens. `inserts_pending` is the wide one - any bay anywhere - and it
@@ -19284,22 +19341,48 @@ impl DesktopApp {
     /// speakers: adding one plugin to a track nobody is playing would dip a
     /// live monitor that has nothing to do with it.
     ///
-    /// **Both of a channel's racks**, because a track inside a folder has a
-    /// second seat and a bay there is as much of the chain as any other.
-    /// The mask stops at 32 because `armed_mask` is a `u32` and there are 32
-    /// channels; there is no thirty-third to miss.
+    /// **Only while REBUILDING** (`racks_restoring`). A plugin picked by hand
+    /// is constructed while the chain it joins goes on playing, and the swap
+    /// is one block: there is nothing to hide. Holding the room for it
+    /// was worse than useless. The room is held by SUBTRACTION
+    /// (`room = mix - input_dry`), which is exact only through linear gains,
+    /// so a microphone whose denoiser sits on its FOLDER was held as the
+    /// folder's output minus the raw mic - the noise the denoiser removes, at
+    /// full level, for as long as Kontakt took to load on the armed piano.
+    /// The owner: "Denoise is unheard for a second so the noise goes full
+    /// blast every plugin load".
+    ///
+    /// **Only AUDIO inputs**, the only thing that can reach the speakers dry.
+    /// An armed MIDI track whose instrument is still loading makes no sound.
+    ///
+    /// **The whole chain an input is heard through**: its own racks, every
+    /// folder above it and every channel it is routed to - see
+    /// `armed_rack_pending`. The mask stops at 32 because `armed_mask` is a
+    /// `u32` and there are 32 channels; there is no thirty-third to miss.
     #[cfg(feature = "recorder")]
     fn armed_racks_pending(&self) -> bool {
-        if self.insert_outstanding == 0 || self.recorder.engine.is_none() {
+        if !self.racks_restoring || self.recorder.engine.is_none() {
             return false;
         }
         let inserts = tangent_ui::recorder::INSERTS;
-        armed_rack_pending(self.insert_outstanding, self.app.armed_mask(), |seat, bay| {
-            self.recorder
-                .inserts_loaded
-                .get(seat * inserts + bay)
-                .is_some_and(|got| self.app.insert(seat, bay) != got.as_deref())
-        })
+        let routes = self.app.routes();
+        armed_rack_pending(
+            self.app.armed_mask(),
+            |ch| self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio),
+            &self.app.folder_parents(),
+            |ch| {
+                routes.from(ch).into_iter().fold(0u32, |m, (_, r)| match r.target {
+                    tangent_ui::routing::Target::Channel(n) if n < 32 => m | 1 << n,
+                    _ => m,
+                })
+            },
+            |seat, bay| {
+                self.recorder
+                    .inserts_loaded
+                    .get(seat * inserts + bay)
+                    .is_some_and(|got| self.app.insert(seat, bay) != got.as_deref())
+            },
+        )
     }
 
     /// Paint the splash, and decide when it goes.
@@ -20094,29 +20177,59 @@ impl Counted {
 /// no longer marks a bay that is empty on both sides, so every bay this walk
 /// finds is a bay with work in it and the count is the number of frames left.
 #[cfg(feature = "recorder")]
-/// **Which seats an armed desk is still waiting on** - the decision behind
-/// [`DesktopApp::armed_racks_pending`], as a function of its inputs so that
-/// it can be driven by a test. `DesktopApp` cannot be built in one.
+/// **Whether an armed input is still waiting on a bay** - the decision
+/// behind [`DesktopApp::armed_racks_pending`], as a function of its inputs so
+/// that it can be driven by a test. `DesktopApp` cannot be built in one.
 ///
+/// `armed` is the arm mask and `is_input` says which channels take a live
+/// AUDIO input; only those can be heard dry. An input is heard through every seat
+/// of every channel in its CHAIN: itself, the folder above it (and the one
+/// above that), and any channel it is routed to, followed the same way. A
+/// denoiser on a microphone's folder is as much the microphone's as one on
+/// its own strip, and the gate that looked only at the strip let the room
+/// open onto a mic whose folder's denoiser had not loaded yet.
+///
+/// `parents` is the engine's folder table (`folder_parents`, -1 for none);
+/// `routed_to` answers the channels one channel is routed to, as a mask.
 /// `mismatched` answers "is this seat's bay holding something other than what
 /// the desk asks for", which is the reconcile's own word for a bay that has
 /// not arrived - the same predicate `insert_walk` counts.
 #[cfg(feature = "recorder")]
 fn armed_rack_pending(
-    outstanding: usize,
     armed: u32,
+    is_input: impl Fn(usize) -> bool,
+    parents: &[i32; tangent_ui::recorder::CHANNELS],
+    routed_to: impl Fn(usize) -> u32,
     mismatched: impl Fn(usize, usize) -> bool,
 ) -> bool {
-    // **Nothing outstanding anywhere, or nothing armed, is not waiting.**
-    // The first is the ordinary case and costs one compare; the second is
-    // what keeps a desk with no microphone on it out of this walk entirely.
-    if outstanding == 0 || armed == 0 {
-        return false;
+    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, INSERTS};
+    // The chain, as a mask: a worklist over 32 channels, each visited once,
+    // so a folder two inputs share or a route loop costs nothing twice.
+    let mut chain = 0u32;
+    let mut todo = (0..32usize)
+        .filter(|&ch| armed & 1 << ch != 0 && is_input(ch))
+        .fold(0u32, |m, ch| m | 1 << ch);
+    while todo != 0 {
+        let ch = todo.trailing_zeros() as usize;
+        todo &= todo - 1;
+        if chain & 1 << ch != 0 {
+            continue;
+        }
+        chain |= 1 << ch;
+        if let Some(p) = parents.get(ch).and_then(|p| usize::try_from(*p).ok()).filter(|p| *p < 32) {
+            todo |= 1 << p;
+        }
+        todo |= routed_to(ch);
+        todo &= !chain;
     }
-    (0..tangent_ui::recorder::CHANNELS)
-        .filter(|ch| armed & (1u32 << ch) != 0)
-        .flat_map(|ch| [ch, tangent_ui::recorder::folder_extra_seat(ch)])
-        .any(|seat| (0..tangent_ui::recorder::INSERTS).any(|bay| mismatched(seat, bay)))
+    (0..32usize)
+        .filter(|ch| chain & 1 << ch != 0)
+        .flat_map(|ch| {
+            [ch, folder_extra_seat(ch)]
+                .into_iter()
+                .chain((0..AMP_PEDALS).map(move |pedal| amp_pedal_seat(ch, pedal)))
+        })
+        .any(|seat| (0..INSERTS).any(|bay| mismatched(seat, bay)))
 }
 
 fn insert_walk(len: usize, mismatch: impl Fn(usize) -> bool) -> (Option<usize>, usize) {
@@ -20954,6 +21067,11 @@ mod tests {
         assert!(
             bounce.contains("|| self.recorder.arr_rec_wait") && bounce.contains("|| self.recorder.take_count_pending"),
             "an export can start under a count whose downbeat then records into it"
+        );
+        // Every count a take saved, or could join, holds the band's tempo.
+        assert!(
+            src.contains("state.take_counting = self.recorder.take_count_pending || self.recorder.arr_rec_wait;"),
+            "the band is not told when a take's count-in holds the tempo"
         );
         // A new engine has no count running on it.
         let birth = src
@@ -22954,7 +23072,7 @@ mod tests {
     }
 
     /// **A rack that has not arrived yet holds the room shut**, and only for
-    /// the strips somebody is actually playing through.
+    /// the inputs somebody is actually playing through.
     ///
     /// A project opens with every bay empty and fills them one a frame, so
     /// for a second or two an armed input reaches the speakers through
@@ -22962,44 +23080,49 @@ mod tests {
     /// plugins to load and in that short time, the armed inputs can be heard
     /// unprocessed (should be silent until loaded)."
     ///
-    /// The other half is what it must NOT do. `inserts_pending` - any bay
-    /// anywhere - was the obvious gate and the wrong one: it would dip a live
-    /// monitor every time a plugin was dropped onto a track nobody is
-    /// playing.
+    /// The other half is what it must NOT do: dip a live monitor for a bay
+    /// the input is not heard through.
     #[test]
-    fn an_armed_strip_waiting_on_its_rack_holds_the_room_shut() {
-        use tangent_ui::recorder::{folder_extra_seat, CHANNELS, INSERTS};
+    fn an_armed_input_waiting_on_its_chain_holds_the_room_shut() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, CHANNELS, INSERTS};
         let armed_on = |ch: usize| 1u32 << ch;
+        let flat = [-1i32; CHANNELS];
+        let audio = |_: usize| true;
+        let no_routes = |_: usize| 0u32;
 
-        // Nothing outstanding: never waiting, whatever the predicate says.
-        assert!(
-            !armed_rack_pending(0, armed_on(3), |_, _| true),
-            "a settled desk was reported as waiting"
-        );
         // Nothing armed: the room is nobody's to hold.
         assert!(
-            !armed_rack_pending(9, 0, |_, _| true),
+            !armed_rack_pending(0, audio, &flat, no_routes, |_, _| true),
             "a desk with nothing armed was reported as waiting"
         );
-
         // A bay on the armed strip itself.
         assert!(
-            armed_rack_pending(1, armed_on(3), |seat, bay| seat == 3 && bay == 1),
+            armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, bay| seat == 3 && bay == 1),
             "the armed strip's own bay did not hold the room"
         );
-        // Its FOLDER-EXTRA rack, which travels with the track and is as much
-        // of the chain as the first one.
+        // Its FOLDER-EXTRA rack and its PEDALBOARD, which travel with the
+        // track and are as much of the chain as the first rack.
         assert!(
-            armed_rack_pending(1, armed_on(3), |seat, _| seat == folder_extra_seat(3)),
+            armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| seat == folder_extra_seat(3)),
             "the armed strip's second rack did not hold the room"
         );
+        for pedal in 0..AMP_PEDALS {
+            assert!(
+                armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| {
+                    seat == amp_pedal_seat(3, pedal)
+                }),
+                "pedal {pedal} of the armed strip's board did not hold the room"
+            );
+        }
         // And the bay belongs to somebody else: the monitor stays open.
         assert!(
-            !armed_rack_pending(1, armed_on(3), |seat, _| seat == 4),
+            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| seat == 4),
             "another track's plugin dipped a live monitor"
         );
         assert!(
-            !armed_rack_pending(1, armed_on(3), |seat, _| seat == folder_extra_seat(4)),
+            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| {
+                seat == folder_extra_seat(4)
+            }),
             "another track's second rack dipped a live monitor"
         );
 
@@ -23008,17 +23131,113 @@ mod tests {
         // is allowed to make.
         for ch in [0, 1, CHANNELS / 2, CHANNELS - 1] {
             assert!(
-                armed_rack_pending(1, armed_on(ch), |seat, _| seat == ch),
+                armed_rack_pending(armed_on(ch), audio, &flat, no_routes, |seat, _| seat == ch),
                 "channel {ch} could not hold the room"
             );
         }
         // And every bay of a seat is looked at, not just the first.
         for bay in 0..INSERTS {
             assert!(
-                armed_rack_pending(1, armed_on(2), |seat, b| seat == 2 && b == bay),
+                armed_rack_pending(armed_on(2), audio, &flat, no_routes, |seat, b| seat == 2 && b == bay),
                 "bay {bay} was never examined"
             );
         }
+    }
+
+    /// **The owner's desk, bay for bay.** PIANO (2) is an armed MIDI track
+    /// holding Kontakt; the SM7B (6) and AT4050 (7) sit in the MICS folder
+    /// (5), whose first bay is the denoiser. Kontakt loading must not touch
+    /// the mics' room - an armed MIDI track makes no sound through an empty
+    /// bay - while the folder's denoiser, still on its way, must hold it:
+    /// that bay is the microphone's as much as any on its own strip.
+    #[test]
+    fn the_mics_wait_for_their_folders_denoiser_and_never_for_the_piano() {
+        use tangent_ui::recorder::{folder_extra_seat, CHANNELS};
+        let armed = 1u32 << 2 | 1 << 4 | 1 << 6;
+        let audio = |ch: usize| matches!(ch, 0 | 4 | 6 | 7);
+        let mut parents = [-1i32; CHANNELS];
+        parents[6] = 5;
+        parents[7] = 5;
+        let no_routes = |_: usize| 0u32;
+        assert!(
+            !armed_rack_pending(armed, audio, &parents, no_routes, |seat, bay| seat == 2 && bay == 0),
+            "Kontakt on the armed piano held the microphones' room"
+        );
+        assert!(
+            armed_rack_pending(armed, audio, &parents, no_routes, |seat, bay| seat == 5 && bay == 0),
+            "the mics' folder's denoiser was not waited for"
+        );
+        assert!(
+            armed_rack_pending(armed, audio, &parents, no_routes, |seat, _| seat == folder_extra_seat(5)),
+            "the mics' folder's second rack was not waited for"
+        );
+        // An UNARMED mic's folder is not the armed one's: with only the DI
+        // armed, the MICS folder's bays are nobody's to wait on.
+        assert!(
+            !armed_rack_pending(1 << 4, audio, &parents, no_routes, |seat, _| seat == 5),
+            "an unarmed folder held the DI's room"
+        );
+        // Two folders deep: the grandparent is in the chain too.
+        let mut nested = parents;
+        nested[5] = 1;
+        assert!(
+            armed_rack_pending(armed, audio, &nested, no_routes, |seat, _| seat == 1),
+            "the folder above the mics' folder was not waited for"
+        );
+        // A route: the mic moved to channel 9, whose bay is its chain now -
+        // and a route loop is walked once and ends.
+        let routed = |ch: usize| match ch {
+            6 => 1u32 << 9,
+            9 => 1u32 << 6,
+            _ => 0,
+        };
+        assert!(
+            armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, |seat, _| seat == 9),
+            "the channel the mic is routed to was not waited for"
+        );
+        assert!(
+            !armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, |seat, _| seat == 10),
+            "a bay off the mic's chain held its room"
+        );
+    }
+
+    /// **The gate holds only while the racks are REBUILT.** A plugin picked
+    /// by hand joins a chain that keeps playing until the swap, and the room
+    /// is held by subtraction, which leaves a folder's denoiser's residue at
+    /// full level: the owner's "the noise goes full blast every plugin load".
+    /// A source scan, because `DesktopApp` cannot be built in a test: the
+    /// flag gates the question, both rebuilds raise it, and the settled
+    /// reconcile lowers it.
+    #[test]
+    fn only_a_rebuild_may_hold_the_room() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} is gone"));
+            let rest = &src[at..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        assert!(
+            body("fn armed_racks_pending(").contains("if !self.racks_restoring || self.recorder.engine.is_none() {\n            return false;"),
+            "the room is held for a plugin picked by hand"
+        );
+        assert!(
+            body("fn force_insert_reload(").contains("self.racks_restoring = true;"),
+            "a session switch no longer counts as a rebuild"
+        );
+        let born = body("fn start_engine(");
+        let wipe = born
+            .find("self.recorder.inserts_loaded =\n                    vec![None; tangent_ui::recorder::INSERT_SPACE];")
+            .expect("start_engine's ledger wipe");
+        assert!(
+            born[wipe..].contains("self.racks_restoring = true;"),
+            "an engine born empty no longer counts as a rebuild"
+        );
+        assert!(
+            src.contains("self.insert_outstanding = outstanding;\n        if outstanding == 0 {\n            self.racks_restoring = false;"),
+            "the rebuild never ends, so every later pick would hold the room"
+        );
+        assert_eq!(src.matches("self.racks_restoring = true;").count(), 2, "a third road raises the flag");
     }
 
     /// **And the room is actually wired to it.** `push_monitor_settings` is

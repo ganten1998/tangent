@@ -317,7 +317,10 @@ pub struct RecorderView<'a> {
     pub input_monitor: bool,
     /// Beats and tempo, shared by the click, the count-in and the SMF's tempo
     /// mark — one number, because a click at 90 against a file that says 120
-    /// is a take nobody can edit afterwards.
+    /// is a take nobody can edit afterwards. **One number at a take's START**:
+    /// the knob stays live through a take now, and a tempo moved mid-take
+    /// plays at the new tempo while the take's `.mid` keeps the mark it began
+    /// with - its event times exact, only its bar lines after the move off.
     pub tempo_bpm: f64,
     /// The take's time signature, shown beside the tempo and the count-in
     /// because the three describe one thing between them.
@@ -347,6 +350,12 @@ pub struct RecorderView<'a> {
     /// **The limiter is out of circuit**, so its dial is drawn dark. See
     /// `TangentApp::limiter_disabled`. Appended, the struct's law.
     pub limiter_off: bool,
+    /// **The tempo is held**: the knob, TAP and the word are drawn dim and
+    /// the app refuses them. See [`RecorderState::tempo_held`]. Appended.
+    pub tempo_held: bool,
+    /// The count-in beat clicking now while a take is ALREADY writing - see
+    /// [`RecorderState::count_beat`]. Appended.
+    pub count_beat: Option<u32>,
 }
 
 /// The band timeline's overview of the ARRANGEMENT: every clip as a block
@@ -436,6 +445,8 @@ impl RecorderView<'_> {
             message: None,
             clip_warning: false,
             limiter_off: false,
+            tempo_held: false,
+            count_beat: None,
         }
     }
 }
@@ -1915,6 +1926,17 @@ pub struct RecorderState {
     /// on screen. `Some` is what makes Export mean "re-export that take"
     /// rather than "set up the next one".
     pub last_take_folder: Option<String>,
+    /// **A count-in a take saved, or could save, something from is still
+    /// clicking** - the take's own, pre-roll or recorded into the file, or
+    /// the arrangement's record count, which a take can join mid-count. The
+    /// host's fact; see [`RecorderState::tempo_held`].
+    pub take_counting: bool,
+    /// **The beat of a count-in recorded INTO the take**, within the bar.
+    /// With the count in the file the session is writing (Rolling) from the
+    /// press, so its own CountIn digit never shows; the engine's click is the
+    /// only thing that knows the beat, and the glass shows this instead of
+    /// the take's clock until the count is over. The host's fact.
+    pub count_beat: Option<u32>,
 }
 
 /// Hand-written because `strip_peaks` is a thirty-five-row array and std
@@ -1952,12 +1974,31 @@ impl Default for RecorderState {
             message: None,
             clip_warning: false,
             last_take_folder: None,
+            take_counting: false,
+            count_beat: None,
         }
     }
 }
 
 
 impl RecorderState {
+    /// **The tempo holds still.** The knob stays in the transport row through
+    /// a take - the owner: "the main buttons need to be intact while
+    /// recording takes" - and turns freely while the take rolls. It holds for
+    /// the one or two bars of a count-in a take has saved something from:
+    /// the session counts its pre-roll on the wall clock at the tempo of the
+    /// press while the engine re-reads the dial every callback, and a count
+    /// recorded into the file has its head latched at the press - so a tempo
+    /// moved then puts the digit off the click and the take off its lane. And
+    /// through an export, where a tempo move retimes every MIDI clip
+    /// mid-render. The arrangement's record count holds as well, before any
+    /// take has joined it: a take pressed during it works its head out from
+    /// the tempo at the press, so a tempo moved a beat earlier moves the
+    /// downbeat out from under that head.
+    pub fn tempo_held(&self) -> bool {
+        self.exporting || self.take_counting || matches!(self.state, RecordState::CountIn { .. })
+    }
+
     /// Borrow it as the painter wants it.
     ///
     /// The take name, the pre-roll and the hide-elapsed flag come from the app
@@ -2008,6 +2049,8 @@ impl RecorderState {
             meters: self.meters,
             master: self.master,
             limiter_off: false,
+            tempo_held: self.tempo_held(),
+            count_beat: self.count_beat,
             gr_db: self.gr_db,
             dest: &self.dest,
             project_dest: &self.project_dest,
@@ -3695,6 +3738,26 @@ pub enum NumField {
     MarkerName(usize),
 }
 
+impl NumField {
+    /// **Whether the field is typed into the BAND** - its knobs, dial and the
+    /// panels hung off them - rather than into the arrangement. Exhaustive on
+    /// purpose: a new variant is appended at the END (this enum's law) and has
+    /// to say where it lives, rather than defaulting to one side and being
+    /// cleared, or kept, by accident.
+    pub fn lives_in_band(self) -> bool {
+        match self {
+            NumField::Master
+            | NumField::Fx(_)
+            | NumField::Tempo
+            | NumField::Meter
+            | NumField::VariMin
+            | NumField::VariMax
+            | NumField::Varispeed => true,
+            NumField::MeterAt(_) | NumField::MarkerName(_) => false,
+        }
+    }
+}
+
 /// A time typed into a trim field, in seconds.
 ///
 /// **Both ways somebody writes one.** `12.5` is twelve and a half seconds and
@@ -5173,6 +5236,33 @@ mod tests {
         assert_eq!(quiet.bars(), [None, None]);
     }
     use super::*;
+
+    /// **The tempo holds only where a take saved it**, and the painter's view
+    /// carries the same answer - one predicate, asked by both.
+    #[test]
+    fn the_tempo_holds_only_where_a_take_saved_it() {
+        let case = |state: RecordState, counting: bool, exporting: bool| {
+            let s = RecorderState {
+                state,
+                take_counting: counting,
+                exporting,
+                ..RecorderState::default()
+            };
+            assert_eq!(
+                s.view("", false, None, Knobs::default(), false, None).tempo_held,
+                s.tempo_held(),
+                "the view disagrees in {state:?}"
+            );
+            s.tempo_held()
+        };
+        assert!(!case(RecordState::Idle, false, false));
+        assert!(case(RecordState::Idle, true, false), "a count a take saved from");
+        assert!(case(RecordState::CountIn { beat: 1, of: 4 }, false, false), "the take's own count");
+        assert!(!case(RecordState::Rolling, false, false), "a rolling take holds the tempo");
+        assert!(case(RecordState::Rolling, true, false), "a count recorded into a rolling take");
+        assert!(case(RecordState::Rolling, false, true), "an export");
+        assert!(!case(RecordState::Finishing, false, false));
+    }
 
     #[test]
     fn a_take_that_writes_nothing_is_refused() {

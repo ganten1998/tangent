@@ -7369,8 +7369,18 @@ impl TangentApp {
     /// that particular panel must not wear. Charcoal rather than black so it
     /// reads as an edge on the wave's darkest colours too, and always,
     /// whichever mode.
+    ///
+    /// **And on Sandstone and Celadon, for the same reason.** Both are light
+    /// bands, so `heart_tint` darkens the fill to clear them and the measured
+    /// pick then goes near-white - an outline drawn in almost the band's own
+    /// colour. The owner: "sandstone and celadon have heart border colors
+    /// that are near white, and illegible -- make them dark". The edge only,
+    /// and nothing else about either theme.
     fn heart_border(&self, fill: egui::Color32) -> egui::Color32 {
-        if self.settings.theme_name == "Centennial" {
+        if matches!(
+            self.settings.theme_name.as_str(),
+            "Centennial" | "Sandstone" | "Celadon"
+        ) {
             egui::Color32::from_rgb(0x2b, 0x2b, 0x2e)
         } else {
             recorder_panel::heart_border(fill)
@@ -7739,6 +7749,10 @@ impl TangentApp {
                         Some(recorder_panel::Hit::Record)
                             if !self.recorder.state.is_active() =>
                         {
+                            // The RECORDING shape shows COUNT-IN and SIG only:
+                            // a take name focused in the TAKE shape would be
+                            // left invisible and eating keys.
+                            self.name_focused = false;
                             self.setup_open = true;
                             self.setup_shape = recorder_panel::SetupShape::Rolling;
                             return;
@@ -7930,28 +7944,43 @@ impl TangentApp {
                 let anchor = self.setup_anchor(band, &view);
                 let panel =
                     recorder_panel::setup_popup_rect(ui.max_rect(), anchor, self.setup_shape);
-                match recorder_panel::setup_hit_test(
+                let hit = recorder_panel::setup_hit_test(
                     ui.max_rect(),
                     anchor,
                     &view,
                     pos,
                     self.setup_shape,
-                ) {
-                    Some(hit) => self.apply_recorder_hit(hit),
-                    None if !panel.contains(pos) => {
-                        self.setup_open = false;
-                        // **The dismissing press is SPENT** — the same
-                        // latch every other overlay uses. The mixer and
-                        // arrangement passes run later this frame and
-                        // read `band_popup_owns` AFTER the flag cleared;
-                        // without the latch the click that closed the
-                        // cog also located the playhead or toggled a
-                        // mute underneath it.
-                        self.menu_ate_press = true;
+                );
+                if hit.is_none() && !panel.contains(pos) {
+                    self.close_setup();
+                    // **The dismissing press is SPENT** — the same
+                    // latch every other overlay uses. The mixer and
+                    // arrangement passes run later this frame and
+                    // read `band_popup_owns` AFTER the flag cleared;
+                    // without the latch the click that closed the
+                    // cog also located the playhead or toggled a
+                    // mute underneath it.
+                    self.menu_ate_press = true;
+                } else {
+                    // **The band's own focus rule** (see the band press
+                    // below): a press on anything but the name takes the
+                    // caret off it, and a press on anything but the open
+                    // number commits it. This branch returns before that
+                    // rule runs, so a press on SIG and then NAME left both
+                    // editors live, fed the same keys.
+                    self.name_focused = matches!(hit, Some(recorder_panel::Hit::NameField));
+                    self.commit_number_unless(hit);
+                    if let Some(hit) = hit {
+                        self.apply_recorder_hit(hit);
                     }
-                    None => {}
                 }
             }
+            // **Every press the panel handles is SPENT**, DONE included. The
+            // panel hangs below the band, over the arrangement's ruler or the
+            // desk; DONE closes it (so `band_popup_owns` reads false later
+            // this frame) and the same press then located the playhead or
+            // cleared the time selection under the X.
+            self.menu_ate_press = true;
             return;
         }
 
@@ -8031,7 +8060,14 @@ impl TangentApp {
                     // Remember a dragged control for as long as the button is
                     // held. Only the value-carrying hits are grabbable; a
                     // button does not want a drag.
-                    self.grabbed = hit.filter(recorder_panel::Hit::is_draggable).map(|h| Grab {
+                    // Not a HELD tempo: the knob is still a control, so the
+                    // press lands on it (and never on the empty-band window
+                    // drag), but it does not turn.
+                    let held = self.recorder.tempo_held();
+                    self.grabbed = hit
+                        .filter(recorder_panel::Hit::is_draggable)
+                        .filter(|h| !(held && h.is_same_control(recorder_panel::Hit::SetTempo(0.0))))
+                        .map(|h| Grab {
                         hit: h,
                         from: pos,
                         moved: false,
@@ -8837,6 +8873,7 @@ impl TangentApp {
             Some(recorder_panel::VariHit::Close) => {
                 self.vari_open = false;
                 self.num_edit = None;
+                self.menu_ate_press = true;
             }
             // Panel chrome swallows the press; outside it, the press closes
             // the panel and is SPENT — the rule `press_in_fx_panel` gives.
@@ -8889,6 +8926,9 @@ impl TangentApp {
             Some(recorder_panel::FxHit::Close) => {
                 self.fx_open = None;
                 self.fx_choice = None;
+                // Spent, like the setup panel's DONE: nothing under the X
+                // takes this press too.
+                self.menu_ate_press = true;
             }
             // A press on the panel's own chrome is swallowed; one outside it
             // closes the panel and does nothing else — SPENT, so the
@@ -14422,6 +14462,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Put a tempo point at `t` seconds, at `bpm`. Answers where it landed.
     fn arr_put_tempo_point(&mut self, t: f64, bpm: f64) -> Option<usize> {
+        // **Held with the dial** - see `RecorderState::tempo_held`: the
+        // tempo map is the same number the engine and an export are timed on.
+        if self.recorder.tempo_held() {
+            return None;
+        }
         let map = self.live_tempo_map();
         let at_beat = Self::snap_quarter(
             &self.live_meter_map(),
@@ -14493,6 +14538,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Carry a tempo point to `t` seconds and `bpm`.
     fn arr_drag_tempo_point(&mut self, index: usize, t: f64, bpm: f64) {
+        // **Held with the dial** - see `RecorderState::tempo_held`: the
+        // tempo map is the same number the engine and an export are timed on.
+        if self.recorder.tempo_held() {
+            return;
+        }
         let map = self.live_tempo_map();
         let Some(old) = map.points().get(index).copied() else {
             return;
@@ -14554,6 +14604,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Take a tempo point out. **Never the first**: see the drag.
     fn arr_remove_tempo_point(&mut self, index: usize) {
+        // **Held with the dial** - see `RecorderState::tempo_held`: the
+        // tempo map is the same number the engine and an export are timed on.
+        if self.recorder.tempo_held() {
+            return;
+        }
         if index == 0 {
             return;
         }
@@ -14577,6 +14632,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// after it should make the ramp mean something rather than needing to
     /// be set again.
     fn arr_toggle_tempo_ramp(&mut self, index: usize) {
+        // **Held with the dial** - see `RecorderState::tempo_held`: the
+        // tempo map is the same number the engine and an export are timed on.
+        if self.recorder.tempo_held() {
+            return;
+        }
         let mut pts = self.live_tempo_map().points().to_vec();
         let Some(slot) = pts.get_mut(index) else {
             return;
@@ -14616,6 +14676,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Put the song back to one tempo. Reached only from the dialog above.
     pub fn flatten_tempo(&mut self) {
+        // **Held with the dial** - see `RecorderState::tempo_held`: the
+        // tempo map is the same number the engine and an export are timed on.
+        if self.recorder.tempo_held() {
+            return;
+        }
         let bpm = self.live_tempo_map().bpm_at_beat(0.0);
         self.arrangement.tempo = crate::tempo::TempoMap::constant(bpm);
         self.arr_tempo_hot = None;
@@ -15578,7 +15643,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// take**, which owns nothing: record a part on camera, hear it, press
     /// Cmd+Z, is the breakdown video.
     fn undo(&mut self) {
-        if self.recorder.exporting || self.recorder.arr_recording {
+        // And while the tempo is held: the desk it restores carries the
+        // tempo, and a count-in is one or two bars long.
+        if self.recorder.tempo_held() || self.recorder.arr_recording {
             return;
         }
         self.undo_commit();
@@ -15591,7 +15658,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// REDO: forward along the same line, while there is one. The same
     /// refusals as `undo`.
     fn redo(&mut self) {
-        if self.recorder.exporting || self.recorder.arr_recording {
+        if self.recorder.tempo_held() || self.recorder.arr_recording {
             return;
         }
         if self.hist_at + 1 >= self.history.len() {
@@ -16865,6 +16932,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// painted in one place and hit-tested in another: every press landed on
     /// whatever the cog's geometry said was there, which is why its Done
     /// button did nothing at all. One function now, and both roads call it.
+    /// **Close the setup panel, and take its fields with it.**
+    ///
+    /// The take's NAME is typed only in this panel, and the signature only
+    /// here or in the red button's shape. DONE and a click outside used to
+    /// clear `setup_open` and nothing else, so the panel went away and left
+    /// an invisible field holding the keyboard: type a take name, press DONE,
+    /// press Space to roll the song for the video - nothing plays, and the
+    /// name gains a space. A typed signature is COMMITTED here, the band's own
+    /// rule for looking away from a number; Escape is the one road that
+    /// abandons it, in `edit_number`.
+    fn close_setup(&mut self) {
+        self.setup_open = false;
+        self.name_focused = false;
+        if self
+            .num_edit
+            .as_ref()
+            .is_some_and(|e| e.field == recorder::NumField::Meter)
+        {
+            self.commit_number();
+        }
+    }
+
     fn setup_anchor(
         &self,
         band: Rect,
@@ -16906,6 +16995,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 unit: sig.unit,
                 div: self.settings.metronome_div,
                 sample: &self.settings.click_sample,
+                held: self.recorder.tempo_held(),
             },
             &self.settings,
         );
@@ -16987,6 +17077,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.met_menu = None;
                 self.met_at = None;
             }
+            // A held tempo grabs nothing, as the band's knob does - or a drag
+            // begun during a count-in would jump the tempo to the pointer the
+            // moment the count ended.
+            Some(MetHit::Tempo(_)) if self.recorder.tempo_held() => {}
             Some(MetHit::Tempo(t)) => {
                 self.met_drag = true;
                 self.set_tempo_fraction(t);
@@ -21524,7 +21618,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// AFTER it and re-read the SAME frame's click: the Windows tester
     /// pressed SHOW and got the plugin picker from the bay underneath.
     fn band_popup_owns(&self) -> bool {
-        self.setup_open || self.fx_open.is_some()
+        // The varispeed range panel too: it is a band popup on the same
+        // terms as the other two, and every press on it fell through to
+        // the surfaces under it.
+        self.setup_open || self.fx_open.is_some() || self.vari_open
     }
 
     /// Whether the open drumpad owns the pointer this frame — every other
@@ -29706,7 +29803,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // `draw_focus_ring`.
             self.settings.white_key_active_color.to_color32(),
         ) {
-            self.a11y_on = focused(node);
+            // A DISABLED control with focus takes no keys: an arrow or Space
+            // on it would be refused anyway, and swallowing them there left
+            // the transpose and playhead keys behind it dead too.
+            self.a11y_on = if node.enabled { focused(node) } else { None };
         }
     }
 
@@ -29929,6 +30029,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
         use recorder_panel::Hit;
         use recorder::RecorderRequest as R;
+        // **A held tempo is refused here, where every tempo control arrives**
+        // - the band's dial, TAP, the TEMPO word, a typed commit, the
+        // metronome panel's row, the double-click reset. Before a tap is
+        // recorded, so a refused tap leaves nothing in `tap_times`. See
+        // `RecorderState::tempo_held`: a take's count-in, or an export.
+        if self.recorder.tempo_held()
+            && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
+        {
+            return;
+        }
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
             Hit::Capture => self.request_recorder(R::Capture),
@@ -29994,7 +30104,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // host reads it after the frame and does the scan.
                 self.plugin_rescan = true;
             }
-            Hit::CloseSetup => self.setup_open = false,
+            Hit::CloseSetup => self.close_setup(),
             // **Requested, not done here.** The message belongs to the host —
             // it is the one that knows a take dropped frames — and this crate
             // cannot reach it. Same shape as `take_reveal_request`.
@@ -30037,10 +30147,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // A click OPENS it for typing — there is nothing to drag, so the
             // tap-versus-drag gesture the faders use does not apply.
             Hit::EditTimeSignature => {
-                self.num_edit = Some(recorder::NumEdit::prefilled(
-                    recorder::NumField::Meter,
-                    self.field_seed(recorder::NumField::Meter),
-                ));
+                // A press back into the signature being typed keeps what
+                // was typed - the rule `commit_number_unless` already keeps.
+                if !self
+                    .num_edit
+                    .as_ref()
+                    .is_some_and(|e| e.field == recorder::NumField::Meter)
+                {
+                    self.num_edit = Some(recorder::NumEdit::prefilled(
+                        recorder::NumField::Meter,
+                        self.field_seed(recorder::NumField::Meter),
+                    ));
+                }
                 self.name_focused = false;
             }
             Hit::CycleCountIn => {
@@ -31478,7 +31596,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if self.num_edit.is_some() {
                         self.num_edit = None;
                     } else {
-                        self.setup_open = false;
+                        self.close_setup();
                     }
                 }
                 _ => {}
@@ -36840,7 +36958,16 @@ impl TangentApp {
             // and invisible, still swallowing every single-key shortcut — an
             // app that has apparently stopped responding, with nothing on
             // screen to explain why or to click on to get out of it.
-            self.num_edit = None;
+            //
+            // **The BAND's fields, not the arrangement's.** A marker's name
+            // and a ruler signature chip are typed into the arrangement, and
+            // they open inside `arrangement_input`, AFTER this block - so
+            // clearing every field here closed them one frame after they
+            // opened whenever the band was hidden, before a letter could be
+            // typed.
+            if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_band()) {
+                self.num_edit = None;
+            }
             self.name_focused = false;
             self.grabbed = None;
         }
@@ -38368,11 +38495,28 @@ impl TangentApp {
         // `TextEdit`, and the field is worth having anyway: "type nocturne
         // once, press record five times" is the workflow the whole naming
         // scheme exists to support.
+        // **Escape backs out of the settings panel one layer at a time.** The
+        // snapshot is taken BEFORE the typing handlers: one Escape that ends
+        // the typing must not also close the panel around it - that is two
+        // layers for one press, which `edit_number`'s own Escape refuses.
+        //
+        // Only the two fields this block services: a mixer or drumpad field
+        // left open under the panel is not this block's to end, and counting
+        // it made Escape dead for as long as it stayed open.
+        let typing_before = self.name_focused || self.num_edit.is_some();
         if self.name_focused {
             self.edit_take_name(&ctx);
         }
         if self.num_edit.is_some() {
             self.edit_number(&ctx);
+        }
+        if self.setup_open
+            && !typing_before
+            && self.menu_state.is_none()
+            && !self.dialog_blocks_keys(&ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.close_setup();
         }
 
         // Held, not toggled: press to read, release and it slides away. Drawn
@@ -47119,6 +47263,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Undo holds still during a count-in too: the desk it restores carries
+    /// the tempo the count is timed on.
+    #[test]
+    fn undo_waits_out_a_count_in() {
+        let root = project_scratch("undo-count");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.set_insert(2, 0, Some(dialogs::BUILTIN_PATH));
+        app.recorder.state = recorder::RecordState::CountIn { beat: 1, of: 4 };
+        app.undo();
+        assert_eq!(app.insert(2, 0), Some(dialogs::BUILTIN_PATH), "undo ran under a count-in");
+        app.recorder.state = recorder::RecordState::Idle;
+        app.undo();
+        assert_eq!(app.insert(2, 0), None, "undo did not run after the count");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The launch reopen seeds the undo baseline.** Reopening the
     /// remembered project used to skip `undo_reset`, so the FIRST edit of
     /// every session committed its own post-state as moment zero and
@@ -49677,6 +49838,38 @@ mod tests {
         );
     }
 
+    /// **The tempo lane holds with the dial.** Under an export (or a take's
+    /// count-in) no tempo point may be placed, dragged, removed, ramped or
+    /// flattened: the map is what the render and the click are timed on.
+    #[test]
+    fn the_tempo_lane_holds_while_the_tempo_is_held() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.arr_put_tempo_point(4.0, 90.0).expect("placed");
+        let before = app.arrangement.tempo.points().to_vec();
+        for held in [
+            (recorder::RecordState::Rolling, true, false),
+            (recorder::RecordState::CountIn { beat: 1, of: 4 }, false, false),
+            (recorder::RecordState::Rolling, false, true),
+        ] {
+            app.recorder.state = held.0;
+            app.recorder.exporting = held.1;
+            app.recorder.take_counting = held.2;
+            assert!(app.recorder.tempo_held());
+            assert_eq!(app.arr_put_tempo_point(8.0, 60.0), None, "a point was placed while held");
+            app.arr_drag_tempo_point(1, 6.0, 70.0);
+            app.arr_toggle_tempo_ramp(1);
+            app.arr_remove_tempo_point(1);
+            app.flatten_tempo();
+            assert_eq!(app.arrangement.tempo.points(), &before[..], "the tempo map moved while held");
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.exporting = false;
+        app.recorder.take_counting = false;
+        assert!(app.arr_put_tempo_point(8.0, 60.0).is_some(), "free again, the lane refused");
+    }
+
     /// A ramp belongs to the point it slides FROM, so the first point can
     /// have one and the last one has nothing to reach.
     #[test]
@@ -51490,6 +51683,31 @@ mod tests {
         );
     }
 
+    /// **A held tempo keeps no keys.** While a take holds the tempo the knob
+    /// refuses every press, so a focused knob that still claimed the arrows
+    /// spent them on nothing and took the playhead keys behind it down too.
+    /// Focus on it must leave `a11y_on` empty while held, and full again the
+    /// moment the hold lifts.
+    #[test]
+    fn a_focused_tempo_holds_no_keys_while_the_tempo_is_held() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.screen_reader_mode = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let tempo = egui::Id::new(("band", "tempo"));
+        for held in [true, false] {
+            app.recorder.take_counting = held;
+            assert_eq!(app.recorder.tempo_held(), held);
+            ctx.memory_mut(|m| m.request_focus(tempo));
+            pointer_frame(&ctx, &mut app, Vec::new());
+            assert_eq!(
+                app.a11y_on.is_some(),
+                !held,
+                "a focused tempo with the tempo held = {held} left a11y_on {:?}",
+                app.a11y_on.is_some()
+            );
+        }
+    }
+
     /// **An arrow key on a focused BUTTON does not press it.**
     ///
     /// The bug this catches was mine and it was live: `nudge_focused` read
@@ -52020,6 +52238,59 @@ mod tests {
             "a tenth of the travel gave {}",
             app.settings.record_export.tempo_bpm
         );
+    }
+
+    /// **The tempo knob turns under a take, and holds through a count-in.**
+    ///
+    /// The owner: "the main buttons need to be intact while recording
+    /// takes". The knob used to leave the row for the whole take; now it
+    /// stays and turns while the take rolls, and only holds for the bar or
+    /// two of a count-in a take has saved the tempo from - and under an
+    /// export. Every route into the tempo is refused while held, and a held
+    /// press grabs nothing.
+    #[test]
+    fn the_tempo_turns_under_a_take_and_holds_through_a_count_in() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // Rolling: the knob turns as at rest.
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.settings.record_export.tempo_bpm = 120.0;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let from = knob_cell(&app, Hit::SetTempo(0.0)).center();
+        press(&ctx, &mut app, from);
+        move_to(&ctx, &mut app, Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.1));
+        assert!(app.settings.record_export.tempo_bpm > 140.0, "the knob did not turn under a take");
+        release(&ctx, &mut app, Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.1));
+
+        // A count-in: held, by every road.
+        app.recorder.state = recorder::RecordState::CountIn { beat: 1, of: 4 };
+        app.settings.record_export.tempo_bpm = 120.0;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let from = knob_cell(&app, Hit::SetTempo(0.0)).center();
+        press(&ctx, &mut app, from);
+        assert!(app.grabbed.is_none(), "a held tempo was grabbed");
+        move_to(&ctx, &mut app, Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.1));
+        release(&ctx, &mut app, Pos2::new(from.x, from.y - KNOB_TRAVEL * 0.1));
+        assert_eq!(app.settings.record_export.tempo_bpm, 120.0, "the held knob turned");
+        app.apply_recorder_hit(Hit::SetTempo(90.0));
+        app.apply_recorder_hit(Hit::TapTempo);
+        app.apply_recorder_hit(Hit::TapTempo);
+        assert_eq!(app.settings.record_export.tempo_bpm, 120.0, "a held tempo took a set or a tap");
+        app.apply_recorder_hit(Hit::Type(recorder::NumField::Tempo));
+        assert!(app.num_edit.is_none(), "a held tempo opened its field");
+
+        // The host's own facts hold it too, and an export does.
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.recorder.take_counting = true;
+        app.apply_recorder_hit(Hit::SetTempo(90.0));
+        assert_eq!(app.settings.record_export.tempo_bpm, 120.0, "held by a take's count, it moved");
+        app.recorder.take_counting = false;
+        app.recorder.exporting = true;
+        app.apply_recorder_hit(Hit::SetTempo(90.0));
+        assert_eq!(app.settings.record_export.tempo_bpm, 120.0, "held by an export, it moved");
+        app.recorder.exporting = false;
+        app.apply_recorder_hit(Hit::SetTempo(90.0));
+        assert_eq!(app.settings.record_export.tempo_bpm, 90.0, "free again, it would not move");
     }
 
     /// One frame with the pointer released at `pos`.
@@ -56692,13 +56963,21 @@ mod tests {
             egui::Color32::from_rgb(0x2b, 0x2b, 0x2e),
             "the fixture's fill has to be one the measurement would edge in white"
         );
-        app.settings.theme_name = "Centennial".to_owned();
-        for fill in [dark_fill, egui::Color32::from_rgb(0xe0, 0x40, 0x40), egui::Color32::WHITE] {
-            assert_eq!(
-                app.heart_border(fill),
-                egui::Color32::from_rgb(0x2b, 0x2b, 0x2e),
-                "on Centennial a {fill:?} heart lost its charcoal edge"
+        // Sandstone and Celadon too: light bands, where the measured pick on
+        // their darkened fills was a near-white edge nobody could see.
+        for theme in ["Centennial", "Sandstone", "Celadon"] {
+            assert!(
+                crate::theme::factory().iter().any(|t| t.name == theme),
+                "{theme} is not a factory theme any more - this test names it"
             );
+            app.settings.theme_name = theme.to_owned();
+            for fill in [dark_fill, egui::Color32::from_rgb(0xe0, 0x40, 0x40), egui::Color32::WHITE] {
+                assert_eq!(
+                    app.heart_border(fill),
+                    egui::Color32::from_rgb(0x2b, 0x2b, 0x2e),
+                    "on {theme} a {fill:?} heart lost its charcoal edge"
+                );
+            }
         }
     }
 
@@ -61012,6 +61291,264 @@ mod tests {").expect("the tests module")];
                 "Space did not stop the song under a take in {state:?}"
             );
         }
+    }
+
+    /// Open the cassette's TAKE panel the way a hand does: a right-click on
+    /// the cassette. Returns the anchor the panel hangs from.
+    fn open_take_panel(ctx: &egui::Context, app: &mut TangentApp) -> Rect {
+        pointer_frame(ctx, app, Vec::new());
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band is not laid out");
+        let at = recorder_panel::capture_rect(band, &app.recorder_layout_view()).center();
+        pointer_frame(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.setup_open && app.setup_shape == recorder_panel::SetupShape::Take,
+            "the right-click did not open the take panel"
+        );
+        app.setup_anchor(band, &app.recorder_layout_view())
+    }
+
+    /// Where on the open panel a press lands on `hit` - searched, so the test
+    /// cannot drift from the panel's own geometry.
+    fn panel_point(app: &TangentApp, anchor: Rect, hit: recorder_panel::Hit) -> Pos2 {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let view = app.recorder_layout_view();
+        let panel = recorder_panel::setup_popup_rect(screen, anchor, app.setup_shape);
+        let mut y = panel.top();
+        while y < panel.bottom() {
+            let mut x = panel.left();
+            while x < panel.right() {
+                let p = Pos2::new(x, y);
+                if recorder_panel::setup_hit_test(screen, anchor, &view, p, app.setup_shape) == Some(hit) {
+                    return p;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        panic!("no {hit:?} on the open panel");
+    }
+
+    /// **DONE hands the keyboard back to the transport.** Name a take, press
+    /// DONE, press Space to roll the song for the video: the panel used to go
+    /// away and leave its name field invisible and focused, so Space did
+    /// nothing and the name gained a space.
+    #[test]
+    fn done_hands_the_keys_back_to_the_transport() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.record_take_name = None;
+        let anchor = open_take_panel(&ctx, &mut app);
+        let name = panel_point(&app, anchor, Hit::NameField);
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        assert!(app.name_focused, "the name field did not take the caret");
+        pointer_frame(&ctx, &mut app, vec![egui::Event::Text("nocturne".into())]);
+        assert_eq!(app.settings.record_take_name.as_deref(), Some("nocturne"));
+        let done = panel_point(&app, anchor, Hit::CloseSetup);
+        click_with(&ctx, &mut app, done, egui::Modifiers::NONE);
+        assert!(!app.setup_open);
+        assert!(!app.text_entry_active(), "DONE left a field holding the keys");
+        app.arrangement_open = true;
+        app.recorder.playing = true;
+        assert_eq!(space(&ctx, &mut app), Some(recorder::RecorderRequest::Stop), "Space did not reach the song");
+        assert_eq!(app.settings.record_take_name.as_deref(), Some("nocturne"), "the name gained a key");
+    }
+
+    /// **The metronome panel's tempo grabs nothing while held** - a drag
+    /// begun in a count-in would jump the tempo to the pointer the moment
+    /// the count ended.
+    #[test]
+    fn the_metronome_panels_tempo_holds_while_the_tempo_is_held() {
+        use crate::recorder_panel::MetHit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        app.met_menu = Some(());
+        app.met_at = Some(Pos2::new(400.0, 200.0));
+        let anchor = app.met_anchor(screen);
+        let panel = recorder_panel::met_popup_rect(screen, anchor);
+        let mut at = None;
+        let mut y = panel.top();
+        'find: while y < panel.bottom() {
+            let mut x = panel.left();
+            while x < panel.right() {
+                let p = Pos2::new(x, y);
+                // Far along the track, so a press that got through moves it.
+                if matches!(recorder_panel::met_hit_test(screen, anchor, p), Some(MetHit::Tempo(t)) if t > 0.9) {
+                    at = Some(p);
+                    break 'find;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        let at = at.expect("no tempo track on the metronome panel");
+        for held in [true, false] {
+            app.recorder.take_counting = held;
+            app.met_drag = false;
+            let before = app.tempo_bpm();
+            assert!(app.met_menu_press(screen, at, true), "the press fell through the panel");
+            assert_eq!(app.met_drag, !held, "held {held}: the drag");
+            assert_eq!(app.tempo_bpm() == before, held, "held {held}: {before} -> {}", app.tempo_bpm());
+        }
+    }
+
+    /// **The DONE press is spent on DONE.** The take panel hangs below the
+    /// band, so its title bar and DONE sit over the arrangement's ruler; the
+    /// press that closed the panel used to go on to the ruler under it in
+    /// the same frame and locate the song, dropping the time selection.
+    #[test]
+    fn done_is_not_also_a_press_on_the_arrangement_under_it() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        let anchor = open_take_panel(&ctx, &mut app);
+        let done = panel_point(&app, anchor, Hit::CloseSetup);
+        let arr = app.arrangement_rect.expect("the arrangement is not laid out");
+        assert!(arr.contains(done), "DONE at {done:?} is not over the arrangement {arr:?}");
+        app.time_sel = Some((1.0, 2.0));
+        let playhead = app.recorder.position_s;
+        while app.take_recorder_request().is_some() {}
+        click_with(&ctx, &mut app, done, egui::Modifiers::NONE);
+        assert!(!app.setup_open, "DONE did not close the panel");
+        assert_eq!(app.time_sel, Some((1.0, 2.0)), "DONE also pressed the arrangement");
+        assert_eq!(app.recorder.position_s, playhead, "DONE located the song");
+        let mut asked = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            asked.push(r);
+        }
+        assert!(asked.is_empty(), "DONE reached the arrangement: {asked:?}");
+    }
+
+    /// **A signature typed and then clicked away from is kept.** The
+    /// click-away is the one road on which closing the panel is what commits
+    /// the field; it used to leave the typed text behind, invisible.
+    #[test]
+    fn a_signature_typed_then_clicked_away_from_is_kept() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let anchor = open_take_panel(&ctx, &mut app);
+        assert_ne!(app.time_signature(), recorder::TimeSignature { beats: 7, unit: 8 });
+        let sig = panel_point(&app, anchor, Hit::EditTimeSignature);
+        click_with(&ctx, &mut app, sig, egui::Modifiers::NONE);
+        pointer_frame(&ctx, &mut app, vec![egui::Event::Text("7/8".into())]);
+        assert!(app.num_edit.as_ref().is_some_and(|e| e.text == "7/8"), "the typing did not land");
+        let outside = Pos2::new(1290.0, 890.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        assert!(!recorder_panel::setup_popup_rect(screen, anchor, app.setup_shape).contains(outside));
+        click_with(&ctx, &mut app, outside, egui::Modifiers::NONE);
+        assert!(!app.setup_open, "the click-away did not close the panel");
+        assert!(app.num_edit.is_none(), "the typed field outlived its panel");
+        assert_eq!(
+            app.time_signature(),
+            recorder::TimeSignature { beats: 7, unit: 8 },
+            "the typed signature was thrown away"
+        );
+    }
+
+    /// A press outside the panel closes it AND takes the caret with it; a
+    /// press inside moves the caret as a press in the band does.
+    #[test]
+    fn the_settings_panel_keeps_one_field_live_at_a_time() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let anchor = open_take_panel(&ctx, &mut app);
+        let sig = panel_point(&app, anchor, Hit::EditTimeSignature);
+        click_with(&ctx, &mut app, sig, egui::Modifiers::NONE);
+        assert!(app.num_edit.as_ref().is_some_and(|e| e.field == recorder::NumField::Meter));
+        let name = panel_point(&app, anchor, Hit::NameField);
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        assert!(app.name_focused && app.num_edit.is_none(), "SIG and NAME both live");
+        let count = panel_point(&app, anchor, Hit::CycleCountIn);
+        click_with(&ctx, &mut app, count, egui::Modifiers::NONE);
+        assert!(!app.name_focused, "a press on the count-in left the name focused");
+
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        let outside = Pos2::new(1290.0, 890.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        assert!(!recorder_panel::setup_popup_rect(screen, anchor, app.setup_shape).contains(outside));
+        click_with(&ctx, &mut app, outside, egui::Modifiers::NONE);
+        assert!(!app.setup_open && !app.name_focused, "the click-away left the caret behind");
+    }
+
+    /// **Escape backs out of the panel one layer at a time**: the field
+    /// first, then the panel - and not at all under a modal.
+    #[test]
+    fn escape_backs_out_of_the_settings_panel_one_layer_at_a_time() {
+        use recorder_panel::Hit;
+        let esc = |ctx: &egui::Context, app: &mut TangentApp| {
+            pointer_frame(
+                ctx,
+                app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        };
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let anchor = open_take_panel(&ctx, &mut app);
+        let name = panel_point(&app, anchor, Hit::NameField);
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        esc(&ctx, &mut app);
+        assert!(!app.name_focused && app.setup_open, "one Escape took two layers");
+        esc(&ctx, &mut app);
+        assert!(!app.setup_open, "Escape did not close the panel");
+
+        let anchor = open_take_panel(&ctx, &mut app);
+        let sig = panel_point(&app, anchor, Hit::EditTimeSignature);
+        click_with(&ctx, &mut app, sig, egui::Modifiers::NONE);
+        esc(&ctx, &mut app);
+        assert!(app.num_edit.is_none() && app.setup_open, "Escape on SIG closed the panel");
+        esc(&ctx, &mut app);
+        assert!(!app.setup_open);
+
+        // Under a modal, Escape is the modal's.
+        open_take_panel(&ctx, &mut app);
+        app.dialog = Some(Dialog::About);
+        esc(&ctx, &mut app);
+        assert!(app.setup_open, "Escape reached the panel under a modal");
+    }
+
+    /// **Hiding the band leaves the arrangement's own fields open.** A new
+    /// marker's name used to close one frame after it opened whenever the
+    /// band was hidden, because the band's clear took every field with it.
+    #[test]
+    fn hiding_the_band_leaves_the_arrangements_own_fields_open() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.show_recorder = false;
+        app.arrangement_open = true;
+        app.num_edit = Some(recorder::NumEdit::new(recorder::NumField::MarkerName(0)));
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            app.num_edit.as_ref().is_some_and(|e| e.field == recorder::NumField::MarkerName(0)),
+            "the hidden band closed the arrangement's marker field"
+        );
+        // A band field still goes with the band.
+        app.num_edit = Some(recorder::NumEdit::new(recorder::NumField::Tempo));
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.num_edit.is_none(), "a band field outlived the band");
     }
 
     /// **The red button's right-click opens its panel at rest, and falls

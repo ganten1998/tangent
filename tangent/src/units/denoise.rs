@@ -1327,6 +1327,13 @@ struct Spectral {
     /// attack and release move — a frame writes a TARGET and this follows
     /// it. Unity at rest.
     g_db: [f32; DENOISE_BANDS],
+    /// **No frame has been heard since the last reset**, so there is no
+    /// gain to follow FROM: the first frame takes its target outright. A
+    /// follower started at unity glided down at the RELEASE rate, and a bay
+    /// rebuilt under a live microphone reopened the room onto its noise at
+    /// full level for a quarter of a second. The target was right from the
+    /// first frame; only the follower lagged.
+    fresh: bool,
     /// Each band's learned floor as energy, the print the opening rule
     /// measures a frame's band energy against. Laid down by `refloor`.
     floor_b: [f32; DENOISE_BANDS],
@@ -1375,6 +1382,7 @@ impl Spectral {
             a_ph1: 0.0,
             a_psd: 0.0,
             g_db: [0.0; DENOISE_BANDS],
+            fresh: true,
             floor_b: [1.0; DENOISE_BANDS],
             shelf: [0.0; DENOISE_BANDS],
         }
@@ -1429,6 +1437,7 @@ impl Spectral {
         self.ph1.fill(0.0);
         self.s_prev = [0.0; DENOISE_BANDS];
         self.g_db = [0.0; DENOISE_BANDS];
+        self.fresh = true;
         self.restart_learn();
     }
 
@@ -1764,6 +1773,15 @@ pub struct Denoise {
     /// through the current tick the sample loop is.
     tick_len: u32,
     phase: u32,
+    /// **No tick has run since the bands were cleared**, so there is no cut
+    /// to smooth FROM: the first tick takes its target outright. The cut
+    /// used to start at zero and climb at the RELEASE rate, and a bay rebuilt
+    /// under a live microphone reopened the room onto its noise 13 dB over
+    /// the settled level. One tick only: after it every move is smoothed
+    /// again, because a bell whose depth jumps tick to tick is the artefact
+    /// the smoothing exists to prevent - the first jump lands on bells that
+    /// are themselves starting from silence.
+    fresh: bool,
     /// Tick-domain smoothing coefficients for the fixed time constants,
     /// computed once in `new`.
     a_rise: f32,
@@ -1949,6 +1967,7 @@ impl Denoise {
             band: [Band::IDLE; DENOISE_BANDS],
             tick_len,
             phase: 0,
+            fresh: true,
             a_rise: a_of(ENV_RISE_MS),
             a_fall: a_of(ENV_FALL_MS),
             a_level: a_of(LEVEL_MS),
@@ -1998,6 +2017,7 @@ impl Denoise {
         for b in self.band.iter_mut() {
             b.quiesce();
         }
+        self.fresh = true;
         self.ring.iter_mut().for_each(|s| *s = 0.0);
         self.rpos = 0;
         self.phase = 0;
@@ -2372,6 +2392,7 @@ impl Denoise {
     fn control(&mut self, plan: &TickPlan) {
         let inv_tick = 1.0 / self.tick_len as f32;
         let mut depth = [0.0_f32; DENOISE_BANDS];
+        let fresh = std::mem::replace(&mut self.fresh, false);
 
         for (k, b) in self.band.iter_mut().enumerate() {
             // The tick's band level. The ×4 calibrates the complex
@@ -2517,7 +2538,10 @@ impl Denoise {
             // the release, interpolated toward its after-a-transient speed
             // by the boost flag.
             let target = depth[k];
-            let a = if target < b.depth_db {
+            let a = if fresh {
+                // No cut was heard yet to move FROM: the target, outright.
+                1.0
+            } else if target < b.depth_db {
                 self.a_open
             } else {
                 plan.a_rel_slow + (plan.a_rel_fast - plan.a_rel_slow) * b.boost
@@ -3168,7 +3192,7 @@ impl Denoise {
                 .clamp(plan.floor_db, lift.max(0.0));
             let was = self.sp.g_db[b];
             let a = if target > was { plan.a_att } else { plan.a_rel };
-            let now = was + a * (target - was);
+            let now = if self.sp.fresh { target } else { was + a * (target - was) };
             let now = if now.is_finite() { now } else { plan.floor_db };
             self.sp.g_db[b] = now;
             g_lin[b] = 10.0_f32.powf(now / 20.0);
@@ -3176,6 +3200,7 @@ impl Denoise {
             // kernel is running; a lifted band reads as no cut.
             self.band[b].depth_db = -now.min(0.0);
         }
+        self.sp.fresh = false;
 
         // ── back onto the bins, and mirrored ────────────────────────────
         for k in 0..=bins {
@@ -3426,6 +3451,7 @@ impl Denoise {
         for b in self.band.iter_mut() {
             b.quiesce();
         }
+        self.fresh = true;
         self.ring.iter_mut().for_each(|s| *s = 0.0);
         self.rpos = 0;
         self.phase = 0;
@@ -4895,6 +4921,69 @@ mod tests {
         let mut silent = vec![0.0_f32; 512 * 2];
         dn.process(&mut silent, 512, 2, &on(DenoiseKernel::Bank));
         assert!(silent.iter().all(|&s| s == 0.0), "the lookahead line replayed old audio");
+    }
+
+    /// **A cleared spectral denoiser comes back CLOSED on the noise it was
+    /// cutting.** A bay rebuilt by an engine restart or a session switch is
+    /// created, cleared and handed its print - and the band gains used to
+    /// start at unity and glide down at the RELEASE rate, so the room reopened
+    /// onto the noise at full level for a quarter of a second (two at the
+    /// slowest release). The first frame's target was already right; only the
+    /// follower lagged. Measured in 10 ms windows from the first frame out,
+    /// against the level the same unit settles to.
+    #[test]
+    fn a_cleared_denoiser_is_back_on_the_noise_at_once() {
+        // The owner's bay as saved: Bank, lookahead on, REDUCE all the way.
+        let owners = DenoiseParams {
+            lookahead: 1.0,
+            reduce: 1.0,
+            ..on(DenoiseKernel::Bank)
+        };
+        let cases = DenoiseKernel::ALL
+            .into_iter()
+            .flat_map(|kernel| {
+                [DenoiseParams::default().release, 1.0]
+                    .map(|release| (kernel, DenoiseParams { release, ..on(kernel) }))
+            })
+            .chain([(DenoiseKernel::Bank, owners)]);
+        for (kernel, p) in cases {
+            let release = p.release;
+            {
+                let mut dn = learned(kernel, 0x5a, 0.05, SR, 1.0);
+                let mut noise = Noise::new(0x5b, 0.05, SR);
+                let settle = SR as usize;
+                let mut buf = noise.frames(settle);
+                for chunk in buf.chunks_mut(512) {
+                    dn.process(chunk, chunk.len() / 2, 2, &p);
+                }
+                let settled = rms_db(&buf, settle - SR as usize / 5);
+                let raw = rms_db(&noise.frames(SR as usize / 5), 0);
+                assert!(raw - settled > 6.0, "{}: nothing was cutting ({raw:.1} vs {settled:.1})", kernel.label());
+
+                dn.clear();
+                let lat = dn.latency() as usize;
+                let win = SR as usize / 100;
+                let span = lat + 20 * win;
+                let mut after = noise.frames(span);
+                for chunk in after.chunks_mut(512) {
+                    dn.process(chunk, chunk.len() / 2, 2, &p);
+                }
+                // From the first frame the new instance writes out.
+                let first = lat + lat / 4;
+                let mut worst = f32::MIN;
+                let mut k = 0;
+                while first + (k + 1) * win <= span {
+                    let at = &after[(first + k * win) * 2..(first + (k + 1) * win) * 2];
+                    worst = worst.max(rms_db(at, 0) - settled);
+                    k += 1;
+                }
+                assert!(
+                    worst < 3.0,
+                    "{} (release {release}): the cleared unit let the noise through {worst:.1} dB over its settled level",
+                    kernel.label()
+                );
+            }
+        }
     }
 
     /// Mono is left alone rather than half-processed, and a third channel
