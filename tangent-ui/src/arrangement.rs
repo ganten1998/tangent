@@ -1128,6 +1128,10 @@ pub struct DeskSnap {
     pub notation: Option<Notation>,
     /// See [`Look`].
     pub look: Option<Look>,
+    /// **The arrangement's grid and window.** See [`View`]. `None` in every
+    /// document written before it, which reads as "keep whatever the app
+    /// has" rather than as a set of zeroes.
+    pub view: Option<View>,
     /// **Which lanes are frozen, and to what file.** See [`FrozenLane`].
     ///
     /// The one desk field where "the document does not say" does NOT mean
@@ -1269,6 +1273,65 @@ pub struct Feel {
     pub triplet: bool,
     pub humanize_timing: u8,
     pub humanize_vel: u8,
+}
+
+/// **How the ARRANGEMENT was left looking** — its grid, and the shape of
+/// the window onto the song.
+///
+/// [`Feel`] is the MIDI editor's half of this and has been in the document
+/// for a while; this is the timeline's, and the owner asked for it on the
+/// same reasoning: "Make the met, grid, tempo arms all session dependent as
+/// well as the viewport and related settings". The metronome, the tempo, the
+/// signature and the editor's grid were already here. The arrangement's own
+/// grid and window were not, so a session opened on a machine that had last
+/// worked on something else came up with that other song's zoom and
+/// division.
+///
+/// **A song's grid is a property of the song.** A piece written in bars of
+/// 6/8 wants a different division from one in 4/4, and "how far in am I
+/// looking" is where somebody left off rather than a preference about
+/// Tangent.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct View {
+    /// `arr_snap`: the timeline's magnet.
+    pub snap: bool,
+    /// `arr_grid_exp`: which division its lines are drawn at.
+    pub grid_exp: i64,
+    /// `arr_tempo_lane`: whether the tempo lane is showing.
+    pub tempo_lane: bool,
+    /// `arr_master_row`: whether the master row is showing.
+    pub master_row: bool,
+    /// `arr_header_w`: how wide the track headers are.
+    pub header_w: f64,
+    /// `arr_visible`: how many lanes fit the window — the vertical zoom.
+    pub visible: u8,
+    /// `arr_visible_at`: **the pane height that count was chosen at**, which
+    /// has to travel WITH it. A count is a density, and `app::carried_count`
+    /// reads this to give the same lane height on a different display; a
+    /// document carrying the count alone would be scaled against whatever
+    /// height the last session happened to choose one at. Zero is "not
+    /// recorded", the settings field's own sentinel.
+    pub visible_at: f64,
+    /// **The quantize window's own grid and strength**, which travel here
+    /// rather than in [`Feel`] because they are the arrangement's question:
+    /// `Q` quantizes audio on the timeline and notes in the editor, and the
+    /// window states one grid for both.
+    pub quantize_grid_exp: i64,
+    pub quantize_triplet: bool,
+    pub quantize_swing_pct: f64,
+    pub quantize_strength_pct: f64,
+    pub quantize_window_ms: f64,
+    /// `quantize_sensitivity`: how readily the audio side calls something an
+    /// attack. A property of the MATERIAL on this timeline, which is why it
+    /// travels: the setting that finds a soft brush kit's hits buries a
+    /// close-miked snare in false ones.
+    pub quantize_sensitivity: f64,
+    /// `quantize_fit`: how a warped segment gets where it belongs, by key,
+    /// verbatim. Empty is auto. Carried as the word and never as an index,
+    /// the same rule `stretch_mode` and `Notation::tuning` keep — a name an
+    /// older build cannot resolve falls back at the point of use and is
+    /// never rewritten.
+    pub quantize_fit: String,
 }
 
 /// **What the music is written in** — the staff's key signature, whether
@@ -1449,6 +1512,8 @@ pub struct DeskRef<'a> {
     pub notation: Option<NotationRef<'a>>,
     /// See [`DeskSnap::look`].
     pub look: Option<LookRef<'a>>,
+    /// See [`DeskSnap::view`].
+    pub view: Option<ViewRef<'a>>,
     /// See [`DeskSnap::frozen`].
     pub frozen: Option<&'a [FrozenLane]>,
 }
@@ -1493,6 +1558,26 @@ pub struct LookRef<'a> {
     pub palette_auto: bool,
     /// See [`Look::view`].
     pub view: &'a str,
+}
+
+/// [`View`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct ViewRef<'a> {
+    pub snap: bool,
+    pub grid_exp: i64,
+    pub tempo_lane: bool,
+    pub master_row: bool,
+    pub header_w: f64,
+    pub visible: u8,
+    pub visible_at: f64,
+    pub quantize_grid_exp: i64,
+    pub quantize_triplet: bool,
+    pub quantize_swing_pct: f64,
+    pub quantize_strength_pct: f64,
+    pub quantize_window_ms: f64,
+    pub quantize_sensitivity: f64,
+    /// See [`View::quantize_fit`].
+    pub quantize_fit: &'a str,
 }
 
 /// [`Instruments`] borrowed — see [`DeskRef`].
@@ -1567,6 +1652,22 @@ impl DeskRef<'_> {
             }),
             transpose: self.transpose,
             count_in: self.count_in,
+            view: self.view.map(|v| View {
+                snap: v.snap,
+                grid_exp: v.grid_exp,
+                tempo_lane: v.tempo_lane,
+                master_row: v.master_row,
+                header_w: v.header_w,
+                visible: v.visible,
+                visible_at: v.visible_at,
+                quantize_grid_exp: v.quantize_grid_exp,
+                quantize_triplet: v.quantize_triplet,
+                quantize_swing_pct: v.quantize_swing_pct,
+                quantize_strength_pct: v.quantize_strength_pct,
+                quantize_window_ms: v.quantize_window_ms,
+                quantize_sensitivity: v.quantize_sensitivity,
+                quantize_fit: v.quantize_fit.to_owned(),
+            }),
             look: self.look.map(|l| Look {
                 theme: l.theme.to_owned(),
                 palette: l.palette,
@@ -1830,6 +1931,25 @@ impl DeskRef<'_> {
             // others moves every existing document's hash.
             f.str(l.view);
         }
+        // The arrangement's grid and window, appended by the same rule.
+        opt(f, self.view.is_some());
+        if let Some(v) = self.view {
+            f.bool(v.snap);
+            f.u64(v.grid_exp as u64);
+            f.bool(v.tempo_lane);
+            f.bool(v.master_row);
+            f.f64(v.header_w);
+            f.u64(u64::from(v.visible));
+            f.u64(v.quantize_grid_exp as u64);
+            f.bool(v.quantize_triplet);
+            f.f64(v.quantize_swing_pct);
+            f.f64(v.quantize_strength_pct);
+            f.f64(v.quantize_window_ms);
+            // Appended after the block's first eleven, by the same rule.
+            f.f64(v.visible_at);
+            f.f64(v.quantize_sensitivity);
+            f.str(if v.quantize_fit == "auto" { "" } else { v.quantize_fit });
+        }
     }
 }
 
@@ -1896,6 +2016,22 @@ impl DeskSnap {
             }),
             transpose: self.transpose,
             count_in: self.count_in,
+            view: self.view.as_ref().map(|v| ViewRef {
+                snap: v.snap,
+                grid_exp: v.grid_exp,
+                tempo_lane: v.tempo_lane,
+                master_row: v.master_row,
+                header_w: v.header_w,
+                visible: v.visible,
+                visible_at: v.visible_at,
+                quantize_grid_exp: v.quantize_grid_exp,
+                quantize_triplet: v.quantize_triplet,
+                quantize_swing_pct: v.quantize_swing_pct,
+                quantize_strength_pct: v.quantize_strength_pct,
+                quantize_window_ms: v.quantize_window_ms,
+                quantize_sensitivity: v.quantize_sensitivity,
+                quantize_fit: &v.quantize_fit,
+            }),
             look: self.look.as_ref().map(|l| LookRef {
                 theme: &l.theme,
                 palette: l.palette,
@@ -2163,6 +2299,28 @@ impl DeskSnap {
             lm.insert("palette_auto".into(), Value::Bool(l.palette_auto));
             lm.insert("view".into(), Value::String(l.view.to_owned()));
             m.insert("look".into(), Value::Object(lm));
+        }
+        if let Some(v) = self.view.as_ref() {
+            let mut vm = Map::new();
+            vm.insert("snap".into(), Value::Bool(v.snap));
+            vm.insert("grid_exp".into(), Value::Number(v.grid_exp.into()));
+            vm.insert("tempo_lane".into(), Value::Bool(v.tempo_lane));
+            vm.insert("master_row".into(), Value::Bool(v.master_row));
+            vm.insert("header_w".into(), serde_json::json!(v.header_w));
+            vm.insert("visible".into(), Value::Number(v.visible.into()));
+            vm.insert("q_grid_exp".into(), Value::Number(v.quantize_grid_exp.into()));
+            vm.insert("q_triplet".into(), Value::Bool(v.quantize_triplet));
+            vm.insert("q_swing_pct".into(), serde_json::json!(v.quantize_swing_pct));
+            vm.insert("q_strength_pct".into(), serde_json::json!(v.quantize_strength_pct));
+            vm.insert("q_window_ms".into(), serde_json::json!(v.quantize_window_ms));
+            vm.insert("visible_at".into(), serde_json::json!(v.visible_at));
+            vm.insert("q_sensitivity".into(), serde_json::json!(v.quantize_sensitivity));
+            // Auto is the empty word, one spelling, the way `stretch_mode`
+            // has it — or the document would not be a fixed point.
+            if !v.quantize_fit.is_empty() && v.quantize_fit != "auto" {
+                vm.insert("q_fit".into(), Value::String(v.quantize_fit.to_owned()));
+            }
+            m.insert("view".into(), Value::Object(vm));
         }
         if let Some(v) = self.take_name.as_ref() {
             m.insert("take_name".into(), Value::String(v.clone()));
@@ -2519,6 +2677,68 @@ impl DeskSnap {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 }
+            }),
+            // **Every field falls back to what the app already has**, which
+            // is why the reader takes a default from nowhere: a document
+            // written before one of these keys existed must not pull the
+            // arrangement to a zero it never chose. The caller applies this
+            // over its live settings and only the keys present move.
+            view: m.get("view").and_then(Value::as_object).map(|vm| View {
+                snap: vm.get("snap").and_then(Value::as_bool).unwrap_or(true),
+                grid_exp: vm.get("grid_exp").and_then(Value::as_i64).unwrap_or(-2).clamp(-7, 3),
+                tempo_lane: vm.get("tempo_lane").and_then(Value::as_bool).unwrap_or(false),
+                master_row: vm.get("master_row").and_then(Value::as_bool).unwrap_or(true),
+                header_w: vm
+                    .get("header_w")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0),
+                visible: vm
+                    .get("visible")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .unwrap_or(0),
+                quantize_grid_exp: vm
+                    .get("q_grid_exp")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-3)
+                    .clamp(-7, 3),
+                quantize_triplet: vm.get("q_triplet").and_then(Value::as_bool).unwrap_or(false),
+                quantize_swing_pct: vm
+                    .get("q_swing_pct")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(50.0)
+                    .clamp(50.0, 95.0),
+                quantize_strength_pct: vm
+                    .get("q_strength_pct")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(100.0)
+                    .clamp(0.0, 100.0),
+                quantize_window_ms: vm
+                    .get("q_window_ms")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 500.0),
+                visible_at: vm
+                    .get("visible_at")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(0.0),
+                quantize_sensitivity: vm
+                    .get("q_sensitivity")
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0),
+                quantize_fit: vm
+                    .get("q_fit")
+                    .and_then(Value::as_str)
+                    .filter(|w| *w != "auto")
+                    .unwrap_or_default()
+                    .to_owned(),
             }),
             look: m.get("look").and_then(Value::as_object).map(|lm| Look {
                 theme: lm
@@ -4878,6 +5098,25 @@ mod tests {
             }),
             transpose: Some(-3),
             count_in: Some(CountIn { bars: 2, beats: 8, in_take: true }),
+            // **NOT the defaults**, deliberately: this fixture exists to
+            // prove a round trip, and a field left at its default round-trips
+            // whether the writer carries it or not.
+            view: Some(View {
+                snap: false,
+                grid_exp: -5,
+                tempo_lane: true,
+                master_row: false,
+                header_w: 173.5,
+                visible: 9,
+                quantize_grid_exp: -4,
+                quantize_triplet: true,
+                quantize_swing_pct: 62.5,
+                quantize_strength_pct: 72.0,
+                quantize_window_ms: 35.0,
+                visible_at: 918.0,
+                quantize_sensitivity: 0.7,
+                quantize_fit: "slice".into(),
+            }),
             look: Some(Look {
                 theme: "Rhodes".into(),
                 palette: 6,
@@ -5272,6 +5511,9 @@ mod tests {
         fn desk(a: &mut Arrangement) -> &mut DeskSnap {
             a.desk.as_mut().unwrap()
         }
+        fn view(a: &mut Arrangement) -> &mut View {
+            desk(a).view.as_mut().unwrap()
+        }
         moves_both("the backing track's level", |a| desk(a).track_gain = Some(0.25));
         moves_both("that level going unsaid", |a| desk(a).track_gain = None);
         moves_both("the mono fold", |a| desk(a).master_mono = Some(false));
@@ -5332,6 +5574,35 @@ mod tests {
             desk(a).look.as_mut().unwrap().palette_auto = true;
         });
         moves_both("the look going unsaid", |a| desk(a).look = None);
+        // **The timeline's own grid and window.** Eleven fields, each one
+        // its own line, because the block was appended to the fingerprint
+        // as a whole and a whole block is exactly the shape that hashes
+        // right while one member of it is never read.
+        moves_both("the timeline's magnet", |a| view(a).snap = true);
+        moves_both("the timeline's grid", |a| view(a).grid_exp = -1);
+        moves_both("the tempo lane", |a| view(a).tempo_lane = false);
+        moves_both("the master row", |a| view(a).master_row = true);
+        moves_both("the width of the track headers", |a| view(a).header_w = 210.0);
+        moves_both("how many lanes are on screen", |a| view(a).visible = 5);
+        moves_both("the quantize grid", |a| view(a).quantize_grid_exp = -2);
+        moves_both("quantizing to triplets", |a| view(a).quantize_triplet = false);
+        moves_both("where quantize puts the off-beat", |a| {
+            view(a).quantize_swing_pct = 58.0;
+        });
+        moves_both("how hard quantize pulls", |a| view(a).quantize_strength_pct = 40.0);
+        moves_both("the window quantize leaves alone", |a| {
+            view(a).quantize_window_ms = 60.0;
+        });
+        moves_both("the height the lane count was chosen at", |a| {
+            view(a).visible_at = 1200.0;
+        });
+        moves_both("how readily an attack is called one", |a| {
+            view(a).quantize_sensitivity = 0.35;
+        });
+        moves_both("how a warped segment gets there", |a| {
+            view(a).quantize_fit = "stretch".into();
+        });
+        moves_both("the view going unsaid", |a| desk(a).view = None);
         moves_both("the take name", |a| desk(a).take_name = Some("etude".into()));
         // **A CLEARED name is not an unsaid one.** The empty string is a
         // document saying "no name", which a session holding one has to be
@@ -5529,6 +5800,13 @@ mod tests {
             a_document_with_everything_in_it(),
             |a| a.clips[1].stretch_mode = "auto".into(),
         );
+        // The same two spellings, one surface further out: the quantize
+        // window's fit, whose empty word and "auto" mean one thing.
+        let mut auto_fit = a_document_with_everything_in_it();
+        auto_fit.desk.as_mut().unwrap().view.as_mut().unwrap().quantize_fit = String::new();
+        moves_neither("the two spellings of no warp fit", auto_fit, |a| {
+            a.desk.as_mut().unwrap().view.as_mut().unwrap().quantize_fit = "auto".into();
+        });
         // A ONE-POINT tempo map is not written at all — the desk snapshot
         // carries the song's single tempo instead. So its value cannot move
         // the fingerprint, or every undo on a plain song would look like an

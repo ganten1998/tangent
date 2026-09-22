@@ -625,8 +625,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // on both sides: in here it moves audio onto the grid, in the
             // editor it moves notes. Audio only, for the same reason
             // normalise is — a note is moved where notes are edited.
-            ("Q", "quantise the selected audio clips to the grid"),
-            ("S-Q", "shift+Q: the quantize window - grid, strength, window, feel"),
+            ("Q", "the quantize window - grid, strength, window, feel"),
             // **C-M is the metronome now** and the master row took shift
             // with it - the owner's call, and the card is where a moved
             // shortcut has to be said or it is simply lost.
@@ -651,7 +650,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("J", "join the selected notes"),
             ("S", "split the selection at the playhead"),
             ("DEL", "delete the selection"),
-            ("Q", "quantise the selection to the grid"),
+            ("Q", "the quantize window - grid, strength, window, feel"),
             ("S-H", "humanize the selection: timing and velocity, by percent"),
             ("-/=", "zoom out / in, in steps, around the playhead"),
             ("W", "fit the clip"),

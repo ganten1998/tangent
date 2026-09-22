@@ -299,6 +299,22 @@ pub(crate) fn desk() -> DeskSnap {
 pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
     let sig = s.time_signature();
     DeskSnap {
+        view: Some(crate::arrangement::View {
+            snap: s.arr_snap,
+            grid_exp: s.arr_grid_exp,
+            tempo_lane: s.arr_tempo_lane,
+            master_row: s.arr_master_row,
+            header_w: s.arr_header_w,
+            visible: s.arr_visible,
+            quantize_grid_exp: s.quantize_grid_exp,
+            quantize_triplet: s.quantize_triplet,
+            quantize_swing_pct: s.quantize_swing_pct,
+            quantize_strength_pct: s.midi_quantize_pct,
+            quantize_window_ms: s.quantize_window_ms,
+            visible_at: f64::from(s.arr_visible_at),
+            quantize_sensitivity: s.quantize_sensitivity,
+            quantize_fit: s.quantize_fit.clone(),
+        }),
         kinds: s.channel_kinds.to_vec(),
         icons: s.channel_icons.to_vec(),
         names: s.strip_names.clone(),

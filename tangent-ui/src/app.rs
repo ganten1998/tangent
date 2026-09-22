@@ -7657,10 +7657,22 @@ impl TangentApp {
                     // "only a copy of the Countin and Sig options" is what a
                     // second panel would be FOR, and a copy is what drifts.
                     // The take tier already leads with those two.
+                    // **The two buttons open two SHAPES of one panel.**
+                    // Capture makes a take, so it opens everything about the
+                    // take; the red button is pressed in the moment, so it
+                    // opens the two settings somebody reaches for there and
+                    // nothing else. They were the same panel for a day and
+                    // the owner's answer was that the red button "should not"
+                    // do that.
                     match recorder_panel::hit_test(band, &view, pos) {
-                        Some(recorder_panel::Hit::Capture | recorder_panel::Hit::Record) => {
+                        Some(recorder_panel::Hit::Capture) => {
                             self.setup_open = true;
                             self.setup_shape = recorder_panel::SetupShape::Take;
+                            return;
+                        }
+                        Some(recorder_panel::Hit::Record) => {
+                            self.setup_open = true;
+                            self.setup_shape = recorder_panel::SetupShape::Rolling;
                             return;
                         }
                         _ => {}
@@ -7847,7 +7859,7 @@ impl TangentApp {
             if let Some(pos) = pointer {
                 let band = recorder_rect.unwrap_or(Rect::NOTHING);
                 let view = self.recorder_layout_view();
-                let anchor = recorder_panel::setup_rect(band, &view);
+                let anchor = self.setup_anchor(band, &view);
                 let panel =
                     recorder_panel::setup_popup_rect(ui.max_rect(), anchor, self.setup_shape);
                 match recorder_panel::setup_hit_test(
@@ -9891,6 +9903,24 @@ impl TangentApp {
             // `None` on this field means the DOCUMENT did not say, and a
             // live desk always does. See `DeskSnap::take_name`.
             take_name: Some(s.record_take_name.as_deref().unwrap_or_default()),
+            // The timeline's own grid and window — the arrangement's half of
+            // what `feel` is for the editor. See `arrangement::View`.
+            view: Some(crate::arrangement::ViewRef {
+                snap: s.arr_snap,
+                grid_exp: s.arr_grid_exp,
+                tempo_lane: s.arr_tempo_lane,
+                master_row: s.arr_master_row,
+                header_w: s.arr_header_w,
+                visible: s.arr_visible,
+                quantize_grid_exp: s.quantize_grid_exp,
+                quantize_triplet: s.quantize_triplet,
+                quantize_swing_pct: s.quantize_swing_pct,
+                quantize_strength_pct: s.midi_quantize_pct,
+                quantize_window_ms: s.quantize_window_ms,
+                visible_at: f64::from(s.arr_visible_at),
+                quantize_sensitivity: s.quantize_sensitivity,
+                quantize_fit: &s.quantize_fit,
+            }),
             feel: Some(crate::arrangement::Feel {
                 snap: s.midi_snap,
                 grid_exp: s.midi_grid_exp,
@@ -10221,6 +10251,53 @@ impl TangentApp {
             self.settings.midi_triplet = t.triplet;
             self.settings.midi_humanize_timing = t.humanize_timing.min(100);
             self.settings.midi_humanize_vel = t.humanize_vel.min(100);
+        }
+        // **The arrangement's grid and window**, the timeline's half of what
+        // `feel` is for the editor. Clamped on the way in exactly as the
+        // settings reader clamps them, or a document could hand the app a
+        // number its own file could never hold.
+        if let Some(v) = d.view.as_ref() {
+            self.settings.arr_snap = v.snap;
+            self.settings.arr_grid_exp = v.grid_exp.clamp(-7, 3);
+            self.settings.arr_tempo_lane = v.tempo_lane;
+            self.settings.arr_master_row = v.master_row;
+            // **Zero means "say nothing"**, for the two the app derives from
+            // the window when it has no opinion. A document written before
+            // these keys carries zero, and taking it literally would give
+            // every old session a track header of no width.
+            if v.header_w > 0.0 && v.header_w.is_finite() {
+                self.settings.arr_header_w = v.header_w;
+            }
+            // **The count and the height it was chosen at travel as a
+            // pair.** A count without its height is a density measured
+            // against whatever the last session happened to be looking at,
+            // which is the whole thing `carried_count` exists to avoid, so
+            // neither moves without the other.
+            if v.visible > 0 {
+                self.settings.arr_visible = v.visible;
+                self.settings.arr_visible_at = if v.visible_at.is_finite() {
+                    v.visible_at.clamp(0.0, f64::from(f32::MAX)) as f32
+                } else {
+                    0.0
+                };
+            }
+            self.settings.quantize_grid_exp = v.quantize_grid_exp.clamp(-7, 3);
+            self.settings.quantize_triplet = v.quantize_triplet;
+            if v.quantize_swing_pct.is_finite() {
+                self.settings.quantize_swing_pct = v.quantize_swing_pct.clamp(50.0, 95.0);
+            }
+            if v.quantize_strength_pct.is_finite() {
+                self.settings.midi_quantize_pct = v.quantize_strength_pct.clamp(0.0, 100.0);
+            }
+            if v.quantize_window_ms.is_finite() {
+                self.settings.quantize_window_ms = v.quantize_window_ms.clamp(0.0, 500.0);
+            }
+            if v.quantize_sensitivity.is_finite() {
+                self.settings.quantize_sensitivity = v.quantize_sensitivity.clamp(0.0, 1.0);
+            }
+            // Verbatim, and an EMPTY word is the real value "auto" rather
+            // than "does not say" — see `View::quantize_fit`.
+            self.settings.quantize_fit = v.quantize_fit.clone();
         }
         if let Some(n) = d.notation.as_ref() {
             self.settings.staff_key =
@@ -15727,58 +15804,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
     }
 
-    /// **Quantize the selected audio clips onto the arrangement's grid.**
-    ///
-    /// The audio twin of the editor's `Q`, and the same rule as every clip
-    /// action here: the marquee if there is one, otherwise the single
-    /// selection. MIDI clips are skipped rather than refused - a selection
-    /// of both means "quantize what can be quantized", and the MIDI editor
-    /// is where a note gets moved.
-    ///
-    /// The host does the work; this only says which clips and which grid.
-    /// The grid travels WITH the request for the reason
-    /// `ProjectRequest::QuantizeClips` gives: a host that looked it up again
-    /// could answer a different question than the one it was asked.
-    fn arr_quantize_selection(&mut self) {
-        let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
-        if let Some(one) = self.arr_selected {
-            if !ids.contains(&one) {
-                ids.push(one);
-            }
-        }
-        ids.retain(|id| {
-            self.arrangement
-                .clips
-                .iter()
-                .any(|c| c.id == *id && c.kind == crate::arrangement::ClipKind::Audio)
-        });
-        if ids.is_empty() {
-            self.notify(
-                crate::notify::Kind::Info,
-                "Nothing to quantize - select an audio clip first.",
-            );
-            return;
-        }
-        // **The arrangement's grid is straight**: it has no swing and no
-        // triplet, unlike the MIDI editor's. Passing `None` rather than
-        // inventing one is the honest answer - a swung audio quantize wants
-        // the editor's grid brought out here, which is a separate decision.
-        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
-        let sig = self.settings.time_signature();
-        let quarters = crate::arrangement_panel::grid_quarters(
-            self.settings.arr_grid_exp.clamp(-7, 3) as i8,
-            sig.beats,
-            sig.unit,
-        );
-        let step_s = quarters * (60.0 / bpm);
-        self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips {
-            ids,
-            step_s,
-            swing: None,
-            strength: self.settings.midi_quantize_pct.clamp(0.0, 100.0) / 100.0,
-        });
-    }
-
     /// **The set, or the one.** The same rule every clip action here follows:
     /// a marquee over eight takes means all eight.
     fn arr_normalize_selection(&mut self) {
@@ -16322,6 +16347,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// arrangement when it is open, the desk otherwise.
     fn met_stage(&self) -> Option<Rect> {
         self.arrangement_rect.or(self.mixer_rect)
+    }
+
+
+    /// **Where the setup panel hangs, asked once.**
+    ///
+    /// The draw took this from the capture button for the take shape while
+    /// the PRESS path still took it from the cog, so the take panel was
+    /// painted in one place and hit-tested in another: every press landed on
+    /// whatever the cog's geometry said was there, which is why its Done
+    /// button did nothing at all. One function now, and both roads call it.
+    fn setup_anchor(
+        &self,
+        band: Rect,
+        view: &recorder::RecorderView<'_>,
+    ) -> Rect {
+        match self.setup_shape {
+            recorder_panel::SetupShape::Machine => recorder_panel::setup_rect(band, view),
+            recorder_panel::SetupShape::Take => recorder_panel::capture_rect(band, view),
+            recorder_panel::SetupShape::Rolling => recorder_panel::record_rect(band, view),
+        }
     }
 
     /// Draw the metronome's panel, when it is up.
@@ -17159,48 +17204,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// MOVE the whole selection by the grabbed note's delta — every note
-    /// keeps its distance from the hand, and the CLIP's edges clamp the
-    /// set as one, so a chord cannot shear against its own notes.
-    /// **Quantize: put what was played on the grid the editor is showing.**
-    ///
-    /// The SELECTION if there is one, the whole clip if there is not - which
-    /// is what every desk means by the word and what a hand that has selected
-    /// nothing is asking for.
-    ///
-    /// Aimed at the grid the eye can see, because it goes through
-    /// `midi_edit_view` and therefore through the same `Grid` the magnet
-    /// snaps to. Straight, triplet or swung: a quantize on a swung grid lands
-    /// on the swung lines, which is the whole reason swing is a grid setting
-    /// and not a separate operation.
-    ///
-    /// **Clip-relative in, clip-relative out.** A note's `at_s` is measured
-    /// from the clip's own offset, and the grid is drawn on the TIMELINE, so
-    /// the arithmetic has to cross into absolute seconds and back. Getting
-    /// that wrong quantizes correctly against the wrong lines, which looks
-    /// almost right and is the kind of thing nobody notices until a clip is
-    /// moved off the bar.
-    fn me_quantize(&mut self) {
-        // **`Q` aims at the grid on screen**, which is the fast road. The
-        // window is the other one and states its own - see
-        // `apply_quantize_window`.
-        let Some(st) = self.midi_edit.as_ref() else {
-            return;
-        };
-        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
-            return;
-        };
-        let Some(grid) = crate::midi_editor::view_grid(&self.midi_edit_view(st, clip)) else {
-            return;
-        };
-        self.me_quantize_with(crate::quantize::Quantize {
-            grid,
-            strength: (self.settings.midi_quantize_pct.clamp(0.0, 100.0)) / 100.0,
-            window: (self.settings.quantize_window_ms > 0.0)
-                .then(|| self.settings.quantize_window_ms / 1000.0),
-        });
-    }
-
     /// [`me_quantize`](Self::me_quantize), told exactly what to do rather
     /// than working it out from the view.
     fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
@@ -17232,14 +17235,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         if moved > 0 {
-            // Sorted by `at` is a contract of this list, and a quantize can
-            // reorder it: two notes a hair apart can cross when one is late
+            // **Sorted by `at` is a contract of this list**, and a quantize
+            // can reorder it: two notes a hair apart cross when one is late
             // and the other early. The selection is indices INTO that list,
-            // so it cannot survive the sort and is dropped rather than left
-            // pointing at whatever moved into the slot.
-            clip.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+            // so it cannot simply survive the sort.
+            //
+            // **Carried through it, not dropped.** Dropping was the first
+            // answer and it is wrong: a hand that quantizes and then nudges
+            // or duplicates has done two halves of one gesture, and an
+            // emptied selection makes the second half do nothing at all.
+            // So the sort is performed on (index, note) pairs and the
+            // selection is rewritten from where each of its notes landed.
+            let mut order: Vec<usize> = (0..clip.notes.len()).collect();
+            order.sort_by(|&a, &b| clip.notes[a].at_s.total_cmp(&clip.notes[b].at_s));
+            let mut where_now = vec![0usize; clip.notes.len()];
+            for (to, &from) in order.iter().enumerate() {
+                where_now[from] = to;
+            }
+            let sorted: Vec<_> = order.iter().map(|&i| clip.notes[i].clone()).collect();
+            clip.notes = sorted;
             if let Some(st) = self.midi_edit.as_mut() {
-                st.selected.clear();
+                for i in &mut st.selected {
+                    *i = where_now.get(*i).copied().unwrap_or(*i);
+                }
+                st.selected.sort_unstable();
             }
             self.undo_commit();
         }
@@ -17835,42 +17854,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 st.dirty = true;
             }
         }
-    }
-
-    /// QUANTISE the selection: starts to the grid, held durations kept.
-    fn me_quantise(&mut self) {
-        let Some(st) = self.midi_edit.as_ref() else {
-            return;
-        };
-        let id = st.id;
-        let sel = st.selected.clone();
-        if sel.is_empty() {
-            return;
-        }
-        // Snap in absolute time, through the one authority.
-        let mut moves: Vec<(usize, f64)> = Vec::new();
-        {
-            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
-                return;
-            };
-            for &i in &sel {
-                let Some(n) = clip.notes.get(i) else { continue };
-                let abs = clip.start_s + (n.at_s - clip.offset_s);
-                let to = self.me_snap(abs).clamp(
-                    clip.start_s,
-                    (clip.start_s + clip.len_s - n.dur_s.max(0.05)).max(clip.start_s),
-                );
-                moves.push((i, clip.offset_s + (to - clip.start_s)));
-            }
-        }
-        if let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
-            for (i, at) in moves {
-                if let Some(n) = clip.notes.get_mut(i) {
-                    n.at_s = at;
-                }
-            }
-        }
-        self.arr_save_edits();
     }
 
     /// **One grid step, in seconds** — the reference HUMANIZE measures its
@@ -21270,11 +21253,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 self.save_settings();
             }
-            // Q puts the selection on the grid; Z fits the clip back in
-            // the window; Cmd+A takes everything; Cmd+D lays a copy one
-            // step later. The arrows nudge — a step along, a semitone up.
+            // Q raises the quantize window; Z fits the clip back in the
+            // window; Cmd+A takes everything; Cmd+D lays a copy one step
+            // later. The arrows nudge — a step along, a semitone up.
+            //
+            // **Q ASKS rather than acts**, since the owner used both: a
+            // quantize is aimed before it is fired, and the grid that
+            // happens to be on screen is rarely the grid somebody meant.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
-                self.me_quantise();
+                self.open_quantize_window();
             }
             // **H hangs the HUMANIZE menu** — the owner's "a midi editor
             // command H for humanize - Timing percentage change, Velocity
@@ -21497,11 +21484,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.me_insert_at_playhead();
             }
 
-            // **Q quantizes**, the one letter every desk agrees on. Bare,
-            // because every modifier on it means something else here and a
-            // quantize is not a thing to make somebody reach for.
+            // **Q raises the quantize window**, the one letter every desk
+            // agrees on. Bare, because every modifier on it means something
+            // else here and a quantize is not a thing to make somebody reach
+            // for. The window quantizes notes while the editor is open and
+            // audio when it is not, so one key is right in both places.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
-                self.me_quantize();
+                self.open_quantize_window();
             }
 
             // **Delete deletes; Backspace also steps back.** See `me_backspace`.
@@ -24714,29 +24703,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
         }
-        // **Shift+Q: the quantize window**, where every knob lives. Checked
-        // before the bare Q below, which is the same letter without it.
-        if keys_ok
-            && ctx.input(|i| {
-                i.modifiers.shift
-                    && !i.modifiers.command
-                    && !i.modifiers.ctrl
-                    && i.key_pressed(egui::Key::Q)
-            })
-        {
-            self.open_quantize_window();
-        }
-        // **Q: quantize what you are looking at.**
+        // **Q opens the quantize window, every time.**
         //
-        // The same letter the MIDI editor uses, and deliberately: in the
-        // editor it moves notes, out here it moves audio. A hand that has
-        // learned one has learned the other, and the two can never fire at
-        // once because this is guarded on the editor being closed.
-        if keys_ok
-            && self.midi_edit.is_none()
-            && ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q))
-        {
-            self.arr_quantize_selection();
+        // It used to quantize immediately at whatever grid was on screen,
+        // with Shift+Q for the window. The owner's call after using both:
+        // "I also want Q to bring up the quantize menu every time
+        // (centered), and for the shift q to be unbound." A key that ACTS
+        // rather than asks is the wrong shape for this one - a quantize is a
+        // thing you aim before you fire, and the grid on screen is rarely
+        // the grid you meant.
+        //
+        // Not guarded on the editor being closed: the window quantizes notes
+        // when the editor is open and audio when it is not, so the one key
+        // is right in both places.
+        if keys_ok && ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
+            self.open_quantize_window();
         }
         // **Ctrl/Cmd+Shift+N: normalise.**
         //
@@ -24802,9 +24783,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.met_menu = None;
                 self.met_at = None;
             } else {
-                self.met_at = ctx.pointer_hover_pos().or_else(|| {
-                    self.met_stage().map(|r| r.center())
-                });
+                // **CENTRED, not at the pointer.** It opened where the hand
+                // was, on the reasoning that a summon should not make you
+                // travel; the owner's answer after living with it was to
+                // centre it. A panel that appears somewhere different every
+                // time is one you have to FIND, and the eye goes to the
+                // middle of the window on its own.
+                self.met_at = self.met_stage().map(|r| r.center());
                 self.met_menu = Some(());
             }
         }
@@ -36696,14 +36681,7 @@ impl TangentApp {
                     // panel belongs under the capture button, for the same
                     // reason - a popup that appears somewhere other than the
                     // thing pressed reads as a different window.
-                    match self.setup_shape {
-                        recorder_panel::SetupShape::Machine => {
-                            recorder_panel::setup_rect(rect, &view)
-                        }
-                        recorder_panel::SetupShape::Take => {
-                            recorder_panel::capture_rect(rect, &view)
-                        }
-                    },
+                    self.setup_anchor(rect, &view),
                     &view,
                     &self.settings,
                     self.setup_shape,
@@ -39195,7 +39173,15 @@ mod tests {
         });
         app.arr_multi = [audio, midi].into_iter().collect();
 
-        app.arr_quantize_selection();
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 100.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        });
         match app.take_project_request() {
             Some(crate::ports::ProjectRequest::QuantizeClips { ids, step_s, swing, strength }) => {
                 assert_eq!(ids, vec![audio], "the MIDI clip was sent to an audio quantize");
@@ -39210,7 +39196,15 @@ mod tests {
         // And a selection with no audio in it asks for nothing at all.
         app.arr_multi = [midi].into_iter().collect();
         app.arr_selected = None;
-        app.arr_quantize_selection();
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 100.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        });
         assert!(
             app.take_project_request().is_none(),
             "a MIDI-only selection still asked the host to quantize audio"
@@ -39267,8 +39261,16 @@ mod tests {
         app.open_midi_editor(id);
 
         // FULL strength: every note on the nearest half second.
-        app.settings.midi_quantize_pct = 100.0;
-        app.me_quantize();
+        app.settings.quantize_grid_exp = -2;
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 100.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        });
         let at: Vec<f64> = app.arrangement.clips.iter()
             .find(|c| c.id == id).expect("the clip")
             .notes.iter().map(|n| n.at_s).collect();
@@ -39292,8 +39294,15 @@ mod tests {
             ..Default::default()
         });
         app.open_midi_editor(id2);
-        app.settings.midi_quantize_pct = 50.0;
-        app.me_quantize();
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 50.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        });
         let half = app.arrangement.clips.iter()
             .find(|c| c.id == id2).expect("the clip")
             .notes[0].at_s;
@@ -39929,7 +39938,15 @@ mod tests {
         // at 120 bpm. Named rather than inherited for the reason
         // `the_midi_editor_edits_the_document` gives.
         app.settings.midi_grid_exp = -4;
-        app.me_quantise();
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -4,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 100.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        });
         let ats: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
         assert!((ats[0] - 0.0).abs() < 1e-9, "{ats:? }");
         assert!((ats[1] - 1.0).abs() < 1e-9);
@@ -40576,6 +40593,21 @@ mod tests {
         app.set_insert(2, 0, Some("/x/EP.vst3"));
         app.settings.channel_gains[2] = 0.42;
         app.settings.record_export.tempo_bpm = 93.0;
+        // And the timeline's own grid and window, the half of the desk the
+        // arrangement owns: a magnet, a grid, a header width, a lane count
+        // and what quantize is set to.
+        app.settings.arr_snap = false;
+        app.settings.arr_grid_exp = -5;
+        app.settings.arr_header_w = 211.0;
+        app.settings.arr_visible = 9;
+        app.settings.arr_visible_at = 1180.0;
+        app.settings.quantize_sensitivity = 0.34;
+        app.settings.quantize_fit = "slice".to_owned();
+        app.settings.quantize_grid_exp = -4;
+        app.settings.quantize_triplet = true;
+        app.settings.quantize_swing_pct = 63.0;
+        app.settings.midi_quantize_pct = 71.0;
+        app.settings.quantize_window_ms = 45.0;
         // **Saved on purpose.** `arr_save_edits` no longer writes — the
         // autosave is retired — so a test that reads the disk has to ask for
         // the save the person would have asked for.
@@ -40589,6 +40621,34 @@ mod tests {
         assert_eq!(desk.bay(2 * recorder::INSERTS), Some("/x/EP.vst3"));
         assert!((desk.gains[2] - 0.42).abs() < 1e-9);
         assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
+        let view = desk.view.expect("the save left the timeline's view out");
+        assert!(!view.snap, "the magnet did not travel");
+        assert_eq!(view.grid_exp, -5, "the timeline's grid did not travel");
+        assert!((view.header_w - 211.0).abs() < 1e-9, "the header width did not travel");
+        assert_eq!(view.visible, 9, "the lane count did not travel");
+        assert!(
+            (view.visible_at - 1180.0).abs() < 1e-9,
+            "the height the count was chosen at did not travel"
+        );
+        assert!(
+            (view.quantize_sensitivity - 0.34).abs() < 1e-9,
+            "the attack sensitivity did not travel"
+        );
+        assert_eq!(view.quantize_fit, "slice", "the warp fit did not travel");
+        assert_eq!(view.quantize_grid_exp, -4, "the quantize grid did not travel");
+        assert!(view.quantize_triplet, "the triplet switch did not travel");
+        assert!(
+            (view.quantize_swing_pct - 63.0).abs() < 1e-9,
+            "the quantize swing did not travel"
+        );
+        assert!(
+            (view.quantize_strength_pct - 71.0).abs() < 1e-9,
+            "the quantize strength did not travel"
+        );
+        assert!(
+            (view.quantize_window_ms - 45.0).abs() < 1e-9,
+            "the quantize window did not travel"
+        );
 
         // A DIFFERENT app (fresh settings) opens it: the desk arrives.
         let (_ctx2, mut other) = headless_with(Caps::DESKTOP, Settings::default());
@@ -40597,6 +40657,36 @@ mod tests {
         assert_eq!(other.insert(2, 0), Some("/x/EP.vst3"));
         assert!((other.settings.channel_gains[2] - 0.42).abs() < 1e-9);
         assert!((other.settings.record_export.tempo_bpm - 93.0).abs() < 1e-9);
+        assert!(!other.settings.arr_snap, "the magnet did not arrive");
+        assert_eq!(other.settings.arr_grid_exp, -5, "the timeline's grid did not arrive");
+        assert!(
+            (other.settings.arr_header_w - 211.0).abs() < 1e-9,
+            "the header width did not arrive"
+        );
+        assert_eq!(other.settings.arr_visible, 9, "the lane count did not arrive");
+        assert!(
+            (other.settings.arr_visible_at - 1180.0).abs() < 1e-3,
+            "the height the count was chosen at did not arrive"
+        );
+        assert!(
+            (other.settings.quantize_sensitivity - 0.34).abs() < 1e-9,
+            "the attack sensitivity did not arrive"
+        );
+        assert_eq!(other.settings.quantize_fit, "slice", "the warp fit did not arrive");
+        assert_eq!(other.settings.quantize_grid_exp, -4, "the quantize grid did not arrive");
+        assert!(other.settings.quantize_triplet, "the triplet switch did not arrive");
+        assert!(
+            (other.settings.quantize_swing_pct - 63.0).abs() < 1e-9,
+            "the quantize swing did not arrive"
+        );
+        assert!(
+            (other.settings.midi_quantize_pct - 71.0).abs() < 1e-9,
+            "the quantize strength did not arrive"
+        );
+        assert!(
+            (other.settings.quantize_window_ms - 45.0).abs() < 1e-9,
+            "the quantize window did not arrive"
+        );
         assert!(
             other.take_desk_reload(),
             "the host was not told to reload the bays"
@@ -45518,6 +45608,11 @@ mod tests {
             "insert_keys",
             "insert_bypass",
             "instruments",
+            // The arrangement's grid and window, added later still. Zero is
+            // a real value for two of its fields — a header of no width and
+            // no lanes visible — so an absent block that read as zeroes
+            // would give every old session an unusable timeline.
+            "view",
         ] {
             assert!(desk.remove(k).is_some(), "{k} was never written");
         }
@@ -45532,17 +45627,41 @@ mod tests {
             gain: 0.25,
         }]);
         app.settings.strip_dx7_patch[1] = 23;
+        app.settings.arr_grid_exp = -5;
+        app.settings.arr_header_w = 210.0;
+        app.settings.arr_visible = 7;
+        app.settings.quantize_window_ms = 40.0;
+        app.settings.quantize_fit = "stretch".to_owned();
         let keep = (
             app.settings.strip_phase,
             app.settings.strip_to_theory.clone(),
             app.settings.routes.clone(),
             app.settings.strip_dx7_patch.clone(),
         );
+        let view_keep = (
+            app.settings.arr_grid_exp,
+            app.settings.arr_header_w,
+            app.settings.arr_visible,
+            app.settings.quantize_window_ms,
+            app.settings.quantize_fit.clone(),
+        );
         app.open_project(&doc);
         assert_eq!(app.settings.strip_phase, keep.0, "polarity was cleared");
         assert_eq!(app.settings.strip_to_theory, keep.1, "the theory sends were cleared");
         assert_eq!(app.settings.routes, keep.2, "the routing was cleared");
         assert_eq!(app.settings.strip_dx7_patch, keep.3, "the patches were reset");
+        assert_eq!(app.settings.arr_grid_exp, view_keep.0, "the timeline's grid was reset");
+        assert!(
+            (app.settings.arr_header_w - view_keep.1).abs() < 1e-9,
+            "the track headers were squashed to {}",
+            app.settings.arr_header_w
+        );
+        assert_eq!(app.settings.arr_visible, view_keep.2, "the lane count was reset");
+        assert!(
+            (app.settings.quantize_window_ms - view_keep.3).abs() < 1e-9,
+            "the quantize window was reset"
+        );
+        assert_eq!(app.settings.quantize_fit, view_keep.4, "the warp fit was reset");
         // And it does not read as unsaved work merely for being old.
         assert!(
             !app.project_dirty(),

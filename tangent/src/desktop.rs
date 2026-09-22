@@ -3186,6 +3186,59 @@ fn stretched_clip_audio(
     }
 }
 
+
+/// **The live path's warped audio, with its own picture.**
+    ///
+    /// The export road works in `Arc<Clip>` because a bounce only needs
+    /// samples; this one needs a [`Decoded`] - samples AND a pyramid -
+    /// because the clip that gets drawn is drawn from that pyramid. A warped
+    /// clip drawn from the FILE's pyramid is the picture that does not move,
+    /// which is how the whole gap was noticed.
+    ///
+    /// Rendered inline and cached, unlike a stretch, which hands its render
+    /// to the crew and shows a stand-in meanwhile. A warp is the same class
+    /// of work and deserves the same treatment; it does not have it yet, so
+    /// a long take will pause once on the frame after it is quantized and
+    /// never again. Said out loud rather than discovered.
+///
+/// A free function over the CACHE rather than a method, because the caller
+/// is inside `for clip in &self.app.arrangement().clips` and cannot hand out
+/// `&mut self` while that borrow stands.
+#[cfg(feature = "recorder")]
+fn warped_live(
+    clip: &tangent_ui::arrangement::ArrClip,
+    path: &std::path::Path,
+    decoded: Decoded,
+    cache: &mut std::collections::HashMap<StretchKey, Decoded>,
+) -> Decoded {
+    if clip.warp.len() < 2 {
+        return decoded;
+    }
+    let (f0, t0) = clip.warp[0];
+    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    let key: StretchKey = (
+        path.to_path_buf(),
+        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
+        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
+    );
+    if let Some(made) = cache.get(&key) {
+        return made.clone();
+    }
+    let anchors: Vec<crate::warp::Anchor> = clip
+        .warp
+        .iter()
+        .map(|&(from, to)| crate::warp::Anchor {
+            from: usize::try_from(from).unwrap_or(usize::MAX),
+            to: usize::try_from(to).unwrap_or(usize::MAX),
+        })
+        .collect();
+    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
+    let fit = crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default();
+    let made = Decoded::of(crate::warp::warp(&decoded.clip, &anchors, mode, fit));
+    cache.insert(key, made.clone());
+    made
+    }
+
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
 ///
@@ -11087,6 +11140,22 @@ impl DesktopApp {
             // rest), with `file_s` what the render will measure, so trims
             // and the drag itself keep their numbers; no pyramid is handed
             // over, because its time base would be the wrong one.
+            // **The WARP, before anything else looks at this audio.**
+            //
+            // It was wired into `stretched_clip_audio` and nowhere else -
+            // and that function serves `start_offline_render` alone. So a
+            // quantize moved the audio in an EXPORT and in nothing a person
+            // could hear or see: playback read this road, the picture reads
+            // this road, and neither knew about it. Reported as "i'm not
+            // sure quantizing is actually occuring with the takes I have --
+            // their waveforms do not visually change", which is exactly
+            // what that looks like from the outside.
+            //
+            // Done here, above the stretch branch, so everything below - the
+            // trim, the fades, the picture, the frame counts - works on the
+            // warped audio without knowing it, which is the argument the
+            // stretch's own comment makes one screen up.
+            let decoded = warped_live(clip, &path, decoded, &mut self.stretch_cache);
             let (decoded, stand_in) = match stretch_key(clip, &path) {
                 None => (decoded, None),
                 Some((key, mode)) => {
@@ -22257,6 +22326,89 @@ mod tests {
                 "a second amp re-seeded the board and switched a pedal back off"
             );
         }
+    }
+
+    /// **The LIVE path warps too, and carries a picture of what it warped.**
+    ///
+    /// The warp was wired into `stretched_clip_audio`, which serves
+    /// `start_offline_render` and nothing else - so a quantize moved the
+    /// audio in an EXPORT and in nothing anybody could hear or see.
+    /// Playback and the drawn waveform both come off the road this covers.
+    /// Reported as "i'm not sure quantizing is actually occuring with the
+    /// takes I have -- their waveforms do not visually change".
+    ///
+    /// Two halves, and the second is the one that was missing. The audio has
+    /// to change, and the PICTURE has to change with it: a `Decoded` carries
+    /// a pyramid, and handing back one built from the FILE would draw a
+    /// warped clip as though nothing had happened.
+    #[test]
+    fn the_live_path_warps_the_audio_and_its_picture_with_it() {
+        // A click at the very start of a second of silence, so a warp that
+        // moves it is visible in the samples and in the pyramid.
+        let rate = 8_000u32;
+        let mut samples = vec![0.0f32; rate as usize * 2 * 2];
+        for f in 0..80 {
+            samples[f * 2] = 0.8;
+            samples[f * 2 + 1] = 0.8;
+        }
+        let decoded = Decoded::of(tangent_record::decode::Clip {
+            samples,
+            rate,
+            source: std::path::PathBuf::from("a.wav"),
+        });
+        let path = std::path::PathBuf::from("a.wav");
+        let mut cache = std::collections::HashMap::new();
+
+        // Unwarped: handed straight back, same pointer, nothing rendered.
+        let plain = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "a.wav".to_owned(),
+            lane: 0,
+            len_s: 1.0,
+            ..Default::default()
+        };
+        let same = warped_live(&plain, &path, decoded.clone(), &mut cache);
+        assert!(
+            Arc::ptr_eq(&same.clip, &decoded.clip),
+            "an unwarped clip was re-rendered"
+        );
+        assert!(cache.is_empty(), "an unwarped clip took a cache slot");
+
+        // Warped: the click is asked to move half a second later.
+        let half = u64::from(rate) / 2;
+        let warped_clip = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, half), (u64::from(rate), u64::from(rate) + half)],
+            ..plain.clone()
+        };
+        let out = warped_live(&warped_clip, &path, decoded.clone(), &mut cache);
+        assert!(!Arc::ptr_eq(&out.clip, &decoded.clip), "the warp rendered nothing");
+
+        // **The audio moved.** The first tenth is silent now and the click
+        // is somewhere after it, which is the whole of what a quantize does.
+        let head_peak = out.clip.samples[..(rate as usize / 10) * 2]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(head_peak < 0.05, "the click is still at the start: {head_peak}");
+        let all_peak = out.clip.samples.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(all_peak > 0.3, "the warp lost the click entirely: {all_peak}");
+
+        // **And the PICTURE moved with it**, which is the half that was
+        // missing: the pyramid is the warped clip's, not the file's.
+        let (was_lo, was_hi) = decoded.peaks.minmax_s(0.0, 0.05);
+        let (now_lo, now_hi) = out.peaks.minmax_s(0.0, 0.05);
+        assert!(
+            was_hi - was_lo > 0.3,
+            "the fixture's own picture has no click at its start"
+        );
+        assert!(
+            now_hi - now_lo < 0.1,
+            "the drawn picture still shows a click the audio no longer has"
+        );
+
+        // Asked twice, rendered once.
+        assert_eq!(cache.len(), 1, "the warp did not cache");
+        let again = warped_live(&warped_clip, &path, decoded, &mut cache);
+        assert!(Arc::ptr_eq(&again.clip, &out.clip), "the warp rendered twice");
     }
 
     /// **The export renders the STRETCHED audio, at the stretched length.**
