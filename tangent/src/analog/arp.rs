@@ -194,6 +194,18 @@ impl Arp {
         self.sounding
     }
 
+    /// The same note, and the arpeggiator forgets it — for a caller that is
+    /// stopping it ITSELF.
+    ///
+    /// Without this the switch leaving a mode races [`Arp::run`]: the run
+    /// that sees the mode off pushes an `Off` for whatever was sounding at
+    /// frame 0, which lands on top of the chord the caller has just put back
+    /// under the player's fingers and cuts the one note they share.
+    pub fn take_sounding(&mut self) -> Option<u8> {
+        self.gate_left = 0;
+        self.sounding.take()
+    }
+
     /// The pattern's keys in the order the mode walks them, with the
     /// octave spread applied: entry `i` of `n · octaves`.
     fn note_at(&self, p: &ArpParams, i: usize) -> Option<(u8, u8)> {
@@ -263,6 +275,23 @@ impl Arp {
     /// Walk `frames` of time and collect what to play. With the song
     /// playing the grid is the playhead's; stopped, it is the free clock's.
     pub fn run(&mut self, p: &ArpParams, t: Transport, frames: usize, out: &mut Vec<ArpOut>) {
+        // **The song's tempo, ALWAYS - rolling or not.**
+        //
+        // Both arms below used to take it under `if t.playing`, so a stopped
+        // transport free-ran at whatever `Arp::new` seeded (120) until
+        // somebody pressed play once. Auditioning a patch is the one thing
+        // you do with the transport stopped, so on a 90 bpm song a held
+        // chord at 1/8 gave four notes a second instead of three, and it
+        // came right the moment you rolled past and stopped again - which
+        // reads as an arp that is not wired to the tempo at all. The owner
+        // put it exactly that way.
+        //
+        // The module header above already promised this ("the clock keeps
+        // running at the last tempo it saw"); "saw" quietly meant "saw
+        // while rolling". Only the CLOCK is conditional now, which is the
+        // part that genuinely is: a rolling transport owns the position, a
+        // stopped one has to keep its own.
+        self.bpm = t.bpm.max(1.0);
         self.hold = p.hold;
         if !p.hold {
             // **The latch came off: keep what is physically down.**
@@ -289,7 +318,6 @@ impl Arp {
             }
             // Keep the clock in step with the song even while silent.
             if t.playing {
-                self.bpm = t.bpm.max(1.0);
                 self.clock = t.beat;
             } else {
                 self.clock += frames as f64 * self.bpm / 60.0 / self.rate;
@@ -297,7 +325,6 @@ impl Arp {
             return;
         }
         if t.playing {
-            self.bpm = t.bpm.max(1.0);
             self.clock = t.beat;
         }
         let step_beats = ARP_RATES[p.rate.min(ARP_RATES.len() - 1)].1;
@@ -472,6 +499,81 @@ mod tests {
     /// 100 bpm, the first boundary after the start lands where the
     /// playhead crosses beat 1.0 — 0.1 beats in, 2880 frames — and not on
     /// the block's own clock.
+    /// **STOPPED, it runs at the song's tempo and not at 120.**
+    ///
+    /// Auditioning a patch is the one thing you do with the transport
+    /// stopped, and both tempo assignments used to sit under `if
+    /// t.playing` - so the arp free-ran at whatever `Arp::new` seeded until
+    /// somebody pressed play once, and came right the moment they stopped
+    /// again. The owner: "i am not sure that analog's arp is hooked up with
+    /// it's rate and the project tempo."
+    ///
+    /// The tempos are chosen so the two answers cannot be confused: at 90
+    /// bpm an eighth is 1/3 s and at 120 it is 1/4 s, so one second holds
+    /// three steps or four.
+    #[test]
+    fn stopped_it_runs_at_the_songs_tempo_and_not_at_a_default() {
+        let steps = |bpm: f64| -> usize {
+            let mut arp = Arp::new(SR);
+            arp.key_down(60, 100);
+            arp.key_down(64, 100);
+            arp.key_down(67, 100);
+            let p = ArpParams {
+                mode: ArpMode::Up,
+                // 1/8 - index 2 in `ARP_RATES`.
+                rate: 2,
+                octaves: 1,
+                gate: 0.5,
+                hold: false,
+            };
+            // STOPPED, and the beat it carries is irrelevant while it is.
+            let t = Transport { bpm, playing: false, beat: 0.0 };
+            run_secs(&mut arp, &p, t, 1.0)
+                .iter()
+                .filter(|(_, o)| matches!(o, ArpOut::On { .. }))
+                .count()
+        };
+        // A fresh `Arp` has never seen a rolling transport, which is the
+        // case that was broken: the seed was 120 and nothing overwrote it.
+        assert_eq!(steps(120.0), 4, "the fixture does not step at 120");
+        assert_eq!(
+            steps(90.0),
+            3,
+            "a stopped arp ignored the song's tempo and free-ran at its seed"
+        );
+        assert_eq!(
+            steps(180.0),
+            6,
+            "a stopped arp ignored a tempo ABOVE its seed too"
+        );
+
+        // **And a tempo changed while stopped is followed**, rather than
+        // latched at whatever it first saw.
+        let mut arp = Arp::new(SR);
+        arp.key_down(60, 100);
+        let p = ArpParams {
+            mode: ArpMode::Up,
+            rate: 2,
+            octaves: 1,
+            gate: 0.5,
+            hold: false,
+        };
+        let slow = Transport { bpm: 60.0, playing: false, beat: 0.0 };
+        let fast = Transport { bpm: 240.0, playing: false, beat: 0.0 };
+        let a = run_secs(&mut arp, &p, slow, 1.0)
+            .iter()
+            .filter(|(_, o)| matches!(o, ArpOut::On { .. }))
+            .count();
+        let b = run_secs(&mut arp, &p, fast, 1.0)
+            .iter()
+            .filter(|(_, o)| matches!(o, ArpOut::On { .. }))
+            .count();
+        assert!(
+            b > a * 3,
+            "the dial moved from 60 to 240 while stopped and the arp went {a} -> {b}"
+        );
+    }
+
     #[test]
     fn a_playing_transport_places_steps_on_its_own_grid() {
         let mut arp = Arp::new(SR);

@@ -413,6 +413,13 @@ impl FilterBank {
     }
 }
 
+/// A key's velocity as the arpeggiator wants it: 1..=127, never 0, since a
+/// zero there would read as a note OFF.
+#[inline]
+fn arp_vel(vel: f32) -> u8 {
+    (vel * 127.0).round().clamp(1.0, 127.0) as u8
+}
+
 /// A lane number into its group and position.
 #[inline]
 fn split(l: u8) -> (usize, usize) {
@@ -443,6 +450,14 @@ pub struct Analog {
     arp_out: Vec<ArpOut>,
     /// Keys down for the mono side, in press order, with velocities.
     held: Vec<(u8, f32)>,
+    /// **Every key physically down, whatever the voice mode**, in press
+    /// order. `held` is the mono side's own list and stays empty in poly,
+    /// where the voices are the only record of what is down — and a voice
+    /// is no use to the ARP switch, which has to hand a chord from the
+    /// keyboard to the arpeggiator and back. See `hand_over_arp`.
+    keys_down: Vec<(u8, f32)>,
+    /// The ARP switch as the last chunk found it, to notice it MOVING.
+    arp_was: ArpMode,
     sustain: bool,
     bend: f32,
     wheel: f32,
@@ -485,6 +500,8 @@ impl Analog {
             arp: Arp::new(rate),
             arp_out: Vec::with_capacity(64),
             held: Vec::with_capacity(64),
+            keys_down: Vec::with_capacity(64),
+            arp_was: ArpMode::Off,
             sustain: false,
             bend: 0.0,
             wheel: 0.0,
@@ -568,6 +585,7 @@ impl Analog {
             c.left = 0;
         }
         self.held.clear();
+        self.keys_down.clear();
         self.arp.clear();
         self.ensemble.clear();
         self.sustain = false;
@@ -615,15 +633,80 @@ impl Analog {
 
     // ── notes ──────────────────────────────────────────────────────────
 
+    /// **The ARP switch, moved with a chord under your hands.**
+    ///
+    /// `note_on` routes on the mode as it stands, so the switch used to
+    /// decide nothing for a key already down. Two ways that showed:
+    ///
+    /// * Holding a chord and switching the arp ON did nothing at all - the
+    ///   chord went on droning and no step ever played, because the
+    ///   arpeggiator's pattern was empty and only a fresh press could fill
+    ///   it. That reads exactly like an arp that is not wired up, which is
+    ///   what the owner reported.
+    /// * Switching it OFF and letting go left the keys in the arpeggiator,
+    ///   since `note_off` had already routed away from it. Switching it
+    ///   back on then played a chord nobody was holding.
+    ///
+    /// So the switch hands the keys across. On, the fingered chord stops
+    /// and becomes the pattern - `Arp::run` fires its first step on the
+    /// next frame rather than the next boundary, so the arpeggio speaks at
+    /// once. Off, the arpeggiator's own note stops and what is under your
+    /// hands sounds. A move between two ON modes hands nothing over: the
+    /// pattern is already right and re-seeding it would restart the walk.
+    ///
+    /// No allocation: `keys_down` is moved out and put back, so the Vec
+    /// this walks is the one it already had.
+    fn hand_over_arp(&mut self, mode: ArpMode) {
+        let was_off = self.arp_was == ArpMode::Off;
+        let now_off = mode == ArpMode::Off;
+        self.arp_was = mode;
+        if was_off == now_off {
+            return;
+        }
+        let keys = std::mem::take(&mut self.keys_down);
+        if now_off {
+            // Taken rather than read, so the `run` below does not push an
+            // `Off` at frame 0 over the chord we are about to sound.
+            if let Some(k) = self.arp.take_sounding() {
+                self.release(k);
+            }
+            for &(k, v) in &keys {
+                self.play(k, v);
+            }
+        } else {
+            for &(k, _) in &keys {
+                self.release(k);
+            }
+            // **The pattern becomes exactly what is physically down**, and
+            // nothing else: the keys the arpeggiator still holds from before
+            // it was switched off are stale, since `note_off` routed away
+            // from it while it was off. Clearing here and not on the way off
+            // is what makes that one rule rather than two - and it is where
+            // a hold LATCH ends too, for the same reason `Arp::key_down`
+            // starts a new pattern on a fresh press after one.
+            self.arp.all_up();
+            for &(k, v) in &keys {
+                self.arp.key_down(k, arp_vel(v));
+            }
+        }
+        self.keys_down = keys;
+    }
+
     pub fn note_on(&mut self, key: u8, vel: f32) {
+        // Kept whichever road the key takes below, and in press order: this
+        // is what the ARP switch hands over when it moves.
+        if !self.keys_down.iter().any(|d| d.0 == key) && self.keys_down.len() < 64 {
+            self.keys_down.push((key, vel));
+        }
         if self.arp_mode() != ArpMode::Off {
-            self.arp.key_down(key, (vel * 127.0).round().clamp(1.0, 127.0) as u8);
+            self.arp.key_down(key, arp_vel(vel));
             return;
         }
         self.play(key, vel);
     }
 
     pub fn note_off(&mut self, key: u8) {
+        self.keys_down.retain(|d| d.0 != key);
         if self.arp_mode() != ArpMode::Off {
             self.arp.key_up(key);
             return;
@@ -633,6 +716,7 @@ impl Analog {
 
     pub fn all_notes_off(&mut self) {
         self.held.clear();
+        self.keys_down.clear();
         self.arp.all_up();
         for v in &mut self.voices {
             if v.gate || v.sustained {
@@ -1024,9 +1108,15 @@ impl Analog {
                 self.smooth[i] += coef * (self.vals[i] - self.smooth[i]);
             }
         }
-        // The arpeggiator, first: its notes land inside this chunk.
+        // The arpeggiator, first: its notes land inside this chunk. The
+        // switch is read here rather than where it is set, so automation
+        // moves it exactly as a hand does.
+        let mode = self.arp_mode();
+        if mode != self.arp_was {
+            self.hand_over_arp(mode);
+        }
         let ap = ArpParams {
-            mode: self.arp_mode(),
+            mode,
             rate: rate_index(self.vals[P_ARP_RATE]),
             octaves: step_index(self.vals[P_ARP_OCT], 4) as u8 + 1,
             gate: self.vals[P_ARP_GATE],
@@ -2164,6 +2254,150 @@ mod tests {
     fn sixteen_voices_with_ensemble_meet_the_briefs_forty_times_gate() {
         let factor = realtime_factor();
         assert!(factor >= CPU_GATE, "16 voices render at {factor:.1}x realtime against the brief's {CPU_GATE}x");
+    }
+
+    /// Onsets inside a window: the envelope in 10 ms hops, rises from
+    /// under a quarter of THAT window's peak to over half of it. Each
+    /// window is measured against itself, because a three-note chord and a
+    /// one-note arp step are nowhere near the same height.
+    fn onsets_in(x: &[f32]) -> usize {
+        let e = measure::envelope(x, ms(10.0));
+        let pk = e.iter().cloned().fold(0.0_f32, f32::max);
+        if pk <= 1.0e-4 {
+            return 0;
+        }
+        let mut n = 0;
+        let mut low = true;
+        for &v in &e {
+            if low && v > 0.5 * pk {
+                n += 1;
+                low = false;
+            } else if !low && v < 0.25 * pk {
+                low = true;
+            }
+        }
+        n
+    }
+
+    /// **The ARP switch acts on a chord already under your hands.**
+    ///
+    /// `note_on` routes on the mode as it stands, so turning the arp on
+    /// while holding a chord used to do nothing whatever: the chord went on
+    /// droning and not one step played, because only a fresh press could
+    /// fill the pattern. The owner read that as the arp not being wired to
+    /// anything.
+    #[test]
+    fn turning_the_arp_on_takes_over_a_chord_already_held() {
+        let mut setup = CLEAN.to_vec();
+        setup.push((P_ARP_MODE as u32, 0.0)); // off, to start
+        setup.push((P_ARP_RATE as u32, 4.0 / 6.0)); // 1/16 at 120: 8 a second
+        setup.push((P_A_DECAY as u32, 0.2));
+        setup.push((P_A_SUSTAIN as u32, 0.0));
+        let x = mono(&script(
+            &setup,
+            &[
+                (0, Ev::On(60, 100)),
+                (0, Ev::On(64, 100)),
+                (0, Ev::On(67, 100)),
+                // The switch, with all three keys still down.
+                (secs(0.5), Ev::Param(P_ARP_MODE as u32, 0.2)), // up
+            ],
+            secs(1.5),
+        ));
+        // Before the switch: one strike, the chord.
+        let before = onsets_in(&x[..secs(0.45)]);
+        assert_eq!(before, 1, "{before} onsets before the switch, from one chord");
+        // After it: the arpeggio, without anybody pressing a key again.
+        let after = onsets_in(&x[secs(0.55)..]);
+        assert!(
+            (6..=9).contains(&after),
+            "{after} onsets in the 0.95 s after the arp was switched on over a held chord"
+        );
+    }
+
+    /// **And switching it OFF hands the chord back, leaving nothing for a
+    /// later switch-on to replay.**
+    ///
+    /// `note_off` routed on the mode too, so keys let go after the arp went
+    /// off stayed in the arpeggiator: switching it back on played a chord
+    /// nobody was holding.
+    #[test]
+    fn turning_the_arp_off_hands_the_chord_back_and_keeps_no_ghost() {
+        let mut setup = CLEAN.to_vec();
+        setup.push((P_ARP_MODE as u32, 0.2)); // up
+        setup.push((P_ARP_RATE as u32, 4.0 / 6.0));
+        setup.push((P_A_DECAY as u32, 0.2));
+        setup.push((P_A_SUSTAIN as u32, 0.0));
+        let x = mono(&script(
+            &setup,
+            &[
+                (0, Ev::On(60, 100)),
+                (0, Ev::On(64, 100)),
+                (0, Ev::On(67, 100)),
+                (secs(0.4), Ev::Param(P_ARP_MODE as u32, 0.0)), // off, still held
+                (secs(0.7), Ev::Off(60)),
+                (secs(0.7), Ev::Off(64)),
+                (secs(0.7), Ev::Off(67)),
+                (secs(1.0), Ev::Param(P_ARP_MODE as u32, 0.2)), // up again
+            ],
+            secs(1.8),
+        ));
+        // The switch going off strikes what is under your hands.
+        let handed_back = peak(&x[secs(0.4)..secs(0.6)]);
+        let arping = peak(&x[secs(0.1)..secs(0.4)]);
+        assert!(
+            handed_back > 0.5 * arping,
+            "the chord handed back peaks at {handed_back:.4} against the arpeggio's {arping:.4}"
+        );
+        // And from 1.0 s the arp is on again with nothing held: silence,
+        // past the 0.3 s release of the chord let go at 0.7.
+        let ghost = peak(&x[secs(1.2)..]);
+        assert!(
+            ghost < 0.002,
+            "the arp replayed a chord nobody was holding: {ghost:.4} peak after it came back on"
+        );
+    }
+
+    /// **Moving between two ON modes hands nothing over.**
+    ///
+    /// The handover above re-seeds the pattern, which resets the walk to its
+    /// first note. That is right when the arp is coming on and wrong when it
+    /// is merely changing direction under a chord already arpeggiating: the
+    /// switch passes through its middle positions as it is dragged, and each
+    /// one would jump the walk back to the bottom of the chord.
+    ///
+    /// C-E-G at 1/4, the arp UP, so the steps are 60, 64, 67, 60 - and then
+    /// DOWN from where the walk stands, which is 64. A walk reset to zero
+    /// would answer 67 instead, and the strongest bin says which.
+    #[test]
+    fn changing_the_arps_direction_keeps_its_place_in_the_walk() {
+        let mut setup = CLEAN.to_vec();
+        setup.push((P_ARP_MODE as u32, 0.2)); // up
+        setup.push((P_ARP_RATE as u32, 0.0)); // 1/4: 500 ms a step at 120
+        setup.push((P_ARP_OCT as u32, 0.0)); // one octave, so three steps
+        setup.push((P_ARP_GATE as u32, 0.9));
+        setup.push((P_A_SUSTAIN as u32, 1.0));
+        setup.push((P_A_DECAY as u32, 0.0));
+        setup.push((P_A_RELEASE as u32, 0.0));
+        let x = mono(&script(
+            &setup,
+            &[
+                (0, Ev::On(60, 100)),
+                (0, Ev::On(64, 100)),
+                (0, Ev::On(67, 100)),
+                // Between the fourth step and the fifth, chord still down.
+                (secs(1.9), Ev::Param(P_ARP_MODE as u32, 0.4)), // down
+            ],
+            secs(2.6),
+        ));
+        let w = &x[secs(2.1)..secs(2.4)];
+        let c = measure::goertzel_hann(w, 261.626, SR);
+        let e = measure::goertzel_hann(w, 329.628, SR);
+        let g = measure::goertzel_hann(w, 391.995, SR);
+        assert!(
+            e > c && e > g,
+            "the first DOWN step is not E: C {c:.4}, E {e:.4}, G {g:.4}"
+        );
     }
 
     /// An arpeggio plays through the instrument: three keys held with
