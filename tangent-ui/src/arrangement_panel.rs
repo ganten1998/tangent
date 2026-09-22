@@ -648,7 +648,7 @@ impl Hit {
             | Hit::FadeIn(id)
             | Hit::FadeOut(id) => Some(id),
             _ => None,
-        }
+            }
     }
 }
 
@@ -5097,27 +5097,44 @@ fn draw_clip_marks(
     let found_ink = MARK_INK;
     let target_ink = ink.gamma_multiply(0.55);
     let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
-    for &(found_s, target_s) in clip.marks {
-        // Source seconds -> the clip's own drawn timeline.
-        let at = clip.start_s + (f64::from(found_s) - clip.offset_s);
-        let to = clip.start_s + (f64::from(target_s) - clip.offset_s);
-        let x = x_of_in(l, view, at);
-        if x < r.left() || x > r.right() {
-            continue;
-        }
-        if (to - at).abs() > per_px {
-            let tx = x_of_in(l, view, to);
-            if tx >= r.left() && tx <= r.right() {
-                painter.line_segment(
-                    [Pos2::new(tx, top), Pos2::new(tx, bot)],
-                    Stroke::new(1.0_f32, target_ink),
-                );
+    // **Every pass of a loop, not just the first.** A looped clip plays its
+    // section over and over and the wave is drawn that way (`wave_band`
+    // folds the same way), so ticks on the first pass alone would say the
+    // attacks stop after one bar. Clamped, because `len_s / loop_s` on a
+    // very short loop is a number nobody wants to iterate.
+    let looped = clip.loop_s > 1.0e-6 && clip.loop_s.is_finite();
+    let passes: usize = if looped {
+        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512)
+    } else {
+        1
+    };
+    for pass in 0..passes {
+        // Zero for an unlooped clip, whose `loop_s` may not even be finite -
+        // `inf * 0.0` is NaN, and a NaN x is a line drawn nowhere in
+        // particular.
+        let shift = if looped { clip.loop_s * pass as f64 } else { 0.0 };
+        for &(found_s, target_s) in clip.marks {
+            // Source seconds -> the clip's own drawn timeline.
+            let at = clip.start_s + (f64::from(found_s) - clip.offset_s) + shift;
+            let to = clip.start_s + (f64::from(target_s) - clip.offset_s) + shift;
+            let x = x_of_in(l, view, at);
+            if x < r.left() || x > r.right() {
+                continue;
             }
+            if (to - at).abs() > per_px {
+                let tx = x_of_in(l, view, to);
+                if tx >= r.left() && tx <= r.right() {
+                    painter.line_segment(
+                        [Pos2::new(tx, top), Pos2::new(tx, bot)],
+                        Stroke::new(1.0_f32, target_ink),
+                    );
+                }
+            }
+            painter.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, bot)],
+                Stroke::new(1.0_f32, found_ink),
+            );
         }
-        painter.line_segment(
-            [Pos2::new(x, top), Pos2::new(x, bot)],
-            Stroke::new(1.0_f32, found_ink),
-        );
     }
 }
 
@@ -11910,6 +11927,44 @@ selected: false,
             }
         }
         got
+    }
+
+    /// **A looped clip is marked in every pass.**
+    ///
+    /// The wave is drawn pass by pass (`wave_band` folds the same way), so
+    /// ticks on the first pass alone say the attacks stop after one bar -
+    /// which for a looped take is the whole of what somebody is looking at.
+    #[test]
+    fn a_looped_clip_is_marked_in_every_pass() {
+        let area = rect();
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let notes: Vec<crate::arrangement::ArrNote> = Vec::new();
+        let marks = [(0.5_f32, 0.5_f32)];
+        let ticks = |loop_s: f64, len_s: f64| -> usize {
+            let clips = [ClipView {
+                peaks: Some(&peaks),
+                len_s,
+                max_len_s: 8.0,
+                loop_s,
+                marks: &marks,
+                ..a_looped_clip(&notes, 2.0, 2.0)
+            }];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = 8.0;
+            v.song_s = 12.0;
+            let body = clip_rect(area, &v, &clips[0]);
+            wave_columns_xy_in(&v, body)
+                .into_iter()
+                .filter(|(_, top, bot)| bot - top > body.height() * 0.8)
+                .count()
+        };
+        // Unlooped: one attack, one tick.
+        assert_eq!(ticks(0.0, 4.0), 1, "an unlooped clip drew the wrong count");
+        // Four passes of a one-second loop: four.
+        assert_eq!(ticks(1.0, 4.0), 4, "a looped clip was marked in its first pass only");
+        // A loop longer than the clip is one pass, not a fraction of one.
+        assert_eq!(ticks(6.0, 4.0), 1, "a loop longer than its clip drew twice");
     }
 
     /// **The quantize window's marks are drawn, where the detector put
