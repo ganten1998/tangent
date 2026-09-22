@@ -13114,6 +13114,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     selected: self.arr_selected == Some(c.id)
                         || self.arr_multi.contains(&c.id),
                     midi: c.kind == crate::arrangement::ClipKind::Midi,
+                    gain: c.gain as f32,
                 }
             })
             .collect();
@@ -13146,6 +13147,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         selected: false,
                         midi: *is_midi,
                         recording: true,
+                        gain: 1.0,
                     });
                 }
             }
