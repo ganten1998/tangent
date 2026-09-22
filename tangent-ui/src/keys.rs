@@ -627,7 +627,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // normalise is — a note is moved where notes are edited.
             ("Q", "quantise the selected audio clips to the grid"),
             ("S-Q", "shift+Q: the quantize window - grid, strength, window, feel"),
-            ("C-M", "the master row on/off"),
+            // **C-M is the metronome now** and the master row took shift
+            // with it - the owner's call, and the card is where a moved
+            // shortcut has to be said or it is simply lost.
+            ("C-M", "the metronome panel, at the pointer"),
+            ("C-S-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
             ("S-3", "shift+3: the mixer"),

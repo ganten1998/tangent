@@ -7268,6 +7268,30 @@ mod tests {
         assert_eq!(met_hit_test(screen, anchor, sound[1].center()), Some(MetHit::SoundPick));
         assert_eq!(met_hit_test(screen, anchor, l.close.center()), Some(MetHit::Close));
 
+        // **COUNT-IN, on the beats row's own shape.** It moved here from the
+        // Setup panel - two tiers away from the thing it counts - so it has
+        // to answer like everything else the panel draws. The middle cell is
+        // a READOUT and must not change anything, the same rule the beat
+        // count follows three rows above it.
+        let count = MetLayout::cells(l.rows[5], 3);
+        assert_eq!(met_hit_test(screen, anchor, count[0].center()), Some(MetHit::CountIn(-1)));
+        assert_eq!(met_hit_test(screen, anchor, count[2].center()), Some(MetHit::CountIn(1)));
+        assert!(
+            !matches!(
+                met_hit_test(screen, anchor, count[1].center()),
+                Some(MetHit::CountIn(_))
+            ),
+            "the count-in readout stepped the count"
+        );
+        // And the in-take row answers across its whole width: it is one
+        // question with two words, not two controls.
+        for cell in MetLayout::cells(l.rows[6], 2) {
+            assert_eq!(
+                met_hit_test(screen, anchor, cell.center()),
+                Some(MetHit::CountInInTake)
+            );
+        }
+
         // The tempo answers along its whole ROW, not just the two-point well
         // — a hand a little high still moves it — and reads 0 at the left end
         // and 1 at the right.
@@ -11228,11 +11252,20 @@ impl VariLayout {
 
 /// The metronome panel's proportions. See [`draw_met`].
 const MET_W: (f32, f32, f32) = (0.22, 260.0, 380.0);
-const MET_ASPECT: f32 = 1.02;
+/// Taller since count-in arrived: two more rows out of five, over a panel
+/// that is mostly rows.
+const MET_ASPECT: f32 = 1.34;
 /// Where a row's control starts and ends, as a fraction of the row.
 const MET_TRACK: (f32, f32) = (0.32, 0.98);
-/// TEMPO, BEATS, UNIT, CLICK, SOUND.
-const MET_ROWS: usize = 5;
+/// TEMPO, BEATS, UNIT, CLICK, SOUND, COUNT-IN, IN-TAKE.
+///
+/// **Count-in joined the metronome** on the owner's call: "move the relevant
+/// timing/met controls (countin and time sig) to the metronome icon's right
+/// click menu". The signature was already here as the BEATS and UNIT rows -
+/// a time signature IS how many beats and what kind - so what actually
+/// moved is the count, which had been living in the Setup panel two tiers
+/// away from the thing it counts.
+const MET_ROWS: usize = 7;
 
 /// **The metronome's right-click panel, built like the dials' own.**
 ///
@@ -11357,6 +11390,10 @@ pub struct MetView<'a> {
     pub div: i64,
     /// The chosen click file, or empty for the one that ships.
     pub sample: &'a str,
+    /// Count-in length, in BARS at this signature. Zero is none.
+    pub count_in_bars: i64,
+    /// Whether the count-in keeps clicking once the take has started.
+    pub count_in_in_take: bool,
 }
 
 /// What a press inside the metronome panel means.
@@ -11370,6 +11407,10 @@ pub enum MetHit {
     Unit(u8),
     /// One of [`MET_DIVS`].
     Div(i64),
+    /// One count-in bar fewer, or one more.
+    CountIn(i8),
+    /// Whether the count-in keeps clicking into the take.
+    CountInInTake,
     /// Choose a click sound.
     SoundPick,
     /// Back to the one that ships.
@@ -11436,6 +11477,19 @@ pub fn met_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<MetHit> {
     }
     if sound.get(1).is_some_and(|c| c.contains(pos)) {
         return Some(MetHit::SoundPick);
+    }
+    // COUNT-IN: minus, the count, plus — the BEATS row's own shape, because
+    // it is the same kind of question and a hand should not have to learn a
+    // second way to step a number in one panel.
+    let count = MetLayout::cells(l.rows[5], 3);
+    if count.first().is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::CountIn(-1));
+    }
+    if count.get(2).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::CountIn(1));
+    }
+    if l.rows[6].contains(pos) {
+        return Some(MetHit::CountInInTake);
     }
     None
 }
@@ -11604,6 +11658,42 @@ pub fn draw_met(
             cell(*pick, &name, !v.sample.is_empty());
         }
     }
+    // ── COUNT-IN: minus, the count, plus ──
+    //
+    // **The BEATS row's own shape**, deliberately: it is the same kind of
+    // question, and a hand should not have to learn a second way to step a
+    // number inside one panel.
+    let row = l.rows[5];
+    if row.is_positive() {
+        label(row, "COUNT");
+        let cells = MetLayout::cells(row, 3);
+        if let [minus, count, plus] = cells.as_slice() {
+            cell(*minus, "-", false);
+            // **Bars, and it says so.** "2" alone in a metronome panel could
+            // be two of anything; in 6/8 two bars is twelve clicks and the
+            // difference matters. Zero is spelled "off" rather than "0 bars",
+            // because none is a state and not a quantity.
+            let word = match v.count_in_bars.max(0) {
+                0 => "off".to_owned(),
+                1 => "1 bar".to_owned(),
+                n => format!("{n} bars"),
+            };
+            cell(*count, &word, false);
+            cell(*plus, "+", false);
+        }
+    }
+
+    // ── IN TAKE: does the count keep clicking once it is rolling ──
+    let row = l.rows[6];
+    if row.is_positive() {
+        label(row, "IN TAKE");
+        let cells = MetLayout::cells(row, 2);
+        if let [off, on] = cells.as_slice() {
+            cell(*off, "stops", !v.count_in_in_take);
+            cell(*on, "carries on", v.count_in_in_take);
+        }
+    }
+
 }
 
 /// What a press inside the varispeed range panel means.

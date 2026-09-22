@@ -1105,6 +1105,15 @@ pub struct TangentApp {
     /// `recorder_panel::draw_met`. `Some(())` because it has no state of its
     /// own: it hangs off the toolbar button, whose rect the layout knows.
     met_menu: Option<()>,
+    /// **Where the metronome panel was summoned**, when it was summoned by
+    /// the keyboard rather than by pressing its icon.
+    ///
+    /// `None` means the icon, and the panel hangs off it as it always has.
+    /// `Some` is Cmd+M's "wherever the pointer is", which is the whole
+    /// difference between a shortcut and a second way to click the same
+    /// chip: a panel that opened across the window from the hand would be
+    /// slower than reaching for the icon.
+    met_at: Option<Pos2>,
     /// A drag along the panel's tempo track, once one has begun.
     met_drag: bool,
     /// The meters' held picture: rise instant, fall exponential — the
@@ -3850,6 +3859,7 @@ impl TangentApp {
             arr_marker_sel: None,
             arr_fx_menu: None,
             met_menu: None,
+            met_at: None,
             met_drag: false,
             meter_hold: [[0.0; 2]; recorder::STRIPS],
             history: Vec::new(),
@@ -7312,7 +7322,13 @@ impl TangentApp {
     /// somebody works in for hours should not fidget — but at that rate
     /// nothing is travelling, it is one colour slowly changing its mind, and
     /// the owner's word was that it has to move.
-    const HEART_CYCLE_S: f64 = 6.0;
+    ///
+    /// **Twelve, not six** — the owner again, once six had been lived with:
+    /// "half the heart's animation speed". A longer cycle is a slower wave,
+    /// since this is the seconds one lap takes. Still travelling, which was
+    /// the whole objection to twenty-four, and no longer the only thing in
+    /// the corner of the eye that is moving.
+    const HEART_CYCLE_S: f64 = 12.0;
 
     /// **How often an animated heart asks to be drawn**, while the window is
     /// looked at.
@@ -7329,8 +7345,11 @@ impl TangentApp {
     /// the one no test ever saw.
     ///
     /// The wave is STEPPED (see `heart_wave`) and advances one band every
-    /// `HEART_CYCLE_S / 16`, 375 ms; the cheater's swirl turns once in ten
-    /// seconds. A hundred milliseconds draws every pixel either can change.
+    /// `HEART_CYCLE_S / 16` — 750 ms since the cycle was slowed to twelve
+    /// seconds; the cheater's swirl turns once in ten. A hundred
+    /// milliseconds still draws every pixel either can change, and the tick
+    /// is deliberately NOT derived from the cycle: it is the rate at which
+    /// asking is cheap, not the rate at which the picture moves.
     /// And an unfocused or minimised window asks for nothing at all: a heart
     /// nobody is looking at still moves, at the idle poll, for free.
     const HEART_TICK: Duration = Duration::from_millis(100);
@@ -16234,6 +16253,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// as its own button". One panel, two doors, and the anchor decides where
     /// it opens rather than each caller deciding.
     fn met_anchor(&self, rect: Rect) -> Rect {
+        // **Summoned at the pointer beats hanging off a chip somewhere
+        // else.** A one-point rect is enough: `MetLayout` only reads the
+        // anchor to decide which side to fall on and gets clamped to the
+        // surface either way.
+        if let Some(p) = self.met_at {
+            return Rect::from_center_size(p, Vec2::splat(1.0));
+        }
         if self.arrangement_rect.is_some() {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
@@ -16272,6 +16298,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             rect,
             self.met_anchor(rect),
             recorder_panel::MetView {
+                count_in_bars: self.settings.record_count_in_bars.clamp(0, 8),
+                count_in_in_take: self.settings.record_count_in_in_take,
                 bpm: self.tempo_bpm(),
                 beats: sig.beats,
                 unit: sig.unit,
@@ -16314,6 +16342,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
             if down && !inside && !self.met_drag {
                 self.met_menu = None;
+                // **The summon point dies with the panel**, or the next
+                // press on the icon would open it at a stale cursor.
+                self.met_at = None;
                 self.met_drag = false;
                 self.menu_ate_press = true;
                 return true;
@@ -16353,6 +16384,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         match hit {
             Some(MetHit::Close) => {
                 self.met_menu = None;
+                self.met_at = None;
             }
             Some(MetHit::Tempo(t)) => {
                 self.met_drag = true;
@@ -16369,6 +16401,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             Some(MetHit::Div(div)) => {
                 self.settings.metronome_div = div.clamp(0, 8);
+                self.save_settings();
+            }
+            // **Bars, clamped at nothing.** Zero is off and there is no
+            // negative count-in; eight bars is already longer than anybody
+            // waits through twice.
+            Some(MetHit::CountIn(d)) => {
+                self.settings.record_count_in_bars =
+                    (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
+                self.save_settings();
+            }
+            Some(MetHit::CountInInTake) => {
+                self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
             }
             Some(MetHit::SoundPick) => {
@@ -24699,14 +24743,44 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.add_track_first_free();
         }
-        // **Ctrl/Cmd+M: show or hide the MASTER row.** It cannot be removed
-        // the way a track can — a bus you can delete and not get back is one
-        // people delete once and then go looking for — so this is the way it
-        // goes away, and it comes back the same way.
+        // **Ctrl/Cmd+M: the metronome panel, at the pointer.** The owner's
+        // call: the click's own settings - tempo, signature, count-in -
+        // should be one chord away from wherever the hand already is,
+        // rather than a reach for a chip in the corner.
+        //
+        // It DISPLACED the master row, which had this chord and now has
+        // shift with it. Said out loud because a shortcut that quietly
+        // changes what it does is worse than one that moves.
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
-                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::M)
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::M)
+            })
+        {
+            if self.met_menu.is_some() {
+                // A second press closes it, which is what a summon chord
+                // should do - otherwise the only way out is the mouse.
+                self.met_menu = None;
+                self.met_at = None;
+            } else {
+                self.met_at = ctx.pointer_hover_pos().or_else(|| {
+                    self.met_stage().map(|r| r.center())
+                });
+                self.met_menu = Some(());
+            }
+        }
+        // **Ctrl/Cmd+Shift+M: show or hide the MASTER row.** It cannot be
+        // removed the way a track can — a bus you can delete and not get
+        // back is one people delete once and then go looking for — so this
+        // is the way it goes away, and it comes back the same way.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && i.modifiers.shift
+                    && i.key_pressed(egui::Key::M)
             })
         {
             self.settings.arr_master_row = !self.settings.arr_master_row;
