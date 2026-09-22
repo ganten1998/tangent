@@ -145,6 +145,23 @@ fn lcd_split(r: Rect) -> f32 {
     (1.909 * r.height() / r.width()).clamp(0.28, 0.475)
 }
 
+/// **The LCD's scope glass**: its right-hand side, where the oscilloscope is
+/// drawn - and, while a take runs, the take's own readout. One geometry for
+/// both, so the readout covers exactly the glass and nothing the LCD's drag
+/// cells own. `NOTHING`, never an inverted sliver, when there is no room.
+fn lcd_scope_rect(lcd: Rect) -> Rect {
+    if !lcd.is_positive() {
+        return Rect::NOTHING;
+    }
+    let side = slice_h(lcd, lcd_split(lcd) + 0.025, 0.99);
+    let r = slice_v(side, 0.07, 0.93).shrink2(Vec2::new(2.0, 0.0));
+    if r.is_positive() {
+        r
+    } else {
+        Rect::NOTHING
+    }
+}
+
 pub fn camera_split_x(rect: Rect, view: &RecorderView<'_>) -> f32 {
     Layout::new(rect, view).preview.right()
 }
@@ -965,7 +982,9 @@ struct Layout {
     /// An indicator and not a control, so it is not a hit.
     stop: Rect,
     meter: Rect,
-    /// The big readout. [`Rect::NOTHING`] when the clock is suppressed.
+    /// The take's readout - the count-in digit, the take's clock, FINISHING -
+    /// on the LCD's scope glass. [`Rect::NOTHING`] at rest and when the
+    /// clock is hidden.
     timecode: Rect,
 
     // ── the timeline ──
@@ -1442,11 +1461,10 @@ impl Layout {
         // already placed — not from a fraction of this row, which would agree
         // with it only by luck and only at one window size.
         //
-        // **And the clock takes its place while a take runs.** The tempo
-        // cannot be changed mid-take — the `.mid`'s tempo map is already
-        // written — so leaving a live knob there would be a control that lies.
-        // What goes in its place is the one number anybody looks at from a
-        // piano bench, in the row their hand is already on.
+        // **And it stays through a take.** The take's clock used to take this
+        // slot, on the ruling that the tempo could not change mid-take; the
+        // owner wants the main controls intact while recording takes, and the
+        // take's readout lives on the LCD's glass now. See `fill_rolling`.
         let head = if self.fx[0].is_positive() {
             let size = Vec2::new(
                 self.fx[0].width().min(bar.width() * 0.5),
@@ -1584,18 +1602,22 @@ impl Layout {
                 Vec2::new(knob_w, head.height()),
             )
         });
-        if rolling {
-            self.timecode = head;
-            self.tempo_tap = Rect::NOTHING;
-        } else {
-            self.tempo = head;
-            self.tempo_tap = centre(1).map_or(Rect::NOTHING, |cx| {
-                Rect::from_center_size(
-                    Pos2::new(cx, line),
-                    Vec2::new(tap_w.min(widths[1]), (side * 0.9).clamp(11.0, 16.0)),
-                )
-            });
-        }
+        // **The tempo stays in the row through a take**, in both layouts - the
+        // owner: "the main buttons need to be intact while recording takes".
+        // The take's own readout, which used to take this slot, lives on the
+        // LCD's glass now (see `fill_rolling`). A tempo moved mid-take plays
+        // at the new tempo while the take's `.mid` keeps the one tempo mark it
+        // started with: its event times stay exact, only its bar lines after
+        // the move stop matching. During a count-in it is held still - see
+        // `RecorderState::tempo_held`.
+        let _ = rolling;
+        self.tempo = head;
+        self.tempo_tap = centre(1).map_or(Rect::NOTHING, |cx| {
+            Rect::from_center_size(
+                Pos2::new(cx, line),
+                Vec2::new(tap_w.min(widths[1]), (side * 0.9).clamp(11.0, 16.0)),
+            )
+        });
         // Slot 0 is the knob (or the clock), slot 1 the tap chip, and the
         // seven transport slots follow — in both layouts.
         let first_icon = 2;
@@ -2221,20 +2243,43 @@ impl Layout {
             self.record = Rect::NOTHING;
             self.play = Rect::NOTHING;
             self.pause = Rect::NOTHING;
+            // And the tempo: a tempo move retimes every MIDI clip mid-render.
+            self.tempo = Rect::NOTHING;
+            self.tempo_tap = Rect::NOTHING;
         }
 
-        // **The identical band, with the record button become the dot.** The
-        // transport sits at the foot of the faders in both layouts, so the
-        // stop button is under the same pixel at 0:00 and at 4:12 — see
-        // `fill_faders`, which places both. What leaves is the tempo, which
-        // cannot be changed mid-take; the clock takes its box.
+        // **The take's readout, on the LCD's scope glass.** It used to take
+        // the tempo knob's slot in the transport row - six and a half points
+        // tall at the 900-point window, a number nobody could read from a
+        // bench, and the price was a control the owner wants in the row
+        // mid-take. The glass is the one free surface big enough: the count-in
+        // digit and the take's clock are drawn there at forty to seventy
+        // points, over the oscilloscope, for as long as the take runs. The
+        // glass is not a target and the LCD's drag cells are all to its left,
+        // so nothing that can be pressed moves or is covered.
+        self.timecode = lcd_scope_rect(self.lcd);
 
-        // The one thing `hide_elapsed` suppresses is a CLOCK. The count-in beat
+        // The one thing `hide_elapsed` suppresses is a CLOCK - and with it
+        // off, the glass keeps its scope for the whole take, which is what a
+        // breakdown video may want. The count-in beat
         // is the number the player is counting, and "FINISHING" is the reason
         // not to close the lid yet; hiding either would be hiding the wrong
         // thing under the name of a performance setting.
-        if view.hide_elapsed && matches!(view.state, RecordState::Rolling) {
+        if view.hide_elapsed
+            && matches!(view.state, RecordState::Rolling)
+            && view.count_beat.is_none()
+        {
             self.timecode = Rect::NOTHING;
+        }
+        // **A glass too small for the digits keeps its scope.** The readout
+        // bails below `MIN_TEXT`; the glass it would have taken must not go
+        // blank for a number nobody draws.
+        if self.timecode.is_positive() {
+            let state = readout_state(view);
+            let text = readout_text(state, view.position_s, view.elapsed_s);
+            if readout_size(self.timecode, state, &text) < MIN_TEXT {
+                self.timecode = Rect::NOTHING;
+            }
         }
     }
 
@@ -3193,7 +3238,8 @@ fn name_for(
             Hit::Capture => Node::button(id("capture"), r, "Record a take"),
             Hit::ProjectMenu => Node::button(id("project"), r, "Project menu"),
             Hit::OpenSetup => Node::button(id("setup"), r, "Take settings"),
-            Hit::TapTempo => Node::button(id("tap"), r, "Tap tempo"),
+            // Disabled while the tempo is held - see `RecorderState::tempo_held`.
+            Hit::TapTempo => Node::button(id("tap"), r, "Tap tempo").enabled(!view.tempo_held),
             Hit::Export => Node::button(id("export"), r, "Export"),
             Hit::ChooseFolder => Node::button(id("dest"), r, "Choose the take folder"),
             Hit::RevealFolder => Node::button(id("reveal"), r, "Show the take folder"),
@@ -3373,7 +3419,8 @@ fn name_for(
                     // mapped through `knob_to_tempo`, so the fraction the
                     // pointer means is `tempo_to_knob` and nothing simpler.
                     up(tempo_to_knob(view.tempo_bpm)),
-                ),
+                )
+                .enabled(!view.tempo_held),
                 _ => return None,
             }
         }
@@ -3475,21 +3522,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     draw_capture(painter, l.capture, view.state.is_active(), &p);
     draw_folder(painter, l.project, &p);
     draw_meter(painter, l.meter, view.meters, &p);
-    draw_readout(painter, &l, view, &p);
     draw_monitor(painter, &l, view, &p);
+    // AFTER the monitor, which fills the LCD's face: the take's readout is
+    // drawn on its glass.
+    draw_readout(painter, &l, view, &p);
     if !l.rolling {
         draw_cog(painter, l.setup, &p);
-        // Over the metronome's own icon, which says what the number is for
-        // better than a caption would.
-        draw_tempo(
-            painter,
-            &l,
-            view.tempo_bpm,
-            typing_for(view, NumField::Tempo),
-            view.turning == Some(NumField::Tempo),
-            &p,
-        );
     }
+    // In both layouts now - see `fill_faders`. `draw_knob` draws nothing in a
+    // NOTHING rect, which is what an export leaves.
+    draw_tempo(
+        painter,
+        &l,
+        view.tempo_bpm,
+        typing_for(view, NumField::Tempo),
+        view.turning == Some(NumField::Tempo),
+        view.tempo_held,
+        &p,
+    );
     for r in l.rules {
         if r.is_positive() {
             painter.rect_filled(r, 0.0, p.line.gamma_multiply(0.55));
@@ -3540,22 +3590,40 @@ fn labelled(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color32,
 /// is a thing to read and not a thing to press. Same insets, same sizing, so
 /// the row does not jump at the moment the take starts.
 fn label_text(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color32, p: &Palette) {
-    if !r.is_positive() {
+    let Some(inner) = label_inner(r) else {
         return;
+    };
+    let joined = format!("{cap} {value}");
+    let size = fit_text(inner, &joined, inner.height() * 0.52);
+    if size < MIN_TEXT {
+        return;
+    }
+    paint_caption_value(painter, inner, cap, value, size, colour, p);
+}
+
+/// Where a labelled row's words go: the row, less its inset on each side.
+fn label_inner(r: Rect) -> Option<Rect> {
+    if !r.is_positive() {
+        return None;
     }
     let inset = label_inset(r);
     let inner = Rect::from_min_max(
         Pos2::new(r.left() + inset, r.top()),
         Pos2::new(r.right() - inset, r.bottom()),
     );
-    if !inner.is_positive() {
-        return;
-    }
-    let joined = format!("{cap} {value}");
-    let size = fit_text(inner, &joined, inner.height() * 0.52);
-    if size < MIN_TEXT {
-        return;
-    }
+    inner.is_positive().then_some(inner)
+}
+
+/// The caption in the faint ink, then the value, at one size.
+fn paint_caption_value(
+    painter: &Painter,
+    inner: Rect,
+    cap: &str,
+    value: &str,
+    size: f32,
+    colour: Color32,
+    p: &Palette,
+) {
     let y = inner.center().y;
     let after = painter
         .text(
@@ -3566,6 +3634,9 @@ fn label_text(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color3
             p.faint,
         )
         .right();
+    if value.is_empty() {
+        return;
+    }
     painter.text(
         Pos2::new(after + size * ADV, y),
         Align2::LEFT_CENTER,
@@ -3573,6 +3644,72 @@ fn label_text(painter: &Painter, r: Rect, cap: &str, value: &str, colour: Color3
         font_light(size),
         colour,
     );
+}
+
+/// **The smallest a device name is set, as a share of the row's own type.**
+///
+/// A labelled row shrinks its caption and its value TOGETHER and draws
+/// nothing below `MIN_TEXT` - right for a path or a number, wrong for a device
+/// name, which comes from the driver at whatever length the driver likes. The
+/// owner's Linux input is the PipeWire node
+/// `alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0`:
+/// 84 characters with the caption, 260 points at the smallest type, in a row
+/// 197 to 309 points wide - so the AUDIO SETUP row was an EMPTY BOX in every
+/// window narrower than about 1450 points, and 5.9-point type above that.
+/// Below this floor the name is cut in the MIDDLE instead (the start names
+/// the maker, the end the driver or the profile), so the row always says
+/// something at a size somebody can read.
+const DEVICE_FLOOR: f32 = 0.75;
+
+/// `s` cut to `max` characters with an ellipsis in the middle, counted in
+/// CHARACTERS - a driver name can hold a trademark sign - never bytes.
+pub(crate) fn cut_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let keep = max - 1;
+    let head = keep - keep / 2;
+    let tail = keep / 2;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{}\u{2026}{}", h.trim_end(), t.trim_start())
+}
+
+/// What a device row sets, and at what size: the whole name when it fits at
+/// the floor, else the name cut to fit at the floor, else the caption alone.
+fn device_row_text<'a>(inner: Rect, cap: &str, name: &'a str) -> (std::borrow::Cow<'a, str>, f32) {
+    use std::borrow::Cow;
+    let want = inner.height() * 0.52;
+    let floor = (want * DEVICE_FLOOR).max(MIN_TEXT);
+    let size = fit_text(inner, &format!("{cap} {name}"), want);
+    if size >= floor {
+        return (Cow::Borrowed(name), size);
+    }
+    let room = (inner.width() / (floor * ADV)).floor() as usize;
+    let Some(budget) = room.checked_sub(cap.chars().count() + 1) else {
+        return (Cow::Borrowed(""), fit_text(inner, cap, want));
+    };
+    let cut = cut_middle(name, budget);
+    let size = fit_text(inner, &format!("{cap} {cut}"), want);
+    (Cow::Owned(cut), size)
+}
+
+/// A labelled row whose value is a DEVICE name: never blank, never smudged.
+/// See [`DEVICE_FLOOR`].
+fn draw_device_row(painter: &Painter, r: Rect, cap: &str, name: &str, colour: Color32, p: &Palette) {
+    control(painter, r, p);
+    let Some(inner) = label_inner(r) else {
+        return;
+    };
+    let (value, size) = device_row_text(inner, cap, name);
+    if size < MIN_TEXT {
+        return;
+    }
+    paint_caption_value(painter, inner, cap, &value, size, colour, p);
 }
 
 /// The camera, as a PANE OF THE WINDOW rather than a box in the Recorder band.
@@ -3803,28 +3940,129 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
 /// mistaken for the arrangement's red.
 const TAPE_AMBER: Color32 = Color32::from_rgb(0xC9, 0x8B, 0x3D);
 
-/// The cassette. Body, two hubs — filled while a capture is writing, dimmed
-/// at rest, exactly the play triangle's grammar.
+/// **How far the LIT amber must stand off the band.** TAPE_AMBER measures
+/// 3.4:1 on the stock wine band and more on every dark factory band, so it is
+/// used unchanged there; on the light bands (Sandstone, Celadon, Centennial)
+/// it sits near the band's own lightness, and "lit" is carried by depth
+/// instead - `distinct_surface_at`, the palette's own way of deriving a
+/// surface that has to read.
+const CASSETTE_LIT_FLOOR: f32 = 2.5;
+
+/// The lit plate behind the cassette: the lamp's colour faded this far into
+/// the band - a glow, not a second button.
+const CASSETTE_GLOW_T: f32 = 0.45;
+
+/// Lit body kept above and below each hub, in points - one pixel at 1x.
+const HUB_CLEAR: f32 = 1.0;
+/// The thinnest hub ring, for the hubs too small for a proper one.
+const HUB_HAIRLINE: f32 = 0.75;
+
+/// The cassette body's corner radius.
+const BODY_CR: f32 = 2.0;
+
+/// Below this side the plate's edge is left hard: a feather of a pixel only
+/// greys the edge of something this small.
+const CASSETTE_FEATHER_FROM: f32 = 12.0;
+const CASSETTE_FEATHER_MAX: f32 = 3.0;
+
+/// **The cassette's geometry, one answer for the painter and the tests.**
+///
+/// It was drawn with a 1.5-point rim and hubs of 22% of the body's height at
+/// every size - which at 10.5 points (the 100% window on a 1440-point laptop)
+/// left six or eight of the body's sixty-odd pixels showing amber: the rest
+/// was rim, hub hole and hairline. The owner's screen measured the icon's
+/// centre at 108,86,71 at rest and 115,92,72 during a take, a contrast of
+/// 1.09:1 - the take button did not "glow amber" at the size it is drawn.
+/// Colour could not fix that; the pixels had to be amber first.
+#[derive(Debug, Clone, Copy)]
+struct Cassette {
+    /// The lit plate, inside the button's own square.
+    plate: Rect,
+    plate_cr: f32,
+    /// The plate's soft edge, which also stays inside the square.
+    feather: f32,
+    body: Rect,
+    rim: f32,
+    hubs: [Pos2; 2],
+    hub: f32,
+    /// The hub's own ring, drawn INSIDE the hub: a hairline on the smallest
+    /// hubs, and none only where no hub is drawn.
+    ring: f32,
+}
+
+fn cassette(r: Rect) -> Cassette {
+    let d = r.width().min(r.height());
+    // The silhouette is unchanged.
+    let body = Rect::from_center_size(r.center(), Vec2::new(r.width() * 0.98, r.height() * 0.62));
+    // 1.05 points at the smallest button, 1.5 again from 15 points up.
+    let rim = (d * 0.1).clamp(1.0, 1.5);
+    // Never so big that a hub eats the lit body above and below it.
+    let hub = (body.height() * 0.22)
+        .min(body.height() * 0.5 - rim - HUB_CLEAR)
+        .max(0.0);
+    // Below 1.5 points a hairline, not nothing: on the light bands the
+    // resting hole is the band's own colour against a body 1.5:1 from it,
+    // and with no edge the owner's 10.5-point cassette read as a plain bar.
+    let ring = if hub >= 1.5 {
+        (hub * 0.4).min(1.0)
+    } else if hub > 0.5 {
+        HUB_HAIRLINE.min(hub)
+    } else {
+        0.0
+    };
+    let dx = body.width() * 0.24;
+    let feather = ((d - CASSETTE_FEATHER_FROM) * 0.5).clamp(0.0, CASSETTE_FEATHER_MAX);
+    let c = body.center();
+    Cassette {
+        // A centred feather ends exactly at the square's edge.
+        plate: r.shrink(feather * 0.5),
+        // Concentric with the body's own corners.
+        plate_cr: BODY_CR + (r.height() - body.height()) * 0.5,
+        feather,
+        body,
+        rim,
+        hubs: [Pos2::new(c.x - dx, c.y), Pos2::new(c.x + dx, c.y)],
+        hub,
+        ring,
+    }
+}
+
+/// The cassette's lamp colour on this band. See [`CASSETTE_LIT_FLOOR`].
+fn cassette_lit(bg: Color32) -> Color32 {
+    distinct_surface_at(TAPE_AMBER, bg, CASSETTE_LIT_FLOOR)
+}
+
+/// **The cassette: dimmed at rest, and LIT - a glowing plate under it -
+/// while a take is capturing.** The play triangle's grammar, and the scope's
+/// glow-under, core-over idiom. The cassette is the only control that reaches
+/// a take, so whether one is running has to read at the smallest size the
+/// row is drawn. See [`Cassette`].
 fn draw_capture(painter: &Painter, r: Rect, active: bool, p: &Palette) {
     if !r.is_positive() {
         return;
     }
-    let body = Rect::from_center_size(
-        r.center(),
-        Vec2::new(r.width() * 0.98, r.height() * 0.62),
-    );
-    let col = if active {
-        TAPE_AMBER
-    } else {
-        toward(TAPE_AMBER, p.bg, 0.4)
-    };
-    painter.rect_filled(body, 2.0, col);
-    painter.rect_stroke(body, 2.0, Stroke::new(1.5_f32, p.line), StrokeKind::Inside);
-    let hub = body.height() * 0.22;
-    for side in [-1.0_f32, 1.0] {
-        let c = Pos2::new(body.center().x + side * body.width() * 0.24, body.center().y);
-        painter.circle_filled(c, hub, p.bg);
-        painter.circle_stroke(c, hub, Stroke::new(1.0_f32, p.line));
+    let g = cassette(r);
+    let lit = cassette_lit(p.bg);
+    let glow = toward(lit, p.bg, CASSETTE_GLOW_T);
+    if active {
+        // The button's own square, lit, first - so the cassette sits on it.
+        painter.add(
+            egui::epaint::RectShape::filled(g.plate, g.plate_cr, glow).with_blur_width(g.feather),
+        );
+    }
+    let body = if active { lit } else { toward(TAPE_AMBER, p.bg, 0.4) };
+    painter.rect_filled(g.body, BODY_CR, body);
+    painter.rect_stroke(g.body, BODY_CR, Stroke::new(g.rim, p.line), StrokeKind::Inside);
+    if g.hub > 0.5 {
+        // A window in the shell shows what is behind the tape: the lit plate
+        // while a take runs, the band at rest.
+        let hole = if active { glow } else { p.bg };
+        for c in g.hubs {
+            painter.circle_filled(c, g.hub, hole);
+            if g.ring > 0.0 {
+                painter.circle_stroke(c, g.hub - g.ring * 0.5, Stroke::new(g.ring, p.line));
+            }
+        }
     }
 }
 
@@ -3855,7 +4093,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     // instruments live on the desk now and the click, the input and the
     // backing track are channels there, each with a real fader. What this
     // band shows instead is WHEN.
-    draw_timecode_cluster(painter, l.lcd, view, p);
+    draw_timecode_cluster(painter, l.lcd, view, p, l.timecode.is_positive());
     draw_timeline(painter, l.timeline, view, p);
     // The ×, only when it can be pressed: a file loaded and no take rolling.
     if l.timeline_close.is_positive() && l.timeline_loaded && !l.rolling {
@@ -4230,7 +4468,13 @@ pub fn bars_beats_parts(
 /// minutes:seconds under it on the left, and the VIEWPORT's Start / End /
 /// Length on the right — live numbers whether or not a single clip
 /// exists, every part draggable by the unit it shows.
-fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palette) {
+fn draw_timecode_cluster(
+    painter: &Painter,
+    r: Rect,
+    view: &RecorderView<'_>,
+    p: &Palette,
+    glass_taken: bool,
+) {
     if !r.is_positive() {
         return;
     }
@@ -4385,9 +4629,16 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     // **The right half is the OSCILLOSCOPE** — the sibling session's
     // widget, the owner's pick: the speakers' mix without the click, on
     // the same black glass the timecode is behind.
-    let scope_side = slice_h(r, lcd_split(r) + 0.025, 0.99);
-    let scope_r = slice_v(scope_side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
-    view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face));
+    //
+    // **Unless a take's readout has the glass** - the count-in digit, the
+    // take's clock, FINISHING. See `fill_rolling`.
+    if !glass_taken {
+        view.scope.draw(
+            painter,
+            lcd_scope_rect(r),
+            &crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face),
+        );
+    }
 }
 
 /// Start, End, Length of the arrangement's viewport — each value in three
@@ -5206,9 +5457,9 @@ fn readout_text(state: RecordState, position_s: f64, elapsed_s: f64) -> String {
         // saying out loud, as large as the box will draw it.
         RecordState::CountIn { beat, .. } => beat.to_string(),
         RecordState::Finishing => "FINISHING".to_owned(),
-        // **The TAKE's own time while one runs.** This clock stands in the
-        // tempo knob's slot only during a take, and the LCD above it already
-        // shows the playhead in bars and seconds. It read the playhead too,
+        // **The TAKE's own time while one runs.** This clock is drawn on the
+        // LCD's scope glass during a take, beside the LCD's own playhead in
+        // bars and seconds. It read the playhead too,
         // which was the take's length only because a take used to drive the
         // transport; now the song can be stopped, located or played in any
         // order under a take, and a take clock that froze with the song
@@ -5225,22 +5476,76 @@ fn draw_readout(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     if !r.is_positive() {
         return;
     }
-    let text = readout_text(view.state, view.position_s, view.elapsed_s);
-    let colour = match view.state {
-        RecordState::CountIn { .. } => p.rec,
-        RecordState::Rolling | RecordState::Finishing => p.ink,
-        RecordState::Idle => p.faint,
-    };
-    let size = fit_text(r, &text, r.height() * (if l.rolling { 0.92 } else { 0.8 }));
+    let state = readout_state(view);
+    let text = readout_text(state, view.position_s, view.elapsed_s);
+    let size = readout_size(r, state, &text);
     if size < MIN_TEXT {
         return;
     }
-    let (at, align) = if l.rolling {
-        (r.center(), Align2::CENTER_CENTER)
-    } else {
-        (Pos2::new(r.left(), r.center().y), Align2::LEFT_CENTER)
+    // In the LCD's own face, on its glass - the same digits as the clock
+    // beside it.
+    painter.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        &text,
+        FontId::new(size, fonts::courier()),
+        readout_ink(state, p),
+    );
+}
+
+/// What the glass is showing: the take's own state - except while a count-in
+/// recorded INTO the take is still clicking, when it is that count's beat.
+fn readout_state(view: &RecorderView<'_>) -> RecordState {
+    match (view.state, view.count_beat) {
+        (RecordState::Rolling, Some(beat)) => RecordState::CountIn {
+            beat,
+            of: u32::from(view.time_signature.beats.max(1)),
+        },
+        (state, _) => state,
+    }
+}
+
+/// **Sized on the WIDEST text the state can show**, never on the text itself:
+/// a clock sized on its own digits would jump a size at 9:59 -> 10:00, and a
+/// count-in at 9 -> 10 beats.
+fn readout_size(r: Rect, state: RecordState, text: &str) -> f32 {
+    let (widest, share) = match state {
+        RecordState::CountIn { .. } => ("00", 0.80),
+        RecordState::Finishing => ("FINISHING", 0.50),
+        _ if text.chars().count() > 5 => ("0:00:00", 0.62),
+        _ => ("00:00", 0.62),
     };
-    painter.text(at, align, &text, font_light(size), colour);
+    fit_text(r, widest, r.height() * share)
+}
+
+/// The count-in digit in the record red - the number the player counts along
+/// to - and every other readout in the LCD's own ink.
+fn readout_ink(state: RecordState, p: &Palette) -> Color32 {
+    match state {
+        RecordState::CountIn { .. } => count_red(p.rec, p.lcd_face),
+        _ => p.lcd,
+    }
+}
+
+/// **The record red, stood off the LCD's face** far enough to read as a big
+/// digit (3:1, the large-type floor). The raw red goes to 2.36:1 on
+/// Sandstone's pale glass; the walk changes only faces like that one, and
+/// keeps it red.
+fn count_red(rec: Color32, face: Color32) -> Color32 {
+    if contrast_ratio(rec, face) >= 3.0 {
+        return rec;
+    }
+    let mut t = 0.05;
+    while t <= 0.60 + 1e-6 {
+        for toward_c in [Color32::BLACK, Color32::WHITE] {
+            let c = toward(rec, toward_c, t);
+            if contrast_ratio(c, face) >= 3.0 {
+                return c;
+            }
+        }
+        t += 0.05;
+    }
+    rec
 }
 
 // ── the destination ────────────────────────────────────────────────────────
@@ -6702,42 +7007,43 @@ fn draw_tempo(
     bpm: f64,
     typing: Option<String>,
     turning: bool,
+    held: bool,
     p: &Palette,
 ) {
     // The typed digits ride the knob's OWN strip — the same entry every
     // other dial wears. The box below was the odd one out on the desk,
     // and the owner asked for one language.
-    draw_knob(
-        painter,
-        l.tempo,
-        &Knob {
-            value: tempo_to_knob(bpm),
-            label: TEMPO_WORD,
-            typing,
-            turning,
-            reading: tempo_text(bpm),
-            cap: TEMPO_CAP,
-            dim: false,
-        },
-        p,
-    );
+    draw_knob(painter, l.tempo, &tempo_knob(bpm, typing, turning, held), p);
     // The TAP chip, wearing the tempo's own orange so the pair reads as
-    // one control. Absent when the layout could not seat it.
+    // one control. Absent when the layout could not seat it. Dimmed with the
+    // knob while the tempo is held.
     if l.tempo_tap.is_positive() {
+        let ink = if held { toward(TEMPO_CAP, p.bg, 0.55) } else { TEMPO_CAP };
         painter.rect_filled(l.tempo_tap, 3.0, Color32::from_black_alpha(70));
-        painter.rect_stroke(
-            l.tempo_tap,
-            3.0,
-            Stroke::new(1.0_f32, TEMPO_CAP),
-            StrokeKind::Inside,
-        );
+        painter.rect_stroke(l.tempo_tap, 3.0, Stroke::new(1.0_f32, ink), StrokeKind::Inside);
         painter.text(
             l.tempo_tap.center(),
             Align2::CENTER_CENTER,
             "TAP",
             FontId::new((l.tempo_tap.height() * 0.62).clamp(7.0, 10.0), fonts::courier()),
-            TEMPO_CAP,
+            ink,
         );
+    }
+}
+
+/// The tempo knob as the painter draws it. **Dark while the tempo is held**
+/// (a take's count-in, an export) - the limiter's out-of-circuit look: still
+/// the control, still where the hand expects it, and plainly not turning now.
+/// See `RecorderState::tempo_held`.
+fn tempo_knob(bpm: f64, typing: Option<String>, turning: bool, held: bool) -> Knob<'static> {
+    Knob {
+        value: tempo_to_knob(bpm),
+        label: TEMPO_WORD,
+        typing,
+        turning,
+        reading: tempo_text(bpm),
+        cap: TEMPO_CAP,
+        dim: held,
     }
 }
 
@@ -7091,8 +7397,11 @@ pub(crate) fn every_control_drawn(rect: Rect, view: &RecorderView<'_>) -> Result
         ("pause", l.pause),
         ("the cassette", l.capture),
     ];
-    if !rolling {
+    // The tempo is in the row in every layout but an export's.
+    if !view.exporting {
         need.push(("TAP", l.tempo_tap));
+    }
+    if !rolling {
         need.push(("the project folder", l.project));
     }
     for (name, r) in need {
@@ -7103,7 +7412,7 @@ pub(crate) fn every_control_drawn(rect: Rect, view: &RecorderView<'_>) -> Result
     if !rolling && !cog_fits(l.setup) {
         missing.push("the settings cog".to_owned());
     }
-    if !rolling {
+    if !view.exporting {
         match knob_face(l.tempo) {
             None => missing.push("the tempo knob".to_owned()),
             Some(f) => {
@@ -8255,6 +8564,108 @@ mod tests {
     /// change: it moves the size at which the row stops existing. The row
     /// carries the longest caption-plus-value pair on the card, which makes
     /// it the one that hits the floor first.
+    const LONG_NODE: &str =
+        "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
+
+    /// **The AUDIO SETUP row names a long device at a size somebody can read.**
+    ///
+    /// On the owner's Linux box the row was an empty box: the caption and the
+    /// PipeWire node name shrink together, and 84 characters in a 197-309 pt
+    /// row fall under `MIN_TEXT`, where `label_text` draws nothing. The fixture
+    /// reproduces that first, so this cannot pass vacuously.
+    #[test]
+    fn the_audio_setup_row_names_a_long_device_at_a_readable_size() {
+        for w in [900.0_f32, 1117.0, 1280.0, 1440.0, 1920.0, 2560.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            let l = SetupLayout::new(screen, anchor, SetupShape::Machine);
+            let inner = label_inner(l.audio).expect("the row has room");
+            let want = inner.height() * 0.52;
+            if w <= 1440.0 {
+                assert!(
+                    fit_text(inner, &format!("AUDIO SETUP {LONG_NODE}"), want) < MIN_TEXT,
+                    "at {w} the old row would have drawn - the fixture no longer shows the bug"
+                );
+            }
+            let (v, size) = device_row_text(inner, "AUDIO SETUP", LONG_NODE);
+            assert!(size >= want * DEVICE_FLOOR - 1e-3, "at {w}pt the device is set at {size:.1}pt");
+            assert!(
+                v.contains('\u{2026}') && v.starts_with("alsa_input") && v.ends_with("input-0"),
+                "at {w} the cut did not keep both ends: {v}"
+            );
+            assert!(
+                (12 + v.chars().count()) as f32 * ADV * size <= inner.width() + 0.01,
+                "at {w} what is drawn overruns the row"
+            );
+            // The tidied name the host now sends is drawn WHOLE.
+            let (whole, size) = device_row_text(inner, "AUDIO SETUP", "Focusrite Scarlett Solo USB");
+            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "at {w} the short name was cut");
+            assert!(size >= want * DEVICE_FLOOR - 1e-3);
+            // Counted in characters: a trademark sign must not split a char.
+            let win = "Microphone Array (Intel\u{ae} Smart Sound Technology for Digital Microphones)";
+            let (v, _) = device_row_text(inner, "AUDIO SETUP", win);
+            assert!(v.ends_with("Microphones)"), "at {w}: {v}");
+        }
+    }
+
+    /// And the words really are PAINTED - the check above is arithmetic; this
+    /// runs `draw_setup` and reads the text shapes back out of the row.
+    #[test]
+    fn the_audio_setup_row_paints_words_for_a_long_device_name() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        for w in [1117.0_f32, 1280.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            let l = SetupLayout::new(screen, anchor, SetupShape::Machine);
+            for label in [DeviceLabel::Open(LONG_NODE), DeviceLabel::Missing(LONG_NODE)] {
+                let view = RecorderView {
+                    audio: label,
+                    ..RecorderView::empty()
+                };
+                let out = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                        draw_setup(&painter, screen, anchor, &view, &Settings::default(), SetupShape::Machine);
+                    },
+                );
+                let mut texts: Vec<(String, f32, Rect)> = Vec::new();
+                fn walk(shape: &egui::Shape, row: Rect, out: &mut Vec<(String, f32, Rect)>) {
+                    match shape {
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, row, out)),
+                        egui::Shape::Text(t) => {
+                            let r = t.visual_bounding_rect();
+                            if row.contains(r.center()) {
+                                let size = t.galley.job.sections.first().map_or(0.0, |s| s.format.font_id.size);
+                                out.push((t.galley.text().to_owned(), size, r));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for c in &out.shapes {
+                    walk(&c.shape, l.audio, &mut texts);
+                }
+                let cap = texts
+                    .iter()
+                    .find(|(t, ..)| t == "AUDIO SETUP")
+                    .unwrap_or_else(|| panic!("the audio row is an empty box at {w}: {texts:?}"));
+                let floor = label_inner(l.audio).unwrap().height() * 0.52 * DEVICE_FLOOR - 1e-3;
+                let value = texts
+                    .iter()
+                    .find(|(t, ..)| t != "AUDIO SETUP" && !t.is_empty())
+                    .unwrap_or_else(|| panic!("no device name painted at {w}: {texts:?}"));
+                assert!(value.1 >= floor, "at {w} the name is painted at {:.1}pt", value.1);
+                assert!(value.0.contains('\u{2026}'), "at {w} the name was not cut: {}", value.0);
+                assert!(value.2.right() <= l.audio.right() && value.2.left() >= cap.2.right());
+            }
+        }
+    }
+
     #[test]
     fn the_plugins_row_still_has_room_for_its_words() {
         for w in [900.0_f32, 1280.0, 1920.0, 2560.0] {
@@ -8443,6 +8854,35 @@ mod tests {
         }
     }
 
+    /// **A held tempo says so to the keyboard too.** The knob and TAP stay
+    /// drawn and stay a control, but while a take or an export holds the
+    /// tempo a press on them is refused; the nodes a screen reader walks must
+    /// report them disabled then, and enabled the moment the hold lifts,
+    /// or the keys spent on them vanish into a control that ignores them.
+    #[test]
+    fn a_held_tempo_is_disabled_to_a_screen_reader_and_only_then() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0)));
+        for held in [false, true] {
+            let mut view = furnished();
+            view.tempo_held = held;
+            let nodes = a11y_nodes(rect, &view);
+            for label in ["Tempo", "Tap tempo"] {
+                let n = nodes
+                    .iter()
+                    .find(|n| n.label == label)
+                    .unwrap_or_else(|| panic!("no {label:?} node (held {held})"));
+                assert_eq!(n.enabled, !held, "{label:?} with the tempo held = {held}");
+            }
+            // Only those two: a hold is not a reason to grey out the band.
+            let greyed: Vec<&str> =
+                nodes.iter().filter(|n| !n.enabled).map(|n| n.label.as_str()).collect();
+            let expect: &[&str] = if held { &["Tap tempo", "Tempo"] } else { &[] };
+            let mut greyed_sorted = greyed.clone();
+            greyed_sorted.sort_unstable();
+            assert_eq!(greyed_sorted, expect, "held = {held}");
+        }
+    }
+
     /// **Every control in the band has words, and they are the words on it.**
     ///
     /// The band is one `Painter`; before AccessKit it was one empty rectangle
@@ -8573,8 +9013,10 @@ mod tests {
     fn every_control_is_drawn_at_every_width_the_window_allows() {
         let mut w = crate::settings::MIN_WINDOW.x;
         while w <= 2600.0 {
-            if let Err(missing) = every_control_drawn(band(w), &idle()) {
-                panic!("at {w} points the band does not draw {missing:?}");
+            for view in [idle(), rolling()] {
+                if let Err(missing) = every_control_drawn(band(w), &view) {
+                    panic!("at {w} points ({:?}) the band does not draw {missing:?}", view.state);
+                }
             }
             w += 1.0;
         }
@@ -9334,11 +9776,18 @@ mod tests {
     /// only and the song under it is still played, stopped and recorded from
     /// these buttons. The pickers and the import do not: each one opens a
     /// dialog over a take that cannot change its devices or its destination.
-    const SURVIVORS: [Hit; 26] = [
+    const SURVIVORS: [Hit; 29] = [
         Hit::Record,
         Hit::Play,
         Hit::Stop,
         Hit::Pause,
+        // The tempo stays too - its knob, its TAP chip and its typed word.
+        // During a count-in they refuse (the APP does, see
+        // `RecorderState::tempo_held`), but they are still where the hand
+        // expects them, so a press on one is never a press on empty band.
+        Hit::SetTempo(0.0),
+        Hit::TapTempo,
+        Hit::Type(NumField::Tempo),
         // The cassette started this take, and pressing it again is how it
         // ends, or how its count-in is cancelled - the one control that
         // reaches the take at all.
@@ -9350,9 +9799,7 @@ mod tests {
         // exactly when somebody does that.
         Hit::DismissClip,
         // **And every number that belongs to something that survives.** A
-        // level you can drag mid-take is a level you can type mid-take; the
-        // tempo is not here because its knob becomes the clock when a take
-        // starts, so there is no word left to press.
+        // level you can drag mid-take is a level you can type mid-take.
         Hit::Type(NumField::Master),
         Hit::Type(NumField::Fx(Fx::Reverb)),
         Hit::Type(NumField::Fx(Fx::Delay)),
@@ -9694,6 +10141,8 @@ mod tests {
                     ("stop", at_rest.stop, l.stop),
                     ("pause", at_rest.pause, l.pause),
                     ("the cassette", at_rest.capture, l.capture),
+                    ("the tempo knob", at_rest.tempo, l.tempo),
+                    ("TAP", at_rest.tempo_tap, l.tempo_tap),
                 ] {
                     assert_eq!(a, b, "{name} moved or went away in {state:?} at {r:?}");
                 }
@@ -9703,6 +10152,7 @@ mod tests {
                     (Hit::Stop, l.stop),
                     (Hit::Pause, l.pause),
                     (Hit::Capture, l.capture),
+                    (Hit::TapTempo, l.tempo_tap),
                 ] {
                     if rect.is_positive() {
                         assert_eq!(
@@ -10030,8 +10480,8 @@ mod tests {
 
     /// The timeline is one rectangle wearing two hits: empty it is the
     /// import button, loaded it is a locate whose fraction is the fraction
-    /// into the file — and while a take rolls it is neither, because moving
-    /// the playhead under a running take would tear the file.
+    /// into the file (a take no longer stands in its way: it films the
+    /// window and does not own the transport).
     /// **The heart's corner is nobody else's.** It floats at the band's
     /// very top right and must not sit on the master ladder's numbers or
     /// bars.
@@ -10228,6 +10678,16 @@ mod tests {
             !hidden(RecordState::Rolling).is_positive(),
             "the clock is still on screen during a take"
         );
+        // Hiding a clock hides a clock - never the tempo beside it.
+        let l = Layout::new(
+            r,
+            &RecorderView {
+                state: RecordState::Rolling,
+                hide_elapsed: true,
+                ..RecorderView::empty()
+            },
+        );
+        assert!(l.tempo.is_positive() && l.tempo_tap.is_positive(), "hiding the clock took the tempo");
         assert!(
             hidden(RecordState::CountIn { beat: 2, of: 4 }).is_positive(),
             "the count-in is the number the user is waiting for"
@@ -10279,6 +10739,129 @@ mod tests {
         }
     }
 
+    /// Every rect the band seats the cassette in, rolling (the take's own
+    /// row), at every width the window allows, plus the two detached sizes.
+    fn capture_rects() -> Vec<Rect> {
+        let mut out = Vec::new();
+        let mut w = crate::settings::MIN_WINDOW.x;
+        while w <= 2600.0 {
+            out.push(Layout::new(band(w), &rolling()).capture);
+            w += 1.0;
+        }
+        for d in [DETACHED_DEFAULT, DETACHED_MIN] {
+            out.push(Layout::new(Rect::from_min_size(Pos2::ZERO, d), &rolling()).capture);
+        }
+        out.retain(|r| r.is_positive());
+        out
+    }
+
+    /// **A hub never eats the body it sits in**, so the amber is there to
+    /// light at the smallest size the row draws. At 10.5 points the old hubs
+    /// and rim left six or eight pixels of amber, and the owner's screen read
+    /// the take button at 108,86,71 at rest against 115,92,72 lit.
+    #[test]
+    fn a_hub_never_eats_the_body_it_sits_in() {
+        let mut rects = capture_rects();
+        let mut d = TRANSPORT_MIN_SIDE;
+        while d <= 40.0 {
+            rects.push(Rect::from_min_size(Pos2::new(100.3, 50.7), Vec2::splat(d)));
+            d += 0.25;
+        }
+        for r in rects {
+            let g = cassette(r);
+            assert!(
+                g.hub <= g.body.height() * 0.5 - g.rim - HUB_CLEAR + 1e-4,
+                "at {r:?} a hub leaves less than a point of lit body above and below it"
+            );
+            assert!(
+                (g.hubs[1].x - g.hubs[0].x) - 2.0 * g.hub >= 2.0,
+                "at {r:?} the hubs leave no lit body between them"
+            );
+            assert!(
+                g.body.height() - 2.0 * g.rim >= 0.6 * g.body.height(),
+                "at {r:?} the rim is most of the body"
+            );
+            assert!(
+                r.expand(1e-3).contains_rect(g.plate.expand(g.feather * 0.5)),
+                "at {r:?} the glow leaves its own button"
+            );
+            if r.width().min(r.height()) >= 20.0 {
+                assert!(g.ring >= 0.9, "at {r:?} there is room for the hub rings and none is drawn");
+            }
+            // Every hub that is drawn has an edge: at rest its hole is the
+            // band's colour, 1.5:1 from the body on the light bands.
+            if g.hub > 0.5 {
+                assert!(g.ring > 0.0, "at {r:?} a hub is drawn with no ring");
+                assert!(g.ring <= g.hub, "at {r:?} the ring is wider than its hub");
+            }
+        }
+    }
+
+    /// **The lit cassette paints nothing outside its own button** - the row's
+    /// three-point gap to its neighbours stays empty - and it IS lit: one
+    /// plate in the glow colour, soft-edged only where there is room.
+    #[test]
+    fn the_lit_cassette_paints_nothing_outside_its_own_button() {
+        let ctx = egui::Context::default();
+        let p = palette(&Settings::default());
+        let glow = toward(cassette_lit(p.bg), p.bg, CASSETTE_GLOW_T);
+        let rects = capture_rects();
+        let smallest = *rects
+            .iter()
+            .min_by(|a, b| a.width().min(a.height()).total_cmp(&b.width().min(b.height())))
+            .unwrap();
+        let largest = *rects
+            .iter()
+            .max_by(|a, b| a.width().min(a.height()).total_cmp(&b.width().min(b.height())))
+            .unwrap();
+        for r in [smallest, largest] {
+            for active in [false, true] {
+                let out = ctx.run(egui::RawInput::default(), |ctx| {
+                    let painter = Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                    draw_capture(&painter, r, active, &p);
+                });
+                let mut plates = 0;
+                for c in &out.shapes {
+                    assert!(
+                        r.expand(1e-3).contains_rect(c.shape.visual_bounding_rect()),
+                        "at {r:?} (active {active}) a shape leaves the button: {:?}",
+                        c.shape.visual_bounding_rect()
+                    );
+                    if let egui::Shape::Rect(rs) = &c.shape {
+                        if rs.fill == glow {
+                            plates += 1;
+                            let soft = rs.blur_width > 0.0;
+                            assert_eq!(soft, r == largest, "at {r:?} the plate's edge is soft={soft}");
+                        }
+                    }
+                }
+                assert_eq!(plates, usize::from(active), "at {r:?} active {active}: {plates} lit plates");
+            }
+        }
+    }
+
+    /// The stock band, and every dark factory band, keeps the owner's amber
+    /// exactly; only the light bands deepen it so "lit" still reads.
+    #[test]
+    fn the_stock_band_keeps_the_owners_amber() {
+        assert_eq!(cassette_lit(palette(&Settings::default()).bg), TAPE_AMBER);
+        for t in crate::theme::factory() {
+            let mut set = Settings::default();
+            t.apply(&mut set);
+            let bg = palette(&set).bg;
+            let lit = cassette_lit(bg);
+            if wants_light_ink(bg) {
+                assert_eq!(lit, TAPE_AMBER, "{} is a dark band and its lamp moved", t.name);
+            }
+            assert!(
+                contrast_ratio(lit, bg) >= CASSETTE_LIT_FLOOR - 0.05,
+                "{}: the lit cassette stands {:.2}:1 off its band",
+                t.name,
+                contrast_ratio(lit, bg)
+            );
+        }
+    }
+
     /// **An export is the exception**: it owns the transport, the host
     /// refuses a record, play or pause into it, so the band does not seat
     /// them. Stop (which ends it early, on purpose) and the cassette stay put.
@@ -10293,11 +10876,348 @@ mod tests {
                 ..rolling()
             },
         );
-        for (name, rect) in [("record", export.record), ("play", export.play), ("pause", export.pause)] {
+        for (name, rect) in [
+            ("record", export.record),
+            ("play", export.play),
+            ("pause", export.pause),
+            ("the tempo knob", export.tempo),
+            ("TAP", export.tempo_tap),
+        ] {
             assert!(!rect.is_positive(), "{name} is seated over an export the host refuses it for");
         }
+        assert!(take.tempo.is_positive(), "an ordinary take lost its tempo knob");
         assert_eq!(export.stop, take.stop, "Stop moved under an export");
         assert_eq!(export.capture, take.capture, "the cassette moved under an export");
+    }
+
+    /// **The take's readout lives on the LCD's scope glass and covers no
+    /// control.** It used to take the tempo knob's slot in the transport row.
+    #[test]
+    fn the_take_readout_lives_on_the_scope_glass_and_displaces_nothing() {
+        let mut rects: Vec<Rect> = [560.0_f32, 900.0, 1300.0, 2560.0].iter().map(|w| band(*w)).collect();
+        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT));
+        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_MIN));
+        for r in rects {
+            for state in [
+                RecordState::CountIn { beat: 2, of: 4 },
+                RecordState::Rolling,
+                RecordState::Finishing,
+            ] {
+                let view = with_rack(state);
+                let l = Layout::new(r, &view);
+                let g = l.timecode;
+                assert!(g.is_positive(), "at {r:?} in {state:?} there is no readout");
+                assert_eq!(g, lcd_scope_rect(l.lcd), "at {r:?} the readout is not the glass");
+                assert!(l.lcd.contains_rect(g));
+                assert!(
+                    g.left() > l.lcd.left() + l.lcd.width() * lcd_split(l.lcd),
+                    "at {r:?} the readout reaches into the LCD's clock cells"
+                );
+                for (target, _) in l.targets() {
+                    if target.is_positive() {
+                        assert!(!target.intersects(g), "at {r:?} the readout covers a control at {target:?}");
+                    }
+                }
+                assert_eq!(hit_test(r, &view, g.center()), None, "at {r:?} the glass answers a press");
+            }
+            assert!(!Layout::new(r, &idle()).timecode.is_positive(), "at {r:?} a readout at rest");
+        }
+        // A band too small for an LCD has no glass - NOTHING, never NaN; one
+        // with a sliver of LCD has a sliver of glass, inside it.
+        for tiny in [band(0.0), Rect::from_min_size(Pos2::ZERO, Vec2::new(60.0, 20.0))] {
+            let l = Layout::new(tiny, &rolling());
+            let t = l.timecode;
+            assert!(!t.min.x.is_nan() && !t.max.y.is_nan(), "a tiny band made a NaN readout: {t:?}");
+            assert!(!t.is_positive() || l.lcd.contains_rect(t), "a tiny band's readout left its LCD");
+        }
+    }
+
+    /// **And it reads from the bench**: forty points and more at the 900-point
+    /// window where the old slot-0 clock was six and a half - and it does not
+    /// jump a size as the digits change.
+    #[test]
+    fn the_take_readout_reads_from_the_bench() {
+        for (w, clock, count) in [(900.0_f32, 30.0, 40.0), (1300.0, 45.0, 60.0)] {
+            let g = Layout::new(band(w), &rolling()).timecode;
+            assert!(readout_size(g, RecordState::Rolling, "4:12") >= clock, "at {w} the take clock is small");
+            assert!(
+                readout_size(g, RecordState::CountIn { beat: 3, of: 4 }, "3") >= count,
+                "at {w} the count-in digit is small"
+            );
+            assert!(readout_size(g, RecordState::Finishing, "FINISHING") >= 20.0 * w / 900.0);
+            assert_eq!(
+                readout_size(g, RecordState::Rolling, "9:59"),
+                readout_size(g, RecordState::Rolling, "10:00"),
+                "the clock jumps a size at ten minutes"
+            );
+            assert_eq!(
+                readout_size(g, RecordState::CountIn { beat: 1, of: 12 }, "1"),
+                readout_size(g, RecordState::CountIn { beat: 12, of: 12 }, "12")
+            );
+        }
+        // On a NARROW glass the width binds, and a size taken from the text
+        // itself would jump at every digit that changes the string's length.
+        let narrow = Rect::from_min_size(Pos2::ZERO, Vec2::new(40.0, 60.0));
+        assert_eq!(
+            readout_size(narrow, RecordState::Rolling, "4:12"),
+            readout_size(narrow, RecordState::Rolling, "10:00"),
+            "on a narrow glass the clock grows and shrinks with its digits"
+        );
+        assert_eq!(
+            readout_size(narrow, RecordState::CountIn { beat: 1, of: 12 }, "1"),
+            readout_size(narrow, RecordState::CountIn { beat: 12, of: 12 }, "12")
+        );
+    }
+
+    /// **The count-in digit is red and readable on every theme's glass.**
+    #[test]
+    fn the_count_in_is_red_on_every_glass() {
+        for t in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = Settings {
+                    dark_mode: dark,
+                    ..Settings::default()
+                };
+                t.apply(&mut set);
+                let p = palette(&set);
+                let c = readout_ink(RecordState::CountIn { beat: 1, of: 4 }, &p);
+                assert!(
+                    contrast_ratio(c, p.lcd_face) >= 3.0,
+                    "{} (dark {dark}): the count-in stands {:.2}:1 off the glass",
+                    t.name,
+                    contrast_ratio(c, p.lcd_face)
+                );
+                assert!(c.r() > c.g() && c.r() > c.b(), "{}: the count-in is not red: {c:?}", t.name);
+                assert_eq!(readout_ink(RecordState::Rolling, &p), p.lcd);
+            }
+        }
+    }
+
+    /// Every leaf shape the band paints for `view` at `r`.
+    fn band_shapes(r: Rect, view: &RecorderView<'_>) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(r),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = Painter::new(ctx.clone(), egui::LayerId::background(), r);
+                draw(&painter, r, view, &Settings::default());
+            },
+        );
+        fn walk(shape: egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(v) => v.into_iter().for_each(|s| walk(s, out)),
+                other => out.push(other),
+            }
+        }
+        let mut leaves = Vec::new();
+        for c in out.shapes {
+            walk(c.shape, &mut leaves);
+        }
+        leaves
+    }
+
+    /// **What `draw` paints for a held tempo, not what a helper returns.** The
+    /// knob's cap loses its light and TAP its orange, on the band itself;
+    /// with the tempo free both are at full colour.
+    #[test]
+    fn the_band_paints_a_held_tempo_dim() {
+        let p = palette(&Settings::default());
+        for w in [900.0_f32, 1300.0] {
+            for held in [false, true] {
+                let view = RecorderView {
+                    state: RecordState::Rolling,
+                    tempo_held: held,
+                    ..furnished()
+                };
+                let r = band(w);
+                let l = Layout::new(r, &view);
+                assert!(l.tempo.is_positive() && l.tempo_tap.is_positive(), "at {w} no tempo pair");
+                let shapes = band_shapes(r, &view);
+                let caps: Vec<Color32> = shapes
+                    .iter()
+                    .filter_map(|s| match s {
+                        egui::Shape::Circle(c) if l.tempo.contains(c.center) => Some(c.fill),
+                        _ => None,
+                    })
+                    .collect();
+                let (lit, dim) = (TEMPO_CAP, TEMPO_CAP.gamma_multiply(0.33));
+                assert_eq!(caps.contains(&lit), !held, "at {w} held {held}: caps {caps:?}");
+                assert_eq!(caps.contains(&dim), held, "at {w} held {held}: caps {caps:?}");
+                let tap = shapes
+                    .iter()
+                    .find_map(|s| match s {
+                        egui::Shape::Text(t) if t.galley.text() == "TAP" => {
+                            t.galley.job.sections.first().map(|s| s.format.color)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("at {w} no TAP painted"));
+                let want = if held { toward(TEMPO_CAP, p.bg, 0.55) } else { TEMPO_CAP };
+                assert_eq!(tap, want, "at {w} TAP with the tempo held = {held}");
+            }
+        }
+    }
+
+    /// **The glass is the readout's or the scope's, never both and never
+    /// neither.** While a take rolls the scope draws nothing under the digits;
+    /// with the clock hidden the scope has the glass back; and a glass too
+    /// small for the digits keeps its scope rather than going blank.
+    #[test]
+    fn the_glass_is_the_readouts_or_the_scopes() {
+        // Paint on the glass that is not text: the scope's face, its
+        // graticule, its trace.
+        let scope_on = |r: Rect, view: &RecorderView<'_>| {
+            let glass = lcd_scope_rect(Layout::new(r, view).lcd);
+            let shapes = band_shapes(r, view);
+            let inside = |s: &egui::Shape| glass.expand(0.5).contains_rect(s.visual_bounding_rect());
+            let marks = shapes.iter().filter(|s| inside(s) && !matches!(s, egui::Shape::Text(_))).count();
+            let words = shapes.iter().filter(|s| inside(s) && matches!(s, egui::Shape::Text(_))).count();
+            (marks, words)
+        };
+        for w in [900.0_f32, 1300.0, 2560.0] {
+            let r = band(w);
+            let (marks, words) = scope_on(r, &rolling());
+            assert_eq!(marks, 0, "at {w} the scope draws under the take's clock");
+            assert_eq!(words, 1, "at {w} the take's clock is not on the glass");
+            let hidden = RecorderView {
+                hide_elapsed: true,
+                ..rolling()
+            };
+            let (marks, words) = scope_on(r, &hidden);
+            assert!(marks > 0, "at {w} the clock is hidden and the glass is blank");
+            assert_eq!(words, 0, "at {w} a hidden clock is still drawn");
+            let (marks, _) = scope_on(r, &idle());
+            assert!(marks > 0, "at {w} the scope is gone at rest");
+        }
+        // A glass that cannot hold the digits: its scope, not an empty face.
+        let mut found = false;
+        let mut h = 4.0;
+        while h < 40.0 {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, h));
+            let l = Layout::new(r, &rolling());
+            let glass = lcd_scope_rect(l.lcd);
+            if glass.is_positive() && !l.timecode.is_positive() {
+                found = true;
+                let (marks, words) = scope_on(r, &rolling());
+                assert!(marks > 0, "at height {h} the glass is blank: no digits, no scope");
+                assert_eq!(words, 0);
+            }
+            h += 1.0;
+        }
+        assert!(found, "no band small enough to test the empty-glass case");
+    }
+
+    /// **A count recorded INTO a take reads its beat, in red, on the glass** -
+    /// the session is already Rolling, so only `count_beat` says a count is
+    /// on - and hiding the elapsed clock does not hide the beat.
+    #[test]
+    fn a_count_inside_a_take_paints_its_beat_in_red() {
+        let p = palette(&Settings::default());
+        for w in [900.0_f32, 1300.0] {
+            for hide in [false, true] {
+                let view = RecorderView {
+                    count_beat: Some(3),
+                    hide_elapsed: hide,
+                    ..rolling()
+                };
+                let r = band(w);
+                let l = Layout::new(r, &view);
+                assert!(l.timecode.is_positive(), "at {w} hide {hide}: the beat has no glass");
+                let texts: Vec<(String, Color32)> = band_shapes(r, &view)
+                    .iter()
+                    .filter_map(|s| match s {
+                        egui::Shape::Text(t) if l.timecode.contains(t.visual_bounding_rect().center()) => Some((
+                            t.galley.text().to_owned(),
+                            t.galley.job.sections.first().map_or(Color32::TRANSPARENT, |s| s.format.color),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    texts,
+                    vec![("3".to_owned(), count_red(p.rec, p.lcd_face))],
+                    "at {w} hide {hide}: the glass reads {texts:?}"
+                );
+            }
+        }
+    }
+
+    /// **The metronome panel's TEMPO row dims with the knob** - the other
+    /// road to the same number wears the same rule.
+    #[test]
+    fn the_metronome_panels_tempo_dims_while_held() {
+        let p = palette(&Settings::default());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let anchor = Rect::from_center_size(Pos2::new(400.0, 200.0), Vec2::splat(1.0));
+        let row = MetLayout::new(screen, anchor).rows[0];
+        assert!(row.is_positive());
+        let track = MetLayout::track(row);
+        for held in [false, true] {
+            let ctx = egui::Context::default();
+            fonts::install(&ctx, fonts::FontChoice::default(), None);
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                let v = MetView {
+                    bpm: 120.0,
+                    beats: 4,
+                    unit: 4,
+                    div: 1,
+                    sample: "",
+                    count_in_bars: 1,
+                    count_in_in_take: false,
+                    held,
+                };
+                draw_met(&painter, screen, anchor, v, &Settings::default());
+            });
+            let fills: Vec<Color32> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) if row.contains_rect(r.rect) && track.expand(4.0).contains_rect(r.rect) => {
+                        Some(r.fill)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let (fill, handle) = met_tempo_inks(held, &p);
+            assert!(fills.contains(&fill) && fills.contains(&handle), "held {held}: the row paints {fills:?}");
+            let lit = [p.accent, p.ink];
+            assert_eq!(
+                fills.iter().any(|f| lit.contains(f)),
+                !held,
+                "held {held}: the row paints {fills:?}"
+            );
+        }
+        assert_ne!(met_tempo_inks(true, &p), met_tempo_inks(false, &p));
+    }
+
+    /// **A held tempo is dim and still a control**: it keeps its place and
+    /// its press, so a hand on it is never a hand on empty band (which, in a
+    /// borderless window, drags the window).
+    #[test]
+    fn a_held_tempo_is_dim_and_still_a_control() {
+        assert!(tempo_knob(120.0, None, false, true).dim);
+        assert!(!tempo_knob(120.0, None, false, false).dim);
+        for w in [900.0_f32, 1300.0] {
+            let r = band(w);
+            let view = RecorderView {
+                state: RecordState::CountIn { beat: 1, of: 4 },
+                tempo_held: true,
+                ..furnished()
+            };
+            let l = Layout::new(r, &view);
+            assert_eq!(l.tempo, Layout::new(r, &furnished()).tempo, "at {w} a held tempo moved");
+            let at = knob_centre(l.tempo).expect("the held knob has a face");
+            assert!(
+                hit_test(r, &view, at).is_some_and(|h| h.is_same_control(Hit::SetTempo(0.0))),
+                "at {w} a press on the held knob is not a press on the knob"
+            );
+            assert_eq!(hit_test(r, &view, l.tempo_tap.center()), Some(Hit::TapTempo));
+        }
     }
 
     /// The record button is the ARRANGEMENT's and stays one under a take;
@@ -10310,17 +11230,15 @@ mod tests {
         assert!(at_rest.record.is_positive());
         let live = Layout::new(r, &rolling());
         assert_eq!(live.record, at_rest.record, "the red button moved or went away");
-        // **The clock is the one thing that moves, and it grows.** At rest it
-        // says 0:00 and takes what is left of the transport's row; while a
-        // take runs it is the number somebody reads from a piano bench, and
-        // the name and tempo boxes it replaces cannot be touched mid-take
-        // anyway.
+        // **The take's readout is on the LCD's glass**, the height of the
+        // LCD, and the LCD itself does not move.
         assert!(
-            live.timecode.area() > at_rest.timecode.area() * 2.0,
-            "the clock did not take the column: {:?} vs {:?}",
+            live.timecode.height() >= live.lcd.height() * 0.8,
+            "the take's readout is not on the glass: {:?} in {:?}",
             live.timecode,
-            at_rest.timecode
+            live.lcd
         );
+        assert_eq!(live.lcd, at_rest.lcd, "the LCD moved when the take started");
 
         // **And the preview does NOT collapse.** It used to, back when it was
         // a framing check somebody glanced at before a take. A take records
@@ -10568,6 +11486,8 @@ mod tests {
                                 playing: false,
                                 arr_recording: false,
                                 exporting: false,
+                                tempo_held: matches!(state, RecordState::CountIn { .. }),
+                                count_beat: None,
                                 view_window: (0.0, 60.0),
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),
@@ -12208,6 +13128,16 @@ pub const MET_DIVS: [(i64, &str); 5] =
 /// The bottom numbers a signature may have. Buttons rather than a field,
 /// because the bottom number is a power of two and a field would invite 3.
 pub const MET_UNITS: [u8; 4] = [2, 4, 8, 16];
+/// The metronome panel's TEMPO row inks: the accent fill and the ink handle,
+/// or both faded into the band while the tempo is held - the TAP chip's dim.
+fn met_tempo_inks(held: bool, p: &Palette) -> (Color32, Color32) {
+    if held {
+        (toward(p.accent, p.bg, 0.55), toward(p.ink, p.bg, 0.55))
+    } else {
+        (p.accent, p.ink)
+    }
+}
+
 
 /// What the metronome panel is showing.
 #[derive(Debug, Clone, Copy)]
@@ -12222,6 +13152,10 @@ pub struct MetView<'a> {
     pub count_in_bars: i64,
     /// Whether the count-in keeps clicking once the take has started.
     pub count_in_in_take: bool,
+    /// **The tempo is held** (a take's count-in, an export): the TEMPO row is
+    /// drawn dim, and the app refuses it - the band's knob's rule, on the
+    /// other road to the same number. See `RecorderState::tempo_held`.
+    pub held: bool,
 }
 
 /// What a press inside the metronome panel means.
@@ -12408,11 +13342,12 @@ pub fn draw_met(
         let h = (row.height() * 0.22).max(2.0);
         let well = Rect::from_center_size(track.center(), Vec2::new(track.width(), h));
         painter.rect_filled(well, h * 0.5, p.well);
+        let (fill, handle) = met_tempo_inks(v.held, &p);
         if t > 0.0 {
             painter.rect_filled(
                 Rect::from_min_size(well.min, Vec2::new(well.width() * t, h)),
                 h * 0.5,
-                p.accent,
+                fill,
             );
         }
         let knob_w = (row.height() * 0.20).max(3.0);
@@ -12423,7 +13358,7 @@ pub fn draw_met(
                 Vec2::new(knob_w, row.height() * 0.62),
             ),
             1.5,
-            p.ink,
+            handle,
         );
     }
 
@@ -13267,7 +14202,10 @@ pub fn draw_setup(
     // device name answers, so the row is a readout as well as a way in: an
     // interface that has gone missing says so here, in the panel you would open
     // to find out why nothing is being recorded.
-    labelled(painter, l.audio, "AUDIO SETUP", view.audio.text(), p.ink, &p);
+    //
+    // Not `labelled`: a device name is as long as its driver makes it, and a
+    // long one drew nothing at all there. See `DEVICE_FLOOR`.
+    draw_device_row(painter, l.audio, "AUDIO SETUP", view.audio.text(), p.ink, &p);
 }
 
 

@@ -142,8 +142,12 @@ by sha256, and the Linux tarballs and the Windows artifact ship them as
 `tangent-ffmpeg(.exe)`:
 
 * Linux x86_64 and arm64: johnvansickle.com static ffmpeg **7.0.2**.
-* Windows: BtbN autobuild ffmpeg **n8.1.2-44-g7c533d0f86**, from the
-  immutable tag `autobuild-2026-08-17-13-05` of `BtbN/FFmpeg-Builds`.
+* Windows: BtbN autobuild ffmpeg **n8.1.3** (`ffmpeg-n8.1.3-win64-gpl-8.1.zip`),
+  from the dated tag `autobuild-2026-09-22-13-18` of `BtbN/FFmpeg-Builds`.
+  BtbN prunes dated tags after a few weeks, so the pin says which build, not
+  where it can still be fetched. Windows builds 4.4.1 through 5.0.0-beta.13
+  bundled **n8.1.2-44-g7c533d0f86** from `autobuild-2026-08-17-13-05`
+  (already gone upstream).
 
 macOS and FreeBSD are unaffected (AVFoundation, and the `multimedia/ffmpeg`
 port, respectively). Because the artifacts are handed out through
@@ -163,11 +167,17 @@ GitHub releases in the same repo the binaries are served from:
   builder's GPL source drop for that build, bundled libraries included) plus
   his build readme. Fetch and hash these promptly; that server rotates old
   builds out.
-* Tag `third-party-src-ffmpeg-n8.1.2-btbn-2026-08-17`: the FFmpeg source
+* Tag `third-party-src-ffmpeg-n8.1.2-btbn-2026-08-17`, for the Windows
+  builds already out (4.4.1 through 5.0.0-beta.13): the FFmpeg source
   archive at commit `7c533d0f86`, a git archive of `BtbN/FFmpeg-Builds` at
-  tag `autobuild-2026-08-17-13-05`, and the source tarball of every bundled
-  library that tag's `scripts.d/` files pin. "Reconstructible from someone
-  else's repo" is not hosting; the tarballs themselves go in the release.
+  the COMMIT the tag `autobuild-2026-08-17-13-05` pointed to (the tag itself
+  is gone upstream), and the source tarball of every bundled library that
+  commit's `scripts.d/` files pin. "Reconstructible from someone else's repo"
+  is not hosting; the tarballs themselves go in the release.
+* Tag `third-party-src-ffmpeg-n8.1.3-btbn-2026-09-22`, for the current pin:
+  the FFmpeg source at the release tag `n8.1.3`, a git archive of
+  `BtbN/FFmpeg-Builds` at `autobuild-2026-09-22-13-18` (archive it now,
+  before it is pruned too), and the pinned library tarballs.
 * Never delete these source releases while the binaries are offered: the
   `releases/latest/download` links in old supporter emails keep old binaries
   on offer indefinitely, so availability is indefinite too.

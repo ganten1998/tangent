@@ -65,11 +65,19 @@ ARM64_URLS="https://johnvansickle.com/ffmpeg/releases/$ARM64_FILE
 https://johnvansickle.com/ffmpeg/old-releases/$ARM64_FILE"
 ARM64_SHA="f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1"
 
-# ffmpeg 8.1.2, win64, BtbN's autobuilds — an IMMUTABLE dated tag, never the
-# rolling `latest` release, whose assets are rebuilt in place.
-WIN_FILE="ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip"
-WIN_URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-17-13-05/$WIN_FILE"
-WIN_SHA="19b9b43e6df8839473ba22c8e22bf14b937c1e2ca40ecbd19d58afedc83ac908"
+# ffmpeg 8.1.3, win64, BtbN's autobuilds — a dated tag, never the rolling
+# `latest` release, whose assets are rebuilt in place. The clean n8.1.3 tag
+# rather than a git-describe build between releases.
+#
+# **Dated is not permanent.** BtbN prunes its dated releases after a few
+# weeks: the 8.1.2 pin this replaced (autobuild-2026-08-17-13-05) 404ed on
+# the TAG by 2026-09-22, and every clean Windows build died here after its
+# `cargo xwin build` had already succeeded. So the archive is also kept in
+# the durable cache below; when this URL goes the same way, the cache still
+# builds, and a fresh machine needs the deliberate URL+hash bump.
+WIN_FILE="ffmpeg-n8.1.3-win64-gpl-8.1.zip"
+WIN_URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-22-13-18/$WIN_FILE"
+WIN_SHA="ed885833e406f0f7a1ea0304dd170779117799b2fba8096abc3e2e4dd679cc20"
 
 PLATFORM="${1:-}"
 case "$PLATFORM" in
@@ -89,13 +97,26 @@ sha_ok() { # sha_ok <file> <sha256>
     [ "$got" = "$2" ]
 }
 
+# **The durable cache: `vendor/ffmpeg/`, beside the ASIO SDK.** `dist/vendor`
+# was the only copy, and a clean build starts with `rm -rf dist` - which is
+# how the Windows leg lost its archive and then found its upstream gone.
+# `/vendor/` is gitignored (the ASIO licence forbids committing the SDK next
+# to it), so nothing is redistributed by keeping the archives here.
+CACHE="vendor/ffmpeg"
+
 fetch() { # fetch <file> <sha256> <url...>
     local file="$1" sha="$2" url
     shift 2
     if [ -f "dist/vendor/$file" ] && sha_ok "dist/vendor/$file" "$sha"; then
+        keep "$file" "$sha"
         return 0
     fi
     mkdir -p dist/vendor
+    if [ -f "$CACHE/$file" ] && sha_ok "$CACHE/$file" "$sha"; then
+        cp "$CACHE/$file" "dist/vendor/$file"
+        echo "==> $file from $CACHE"
+        return 0
+    fi
     for url in "$@"; do
         echo "==> fetching $url"
         if curl -fL --retry 3 -o "dist/vendor/$file.part" "$url"; then
@@ -109,6 +130,27 @@ fetch() { # fetch <file> <sha256> <url...>
         rm -f "dist/vendor/$file"
         exit 1
     }
+    keep "$file" "$sha"
+}
+
+# keep <file> <sha256>: a verified archive, copied into the durable cache.
+#
+# Replaces a cached file of the SAME NAME that does not verify: BtbN names its
+# archives by tag alone, so a later dated build of n8.1.3 is the same file
+# name with different bytes, and a cache that only asked "is it there" kept
+# the old one forever after a pin bump. And never fatal: the cache is a
+# backup, and a build that has its archive in dist/ must not fail because the
+# backup could not be written.
+keep() {
+    if [ -f "$CACHE/$1" ] && sha_ok "$CACHE/$1" "$2"; then
+        return 0
+    fi
+    if mkdir -p "$CACHE" && cp "dist/vendor/$1" "$CACHE/$1.part" && mv "$CACHE/$1.part" "$CACHE/$1"; then
+        return 0
+    fi
+    rm -f "$CACHE/$1.part"
+    echo "warning: could not keep $1 in $CACHE (the build goes on without the backup)" >&2
+    return 0
 }
 
 provenance() { # provenance <dir> <url> <sha>

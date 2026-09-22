@@ -168,6 +168,113 @@ fn parse_pick(spec: &str) -> Option<ChannelPick> {
     }
 }
 
+/// **A USB interface's PipeWire node name, as a person would say it.**
+///
+/// PipeWire names an ALSA node `alsa_input.usb-<Maker>_<Model>_<serial>-<if>.<profile>`,
+/// and that string is what the input stream reports as its device - the
+/// owner's Scarlett is
+/// `alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0`.
+/// The picker shows the node's description instead, but the band only ever
+/// had the node name, so its AUDIO SETUP row said the whole thing (or,
+/// too long to fit, nothing at all). This takes the maker and model out of it:
+/// `Focusrite Scarlett Solo USB`.
+///
+/// USB only. A `pci-` node names a bus address and a `bluez_` node a MAC, and
+/// neither has a maker and model to recover, so those - and anything whose
+/// shape this does not recognise - are left exactly as they are.
+fn usb_node_label(node: &str) -> Option<String> {
+    let rest = node
+        .strip_prefix("alsa_input.")
+        .or_else(|| node.strip_prefix("alsa_output."))?;
+    let rest = rest.strip_prefix("usb-")?;
+    // WirePlumber's de-duplication suffix, `.2`, when two nodes would share a
+    // name (two identical interfaces) - before the profile, or the profile's
+    // own trailing digit would be taken for the interface number.
+    let rest = match rest.rsplit_once('.') {
+        Some((head, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => rest,
+    };
+    // The profile, after the LAST dot: `.pro-input-0`, `.analog-stereo`.
+    let rest = rest.rsplit_once('.').map_or(rest, |(head, _)| head);
+    // The USB interface number, `-00`. REQUIRED: a node without one is not
+    // the shape this reads, and is passed through rather than guessed at.
+    let rest = match rest.rsplit_once('-') {
+        Some((head, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => return None,
+    };
+    let mut words: Vec<&str> = rest.split('_').filter(|w| !w.is_empty()).collect();
+    // The serial: the last word, when it is long, alphanumeric and has a
+    // digit in it - and never the only word, which would leave nothing.
+    if words.len() > 1 {
+        let last = words[words.len() - 1];
+        if last.len() >= 10
+            && last.chars().all(|c| c.is_ascii_alphanumeric())
+            && last.chars().any(|c| c.is_ascii_digit())
+        {
+            words.pop();
+        }
+    }
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// **A device's name as a person would say it**: a USB PipeWire node made
+/// readable (`usb_node_label`), anything else exactly as the driver gave it.
+/// The band's AUDIO SETUP row, the mixer strips and the Setup dialog all name
+/// the input through this, so they cannot disagree.
+pub fn device_display_name(name: &str) -> String {
+    usb_node_label(name).unwrap_or_else(|| name.to_owned())
+}
+
+/// **The SHORT NAME, when it names the interface that is actually open.**
+///
+/// The owner gives the interface they chose a short name. A chosen interface
+/// that is unplugged does not leave nothing open: the session falls back to
+/// the default input (the laptop's microphone), and a short name applied to
+/// whatever is open then called the built-in mic "solo" while it recorded.
+/// So the alias applies only when nothing was chosen (the open device IS the
+/// one in use) or the chosen uid names the open device.
+pub fn alias_for_open<'a>(open: Option<&str>, uid: Option<&str>, alias: &'a str) -> Option<&'a str> {
+    let alias = alias.trim();
+    let open = open?;
+    if alias.is_empty() {
+        return None;
+    }
+    let chosen = match uid {
+        None => return Some(alias),
+        Some(uid) => split_channel(uid).0,
+    };
+    let names_open = match chosen.strip_prefix(PIPEWIRE_UID) {
+        Some(node) => node == open,
+        None => tangent_record::audio::DeviceKey::from_setting(chosen).name == open,
+    };
+    names_open.then_some(alias)
+}
+
+/// **What the band calls the input it is recording.**
+///
+/// 1. Nothing chosen and nothing open: `None`, and the band says so.
+/// 2. The SHORT NAME, when it names what is open - see `alias_for_open`.
+/// 3. The open device, by `device_display_name`.
+/// 4. With nothing open, the CHOSEN device, spelled as the picker spells it -
+///    never the raw settings uid, whose `pw:` prefix and unit-separator
+///    channel suffix are this module's private grammar.
+pub fn band_device_name(open: Option<&str>, uid: Option<&str>, alias: &str) -> Option<String> {
+    if open.is_none() && uid.is_none() {
+        return None;
+    }
+    if let Some(alias) = alias_for_open(open, uid, alias) {
+        return Some(alias.to_owned());
+    }
+    if let Some(name) = open {
+        return Some(device_display_name(name));
+    }
+    let (key, _) = split_channel(uid?);
+    Some(match key.strip_prefix(PIPEWIRE_UID) {
+        Some(node) => device_display_name(node),
+        None => tangent_record::audio::DeviceKey::from_setting(key).to_string(),
+    })
+}
+
 /// The uid for one input of a device, or a pair of them.
 fn channel_uid(key: &str, pick: ChannelPick) -> String {
     match pick {
@@ -972,6 +1079,65 @@ pub fn auto_expose(shared: &Shared, seeded: &[String]) -> Option<(String, Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The band names the interface, not its PipeWire node.** The owner's
+    /// AUDIO SETUP row showed nothing (the node name was too long to draw) and
+    /// would have said `alsa_input.usb-Focusrite_...pro-input-0` if it had.
+    #[test]
+    fn the_band_names_the_interface_not_its_pipewire_node() {
+        let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
+        assert_eq!(
+            band_device_name(Some(node), None, "").as_deref(),
+            Some("Focusrite Scarlett Solo USB")
+        );
+        // The owner's own short name wins, trimmed, as it does on the strips.
+        assert_eq!(band_device_name(Some(node), None, "  solo ").as_deref(), Some("solo"));
+        // Not open: the chosen device, never the uid's private grammar.
+        let uid = channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(0, 1));
+        let missing = band_device_name(None, Some(&uid), "").expect("a chosen device has a name");
+        assert_eq!(missing, "Focusrite Scarlett Solo USB");
+        assert!(!missing.contains(CHANNEL_SEP) && !missing.starts_with(PIPEWIRE_UID));
+        // macOS / Windows names pass through; a cpal key is spelled as the
+        // picker spells it.
+        assert_eq!(band_device_name(Some("Scarlett 2i2 USB"), None, "").as_deref(), Some("Scarlett 2i2 USB"));
+        assert_eq!(
+            band_device_name(None, Some("Scarlett 2i2 USB#1"), "").as_deref(),
+            Some("Scarlett 2i2 USB (2)")
+        );
+        // A PCI node is a bus address, and is left alone.
+        let pci = "alsa_input.pci-0000_00_1f.3.analog-stereo";
+        assert_eq!(band_device_name(Some(pci), None, "").as_deref(), Some(pci));
+        // A card with no serial keeps every word of its model.
+        assert_eq!(
+            band_device_name(Some("alsa_input.usb-BEHRINGER_UMC204HD_192k-00.analog-stereo"), None, "")
+                .as_deref(),
+            Some("BEHRINGER UMC204HD 192k")
+        );
+        // Nothing chosen is nothing, whatever the alias says.
+        assert_eq!(band_device_name(None, None, "x"), None);
+        // The chosen interface unplugged: the session fell back to the laptop
+        // mic, and the short name must not be pinned on it.
+        assert_eq!(
+            band_device_name(Some("MacBook Pro Microphone"), Some("Scarlett Solo USB"), "solo").as_deref(),
+            Some("MacBook Pro Microphone")
+        );
+        assert_eq!(
+            band_device_name(Some("Scarlett Solo USB"), Some("Scarlett Solo USB"), "solo").as_deref(),
+            Some("solo"),
+            "the short name names the interface it was given to"
+        );
+        assert_eq!(band_device_name(Some(node), Some(&uid), "solo").as_deref(), Some("solo"));
+        // Chosen and not open at all: the chosen device, not its short name.
+        assert_eq!(band_device_name(None, Some(&uid), "solo").as_deref(), Some("Focusrite Scarlett Solo USB"));
+        // WirePlumber's duplicate suffix does not eat the profile's digit.
+        assert_eq!(
+            device_display_name(&format!("{node}.2")),
+            "Focusrite Scarlett Solo USB"
+        );
+        // A USB node without an interface number is passed through whole.
+        let odd = "alsa_input.usb-Some_Thing.analog-stereo";
+        assert_eq!(device_display_name(odd), odd);
+    }
 
     fn a_device(uid: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
