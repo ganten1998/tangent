@@ -1482,6 +1482,9 @@ struct BarClock {
     /// about to fire is the take's. They are not the same number and
     /// comparing them would be comparing two clocks' idea of zero.
     already_sounded: bool,
+    /// Frames `already_sounded` has waited for the transport to roll. See
+    /// [`SOUNDED_GRACE_S`].
+    sounded_wait: u32,
     /// Clicks per beat of the signature; 0 means one per BAR. Held here so
     /// `normalise` and `frame_of` cannot disagree about how many there are.
     div: u32,
@@ -1502,10 +1505,23 @@ impl Default for BarClock {
             expect: 0,
             armed: false,
             already_sounded: false,
+            sounded_wait: 0,
             div: 1,
         }
     }
 }
+
+/// **How long the count-in's "go" may stand in for beat one, waiting for the
+/// transport to roll**, in seconds.
+///
+/// `BarClock::already_sounded` assumes the transport starts on the go - the
+/// host rolls it a UI poll later, tens of milliseconds - and that was true of
+/// every count-in while a take drove the transport. It is not true now: a
+/// take's count-in leaves the transport where it was, and the flag, left up,
+/// swallowed the first click of whatever Play came next, any time later. A
+/// quarter of a second is several slow polls and far less than anybody takes
+/// to reach for Play.
+const SOUNDED_GRACE_S: f64 = 0.25;
 
 impl BarClock {
     /// How many clicks a bar carries at this division.
@@ -1591,6 +1607,18 @@ impl BarClock {
     /// frame number.
     fn sounded_elsewhere(&mut self) {
         self.already_sounded = true;
+        self.sounded_wait = 0;
+    }
+
+    /// A frame with the transport NOT rolling. The go stops standing in for
+    /// beat one once nothing has rolled for [`SOUNDED_GRACE_S`].
+    fn idle(&mut self, rate: f64) {
+        if self.already_sounded {
+            self.sounded_wait = self.sounded_wait.saturating_add(1);
+            if f64::from(self.sounded_wait) > rate.max(1.0) * SOUNDED_GRACE_S {
+                self.already_sounded = false;
+            }
+        }
     }
 
     /// Advance one frame. `Some` on the frame a beat lands.
@@ -9409,6 +9437,10 @@ impl Renderer {
                 // wherever playback happened to begin, and a tempo map —
                 // which has no single period to accumulate — works at all.
                 let heard_beat = if self.beats.counting_in() || !rolling {
+                    // Not rolling: the bar clock is not ticked, so this is
+                    // where a count-in's go that nothing rolled after lets go
+                    // of the beat it stood in for.
+                    self.bar_clock.idle(self.rate);
                     self.beats.tick(metro_on && rolling, bpb)
                 } else if metro_on {
                     self.bar_clock.tick(at + frame_index as u64, &self.maps, self.rate)
@@ -9439,7 +9471,17 @@ impl Renderer {
                         // transport starts at frame zero a poll from now,
                         // which is beat one — the beat this "go" just was.
                         // See `BarClock::already_sounded`.
-                        self.bar_clock.sounded_elsewhere();
+                        //
+                        // **Only if it is not rolling ALREADY.** A go over a
+                        // song that is playing stands in for none of its
+                        // beats: the bar clock would resync to the song's
+                        // next one and step past it in silence, a beat or two
+                        // after the go. The host now keeps Play to the
+                        // downbeat while a count runs, but the rule belongs
+                        // here, where the two clocks meet.
+                        if !rolling {
+                            self.bar_clock.sounded_elsewhere();
+                        }
                     }
                 }
 
@@ -14955,6 +14997,18 @@ impl RecorderTap {
             },
         )
     }
+    /// **Whether an engine is still writing into this tap.**
+    ///
+    /// The write end lives in the output callback, so it goes when its
+    /// engine does - and a tap whose engine has gone does not fail, it just
+    /// never has anything in it. A take recording through one is exact zeros
+    /// with every counter clean, which is how three takes on the owner's
+    /// Linux box came out silent with nothing anywhere saying why. See
+    /// `record::adopt_queued_taps` for how a writer ended up holding one.
+    pub fn is_live(&self) -> bool {
+        !self.rx.is_abandoned()
+    }
+
     /// Append everything available. Interleaved; returns frames moved.
     pub fn drain(&mut self, out: &mut Vec<f32>) -> usize {
         let available = self.rx.slots();
@@ -20959,6 +21013,75 @@ mod tests {
             .collect()
     }
 
+    /// **A count-in nothing rolls after does not swallow the next Play's
+    /// first click.**
+    ///
+    /// The count-in's go tells the bar clock its next beat has been sounded,
+    /// because the host used to roll the transport on every go - the red
+    /// button's count and the take's alike. A take leaves the transport alone
+    /// now, so after a take's count the flag stayed up, and the first click of
+    /// whatever Play came next, a minute later, was stepped past in silence.
+    /// It expires after `SOUNDED_GRACE_S` of nothing rolling. The engine's own
+    /// loop, idle call included; the control half is the existing guarantee,
+    /// with the transport starting a poll after the go.
+    #[test]
+    fn a_count_in_nothing_rolls_after_does_not_swallow_the_next_first_click() {
+        let rate = 48_000.0;
+        let maps = Maps::default();
+        // (frames from the go to Play, whether beat one must sound on Play)
+        for (wait, sounds) in [(48_000u64, true), (800, false)] {
+            let mut b = Beats::new(rate, 120.0);
+            let mut bar = BarClock::default();
+            b.restart(4);
+            let mut pos = 0u64;
+            let mut rolling = false;
+            let mut go_at: Option<u64> = None;
+            let mut first_on_play: Option<bool> = None;
+            for now in 0..(24_000u64 * 12) {
+                if let Some(g) = go_at {
+                    if !rolling && now >= g + wait {
+                        rolling = true;
+                    }
+                }
+                let heard = if b.counting_in() || !rolling {
+                    bar.idle(rate);
+                    b.tick(false, 4)
+                } else {
+                    bar.tick(pos, &maps, rate)
+                };
+                if rolling && first_on_play.is_none() {
+                    first_on_play = Some(heard.is_some());
+                }
+                if let Some(beat) = heard {
+                    if beat.downbeat {
+                        go_at = Some(now);
+                        bar.sounded_elsewhere();
+                    }
+                }
+                if rolling {
+                    pos += 1;
+                }
+            }
+            assert!(go_at.is_some(), "the count-in never reached its downbeat");
+            assert_eq!(
+                first_on_play,
+                Some(sounds),
+                "Play {wait} frames after the go: beat one {}",
+                if sounds { "was swallowed" } else { "doubled the go" }
+            );
+        }
+        // And the engine really does age the flag where the model does.
+        let src = include_str!("instrument.rs");
+        let at = src
+            .find("let heard_beat = if self.beats.counting_in() || !rolling {")
+            .expect("the click's two-clock branch");
+        assert!(
+            src[at..at + 600].contains("self.bar_clock.idle(self.rate);"),
+            "the engine does not age the go while the transport is still"
+        );
+    }
+
+
     /// **The "go" sounds ONCE, not twice.**
     ///
     /// Reported from a real session: "the metronome countin works, but after
@@ -21062,13 +21185,27 @@ mod tests {
 
         // **And the ENGINE arms it**, which the model above cannot show: it
         // calls `sounded_elsewhere` on the same frame it stores the downbeat.
+        //
+        // **In the production code, not in this test.** The scan used to
+        // `rfind` the store - and the last occurrence of that string in the
+        // file is the literal just below, so it found its own needle and
+        // passed whatever the engine did. The FIRST occurrence is the
+        // engine's (the render loop sits far above this module).
         let src = include_str!("instrument.rs");
-        let at = src
-            .rfind("self.shared.count_in_done.store(true, Ordering::Relaxed);")
-            .expect("the downbeat's own store");
+        let needle = "self.shared.count_in_done.store(true, Ordering::Relaxed);";
+        let at = src.find(needle).expect("the downbeat's own store");
+        assert_ne!(
+            Some(at),
+            src.rfind(needle),
+            "only the test's own literal was found, so this proves nothing"
+        );
+        let after = &src[at..(at + 1_500).min(src.len())];
+        let hand = after
+            .find("self.bar_clock.sounded_elsewhere();")
+            .expect("the engine stores the downbeat without telling the bar clock");
         assert!(
-            src[at..at + 400].contains("bar_clock.sounded_elsewhere()"),
-            "the engine stores the downbeat without telling the bar clock"
+            after[..hand].contains("if !rolling {"),
+            "the go hands its beat over even when the song is already rolling"
         );
     }
 
@@ -28853,6 +28990,7 @@ mod tests {
                 expect: 0,
                 armed: false,
                 already_sounded: false,
+                sounded_wait: 0,
                 div,
             };
             c.ticks_in_bar(beats)

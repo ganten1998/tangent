@@ -309,6 +309,70 @@ struct Writer {
     audio_tx: Option<mpsc::Sender<AudioChunk>>,
 }
 
+/// **Every tap still queued for a writer that is being told to stop.**
+///
+/// Both writer threads loop `while alive { try_recv; pump; sleep }`, and both
+/// owners' `Drop` clears `alive` BEFORE sending `Quit`. So a thread that wakes
+/// after the drop leaves at the `alive` check without reading its queue, and a
+/// `Cmd::Plugin` that was sent just before the drop is thrown away with the
+/// channel - while the thread hands home the tap it was ALREADY holding.
+///
+/// That is exactly the order every audio-path rebuild runs in: `close_input`
+/// parks the old engine's tap in a `PluginAudio`, `start_engine` takes the new
+/// engine's once-only tap and can only queue it there, and `open_input` drops
+/// that `PluginAudio` a fraction of a millisecond later. The new input writer
+/// was then handed the OLD engine's tap, whose write end had gone with its
+/// engine: every take after a buffer change, a "went quiet" recovery or a
+/// rate move was exact digital silence, with `frames_dropped: 0` and nothing
+/// anywhere saying why. The owner's Linux box lost all twelve rebuilds of one
+/// session that way, and a Mac take after three rebuilds went the same way.
+///
+/// Draining the queue on the way out makes the handoff order-proof: the
+/// newest tap anyone gave this writer is the one it hands home, whether or not
+/// the thread got round to reading it. `Cmd::Plugin(None)` is honoured too -
+/// it means "no tap", and the loop body treats it that way.
+fn adopt_queued_taps(
+    cmds: &mpsc::Receiver<Cmd>,
+    tap: &mut Option<crate::instrument::RecorderTap>,
+) {
+    while let Ok(cmd) = cmds.try_recv() {
+        if let Cmd::Plugin(t) = cmd {
+            *tap = t.map(|t| *t);
+        }
+    }
+}
+
+/// What a take says when the desk it was given cannot reach it any more.
+///
+/// A take through a dead tap is silence, and a silent take used to be only a
+/// WARNING on an otherwise ordinary "Recorded 0:15 of audio" line - true, and
+/// no help at all, because the file is empty for a reason that has nothing to
+/// do with what was played.
+const DEAD_TAP: &str = "nothing from the desk reached this take - the audio engine it \
+     was listening to is no longer running, so the file is silence";
+
+/// The same take with no engine ever behind it: the input writer records
+/// only the desk, so with no desk the file is silence too.
+const NO_TAP: &str = "nothing from the desk reached this take - no audio engine was \
+     running when it started, so the file is silence";
+
+/// The first problem a take start can see about its own tap: a live one is
+/// fine, a dead one is the silent take above.
+fn tap_problem(tap: Option<&crate::instrument::RecorderTap>) -> Option<&'static str> {
+    tap.filter(|t| !t.is_live()).map(|_| DEAD_TAP)
+}
+
+/// The INPUT writer's version, which also refuses to be quiet about having
+/// no tap at all: it discards the capture and writes only the desk, so a take
+/// with no engine behind it is exact zeros. (The instrument writer cannot
+/// have none - it exists because it was given one.)
+fn input_tap_problem(tap: Option<&crate::instrument::RecorderTap>) -> Option<&'static str> {
+    match tap {
+        None => Some(NO_TAP),
+        t => tap_problem(t),
+    }
+}
+
 impl Writer {
     /// One pass: absorb whatever the device has produced since the last one.
     ///
@@ -847,6 +911,10 @@ impl Audio {
                                         Some(format!("could not create the audio file: {e}"));
                                 }
                             }
+                            if let Some(p) = input_tap_problem(writer.plugin.as_ref()) {
+                                log::error!("take: {p}");
+                                writer.error.get_or_insert_with(|| p.to_owned());
+                            }
                         }
                         Ok(Cmd::Stop) => {
                             let report = writer.stop();
@@ -886,6 +954,9 @@ impl Audio {
                 if writer.wav.is_some() {
                     let _ = writer.stop();
                 }
+                // Whatever tap was queued behind the Quit wins - see
+                // `adopt_queued_taps`, which is the whole of the silent take.
+                adopt_queued_taps(&cmd_rx, &mut writer.plugin);
                 // Hand the instrument tap back on the way out, so it can be
                 // given to whichever writer runs next. See `Session::tap_tx`.
                 if let Some(t) = writer.plugin.take() {
@@ -1121,11 +1192,12 @@ pub struct Session {
     /// A T0 supplied from outside; see [`arm_at`](Session::arm_at).
     arm_override: Option<Nanos>,
     /// The next take's placement facts, pushed by the host every frame:
-    /// (timeline start s, head s, muted mask, soloed mask). Read once, at
-    /// `begin`, which is the only moment they are true OF anything.
-    take_facts: (f64, f64, u32, u32),
-    /// The same four, latched at `begin` for the manifest `stop` writes.
-    manifest_facts: (f64, f64, u32, u32),
+    /// (timeline start s, transport rolling, head s, muted mask, soloed
+    /// mask). Read once, at `begin`, which is the only moment they are true
+    /// OF anything.
+    take_facts: (f64, bool, f64, u32, u32),
+    /// The same five, latched at `begin` for the manifest `stop` writes.
+    manifest_facts: (f64, bool, f64, u32, u32),
     last: Option<Summary>,
     /// Latched across the take, because the meter's own latch is reset when the
     /// next one is armed and the user may not have looked yet.
@@ -1234,8 +1306,8 @@ impl Session {
             spec: ExportSpec::default(),
             pending_note: None,
             arm_override: None,
-            take_facts: (0.0, 0.0, 0, 0),
-            manifest_facts: (0.0, 0.0, 0, 0),
+            take_facts: (0.0, false, 0.0, 0, 0),
+            manifest_facts: (0.0, false, 0.0, 0, 0),
             last: None,
             clipped: false,
             finished: None,
@@ -1613,11 +1685,37 @@ impl Session {
     /// The take's time signature. Ignored mid-take, like the source: a `.mid`
     /// whose bar lines changed halfway through is a file nobody can edit.
     /// The next take's placement facts, pushed each frame so `begin` can
-    /// latch them at the one moment they are true of anything: where on the
-    /// timeline it starts, how much count-in its head will carry, and the
-    /// desk masks it is cut under.
-    pub fn set_take_facts(&mut self, timeline_start_s: f64, head_s: f64, muted: u32, soloed: u32) {
-        self.take_facts = (timeline_start_s, head_s, muted, soloed);
+    /// latch them at the one moment they are true of anything: where the
+    /// playhead is, whether the transport is rolling (a take no longer rolls
+    /// it, so a playhead that is standing still places nothing), how much
+    /// count-in its head will carry, and the desk masks it is cut under.
+    pub fn set_take_facts(
+        &mut self,
+        timeline_start_s: f64,
+        rolling: bool,
+        head_s: f64,
+        muted: u32,
+        soloed: u32,
+    ) {
+        self.take_facts = (timeline_start_s, rolling, head_s, muted, soloed);
+    }
+
+    /// The head alone, set at the press - which can be inside the same call
+    /// that begins the take, before the host's next per-frame push. See
+    /// `Manifest::head_seconds`.
+    pub fn set_take_head(&mut self, head_s: f64) {
+        self.take_facts.2 = head_s;
+    }
+
+    /// **The count-in began earlier than the press** - it is the
+    /// arrangement's, and this take joined it. Counted from there, the take
+    /// begins on the same downbeat the arrangement record does; counted from
+    /// the press it began a bar or so later, with the rest of the other
+    /// count in its file. Only meaningful while counting in.
+    pub fn count_in_began_at(&mut self, from: Instant) {
+        if matches!(self.state, RecordState::CountIn { .. }) {
+            self.count_in_from = Some(from);
+        }
     }
 
     pub fn set_meter(&mut self, meter: tangent_ui::recorder::TimeSignature) {
@@ -1970,6 +2068,9 @@ impl Session {
         match self.state {
             RecordState::Idle => {
                 self.spec = spec;
+                // An instant offered before this press can never be this
+                // take's. See `arm_at`.
+                self.forget_arm();
                 if count_in_beats == 0 {
                     self.begin(root, name);
                 } else {
@@ -2057,8 +2158,19 @@ impl Session {
     /// late, plus the output device's own delay. Recording from the beat the
     /// player heard is the difference between a take that starts on the bar and
     /// one that starts a few milliseconds after it.
+    ///
+    /// **Only while THIS take is counting in.** The engine has one count-in
+    /// and the arrangement's red button uses it too, and a take whose count
+    /// goes into the file is already writing when its downbeat lands. Either
+    /// way the downbeat is not this take's start - and an instant accepted
+    /// here outside a count-in is consumed by the NEXT `begin`, which is a
+    /// take timestamped from a downbeat minutes old: its `.mid` minutes away
+    /// from its `.wav`. That was reachable once a take stopped owning the
+    /// transport and the two recordings could run in any order.
     pub fn arm_at(&mut self, t0: Nanos) {
-        self.arm_override = Some(t0);
+        if matches!(self.state, RecordState::CountIn { .. }) {
+            self.arm_override = Some(t0);
+        }
     }
 
     /// Forget a T0 that was offered and never used.
@@ -2079,7 +2191,7 @@ impl Session {
         // carry, and what desk it is being cut from — all latched into the
         // manifest here, because a take placed on a lane afterwards has
         // nothing else to ask. See `Manifest::timeline_start_seconds`.
-        let (timeline_start, head, muted, soloed) = self.take_facts;
+        let (timeline_start, rolling, head, muted, soloed) = self.take_facts;
         // The previous take's manifest must not be amendable once a new take
         // exists, or a slow encoder could write take N's video into take N+1.
         self.finished = None;
@@ -2106,7 +2218,7 @@ impl Session {
             .take()
             .unwrap_or_else(|| self.timebase.now());
         self.started_at = at;
-        self.manifest_facts = (timeline_start, head, muted, soloed);
+        self.manifest_facts = (timeline_start, rolling, head, muted, soloed);
         self.started_instant = Some(Instant::now());
         // Keep the minute BEFORE T0: that is where the pedal-down and the
         // program change the .mid has to restate at tick 0 live.
@@ -2364,8 +2476,9 @@ impl Session {
         let mut manifest = Manifest::starting(take.name(), self.started_at, t0);
         // The placement facts latched at `begin` — see `Manifest`'s own docs
         // for why each is irrecoverable after the fact.
-        let (timeline_start, head, muted, soloed) = self.manifest_facts;
+        let (timeline_start, rolling, head, muted, soloed) = self.manifest_facts;
         manifest.timeline_start_seconds = timeline_start;
+        manifest.timeline_rolling = rolling;
         manifest.head_seconds = head;
         manifest.heard_muted = muted;
         manifest.heard_soloed = soloed;
@@ -3450,6 +3563,129 @@ mod tests {
         );
     }
 
+    /// **An audio-path rebuild hands the take the NEW engine's tap.**
+    ///
+    /// The exact sequence `open_audio_path_now` runs, minus the devices:
+    /// `close_input` has parked the old engine's tap in a `PluginAudio`,
+    /// `start_engine` queues the new engine's tap to it, the old engine goes,
+    /// and `open_input` drops the `PluginAudio` and recovers whatever it hands
+    /// home. That used to be the OLD tap nearly every time - the thread leaves
+    /// at its `alive` check without reading its queue - so every take after a
+    /// buffer change was silence. See `adopt_queued_taps`.
+    #[test]
+    fn a_rebuild_hands_the_take_the_new_engines_tap_and_not_the_dead_one() {
+        for round in 0..20 {
+            let mut s = session();
+            let (old, old_write, _) = crate::instrument::RecorderTap::for_test(1024, 2);
+            s.set_plugin_tap(Some(old));
+            let (new, new_write, _) = crate::instrument::RecorderTap::for_test(1024, 2);
+            s.set_plugin_tap(Some(new));
+            // The old engine is dropped with its output stream, and its end of
+            // the ring with it.
+            drop(old_write);
+            // `open_input`: the parked writer goes, and what it hands home is
+            // what the next writer records through.
+            s.plugin_audio = None;
+            let home = s.recover_tap().expect("a tap comes home");
+            assert!(
+                home.is_live(),
+                "round {round}: the take was handed the dead engine's tap, so it records silence"
+            );
+            drop(new_write);
+        }
+    }
+
+    /// The drain itself: the NEWEST queued tap wins, other commands are
+    /// ignored on the way out, and a queued `None` means no tap.
+    #[test]
+    fn the_last_tap_queued_behind_a_quit_is_the_one_kept() {
+        let (tx, rx) = mpsc::channel();
+        let (a, _a_write, _) = crate::instrument::RecorderTap::for_test(64, 1);
+        let (b, _b_write, _) = crate::instrument::RecorderTap::for_test(64, 2);
+        let (held, held_write, _) = crate::instrument::RecorderTap::for_test(64, 4);
+        drop(held_write);
+        tx.send(Cmd::Plugin(Some(Box::new(a)))).unwrap();
+        tx.send(Cmd::ClearClip).unwrap();
+        tx.send(Cmd::Plugin(Some(Box::new(b)))).unwrap();
+        tx.send(Cmd::Quit).unwrap();
+        let mut tap = Some(held);
+        adopt_queued_taps(&rx, &mut tap);
+        let kept = tap.expect("a tap was queued, so one is kept");
+        assert_eq!(kept.channels(), 2, "the newest queued tap wins");
+        assert!(kept.is_live());
+
+        let (c, _c_write, _) = crate::instrument::RecorderTap::for_test(64, 2);
+        tx.send(Cmd::Plugin(None)).unwrap();
+        let mut tap = Some(c);
+        adopt_queued_taps(&rx, &mut tap);
+        assert!(tap.is_none(), "a queued None removes the tap, as the loop does");
+    }
+
+    /// **A take through a dead tap says so.** It records the silence it was
+    /// given - the file and the timeline stay honest - but the report is a
+    /// problem naming the cause, not an ordinary take with a warning on it.
+    #[test]
+    fn a_take_through_a_dead_tap_is_a_problem_and_not_just_a_quiet_take() {
+        let dir = std::env::temp_dir().join(format!("tangent-dead-tap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            format: TAKE_FORMAT,
+        };
+        let start = |path: PathBuf| StartArgs {
+            path,
+            spec,
+            bext: Bext::new(WallTime::from_unix(1_786_804_327, 0), spec),
+            audio_tx: None,
+        };
+
+        let (mut dead, write_end, _) = plugin_writer(2, 4096);
+        drop(write_end);
+        dead.begin(start(dir.join("dead.wav")));
+        let report = dead.finish();
+        assert_eq!(report.error.as_deref(), Some(DEAD_TAP));
+
+        // And a live one is not accused of anything.
+        let (mut live, _write_end, _) = plugin_writer(2, 4096);
+        live.begin(start(dir.join("live.wav")));
+        let report = live.finish();
+        assert!(report.error.is_none(), "{:?}", report.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The input writer runs the same exit as the instrument writer, and it
+    /// cannot be driven here without a device - so it is read instead. Bounded
+    /// to the input thread's own closure: from its thread name to the next
+    /// `.map_err`, which is where `Audio::open` ends the spawn.
+    #[test]
+    fn the_input_writer_also_keeps_the_newest_tap_on_the_way_out() {
+        let src = include_str!("record.rs");
+        let body = src
+            .rsplit_once(".name(\"tangent-writer\".into())")
+            .and_then(|(_, rest)| rest.split_once(".map_err("))
+            .map(|(body, _)| body)
+            .expect("the input writer's thread is spawned in Audio::open");
+        let drain = body
+            .find("adopt_queued_taps(&cmd_rx, &mut writer.plugin)")
+            .expect("the input writer does not drain its queue before it exits");
+        let home = body
+            .find("tap_home.send(")
+            .expect("the input writer hands its tap home");
+        let quit = body
+            .find("Ok(Cmd::Quit)")
+            .expect("the input writer has a quit arm");
+        assert!(
+            quit < drain && drain < home,
+            "the drain has to run after the loop and before the hand-home"
+        );
+        let checked = body
+            .find("input_tap_problem(writer.plugin.as_ref())")
+            .expect("the input writer does not check its tap - or its lack of one - at Start");
+        assert!(checked < quit, "the tap check belongs to the Start arm");
+    }
+
     /// A session with no input device gives the instrument a writer of its own,
     /// and a take then records audio rather than only MIDI.
     #[test]
@@ -3851,10 +4087,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = session();
 
-        // A take that WAS armed from a downbeat.
+        // A take that WAS armed from its own count-in's downbeat.
+        s.toggle(&dir, Some("first"), 3, ExportSpec::default());
         let downbeat = s.timebase.now();
         s.arm_at(downbeat);
-        s.toggle(&dir, Some("first"), 0, ExportSpec::default());
+        s.count_in_from = Some(Instant::now() - Duration::from_secs(60));
+        s.tick(&dir, Some("first"));
+        assert_eq!(s.state(), RecordState::Rolling);
         assert_eq!(s.t0, downbeat, "the armed instant is what a take starts at");
         s.stop();
 
@@ -3864,6 +4103,115 @@ mod tests {
         assert!(
             s.t0 >= before,
             "the second take was stamped from the first take's downbeat"
+        );
+        s.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A take that joins the arrangement's count-in counts from when THAT
+    /// count began**, so both recordings start on its downbeat. Counted from
+    /// the press, the take began a bar or so late - or, as the first draft of
+    /// the join did, at the press itself, with the rest of the other count in
+    /// its file.
+    #[test]
+    fn a_joined_count_in_is_counted_from_when_it_began() {
+        let dir = std::env::temp_dir().join(format!("tangent-joined-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        // Idle: nothing to rewind.
+        s.count_in_began_at(Instant::now() - Duration::from_secs(60));
+        assert_eq!(s.state(), RecordState::Idle);
+
+        // A four-beat count pressed now is still counting a moment later...
+        s.toggle(&dir, Some("joined"), 4, ExportSpec::default());
+        s.tick(&dir, Some("joined"));
+        assert!(matches!(s.state(), RecordState::CountIn { .. }));
+        // ...but joined to one that began a minute ago, it is over.
+        s.count_in_began_at(Instant::now() - Duration::from_secs(60));
+        s.tick(&dir, Some("joined"));
+        assert_eq!(s.state(), RecordState::Rolling, "the joined count was counted from the press");
+        s.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The head and the transport's state are the ones the PRESS decided**,
+    /// and they reach `take.json`. The head used to be recomputed every frame
+    /// from the settings, so a take that skipped its count (the song already
+    /// playing) was written with a bar of head it did not have.
+    #[test]
+    fn the_press_decides_the_head_and_the_manifest_says_whether_the_song_rolled() {
+        let dir = std::env::temp_dir().join(format!("tangent-take-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        // What the per-frame push would say from the settings alone...
+        s.set_take_facts(83.0, true, 2.0, 0, 0);
+        // ...and what the press actually did.
+        s.set_take_head(0.0);
+        s.toggle(&dir, Some("head"), 0, ExportSpec::default());
+        s.stop();
+        let folder = s.last_summary().expect("a summary").folder.clone();
+        let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
+        assert!(json.contains("\"head_seconds\": 0"), "the settings' head reached the manifest: {json}");
+        assert!(json.contains("\"timeline_start_seconds\": 83"), "{json}");
+        assert!(json.contains("\"timeline_rolling\": true"), "{json}");
+
+        // Over a stopped song the playhead places nothing, and says so.
+        s.set_take_facts(12.0, false, 0.0, 0, 0);
+        s.toggle(&dir, Some("still"), 0, ExportSpec::default());
+        s.stop();
+        let folder = s.last_summary().expect("a summary").folder.clone();
+        let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
+        assert!(json.contains("\"timeline_rolling\": false"), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A downbeat that is not this take's count-in's is never its T0.**
+    ///
+    /// The engine has one count-in, and two things now land a downbeat on a
+    /// session that is not counting in: the arrangement's red button (a take
+    /// can run beside an arrangement record), and a take whose count goes
+    /// INTO the file, which is already writing when its own downbeat sounds.
+    /// Either instant used to be kept and consumed by the NEXT take's
+    /// `begin`, stamping it from a downbeat minutes old.
+    #[test]
+    fn a_downbeat_outside_a_count_in_is_not_kept_for_the_next_take() {
+        let dir = std::env::temp_dir().join(format!("tangent-foreign-arm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+
+        // Idle: the arrangement counted in and started its record.
+        let early = s.timebase.now();
+        s.arm_at(early);
+        // Writing: this take's count is in the file, and its go lands now.
+        s.toggle(&dir, Some("counted-in-the-file"), 0, ExportSpec::default());
+        assert_eq!(s.state(), RecordState::Rolling);
+        s.arm_at(s.timebase.now());
+        assert!(
+            s.arm_override.is_none(),
+            "a downbeat was kept while the take was already writing"
+        );
+        s.stop();
+
+        let before = s.timebase.now();
+        s.toggle(&dir, Some("next"), 0, ExportSpec::default());
+        assert!(
+            s.t0 >= before,
+            "the next take was stamped from a downbeat that was not its own"
+        );
+        s.stop();
+
+        // **A count-in cancelled after its downbeat was offered.** The offer
+        // was legitimate - the session WAS counting in - and it is the fresh
+        // press that has to let go of it, not the guard.
+        s.toggle(&dir, Some("cancelled"), 4, ExportSpec::default());
+        s.arm_at(s.timebase.now());
+        s.toggle(&dir, Some("cancelled"), 4, ExportSpec::default());
+        assert_eq!(s.state(), RecordState::Idle, "the second press cancels the count");
+        let before = s.timebase.now();
+        s.toggle(&dir, Some("after-a-cancel"), 0, ExportSpec::default());
+        assert!(
+            s.t0 >= before,
+            "a take was stamped from the downbeat of a count-in that was cancelled"
         );
         s.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -4166,6 +4514,11 @@ impl PluginAudio {
                 if w.wav.is_some() {
                     let _ = w.finish();
                 }
+                // And the same last look at the queue. This is the writer the
+                // rebuild race actually ran through: `close_input` parks the
+                // old tap HERE, the new engine's tap is queued HERE, and
+                // `open_input` drops this thread a moment later.
+                adopt_queued_taps(&cmd_rx, &mut w.tap);
                 // Same hand-back as the input writer's: the tap outlives the
                 // thread that was holding it.
                 if let Some(t) = w.tap.take() {
@@ -4241,6 +4594,10 @@ impl PluginWriter {
         match WavWriter::create(&args.path, args.spec, &args.bext) {
             Ok(w) => self.wav = Some(w),
             Err(e) => self.error = Some(format!("could not create the audio file: {e}")),
+        }
+        if let Some(p) = tap_problem(self.tap.as_ref()) {
+            log::error!("take: {p}");
+            self.error.get_or_insert_with(|| p.to_owned());
         }
     }
 

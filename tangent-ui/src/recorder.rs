@@ -240,6 +240,10 @@ pub struct RecorderView<'a> {
     /// Armed lanes are being recorded into the arrangement — the red
     /// button's lit state. Not the capture-take's `state`.
     pub arr_recording: bool,
+    /// A realtime EXPORT is playing the arrangement into a file. It runs on
+    /// the take machine, so `state` alone cannot tell it from a take - and
+    /// unlike a take it owns the transport: see `RecorderState::exporting`.
+    pub exporting: bool,
     /// The arrangement viewport's `(start_s, len_s)` — the LCD's
     /// Start/End/Length rows are the TIMELINE's, never a clip's, and they
     /// are live whether or not a single clip exists.
@@ -387,6 +391,7 @@ impl RecorderView<'_> {
             position_s: 0.0,
             playing: false,
             arr_recording: false,
+            exporting: false,
             view_window: (0.0, 60.0),
             meters: Meters::SILENT,
             master: Meters::SILENT,
@@ -1855,6 +1860,14 @@ pub struct RecorderState {
     /// The red button's OWN machine: armed lanes are being recorded into the
     /// arrangement. Independent of `state`, which is the capture-take's.
     pub arr_recording: bool,
+    /// **A realtime EXPORT is running.** It is a take of a SPAN - the song
+    /// played start to end into a file - so it runs on the take machine and
+    /// `state` shows it as Rolling. But where an ordinary take owns nothing,
+    /// an export owns the transport and the lanes: its stems are bound to lane
+    /// indices, a seek writes the wrong bars, and Stop cuts it short. The UI
+    /// asks this, not `state`, whenever the question is "may the transport or
+    /// the lanes move".
+    pub exporting: bool,
     /// The record's progress, for the growing ghost clips. `None` idle.
     pub arr_rec: Option<ArrRecView>,
     pub state: RecordState,
@@ -1913,6 +1926,7 @@ impl Default for RecorderState {
             position_s: 0.0,
             playing: false,
             arr_recording: false,
+            exporting: false,
             arr_rec: None,
             state: RecordState::default(),
             elapsed_s: 0.0,
@@ -1989,6 +2003,7 @@ impl RecorderState {
             position_s: self.position_s,
             playing: self.playing,
             arr_recording: self.arr_recording,
+            exporting: self.exporting,
             view_window: (0.0, 60.0),
             meters: self.meters,
             master: self.master,
@@ -2357,15 +2372,20 @@ pub enum RecorderRequest {
     /// The cassette beside the cog: start or stop a CAPTURE — the whole-take
     /// machinery (window video, all audio, the `.mid`), completely separate
     /// from the arrangement. `Toggle` is the arrangement's red button now;
-    /// this is where the old take toggle lives.
+    /// this is where the old take toggle lives. **The only request that
+    /// reaches a take**: a take owns no part of the transport, so every
+    /// other request here answers the same under one as without.
     Capture,
-    /// Stop, unconditionally. Separate from `Toggle` because the band draws a
-    /// distinct Stop control and "the button that stops it" must not also be
-    /// able to start one.
+    /// Stop the TRANSPORT and the arrangement's record. Separate from
+    /// `Toggle` because the band draws a distinct Stop control and "the
+    /// button that stops it" must not also be able to start one. It does not
+    /// end a take - the cassette does - except the realtime export, which is
+    /// a take of a span and which Stop cuts short.
     Stop,
-    /// PAUSE: hold the playhead where it stands. Ignored while any record
-    /// owns the transport — a pause mid-record would let the capture run
-    /// past the playhead.
+    /// PAUSE: hold the playhead where it stands. Ignored while the
+    /// arrangement records or an export plays - a pause mid-record would let
+    /// the capture run past the playhead. Not while a take runs: a take films
+    /// whatever the transport does.
     Pause,
     /// Put out every clip latch: the user has seen it.
     DismissClip,
@@ -2413,10 +2433,10 @@ pub enum RecorderRequest {
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
     OpenInsertEditor(usize, usize),
-    /// The green button: audition from the playhead, no take. Pressed while
-    /// auditioning, it PAUSES in place; Stop is what returns to 0:00. The
-    /// host ignores it while a take is writing — record owns the transport
-    /// then.
+    /// The green button: audition from the playhead. Pressed while
+    /// auditioning, it PAUSES in place; Stop is what returns to the edit
+    /// cursor. The host ignores it while the arrangement records or an export
+    /// plays - each owns the transport then. A take does not.
     Play,
     /// Put the playhead at this many SECONDS from 0:00. Seconds, because
     /// seconds survive a device that changes rate; the host converts at the

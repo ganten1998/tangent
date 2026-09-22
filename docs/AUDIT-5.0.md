@@ -610,10 +610,10 @@ Compiled from a read-only sweep of `/Users/ganten/Library/CloudStorage/Dropbox/P
 - **Capture is its own control**: a tape-amber cassette button beside the transport runs the whole-take machinery completely independently of arrangement recording — you can film a take over a playing or even recording arrangement (4.46).
 - **The take is the desk**: what you hear is what gets recorded — mute is the one control that decides what stays out of a take, and monitored/unmonitored inputs both land in the file correctly (4.27).
 - **Missing-source warning**: while a take is rolling, the band names any muted source that has signal in it, before the take is lost (4.27).
-- **Count-in** in any time signature including 6/8, kept out of the file or recorded in; Enter during the count cancels; the arrangement's red button honours it too (4.2-era; arrangement count-in 4.57).
+- **Count-in** in any time signature including 6/8, kept out of the file or recorded in; the cassette pressed during the count cancels it; the arrangement's red button honours it too, and a take and an arrangement record started together share one count (4.2-era; arrangement count-in 4.57; shared count 5.0).
 - **Take summary**: a take reports its duration and any problem (a silent take counts as one) in a dismissable dialog with a "don't show again" for the happy path (4.18).
 - **Honest take manifest**: `take.json` records every source, the sync report, and now the encoder-side dropped/padded frame counts, so the manifest can never disagree with the band's live counter (4.88).
-- **Space stops anything**: one key halts a capture, an arrangement record, or the rolling transport (4.50).
+- **Space is the transport's**: it stops an arrangement record or the rolling transport and, on the desk, plays from the edit cursor - the same under a take as without one. Only the cassette starts or ends a capture (5.0).
 - **Clip lamp**: a latching, clickable clip indicator on the meters that clears when pressed and warms up past converter glitches so it never lies (4.15–4.20).
 - **Crash-safe, never-overwriting output**: every take gets a fresh timestamped directory; nothing is ever written outside it.
 
@@ -825,12 +825,12 @@ Left to right:
   - **Start / End / Length** rows: the arrangement viewport's own numbers, three draggable part-cells each (bar, beat, thousandths). Start/End count from one; Length from zero.
   - Right half of the glass is the **oscilloscope** (the approved band-LCD scope widget; speakers' mix without the click).
 - **Transport row** (under the LCD; identical geometry idle and rolling):
-  - **Tempo knob** at the head (idle). Drag turns it (vertical, relative); the number cap above it is a click-to-type target; double-click resets to default BPM; a **TAP** chip sits in the cell's slack - each press is one beat and the tempo follows. While rolling the knob is replaced by the **elapsed clock** (suppressed entirely if "Hide Elapsed Time" is on).
-  - **Record** (red) - record armed channels into the arrangement. While rolling its slot shows a steady red **dot** (indicator, not a control).
-  - **Play** (green) - audition from the playhead without recording. Absent while rolling.
-  - **Stop** - stops and returns the playhead home. Same pixel position in both layouts.
-  - **Pause** - hold the playhead where it stands (Stop is the one that goes home). Idle only.
-  - **Cassette (Capture)** - start/stop a capture of the whole session (video, audio, MIDI) apart from the arrangement. Survives into the rolling layout - it is the button that ends the take.
+  - **Tempo knob** at the head (idle). Drag turns it (vertical, relative); the number cap above it is a click-to-type target; double-click resets to default BPM; a **TAP** chip sits in the cell's slack - each press is one beat and the tempo follows. While a take runs the knob is replaced by the take's **elapsed clock** - the take's own time, not the playhead (suppressed entirely if "Hide Elapsed Time" is on).
+  - **Record** (red) - record armed channels into the arrangement. The same button, in the same place, while a take runs.
+  - **Play** (green) - audition from the playhead without recording. Live while a take runs.
+  - **Stop** - stops the transport and returns the playhead to the edit cursor. Same pixel position in both layouts; it does not end a take.
+  - **Pause** - hold the playhead where it stands (Stop is the one that goes home). Live while a take runs.
+  - **Cassette (Capture)** - start/stop a capture of the whole session (video, audio, MIDI) apart from the arrangement. The only control that reaches a take: it glows amber while one runs and is the button that ends it. A take does not start or stop the transport.
   - **Folder (Project)** - opens the Project dialog (new, open, save, save as, template, export).
   - **Cog (Setup)** - opens the take-settings popup (below). Idle only.
 - **VU meter** - what is being recorded (input side). The **whole meter face is a button: clicking it clears the clip lamp** (the clip latch is shown on the face itself).

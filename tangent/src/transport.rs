@@ -42,13 +42,16 @@ pub struct Transport {
     /// Monotonic locate counter. Starts at 1 so a fresh engine (ack 0) always
     /// re-locates on the first push.
     generation: u64,
-    /// Whether PLAY is held down — the audition, distinct from a take rolling.
-    /// A take is the session's business; this is the green button's.
+    /// Whether the transport rolls. **The only thing that decides it.**
+    ///
+    /// A take used to be ORed in: the session's rolling state made the engine
+    /// roll whatever this said, so pressing TAKE played the song and nothing
+    /// could stop the song without ending the take. The take is capture only
+    /// now - a film of the window and the desk - and the transport is this
+    /// switch's, under a take exactly as without one. `docs/ARRANGEMENT.md`
+    /// said as much from the start: "Recording is TWO separate functions,
+    /// never entangled."
     playing: bool,
-    /// The SESSION's rolling level as of the last push, for the falling edge
-    /// that returns the playhead to 0:00 when a take ends. The audition's own
-    /// falling edge is a PAUSE and deliberately not part of this.
-    session_was_rolling: bool,
     /// **The EDIT CURSOR: the position the last explicit locate chose** —
     /// a ruler click, a lane click, a seek. Play rolls from it; STOP
     /// returns to it, the owner's third and final ruling on the pair: the
@@ -62,7 +65,6 @@ impl Transport {
             pos_s: 0.0,
             generation: 1,
             playing: false,
-            session_was_rolling: false,
             cursor_s: 0.0,
         }
     }
@@ -120,21 +122,18 @@ impl Transport {
         }
     }
 
-    /// Reconcile once a frame, AFTER the session has ticked.
+    /// Reconcile once a frame.
     ///
-    /// After, because the rolling level is derived from the session's state
-    /// and publishing it a frame early is how the take's first block used to
-    /// start from the old position. The order inside matters and is the safe
-    /// one twice over: the locate is published BEFORE the level rises (a
-    /// callback that sees the level up is guaranteed a position that is not
-    /// stale), and the level falls BEFORE the return-to-zero locate (so no
-    /// block rolls at zero on the way down).
-    pub fn push(&mut self, engine: Option<&Engine>, session_rolling: bool) {
-        let rolling = session_rolling || self.playing;
-        // A TAKE's falling edge used to return the playhead to 0:00; it
-        // keeps its place now, the same rule as `stop` — what was recorded
-        // is under the playhead, and play carries on from there.
-        self.session_was_rolling = session_rolling;
+    /// The order inside matters and is the safe one twice over: the locate is
+    /// published BEFORE the level rises (a callback that sees the level up is
+    /// guaranteed a position that is not stale), and the level falls BEFORE
+    /// the return-to-cursor locate (so no block rolls at the cursor on the way
+    /// down).
+    ///
+    /// No session in the signature any more: see `playing` for why a take has
+    /// no say in whether the transport rolls.
+    pub fn push(&mut self, engine: Option<&Engine>) {
+        let rolling = self.playing;
         let Some(e) = engine else {
             return;
         };
@@ -172,10 +171,10 @@ mod tests {
         t.locate(83.0);
         t.toggle_play();
         assert!(t.playing());
-        t.push(None, false);
+        t.push(None);
         t.toggle_play();
         assert!(!t.playing(), "the second press did not pause");
-        t.push(None, false);
+        t.push(None);
         assert!(
             (t.position_s(None, 0.0) - 83.0).abs() < 1e-9,
             "pausing moved the playhead to {}",
@@ -185,36 +184,6 @@ mod tests {
         assert!(
             (t.position_s(None, 0.0) - 83.0).abs() < 1e-9,
             "stop moved the playhead away from where the music stopped"
-        );
-    }
-
-    /// A take that ends KEEPS its place now — stop means stay, everywhere.
-    #[test]
-    fn a_take_ending_keeps_its_place() {
-        let mut t = Transport::new();
-        t.locate(10.0);
-        t.push(None, true);
-        t.push(None, false);
-        assert!(
-            (t.position_s(None, 0.0) - 10.0).abs() < 1e-9,
-            "a finished take yanked the playhead to {}",
-            t.position_s(None, 0.0)
-        );
-    }
-
-    /// And a take ending UNDER a running audition does not yank it home.
-    #[test]
-    fn a_take_ending_under_the_audition_leaves_it_rolling() {
-        let mut t = Transport::new();
-        t.locate(45.0);
-        t.toggle_play();
-        t.push(None, true);
-        t.push(None, false);
-        assert!(t.playing());
-        assert!(
-            (t.position_s(None, 0.0) - 45.0).abs() < 1e-9,
-            "the take's end moved a rolling audition to {}",
-            t.position_s(None, 0.0)
         );
     }
 }
