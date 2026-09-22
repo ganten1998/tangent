@@ -7822,6 +7822,33 @@ mod tests {
             assert!(!inside(&machine, m), "{what} is still in the cog's panel");
         }
 
+        // **And the red button's shape is neither.** It shows the AUDIO
+        // tier's count-in and signature - the arrangement's own two - and
+        // not one row of the take tier, whose EXPORT is the giveaway that
+        // the wrong panel is up.
+        let rolling = SetupLayout::new(screen, anchor, SetupShape::Rolling);
+        for (what, r) in [
+            ("the count-in", rolling.audio_count_in),
+            ("the signature", rolling.audio_sig),
+        ] {
+            assert!(inside(&rolling, r), "{what} is missing from the red button's panel");
+        }
+        for (what, r) in [
+            ("the take's name", rolling.name),
+            ("the take's count-in", rolling.count_in),
+            ("the export", rolling.export),
+            ("the audio row", rolling.audio),
+            ("the project row", rolling.project_row),
+        ] {
+            assert!(!inside(&rolling, r), "{what} is on the red button's panel");
+        }
+        assert_eq!(
+            SetupShape::Rolling.tier_word(),
+            "RECORDING",
+            "the red button's panel is headed as somebody else's"
+        );
+        assert_eq!(SetupShape::Take.tier_word(), "TAKE");
+
         // And the machine tier belongs to the cog and is not on the take.
         for (what, m, t) in [
             ("the audio row", machine.audio, take.audio),
@@ -7862,7 +7889,7 @@ mod tests {
         let anchor = Rect::from_min_size(Pos2::new(40.0, 480.0), Vec2::new(20.0, 20.0));
         let v = idle();
         let mut seen_in_some_shape = 0usize;
-        for shape in [SetupShape::Machine, SetupShape::Take] {
+        for shape in [SetupShape::Machine, SetupShape::Take, SetupShape::Rolling] {
             let l = SetupLayout::new(screen, anchor, shape);
             for (rect, want) in l.targets() {
                 assert!(rect.is_positive(), "{want:?} has no rectangle at all in {shape:?}");
@@ -7895,6 +7922,101 @@ mod tests {
             seen_in_some_shape > 0,
             "neither shape showed a single control"
         );
+    }
+
+    /// Every row the shape shows, for the two size claims below.
+    fn setup_rows_shown(l: &SetupLayout) -> Vec<Rect> {
+        [
+            l.name, l.dest, l.reveal, l.folder, l.disk, l.count_in, l.time_sig,
+            l.export, l.open_when_done, l.click_in_take, l.count_in_in_take,
+            l.hide_elapsed, l.audio, l.hear_input, l.audio_count_in, l.audio_sig,
+            l.stream_row, l.project_row, l.plugin_folders, l.plugin_rescan,
+            l.proj_dest, l.export_dest, l.preset_dest, l.irs_dest,
+            l.audio_head, l.take_head, l.project_head,
+        ]
+        .into_iter()
+        .filter(|r| l.panel.contains(r.center()))
+        .collect()
+    }
+
+    /// **A row is the same size in all three shapes.**
+    ///
+    /// The height used to be the machine panel's scaled by how many rows a
+    /// shape showed, so the red button's ONE row came out at a fraction of
+    /// the height of the same control under the cog. The owner's words were
+    /// "too small to be legible anyways". A shorter panel is right; shorter
+    /// ROWS are not, and nothing in the file said so until this.
+    #[test]
+    fn a_row_is_the_same_size_in_every_shape_of_the_panel() {
+        for w in [900.0_f32, 1280.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            // One row each shape actually SHOWS. The hidden ones are laid out
+            // by a different allocator and would prove nothing.
+            let sized = |shape: SetupShape| {
+                let l = SetupLayout::new(screen, anchor, shape);
+                let row = match shape {
+                    SetupShape::Take => l.time_sig,
+                    _ => l.audio_sig,
+                };
+                assert!(
+                    l.panel.contains(row.center()),
+                    "{shape:?} at {w} does not show the row this measures"
+                );
+                (row.height(), l.title.height())
+            };
+            let (row_m, title_m) = sized(SetupShape::Machine);
+            for shape in [SetupShape::Take, SetupShape::Rolling] {
+                let (row, title) = sized(shape);
+                assert!(
+                    (row - row_m).abs() < 0.5,
+                    "{shape:?} at {w}: a row is {row:.1} against the cog's {row_m:.1}"
+                );
+                assert!(
+                    (title - title_m).abs() < 0.5,
+                    "{shape:?} at {w}: the title is {title:.1} against the cog's {title_m:.1}"
+                );
+            }
+            assert!(row_m >= 12.0, "the cog's own rows are {row_m:.1} at {w}");
+        }
+    }
+
+    /// **No shape leaves a row of nothing under its last control.**
+    ///
+    /// One row's worth of margin is the design; two is a panel that lost a
+    /// tier and kept its height. The take tier left the cog's panel and the
+    /// row COUNT did not follow it, which the owner met as "the removal of
+    /// the take options from the main settings panel left an undesirable
+    /// margin/empty space from the bottom".
+    #[test]
+    fn no_shape_leaves_a_row_of_nothing_under_its_last_control() {
+        for w in [900.0_f32, 1280.0, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            for shape in [SetupShape::Machine, SetupShape::Take, SetupShape::Rolling] {
+                let l = SetupLayout::new(screen, anchor, shape);
+                let rows = setup_rows_shown(&l);
+                assert!(!rows.is_empty(), "{shape:?} at {w} shows no rows at all");
+                let bottom = rows.iter().map(|r| r.bottom()).fold(f32::MIN, f32::max);
+                // A row's pitch, read back from a band: `band` insets its
+                // rectangle to 0.10..0.92 of the pitch it stands on.
+                let pitch = rows
+                    .iter()
+                    .map(|r| r.height())
+                    .fold(f32::MIN, f32::max)
+                    / 0.82;
+                let slack = l.panel.bottom() - bottom;
+                assert!(
+                    slack < pitch * 2.4,
+                    "{shape:?} at {w}: {slack:.0}pt under the last control, {:.1} rows",
+                    slack / pitch
+                );
+                assert!(
+                    slack > pitch * 0.5,
+                    "{shape:?} at {w}: the last control is jammed against the edge"
+                );
+            }
+        }
     }
 
     /// **The PLUGINS row still reads after the resync button took its right
@@ -8002,7 +8124,13 @@ mod tests {
         // DRAWS, and the hidden ones are filtered out rather than excused.
         for (w, shape) in [900.0_f32, 1280.0, 1920.0]
             .into_iter()
-            .flat_map(|w| [(w, SetupShape::Machine), (w, SetupShape::Take)])
+            .flat_map(|w| {
+                [
+                    (w, SetupShape::Machine),
+                    (w, SetupShape::Take),
+                    (w, SetupShape::Rolling),
+                ]
+            })
         {
             let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
             let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
@@ -8036,7 +8164,15 @@ mod tests {
                 .into_iter()
                 .filter(|(_, r)| l.panel.contains(r.center()))
                 .collect();
-            assert!(zones.len() > 3, "{shape:?} at {w} shows almost nothing");
+            // The red button's shape is two controls and the way out, and
+            // saying so here is cheaper than a third rule about which rows a
+            // shape owns.
+            let least = if shape == SetupShape::Rolling { 3 } else { 4 };
+            assert!(
+                zones.len() >= least,
+                "{shape:?} at {w} shows almost nothing ({} rows)",
+                zones.len()
+            );
             for i in 0..zones.len() {
                 for j in (i + 1)..zones.len() {
                     if !zones[i].1.is_positive() || !zones[j].1.is_positive() {
@@ -10586,9 +10722,23 @@ const SETUP_ASPECT: f32 = 1.16;
 /// headers take about half a row each on top of these.)
 const SETUP_ROWS: usize = 11;
 
-/// How many of [`SETUP_ROWS`] each shape shows. They sum to the whole, and
-/// the headings each shape carries are counted with them.
-const SETUP_MACHINE_ROWS: usize = 8;
+/// **The panel every proportion here was tuned on**: eight rows under two
+/// headings. It is a REFERENCE and not a shape - no shape shows eight rows -
+/// and it exists so that a row is the same size in all three of them. The
+/// height used to be this one scaled by how many rows a shape showed, which
+/// is right for the panel and wrong for the row: the red button's single row
+/// came out half the height of the same row under the cog, and the owner
+/// could not read it.
+const SETUP_REF_ROWS: usize = 8;
+
+/// How many rows each shape actually shows. The headings are counted on top
+/// of these, and the panel is as tall as its own rows need at the reference
+/// pitch.
+///
+/// **Seven, not eight.** The take tier left this panel and the count did not
+/// follow it, so the cog's panel kept a row's worth of nothing under its last
+/// control - the owner's "undesirable margin/empty space from the bottom".
+const SETUP_MACHINE_ROWS: usize = 7;
 const SETUP_TAKE_ROWS: usize = 6;
 /// The red button's shape: one row of two controls, under one heading.
 const SETUP_ROLLING_ROWS: usize = 1;
@@ -10626,6 +10776,23 @@ pub enum SetupShape {
     /// a COPY. It is the same layout, the same draw and the same hit test,
     /// showing two of its rows.
     Rolling,
+}
+
+impl SetupShape {
+    /// **The word over the tier this shape shows.** On the shape rather than
+    /// in the painter because it is the thing that tells somebody which
+    /// panel they opened: the red button's two rows sat under a heading that
+    /// said TAKE, and the owner read the panel as the wrong one before
+    /// reading a single control in it.
+    ///
+    /// `Machine` has two tiers of its own and names them where they are
+    /// drawn; this is the one heading the other shapes carry.
+    pub fn tier_word(self) -> &'static str {
+        match self {
+            SetupShape::Rolling => "RECORDING",
+            _ => "TAKE",
+        }
+    }
 }
 
 /// Every rectangle in the popup.
@@ -10730,15 +10897,31 @@ impl SetupLayout {
             return Self::NONE;
         }
         let w = (screen.width() * SETUP_W.0).clamp(SETUP_W.1, SETUP_W.2.min(screen.width()));
-        // **Each shape is as tall as the rows it actually shows.** A take
-        // panel with the machine's height would be two thirds empty, which
-        // reads as a panel that failed to load rather than as a short one.
-        let rows_shown = match shape {
-            SetupShape::Machine => SETUP_MACHINE_ROWS,
-            SetupShape::Take => SETUP_TAKE_ROWS,
-            SetupShape::Rolling => SETUP_ROLLING_ROWS,
+        // **Each shape is as tall as the rows it actually shows, AT THE SAME
+        // ROW SIZE.** A take panel with the machine's height would be two
+        // thirds empty, which reads as a panel that failed to load; a panel
+        // whose height alone is scaled shrinks the rows with it, which is how
+        // the red button's one row came out illegible. So the pitch is fixed
+        // once from [`SETUP_REF_ROWS`] and each shape's height is solved from
+        // its own row count against it.
+        const HEAD: f32 = 0.55;
+        const TITLE_FRAC: f32 = 0.13;
+        // A heading is a little over half a row, and the trailing `+ 1.0` is
+        // a row's worth of margin under the last control.
+        let units_of = |heads: f32, rows: usize| HEAD * heads + rows as f32 + 1.0;
+        let (heads, rows_shown) = match shape {
+            SetupShape::Machine => (2.0, SETUP_MACHINE_ROWS),
+            SetupShape::Take => (1.0, SETUP_TAKE_ROWS),
+            SetupShape::Rolling => (1.0, SETUP_ROLLING_ROWS),
         };
-        let h = (w * SETUP_ASPECT * rows_shown as f32 / SETUP_ROWS as f32)
+        let ref_h = w * SETUP_ASPECT * SETUP_REF_ROWS as f32 / SETUP_ROWS as f32;
+        let ref_pad = (ref_h * 0.055).clamp(4.0, 16.0);
+        let ref_body = ref_h - 2.0 * ref_pad;
+        let ref_title = ref_body * TITLE_FRAC;
+        let ref_pitch = (ref_body - ref_title) / units_of(2.0, SETUP_REF_ROWS);
+        // The title band is the SAME height in every shape, for the same
+        // reason the rows are: it carries a word at a size, not a fraction.
+        let h = (ref_title + ref_pitch * units_of(heads, rows_shown) + 2.0 * ref_pad)
             .min(screen.height() * 0.80);
         let mut panel = Rect::from_min_size(
             Pos2::new(anchor.left(), anchor.bottom() + h * 0.04),
@@ -10748,7 +10931,7 @@ impl SetupLayout {
         let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
         panel = panel.translate(Vec2::new(dx, dy));
 
-        let pad = (h * 0.055).clamp(4.0, 16.0);
+        let pad = ref_pad;
         let body = panel.shrink(pad);
         if !body.is_positive() {
             return Self {
@@ -10760,7 +10943,10 @@ impl SetupLayout {
         // right of it. Everything else is seven rows of equal height, because a
         // dialog whose rows are all different sizes reads as a form somebody
         // assembled rather than as a panel.
-        let title_h = body.height() * 0.13;
+        // The reference title where there is room for it, and never more than
+        // a third of a short panel - the clamp only bites when the screen has
+        // squeezed the panel below the height solved for above.
+        let title_h = ref_title.clamp(body.height() * TITLE_FRAC, body.height() * 0.45);
         let title = Rect::from_min_max(
             body.min,
             Pos2::new(body.right(), body.top() + title_h),
@@ -10779,15 +10965,11 @@ impl SetupLayout {
         // rows: `Rect::contains` is inclusive at both edges, so two rows that
         // merely touch share a line of pixels and every overlap test in this
         // file fails there.
-        const HEAD: f32 = 0.55;
-        // Two headings per shape, not three: `Machine` carries AUDIO and
-        // MEDIA, `Take` carries TAKE alone and therefore one.
-        let (heads, rows_shown) = match shape {
-            SetupShape::Machine => (2.0, SETUP_MACHINE_ROWS),
-            SetupShape::Take => (1.0, SETUP_TAKE_ROWS),
-            SetupShape::Rolling => (1.0, SETUP_ROLLING_ROWS),
-        };
-        let units = HEAD * heads + rows_shown as f32 + 1.0;
+        // Two headings for `Machine` - AUDIO and MEDIA - and one for each of
+        // the other two. Counted above, where the height was solved.
+        let units = units_of(heads, rows_shown);
+        // Read back from the rectangle rather than used as solved, so a panel
+        // the screen squeezed still lays out. Unsqueezed it IS `ref_pitch`.
         let pitch = rows.height() / units;
         let mut y = rows.top();
         // **Where a band goes when this shape does not show it.**
@@ -10831,6 +11013,13 @@ impl SetupLayout {
         let r6 = band(1.0, machine);
         let ra2 = band(1.0, machine);
         let ra3 = band(1.0, machine);
+        // **The red button's one row.** It carries the AUDIO tier's own
+        // count-in and signature - the same two rectangles, the same two
+        // hits, moved onto a row of their own and given the whole width -
+        // rather than the take tier's, which also carries EXPORT and is a
+        // list of things about a take. That is what the owner met as "the
+        // take options and NOT THE RECORDING OPTIONS".
+        let rolling_row = band(1.0, rolling);
         // **MEDIA, second.** Where documents go and where exports land — two
         // questions that used to have no answer here at all, because both
         // folders were derived from the TAKE folder and moving one moved all
@@ -10848,6 +11037,8 @@ impl SetupLayout {
         // where nothing can see or reach it, exactly as the other shape's
         // rows are, so the red button's panel is two controls without being
         // a second copy of them.
+        // The heading over whichever tier this shape shows; the word is the
+        // shape's, and `draw_setup` picks it.
         let take_head = band(HEAD, !machine);
         let r0 = band(1.0, take);
         let r1 = band(1.0, take);
@@ -10855,7 +11046,7 @@ impl SetupLayout {
             let r = band(1.0, take);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
-        let r3 = band(1.0, take || rolling);
+        let r3 = band(1.0, take);
         let r4 = band(1.0, take);
         let r5 = band(1.0, take);
         Self {
@@ -10900,8 +11091,20 @@ impl SetupLayout {
             hear_input: slice_h(r6, 0.63, 1.00),
             audio_head,
             take_head,
-            audio_count_in: slice_h(ra2, 0.00, 0.30),
-            audio_sig: slice_h(ra2, 0.33, 0.55),
+            // **On `ra2` under the cog and on a row of its own at the red
+            // button**, where the pair has the width to itself. One pair of
+            // rectangles either way, so there is still exactly one count-in
+            // control in this panel and one signature control.
+            audio_count_in: if rolling {
+                slice_h(rolling_row, 0.00, 0.48)
+            } else {
+                slice_h(ra2, 0.00, 0.30)
+            },
+            audio_sig: if rolling {
+                slice_h(rolling_row, 0.52, 1.00)
+            } else {
+                slice_h(ra2, 0.33, 0.55)
+            },
             // A row of their own: crammed onto the count-in row's free
             // half they were the least legible thing on the card.
             project_row: slice_h(ra3, 0.00, 0.48),
@@ -12423,7 +12626,10 @@ pub fn draw_setup(
     for (band, word) in [
         (l.audio_head, "AUDIO"),
         (l.project_head, "MEDIA"),
-        (l.take_head, "TAKE"),
+        // **The red button's tier is not the take tier**, and a heading that
+        // said TAKE over it was the whole of why its two rows read as the
+        // wrong panel.
+        (l.take_head, shape.tier_word()),
     ] {
         if !band.is_positive() {
             continue;

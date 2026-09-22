@@ -150,12 +150,15 @@ const ATTACK_FADE: usize = 240;
 /// ratio of the segment beside it, so a clip does not change character at
 /// its edges.
 #[must_use]
-pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
-    let frames = clip.frames();
-    if frames == 0 || anchors.is_empty() {
-        return clip.clone();
-    }
-    // Ascending in both fields, inside the clip, and no two on one frame.
+/// **The anchors this map can actually be rendered from**: ascending in both
+/// fields, inside the clip, and no two on one frame.
+///
+/// Its own function because [`projected_frames`] has to see exactly the list
+/// [`warp`] renders from. A length predicted off the raw anchors and a render
+/// made from the cleaned ones would disagree by however many the clean-up
+/// dropped, which is the kind of gap that shows up as a clip drawn one
+/// length and played another.
+fn usable(frames: usize, anchors: &[Anchor]) -> Vec<Anchor> {
     let mut pts: Vec<Anchor> = Vec::with_capacity(anchors.len());
     for a in anchors {
         if a.from >= frames {
@@ -168,6 +171,42 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
         }
         pts.push(*a);
     }
+    pts
+}
+
+/// **How long the render will be, without making it.**
+///
+/// The warp is rendered off the UI thread now, and the frame that asks for it
+/// still has to draw the clip and count its seconds - so the length is
+/// predicted here and the render is checked against it (see
+/// `a_predicted_length_is_the_length_the_render_comes_out`). Every segment is
+/// trimmed or padded to exactly the length the anchor list demands, so the
+/// total is the last output cut and nothing else: the tail carried at the
+/// ratio of the segment before it, on top of the last anchor's landing.
+pub fn projected_frames(frames: usize, anchors: &[Anchor]) -> usize {
+    if frames == 0 || anchors.is_empty() {
+        return frames;
+    }
+    let pts = usable(frames, anchors);
+    let Some(last) = pts.last().copied() else {
+        return frames;
+    };
+    let tail_src = frames - last.from;
+    let tail_ratio = if pts.len() >= 2 {
+        let a = pts[pts.len() - 2];
+        (last.to - a.to) as f64 / (last.from - a.from).max(1) as f64
+    } else {
+        1.0
+    };
+    last.to + ((tail_src as f64) * tail_ratio).round() as usize
+}
+
+pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
+    let frames = clip.frames();
+    if frames == 0 || anchors.is_empty() {
+        return clip.clone();
+    }
+    let pts = usable(frames, anchors);
     if pts.is_empty() {
         return clip.clone();
     }
@@ -350,6 +389,53 @@ mod tests {
             }
         }
         clip_of(s)
+    }
+
+    /// **A predicted length is the length the render comes out.**
+    ///
+    /// The warp is rendered off this thread now, so the frame that asks for
+    /// it has to draw the clip and count its seconds from a number nobody
+    /// has made yet. `projected_frames` is that number, and the only thing
+    /// stopping it drifting from the renderer is this: every shape the
+    /// cleaner can be handed, predicted and then rendered.
+    #[test]
+    fn a_predicted_length_is_the_length_the_render_comes_out() {
+        let src = clicks_at(2.0, &[0.05, 0.47, 0.98, 1.52]);
+        let frames = src.frames();
+        let a = |from: f64, to: f64| Anchor {
+            from: (f64::from(RATE) * from) as usize,
+            to: (f64::from(RATE) * to) as usize,
+        };
+        for (what, anchors) in [
+            ("nothing at all", vec![]),
+            ("one anchor", vec![a(0.47, 0.50)]),
+            ("a plain map", vec![a(0.05, 0.05), a(0.47, 0.50), a(0.98, 1.00), a(1.52, 1.50)]),
+            // Pulled EARLIER, so the tail shortens rather than grows.
+            ("a map that pulls back", vec![a(0.47, 0.40), a(0.98, 0.85), a(1.52, 1.30)]),
+            // The head at frame zero, which is its own branch in the render.
+            ("a map that opens on the downbeat", vec![a(0.0, 0.08), a(0.98, 1.00)]),
+            // Anchors the cleaner throws away: out of the clip, out of
+            // order, and two on one frame. The prediction has to see the
+            // same survivors the render does.
+            (
+                "a map the cleaner has to fix",
+                vec![
+                    a(0.47, 0.50),
+                    a(0.40, 0.60),
+                    a(0.47, 0.70),
+                    a(0.98, 1.00),
+                    a(9.90, 9.90),
+                ],
+            ),
+        ] {
+            for fit in [Fit::Stretch, Fit::Slice] {
+                let want = projected_frames(frames, &anchors);
+                let got = warp(&src, &anchors, Mode::Tape, fit).frames();
+                assert_eq!(got, want, "{what} with {fit:?}: predicted {want}, rendered {got}");
+            }
+        }
+        // And an empty clip predicts its own nothing rather than panicking.
+        assert_eq!(projected_frames(0, &[a(0.0, 0.1)]), 0);
     }
 
     /// **The whole feature, end to end: a sloppy take comes out on the

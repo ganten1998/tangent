@@ -3187,58 +3187,6 @@ fn stretched_clip_audio(
 }
 
 
-/// **The live path's warped audio, with its own picture.**
-    ///
-    /// The export road works in `Arc<Clip>` because a bounce only needs
-    /// samples; this one needs a [`Decoded`] - samples AND a pyramid -
-    /// because the clip that gets drawn is drawn from that pyramid. A warped
-    /// clip drawn from the FILE's pyramid is the picture that does not move,
-    /// which is how the whole gap was noticed.
-    ///
-    /// Rendered inline and cached, unlike a stretch, which hands its render
-    /// to the crew and shows a stand-in meanwhile. A warp is the same class
-    /// of work and deserves the same treatment; it does not have it yet, so
-    /// a long take will pause once on the frame after it is quantized and
-    /// never again. Said out loud rather than discovered.
-///
-/// A free function over the CACHE rather than a method, because the caller
-/// is inside `for clip in &self.app.arrangement().clips` and cannot hand out
-/// `&mut self` while that borrow stands.
-#[cfg(feature = "recorder")]
-fn warped_live(
-    clip: &tangent_ui::arrangement::ArrClip,
-    path: &std::path::Path,
-    decoded: Decoded,
-    cache: &mut std::collections::HashMap<StretchKey, Decoded>,
-) -> Decoded {
-    if clip.warp.len() < 2 {
-        return decoded;
-    }
-    let (f0, t0) = clip.warp[0];
-    let (f1, t1) = clip.warp[clip.warp.len() - 1];
-    let key: StretchKey = (
-        path.to_path_buf(),
-        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
-    );
-    if let Some(made) = cache.get(&key) {
-        return made.clone();
-    }
-    let anchors: Vec<crate::warp::Anchor> = clip
-        .warp
-        .iter()
-        .map(|&(from, to)| crate::warp::Anchor {
-            from: usize::try_from(from).unwrap_or(usize::MAX),
-            to: usize::try_from(to).unwrap_or(usize::MAX),
-        })
-        .collect();
-    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
-    let fit = crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default();
-    let made = Decoded::of(crate::warp::warp(&decoded.clip, &anchors, mode, fit));
-    cache.insert(key, made.clone());
-    made
-    }
-
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
 ///
@@ -3295,6 +3243,48 @@ fn warped_clip_audio(
 /// inserted — the doc on the live path used to warn the sweep to keep up
 /// with it by hand.
 #[cfg(feature = "recorder")]
+/// **What a warp render would be asked for**, or `None` when this clip has
+/// no map worth rendering.
+///
+/// `stretch_key`'s twin, and it keys into the SAME cache: a warp render and
+/// a stretch render are both "this file, treated this way", and the third
+/// field is where the treatments are told apart. The map's own extent and
+/// length are enough to name it - two different maps over one file that
+/// agreed on their first anchor, their last, and how many they had would
+/// have to be the same map to matter - and the fit is in there because
+/// switching a clip from stretch to slice must not hand back the render
+/// made the other way.
+#[cfg(feature = "recorder")]
+fn warp_plan(
+    clip: &tangent_ui::arrangement::ArrClip,
+    path: &std::path::Path,
+) -> Option<(StretchKey, Vec<crate::warp::Anchor>, crate::stretch::Mode, crate::warp::Fit)> {
+    if clip.warp.len() < 2 {
+        return None;
+    }
+    let (f0, t0) = clip.warp[0];
+    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    let key: StretchKey = (
+        path.to_path_buf(),
+        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
+        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
+    );
+    let anchors = clip
+        .warp
+        .iter()
+        .map(|&(from, to)| crate::warp::Anchor {
+            from: usize::try_from(from).unwrap_or(usize::MAX),
+            to: usize::try_from(to).unwrap_or(usize::MAX),
+        })
+        .collect();
+    Some((
+        key,
+        anchors,
+        crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default(),
+        crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default(),
+    ))
+}
+
 fn stretch_key(
     clip: &tangent_ui::arrangement::ArrClip,
     path: &std::path::Path,
@@ -11155,9 +11145,78 @@ impl DesktopApp {
             // trim, the fades, the picture, the frame counts - works on the
             // warped audio without knowing it, which is the argument the
             // stretch's own comment makes one screen up.
-            let decoded = warped_live(clip, &path, decoded, &mut self.stretch_cache);
-            let (decoded, stand_in) = match stretch_key(clip, &path) {
+            //
+            // **And rendered by the CREW, not here.** It ran inline and
+            // cached, which meant a quantize on a long take stopped the
+            // window for as long as the render took - the one thing the
+            // stretch road was rebuilt to stop doing. Same cache, same key
+            // shape, same landing; the only thing a warp does differently is
+            // that it is not submitted through `stretch_step`, because a
+            // warp map changes when somebody quantizes and never sixty times
+            // a second the way a stretch drag does. There is nothing to wait
+            // for a hand to settle on.
+            let (decoded, warp_stand_in) = match warp_plan(clip, &path) {
                 None => (decoded, None),
+                Some((key, anchors, mode, fit)) => {
+                    // Warm as long as a clip wants it, exactly like a
+                    // stretch render - the sweep below frees the rest.
+                    //
+                    // **And NOT into `stretched_ids`**, which is the retain
+                    // list for `stretch_seen` - the per-clip record of which
+                    // ratio was last seen, kept for `stretch_step`. A warp
+                    // does not go through that gate, so a warped clip with no
+                    // stretch has nothing to remember and keeping a row for
+                    // it would only outlive the clip.
+                    live_stretches.insert(key.clone());
+                    match self.stretch_cache.get(&key) {
+                        Some(made) => (made.clone(), None),
+                        None => {
+                            if !self.pool.holds_stretch(&key) {
+                                self.pool.submit(
+                                    Warm::Stretch(key),
+                                    Work::Warp {
+                                        source: Arc::clone(&decoded.clip),
+                                        anchors: anchors.clone(),
+                                        mode,
+                                        fit,
+                                    },
+                                    rate,
+                                    ctx,
+                                );
+                            }
+                            deferred = true;
+                            // **The length the render will be**, so the clip
+                            // keeps its seconds and its picture while it
+                            // waits. See `warp::projected_frames`.
+                            //
+                            // The stand-in picture is the unwarped pyramid
+                            // read at `1/ratio`, which for a warp is a
+                            // uniform smear of a thing that is not uniform -
+                            // the LENGTH is exact and the hits inside it are
+                            // not. It stands for one render and the right
+                            // picture replaces it; a clip drawn at the wrong
+                            // length would move every trim under the hand.
+                            let src = decoded.clip.frames();
+                            let out = crate::warp::projected_frames(src, &anchors);
+                            let ratio = if src == 0 {
+                                1.0
+                            } else {
+                                out as f64 / src as f64
+                            };
+                            (decoded, Some(ratio))
+                        }
+                    }
+                }
+            };
+            // **A pending warp holds the stretch back.** The stretch key
+            // names the file, the ratio and the mode and says nothing about
+            // the map, so a render submitted now would go into the cache
+            // under that key having been made from UNWARPED audio - and the
+            // quantize would be lost for as long as the entry lived.
+            let (decoded, stand_in) = match stretch_key(clip, &path)
+                .filter(|_| warp_stand_in.is_none())
+            {
+                None => (decoded, warp_stand_in),
                 Some((key, mode)) => {
                     live_stretches.insert(key.clone());
                     stretched_ids.push(clip.id);
@@ -13097,6 +13156,17 @@ impl DesktopApp {
                 mask(&desk.soloed),
             );
         }
+        // **Whether every bay this desk asks for is actually in place.**
+        //
+        // Read before the engine borrow, and `&self` either way. A project
+        // opens with its racks EMPTY and fills them one bay a frame, so for
+        // the second or two that takes there is a window where an armed
+        // input reaches the speakers through nothing at all - the owner's
+        // "the armed inputs can be heard unprocessed (should be silent until
+        // loaded)". A guitar through a silent amp is a guitar; the same
+        // guitar through a bay that has not loaded yet is the DI, and it is
+        // the loudest thing in the room.
+        let racks_ready = !self.armed_racks_pending();
         let Some(e) = self.recorder.engine.as_ref() else {
             return;
         };
@@ -13317,7 +13387,11 @@ impl DesktopApp {
         // Never read from a settings file — see `TangentApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
-        e.set_monitor_on(self.app.input_monitor());
+        // **And held OFF while a rack is still arriving.** The room's gain is
+        // slewed (`room_gain`), so this is a fade out and a fade back in
+        // rather than a pair of clicks, and the TAKE is untouched: mute
+        // decides the take, monitoring decides only the room.
+        e.set_monitor_on(self.app.input_monitor() && racks_ready);
         // The backing track's level, pushed with the rest for the same
         // reason: the settings are the one live value, so a fader moved, a
         // project loaded and a hand-edited file all arrive by one path.
@@ -18660,6 +18734,32 @@ impl DesktopApp {
         self.recorder.engine.is_some() && self.insert_outstanding > 0
     }
 
+    /// **Is a bay belonging to an ARMED strip still on its way?**
+    ///
+    /// The narrow question behind holding the room shut while a project
+    /// opens. `inserts_pending` is the wide one - any bay anywhere - and it
+    /// is what the splash is drawn from, but it is the wrong gate for the
+    /// speakers: adding one plugin to a track nobody is playing would dip a
+    /// live monitor that has nothing to do with it.
+    ///
+    /// **Both of a channel's racks**, because a track inside a folder has a
+    /// second seat and a bay there is as much of the chain as any other.
+    /// The mask stops at 32 because `armed_mask` is a `u32` and there are 32
+    /// channels; there is no thirty-third to miss.
+    #[cfg(feature = "recorder")]
+    fn armed_racks_pending(&self) -> bool {
+        if self.insert_outstanding == 0 || self.recorder.engine.is_none() {
+            return false;
+        }
+        let inserts = tangent_ui::recorder::INSERTS;
+        armed_rack_pending(self.insert_outstanding, self.app.armed_mask(), |seat, bay| {
+            self.recorder
+                .inserts_loaded
+                .get(seat * inserts + bay)
+                .is_some_and(|got| self.app.insert(seat, bay) != got.as_deref())
+        })
+    }
+
     /// Paint the splash, and decide when it goes.
     ///
     /// Drawn on a COVER layer after the app's own frame, so it covers
@@ -18888,6 +18988,16 @@ enum Work {
         source: Arc<tangent_record::decode::Clip>,
         ratio: f64,
         mode: crate::stretch::Mode,
+    },
+    /// Render `source` through `anchors` - the job behind a warp. Raised
+    /// under a [`Warm::Stretch`] like the job above, because it lands in the
+    /// same cache under a key of the same shape; what tells the two apart is
+    /// the key's third field, which `warp_plan` writes as `warp:...`.
+    Warp {
+        source: Arc<tangent_record::decode::Clip>,
+        anchors: Vec<crate::warp::Anchor>,
+        mode: crate::stretch::Mode,
+        fit: crate::warp::Fit,
     },
 }
 
@@ -19252,6 +19362,9 @@ fn run_decode_job(decoder: &Decoder, job: &DecodeJob) -> Result<Decoded, String>
         Work::Stretch { source, ratio, mode } => {
             Ok(Decoded::of(crate::stretch::stretch(source, *ratio, *mode)))
         }
+        Work::Warp { source, anchors, mode, fit } => {
+            Ok(Decoded::of(crate::warp::warp(source, anchors, *mode, *fit)))
+        }
     })) {
         Ok(result) => result,
         Err(_) => Err("the decoder crashed on that file".to_owned()),
@@ -19439,6 +19552,31 @@ impl Counted {
 /// no longer marks a bay that is empty on both sides, so every bay this walk
 /// finds is a bay with work in it and the count is the number of frames left.
 #[cfg(feature = "recorder")]
+/// **Which seats an armed desk is still waiting on** - the decision behind
+/// [`DesktopApp::armed_racks_pending`], as a function of its inputs so that
+/// it can be driven by a test. `DesktopApp` cannot be built in one.
+///
+/// `mismatched` answers "is this seat's bay holding something other than what
+/// the desk asks for", which is the reconcile's own word for a bay that has
+/// not arrived - the same predicate `insert_walk` counts.
+#[cfg(feature = "recorder")]
+fn armed_rack_pending(
+    outstanding: usize,
+    armed: u32,
+    mismatched: impl Fn(usize, usize) -> bool,
+) -> bool {
+    // **Nothing outstanding anywhere, or nothing armed, is not waiting.**
+    // The first is the ordinary case and costs one compare; the second is
+    // what keeps a desk with no microphone on it out of this walk entirely.
+    if outstanding == 0 || armed == 0 {
+        return false;
+    }
+    (0..tangent_ui::recorder::CHANNELS)
+        .filter(|ch| armed & (1u32 << ch) != 0)
+        .flat_map(|ch| [ch, tangent_ui::recorder::folder_extra_seat(ch)])
+        .any(|seat| (0..tangent_ui::recorder::INSERTS).any(|bay| mismatched(seat, bay)))
+}
+
 fn insert_walk(len: usize, mismatch: impl Fn(usize) -> bool) -> (Option<usize>, usize) {
     let mut next: Option<usize> = None;
     let mut outstanding = 0usize;
@@ -22152,6 +22290,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A rack that has not arrived yet holds the room shut**, and only for
+    /// the strips somebody is actually playing through.
+    ///
+    /// A project opens with every bay empty and fills them one a frame, so
+    /// for a second or two an armed input reaches the speakers through
+    /// nothing at all. The owner: "loading new tracks takes a second for
+    /// plugins to load and in that short time, the armed inputs can be heard
+    /// unprocessed (should be silent until loaded)."
+    ///
+    /// The other half is what it must NOT do. `inserts_pending` - any bay
+    /// anywhere - was the obvious gate and the wrong one: it would dip a live
+    /// monitor every time a plugin was dropped onto a track nobody is
+    /// playing.
+    #[test]
+    fn an_armed_strip_waiting_on_its_rack_holds_the_room_shut() {
+        use tangent_ui::recorder::{folder_extra_seat, CHANNELS, INSERTS};
+        let armed_on = |ch: usize| 1u32 << ch;
+
+        // Nothing outstanding: never waiting, whatever the predicate says.
+        assert!(
+            !armed_rack_pending(0, armed_on(3), |_, _| true),
+            "a settled desk was reported as waiting"
+        );
+        // Nothing armed: the room is nobody's to hold.
+        assert!(
+            !armed_rack_pending(9, 0, |_, _| true),
+            "a desk with nothing armed was reported as waiting"
+        );
+
+        // A bay on the armed strip itself.
+        assert!(
+            armed_rack_pending(1, armed_on(3), |seat, bay| seat == 3 && bay == 1),
+            "the armed strip's own bay did not hold the room"
+        );
+        // Its FOLDER-EXTRA rack, which travels with the track and is as much
+        // of the chain as the first one.
+        assert!(
+            armed_rack_pending(1, armed_on(3), |seat, _| seat == folder_extra_seat(3)),
+            "the armed strip's second rack did not hold the room"
+        );
+        // And the bay belongs to somebody else: the monitor stays open.
+        assert!(
+            !armed_rack_pending(1, armed_on(3), |seat, _| seat == 4),
+            "another track's plugin dipped a live monitor"
+        );
+        assert!(
+            !armed_rack_pending(1, armed_on(3), |seat, _| seat == folder_extra_seat(4)),
+            "another track's second rack dipped a live monitor"
+        );
+
+        // Every channel can hold it, the last one included - the mask and
+        // the channel count have to agree, and 1 << 32 is not a shift this
+        // is allowed to make.
+        for ch in [0, 1, CHANNELS / 2, CHANNELS - 1] {
+            assert!(
+                armed_rack_pending(1, armed_on(ch), |seat, _| seat == ch),
+                "channel {ch} could not hold the room"
+            );
+        }
+        // And every bay of a seat is looked at, not just the first.
+        for bay in 0..INSERTS {
+            assert!(
+                armed_rack_pending(1, armed_on(2), |seat, b| seat == 2 && b == bay),
+                "bay {bay} was never examined"
+            );
+        }
+    }
+
+    /// **And the room is actually wired to it.** `push_monitor_settings` is
+    /// the one place `set_monitor_on` is pushed per frame; a source scan,
+    /// because `DesktopApp` cannot be built in a test (see
+    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// for the precedent). What this stops is the gate being quietly dropped
+    /// back to a bare `input_monitor()`.
+    #[test]
+    fn the_per_frame_monitor_push_is_gated_on_the_racks() {
+        let src = include_str!("desktop.rs");
+        assert!(
+            src.contains("e.set_monitor_on(self.app.input_monitor() && racks_ready);"),
+            "the per-frame monitor push is no longer gated on the racks"
+        );
+        assert!(
+            src.contains("let racks_ready = !self.armed_racks_pending();"),
+            "`racks_ready` is no longer the armed-strip question"
+        );
+    }
+
     /// **Every seat's bays are reachable, the master's second rack included.**
     ///
     /// `inserts_loaded` is flat — `seat * INSERTS + bay` — and the reconcile
@@ -22341,6 +22566,10 @@ mod tests {
     /// to change, and the PICTURE has to change with it: a `Decoded` carries
     /// a pyramid, and handing back one built from the FILE would draw a
     /// warped clip as though nothing had happened.
+    ///
+    /// Driven through `warp_plan` and `run_decode_job` - the job the crew is
+    /// actually handed - since the render left the UI thread. That is one
+    /// worker's whole job, start to finish, with nothing mocked.
     #[test]
     fn the_live_path_warps_the_audio_and_its_picture_with_it() {
         // A click at the very start of a second of silence, so a warp that
@@ -22357,9 +22586,8 @@ mod tests {
             source: std::path::PathBuf::from("a.wav"),
         });
         let path = std::path::PathBuf::from("a.wav");
-        let mut cache = std::collections::HashMap::new();
 
-        // Unwarped: handed straight back, same pointer, nothing rendered.
+        // Unwarped: no plan, so nothing is submitted and nothing rendered.
         let plain = tangent_ui::arrangement::ArrClip {
             kind: tangent_ui::arrangement::ClipKind::Audio,
             path: "a.wav".to_owned(),
@@ -22367,12 +22595,10 @@ mod tests {
             len_s: 1.0,
             ..Default::default()
         };
-        let same = warped_live(&plain, &path, decoded.clone(), &mut cache);
         assert!(
-            Arc::ptr_eq(&same.clip, &decoded.clip),
-            "an unwarped clip was re-rendered"
+            warp_plan(&plain, &path).is_none(),
+            "an unwarped clip asked for a render"
         );
-        assert!(cache.is_empty(), "an unwarped clip took a cache slot");
 
         // Warped: the click is asked to move half a second later.
         let half = u64::from(rate) / 2;
@@ -22380,7 +22606,37 @@ mod tests {
             warp: vec![(0, half), (u64::from(rate), u64::from(rate) + half)],
             ..plain.clone()
         };
-        let out = warped_live(&warped_clip, &path, decoded.clone(), &mut cache);
+        let (key, anchors, mode, fit) =
+            warp_plan(&warped_clip, &path).expect("a warped clip asks for a render");
+        assert!(key.2.starts_with("warp:"), "the key does not name itself: {}", key.2);
+        // The FIT is in the key, or switching a clip from stretch to slice
+        // would hand back the render made the other way.
+        let sliced = tangent_ui::arrangement::ArrClip {
+            warp_fit: "slice".to_owned(),
+            ..warped_clip.clone()
+        };
+        assert_ne!(
+            warp_plan(&sliced, &path).expect("a fit is still a plan").0,
+            key,
+            "two fits of one map share a cache entry"
+        );
+
+        // One worker's whole job.
+        let job = DecodeJob {
+            item: Warm::Stretch(key.clone()),
+            work: Work::Warp {
+                source: Arc::clone(&decoded.clip),
+                anchors: anchors.clone(),
+                mode,
+                fit,
+            },
+            rate,
+            gen: 0,
+        };
+        // The decoder is never reached on a warp job - the source rides in
+        // the work - but `run_decode_job` takes one, so it gets the real one.
+        let decoder: Decoder = Arc::new(tangent_record::decode::decode);
+        let out = run_decode_job(&decoder, &job).expect("the warp job failed");
         assert!(!Arc::ptr_eq(&out.clip, &decoded.clip), "the warp rendered nothing");
 
         // **The audio moved.** The first tenth is silent now and the click
@@ -22405,10 +22661,42 @@ mod tests {
             "the drawn picture still shows a click the audio no longer has"
         );
 
-        // Asked twice, rendered once.
-        assert_eq!(cache.len(), 1, "the warp did not cache");
-        let again = warped_live(&warped_clip, &path, decoded, &mut cache);
-        assert!(Arc::ptr_eq(&again.clip, &out.clip), "the warp rendered twice");
+        // **And the stand-in the waiting frame draws is the right length**,
+        // which is what keeps a clip's seconds still while the crew works.
+        let want = crate::warp::projected_frames(decoded.clip.frames(), &anchors);
+        assert_eq!(out.clip.frames(), want, "the render is not the length predicted");
+    }
+
+    /// **A warp is rendered by the CREW, and a pending one holds the stretch
+    /// back.**
+    ///
+    /// It ran inline and cached, which stopped the window for the length of
+    /// a render every time somebody quantized a long take - the one thing
+    /// the stretch road exists to avoid. A source scan, because
+    /// `DesktopApp` cannot be built in a test; the precedent is
+    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    ///
+    /// The second half is the trap in doing it at all: a stretch key names
+    /// the file, the ratio and the mode and says NOTHING about the map, so a
+    /// stretch submitted while the warp is still out would be rendered from
+    /// unwarped audio and cached under a key that would go on being handed
+    /// back.
+    #[test]
+    fn a_warp_is_handed_to_the_crew_and_holds_the_stretch_until_it_lands() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        assert!(
+            scan.contains("Work::Warp {"),
+            "the warp is no longer a job the crew can be handed"
+        );
+        assert!(
+            !scan.contains("fn warped_live("),
+            "the inline live-path warp is back"
+        );
+        assert!(
+            scan.contains("stretch_key(clip, &path)\n                .filter(|_| warp_stand_in.is_none())"),
+            "a stretch can be submitted while its clip's warp is still out"
+        );
     }
 
     /// **The export renders the STRETCHED audio, at the stretched length.**
