@@ -171,6 +171,16 @@ pub struct ClipView<'a> {
     /// normalizing, the clip's waveform should reflect the new volume to
     /// visually see these things better".
     pub gain: f32,
+    /// **Where the quantize window's detector finds attacks, and where it
+    /// would put them** - `(found, target)`, both in seconds from the start
+    /// of the FILE, so the same numbers work whatever the clip is trimmed
+    /// to. Empty unless that window is open over this clip.
+    ///
+    /// The owner asked for these: "the waveform should have transient marks
+    /// shown as the different settings are tweaked in its menu". A
+    /// detection threshold is not a number anybody can picture, and this is
+    /// the only way to turn the dial and see what it did.
+    pub marks: &'a [(f32, f32)],
 }
 
 /// One automation lane's contents, pushed in.
@@ -5055,6 +5065,62 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
 /// breaks the band, and the next one starts a new run — never a triangle
 /// across a gap. The pyramid's answer is finite and clamped by contract, so
 /// no column can carry a NaN into the mesh.
+/// **The quantize window's marks over one clip's body.**
+///
+/// `(found, target)` in seconds from the start of the FILE - the clip's own
+/// trim is subtracted here, once, so a trimmed take marks the same attacks
+/// as an untrimmed one. Anything outside the drawn body is skipped rather
+/// than clamped: a tick pinned to the edge would claim an attack at a place
+/// there is none.
+///
+/// **Tall, and full height.** These are answers to "where", and a mark that
+/// only reaches the middle of the wave reads as part of the wave.
+/// **The colour a detected attack is marked in.** Amber, and not the
+/// clip's own ink: these are an answer laid OVER the picture, and one drawn
+/// in the picture's colour reads as part of it. Named so a test can find
+/// them among everything else vertical on the surface.
+pub(crate) const MARK_INK: Color32 = Color32::from_rgb(0xFF, 0xC3, 0x4D);
+
+fn draw_clip_marks(
+    painter: &Painter,
+    r: Rect,
+    clip: &ClipView<'_>,
+    l: &Layout,
+    view: &ArrangeView<'_>,
+    ink: Color32,
+) {
+    // A mark is a MOVE when it would land more than a pixel from where it
+    // was played; below that the two ticks would sit on each other.
+    let t0 = time_at_in(l, view, r.left());
+    let t1 = time_at_in(l, view, r.left() + 1.0);
+    let per_px = (t1 - t0).abs().max(1.0e-9);
+    let found_ink = MARK_INK;
+    let target_ink = ink.gamma_multiply(0.55);
+    let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
+    for &(found_s, target_s) in clip.marks {
+        // Source seconds -> the clip's own drawn timeline.
+        let at = clip.start_s + (f64::from(found_s) - clip.offset_s);
+        let to = clip.start_s + (f64::from(target_s) - clip.offset_s);
+        let x = x_of_in(l, view, at);
+        if x < r.left() || x > r.right() {
+            continue;
+        }
+        if (to - at).abs() > per_px {
+            let tx = x_of_in(l, view, to);
+            if tx >= r.left() && tx <= r.right() {
+                painter.line_segment(
+                    [Pos2::new(tx, top), Pos2::new(tx, bot)],
+                    Stroke::new(1.0_f32, target_ink),
+                );
+            }
+        }
+        painter.line_segment(
+            [Pos2::new(x, top), Pos2::new(x, bot)],
+            Stroke::new(1.0_f32, found_ink),
+        );
+    }
+}
+
 fn wave_band(
     painter: &Painter,
     r: Rect,
@@ -6016,6 +6082,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Stroke::new(1.0_f32, ink),
                 );
             }
+        }
+        // ── the quantize window's marks ───────────────────────────────────
+        //
+        // **What the detector found, and where it would go.** Drawn over
+        // the wave and under the fades, only while that window is open:
+        // a detection threshold is not a number anybody can picture, and
+        // this is the only way to turn the dial and see what it did.
+        //
+        // The pair is what makes it readable. The SOLID tick is the attack
+        // as played; the hollow one is the grid line it would be pulled to,
+        // and the gap between them is the correction. Marks that would not
+        // move draw once, because a doubled tick on a hit already in time
+        // says "something will happen here" when nothing will.
+        if !clip.marks.is_empty() && r.width() >= 4.0 {
+            draw_clip_marks(painter, r, clip, &l, view, clip_ink);
         }
         // The fades: translucent wedges from the top corners, their feet at
         // the fade's end — the picture IS the envelope.
@@ -7559,6 +7640,7 @@ LaneView {
                 offset_s: 0.0,
                 recording: false,
                 gain: 1.0,
+                marks: &[],
             },
             ClipView {
                 id: 2,
@@ -7580,6 +7662,7 @@ LaneView {
                 offset_s: 0.0,
                 recording: false,
                 gain: 1.0,
+                marks: &[],
             },
         ]
     }
@@ -11407,6 +11490,7 @@ selected: false,
             midi: true,
             recording: false,
             gain: 1.0,
+            marks: &[],
         }
     }
 
@@ -11826,6 +11910,162 @@ selected: false,
             }
         }
         got
+    }
+
+    /// **The quantize window's marks are drawn, where the detector put
+    /// them, and only while it is asking.**
+    ///
+    /// The owner: "the waveform should have transient marks shown as the
+    /// different settings are tweaked in its menu". A mark is full height
+    /// on purpose - it is an answer to "where", and one that reached only
+    /// the middle of the wave would read as part of the wave - which is
+    /// also what lets this tell them from the wave's own columns.
+    #[test]
+    fn the_quantize_marks_land_on_the_attacks_they_name() {
+        let area = rect();
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let notes: Vec<crate::arrangement::ArrNote> = Vec::new();
+        let base = ClipView {
+            peaks: Some(&peaks),
+            len_s: 4.0,
+            max_len_s: 8.0,
+            loop_s: 0.0,
+            ..a_looped_clip(&notes, 2.0, 2.0)
+        };
+        // Every FULL-HEIGHT vertical inside the clip, which is a mark; the
+        // wave's own columns reach two fifths of the band about its middle.
+        let ticks = |marks: &[(f32, f32)]| -> Vec<f32> {
+            let clips = [ClipView { marks, ..base }];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = 8.0;
+            v.song_s = 12.0;
+            let r = clip_rect(area, &v, &clips[0]);
+            let mut xs: Vec<f32> = wave_columns_xy_in(&v, r)
+                .into_iter()
+                .filter(|(_, top, bot)| bot - top > r.height() * 0.8)
+                .map(|(x, ..)| x)
+                .collect();
+            xs.sort_by(f32::total_cmp);
+            xs
+        };
+
+        // Nothing asked, nothing drawn - the ordinary clip is untouched.
+        assert!(ticks(&[]).is_empty(), "a clip with no marks drew some anyway");
+
+        // A hit already in time draws ONE tick, at its own second. The
+        // mapping is the panel's own, so this cannot drift from the draw.
+        let clips = [ClipView { marks: &[], ..base }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 8.0;
+        v.song_s = 12.0;
+        let l = Layout::new(area, &v);
+        let x_at = |t: f64| x_of_in(&l, &v, t);
+        let one = ticks(&[(1.0, 1.0)]);
+        assert_eq!(one.len(), 1, "a hit in time drew {} ticks", one.len());
+        assert!(
+            (one[0] - x_at(1.0)).abs() < 1.5,
+            "the tick landed at {} and the attack is at {}",
+            one[0],
+            x_at(1.0)
+        );
+
+        // One that would MOVE draws two: where it was played, and where it
+        // would go. That gap is the whole reading.
+        let two = ticks(&[(1.0, 1.5)]);
+        assert_eq!(two.len(), 2, "a moved hit drew {} ticks", two.len());
+        assert!(
+            (two[0] - x_at(1.0)).abs() < 1.5 && (two[1] - x_at(1.5)).abs() < 1.5,
+            "the pair landed at {two:?}, not at {} and {}",
+            x_at(1.0),
+            x_at(1.5)
+        );
+
+        // Several, each at its own place.
+        let many = ticks(&[(0.5, 0.5), (1.0, 1.0), (2.0, 2.0), (3.5, 3.5)]);
+        assert_eq!(many.len(), 4, "four attacks drew {} ticks", many.len());
+
+        // **And an attack outside the drawn body is not drawn at all.**
+        // Captured over the WHOLE surface rather than inside the clip,
+        // because the fault this guards against is a tick landing on the
+        // neighbouring clip - which a capture bounded by this one cannot
+        // see. The painter is clipped to the panel, not to the body.
+        // Over the whole surface, and told apart from the grid, the
+        // playhead and everything else vertical by their own INK.
+        let wide = |marks: &[(f32, f32)]| -> Vec<f32> {
+            let clips = [ClipView { marks, ..base }];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = 8.0;
+            v.song_s = 12.0;
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+            crate::fonts::apply_text_styles(&ctx);
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(area), ..Default::default() },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_clip_rect(area);
+                        draw(ui.painter(), area, &v);
+                    });
+                },
+            );
+            let mut xs: Vec<f32> = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if stroke.color == MARK_INK && (points[0].x - points[1].x).abs() < 0.25 =>
+                    {
+                        Some(points[0].x)
+                    }
+                    _ => None,
+                })
+                .collect();
+            xs.sort_by(f32::total_cmp);
+            xs
+        };
+        let outside = wide(&[(50.0, 50.0), (2.0, 2.0)]);
+        assert_eq!(
+            outside.len(),
+            1,
+            "a mark past the clip reached the surface: {outside:?}"
+        );
+        assert!(
+            (outside[0] - x_at(2.0)).abs() < 1.5,
+            "the surviving mark is not the one inside the clip"
+        );
+        // The target half too: a hit that would be thrown past the clip
+        // draws its source and nothing else.
+        let far_target = wide(&[(2.0, 50.0)]);
+        assert_eq!(far_target.len(), 1, "a target past the clip was drawn: {far_target:?}");
+
+        // **A TRIMMED clip marks the same attacks.** The seconds are the
+        // FILE's, so the trim comes off here - without that, every mark on
+        // a trimmed take sits `offset_s` too far right.
+        let trimmed = ClipView { offset_s: 1.0, ..base };
+        let clips_t = [ClipView { marks: &[(2.0, 2.0)], ..trimmed }];
+        let mut vt = a_view(&clips_t);
+        vt.view_start_s = 0.0;
+        vt.view_len_s = 8.0;
+        vt.song_s = 12.0;
+        let rt = clip_rect(area, &vt, &clips_t[0]);
+        let xs: Vec<f32> = wave_columns_xy_in(&vt, rt)
+            .into_iter()
+            .filter(|(_, top, bot)| bot - top > rt.height() * 0.8)
+            .map(|(x, ..)| x)
+            .collect();
+        assert_eq!(xs.len(), 1, "the trimmed clip drew {} ticks", xs.len());
+        // An attack at file second 2 on a clip trimmed by 1 is heard at
+        // second 1 of the timeline.
+        let lt = Layout::new(area, &vt);
+        assert!(
+            (xs[0] - x_of_in(&lt, &vt, 1.0)).abs() < 1.5,
+            "the trim was not taken off: drew at {}, the attack is heard at {}",
+            xs[0],
+            x_of_in(&lt, &vt, 1.0)
+        );
     }
 
     /// **The waveform wears the clip's gain.**
@@ -12899,6 +13139,7 @@ mod miniature_cost_probe {
                 midi: true,
                 recording: false,
                 gain: 1.0,
+                marks: &[],
             })
             .collect();
 

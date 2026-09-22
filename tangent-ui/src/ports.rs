@@ -868,13 +868,43 @@ pub enum ProjectRequest {
     /// one put to it. Seconds per step, and the swung off-beat's fraction.
     /// **Ids, not one id**, because `project_request` carries one request a
     /// frame and a marquee over eight takes is one gesture.
-    QuantizeClips {
-        ids: Vec<u64>,
-        step_s: f64,
-        swing: Option<f64>,
-        strength: f64,
-    },
+    QuantizeClips(QuantizeAsk),
     ResetTemplate,
+}
+
+/// **One quantize, exactly as the window put it.**
+///
+/// One struct rather than seven loose arguments, and it crosses the
+/// firewall twice: as the REQUEST, when Apply is pressed, and as the
+/// PREVIEW, every frame the window is open. That is the whole reason it is
+/// a type - the marks drawn on a waveform while somebody turns a dial have
+/// to be made from the same numbers the Apply will use, or the preview is a
+/// second implementation that drifts.
+///
+/// It is also what stopped the knobs going missing: the request carried
+/// four of these seven as loose fields and `window`, `sensitivity` and
+/// `fit` were simply never passed, so three dials in the window reached
+/// nothing on the audio side. A field added here is a compile error at
+/// every site.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantizeAsk {
+    /// **Ids, not one id**, because `project_request` carries one request a
+    /// frame and a marquee over eight takes is one gesture.
+    pub ids: Vec<u64>,
+    /// Seconds per grid step.
+    pub step_s: f64,
+    /// Where the swung off-beat sits, as a fraction; `None` is straight.
+    pub swing: Option<f64>,
+    /// 0..=1. A partial move, not a switch.
+    pub strength: f64,
+    /// **Leave an attack further than this from every line alone**, in
+    /// seconds; `None` is off. A grace note is not a late note.
+    pub window: Option<f64>,
+    /// How readily the detector calls a rise an attack, 0..=1.
+    pub sensitivity: f64,
+    /// How a warped segment gets where it belongs, by key; empty is auto.
+    /// Written onto the clip, so the render uses the fit that was asked for.
+    pub fit: String,
 }
 
 /// What the host found in the scratch project New would reclaim.

@@ -941,6 +941,18 @@ pub struct DesktopApp {
     engine_epoch: u64,
     #[cfg(feature = "recorder")]
     comp_rows_epoch: u64,
+    /// **Detected attacks, per file and per sensitivity.** See
+    /// `attacks_of`: the quantize window's marks are redrawn while a dial
+    /// is being dragged, and the detector is a whole-file pass.
+    #[cfg(feature = "recorder")]
+    attack_cache: std::collections::HashMap<
+        (std::path::PathBuf, i32),
+        Arc<Vec<crate::transient::Transient>>,
+    >,
+    /// The ask the marks currently on screen were built from, so a frame
+    /// that changed nothing asks nothing. See `push_quantize_marks`.
+    #[cfg(feature = "recorder")]
+    quantize_marked: Option<tangent_ui::ports::QuantizeAsk>,
     /// The ReaStream config the sender was last handed. See
     /// `reconcile_reastream`.
     #[cfg(feature = "recorder")]
@@ -3243,6 +3255,46 @@ fn warped_clip_audio(
 /// inserted — the doc on the live path used to warn the sweep to keep up
 /// with it by hand.
 #[cfg(feature = "recorder")]
+/// **The warp map one quantize would write**, and how many attacks were
+/// found on the way to it.
+///
+/// Its own function because TWO callers need it and they must not disagree:
+/// the Apply, which writes it onto the clip, and the PREVIEW, which turns
+/// the same pairs into the ticks drawn over the waveform while somebody
+/// turns a dial. A preview computed separately is a second implementation
+/// of the feature that looks like the first until it does not.
+///
+/// Anchors are in SOURCE frames, trim included - `warp` reads the whole
+/// file - and ascending in both fields, which `warp` demands and the
+/// document's reader enforces again on the way back in.
+#[cfg(feature = "recorder")]
+fn quantize_map(
+    found: &[crate::transient::Transient],
+    rate: u32,
+    start_s: f64,
+    offset_s: f64,
+    q: &tangent_ui::quantize::Quantize,
+) -> Vec<(u64, u64)> {
+    let rate = rate.max(1);
+    let secs = |f: usize| f as f64 / f64::from(rate);
+    let offset = (offset_s * f64::from(rate)).max(0.0).round() as usize;
+    let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
+    for t in found {
+        // Where this attack is heard, and where it should be heard.
+        let heard = start_s + secs(t.at.saturating_sub(offset));
+        let want = q.place(heard);
+        let to = offset as f64 + (want - start_s) * f64::from(rate);
+        if to < 0.0 {
+            continue;
+        }
+        let (f, to) = (t.at as u64, to.round() as u64);
+        if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
+            map.push((f, to));
+        }
+    }
+    map
+}
+
 /// **What a warp render would be asked for**, or `None` when this clip has
 /// no map worth rendering.
 ///
@@ -4862,6 +4914,10 @@ impl DesktopApp {
         #[cfg(feature = "recorder")]
         self.take_save_panel(ctx, frame);
         self.take_project_request(ctx);
+        // **The quantize window's ticks**, while it is open. Free on a
+        // frame where nothing about the ask has moved - see
+        // `push_quantize_marks`, which compares before it works.
+        self.push_quantize_marks();
         #[cfg(feature = "recorder")]
         self.reconcile_reastream();
         #[cfg(feature = "recorder")]
@@ -9987,7 +10043,7 @@ impl DesktopApp {
             // **No overlay for this one.** It is a detection pass over one
             // clip that is already decoded and in memory - measured in
             // milliseconds - and an overlay that flashes is worse than none.
-            Q::QuantizeClips { .. } => ("Quantizing", None),
+            Q::QuantizeClips(_) => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
             // write one file per lane.
@@ -10151,19 +10207,20 @@ impl DesktopApp {
                 }
                 self.app.notify(Kind::Success, format!("Template saved - {name}"));
             }
-            tangent_ui::ports::ProjectRequest::QuantizeClips {
-                ids,
-                step_s,
-                swing,
-                strength,
-            } => {
+            tangent_ui::ports::ProjectRequest::QuantizeClips(ask) => {
                 let mut moved = 0usize;
                 let mut attacks = 0usize;
-                for id in ids {
-                    let (m, a) = self.quantize_clip(id, step_s, swing, strength);
+                for id in ask.ids.clone() {
+                    let (m, a) = self.quantize_clip(id, &ask);
                     moved += m;
                     attacks += a;
                 }
+                // **ONE moment for the gesture.** The write used to commit
+                // per clip, so a marquee over eight takes left eight
+                // moments and one Ctrl+Z took the last take's quantize off
+                // and left the other seven. See `TangentApp::set_clip_warp`,
+                // which no longer commits on its own.
+                self.app.commit_undo_moment();
                 // **One message for the gesture, not one per clip.** Eight
                 // takes quantized at once is one thing somebody did.
                 self.app.notify(
@@ -11846,20 +11903,116 @@ impl DesktopApp {
     /// against the raw file position would put every hit of a trimmed clip
     /// out by the trim.
     #[cfg(feature = "recorder")]
-    fn quantize_clip(
+    /// **This file's attacks at this sensitivity**, detected once.
+    ///
+    /// The detector is a whole-file pass, and the quantize window's marks
+    /// are redrawn every frame somebody is turning its dials - so without
+    /// this the sensitivity slider would run a pass per frame of the drag.
+    /// Keyed on the file and the dial to a thousandth, which is finer than
+    /// the slider can be dragged and coarse enough that a drag lands on the
+    /// same key twice.
+    ///
+    /// **Bounded by clearing, not by eviction.** A run of the slider leaves
+    /// a few dozen entries of a few thousand frames each; the cheap answer
+    /// is to drop the lot once it is silly, since the only thing that ever
+    /// wants an old one is a dial being dragged BACK over ground it covered
+    /// seconds ago.
+    fn attacks_of(
         &mut self,
-        id: u64,
-        step_s: f64,
-        swing: Option<f64>,
-        strength: f64,
-    ) -> (usize, usize) {
+        path: &std::path::Path,
+        decoded: &tangent_record::decode::Clip,
+        sensitivity: f64,
+    ) -> Arc<Vec<crate::transient::Transient>> {
+        let key = (
+            path.to_path_buf(),
+            (sensitivity.clamp(0.0, 1.0) * 1000.0).round() as i32,
+        );
+        if let Some(found) = self.attack_cache.get(&key) {
+            return Arc::clone(found);
+        }
+        const CAP: usize = 64;
+        if self.attack_cache.len() >= CAP {
+            self.attack_cache.clear();
+        }
+        let found = Arc::new(crate::transient::detect(decoded, sensitivity as f32));
+        self.attack_cache.insert(key, Arc::clone(&found));
+        found
+    }
+
+    /// **The marks the quantize window asked for, answered in ticks.**
+    ///
+    /// Run every frame and cheap when there is nothing to do: the app says
+    /// `None` unless that window is open, and an ask that has not changed
+    /// since the last answer is not asked again. The owner: "the waveform
+    /// should have transient marks shown as the different settings are
+    /// tweaked in its menu."
+    ///
+    /// Built from `quantize_map` - the SAME function the Apply writes its
+    /// warp from - so what is drawn is what will happen, rather than a
+    /// second opinion about it.
+    fn push_quantize_marks(&mut self) {
+        let ask = self.app.quantize_preview();
+        if ask == self.quantize_marked {
+            return;
+        }
+        self.quantize_marked = ask.clone();
+        let Some(ask) = ask else {
+            // The window shut. Take the ticks down, and only if there are
+            // any - the ordinary frame must not push an empty list forever.
+            if self.app.has_clip_marks() {
+                self.app.set_clip_marks(Vec::new());
+            }
+            return;
+        };
+        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
+            return;
+        };
+        let q = tangent_ui::quantize::Quantize {
+            grid,
+            strength: ask.strength,
+            window: ask.window,
+        };
+        let doc = self.app.arrangement().clone();
+        let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(ask.ids.len());
+        for id in &ask.ids {
+            let Some(clip) = doc.clips.iter().find(|c| c.id == *id) else {
+                continue;
+            };
+            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
+                continue;
+            };
+            let rate = f64::from(decoded.rate.max(1));
+            let found = self.attacks_of(&path, &decoded, ask.sensitivity);
+            let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
+            out.push((
+                *id,
+                map.iter()
+                    .map(|&(f, t)| ((f as f64 / rate) as f32, (t as f64 / rate) as f32))
+                    .collect(),
+            ));
+        }
+        self.app.set_clip_marks(out);
+    }
+
+    /// **Everything one quantize was asked for**, so the per-clip worker
+    /// takes one argument instead of six and a knob added to the window
+    /// cannot be forgotten at one of the two call sites.
+    fn quantize_clip(&mut self, id: u64, ask: &tangent_ui::ports::QuantizeAsk) -> (usize, usize) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             return (0, 0);
         };
-        let Some(grid) = tangent_ui::quantize::Grid::new(step_s, swing) else {
+        let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
             return (0, 0);
         };
-        let q = tangent_ui::quantize::Quantize { grid, strength, window: None };
+        let q = tangent_ui::quantize::Quantize {
+            grid,
+            strength: ask.strength,
+            window: ask.window,
+        };
         let doc = self.app.arrangement().clone();
         let Some(clip) = doc.clips.iter().find(|c| c.id == id) else {
             return (0, 0);
@@ -11871,33 +12024,16 @@ impl DesktopApp {
         let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
             return (0, 0);
         };
-        let rate = decoded.rate.max(1);
-        let secs = |f: usize| f as f64 / f64::from(rate);
-        let frames = |s: f64| (s * f64::from(rate)).max(0.0).round() as usize;
-        let offset = frames(clip.offset_s);
-
-        let found = crate::transient::detect(&decoded, 0.5);
-        let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
-        for t in &found {
-            // Where this attack is heard, and where it should be heard.
-            let heard = clip.start_s + secs(t.at.saturating_sub(offset));
-            let want = q.place(heard);
-            let to = offset as f64 + (want - clip.start_s) * f64::from(rate);
-            if to < 0.0 {
-                continue;
-            }
-            let (f, to) = (t.at as u64, to.round() as u64);
-            // Ascending in both, which `warp` demands and the document's
-            // reader enforces again on the way back in.
-            if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
-                map.push((f, to));
-            }
-        }
+        let found = self.attacks_of(&path, &decoded, ask.sensitivity);
+        let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
         if map.len() < 2 {
             return (0, found.len());
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
-        self.app.set_clip_warp(id, map);
+        // The FIT travels with the map, because the render is made from the
+        // pair: a map warped under `slice` and one under `stretch` are the
+        // same anchors and two different takes.
+        self.app.set_clip_warp_with_fit(id, map, ask.fit.clone());
         (moved, found.len())
     }
 
@@ -17297,6 +17433,8 @@ impl DesktopApp {
             engine_epoch: 0,
             #[cfg(feature = "recorder")]
             comp_rows_epoch: u64::MAX,
+            attack_cache: std::collections::HashMap::new(),
+            quantize_marked: None,
             #[cfg(feature = "recorder")]
             reastream_pushed: None,
             #[cfg(feature = "recorder")]
@@ -22551,6 +22689,65 @@ mod tests {
                 "a second amp re-seeded the board and switched a pedal back off"
             );
         }
+    }
+
+    /// **The ticks on the waveform and the warp the Apply writes come from
+    /// ONE function.**
+    ///
+    /// The owner asked for marks that follow the dials: "the waveform
+    /// should have transient marks shown as the different settings are
+    /// tweaked in its menu". The trap in a preview is that it is a second
+    /// implementation of the feature - it looks right for a month and then
+    /// disagrees with what pressing Apply actually does. So both roads call
+    /// `quantize_map`, and this is what says so.
+    #[test]
+    fn the_preview_and_the_apply_read_one_map() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let calls = scan.matches("quantize_map(&found,").count();
+        assert_eq!(
+            calls, 2,
+            "the preview and the apply no longer share one map builder ({calls} calls)"
+        );
+        assert!(
+            scan.contains("fn push_quantize_marks(&mut self)"),
+            "nothing pushes the marks any more"
+        );
+        assert!(
+            scan.contains("self.push_quantize_marks();"),
+            "the marks are never pushed from a frame"
+        );
+        // And the detector is reached through the cache at BOTH, or a
+        // slider drag is a whole-file pass per frame.
+        assert_eq!(
+            scan.matches("self.attacks_of(&path, &decoded,").count(),
+            2,
+            "one of the two roads detects without the cache"
+        );
+        assert!(
+            !scan.contains("crate::transient::detect(&decoded"),
+            "a caller went round `attacks_of`"
+        );
+    }
+
+    /// **A file's attacks are detected once per dial position.**
+    ///
+    /// The marks are redrawn while somebody is dragging the sensitivity
+    /// slider and the detector is a whole-file pass, so without the cache
+    /// that is one pass a frame. Driven through the real function, which
+    /// needs a `DesktopApp` - so what is checked here is the KEY, which is
+    /// where the cache either works or quietly never hits: a dial rounded
+    /// to a thousandth is finer than a slider can be dragged, and two
+    /// frames of one position must land on the same key.
+    #[test]
+    fn the_attack_cache_keys_on_the_dial_and_not_on_its_noise() {
+        let key = |s: f64| (s.clamp(0.0, 1.0) * 1000.0).round() as i32;
+        assert_eq!(key(0.5), key(0.5000004), "a hair of float noise missed the cache");
+        assert_ne!(key(0.500), key(0.502), "two dial positions shared an answer");
+        // The ends are reachable and do not alias onto each other.
+        assert_eq!(key(-1.0), 0, "below the floor did not clamp");
+        assert_eq!(key(9.0), 1000, "above the ceiling did not clamp");
+        assert_ne!(key(0.0), key(1.0));
     }
 
     /// **The LIVE path warps too, and carries a picture of what it warped.**
