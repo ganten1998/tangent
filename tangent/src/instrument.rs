@@ -1461,6 +1461,27 @@ struct BarClock {
     /// answer to all three is the same: work out where we are from scratch.
     expect: u64,
     armed: bool,
+    /// **The next beat this clock would sound has ALREADY been sounded**, by
+    /// the count-in's downbeat.
+    ///
+    /// Two clocks share the click: `Beats` counts a take in and sounds the
+    /// "go", and this one derives every beat after that from where the
+    /// transport is. The handover doubled that go. The transport does not
+    /// roll during a count-in, so the host starts it AT FRAME ZERO a poll
+    /// after the downbeat - and frame zero is exactly beat one, which this
+    /// clock then sounded a frame or two behind the count-in's. Measured at
+    /// 96000 and 96001.
+    ///
+    /// `resync`'s own note worried about this and guessed the resync would
+    /// land "a frame or two past beat one". It does after a LOCATE, where
+    /// the transport was already moving, and it does not after a count-in,
+    /// where the transport starts on the beat itself.
+    ///
+    /// A flag rather than a frame number, because the frame the count-in
+    /// sounded its go on is the PRE-ROLL's, and the frame this clock is
+    /// about to fire is the take's. They are not the same number and
+    /// comparing them would be comparing two clocks' idea of zero.
+    already_sounded: bool,
     /// Clicks per beat of the signature; 0 means one per BAR. Held here so
     /// `normalise` and `frame_of` cannot disagree about how many there are.
     div: u32,
@@ -1480,6 +1501,7 @@ impl Default for BarClock {
             at_frame: 0.0,
             expect: 0,
             armed: false,
+            already_sounded: false,
             div: 1,
         }
     }
@@ -1562,6 +1584,15 @@ impl BarClock {
         maps.tempo.seconds_at_beat(quarter) * rate
     }
 
+    /// **Somebody else just sounded the beat this clock is about to.**
+    ///
+    /// The count-in's downbeat, and the only caller. See
+    /// [`already_sounded`](Self::already_sounded) for why a flag and not a
+    /// frame number.
+    fn sounded_elsewhere(&mut self) {
+        self.already_sounded = true;
+    }
+
     /// Advance one frame. `Some` on the frame a beat lands.
     ///
     /// `pos` is the transport's ABSOLUTE frame for this sample, which is what
@@ -1572,6 +1603,16 @@ impl BarClock {
         }
         self.expect = pos + 1;
         if (pos as f64) < self.at_frame {
+            return None;
+        }
+        // **The count-in already sounded this one.** Stepped past in
+        // silence rather than suppressed where it is sounded, so the clock
+        // stays exactly where the song says it is — see `already_sounded`.
+        if self.already_sounded {
+            self.already_sounded = false;
+            self.beat += 1;
+            self.normalise(maps);
+            self.at_frame = self.frame_of(maps, rate);
             return None;
         }
         let accent = self.beat == 0;
@@ -9349,6 +9390,11 @@ impl Renderer {
                         let at = heard + (frame_index as f64 / self.rate * 1e9) as Nanos;
                         self.shared.downbeat_ns.store(at, Ordering::Relaxed);
                         self.shared.count_in_done.store(true, Ordering::Relaxed);
+                        // **And the bar clock must not sound it again.** The
+                        // transport starts at frame zero a poll from now,
+                        // which is beat one — the beat this "go" just was.
+                        // See `BarClock::already_sounded`.
+                        self.bar_clock.sounded_elsewhere();
                     }
                 }
 
@@ -20855,6 +20901,119 @@ mod tests {
             .collect()
     }
 
+    /// **The "go" sounds ONCE, not twice.**
+    ///
+    /// Reported from a real session: "the metronome countin works, but after
+    /// what should be its last tick, it sounds twice in quick succession".
+    ///
+    /// Two clocks share this job. `Beats` counts the take in and sounds the
+    /// downbeat that ends it; `BarClock` derives every beat after that from
+    /// where the transport actually is. The handover is the bug: the
+    /// transport does not roll during a count-in, so it starts at frame ZERO
+    /// on the downbeat - and a `BarClock` resyncing at frame zero is exactly
+    /// on beat one and fires it. `resync`'s own comment worried about this
+    /// and guessed the resync would land "a frame or two past beat one",
+    /// which it does after a locate and does not after a count-in.
+    ///
+    /// Driven the way the engine drives them, because neither clock alone
+    /// can show it: the old count-in test walks `Beats` and would pass with
+    /// the double still there.
+    #[test]
+    fn the_downbeat_that_ends_a_count_in_sounds_once() {
+        let rate = 48_000.0;
+        let maps = Maps::default();
+        let mut b = Beats::new(rate, 120.0);
+        let mut bar = BarClock::default();
+        b.restart(4);
+
+        // The count-in runs with the transport held at zero; the moment the
+        // downbeat lands it starts rolling, from zero.
+        // Timed by the LOOP, not by the transport: the transport is parked
+        // at zero for the whole count-in, so its own position cannot tell
+        // the four ticks apart from each other or from the go.
+        let mut fired: Vec<(u64, bool)> = Vec::new();
+        let mut pos = 0u64;
+        let mut rolling = false;
+        for now in 0..(24_000u64 * 6) {
+            let heard = if b.counting_in() || !rolling {
+                b.tick(true, 4)
+            } else {
+                bar.tick(pos, &maps, rate)
+            };
+            if let Some(beat) = heard {
+                fired.push((now, beat.downbeat));
+                if beat.downbeat {
+                    // **The host starts the transport AT ZERO, a poll after
+                    // the go** - it watches `count_in_done` rather than
+                    // being told. So the first frame the bar clock ever sees
+                    // is frame zero, which is exactly beat one. Advancing
+                    // the position on this frame instead is what hid the
+                    // bug the first time this test was written: the clock
+                    // then first saw frame ONE, was a frame past the beat,
+                    // and correctly said nothing.
+                    rolling = true;
+                    // The engine's own handover, through the same door it
+                    // uses: see `BarClock::sounded_elsewhere`.
+                    bar.sounded_elsewhere();
+                    continue;
+                }
+            }
+            if rolling {
+                pos += 1;
+            }
+        }
+
+        // Four count-in ticks, then the go, then the song's own beats — and
+        // NOTHING within a hair of the go but the go itself.
+        let go = fired
+            .iter()
+            .position(|(_, down)| *down)
+            .expect("the count-in never reached its downbeat");
+        let doubles = fired
+            .iter()
+            .enumerate()
+            .filter(|(i, (at, _))| *i != go && at.abs_diff(fired[go].0) < 12_000)
+            .count();
+        assert_eq!(
+            doubles,
+            0,
+            "the go sounded {} times: beats at {:?}",
+            doubles + 1,
+            fired.iter().map(|(at, _)| *at).collect::<Vec<_>>()
+        );
+
+        // **And the song's beats carry on afterwards**, which is the half a
+        // guard like this can quietly break: swallowing one beat too many
+        // leaves the click silent for a bar and looks like a fix.
+        let after: Vec<u64> = fired
+            .iter()
+            .filter(|(at, _)| *at > fired[go].0)
+            .map(|(at, _)| *at)
+            .collect();
+        assert!(
+            !after.is_empty(),
+            "the click never came back after the count-in: {:?}",
+            fired.iter().map(|(at, _)| *at).collect::<Vec<_>>()
+        );
+        // The first one lands a beat after the go, not two.
+        let gap = after[0] - fired[go].0;
+        assert!(
+            (23_000..=25_000).contains(&gap),
+            "the beat after the go came {gap} frames later, not one beat"
+        );
+
+        // **And the ENGINE arms it**, which the model above cannot show: it
+        // calls `sounded_elsewhere` on the same frame it stores the downbeat.
+        let src = include_str!("instrument.rs");
+        let at = src
+            .rfind("self.shared.count_in_done.store(true, Ordering::Relaxed);")
+            .expect("the downbeat's own store");
+        assert!(
+            src[at..at + 400].contains("bar_clock.sounded_elsewhere()"),
+            "the engine stores the downbeat without telling the bar clock"
+        );
+    }
+
     #[test]
     fn a_count_in_is_measured_in_beats_and_recording_starts_one_beat_after_the_last_one() {
         // 120 bpm at 48 kHz is 24000 frames per beat. Four beats of count-in
@@ -28629,7 +28788,15 @@ mod tests {
     fn the_metronome_division_changes_how_many_clicks_a_bar_holds() {
         // The maths both clocks agree on, checked directly: ticks in a bar.
         let ticks = |beats: u32, div: u32| -> u32 {
-            let c = BarClock { bar: 0, beat: 0, at_frame: 0.0, expect: 0, armed: false, div };
+            let c = BarClock {
+                bar: 0,
+                beat: 0,
+                at_frame: 0.0,
+                expect: 0,
+                armed: false,
+                already_sounded: false,
+                div,
+            };
             c.ticks_in_bar(beats)
         };
         // One a beat is the meter's own count.

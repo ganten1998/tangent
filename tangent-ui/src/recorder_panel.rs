@@ -3074,6 +3074,11 @@ pub fn capture_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).capture
 }
 
+/// The record button, for the same reason.
+pub fn record_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    Layout::new(rect, view).record
+}
+
 /// Everything in the band a keyboard can reach and a screen reader can say.
 ///
 /// **Built from `Layout::targets`, which already existed.** That list is the
@@ -10585,6 +10590,8 @@ const SETUP_ROWS: usize = 11;
 /// the headings each shape carries are counted with them.
 const SETUP_MACHINE_ROWS: usize = 8;
 const SETUP_TAKE_ROWS: usize = 6;
+/// The red button's shape: one row of two controls, under one heading.
+const SETUP_ROLLING_ROWS: usize = 1;
 
 /// **Which tiers of the setup panel a caller wants.**
 ///
@@ -10608,6 +10615,17 @@ pub enum SetupShape {
     Machine,
     /// The capture button's panel: the take being made right now.
     Take,
+    /// **The record button's panel: the two settings somebody reaches for at
+    /// the red button**, and nothing else.
+    ///
+    /// The owner asked for this shape first, got the whole take tier on the
+    /// grounds that a copy of two controls is a copy that drifts, and said
+    /// no: "The record button now summmons the menu you put on the takes
+    /// button, which should not happen." They are right, and the drift
+    /// argument was answered by the wrong thing - the fix is that it is not
+    /// a COPY. It is the same layout, the same draw and the same hit test,
+    /// showing two of its rows.
+    Rolling,
 }
 
 /// Every rectangle in the popup.
@@ -10718,6 +10736,7 @@ impl SetupLayout {
         let rows_shown = match shape {
             SetupShape::Machine => SETUP_MACHINE_ROWS,
             SetupShape::Take => SETUP_TAKE_ROWS,
+            SetupShape::Rolling => SETUP_ROLLING_ROWS,
         };
         let h = (w * SETUP_ASPECT * rows_shown as f32 / SETUP_ROWS as f32)
             .min(screen.height() * 0.80);
@@ -10766,6 +10785,7 @@ impl SetupLayout {
         let (heads, rows_shown) = match shape {
             SetupShape::Machine => (2.0, SETUP_MACHINE_ROWS),
             SetupShape::Take => (1.0, SETUP_TAKE_ROWS),
+            SetupShape::Rolling => (1.0, SETUP_ROLLING_ROWS),
         };
         let units = HEAD * heads + rows_shown as f32 + 1.0;
         let pitch = rows.height() / units;
@@ -10804,6 +10824,8 @@ impl SetupLayout {
             r
         };
         let machine = shape == SetupShape::Machine;
+        let take = shape == SetupShape::Take;
+        let rolling = shape == SetupShape::Rolling;
         let mut band = |u: f32, mine: bool| if mine { band(u) } else { gone() };
         let audio_head = band(HEAD, machine);
         let r6 = band(1.0, machine);
@@ -10821,16 +10843,21 @@ impl SetupLayout {
         let rp2 = band(1.0, machine);
         let rp3 = band(1.0, machine);
         let rp4 = band(1.0, machine);
+        // **`Rolling` shows the heading and `r3` alone** - the row that
+        // carries COUNT-IN and SIG. Everything else in the tier is laid out
+        // where nothing can see or reach it, exactly as the other shape's
+        // rows are, so the red button's panel is two controls without being
+        // a second copy of them.
         let take_head = band(HEAD, !machine);
-        let r0 = band(1.0, !machine);
-        let r1 = band(1.0, !machine);
+        let r0 = band(1.0, take);
+        let r1 = band(1.0, take);
         let note = {
-            let r = band(1.0, !machine);
+            let r = band(1.0, take);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
-        let r3 = band(1.0, !machine);
-        let r4 = band(1.0, !machine);
-        let r5 = band(1.0, !machine);
+        let r3 = band(1.0, take || rolling);
+        let r4 = band(1.0, take);
+        let r5 = band(1.0, take);
         Self {
             panel,
             title,
