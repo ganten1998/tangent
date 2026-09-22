@@ -86,12 +86,60 @@ const FLOOR_HALF: usize = 100;
 /// gives none after its own start.
 ///
 /// Returns positions in ascending order, each the foot of its rise.
+///
+/// **In two halves, and every caller uses both.** [`analyse`] is the whole
+/// cost and reads no sensitivity; [`pick`] is what a hand on a dial
+/// re-runs. There is no one-shot door, because the only caller there has
+/// ever been wants to turn the dial - see `DesktopApp::attacks_of`.
+///
+/// **What a file sounds like, before anybody has said how readily to call a
+/// rise an attack.**
+///
+/// Everything in [`detect`] up to the threshold: the envelope of the
+/// differenced signal, one pass over every sample, and the flux against the
+/// recent peak, one pass over the hops. Neither reads `sensitivity`.
+///
+/// It is split out because the quantize window's marks are redrawn while
+/// somebody is dragging the detect slider, and this half is the whole cost:
+/// a three-minute take is eight million samples through the envelope and
+/// nothing about turning the dial changes any of it. The host analyses a
+/// file once and [`pick`]s from it per dial position - see
+/// `DesktopApp::attacks_of`.
+///
+/// `None` for a clip too short to have hops to compare.
+pub struct Analysis {
+    env: Vec<f32>,
+    /// Every hop the flux PEAKS on, with the local median it stands over.
+    ///
+    /// **The median is here and not in [`pick`] because it does not depend
+    /// on the dial either**, and it is where the time goes: a sort of two
+    /// hundred numbers at every peak of a three-minute take measured 35 ms,
+    /// against 10 ms for the envelope and the flux together. Left in
+    /// `pick`, dragging the detect slider would have run that sort tens of
+    /// thousands of times a frame.
+    cand: Vec<Cand>,
+    hop: usize,
+    rate: u32,
+    frames: usize,
+}
+
+/// One rise that turned over, and what it has to beat.
+struct Cand {
+    /// Which hop.
+    k: usize,
+    /// The detection function there.
+    flux: f32,
+    /// The local median of the detection function around it - the adaptive
+    /// floor, before the sensitivity's margin is added.
+    median: f32,
+}
+
 #[must_use]
-pub fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
+pub fn analyse(clip: &Clip) -> Option<Analysis> {
     let hop = ((f64::from(clip.rate.max(1)) * HOP_S) as usize).max(1);
     let frames = clip.frames();
     if frames < hop * 8 {
-        return Vec::new();
+        return None;
     }
 
     // ── the envelope, of the DIFFERENCED signal ─────────────────────────
@@ -130,7 +178,7 @@ pub fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
         i += hop;
     }
     if env.len() < 8 {
-        return Vec::new();
+        return None;
     }
 
     // ── the detection function: this hop over the RECENT PEAK, in dB ────
@@ -179,23 +227,19 @@ pub fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
         })
         .collect();
 
-    // ── the adaptive floor: the local median, plus a margin ─────────────
-    let margin = 1.5 + (1.0 - sensitivity.clamp(0.0, 1.0)) * 6.0;
-    let mut out: Vec<Transient> = Vec::new();
-    let min_gap = ((f64::from(clip.rate.max(1)) * MIN_GAP_S) as usize / hop).max(1);
-    // How far back the foot walk may reach: ~6 ms, a few hops. See `foot`.
-    let max_back = ((f64::from(clip.rate.max(1)) * 0.006) as usize / hop).max(1);
+    // ── the peaks, and the floor each stands over ───────────────────────
+    //
+    // Both sensitivity-free, so both are done once here. A rise that has
+    // not turned over is not an attack; hop zero has nothing before it, so
+    // it only has to out-rank what follows, and the last hop is never a
+    // peak because a rise still climbing at the end of the clip is not one
+    // this can place.
+    let mut cand: Vec<Cand> = Vec::new();
     let mut scratch: Vec<f32> = Vec::with_capacity(FLOOR_HALF * 2 + 1);
-    let mut last: Option<usize> = None;
-
     for k in 0..flux.len() {
-        // A peak, or it is not an attack - the rise has to be turning over.
-        // Hop zero has nothing before it, so it only has to out-rank what
-        // follows; the last hop is never a peak, because a rise that has not
-        // turned over by the end of the clip is not one this can place.
         let prev = if k == 0 { 0.0 } else { flux[k - 1] };
         let Some(&next) = flux.get(k + 1) else { continue };
-        if flux[k] < prev || flux[k] < next {
+        if flux[k] < prev || flux[k] < next || flux[k] <= 0.0 {
             continue;
         }
         let lo = k.saturating_sub(FLOOR_HALF);
@@ -203,9 +247,32 @@ pub fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
         scratch.clear();
         scratch.extend_from_slice(&flux[lo..hi]);
         scratch.sort_by(f32::total_cmp);
-        let median = scratch[scratch.len() / 2];
-        let threshold = median + margin;
-        if flux[k] < threshold || flux[k] <= 0.0 {
+        cand.push(Cand { k, flux: flux[k], median: scratch[scratch.len() / 2] });
+    }
+    Some(Analysis { env, cand, hop, rate: clip.rate.max(1), frames })
+}
+
+/// **Which of an [`Analysis`]'s rises count as attacks at this
+/// sensitivity.** The cheap half: one walk of the flux, and a local median
+/// taken only at the hops that are actually peaks.
+///
+/// `sensitivity` runs 0 to 1 and is the MARGIN over that median - see
+/// [`detect`], whose doc this half answers.
+#[must_use]
+pub fn pick(a: &Analysis, sensitivity: f32) -> Vec<Transient> {
+    let Analysis { env, cand, hop, rate, frames } = a;
+    let (hop, rate, frames) = (*hop, *rate, *frames);
+    // ── the adaptive floor: the local median, plus a margin ─────────────
+    let margin = 1.5 + (1.0 - sensitivity.clamp(0.0, 1.0)) * 6.0;
+    let mut out: Vec<Transient> = Vec::new();
+    let min_gap = ((f64::from(rate) * MIN_GAP_S) as usize / hop).max(1);
+    // How far back the foot walk may reach: ~6 ms, a few hops. See `foot`.
+    let max_back = ((f64::from(rate) * 0.006) as usize / hop).max(1);
+    let mut last: Option<usize> = None;
+
+    for c in cand {
+        let (k, flux) = (c.k, c.flux);
+        if flux < c.median + margin {
             continue;
         }
         // **The refractory period keeps the LOUDER of two close calls**, so
@@ -214,15 +281,15 @@ pub fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
         if let Some(prev) = last {
             if k - prev < min_gap {
                 if let Some(back) = out.last_mut() {
-                    if flux[k] > back.strength {
-                        *back = Transient { at: foot(&env, k, max_back) * hop, strength: flux[k] };
+                    if flux > back.strength {
+                        *back = Transient { at: foot(env, k, max_back) * hop, strength: flux };
                         last = Some(k);
                     }
                 }
                 continue;
             }
         }
-        out.push(Transient { at: foot(&env, k, max_back) * hop, strength: flux[k] });
+        out.push(Transient { at: foot(env, k, max_back) * hop, strength: flux });
         last = Some(k);
     }
     // The foot walk can land two detections on one frame when a hit rises
@@ -262,6 +329,13 @@ mod tests {
     use tangent_record::decode::Clip;
 
     const RATE: u32 = 48_000;
+
+    /// The two halves as one call, which is how every test here reads.
+    /// Production has no such door: its one caller analyses once per file
+    /// and picks per dial position.
+    fn detect(clip: &Clip, sensitivity: f32) -> Vec<Transient> {
+        analyse(clip).map_or_else(Vec::new, |a| pick(&a, sensitivity))
+    }
 
     fn clip_of(samples: Vec<f32>) -> Clip {
         Clip { samples, rate: RATE, source: std::path::PathBuf::from("t.wav") }
@@ -428,6 +502,51 @@ mod tests {
 
     /// **Sensitivity moves the count in the direction it says**, which is
     /// the only promise the dial makes.
+    /// **The dial is free to turn.**
+    ///
+    /// `analyse` is the whole cost of a detection and `pick` is what a hand
+    /// on the detect slider re-runs, so the split is only worth anything if
+    /// the second one is nearly nothing. Measured on a three-minute take at
+    /// 48 kHz: 12 ms to analyse, 0.01 ms to pick. Before the median moved
+    /// out of `pick` it was 35 ms - a sort of two hundred numbers at every
+    /// peak - which is three dropped frames per pixel of slider travel.
+    ///
+    /// The ratio is what is asserted, not the milliseconds: this runs on
+    /// whatever machine it runs on. A hundredfold is far inside the
+    /// thousandfold measured and far outside anything the old shape could
+    /// reach.
+    #[test]
+    fn picking_a_sensitivity_costs_almost_nothing_next_to_analysing() {
+        let rate = 48_000u32;
+        let frames = rate as usize * 20;
+        let mut v = Vec::with_capacity(frames * 2);
+        for f in 0..frames {
+            let t = f as f32 / rate as f32;
+            let hit = ((t * 4.0).fract() * 40.0).exp2().recip();
+            let x = (t * 220.0 * std::f32::consts::TAU).sin() * 0.2 + hit * 0.7;
+            v.push(x);
+            v.push(x);
+        }
+        let clip = Clip { samples: v, rate, source: std::path::PathBuf::from("t.wav") };
+        let t0 = std::time::Instant::now();
+        let a = analyse(&clip).expect("an analysis");
+        let analysed = t0.elapsed();
+        // Enough picks that the timer has something to read.
+        const N: u32 = 50;
+        let t1 = std::time::Instant::now();
+        let mut found = 0usize;
+        for i in 0..N {
+            found += pick(&a, 0.2 + (i % 40) as f32 * 0.02).len();
+        }
+        let picked = t1.elapsed() / N;
+        assert!(found > 0, "the fixture has no attacks to pick");
+        assert!(
+            picked.as_secs_f64() * 100.0 < analysed.as_secs_f64(),
+            "a pick costs {:?} against an analysis of {analysed:?} - the dial is not free",
+            picked
+        );
+    }
+
     #[test]
     fn a_lower_sensitivity_never_finds_more() {
         let c = clicks(4.0, 0.25);

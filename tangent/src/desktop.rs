@@ -941,14 +941,13 @@ pub struct DesktopApp {
     engine_epoch: u64,
     #[cfg(feature = "recorder")]
     comp_rows_epoch: u64,
-    /// **Detected attacks, per file and per sensitivity.** See
+    /// **What each file SOUNDS like**, before a sensitivity is chosen. See
     /// `attacks_of`: the quantize window's marks are redrawn while a dial
-    /// is being dragged, and the detector is a whole-file pass.
+    /// is being dragged, and this is the half of the detection that the
+    /// dial does not change.
     #[cfg(feature = "recorder")]
-    attack_cache: std::collections::HashMap<
-        (std::path::PathBuf, i32),
-        Arc<Vec<crate::transient::Transient>>,
-    >,
+    attack_cache:
+        std::collections::HashMap<std::path::PathBuf, Arc<crate::transient::Analysis>>,
     /// The ask the marks currently on screen were built from, so a frame
     /// that changed nothing asks nothing. See `push_quantize_marks`.
     #[cfg(feature = "recorder")]
@@ -4917,7 +4916,7 @@ impl DesktopApp {
         // **The quantize window's ticks**, while it is open. Free on a
         // frame where nothing about the ask has moved - see
         // `push_quantize_marks`, which compares before it works.
-        self.push_quantize_marks();
+        self.push_quantize_marks(ctx);
         #[cfg(feature = "recorder")]
         self.reconcile_reastream();
         #[cfg(feature = "recorder")]
@@ -10221,6 +10220,13 @@ impl DesktopApp {
                 // and left the other seven. See `TangentApp::set_clip_warp`,
                 // which no longer commits on its own.
                 self.app.commit_undo_moment();
+                // **And the ticks are stale now.** The window stays open
+                // after Apply on purpose, and nothing in the ask moved -
+                // same clips, same knobs - so the comparison in
+                // `push_quantize_marks` would never rebuild them. What DID
+                // move is the audio under them: the clips have a warp map
+                // the marks have to be projected through.
+                self.quantize_marked = None;
                 // **One message for the gesture, not one per clip.** Eight
                 // takes quantized at once is one thing somebody did.
                 self.app.notify(
@@ -11903,40 +11909,37 @@ impl DesktopApp {
     /// against the raw file position would put every hit of a trimmed clip
     /// out by the trim.
     #[cfg(feature = "recorder")]
-    /// **This file's attacks at this sensitivity**, detected once.
-    ///
-    /// The detector is a whole-file pass, and the quantize window's marks
-    /// are redrawn every frame somebody is turning its dials - so without
-    /// this the sensitivity slider would run a pass per frame of the drag.
-    /// Keyed on the file and the dial to a thousandth, which is finer than
-    /// the slider can be dragged and coarse enough that a drag lands on the
-    /// same key twice.
-    ///
-    /// **Bounded by clearing, not by eviction.** A run of the slider leaves
-    /// a few dozen entries of a few thousand frames each; the cheap answer
-    /// is to drop the lot once it is silly, since the only thing that ever
-    /// wants an old one is a dial being dragged BACK over ground it covered
-    /// seconds ago.
+    /// **This file's attacks at this sensitivity.**
     fn attacks_of(
         &mut self,
         path: &std::path::Path,
         decoded: &tangent_record::decode::Clip,
         sensitivity: f64,
-    ) -> Arc<Vec<crate::transient::Transient>> {
-        let key = (
-            path.to_path_buf(),
-            (sensitivity.clamp(0.0, 1.0) * 1000.0).round() as i32,
-        );
-        if let Some(found) = self.attack_cache.get(&key) {
-            return Arc::clone(found);
+    ) -> Vec<crate::transient::Transient> {
+        // **The FILE is what is cached, not the answer.** `analyse` is the
+        // whole cost - the envelope over every sample and the local median
+        // at every peak - and none of it reads the dial; `pick` is a walk
+        // of the candidates and measured 0.01 ms against 12 ms for the
+        // analysis. So a hand on the detect slider re-picks and never
+        // re-analyses, and there is one entry per file rather than one per
+        // file per dial position.
+        const CAP: usize = 8;
+        if !self.attack_cache.contains_key(path) {
+            let Some(a) = crate::transient::analyse(decoded) else {
+                return Vec::new();
+            };
+            // A few takes' analyses are a few hundred kilobytes; the
+            // cheap answer to "how many" is to drop the lot once it is
+            // silly, since the only thing that wants an old one is a
+            // selection being made again.
+            if self.attack_cache.len() >= CAP {
+                self.attack_cache.clear();
+            }
+            self.attack_cache.insert(path.to_path_buf(), Arc::new(a));
         }
-        const CAP: usize = 64;
-        if self.attack_cache.len() >= CAP {
-            self.attack_cache.clear();
-        }
-        let found = Arc::new(crate::transient::detect(decoded, sensitivity as f32));
-        self.attack_cache.insert(key, Arc::clone(&found));
-        found
+        self.attack_cache
+            .get(path)
+            .map_or_else(Vec::new, |a| crate::transient::pick(a, sensitivity as f32))
     }
 
     /// **The marks the quantize window asked for, answered in ticks.**
@@ -11950,25 +11953,52 @@ impl DesktopApp {
     /// Built from `quantize_map` - the SAME function the Apply writes its
     /// warp from - so what is drawn is what will happen, rather than a
     /// second opinion about it.
-    fn push_quantize_marks(&mut self) {
+    fn push_quantize_marks(&mut self, ctx: &egui::Context) {
         let ask = self.app.quantize_preview();
         if ask == self.quantize_marked {
             return;
         }
-        self.quantize_marked = ask.clone();
-        let Some(ask) = ask else {
-            // The window shut. Take the ticks down, and only if there are
-            // any - the ordinary frame must not push an empty list forever.
-            if self.app.has_clip_marks() {
-                self.app.set_clip_marks(Vec::new());
-            }
-            return;
-        };
+        let want = ask.as_ref().map_or(0, |a| a.ids.len());
+        let marks = ask.as_ref().map_or_else(Vec::new, |a| self.quantize_marks_for(a));
+        // **An ask is only ANSWERED when every clip in it was.** A take
+        // whose file has not landed in `track_cache` yet is skipped, and
+        // latching the ask anyway would mean the early return above never
+        // lets it be asked again - so the marks for that clip would arrive
+        // never rather than late. Nothing about the ask changes when a
+        // decode lands, so the ask is the only thing that can remember.
+        if marks.len() == want {
+            self.quantize_marked = ask;
+        }
+        // **Nothing to put up and nothing up is nothing happening.** The
+        // window shutting takes the ticks down; an ordinary frame with no
+        // window open passes through here and must cost nothing, and must
+        // not ask for a frame of its own - the window RESTS.
+        let changed = !marks.is_empty() || self.app.has_clip_marks();
+        if changed {
+            self.app.set_clip_marks(marks);
+        }
+        // A late change, so it asks for the frame that will show it: this
+        // runs at the top of a frame, after the app was drawn on the last
+        // one. Same door the insert reconcile uses.
+        late_change(ctx, changed);
+    }
+
+    /// **The ticks one ask comes to**, per clip, in seconds from the start
+    /// of each FILE.
+    ///
+    /// Split from the pusher so that one has a single exit and can hand
+    /// `late_change` an ANSWER rather than a bare `true` - see
+    /// `the_late_roads_ask_for_a_frame_and_the_idle_one_does_not`, which is
+    /// the rule that keeps this window resting.
+    fn quantize_marks_for(
+        &mut self,
+        ask: &tangent_ui::ports::QuantizeAsk,
+    ) -> Vec<(u64, Vec<(f32, f32)>)> {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
-            return;
+            return Vec::new();
         };
         let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
-            return;
+            return Vec::new();
         };
         let q = tangent_ui::quantize::Quantize {
             grid,
@@ -11988,14 +12018,37 @@ impl DesktopApp {
             let rate = f64::from(decoded.rate.max(1));
             let found = self.attacks_of(&path, &decoded, ask.sensitivity);
             let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
+            // **An attack is FOUND in the file and DRAWN over what the clip
+            // plays**, and those are two different timelines the moment a
+            // warp map exists. Projecting through it is what makes an
+            // already-quantized take show its ticks ON its hits - and,
+            // since the target needs no projection (it is already a place
+            // in the result), what makes the pair coincide on a take that
+            // is in time. A clip with no map projects as itself.
+            let anchors: Vec<crate::warp::Anchor> = clip
+                .warp
+                .iter()
+                .map(|&(from, to)| crate::warp::Anchor {
+                    from: usize::try_from(from).unwrap_or(usize::MAX),
+                    to: usize::try_from(to).unwrap_or(usize::MAX),
+                })
+                .collect();
+            let frames = decoded.frames();
             out.push((
                 *id,
                 map.iter()
-                    .map(|&(f, t)| ((f as f64 / rate) as f32, (t as f64 / rate) as f32))
+                    .map(|&(f, t)| {
+                        let at = crate::warp::project_frame(
+                            frames,
+                            &anchors,
+                            usize::try_from(f).unwrap_or(usize::MAX),
+                        );
+                        ((at as f64 / rate) as f32, (t as f64 / rate) as f32)
+                    })
                     .collect(),
             ));
         }
-        self.app.set_clip_marks(out);
+        out
     }
 
     /// **Everything one quantize was asked for**, so the per-clip worker
@@ -12087,6 +12140,16 @@ impl DesktopApp {
             self.app
                 .set_clip_gain(clip.id, f64::from(CEILING / peak));
             done += 1;
+        }
+        // **ONE moment for the gesture, and its OWN.** `set_clip_gain`
+        // commits nothing, and neither did this - so a normalize had no
+        // moment of its own and was folded into whatever came next. The
+        // owner met it as "record track 7 -> normalize -> quantize ->
+        // cmd+z == unquantize AND unnormalize": two things done, one step
+        // back. Committed only when something actually moved, or a
+        // normalize that found nothing to do would push an empty moment.
+        if done > 0 {
+            self.app.commit_undo_moment();
         }
         // A receipt when it did something, a refusal when it did not — the
         // kind carries which, so the accent does not have to be read.
@@ -12255,8 +12318,14 @@ impl DesktopApp {
         {
             write_insert_state(to_strip, to_bay, &bundle, &state);
         }
+        // **ONE moment for the drag.** `set_insert` commits its own, so
+        // filling the destination and clearing the source left two - and
+        // one Ctrl+Z landed on the halfway state, the same plugin in BOTH
+        // bays, which is a desk nobody made and cannot make by hand.
+        self.app.begin_one_moment();
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
         self.app.set_insert(from_strip, from_bay, None);
+        self.app.commit_undo_moment();
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
     }
 
@@ -12371,8 +12440,13 @@ impl DesktopApp {
                     e.insert_editor_open(b_strip, b_bay),
                 )
             });
+        // One moment, for the reason `move_insert` states: the halfway
+        // state of a TRADE is worse still - `b` in both bays and `a` gone
+        // from the project entirely.
+        self.app.begin_one_moment();
         self.app.set_insert(a_strip, a_bay, Some(&b));
         self.app.set_insert(b_strip, b_bay, Some(&a));
+        self.app.commit_undo_moment();
         // The window follows its unit across the trade. One flag, so with
         // both up the one that was picked up wins — it is the one the hand
         // is thinking about.
@@ -21472,6 +21546,9 @@ mod tests {
                 "the deadline door reloaded",
                 "let deferred = self.reload_clips(Decode::CachedOnly, ctx);\n                late_change(ctx, true);",
             ),
+            // The quantize window's ticks, which are computed at the top of
+            // a frame the app was drawn from on the one before.
+            ("the marks moved", "late_change(ctx, changed);"),
         ] {
             assert!(body.contains(ask), "{road}: the frame that draws it is not asked for");
         }
@@ -22691,6 +22768,57 @@ mod tests {
         }
     }
 
+    /// **Every host-side edit ends its own gesture.**
+    ///
+    /// The host reaches the document through setters that commit nothing -
+    /// deliberately, so a batch over eight clips is one moment and not
+    /// eight - which means the BATCH has to commit. A batch that forgets
+    /// leaves its edit with no moment of its own, and it is then folded
+    /// into the next gesture's: one Ctrl+Z undoes two things somebody did.
+    ///
+    /// The owner met exactly that: "Default template -> record track 7 ->
+    /// normalize -> quantize -> cmd+z == unquantize AND unnormalize."
+    ///
+    /// A source scan, because `DesktopApp` cannot be built in a test - the
+    /// precedent is
+    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    /// What it pins is that each named batch still reaches the door.
+    #[test]
+    fn every_host_side_edit_commits_its_own_undo_moment() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        // The body of each batch, from its signature to the next `fn` at
+        // the same depth, must contain the commit.
+        for (f, what) in [
+            ("fn normalize_clips(&mut self, ids: &[u64]) {", "normalize"),
+            ("ProjectRequest::QuantizeClips(ask) => {", "quantize"),
+        ] {
+            let at = scan.find(f).unwrap_or_else(|| panic!("{what} is gone"));
+            let body = &scan[at..(at + 4000).min(scan.len())];
+            assert!(
+                body.contains("self.app.commit_undo_moment();"),
+                "{what} no longer ends its own undo moment"
+            );
+        }
+        // And the setters they use still commit NOTHING of their own, or
+        // the batch would leave one moment per clip.
+        let ui = include_str!("../../tangent-ui/src/app.rs");
+        for (f, what) in [
+            ("pub fn set_clip_gain(&mut self, id: u64, gain: f64) {", "the gain setter"),
+            (
+                "pub fn set_clip_warp_with_fit(&mut self, id: u64, warp: Vec<(u64, u64)>, fit: String) {",
+                "the warp setter",
+            ),
+        ] {
+            let at = ui.find(f).unwrap_or_else(|| panic!("{what} is gone"));
+            let body = &ui[at..at + ui[at..].find("\n    }\n").expect("its end")];
+            assert!(
+                !body.contains("undo_commit()"),
+                "{what} commits a moment of its own again, so a batch leaves one per clip"
+            );
+        }
+    }
+
     /// **The ticks on the waveform and the warp the Apply writes come from
     /// ONE function.**
     ///
@@ -22710,11 +22838,11 @@ mod tests {
             "the preview and the apply no longer share one map builder ({calls} calls)"
         );
         assert!(
-            scan.contains("fn push_quantize_marks(&mut self)"),
+            scan.contains("fn push_quantize_marks(&mut self, ctx: &egui::Context)"),
             "nothing pushes the marks any more"
         );
         assert!(
-            scan.contains("self.push_quantize_marks();"),
+            scan.contains("self.push_quantize_marks(ctx);"),
             "the marks are never pushed from a frame"
         );
         // And the detector is reached through the cache at BOTH, or a
@@ -22724,9 +22852,27 @@ mod tests {
             2,
             "one of the two roads detects without the cache"
         );
+        // **One analysis, inside the cache.** A second caller anywhere is
+        // a whole-file pass per frame of a slider drag.
+        assert_eq!(
+            scan.matches("crate::transient::analyse(").count(),
+            1,
+            "a caller analyses a file without going through `attacks_of`"
+        );
+        let cache = &scan[scan.find("fn attacks_of(").expect("the cache")..];
+        let cache = &cache[..cache.find("\n    /// ").unwrap_or(cache.len())];
         assert!(
-            !scan.contains("crate::transient::detect(&decoded"),
-            "a caller went round `attacks_of`"
+            cache.contains("crate::transient::analyse("),
+            "the one analysis is no longer the cache's"
+        );
+        // **And a new set of ticks asks for the frame that draws it.** The
+        // window rests; marks computed after a frame and never repainted
+        // are marks nobody sees until something else happens. With the
+        // ANSWER, not a bare `true` - see
+        // `the_late_roads_ask_for_a_frame_and_the_idle_one_does_not`.
+        assert!(
+            scan.contains("late_change(ctx, changed);"),
+            "a mark change does not ask for the frame that would show it"
         );
     }
 

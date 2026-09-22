@@ -201,6 +201,54 @@ pub fn projected_frames(frames: usize, anchors: &[Anchor]) -> usize {
     last.to + ((tail_src as f64) * tail_ratio).round() as usize
 }
 
+/// **Where one source frame ends up in the render**, without making it.
+///
+/// The same piecewise map [`warp`] renders through: linear between the
+/// anchors that survive the clean-up, and the tail carried at the ratio of
+/// the segment before it. The quantize window's marks need it - an attack
+/// is FOUND in the file and DRAWN over the warped audio, so a clip that has
+/// already been quantized would otherwise wear ticks a whole correction
+/// away from the hits they name.
+///
+/// Identity when there is no usable map, which is what makes the caller's
+/// unwarped case free.
+#[must_use]
+pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
+    if frames == 0 || anchors.is_empty() {
+        return at;
+    }
+    let pts = usable(frames, anchors);
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return at;
+    };
+    // Before the first anchor: the head is squeezed or stretched into the
+    // room in front of it, exactly as the render lays it out.
+    if at <= first.from {
+        if first.from == 0 {
+            return first.to.min(projected_frames(frames, anchors));
+        }
+        let f = at as f64 / first.from as f64;
+        return (f * first.to as f64).round() as usize;
+    }
+    // Between two anchors.
+    for pair in pts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if at <= b.from {
+            let span = (b.from - a.from).max(1) as f64;
+            let f = (at - a.from) as f64 / span;
+            return (a.to as f64 + f * (b.to - a.to) as f64).round() as usize;
+        }
+    }
+    // The tail, at the ratio of the segment before it.
+    let ratio = if pts.len() >= 2 {
+        let a = pts[pts.len() - 2];
+        (last.to - a.to) as f64 / (last.from - a.from).max(1) as f64
+    } else {
+        1.0
+    };
+    last.to + ((at - last.from) as f64 * ratio).round() as usize
+}
+
 pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     let frames = clip.frames();
     if frames == 0 || anchors.is_empty() {
@@ -364,6 +412,12 @@ mod tests {
 
     const RATE: u32 = 48_000;
 
+    /// The detector's two halves as one call. See
+    /// `transient::tests::detect` for why production has no such door.
+    fn detect(clip: &Clip, sensitivity: f32) -> Vec<transient::Transient> {
+        transient::analyse(clip).map_or_else(Vec::new, |a| transient::pick(&a, sensitivity))
+    }
+
     fn clip_of(samples: Vec<f32>) -> Clip {
         Clip { samples, rate: RATE, source: std::path::PathBuf::from("t.wav") }
     }
@@ -389,6 +443,115 @@ mod tests {
             }
         }
         clip_of(s)
+    }
+
+    /// **A projected frame is where the render actually puts it.**
+    ///
+    /// The quantize window's marks are found in the FILE and drawn over
+    /// what the clip plays, which are two timelines the moment a warp map
+    /// exists - so an already-quantized take would wear its ticks a whole
+    /// correction away from the hits they name. This is the map that fixes
+    /// that, checked against the render rather than against itself: each
+    /// anchor is asked where it goes and has to answer with its own target,
+    /// and the audio is asked where its attacks came out.
+    #[test]
+    fn a_projected_frame_is_where_the_render_put_it() {
+        let a = |from: f64, to: f64| Anchor {
+            from: (f64::from(RATE) * from) as usize,
+            to: (f64::from(RATE) * to) as usize,
+        };
+        let src = clicks_at(2.0, &[0.05, 0.47, 0.98, 1.52]);
+        let frames = src.frames();
+
+        // No map is the identity, which is what makes the unwarped case free.
+        for at in [0usize, 1000, frames / 2, frames - 1] {
+            assert_eq!(project_frame(frames, &[], at), at, "an empty map moved a frame");
+        }
+
+        // **The three pieces, each on its own.** A map whose first anchor
+        // MOVES carries the head with it, the middle is linear between
+        // anchors, and the tail keeps the last segment's ratio - and each
+        // of the three is a branch that can be written as the identity
+        // without the rest noticing.
+        let three = vec![a(0.40, 0.20), a(0.80, 0.60)];
+        // Head: half of the way to the first anchor is half of the way to
+        // its target, so 0.20 s of source lands at 0.10 s.
+        let head = project_frame(frames, &three, (f64::from(RATE) * 0.20) as usize);
+        assert!(
+            head.abs_diff((f64::from(RATE) * 0.10) as usize) <= 2,
+            "the head was not carried: 0.20 s projected to {} s",
+            head as f64 / f64::from(RATE)
+        );
+        // Middle: halfway between the anchors is halfway between targets.
+        let mid = project_frame(frames, &three, (f64::from(RATE) * 0.60) as usize);
+        assert!(
+            mid.abs_diff((f64::from(RATE) * 0.40) as usize) <= 2,
+            "the middle is not linear: 0.60 s projected to {} s",
+            mid as f64 / f64::from(RATE)
+        );
+        // **A first anchor AT frame zero**, which is its own branch: there
+        // is no material in front of it to carry, so the render writes
+        // silence and frame zero simply IS the target. Without this the
+        // head of a clip that opens on its downbeat projects as itself and
+        // its first tick sits the whole shift early.
+        let opens = vec![a(0.0, 0.10), a(0.98, 1.00)];
+        let at_zero = project_frame(frames, &opens, 0);
+        assert!(
+            at_zero.abs_diff((f64::from(RATE) * 0.10) as usize) <= 2,
+            "a clip opening on its downbeat projected frame 0 to {at_zero}"
+        );
+
+        // Tail: the segment before it runs at 1.0, so 0.20 s past the last
+        // anchor is 0.20 s past its target.
+        let tail = project_frame(frames, &three, (f64::from(RATE) * 1.00) as usize);
+        assert!(
+            tail.abs_diff((f64::from(RATE) * 0.80) as usize) <= 2,
+            "the tail did not keep its ratio: 1.00 s projected to {} s",
+            tail as f64 / f64::from(RATE)
+        );
+
+        let anchors = vec![a(0.05, 0.05), a(0.47, 0.50), a(0.98, 1.00), a(1.52, 1.50)];
+        // **Every anchor lands on its own target.** That is the whole
+        // property: it is why a quantized take's found tick and its target
+        // tick come out on top of each other.
+        for (n, an) in anchors.iter().enumerate() {
+            let got = project_frame(frames, &anchors, an.from);
+            assert!(
+                got.abs_diff(an.to) <= 1,
+                "anchor {n} projected to {got}, not to its own target {}",
+                an.to
+            );
+        }
+        // Monotone, and inside the render.
+        let out_len = projected_frames(frames, &anchors);
+        let mut last = 0usize;
+        for k in 0..200 {
+            let at = k * frames / 200;
+            let got = project_frame(frames, &anchors, at);
+            assert!(got >= last, "the map went backwards at {at}");
+            assert!(got <= out_len + 2, "{at} projected past the render: {got} > {out_len}");
+            last = got;
+        }
+
+        // **And the audio agrees.** Warp the clip, detect the result's own
+        // attacks, and each has to be where this says it would be. Checking
+        // the render rather than the arithmetic is the point - the two are
+        // written separately and only this keeps them together.
+        let out = warp(&src, &anchors, Mode::Tape, Fit::Stretch);
+        let heard: Vec<usize> = detect(&out, 0.5).iter().map(|t| t.at).collect();
+        assert!(heard.len() >= 3, "the warped fixture lost its clicks: {heard:?}");
+        let near = |want: usize| {
+            heard
+                .iter()
+                .any(|&h| h.abs_diff(want) < (f64::from(RATE) * 0.020) as usize)
+        };
+        for an in &anchors {
+            let want = project_frame(frames, &anchors, an.from);
+            assert!(
+                near(want),
+                "nothing was heard at the projected {want} (heard {heard:?})"
+            );
+        }
     }
 
     /// **A predicted length is the length the render comes out.**
@@ -455,7 +618,7 @@ mod tests {
         let grid = [0.0, 0.5, 1.0, 1.5, 2.0];
         let c = clicks_at(3.0, &played);
 
-        let found = transient::detect(&c, 0.5);
+        let found = detect(&c, 0.5);
         assert_eq!(found.len(), played.len(), "the fixture was not detected cleanly: {found:?}");
 
         let anchors: Vec<Anchor> = found
@@ -465,7 +628,7 @@ mod tests {
             .collect();
         let out = warp(&c, &anchors, Mode::Rhythmic, Fit::Stretch);
 
-        let after = transient::detect(&out, 0.5);
+        let after = detect(&out, 0.5);
         assert_eq!(
             after.len(),
             grid.len(),

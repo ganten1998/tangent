@@ -1580,6 +1580,31 @@ pub struct ViewRef<'a> {
     pub quantize_fit: &'a str,
 }
 
+impl ViewRef<'_> {
+    /// The one place a borrowed view is copied into an owned one - the
+    /// desk's `to_snap` and the app's per-frame comparison both take it,
+    /// so the two cannot disagree about what a view IS.
+    #[must_use]
+    pub fn to_view(&self) -> View {
+        View {
+            snap: self.snap,
+            grid_exp: self.grid_exp,
+            tempo_lane: self.tempo_lane,
+            master_row: self.master_row,
+            header_w: self.header_w,
+            visible: self.visible,
+            visible_at: self.visible_at,
+            quantize_grid_exp: self.quantize_grid_exp,
+            quantize_triplet: self.quantize_triplet,
+            quantize_swing_pct: self.quantize_swing_pct,
+            quantize_strength_pct: self.quantize_strength_pct,
+            quantize_window_ms: self.quantize_window_ms,
+            quantize_sensitivity: self.quantize_sensitivity,
+            quantize_fit: self.quantize_fit.to_owned(),
+        }
+    }
+}
+
 /// [`Instruments`] borrowed — see [`DeskRef`].
 #[derive(Clone, Copy)]
 pub struct InstrumentsRef<'a> {
@@ -1652,22 +1677,7 @@ impl DeskRef<'_> {
             }),
             transpose: self.transpose,
             count_in: self.count_in,
-            view: self.view.map(|v| View {
-                snap: v.snap,
-                grid_exp: v.grid_exp,
-                tempo_lane: v.tempo_lane,
-                master_row: v.master_row,
-                header_w: v.header_w,
-                visible: v.visible,
-                visible_at: v.visible_at,
-                quantize_grid_exp: v.quantize_grid_exp,
-                quantize_triplet: v.quantize_triplet,
-                quantize_swing_pct: v.quantize_swing_pct,
-                quantize_strength_pct: v.quantize_strength_pct,
-                quantize_window_ms: v.quantize_window_ms,
-                quantize_sensitivity: v.quantize_sensitivity,
-                quantize_fit: v.quantize_fit.to_owned(),
-            }),
+            view: self.view.map(|v| v.to_view()),
             look: self.look.map(|l| Look {
                 theme: l.theme.to_owned(),
                 palette: l.palette,
