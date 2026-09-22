@@ -2039,6 +2039,26 @@ struct Shared {
     grain: AtomicU32,
     /// The frame the callback reached at the end of the last chunk.
     transport_pos: AtomicU64,
+    /// **Where that frame is in the MUSIC, and how fast the music is going
+    /// there** - the beat as the tempo map reckons it, and the map's
+    /// instantaneous tempo, both as `f64` bits.
+    ///
+    /// The rack has the board but not the renderer, and the tempo MAP lives
+    /// on `Renderer::maps` where only the click could reach it. So a
+    /// built-in voice's arpeggiator worked out its own beat as
+    /// `seconds * bpm`, from the band's single tempo dial - a straight line
+    /// that cannot express a map at all. On a song with any tempo change
+    /// the click and the bar lines followed the map while the arp did not,
+    /// and because the error is the INTEGRAL of the difference it grew
+    /// every bar: an arp that walks off the grid rather than one merely at
+    /// the wrong speed. New tempo points default to a RAMP, so that is the
+    /// ordinary case and not an exotic one.
+    ///
+    /// Published once a block by `run_transport`, from the same two calls
+    /// `BarClock::resync` makes, so the arp and the click cannot disagree
+    /// about where the song is.
+    transport_beat: AtomicU64,
+    transport_bpm: AtomicU64,
     /// **The engine's sample rate, for whoever on the audio thread needs
     /// to turn `transport_pos` into beats.** A built-in voice's
     /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
@@ -3089,6 +3109,10 @@ impl Shared {
             grain: AtomicU32::new(0),
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
+            transport_beat: AtomicU64::new(0.0f64.to_bits()),
+            // The same seed `Arp::new` had, so a rack that runs before the
+            // first `run_transport` is no worse off than it was.
+            transport_bpm: AtomicU64::new(120.0f64.to_bits()),
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
@@ -6762,6 +6786,42 @@ fn run_extra_rack(
         );
 }
 
+/// **Where the song is, for a built-in voice inside a rack.**
+///
+/// A rack has the board but not the renderer, so an Analog arpeggiator used
+/// to work its own beat out as `seconds * bpm` from the band's single tempo
+/// DIAL. That is a straight line, and a straight line cannot express a tempo
+/// map however the bpm is chosen: the click and the bar lines followed the
+/// map and the arp did not, and because the error is the INTEGRAL of the
+/// difference it grew every bar. New tempo points default to a ramp, so that
+/// was the ordinary case rather than an exotic one.
+///
+/// `run_transport` now publishes the map's own beat and instantaneous tempo
+/// beside the frame, from the same two calls `BarClock::resync` makes, and
+/// this reads that pair. Three relaxed loads per rack call, read once so
+/// every bay in the rack sees one block.
+///
+/// `pos` is the span's own first frame, or `u64::MAX` for a caller that has
+/// none. A lane renders grains out of step with the callback, so the
+/// published beat - which is the callback's - would put a staggered lane's
+/// arp a grain early or late; the offset walks it back at the published
+/// tempo, which is the right tempo either way, since within one block the
+/// map cannot have moved enough to matter and a grain is a fraction of a
+/// block.
+fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
+    let rolling = shared.rolling.load(Ordering::Relaxed);
+    let beat = f64::from_bits(shared.transport_beat.load(Ordering::Relaxed));
+    let bpm = f64::from_bits(shared.transport_bpm.load(Ordering::Relaxed));
+    let beat = if pos == u64::MAX {
+        beat
+    } else {
+        let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
+        let here = shared.transport_pos.load(Ordering::Relaxed) as f64;
+        beat + (pos as f64 - here) / rate * bpm / 60.0
+    };
+    crate::analog::arp::Transport { bpm, playing: rolling, beat }
+}
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -6849,22 +6909,7 @@ fn run_rack(
     // board's tempo — the same figure the arpeggiator would free-run from
     // when the transport stops. Read once here so every bay in the rack
     // sees the same block.
-    let transport = {
-        let bpm = f64::from_bits(shared.bpm.load(Ordering::Relaxed));
-        let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
-        // The span's own position, or the playhead when the caller said it
-        // is rendering the block the callback is on. See `pos`.
-        let pos = if pos == u64::MAX {
-            shared.transport_pos.load(Ordering::Relaxed)
-        } else {
-            pos
-        } as f64;
-        crate::analog::arp::Transport {
-            bpm,
-            playing: shared.rolling.load(Ordering::Relaxed),
-            beat: pos / rate * bpm / 60.0,
-        }
-    };
+    let transport = rack_transport(shared, pos);
     // **The scratch buffers are SHARED, and a hosted plugin SHRINKS them.**
     //
     // `tangent_host::Instance::process` clears and resizes the caller's
@@ -11561,6 +11606,19 @@ impl Renderer {
             }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
+        // **And where that is in the MUSIC.** The same two calls
+        // `BarClock::resync` makes, so the click and a built-in voice's
+        // arpeggiator read one tempo map rather than two different ideas of
+        // the tempo. Once a block, not once a frame: an arp step is tens of
+        // milliseconds and a block is under one.
+        let secs = self.pos as f64 / self.rate.max(1.0);
+        let beat = self.maps.tempo.beat_at_seconds(secs);
+        self.shared
+            .transport_beat
+            .store(beat.to_bits(), Ordering::Relaxed);
+        self.shared
+            .transport_bpm
+            .store(self.maps.tempo.bpm_at_beat(beat).to_bits(), Ordering::Relaxed);
         (at, rolling, flush, wrap_from)
     }
 
@@ -32836,6 +32894,116 @@ mod sampler_road {
     /// thread's. A count that stayed at two would be a leak; a count that
     /// fell without `retire_tick` would mean the callback had done the
     /// freeing, which is the fault.
+    /// **The arp and the click read ONE tempo map.**
+    ///
+    /// The rack has the board but not the renderer, so a built-in voice's
+    /// arpeggiator worked its own beat out as `seconds * bpm` from the
+    /// band's single tempo DIAL - a straight line, which cannot express a
+    /// tempo map however the bpm is chosen. The click and the bar lines
+    /// followed the map and the arp did not, and because the error is the
+    /// INTEGRAL of the difference it grew every bar: an arp that walks off
+    /// the grid rather than one merely at the wrong speed. New tempo points
+    /// default to a RAMP, so that is the ordinary case.
+    ///
+    /// `run_transport` publishes the map's own beat and instantaneous tempo
+    /// beside the frame now, from the same two calls `BarClock::resync`
+    /// makes. This drives a real engine over a real ramp and checks the
+    /// published pair against the map - and against the straight line, so
+    /// it cannot pass by accident on a map the two agree about.
+    /// The READ side of the pair above: a rack takes the published beat as
+    /// it stands, and a lane whose grain sits away from the callback's frame
+    /// is walked to its own position at the published tempo rather than left
+    /// on the callback's. A staggered lane is the normal case here, not an
+    /// exotic one - see `run_lane`.
+    #[test]
+    fn a_racks_beat_is_the_published_one_walked_to_the_spans_own_frame() {
+        let shared = Shared::new();
+        shared.rate.store(48_000, Ordering::Relaxed);
+        shared.rolling.store(true, Ordering::Relaxed);
+        shared.transport_pos.store(48_000, Ordering::Relaxed);
+        shared.transport_beat.store(4.0f64.to_bits(), Ordering::Relaxed);
+        shared.transport_bpm.store(90.0f64.to_bits(), Ordering::Relaxed);
+
+        // No span of its own: the callback's own figures, untouched.
+        let t = rack_transport(&shared, u64::MAX);
+        assert!((t.beat - 4.0).abs() < 1.0e-9, "beat {} is not the published one", t.beat);
+        assert!((t.bpm - 90.0).abs() < 1.0e-9, "tempo {} is not the published one", t.bpm);
+        assert!(t.playing);
+
+        // Half a second LATER than the callback, at 90 bpm: three quarters
+        // of a beat further on.
+        let t = rack_transport(&shared, 48_000 + 24_000);
+        assert!(
+            (t.beat - 4.75).abs() < 1.0e-9,
+            "a lane half a second ahead is at beat {}, not 4.75",
+            t.beat
+        );
+        // And half a second EARLIER, which is the direction a staggered lane
+        // usually sits: the offset has to carry its sign.
+        let t = rack_transport(&shared, 48_000 - 24_000);
+        assert!(
+            (t.beat - 3.25).abs() < 1.0e-9,
+            "a lane half a second behind is at beat {}, not 3.25",
+            t.beat
+        );
+
+        // Stopped, a rack still gets the tempo - that is what an arp
+        // free-runs at while a patch is auditioned.
+        shared.rolling.store(false, Ordering::Relaxed);
+        let t = rack_transport(&shared, u64::MAX);
+        assert!(!t.playing);
+        assert!((t.bpm - 90.0).abs() < 1.0e-9, "stopped, the tempo is {}", t.bpm);
+    }
+
+    #[test]
+    fn a_built_in_voices_arp_reads_the_tempo_map_and_not_the_dial() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+
+        // 60 bpm ramping to 180 over the first eight beats: a ritardando's
+        // mirror, and steep enough that a straight line is visibly wrong.
+        let tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 60.0, ramp: true },
+            TempoPoint { at_beat: 8.0, bpm: 180.0, ramp: false },
+        ]);
+        // The DIAL says something else entirely, which is the whole point:
+        // before this fix the arp played at 120 over that ramp.
+        e.set_tempo(120.0);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+
+        let mut out = vec![0.0f32; 2 * 512];
+        let mut agreed = 0usize;
+        for _ in 0..40 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let pos = e.shared.transport_pos.load(Ordering::Relaxed);
+            let beat = f64::from_bits(e.shared.transport_beat.load(Ordering::Relaxed));
+            let bpm = f64::from_bits(e.shared.transport_bpm.load(Ordering::Relaxed));
+            let secs = pos as f64 / f64::from(rate);
+            let want = tempo.beat_at_seconds(secs);
+            assert!(
+                (beat - want).abs() < 1.0e-6,
+                "the published beat is {beat} where the map says {want} at {secs:.3}s"
+            );
+            assert!(
+                (bpm - tempo.bpm_at_beat(want)).abs() < 1.0e-6,
+                "the published tempo is {bpm} where the map says {} at beat {want:.3}",
+                tempo.bpm_at_beat(want)
+            );
+            // And it is NOT the straight line the dial would have drawn.
+            if secs > 0.05 && (want - secs * 120.0 / 60.0).abs() > 0.01 {
+                agreed += 1;
+            }
+        }
+        assert!(
+            agreed > 10,
+            "the fixture's map never diverged from the dial, so this proves nothing"
+        );
+    }
+
     #[test]
     fn the_engine_hands_a_sample_over_and_drops_the_displaced_one_here() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
