@@ -12704,7 +12704,13 @@ fn show_on(
             // rest of the app is wearing.
             let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
             let dim = t.text.gamma_multiply(0.62);
-            show_dialog_viewport(
+            // **Bound, so a CLOSE can carry the typed fields.** The
+            // checkbox writes through the moment it is ticked and the two
+            // text fields only on Done, so Escape or the window's X threw
+            // away a typed identifier and host and left the send switched
+            // on pointing at the old one. Half a commit is the worst of
+            // both: there is no Cancel here to mean "none of it".
+            let closed = show_dialog_viewport(
                 ctx,
                 placement,
                 "Stream to OBS (ReaStream)",
@@ -12788,7 +12794,16 @@ fn show_on(
                             });
                         });
                 },
-            )
+            );
+            // Done already sent it; this is every other way out.
+            if closed.close && action.is_none() {
+                action = Some(DialogAction::SetReaStream {
+                    enabled: *enabled,
+                    identifier: identifier.clone(),
+                    host: host.clone(),
+                });
+            }
+            closed
         }
         Dialog::SupporterKey {
             input,
@@ -13970,6 +13985,49 @@ fn show_on(
 
 #[cfg(test)]
 mod tests {
+
+    /// **The OBS window keeps what was typed into it, however it is
+    /// closed.**
+    ///
+    /// Its checkbox wrote through the moment it was ticked and its two text
+    /// fields only on Done, so Escape or the window's X threw away a typed
+    /// identifier and host and left the send switched ON pointing at the
+    /// old ones - half a commit, which is the worst of both. There is no
+    /// Cancel here to mean "none of it".
+    ///
+    /// A source scan: driving a dialog's close needs a frame, a viewport
+    /// and a pointer, and what would regress is somebody dropping the bind
+    /// and going back to `show_dialog_viewport(...)` as a tail expression.
+    #[test]
+    fn the_obs_window_keeps_what_was_typed_however_it_is_closed() {
+        let src = include_str!("dialogs.rs");
+        let arm = {
+            let at = src.find("        Dialog::ReaStream {").expect("the arm");
+            &src[at..at + src[at..].find("        Dialog::SupporterKey {").expect("its end")]
+        };
+        assert!(
+            arm.contains("let closed = show_dialog_viewport("),
+            "the OBS window no longer binds its close"
+        );
+        assert!(
+            arm.contains("if closed.close && action.is_none() {"),
+            "a close other than Done no longer keeps the typed fields"
+        );
+        // Three senders and no more: the checkbox, which writes through
+        // the moment it is ticked; Done; and the close. A fourth would be
+        // somebody adding a road that does not carry the fields.
+        assert_eq!(
+            arm.matches("DialogAction::SetReaStream {").count(),
+            3,
+            "the OBS window has a road out that does not send its fields"
+        );
+        // The close is guarded on `action.is_none()`, or Done would send
+        // twice - it sets the action AND closes.
+        assert!(
+            arm.contains("result.close = true;"),
+            "Done no longer closes the window"
+        );
+    }
 
     /// **Everything Tangent ships is a sentinel, and nothing else is.**
     ///

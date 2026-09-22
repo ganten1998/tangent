@@ -4852,6 +4852,9 @@ impl TangentApp {
             *slot = !was;
         }
         self.save_settings();
+        // Hashed like the folder flag it belongs to, so it needs a moment
+        // of its own - `toggle_folder` beside it has always had one.
+        self.undo_commit();
     }
 
     fn set_is_folder(&mut self, ch: usize, on: bool) {
@@ -5603,6 +5606,37 @@ impl TangentApp {
     /// field, one of its bays, its input menu — and doors do not spread.
     fn apply_mixer_hit(&mut self, hit: crate::mixer_panel::Hit, value: f32) {
         use crate::mixer_panel::Hit as H;
+        self.apply_mixer_hit_spread(hit, value);
+        // **A SWITCH is a press, so it is a gesture, so it is a moment.**
+        //
+        // Mute, solo, arm, polarity and the theory send are all desk fields
+        // and all hashed, and none of them committed in EITHER panel: the
+        // mixer's release commit fires only for a control that armed
+        // `mixer_grab`, which a switch never does. So pressing M on a track
+        // left no moment and folded into whatever the user did next.
+        //
+        // **Out here rather than at the end of the spread**, because that
+        // function returns from four places - the plain single-track press
+        // is one of them, and it is the common one.
+        //
+        // **Guarded, and the guard is the whole safety of it.** This is
+        // also the road every DIAL takes, once per frame of a drag; a bare
+        // commit would push a moment per pixel, which is how the marker
+        // drag used to drain the history. The dials take their moment at
+        // the release, through `arr_gesture_dirty`.
+        if matches!(
+            hit,
+            H::Mute(_) | H::Solo(_) | H::Arm(_) | H::ToTheory(_) | H::Phase(_)
+        ) {
+            self.undo_commit();
+        }
+    }
+
+    /// `apply_mixer_hit`'s work: the one control, and the selection it
+    /// spreads across. Four exits, which is why the moment is taken by its
+    /// caller.
+    fn apply_mixer_hit_spread(&mut self, hit: crate::mixer_panel::Hit, value: f32) {
+        use crate::mixer_panel::Hit as H;
         use crate::recorder::Column;
         let Some(n) = Self::hit_channel(hit) else {
             self.apply_mixer_hit_one(hit, value);
@@ -6183,9 +6217,15 @@ impl TangentApp {
         let mut all = self.selection_partners(n);
         all.push(n);
         all.sort_unstable_by(|a, b| b.cmp(a));
+        // **Removing four selected tracks is ONE thing somebody did.**
+        // `remove_channel` holds its own removal; this nests one deeper so
+        // a marquee over four lanes is one Ctrl+Z rather than four, each
+        // putting a different track back on its own.
+        self.begin_one_moment();
         for m in all {
             self.remove_channel(m);
         }
+        self.commit_undo_moment();
         self.selected_tracks.clear();
         self.selected_channel = None;
         self.sel_anchor = None;
@@ -6321,9 +6361,8 @@ impl TangentApp {
             .insert_bypass
             .drop_seat(recorder::folder_extra_seat(at));
         self.save_settings();
-        // Inside the batch this is the removal's own moment; the hold above
-        // is what makes it the ONLY one.
-        self.undo_commit();
+        // No commit here, for the reason `paste_track_inner` states: the
+        // hold in `remove_channel` is what ends the gesture.
     }
 
     /// What the neck's interval column should say, or nothing when it is off.
@@ -9314,6 +9353,11 @@ impl TangentApp {
         self.settings.click_sample = path.to_owned();
         self.click_sample_dirty = true;
         self.save_settings();
+        // The click's file is part of the document (`Click::sample`), so it
+        // is in the undo fingerprint - and a field that is hashed and never
+        // committed for folds into the NEXT gesture's moment, which is one
+        // Ctrl+Z undoing two things. See `begin_one_moment`.
+        self.undo_commit();
     }
 
     /// Copy `file` into the project's `media/` and stand it on the timeline.
@@ -10462,6 +10506,11 @@ impl TangentApp {
             // on the desk every five seconds for ever.
             if now != self.midi_ports_seen {
                 self.midi_ports_seen = now;
+                // **And the window that is showing them.** It was built
+                // once at open and never again, so a keyboard plugged in
+                // while it was up stayed "not connected" in the one place
+                // somebody had gone to look.
+                self.refresh_midi_inputs_dialog();
             }
         }
         // Compared in place: `menu_cache_key_now` clones the device name,
@@ -11531,14 +11580,20 @@ impl TangentApp {
     /// **A new empty track directly under `n`** — the track menu's Insert
     /// Track. `false` when there is no free lane below to make room with.
     pub fn insert_track_below(&mut self, n: usize) -> bool {
+        // **ONE moment.** `open_lane_below` reorders the lanes and
+        // `reorder_channels` commits; the track that lands in the gap
+        // commits too. So one press left two, and the moment between them
+        // was every track below shifted a row with nothing in the gap.
+        self.begin_one_moment();
         let Some(at) = self.open_lane_below(n) else {
+            self.commit_undo_moment();
             return false;
         };
         self.add_bare_track(at);
         self.selected_channel = Some(at);
         self.selected_tracks = vec![at];
         self.save_settings();
-        self.undo_commit();
+        self.commit_undo_moment();
         true
     }
 
@@ -11551,10 +11606,16 @@ impl TangentApp {
         if !self.track_on_clipboard() {
             return false;
         }
+        // The same two-moment gesture `insert_track_below` is: a lane
+        // permutation and then the paste. Held after the clipboard check,
+        // so a paste with nothing on it holds nothing.
+        self.begin_one_moment();
         let Some(at) = self.open_lane_below(n) else {
+            self.commit_undo_moment();
             return false;
         };
         self.paste_track(at);
+        self.commit_undo_moment();
         true
     }
 
@@ -11740,6 +11801,20 @@ impl TangentApp {
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
+        // **ONE moment for the paste.** A track is a kind, a name, a colour,
+        // six bays, a kit and a pile of clips, and `set_insert` and
+        // `arr_save_edits` each commit their own - so pasting a track with
+        // three plugins in it took four Ctrl+Z, each putting a different
+        // quarter of it back. And a track with NO clips and no plugins left
+        // no moment at all, so it folded into whatever came next. Held
+        // AFTER the two refusals above, so a paste that does nothing holds
+        // nothing. See `begin_one_moment`.
+        self.begin_one_moment();
+        self.paste_track_inner(into, copy);
+        self.commit_undo_moment();
+    }
+
+    fn paste_track_inner(&mut self, into: usize, copy: TrackCopy) {
         let at = recorder::Strip::Channel(into).index();
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
@@ -11812,6 +11887,9 @@ impl TangentApp {
         self.selected_channel = Some(into);
         self.selected_tracks = vec![into];
         self.save_settings();
+        // No commit here: the hold in `paste_track` is what ends this
+        // gesture, and a commit inside a hold is a no-op anyway. The
+        // function is only split so the hold has a body to wrap.
     }
 
     /// The (from, to) strips whose insert state the host should copy, taken
@@ -11862,13 +11940,31 @@ impl TangentApp {
     /// keyboard must not cost somebody the setup — and it is never silently
     /// mixed in with the live ones either: `present` is what the row says out
     /// loud.
-    fn open_midi_inputs_dialog(&mut self, lane: usize) {
+    /// **The device rows for one lane, from the ports that are here NOW.**
+    ///
+    /// `held` is the rows an already-open window is showing, if there is
+    /// one. A row's TICK is the user's - they may have turned one off
+    /// without pressing anything yet - so a refresh has to carry it across
+    /// rather than read the saved selection again.
+    ///
+    /// A device that has gone away keeps its row while it is ticked, so the
+    /// selection can still be seen and cleared; one that is neither present
+    /// nor ticked is simply not there.
+    fn midi_device_rows(
+        &self,
+        lane: usize,
+        held: Option<&[dialogs::MidiDeviceRow]>,
+    ) -> Vec<dialogs::MidiDeviceRow> {
         let sel = self.channel_midi_sel(lane);
         let present = self.midi_ports_seen.clone();
+        let ticked = |name: &str| {
+            held.and_then(|rows| rows.iter().find(|r| r.name == name).map(|r| r.on))
+                .unwrap_or_else(|| sel.devices.iter().any(|d| d == name))
+        };
         let mut devices: Vec<dialogs::MidiDeviceRow> = present
             .iter()
             .map(|name| dialogs::MidiDeviceRow {
-                on: sel.devices.iter().any(|d| d == name),
+                on: ticked(name),
                 name: name.clone(),
                 present: true,
             })
@@ -11876,10 +11972,50 @@ impl TangentApp {
         for gone in sel.missing(&present) {
             devices.push(dialogs::MidiDeviceRow {
                 name: gone.to_owned(),
-                on: true,
+                on: ticked(gone),
                 present: false,
             });
         }
+        // A row the hand ticked for a device that then vanished is still the
+        // hand's, and `sel.missing` cannot know about it - the selection it
+        // reads is the SAVED one and this tick has not been applied yet.
+        if let Some(rows) = held {
+            for r in rows {
+                if r.on && !devices.iter().any(|d| d.name == r.name) {
+                    devices.push(dialogs::MidiDeviceRow {
+                        name: r.name.clone(),
+                        on: true,
+                        present: false,
+                    });
+                }
+            }
+        }
+        devices
+    }
+
+    /// **The open window follows the ports.**
+    ///
+    /// Called from the five-second poll, and only when the list actually
+    /// moved. It said "not connected" about a keyboard plugged in while it
+    /// was up: the rows were built once at open and the chip behind the
+    /// window went on refreshing without it.
+    fn refresh_midi_inputs_dialog(&mut self) {
+        let Some(Dialog::MidiInputs { lane, devices, .. }) = self.dialog.as_ref() else {
+            return;
+        };
+        let (lane, held) = (*lane, devices.clone());
+        let fresh = self.midi_device_rows(lane, Some(&held));
+        if fresh == held {
+            return;
+        }
+        if let Some(Dialog::MidiInputs { devices, .. }) = self.dialog.as_mut() {
+            *devices = fresh;
+        }
+    }
+
+    fn open_midi_inputs_dialog(&mut self, lane: usize) {
+        let sel = self.channel_midi_sel(lane);
+        let devices = self.midi_device_rows(lane, None);
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(Dialog::MidiInputs {
             lane,
@@ -16098,6 +16234,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Put a clip's level back to unity.
     pub fn reset_clip_gain(&mut self, id: u64) {
         self.set_clip_gain(id, 1.0);
+        // Its own gesture, so its own moment - `set_clip_gain` commits
+        // nothing on purpose (the normalize batch is what that is for), so
+        // without this the reset rode the next edit exactly as the
+        // normalize used to. `clear_clip_warp` beside it does the same.
+        self.commit_undo_moment();
     }
 
     /// Which clips a menu on `id` acts on: the selected set if it is in one,
@@ -16717,6 +16858,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Some(MetHit::Div(div)) => {
                 self.settings.metronome_div = div.clamp(0, 8);
                 self.save_settings();
+                // **Every row of this panel is a press, so a gesture, so a
+                // moment.** The click's division, its count-in, whether it
+                // counts into the take and what it plays are all desk
+                // fields and all hashed - and none of them committed, so
+                // choosing one folded into whatever the user did next.
+                self.undo_commit();
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
             // negative count-in; eight bars is already longer than anybody
@@ -16725,10 +16872,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.record_count_in_bars =
                     (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
                 self.save_settings();
+                self.undo_commit();
             }
             Some(MetHit::CountInInTake) => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
+                self.undo_commit();
             }
             Some(MetHit::SoundPick) => {
                 if self.caps.native_file_dialogs {
@@ -16750,6 +16899,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.click_sample = String::new();
                 self.click_sample_dirty = true;
                 self.save_settings();
+                self.undo_commit();
             }
             // The panel's own chrome — a title, a gap between rows. Eaten,
             // because a press inside a panel is never a press on what is
@@ -24425,6 +24575,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });
+                    // **One moment when the hand lets go.** These four dials
+                    // wrote the desk once a frame and marked nothing, so a
+                    // header fader left NO moment and folded into whatever
+                    // came next - while the identical fader in the mixer,
+                    // which arms `mixer_grab` and commits on release, did
+                    // not. Same mechanism the clip drags use; the release
+                    // reads the flag once.
+                    self.arr_gesture_dirty = true;
                 }
                 // The same integrating drag the three header dials use, so a
                 // hand that has turned one has turned this.
@@ -24445,6 +24603,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         from_y: p.y,
                         from: v,
                     });
+                    self.arr_gesture_dirty = true;
                 }
                 ArrDrag::HdrPan { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
@@ -24454,6 +24613,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::HdrPan { lane, from_y: p.y, from: v });
+                    self.arr_gesture_dirty = true;
                 }
                 ArrDrag::Send { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
@@ -24463,6 +24623,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Send { lane, from_y: p.y, from: v });
+                    self.arr_gesture_dirty = true;
                 }
                 ArrDrag::CreateMidi { lane, anchor } => {
                     let to = self.arr_snap_t(t_at);
@@ -27166,6 +27327,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             *slot = 0;
         }
         self.save_settings();
+        // Hashed (`Instruments::dx7_cartridge`), so it needs its own moment.
+        self.undo_commit();
     }
 
     /// Which of its cartridge's patches strip `strip`'s DX7 plays.
@@ -27187,6 +27350,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // which is why it looked like persistence was unimplemented rather
         // than half-wired.
         self.save_settings();
+        self.undo_commit();
     }
 
     /// Which of the modelled keyboard's patches strip `strip` plays, as an
@@ -27208,6 +27372,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             *slot = index.min(dialogs::KEYS_PATCHES - 1);
         }
         self.settings.save();
+        self.undo_commit();
     }
 
     /// One knob of the keyboard panel, for one strip and the sound that
@@ -27257,6 +27422,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.save_settings_soon();
+        // A BUTTON, so a gesture, so a moment - unlike the knob above it,
+        // which is dragged and takes one when the hand lets go.
+        self.undo_commit();
     }
 
 
@@ -27596,6 +27764,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut order: Vec<usize> = (0..CHANNELS).filter(|n| *n != free).collect();
         let at = order.iter().position(|n| *n == top).unwrap_or(0);
         order.insert(at, free);
+        // **ONE moment for the grouping.** `reorder_channels` ends in
+        // `arr_save_edits` and so does the tail of this function, so
+        // Cmd/Ctrl+F left two - and the one in between was every track
+        // shifted a row with no folder over them, a layout nobody asked
+        // for. Held from here rather than from the top of the function
+        // because the four exits above it commit nothing and must not have
+        // to remember to release.
+        self.begin_one_moment();
         self.reorder_channels(&order);
         // After the move the folder sits at `at` and its run begins directly
         // below it.
@@ -27620,6 +27796,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.selected_tracks = vec![at];
         self.save_settings();
         self.arr_save_edits();
+        self.commit_undo_moment();
         true
     }
 
@@ -29664,6 +29841,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Hit::ToggleCountInInTake => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
                 self.save_settings();
+                // Hashed (`CountIn::in_take`), and a tick is a gesture.
+                self.undo_commit();
             }
             Hit::ToggleHideElapsed => {
                 self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
@@ -29736,11 +29915,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Hit::CycleLufs => {
                 self.settings.lufs_window = self.settings.lufs_window.next();
                 self.save_settings();
+                self.undo_commit();
             }
             Hit::ResetLufs => self.request_recorder(R::ResetLoudness),
             Hit::ToggleMetronomeInTake => {
                 self.settings.metronome_in_take = !self.settings.metronome_in_take;
                 self.save_settings();
+                self.undo_commit();
             }
             // Deliberately not saved: monitoring is off at every launch, by
             // construction. See the field.
@@ -31166,6 +31347,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
+        // Both callers are single presses - the band's count-in chip and
+        // the typed number - so one moment each. `CountIn::bars` is hashed.
+        self.undo_commit();
     }
 
     fn request_recorder(&mut self, request: recorder::RecorderRequest) {
@@ -33547,6 +33731,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     *p = 0;
                 }
                 self.save_settings();
+                // A dialog row, so a gesture, so a moment - the same line
+                // `set_dx7_cartridge_of` takes, which this arm bypasses.
+                self.undo_commit();
                 self.default_bank = Some(slot);
             }
             DialogAction::LoadCartridge { slot } => {
@@ -37115,12 +37302,27 @@ impl TangentApp {
             let (down, pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
             if !down {
                 self.grabbed = None;
+                // **A drag in the band is one moment, at its release.**
+                //
                 // A tempo drag rescaled the document tick by tick; the
                 // RELEASE is when the doc goes to disk and history, once.
-                if grab.moved
-                    && grab.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0))
-                {
-                    self.arr_save_edits();
+                // The other three draggable controls - the master fader,
+                // the six rack sends and the varispeed - are hashed just
+                // the same and committed NOTHING, so turning the reverb up
+                // and then moving a clip was one Ctrl+Z for both.
+                //
+                // Two branches rather than one, because the tempo must
+                // keep `arr_save_edits`: `retime_arrangement` rescales
+                // every clip mid-drag and defers its save to here. The
+                // others touch no clip, and putting them through the same
+                // door would make the host re-push the whole schedule for
+                // a knob.
+                if grab.moved {
+                    if grab.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0)) {
+                        self.arr_save_edits();
+                    } else {
+                        self.undo_commit();
+                    }
                 }
                 // Released without ever moving: a TAP, which opens the control
                 // for typing rather than setting it to wherever the pointer is.
@@ -37138,6 +37340,10 @@ impl TangentApp {
                             self.apply_recorder_hit(reset);
                             self.num_edit = None;
                             self.save_settings();
+                            // A double click that puts a knob back is a
+                            // gesture like any other. `grab.moved` is false
+                            // here, so the release above never sees it.
+                            self.undo_commit();
                         }
                     }
                 }
@@ -39601,6 +39807,304 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Every desk control in the ARRANGEMENT undoes like its twin in the
+    /// mixer.**
+    ///
+    /// The header's dials wrote the desk once a frame and marked nothing,
+    /// so a header fader left NO moment and folded into whatever came next
+    /// - while the identical fader in the mixer, which arms `mixer_grab`
+    /// and commits on release, did not. The switches were worse: neither
+    /// panel committed them, so pressing M on a track rode somebody else's
+    /// Ctrl+Z in both places.
+    #[test]
+    fn a_header_dial_and_a_switch_undo_like_the_mixers_own() {
+        let root = project_scratch("hdrundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.add_bare_track(2);
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        // **A switch is a press, so a moment.** One each, and each on its own.
+        for (what, hit) in [
+            ("mute", crate::mixer_panel::Hit::Mute(recorder::Column(2))),
+            ("solo", crate::mixer_panel::Hit::Solo(recorder::Column(2))),
+            ("the theory send", crate::mixer_panel::Hit::ToTheory(recorder::Column(2))),
+        ] {
+            let before = app.hist_at;
+            app.apply_mixer_hit(hit, 0.0);
+            assert_eq!(app.hist_at, before + 1, "{what} left no moment");
+        }
+        // And one step back takes the last one off and leaves the others.
+        let muted = app.settings.strip_muted;
+        app.undo();
+        assert_eq!(
+            app.settings.strip_muted, muted,
+            "one Ctrl+Z on the theory send also unmuted"
+        );
+
+        // **A DIAL is a drag, so ONE moment at its release** - and none
+        // while the hand is still on it, or a fader would push a moment per
+        // pixel. `apply_mixer_hit` is the road the header's dial takes.
+        app.commit_view_change();
+        let before = app.hist_at;
+        for f in 1..=30 {
+            app.apply_mixer_hit(
+                crate::mixer_panel::Hit::Fader(recorder::Column(2)),
+                f as f32 / 60.0,
+            );
+            app.arr_gesture_dirty = true;
+        }
+        assert_eq!(
+            app.hist_at, before,
+            "the dial pushed {} moments mid-drag",
+            app.hist_at - before
+        );
+        // The release, as the pointer-up handler does it.
+        app.arr_gesture_dirty = false;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, before + 1, "the release left no moment");
+        let loud = app.settings.channel_gains[2];
+        app.undo();
+        assert!(
+            (app.settings.channel_gains[2] - loud).abs() > 1e-9,
+            "one step back did not undo the whole drag"
+        );
+
+        // **And all four header dials really do mark the gesture.** The
+        // loop above stands in for what the drag arms do; this is that
+        // they do it. A source scan, because driving `arrangement_input`
+        // needs a frame, a pointer and a latched drag - the precedent is
+        // `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+        // in desktop.rs.
+        let src = include_str!("app.rs");
+        for arm in [
+            "self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });",
+            "self.arr_drag = Some(ArrDrag::HdrPan { lane, from_y: p.y, from: v });",
+            "self.arr_drag = Some(ArrDrag::Send { lane, from_y: p.y, from: v });",
+        ] {
+            let at = src.find(arm).unwrap_or_else(|| panic!("{arm} is gone"));
+            // To the end of THIS arm, so a neighbour's flag cannot stand
+            // in for a missing one.
+            let rest = &src[at + arm.len()..];
+            let after = &rest[..rest.find("ArrDrag::").unwrap_or(rest.len().min(600))];
+            assert!(
+                after.contains("self.arr_gesture_dirty = true;"),
+                "a header dial no longer asks for its moment: {arm}"
+            );
+        }
+        // The auto dial's arm ends differently, so it is checked by shape.
+        let auto = {
+            let at = src
+                .find("ArrDrag::AutoDial { lane, param, from_y, from } =>")
+                .expect("the arm");
+            let rest = &src[at + 20..];
+            &rest[..rest.find("ArrDrag::HdrPan").unwrap_or(rest.len().min(900))]
+        };
+        assert!(
+            auto.contains("self.arr_gesture_dirty = true;"),
+            "the automation dial no longer asks for its moment"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The metronome panel's rows and the band's take toggles are each
+    /// their own step back.**
+    ///
+    /// The click's division, its count-in, whether it counts into the take
+    /// and what it plays are all desk fields and all hashed, and none of
+    /// them committed - so choosing one folded into whatever came next.
+    #[test]
+    fn the_click_and_the_count_in_are_their_own_moments() {
+        let root = project_scratch("clickundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        let steps: Vec<(&str, fn(&mut TangentApp))> = vec![
+            ("the count-in's length", |a| a.set_count_in_bars(2)),
+            ("the click into takes", |a| {
+                a.apply_recorder_hit(recorder_panel::Hit::ToggleMetronomeInTake);
+            }),
+            ("the count-in into takes", |a| {
+                a.apply_recorder_hit(recorder_panel::Hit::ToggleCountInInTake);
+            }),
+            ("the loudness window", |a| {
+                a.apply_recorder_hit(recorder_panel::Hit::CycleLufs);
+            }),
+        ];
+        for (what, step) in steps {
+            let before = app.hist_at;
+            step(&mut app);
+            assert_eq!(app.hist_at, before + 1, "{what} left no moment of its own");
+        }
+        // Two gestures, two steps back.
+        let bars = app.settings.record_count_in_bars;
+        app.undo();
+        assert_eq!(
+            app.settings.record_count_in_bars, bars,
+            "one Ctrl+Z on the loudness window also undid the count-in"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A folder is made, shut and opened in one step each.**
+    ///
+    /// `Cmd/Ctrl+F` reordered the lanes and then wrote the folder, and
+    /// `reorder_channels` commits - so it left TWO moments, and the one in
+    /// between was every track shifted a row with no folder over them, a
+    /// layout nobody asked for.
+    #[test]
+    fn grouping_and_collapsing_a_folder_are_one_step_each() {
+        let root = project_scratch("folderundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        for n in [1usize, 2] {
+            app.add_bare_track(n);
+        }
+        app.selected_tracks = vec![1, 2];
+        app.selected_channel = Some(1);
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        let before = app.hist_at;
+        assert!(app.make_folder(), "the fixture could not make a folder");
+        assert_eq!(
+            app.hist_at,
+            before + 1,
+            "grouping left {} moments",
+            app.hist_at - before
+        );
+        let folder = app.selected_channel.expect("the folder is selected");
+        assert!(app.is_folder(folder), "the folder was not made");
+
+        // ONE step back un-groups AND puts the rows where they were.
+        app.undo();
+        assert!(!app.is_folder(folder), "the folder survived one Ctrl+Z");
+
+        // Shutting one is its own step.
+        app.redo();
+        let before = app.hist_at;
+        app.toggle_folder_shut(folder);
+        assert_eq!(app.hist_at, before + 1, "collapsing left no moment");
+        assert!(app.folder_shut(folder), "the fixture did not collapse it");
+        app.undo();
+        assert!(!app.folder_shut(folder), "the collapse did not come off");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Choosing an instrument, a patch or a click sound is its own step
+    /// back.**
+    ///
+    /// Each of these is a desk field - `Instruments::dx7_cartridge`,
+    /// `dx7_patch`, `keys_patch`, `Click::sample` - so each is in the undo
+    /// fingerprint, and each writer only saved the settings file. A field
+    /// that is hashed and never committed for folds into the NEXT gesture's
+    /// moment: one Ctrl+Z undoing two things, which is the fault the owner
+    /// reported against normalize.
+    #[test]
+    fn choosing_a_sound_is_its_own_moment() {
+        let root = project_scratch("sounds");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        // Each one on its own, from a settled timeline.
+        let steps: Vec<(&str, fn(&mut TangentApp))> = vec![
+            ("a DX7 cartridge", |a| a.set_dx7_cartridge_of(2, "/x/ROM3A.syx".to_owned())),
+            ("a DX7 patch", |a| a.set_dx7_patch_of(2, 11)),
+            ("a Keys patch", |a| a.set_keys_patch_of(3, 1)),
+            ("the click's sound", |a| a.set_click_sample("/x/clave.wav")),
+        ];
+        for (what, step) in steps {
+            let before = app.hist_at;
+            step(&mut app);
+            assert_eq!(
+                app.hist_at,
+                before + 1,
+                "{what} left no moment of its own"
+            );
+        }
+
+        // And a second gesture does not take the first one with it.
+        let cart = app.settings.strip_dx7_cartridge[2].clone();
+        app.set_click_sample("/x/other.wav");
+        app.undo();
+        assert_eq!(
+            app.settings.click_sample, "/x/clave.wav",
+            "one step back did not undo the click's sound"
+        );
+        assert_eq!(
+            app.settings.strip_dx7_cartridge[2], cart,
+            "one step back also undid the cartridge chosen three gestures ago"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Pasting a track is one step back, whatever is on it.**
+    ///
+    /// A track is a kind, a name, a colour, six bays, a kit and a pile of
+    /// clips, and `set_insert` and `arr_save_edits` each commit their own -
+    /// so a paste with three plugins in it took four Ctrl+Z, each putting a
+    /// different quarter of it back. A track with NO clips and no plugins
+    /// went the other way and left no moment at all.
+    #[test]
+    fn pasting_a_track_is_one_step_back() {
+        let root = project_scratch("pastetrack");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+
+        // A track worth copying: a name, two plugins and a clip.
+        app.add_bare_track(1);
+        app.commit_mixer_name(recorder::Column(1), "Rhodes".to_owned());
+        app.set_insert(1, 0, Some("/x/EP.vst3"));
+        app.set_insert(1, 1, Some("/x/Plate.vst3"));
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 1,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_save_edits();
+        app.commit_view_change();
+        app.copy_track(1);
+        let before = app.hist_at;
+
+        app.paste_track(5);
+        assert_eq!(app.insert(5, 1), Some("/x/Plate.vst3"), "the paste lost a bay");
+        assert_eq!(
+            app.hist_at,
+            before + 1,
+            "the paste left {} moments",
+            app.hist_at - before
+        );
+
+        // ONE step back takes the whole track off.
+        app.undo();
+        assert_eq!(app.insert(5, 0), None, "a bay survived the undo");
+        assert_eq!(app.insert(5, 1), None, "the second bay survived the undo");
+        assert_eq!(app.settings.tracks_added & (1 << 5), 0, "the track survived");
+        assert!(
+            !app.arrangement.clips.iter().any(|c| c.lane == 5),
+            "the pasted clip survived the undo"
+        );
+        app.redo();
+        assert_eq!(app.insert(5, 1), Some("/x/Plate.vst3"), "the redo lost a bay");
+
+        // **And an EMPTY track still leaves one.** Nothing in it commits, so
+        // without the hold's own commit this gesture left none at all.
+        app.add_bare_track(8);
+        app.commit_mixer_name(recorder::Column(8), "Bare".to_owned());
+        app.copy_track(8);
+        let before = app.hist_at;
+        app.paste_track(9);
+        assert_eq!(app.hist_at, before + 1, "an empty track pasted with no moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **One gesture is one step back, however many writers it reaches.**
     ///
     /// The other half of the owner's report. Most writers in this file are
@@ -40798,6 +41302,84 @@ mod tests {
         app.me_delete_selected();
         assert_eq!(app.arrangement.clips[0].notes.len(), 3);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The open MIDI Inputs window follows the ports.**
+    ///
+    /// The rows were built once at open and never again, while the chip
+    /// behind the window went on refreshing every five seconds - so a
+    /// keyboard plugged in WHILE the window was up stayed "not connected"
+    /// in the one place somebody had gone to look at it, and the only way
+    /// to see it was to close the window and open it again.
+    ///
+    /// The hard half is what a refresh must not lose: a tick is the user's
+    /// the moment they make it, and the saved selection has not caught up.
+    #[test]
+    fn the_open_midi_inputs_window_follows_the_ports() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_channel_input_spec(4, "midi:all");
+        app.midi_ports_seen = vec!["Keystation 88".to_owned()];
+        app.open_midi_inputs_dialog(4);
+        let rows = |app: &TangentApp| match app.dialog.as_ref() {
+            Some(Dialog::MidiInputs { devices, .. }) => devices.clone(),
+            _ => panic!("the window is not open"),
+        };
+        assert_eq!(rows(&app).len(), 1, "the window did not open on the one port");
+
+        // **A keyboard arrives while the window is up.**
+        app.midi_ports_seen.push("Launchkey 49".to_owned());
+        app.refresh_midi_inputs_dialog();
+        let now = rows(&app);
+        assert_eq!(
+            now.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["Keystation 88", "Launchkey 49"],
+            "the window did not notice the new port"
+        );
+        assert!(now.iter().all(|d| d.present), "a plugged-in device reads as gone");
+
+        // **A tick the hand made survives a refresh.** It is not in the
+        // saved selection yet - nothing has been applied - so a rebuild
+        // that read the settings again would put the box back.
+        if let Some(Dialog::MidiInputs { devices, .. }) = app.dialog.as_mut() {
+            devices[1].on = true;
+        }
+        app.midi_ports_seen.push("Scarlett 2i2".to_owned());
+        app.refresh_midi_inputs_dialog();
+        let now = rows(&app);
+        assert_eq!(now.len(), 3, "the third port did not arrive");
+        assert!(
+            now.iter().find(|d| d.name == "Launchkey 49").is_some_and(|d| d.on),
+            "the refresh untucked a box the hand had ticked"
+        );
+        assert!(
+            now.iter().find(|d| d.name == "Keystation 88").is_some_and(|d| !d.on),
+            "the refresh ticked a box nobody touched"
+        );
+
+        // **A device that goes away keeps its row while it is ticked**, so
+        // the selection can still be seen and cleared - and loses it when
+        // it is not, because an unticked absent device is simply not there.
+        app.midi_ports_seen = vec!["Scarlett 2i2".to_owned()];
+        app.refresh_midi_inputs_dialog();
+        let now = rows(&app);
+        assert!(
+            now.iter().any(|d| d.name == "Launchkey 49" && d.on && !d.present),
+            "a ticked device that was unplugged lost its row: {now:?}"
+        );
+        assert!(
+            !now.iter().any(|d| d.name == "Keystation 88"),
+            "an unticked device that is not plugged in kept a row"
+        );
+
+        // And a poll that finds the same ports changes nothing at all.
+        let before = rows(&app);
+        app.refresh_midi_inputs_dialog();
+        assert_eq!(rows(&app), before, "an idle poll rewrote the window");
+
+        // With no window open it is a no-op rather than a panic.
+        app.dialog = None;
+        app.refresh_midi_inputs_dialog();
+        assert!(app.dialog.is_none(), "the refresh opened a window of its own");
     }
 
     /// **The MIDI Inputs dialog changes what the track listens to, the chip

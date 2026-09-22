@@ -951,7 +951,20 @@ pub struct DesktopApp {
     /// The ask the marks currently on screen were built from, so a frame
     /// that changed nothing asks nothing. See `push_quantize_marks`.
     #[cfg(feature = "recorder")]
-    quantize_marked: Option<tangent_ui::ports::QuantizeAsk>,
+    quantize_marked: Option<(tangent_ui::ports::QuantizeAsk, u64)>,
+    /// **A plugin's settings, shelved because something wrote over the
+    /// file they lived in.** Keyed by seat, bay and the bundle they belong
+    /// to. See `shelve_displaced_state`: a bay's sidecar is one file tagged
+    /// with its current tenant, so a paste or a swap DESTROYS the outgoing
+    /// tenant's only copy - and the bay itself is undoable, so Ctrl+Z asks
+    /// for a plugin whose settings are no longer anywhere.
+    ///
+    /// **In memory and cleared with the session**, never on disk: the
+    /// sidecar naming round-trips strictly, so a second file would be
+    /// invisible to the shelf sweep and would leak another project's knobs
+    /// into this one's bays.
+    #[cfg(feature = "recorder")]
+    displaced_states: std::collections::HashMap<(usize, usize, String), Vec<u8>>,
     /// The ReaStream config the sender was last handed. See
     /// `reconcile_reastream`.
     #[cfg(feature = "recorder")]
@@ -5140,6 +5153,24 @@ impl DesktopApp {
             if want.as_deref() == Some(crate::builtin_fx::AMP_PATH) {
                 seed_amp_board(&mut self.app, i / inserts);
             }
+            // **The bay's settings, worked out BEFORE the engine is
+            // borrowed**, because the shelf is a field of the same `self`.
+            //
+            // The sidecar first, and the shelf when the sidecar has been
+            // written over: a bay's file is one file tagged with its
+            // current tenant, so a paste or a swap destroys the outgoing
+            // plugin's only copy - and the bay is undoable, so Ctrl+Z can
+            // ask for it. See `displaced_states`.
+            let bay_state = want
+                .as_deref()
+                .filter(|p| !is_instrument_sentinel(p))
+                .and_then(|p| {
+                    saved_insert_state(i / inserts, i % inserts, p).or_else(|| {
+                        self.displaced_states
+                            .get(&(i / inserts, i % inserts, p.to_owned()))
+                            .cloned()
+                    })
+                });
             if let Some(e) = self.recorder.engine.as_mut() {
                 // **A built-in INSTRUMENT is not a bundle.** Its sentinel
                 // path rides in the bay like any plugin's — that is what lets
@@ -5156,8 +5187,8 @@ impl DesktopApp {
                 // a while and the racks never did: an effect whose settings
                 // died at every relaunch, silently, because nothing ever asked
                 // its instance for them. See `insert_state_path`.
-                let state =
-                    engine_want.and_then(|p| saved_insert_state(i / inserts, i % inserts, p));
+                // Worked out above, where the shelf could still be read.
+                let state = bay_state;
                 match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
                     Ok(_) => {
                         self.recorder.engine_error = None;
@@ -10614,6 +10645,10 @@ impl DesktopApp {
         // and the session was gone by the time anything noticed.
         self.copy_states_to_project();
         self.app.open_project(doc);
+        // **The shelf belongs to the session it was filled in.** A bay
+        // holding the same bundle in the NEW project would otherwise be
+        // seated with the old project's knobs. See `displaced_states`.
+        self.displaced_states.clear();
         // `open_project` applied the document's desk when it carried one;
         // the flag says so, and the states follow the desk.
         if self.app.take_desk_reload() {
@@ -11909,6 +11944,35 @@ impl DesktopApp {
     /// against the raw file position would put every hit of a trimmed clip
     /// out by the trim.
     #[cfg(feature = "recorder")]
+    /// **Shelve the settings a write is about to destroy.**
+    ///
+    /// A bay's sidecar is ONE file tagged with the bay's current tenant, so
+    /// pasting over a loaded bay - or swapping two - re-tags it and the
+    /// outgoing plugin's only copy is gone. The bay itself is undoable:
+    /// Ctrl+Z restores the bundle name and the reconcile then asks for
+    /// settings nothing has any more, so the plugin comes back at its
+    /// factory values with no error and the rack quietly sounds wrong.
+    ///
+    /// Called with the bundle that is ABOUT to own the file; a sidecar
+    /// already tagged with it is not being displaced by anything.
+    ///
+    /// **Bounded by clearing**, the same cap-and-drop the attack cache
+    /// uses: a sampler's blob is large, and the only thing that ever wants
+    /// an old entry is an undo across the gesture that made it.
+    fn shelve_displaced_state(&mut self, strip: usize, bay: usize, incoming: &str) {
+        let Some((owner, blob)) = sidecar_owner_and_state(strip, bay) else {
+            return;
+        };
+        if owner == incoming || blob.is_empty() {
+            return;
+        }
+        const CAP: usize = 32;
+        if self.displaced_states.len() >= CAP {
+            self.displaced_states.clear();
+        }
+        self.displaced_states.insert((strip, bay, owner), blob);
+    }
+
     /// **This file's attacks at this sensitivity.**
     fn attacks_of(
         &mut self,
@@ -11955,7 +12019,19 @@ impl DesktopApp {
     /// second opinion about it.
     fn push_quantize_marks(&mut self, ctx: &egui::Context) {
         let ask = self.app.quantize_preview();
-        if ask == self.quantize_marked {
+        // **And WHERE the asked clips are**, which the ask cannot see.
+        //
+        // The window is deliberately not modal - the arrangement stays live
+        // under it so a take can be selected, quantized, listened to and
+        // another chosen - so a clip can be dragged, nudged or trimmed with
+        // the ticks up. The target tick is computed against `start_s` and
+        // `offset_s`, so a clip that moves takes its targets off the grid
+        // lines they are supposed to BE, and the preview stops describing
+        // what Apply will do.
+        let sig = ask.as_ref().map_or(0, |a| self.quantize_clip_sig(a));
+        if self.quantize_marked.as_ref().map(|(a, s)| (a, *s))
+            == ask.as_ref().map(|a| (a, sig))
+        {
             return;
         }
         let want = ask.as_ref().map_or(0, |a| a.ids.len());
@@ -11967,7 +12043,7 @@ impl DesktopApp {
         // never rather than late. Nothing about the ask changes when a
         // decode lands, so the ask is the only thing that can remember.
         if marks.len() == want {
-            self.quantize_marked = ask;
+            self.quantize_marked = ask.map(|a| (a, sig));
         }
         // **Nothing to put up and nothing up is nothing happening.** The
         // window shutting takes the ticks down; an ordinary frame with no
@@ -11981,6 +12057,35 @@ impl DesktopApp {
         // runs at the top of a frame, after the app was drawn on the last
         // one. Same door the insert reconcile uses.
         late_change(ctx, changed);
+    }
+
+    /// **Where the asked clips are, as one number.**
+    ///
+    /// Everything `quantize_marks_for` reads that the ask does not carry:
+    /// the file, the placement, the trim, the loop and the warp map. A
+    /// clip that moves changes this and the ticks are rebuilt.
+    ///
+    /// **Not the document's own fingerprint**, which is the obvious
+    /// one-liner and is wrong: it includes the desk, so a fader moved with
+    /// the window open would rebuild every mark on every frame of the drag
+    /// - and a rebuild is a `pick` over the analysis plus a walk per clip.
+    /// This moves only when something the marks are actually built from
+    /// moves.
+    fn quantize_clip_sig(&self, ask: &tangent_ui::ports::QuantizeAsk) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let doc = self.app.arrangement();
+        for id in &ask.ids {
+            if let Some(c) = doc.clips.iter().find(|c| c.id == *id) {
+                c.path.hash(&mut h);
+                c.start_s.to_bits().hash(&mut h);
+                c.offset_s.to_bits().hash(&mut h);
+                c.len_s.to_bits().hash(&mut h);
+                c.loop_s.to_bits().hash(&mut h);
+                c.warp.hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     /// **The ticks one ask comes to**, per clip, in seconds from the start
@@ -12005,42 +12110,70 @@ impl DesktopApp {
             strength: ask.strength,
             window: ask.window,
         };
-        let doc = self.app.arrangement().clone();
-        let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(ask.ids.len());
-        for id in &ask.ids {
-            let Some(clip) = doc.clips.iter().find(|c| c.id == *id) else {
-                continue;
-            };
-            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+        // **What the ask needs, and not the whole document.**
+        //
+        // This ran off a deep clone of the arrangement - every clip, every
+        // note, every automation point - once per dial position, for the
+        // sake of four fields on the handful of clips named in the ask.
+        // The borrow is released at the end of the block, which is what the
+        // clone was buying: `attacks_of` below needs `&mut self`.
+        struct Asked {
+            id: u64,
+            path: std::path::PathBuf,
+            start_s: f64,
+            offset_s: f64,
+            anchors: Vec<crate::warp::Anchor>,
+        }
+        let asked: Vec<Asked> = {
+            let doc = self.app.arrangement();
+            ask.ids
+                .iter()
+                .filter_map(|id| {
+                    let c = doc.clips.iter().find(|c| c.id == *id)?;
+                    Some(Asked {
+                        id: *id,
+                        path: tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path),
+                        start_s: c.start_s,
+                        offset_s: c.offset_s,
+                        // **An attack is FOUND in the file and DRAWN over
+                        // what the clip plays**, and those are two different
+                        // timelines the moment a warp map exists. Projecting
+                        // through it is what makes an already-quantized take
+                        // show its ticks ON its hits - and, since the target
+                        // needs no projection (it is already a place in the
+                        // result), what makes the pair coincide on a take
+                        // that is in time. A clip with no map projects as
+                        // itself.
+                        anchors: c
+                            .warp
+                            .iter()
+                            .map(|&(from, to)| crate::warp::Anchor {
+                                from: usize::try_from(from).unwrap_or(usize::MAX),
+                                to: usize::try_from(to).unwrap_or(usize::MAX),
+                            })
+                            .collect(),
+                    })
+                })
+                .collect()
+        };
+        let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(asked.len());
+        for clip in &asked {
+            let path = clip.path.clone();
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
             let found = self.attacks_of(&path, &decoded, ask.sensitivity);
             let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
-            // **An attack is FOUND in the file and DRAWN over what the clip
-            // plays**, and those are two different timelines the moment a
-            // warp map exists. Projecting through it is what makes an
-            // already-quantized take show its ticks ON its hits - and,
-            // since the target needs no projection (it is already a place
-            // in the result), what makes the pair coincide on a take that
-            // is in time. A clip with no map projects as itself.
-            let anchors: Vec<crate::warp::Anchor> = clip
-                .warp
-                .iter()
-                .map(|&(from, to)| crate::warp::Anchor {
-                    from: usize::try_from(from).unwrap_or(usize::MAX),
-                    to: usize::try_from(to).unwrap_or(usize::MAX),
-                })
-                .collect();
+            let anchors = &clip.anchors;
             let frames = decoded.frames();
             out.push((
-                *id,
+                clip.id,
                 map.iter()
                     .map(|&(f, t)| {
                         let at = crate::warp::project_frame(
                             frames,
-                            &anchors,
+                            anchors,
                             usize::try_from(f).unwrap_or(usize::MAX),
                         );
                         ((at as f64 / rate) as f32, (t as f64 / rate) as f32)
@@ -12362,6 +12495,10 @@ impl DesktopApp {
         // Its state BEFORE either bay is re-pointed — `copy_insert`'s
         // ordering rule, for its reason: the reconcile reads the sidecar as
         // it constructs the instance.
+        // Whatever is in that bay's file now belongs to whatever was in
+        // the bay, and the line below is about to re-tag it. See
+        // `shelve_displaced_state`.
+        self.shelve_displaced_state(to_strip, to_bay, &bundle);
         if let Some(state) = self
             .recorder
             .engine
@@ -12422,6 +12559,12 @@ impl DesktopApp {
             ),
             None => (None, None),
         };
+        // **Both files are about to be cross-tagged**, so both are shelved
+        // first - a swap is the worse of the two cases, because undoing it
+        // would otherwise bring BOTH plugins back at their defaults. This
+        // function's own doc already states the rule it was breaking.
+        self.shelve_displaced_state(b_strip, b_bay, &a);
+        self.shelve_displaced_state(a_strip, a_bay, &b);
         if let Some(state) = a_state {
             write_insert_state(b_strip, b_bay, &a, &state);
         }
@@ -15033,10 +15176,23 @@ fn encode_mp3(
 }
 
 fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
+    let (owner, blob) = sidecar_owner_and_state(strip, bay)?;
+    (owner == bundle).then_some(blob)
+}
+
+/// **A bay's sidecar and WHOSE it is**, without asking whether it is the
+/// one wanted.
+///
+/// [`saved_insert_state`]'s inner half, split out for the one caller that
+/// needs the mismatch: a paste or a swap is about to write over this file,
+/// and the blob it is about to destroy belongs to a plugin the undo stack
+/// can still ask for. See `DesktopApp::shelve_displaced_state`.
+#[cfg(feature = "recorder")]
+fn sidecar_owner_and_state(strip: usize, bay: usize) -> Option<(String, Vec<u8>)> {
     let raw = std::fs::read(insert_state_path(strip, bay)).ok()?;
     let split = raw.iter().position(|b| *b == 0)?;
-    let owner = std::str::from_utf8(&raw[..split]).ok()?;
-    (owner == bundle).then(|| raw[split + 1..].to_vec())
+    let owner = std::str::from_utf8(&raw[..split]).ok()?.to_owned();
+    Some((owner, raw[split + 1..].to_vec()))
 }
 
 /// **What a bay sounds like RIGHT NOW** — the desk that is playing first, its
@@ -17509,6 +17665,7 @@ impl DesktopApp {
             comp_rows_epoch: u64::MAX,
             attack_cache: std::collections::HashMap::new(),
             quantize_marked: None,
+            displaced_states: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             reastream_pushed: None,
             #[cfg(feature = "recorder")]
@@ -22817,6 +22974,166 @@ mod tests {
                 "{what} commits a moment of its own again, so a batch leaves one per clip"
             );
         }
+    }
+
+    /// **The marks are rebuilt when the CLIPS move, not only when a knob
+    /// does.**
+    ///
+    /// The quantize window is deliberately not modal - the arrangement
+    /// stays live under it so a take can be selected, quantized, listened
+    /// to and another chosen - and `QuantizeAsk` carries the ids and the
+    /// seven knobs and nothing about WHERE those clips are. So dragging,
+    /// nudging or trimming the take with the ticks up left the target ticks
+    /// off the grid lines they are supposed to BE, and the preview stopped
+    /// describing what Apply would do.
+    ///
+    /// A source scan for the wiring, because `DesktopApp` cannot be built
+    /// in a test; the fields the signature reads are asserted by name,
+    /// because the fault is a field MISSING from it.
+    #[test]
+    fn the_marks_are_rebuilt_when_the_clips_move() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let sig = {
+            let at = scan.find("fn quantize_clip_sig(").expect("the signature");
+            &scan[at..at + scan[at..].find("\n    }\n").expect("its end")]
+        };
+        // Everything `quantize_marks_for` reads off a clip has to be in it,
+        // or a change to that field leaves stale ticks up.
+        for field in [
+            "c.path.hash",
+            "c.start_s.to_bits",
+            "c.offset_s.to_bits",
+            "c.len_s.to_bits",
+            "c.loop_s.to_bits",
+            "c.warp.hash",
+        ] {
+            assert!(
+                sig.contains(field),
+                "{field} is not in the marks' signature, so changing it leaves stale ticks"
+            );
+        }
+        // And it is the DESK's fingerprint that must NOT be used: it moves
+        // on every frame of a fader drag, and a rebuild is a walk per clip.
+        assert!(
+            !sig.contains("fingerprint()"),
+            "the signature hashes the whole document, so a fader rebuilds every mark"
+        );
+        // The latch carries it.
+        assert!(
+            scan.contains("quantize_marked: Option<(tangent_ui::ports::QuantizeAsk, u64)>,"),
+            "the latch no longer carries where the clips are"
+        );
+        assert!(
+            scan.contains("let sig = ask.as_ref().map_or(0, |a| self.quantize_clip_sig(a));"),
+            "the pusher no longer asks where the clips are"
+        );
+    }
+
+    /// **A plugin's settings survive the undo of a paste or a swap.**
+    ///
+    /// A bay's sidecar is ONE file tagged with its tenant, and the bay is
+    /// undoable - so pasting over a loaded bay re-tags the file, Ctrl+Z
+    /// restores the bundle NAME, and the reconcile then asks for settings
+    /// nothing has any more. The plugin comes back at its factory values
+    /// with no error at all, and a swap does it to BOTH plugins.
+    ///
+    /// Driven through the real file road: write two sidecars, shelve one,
+    /// re-tag the file the way the paste does, and ask for the displaced
+    /// plugin's blob back.
+    #[test]
+    fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
+        // `insert_state_path` is per-install, so this uses a seat far out
+        // of anybody's way and puts it back.
+        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
+        let path = insert_state_path(strip, bay);
+        let had = std::fs::read(&path).ok();
+        let restore = || match &had {
+            Some(raw) => {
+                let _ = std::fs::write(&path, raw);
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        };
+
+        // A plugin with settings somebody dialled in.
+        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as tweaked");
+        assert_eq!(
+            saved_insert_state(strip, bay, "/x/Amp.vst3").as_deref(),
+            Some(&b"the amp as tweaked"[..]),
+            "the fixture did not write a sidecar"
+        );
+        // And the reader that does not filter, which is what the shelf uses.
+        let (owner, blob) = sidecar_owner_and_state(strip, bay).expect("a sidecar");
+        assert_eq!(owner, "/x/Amp.vst3");
+        assert_eq!(blob, b"the amp as tweaked");
+
+        // The paste: shelve, then re-tag the file for the incoming plugin.
+        let mut shelf: std::collections::HashMap<(usize, usize, String), Vec<u8>> =
+            std::collections::HashMap::new();
+        if let Some((owner, blob)) = sidecar_owner_and_state(strip, bay) {
+            if owner != "/x/Delay.vst3" {
+                shelf.insert((strip, bay, owner), blob);
+            }
+        }
+        write_insert_state(strip, bay, "/x/Delay.vst3", b"the delay");
+
+        // **The file no longer knows the amp**, which is the whole defect.
+        assert_eq!(
+            saved_insert_state(strip, bay, "/x/Amp.vst3"),
+            None,
+            "the paste did not actually bury the old tenant"
+        );
+        // And the shelf does, which is the fix. This is exactly the lookup
+        // the reconcile makes.
+        assert_eq!(
+            shelf
+                .get(&(strip, bay, "/x/Amp.vst3".to_owned()))
+                .map(Vec::as_slice),
+            Some(&b"the amp as tweaked"[..]),
+            "the displaced settings were not shelved"
+        );
+        // The incoming plugin still reads its own from the file, so the
+        // shelf is a fallback and never a replacement.
+        assert_eq!(
+            saved_insert_state(strip, bay, "/x/Delay.vst3").as_deref(),
+            Some(&b"the delay"[..])
+        );
+        restore();
+    }
+
+    /// **And the two roads that bury a sidecar both shelve first.**
+    ///
+    /// A source scan, because `DesktopApp` cannot be built in a test. What
+    /// it stops is a third road - or one of these two losing the line -
+    /// putting the loss back silently, which is how it shipped.
+    #[test]
+    fn every_write_that_buries_a_sidecar_shelves_it_first() {
+        let src = include_str!("desktop.rs");
+        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        // The paste, and BOTH bays of the swap.
+        assert_eq!(
+            scan.matches("self.shelve_displaced_state(").count(),
+            3,
+            "a road that writes over a loaded bay's sidecar no longer shelves it"
+        );
+        // And the reconcile still falls back to the shelf.
+        assert!(
+            scan.contains("self.displaced_states
+                            .get(&(i / inserts, i % inserts, p.to_owned()))"),
+            "the reconcile no longer reads the shelf"
+        );
+        // The shelf is cleared with the session, or it leaks another
+        // project's knobs into this one's bays.
+        let switch = {
+            let at = scan.find("fn switch_project(&mut self").expect("switch_project");
+            &scan[at..at + 3000]
+        };
+        assert!(
+            switch.contains("self.displaced_states.clear();"),
+            "the shelf outlives the session it was filled in"
+        );
     }
 
     /// **The ticks on the waveform and the warp the Apply writes come from
