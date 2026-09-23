@@ -1104,6 +1104,10 @@ mod tests {
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-glguard-settings-{}.json", std::process::id())),
             );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-glguard-media-{}", std::process::id())),
+            );
         }
         let (w, h) = (320u32, 240u32);
         let mut c = match Compositor::standalone(w, h) {
@@ -1181,6 +1185,10 @@ mod tests {
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-defaults-settings-{}.json", std::process::id())),
             );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-defaults-media-{}", std::process::id())),
+            );
         }
         let Ok(c) = Compositor::standalone(320, 240) else {
             eprintln!("no compositor here - nothing to agree about");
@@ -1213,6 +1221,19 @@ mod tests {
         };
         const W: u32 = 320;
         const H: u32 = 240;
+        // SAFETY: single-threaded test setup, before any app exists. The
+        // app below is a DESKTOP one; without these it writes the owner's own
+        // settings file and resolves the owner's own media folder.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join(format!("tangent-camera-settings-{}.json", std::process::id())),
+            );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-camera-media-{}", std::process::id())),
+            );
+        }
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
 
         // Opaque orange, in the RGBA byte order the camera delivers: R=0xF0,
@@ -1553,6 +1574,10 @@ mod cost {
                     "IVORY_SETTINGS_PATH",
                     std::env::temp_dir().join(format!("tangent-cost-settings-{}.json", std::process::id())),
                 );
+                std::env::set_var(
+                    "TANGENT_MEDIA_ROOT",
+                    std::env::temp_dir().join(format!("tangent-cost-media-{}", std::process::id())),
+                );
             }
             let (w, h) = (1280u32, 720u32);
             #[cfg(target_os = "linux")]
@@ -1683,6 +1708,10 @@ mod cost {
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-cost-settings-{}.json", std::process::id())),
             );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-cost-media-{}", std::process::id())),
+            );
         }
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
@@ -1789,6 +1818,10 @@ mod shot {
             std::env::set_var(
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
+            );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
             );
         }
         let (w, h) = (1600u32, 900u32);
@@ -2035,6 +2068,10 @@ mod shot {
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
+            );
         }
         let (w, h) = (1220u32, 500u32);
         let mut c = match Compositor::standalone(w, h) {
@@ -2102,6 +2139,10 @@ mod shot {
             std::env::set_var(
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
+            );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
             );
         }
         let (w, h) = (1220u32, 500u32);
@@ -2175,6 +2216,10 @@ mod shot {
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
             );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
+            );
         }
         let (w, h) = (1220u32, 620u32);
         let mut c = match Compositor::standalone(w, h) {
@@ -2240,6 +2285,10 @@ mod shot {
             std::env::set_var(
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
+            );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
             );
         }
         // The proportions of the real panel: the desk fills the window under
@@ -2313,6 +2362,10 @@ mod shot {
             std::env::set_var(
                 "IVORY_SETTINGS_PATH",
                 std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
+            );
+            std::env::set_var(
+                "TANGENT_MEDIA_ROOT",
+                std::env::temp_dir().join(format!("tangent-shot-media-{}", std::process::id())),
             );
         }
         // The window's own shape at 100%: the splash fills it.
