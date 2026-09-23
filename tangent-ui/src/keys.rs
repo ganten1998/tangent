@@ -609,15 +609,15 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("C-C/V/X", "copy · paste · cut the selected clips - or nodes"),
             ("C-F", "group the selection into a folder"),
             ("C-S-F", "freeze the selected track - renders its rack, then rests it; again to thaw"),
-            // "MIDI clips", because that is the truth: `arr_glue_selection`
-            // filters to MIDI and refuses everything else — welding audio
-            // means rendering, a different operation with a different cost.
+            // "clips", audio and MIDI both: MIDI welds its notes, and audio
+            // is rendered by the host into one file - the owner's "Audio
+            // clips don't glue". One kind and one track at a time.
             //
             // **"or one that repeats"**, because one is now enough: glue on a
             // single looped clip welds its own repeats into it. That half is
             // the one nobody would guess from the word "glue", so it is the
             // half that has to be on the card.
-            ("C-G", "glue the selected MIDI clips - or one that repeats - into one"),
+            ("C-G", "glue the selected clips on a track - or one that repeats - into one"),
             // C-S-N, not C-N: the handler requires shift, and only audio
             // comes up — a note's velocity is a performance, not a level.
             ("C-S-N", "normalise the selected audio clips"),
@@ -1511,8 +1511,8 @@ mod tests {
             desc(&arrange, "S-PT")
         );
         assert!(
-            desc(&arrange, "C-G").contains("MIDI"),
-            "C-G glues MIDI only, and the card stopped saying so: {:?}",
+            !desc(&arrange, "C-G").contains("MIDI") && desc(&arrange, "C-G").contains("repeats"),
+            "C-G glues audio and MIDI alike, and one clip that repeats: {:?}",
             desc(&arrange, "C-G")
         );
 

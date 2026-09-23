@@ -2461,6 +2461,14 @@ pub enum RecorderRequest {
     /// The host measures and writes the gain back through
     /// `TangentApp::set_clip_gain`.
     NormalizeClips(Vec<u64>),
+    /// **Weld these audio clips on one track into one**, silences and all.
+    ///
+    /// A request for the reason `NormalizeClips` is one: the samples are
+    /// host-side. The host lays the clips out exactly as playback does -
+    /// trim, loop passes, fades, gain, warp and stretch - mixes them with the
+    /// engine's own mixer, writes the result into the project's `media/`,
+    /// and hands the one clip back through `TangentApp::finish_audio_glue`.
+    GlueAudio(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///
     /// A request rather than a setting, because the number does not live

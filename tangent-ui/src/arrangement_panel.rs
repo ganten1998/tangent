@@ -2667,19 +2667,8 @@ fn loop_pass_w(full_x: (f32, f32), clip: &ClipView<'_>) -> f32 {
 /// over, once, in the middle; the `len_s <= loop_s` test that used to stand
 /// here called that clip unlooped and drew it flat.
 fn clip_head_s(clip: &ClipView<'_>) -> Option<f64> {
-    if clip.loop_s <= 1.0e-6 || !clip.loop_s.is_finite() || !clip.len_s.is_finite() {
-        return None;
-    }
-    let head_s = if clip.midi {
-        // `max` yields the other side of a NaN, so a clip with no offset
-        // written reads as no trim rather than poisoning the arithmetic; an
-        // infinite one falls out of the comparison below as `None`.
-        let phase_s = clip.offset_s.max(0.0) % clip.loop_s;
-        if phase_s <= 1.0e-9 { clip.loop_s } else { clip.loop_s - phase_s }
-    } else {
-        clip.loop_s
-    };
-    (clip.len_s > head_s + 1.0e-9).then_some(head_s)
+    // One spelling, shared with glue's "does it repeat" - see the fn.
+    crate::arrangement::first_pass_s(clip.midi, clip.len_s, clip.loop_s, clip.offset_s)
 }
 
 /// **Does this clip show a seam at all?** — the loop question without the

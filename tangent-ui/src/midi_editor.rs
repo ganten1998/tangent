@@ -165,7 +165,16 @@ pub struct MidiEditView<'a> {
     pub bpm: f64,
     pub sig_top: u32,
     pub sig_bottom: u32,
+    /// **The playhead as the ROLL draws it**: in a looping clip, the song's
+    /// second folded into the one pass the roll shows - see
+    /// `arrangement::fold_into_midi_pass`. Everything on the roll that stands
+    /// at or acts at the playhead reads this.
     pub playhead_s: f64,
+    /// **The song's own second**, for the NAVIGATOR. The box is the whole
+    /// clip, every pass of it, so its line says where in the clip the song
+    /// is - and a scrub on it shows where it put the transport, which a
+    /// folded line would snap back into the first pass.
+    pub song_s: f64,
     /// The lane's colour index into [`crate::mixer_panel::STRIP_COLORS`]; 0 draws the desk
     /// green, exactly as the arrangement does.
     pub color: usize,
@@ -469,7 +478,11 @@ pub fn loop_bar_x(l: &Layout, view: &MidiEditView<'_>) -> Option<f32> {
     if !l.roll.is_positive() || view.loop_s <= 1.0e-6 || !view.loop_s.is_finite() {
         return None;
     }
-    let x = x_of(l, view, view.clip_start_s + view.loop_s);
+    // Where the loop really turns over: a whole loop from the clip's SOURCE
+    // origin, which a clip trimmed from its front starts part-way through.
+    // See `arrangement::midi_loop_origin_s`.
+    let end = crate::arrangement::midi_loop_origin_s(view.clip_start_s, view.offset_s) + view.loop_s;
+    let x = x_of(l, view, end);
     (x.is_finite() && x >= l.roll.left() && x <= l.roll.right()).then_some(x)
 }
 
@@ -1158,8 +1171,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             }
         }
         // The playhead, in the roll's own red, so a scrub on the box shows
-        // where it put the transport before the roll has scrolled to it.
-        let px = nav_x_of(&l, view, view.playhead_s);
+        // where it put the transport before the roll has scrolled to it. The
+        // SONG's second: the box is every pass of the clip, not one.
+        let px = nav_x_of(&l, view, view.song_s);
         if px >= b.left() && px <= b.right() {
             painter.line_segment(
                 [Pos2::new(px, b.top()), Pos2::new(px, b.bottom())],
@@ -2386,6 +2400,7 @@ mod tests {
             sig_top: 4,
             sig_bottom: 4,
             playhead_s: 10.0,
+            song_s: 10.0,
             color: 0,
             dark: true,
             pad_names: None,
@@ -2838,6 +2853,48 @@ mod tests {
         );
     }
 
+    /// **The navigator's red line is the SONG's second, not the pass.** The
+    /// box is every pass of the clip, so its line says where in the clip the
+    /// song is - a scrub shows where it put the transport - while the roll's
+    /// line is folded into the one pass the roll draws.
+    #[test]
+    fn the_navigators_line_stands_at_the_songs_second() {
+        let notes: [ArrNote; 0] = [];
+        let v = MidiEditView { playhead_s: 9.0, song_s: 13.0, ..view(&notes) };
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("nav-line"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let r = rect();
+        let l = Layout::new(r);
+        assert!(l.tool_nav.is_positive(), "the fixture has no navigator");
+        draw(&painter, r, &v);
+        let red = Color32::from_rgb(0xE8, 0x3A, 0x4E);
+        let xs: Vec<f32> = ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::LineSegment { points, stroke }
+                                if stroke.color == red && l.tool_nav.contains(points[0]) =>
+                            {
+                                Some(points[0].x)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let want = nav_x_of(&l, &v, v.song_s);
+        assert!(!xs.is_empty(), "the navigator drew no playhead");
+        assert!(
+            xs.iter().all(|x| (x - want).abs() < 0.01),
+            "the navigator's line is at {xs:?}, not at the song's second ({want})"
+        );
+    }
+
     /// **The miniature draws every note inside the box, higher pitches
     /// higher.** Read off the painted shapes rather than trusted: a mark
     /// drawn against the whole keyboard instead of the part's own span
@@ -3092,6 +3149,14 @@ mod tests {
         assert!(
             (x - x_of(&l, &v, v.clip_start_s + v.loop_s)).abs() < 0.01,
             "the bar is at {x}, not at the end of the pass"
+        );
+        // A part trimmed from its front turns over `offset` sooner: its
+        // passes count from `clip_start_s - offset_s`, as the sound does.
+        let trimmed = MidiEditView { offset_s: 1.0, ..MidiEditView { loop_s: 4.0, ..view(&notes) } };
+        let xt = loop_bar_x(&l, &trimmed).expect("a trimmed looping clip drew no bar");
+        assert!(
+            (xt - x_of(&l, &trimmed, trimmed.clip_start_s - 1.0 + trimmed.loop_s)).abs() < 0.01,
+            "the trimmed part's bar is at {xt}, not where its loop turns over"
         );
 
         // It answers on the ruler's tab, and on the empty roll under it.

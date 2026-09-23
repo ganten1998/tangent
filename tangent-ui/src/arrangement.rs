@@ -763,6 +763,128 @@ impl ArrClip {
             (file_s - self.offset_s).max(0.0)
         }
     }
+
+    /// **Where a MIDI clip's passes are counted from**, in song seconds:
+    /// `start_s - offset_s`. See [`midi_loop_origin_s`].
+    pub fn midi_loop_origin_s(&self) -> f64 {
+        midi_loop_origin_s(self.start_s, self.offset_s)
+    }
+
+    /// **Song second `t`, folded into the ONE pass a looping MIDI clip
+    /// holds.** See [`fold_into_midi_pass`].
+    pub fn midi_fold_s(&self, t: f64) -> f64 {
+        fold_into_midi_pass(self.start_s, self.len_s, self.loop_s, self.offset_s, t)
+    }
+}
+
+/// **Where a looped clip's FIRST pass ends**, in seconds from its head, or
+/// `None` for a clip that never turns over inside itself - the arrangement's
+/// seam rule, in the one place it is spelled.
+///
+/// A MIDI clip trimmed from its front starts part-way through its loop and
+/// turns over `offset mod loop` sooner (the notes stand at `at_s - offset_s
+/// + loop_s * pass`); an audio clip plays the same trimmed seconds every pass,
+/// so it turns over a whole loop in whatever the trim. See the panel's
+/// `clip_head_s`, which draws from this, and glue, which asks it whether one
+/// clip alone shows more than one pass.
+pub fn first_pass_s(midi: bool, len_s: f64, loop_s: f64, offset_s: f64) -> Option<f64> {
+    if loop_s <= 1.0e-6 || !loop_s.is_finite() || !len_s.is_finite() {
+        return None;
+    }
+    let head_s = if midi {
+        // `max` yields the other side of a NaN, so a clip with no offset
+        // written reads as no trim rather than poisoning the arithmetic; an
+        // infinite one falls out of the comparison below as `None`.
+        let phase_s = offset_s.max(0.0) % loop_s;
+        if phase_s <= 1.0e-9 { loop_s } else { loop_s - phase_s }
+    } else {
+        loop_s
+    };
+    (len_s > head_s + 1.0e-9).then_some(head_s)
+}
+
+impl ArrClip {
+    /// **Does this clip show more than one pass?** - a seam inside it. See
+    /// [`first_pass_s`].
+    pub fn repeats(&self) -> bool {
+        first_pass_s(self.kind == ClipKind::Midi, self.len_s, self.loop_s, self.offset_s).is_some()
+    }
+}
+
+/// **What an audio glue made**: one file, and where its clip stands. The
+/// host renders it and hands it to `TangentApp::finish_audio_glue`, which
+/// replaces the clips it was welded from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GluedAudio {
+    pub lane: usize,
+    /// `media/<file>`, inside the project, as every clip's path is.
+    pub path: String,
+    /// The earliest clip's start: the file's first frame stands here.
+    pub start_s: f64,
+    /// The whole weld, the last pass's end included.
+    pub len_s: f64,
+    pub name: String,
+}
+
+/// **Where a looping MIDI clip's passes are counted from**, in song seconds.
+///
+/// [`clip_notes_in_song_time`] places a note at `start_s + (at_s - offset_s)
+/// + loop_s * pass`, so every pass boundary sits a whole loop from
+/// `start_s - offset_s` - the clip's SOURCE origin laid on the timeline. A
+/// clip trimmed from its front therefore starts mid-loop, and its first pass
+/// ends `offset_s mod loop_s` sooner than an untrimmed one's. The editor draws
+/// a clip's notes once, in the pass that starts at this origin, so its loop
+/// bar and its folded playhead count from here too: the bar marks the turn at
+/// the end of the pass the roll draws. That is the arrangement's first seam
+/// (`clip_head_s`) whenever the trim is shorter than a loop; trimmed by a
+/// loop or more, the drawn pass - notes, bar and playhead alike - stands
+/// before the clip's head, as the notes always have.
+pub fn midi_loop_origin_s(start_s: f64, offset_s: f64) -> f64 {
+    // `max` yields the other side of a NaN, so an unwritten offset reads as
+    // no trim rather than poisoning every position computed from it.
+    start_s - offset_s.max(0.0)
+}
+
+/// **Song second `t`, folded into the ONE pass a looping MIDI clip holds** -
+/// where the roll draws whatever is sounding at `t`.
+///
+/// The editor draws a clip's notes once, at `start_s + (at_s - offset_s)`,
+/// and the repeats happen out on the timeline where it cannot see them. So a
+/// playhead drawn at the song's own second walked off the end of the part
+/// while the part went on playing from its top: the owner's "the playhead for
+/// a loop when viewed in the midi editor doesn't visually loop/wrap, it just
+/// keeps going and the loop does play properly". Folded, it stands on the
+/// note that is actually sounding, pass after pass.
+///
+/// Only INSIDE the clip, and only for a clip that loops. Before the clip or
+/// past its end there is no pass to be in, and the song's own second is the
+/// truth; a clip with no loop plays its notes once, where they are drawn.
+/// The fold is the inverse of [`clip_notes_in_song_time`]'s placement, which
+/// is why it counts from [`midi_loop_origin_s`] and not from `start_s`.
+pub fn fold_into_midi_pass(start_s: f64, len_s: f64, loop_s: f64, offset_s: f64, t: f64) -> f64 {
+    if !(loop_s > 1.0e-6) || !loop_s.is_finite() || !t.is_finite() || !len_s.is_finite() {
+        return t;
+    }
+    if t < start_s || t >= start_s + len_s {
+        return t;
+    }
+    let origin = midi_loop_origin_s(start_s, offset_s);
+    // **A second on the boundary is the TOP of the next pass.** `t - origin`
+    // is a difference of two sums and lands a hair short of a whole number of
+    // loops as often as on it - 8.7 - 4.7 is 3.9999999999999996 - and the
+    // remainder of that is a whole loop less a hair: the line flashed to the
+    // loop bar on the frame a pass began, and Enter on a bar line wrote at
+    // the loop's END. Within a nanosecond of the turn is the turn.
+    let mut phase = (t - origin).rem_euclid(loop_s);
+    if loop_s - phase < 1.0e-9 {
+        phase = 0.0;
+    }
+    let folded = origin + phase;
+    if folded.is_finite() {
+        folded
+    } else {
+        t
+    }
 }
 
 /// **A MIDI clip's notes as the SONG hears them**: every loop pass spelled
@@ -5377,6 +5499,70 @@ mod tests {
             .map(|n| n.at_s - flush.start_s)
             .collect();
         assert_eq!(at, vec![0.0, 4.0], "an untrimmed loop changed: {at:?}");
+    }
+
+    /// **A clip repeats when the picture shows a seam inside it** - glue's
+    /// "one clip is enough" and the arrangement's notch ask one rule. A MIDI
+    /// clip trimmed into its loop turns over `offset mod loop` sooner, so it
+    /// can repeat inside a span no longer than one loop; an audio clip plays
+    /// the same trimmed seconds every pass and turns over a whole loop in.
+    #[test]
+    fn a_clip_repeats_where_its_seam_falls() {
+        let midi = ArrClip { kind: ClipKind::Midi, len_s: 2.0, loop_s: 2.0, offset_s: 0.5, ..Default::default() };
+        assert!(midi.repeats(), "a trimmed MIDI loop turns over 1.5 s in, inside its 2 s");
+        assert_eq!(first_pass_s(true, 2.0, 2.0, 0.5), Some(1.5));
+        let audio = ArrClip { kind: ClipKind::Audio, ..midi.clone() };
+        assert!(!audio.repeats(), "an audio clip one loop long plays one pass");
+        let untrimmed = ArrClip { offset_s: 0.0, ..midi.clone() };
+        assert!(!untrimmed.repeats(), "one untrimmed loop's worth is one pass");
+        assert!(ArrClip { len_s: 4.5, ..untrimmed.clone() }.repeats());
+        assert!(!ArrClip { loop_s: 0.0, ..midi }.repeats(), "a clip with no loop never repeats");
+    }
+
+    /// **The fold is the schedule, backwards.** Every note the song plays out
+    /// of a looping MIDI clip folds onto the spot the roll draws that note,
+    /// untrimmed and trimmed by less or more than a loop - which is what puts
+    /// the editor's playhead on the note that is sounding, pass after pass.
+    ///
+    /// And nothing folds outside the clip, or on a clip that does not loop:
+    /// there is no pass to be in, and the song's second is the truth.
+    #[test]
+    fn a_played_note_folds_onto_where_the_roll_draws_it() {
+        let notes: Vec<ArrNote> = [0.0, 0.25, 0.5, 0.9]
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| ArrNote { at_s: at, dur_s: 0.1, key: 60 + i as u8, vel: 100, muted: false })
+            .collect();
+        for offset in [0.0, 0.3, 1.0, 2.7] {
+            let clip = ArrClip {
+                kind: ClipKind::Midi,
+                notes: notes.clone(),
+                start_s: 5.0,
+                offset_s: offset,
+                len_s: 7.0,
+                loop_s: 1.0,
+                ..Default::default()
+            };
+            let played = clip_notes_in_song_time(&clip);
+            assert!(played.len() >= 20, "offset {offset}: only {} notes played", played.len());
+            for p in played {
+                let src = clip.notes.iter().find(|n| n.key == p.key).expect("a played note has a source");
+                let drawn = clip.start_s + (src.at_s - clip.offset_s);
+                let folded = clip.midi_fold_s(p.at_s);
+                assert!(
+                    (folded - drawn).abs() < 1.0e-9,
+                    "offset {offset}: key {} played at {} folded to {folded}, drawn at {drawn}",
+                    p.key,
+                    p.at_s
+                );
+            }
+            // Before the clip and past its end, the song's own second.
+            for t in [4.0, 12.0, 13.5] {
+                assert_eq!(clip.midi_fold_s(t), t, "offset {offset}: folded {t} outside the clip");
+            }
+        }
+        let once = ArrClip { kind: ClipKind::Midi, start_s: 5.0, len_s: 7.0, loop_s: 0.0, ..Default::default() };
+        assert_eq!(once.midi_fold_s(9.5), 9.5, "a clip that does not loop was folded");
     }
 
     /// **Every meaningful change moves the fingerprint.**
