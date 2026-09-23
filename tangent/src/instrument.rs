@@ -6398,7 +6398,7 @@ fn automation_now(
 /// The whole-desk snapshot [`fill_clip_span`] builds was given up on purpose.
 /// Anything later wanting pre-rack timeline audio for the whole desk should
 /// call this once per lane rather than reintroduce a buffer beside it.
-fn pull_lane_clips(
+pub(crate) fn pull_lane_clips(
     clips: &[Placed],
     ch: usize,
     at: u64,

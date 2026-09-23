@@ -3262,17 +3262,13 @@ fn warped_clip_audio(
     path: &std::path::Path,
     cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
 ) -> Arc<tangent_record::decode::Clip> {
-    if clip.warp.len() < 2 {
+    let Some(sig) = warp_sig(clip) else {
         return decoded;
-    }
-    let (f0, t0) = clip.warp[0];
-    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    };
     let key: StretchKey = (
         path.to_path_buf(),
         i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        // The FIT is in the key: without it, switching a clip from stretch
-        // to slice would hand back the render made the other way.
-        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
+        sig,
     );
     if let Some(c) = cache.get(&key) {
         return Arc::clone(c);
@@ -3359,15 +3355,11 @@ fn warp_plan(
     clip: &tangent_ui::arrangement::ArrClip,
     path: &std::path::Path,
 ) -> Option<(StretchKey, Vec<crate::warp::Anchor>, crate::stretch::Mode, crate::warp::Fit)> {
-    if clip.warp.len() < 2 {
-        return None;
-    }
-    let (f0, t0) = clip.warp[0];
-    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    let sig = warp_sig(clip)?;
     let key: StretchKey = (
         path.to_path_buf(),
         i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit),
+        sig,
     );
     let anchors = clip
         .warp
@@ -3393,14 +3385,39 @@ fn stretch_key(
         return None;
     }
     let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
+    // **The warp is part of WHAT was stretched.** A warped clip is stretched
+    // after its warp, so its stretch is a render of the warped audio - and
+    // under a key of file, ratio and mode alone, undoing a quantize on a
+    // stretched clip found that render still standing and went on playing
+    // the warp that had just been taken away.
+    let what = match warp_sig(clip) {
+        Some(sig) => format!("{}|{sig}", mode.key()),
+        None => mode.key().to_owned(),
+    };
     Some((
         (
             path.to_path_buf(),
             (clip.stretch * 1.0e6).round() as i64,
-            mode.key().to_owned(),
+            what,
         ),
         mode,
     ))
+}
+
+/// **A warp map's identity, as the caches key it**, or `None` for a clip
+/// that is not warped. The map's extent and length plus the FIT, which is
+/// enough: two maps over one file agreeing on their first anchor, their last
+/// and how many they had would have to be the same map to matter, and the
+/// fit is in because switching a clip from stretch to slice must not hand
+/// back the render made the other way. One spelling, for the warp's own
+/// entry and for the stretch made from it.
+fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
+    if clip.warp.len() < 2 {
+        return None;
+    }
+    let (f0, t0) = clip.warp[0];
+    let (f1, t1) = clip.warp[clip.warp.len() - 1];
+    Some(format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit))
 }
 
 // **This attribute belongs to the IMPL, not to what is above it.** It was
@@ -5850,6 +5867,12 @@ impl DesktopApp {
                     }
                 }
                 R::NormalizeClips(ids) => self.normalize_clips(&ids),
+                // Behind the cover: a weld decodes, can render a pending warp
+                // or stretch, mixes and writes a file, all on this thread.
+                R::GlueAudio(ids) => {
+                    let detail = format!("{} clip(s)", ids.len());
+                    self.announce(ctx, "Gluing clips", Some(detail), Chore::GlueAudio(ids));
+                }
                 R::CopyInsert { from_strip, from_bay, to_strip, to_bay } => {
                     self.copy_insert(from_strip, from_bay, to_strip, to_bay);
                 }
@@ -12604,6 +12627,160 @@ impl DesktopApp {
         );
     }
 
+    /// **Weld audio clips on one track into one clip, and one file.**
+    ///
+    /// The owner: "Audio clips don't glue." MIDI welds by copying notes; audio
+    /// has to be RENDERED, and rendered exactly as it plays or the weld
+    /// changes the sound. So nothing here is a second opinion about what a
+    /// clip sounds like: every clip goes through the same three steps
+    /// playback takes - the decode `reload_clips` keeps warm, the warp and
+    /// stretch of `stretched_clip_audio`, the passes of `audio_clip_passes`
+    /// with the clip's own gain - and the lot is mixed by the engine's own
+    /// `pull_lane_clips`, the function the audio thread calls for this lane.
+    /// Overlaps sum, gaps are silence, fades and loops land where they play.
+    ///
+    /// The file is a Float32 WAV at the engine's rate, which the decoder
+    /// reads back natively and bit for bit, so the glued clip - no trim, no
+    /// fade, unity gain, a loop over its own length - plays the same samples
+    /// the clips did. Written into the project's `media/` beside the takes,
+    /// through `materialize_project_dir`, the one door that makes a scratch
+    /// real with its kit.
+    #[cfg(feature = "recorder")]
+    fn glue_audio_clips(&mut self, ids: &[u64]) {
+        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+            self.app.notify(Kind::Info, "Nothing to glue into - no project is open.");
+            return;
+        };
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        let doc = self.app.arrangement().clone();
+        let picked: Vec<&tangent_ui::arrangement::ArrClip> = doc
+            .clips
+            .iter()
+            .filter(|c| ids.contains(&c.id) && c.kind == tangent_ui::arrangement::ClipKind::Audio)
+            .collect();
+        let Some(first) = picked.first() else {
+            self.app.notify(Kind::Info, "Nothing to glue - select audio clips first.");
+            return;
+        };
+        let lane = first.lane;
+        if picked.iter().any(|c| c.lane != lane) {
+            self.app.notify(Kind::Info, "Glue works on one track at a time.");
+            return;
+        }
+        // The warp and stretch renders playback already made, reused rather
+        // than made again: the live cache holds each beside its picture, and
+        // `stretched_clip_audio` - the road the export takes too - wants the
+        // audio alone. Anything missing is rendered here, as the export does.
+        let mut renders: std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>> = self
+            .stretch_cache
+            .iter()
+            .map(|(k, d)| (k.clone(), Arc::clone(&d.clip)))
+            .collect();
+        let mut placed: Vec<crate::instrument::Placed> = Vec::new();
+        for clip in &picked {
+            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let decoded = match self.track_cache.get(&path) {
+                Some(d) => Arc::clone(&d.clip),
+                None => match tangent_record::decode::decode(&path, rate) {
+                    Ok(c) => {
+                        let c = Decoded::of(c);
+                        let clip = Arc::clone(&c.clip);
+                        self.track_cache.insert(path.clone(), c);
+                        clip
+                    }
+                    Err(e) => {
+                        self.app.notify(
+                            Kind::Error,
+                            format!("Could not glue - {} did not decode: {e}", clip.name),
+                        );
+                        return;
+                    }
+                },
+            };
+            let audio = stretched_clip_audio(clip, decoded, &path, &mut renders);
+            placed.extend(audio_clip_passes(clip, &audio, f64::from(rate), clip.gain as f32));
+        }
+        // The earliest clip's head is the file's first frame; the last pass's
+        // end is its last.
+        let start_s = picked.iter().map(|c| c.start_s).fold(f64::INFINITY, f64::min);
+        let from = frames_at(f64::from(rate), start_s);
+        let to = placed.iter().map(|p| p.start.saturating_add(p.len)).max().unwrap_or(from);
+        if to <= from {
+            self.app.notify(Kind::Info, "Nothing to glue - those clips hold no audio.");
+            return;
+        }
+        if (to - from) as usize > tangent_record::decode::MAX_FRAMES {
+            // The ceiling is in FRAMES, so in minutes it is this rate's.
+            self.app.notify(
+                Kind::Info,
+                format!(
+                    "That weld would run past {} minutes, longer than a clip can be - glue a shorter stretch.",
+                    tangent_record::decode::MAX_FRAMES / 60 / rate.max(1) as usize
+                ),
+            );
+            return;
+        }
+        self.app.materialize_project_dir();
+        let Some(media) = doc_path.parent().map(|d| d.join("media")) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&media);
+        // **A name nothing answers to yet** - not on disk, and not named by
+        // any clip in the document either. A clip whose file has gone missing
+        // still names it, and a weld written under that name would bring the
+        // old clip back to life playing the new audio, while the refusal the
+        // missing file left in `warm_refused` kept the NEW clip silent.
+        let named: std::collections::HashSet<&str> =
+            doc.clips.iter().map(|c| c.path.as_str()).collect();
+        let name = glue_file_name(&media, &sanitize_file_stem(&first.name), &named);
+        let file = media.join(&name);
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: rate,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let lane_ch = lane.min(tangent_ui::recorder::CHANNELS - 1);
+        let written = tangent_record::wav::WavWriter::create(&file, spec, &bext).and_then(|mut w| {
+            render_placed_span(&placed, lane_ch, from, to, |block| w.write_interleaved(block))?;
+            w.finish()
+        });
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&file);
+            self.app.notify(Kind::Error, format!("Could not write the glued clip: {e}"));
+            return;
+        }
+        // Whatever this path was remembered as - refused, or decoded as some
+        // other file that once stood here - it is this file now.
+        self.track_cache.remove(&file);
+        self.warm_refused.remove(&file);
+        self.refused_why.remove(&file);
+        let glued_ids: Vec<u64> = picked.iter().map(|c| c.id).collect();
+        let count = glued_ids.len();
+        self.app.finish_audio_glue(
+            &glued_ids,
+            tangent_ui::arrangement::GluedAudio {
+                lane,
+                path: format!("media/{name}"),
+                start_s,
+                len_s: (to - from) as f64 / f64::from(rate),
+                name: format!("{} glued", first.name),
+            },
+        );
+        self.app.notify(
+            Kind::Success,
+            if count == 1 {
+                format!("Glued the loop into {name}")
+            } else {
+                format!("Glued {count} clips into {name}")
+            },
+        );
+    }
+
     /// Copy one bay's effect to another channel's next free bay, with the
     /// settings it is playing at right now.
     ///
@@ -15283,22 +15460,80 @@ fn unique_ir_stem(dir: &std::path::Path, stem: &str) -> String {
     stem.to_owned()
 }
 
+/// **The glued file's name**: `<stem>-glued-<n>.wav`, the first `n` that is
+/// neither on disk in `media` nor named by any clip in the document (`named`
+/// holds the clips' `path`s, `media/<file>`). A clip whose file went missing
+/// still names it, and a weld written there would bring that clip back to
+/// life playing the new audio.
+#[cfg(feature = "recorder")]
+fn glue_file_name(
+    media: &std::path::Path,
+    stem: &str,
+    named: &std::collections::HashSet<&str>,
+) -> String {
+    (1..10_000)
+        .map(|n| format!("{stem}-glued-{n}.wav"))
+        .find(|cand| !media.join(cand).exists() && !named.contains(format!("media/{cand}").as_str()))
+        .unwrap_or_else(|| format!("{stem}-glued.wav"))
+}
+
+/// **A lane's placed clips over `[from, to)`, mixed exactly as the engine
+/// mixes them**, handed to `sink` as interleaved stereo blocks.
+///
+/// `pull_lane_clips` is the audio thread's own lane mix - the same fades, the
+/// same gain clamp, overlaps summed - so a render made here IS what the lane's
+/// clips play, before its rack. Blocked, so a weld of minutes never holds the
+/// whole thing twice.
+#[cfg(feature = "recorder")]
+fn render_placed_span(
+    placed: &[crate::instrument::Placed],
+    lane: usize,
+    from: u64,
+    to: u64,
+    mut sink: impl FnMut(&[f32]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    const BLOCK: usize = 16_384;
+    let mut planar = vec![vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]];
+    let mut inter = vec![0.0f32; BLOCK * 2];
+    let mut at = from;
+    while at < to {
+        let n = usize::try_from(to - at).map_or(BLOCK, |left| left.min(BLOCK));
+        crate::instrument::pull_lane_clips(placed, lane, at, n, u64::MAX, &mut planar);
+        for f in 0..n {
+            inter[2 * f] = planar[0][f];
+            inter[2 * f + 1] = planar[1][f];
+        }
+        sink(&inter[..2 * n])?;
+        at += n as u64;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "recorder")]
 /// A file stem the filesystem will take: separators out, trimmed, never
 /// empty.
+///
+/// **Every system's filesystem, not only this one's.** A project is a folder
+/// that travels, and Windows refuses `< > : " | ? *` and control characters
+/// where macOS and Linux shrug; a clip or an export named with any of them
+/// wrote here and failed there. And Windows drops a trailing dot, so a stem
+/// ending in one names a different file than the one written.
 #[cfg(feature = "recorder")]
 fn sanitize_file_stem(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
-            if std::path::is_separator(c) || c == ':' {
+            if std::path::is_separator(c)
+                || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+                || c.is_control()
+            {
                 '-'
             } else {
                 c
             }
         })
         .collect();
-    let s = s.trim();
+    let s = s.trim().trim_end_matches('.').trim();
     if s.is_empty() {
         "mix".to_owned()
     } else {
@@ -19747,6 +19982,9 @@ enum Chore {
     /// then the receipt every save raises. See `SavePurpose::ProjectFirst`
     /// and `TangentApp::save_project_first`.
     SaveFirst(std::path::PathBuf),
+    /// Weld audio clips into one - see `glue_audio_clips`. A decode, perhaps
+    /// a warp or stretch render, a mix and a file write, all on this thread.
+    GlueAudio(Vec<u64>),
     /// The realtime pass landed: copy it out, run the format pass, say where.
     FinishBounce {
         folder: String,
@@ -20550,6 +20788,7 @@ impl DesktopApp {
                 }
             }
             Chore::WriteExport => self.write_export(),
+            Chore::GlueAudio(ids) => self.glue_audio_clips(&ids),
             Chore::FinishFreeze => self.finish_freeze(),
             Chore::RescanPlugins => self.rescan_plugins(),
             Chore::SaveCopy(path) => {
@@ -23372,6 +23611,239 @@ mod tests {
         assert!(!discard_scratch_made_here(true, Some(&recorded), &root));
         assert!(recorded.exists(), "Don't Save deleted a recording");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An audio clip for the glue tests: everything playback reads, spelled.
+    fn glue_clip(
+        id: u64,
+        start_s: f64,
+        offset_s: f64,
+        len_s: f64,
+        loop_s: f64,
+        fades: (f64, f64),
+        gain: f64,
+    ) -> tangent_ui::arrangement::ArrClip {
+        tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            lane: 2,
+            path: format!("clip-{id}.wav"),
+            start_s,
+            offset_s,
+            len_s,
+            loop_s,
+            fade_in_s: fades.0,
+            fade_out_s: fades.1,
+            name: format!("C{id}"),
+            id,
+            gain,
+            ..Default::default()
+        }
+    }
+
+    /// A decoded file whose every sample is different, so a weld that put
+    /// one sample in the wrong place could not pass by accident.
+    fn glue_file(frames: usize, seed: f32) -> Arc<tangent_record::decode::Clip> {
+        Arc::new(tangent_record::decode::Clip {
+            samples: (0..frames * 2).map(|i| ((i as f32 + seed) * 0.013).sin() * 0.5).collect(),
+            rate: 8_000,
+            source: std::path::PathBuf::from("g.wav"),
+        })
+    }
+
+    /// **A glued clip plays the samples its clips did, to the bit.**
+    ///
+    /// The owner: "Audio clips don't glue." The weld is rendered by the
+    /// engine's own lane mix over the passes playback schedules, so a clip
+    /// trimmed, looped three times with fades, turned down, overlapped by
+    /// another turned up, and followed after a gap by a third, becomes one
+    /// file - and that file, placed as the glued clip is placed (no trim, no
+    /// fade, unity gain, a loop over its own length), must play back
+    /// sample-identical to what the three clips played. Silence where the gap
+    /// was; nothing lost off either end.
+    #[test]
+    fn a_glued_clip_plays_the_samples_its_clips_did() {
+        let rate = 8_000u32;
+        let r = f64::from(rate);
+        let sources = [
+            (glue_clip(1, 1.0, 0.2, 1.5, 0.5, (0.05, 0.1), 0.5), glue_file(12_000, 0.0)),
+            (glue_clip(2, 2.0, 0.0, 1.0, 1.0, (0.0, 0.0), 1.2), glue_file(8_000, 7.0)),
+            (glue_clip(3, 4.0, 0.0, 0.5, 0.5, (0.0, 0.05), 1.0), glue_file(8_000, 99.0)),
+        ];
+        let mut placed = Vec::new();
+        for (clip, file) in &sources {
+            placed.extend(audio_clip_passes(clip, file, r, clip.gain as f32));
+        }
+        let from = frames_at(r, 1.0);
+        let to = placed.iter().map(|p| p.start + p.len).max().unwrap();
+        assert_eq!(to, frames_at(r, 4.5), "the weld does not reach the last clip's end");
+        let mut welded = Vec::new();
+        render_placed_span(&placed, 2, from, to, |b| {
+            welded.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(welded.len(), (to - from) as usize * 2);
+        // The gap between the second clip's end (3.0 s) and the third's head
+        // (4.0 s) is silence, and the clips around it are not.
+        let at = |s: f64| (frames_at(r, s) - from) as usize * 2;
+        assert!(welded[at(3.1)..at(3.9)].iter().all(|v| *v == 0.0), "the gap is not silent");
+        assert!(welded[at(1.2)..at(1.4)].iter().any(|v| *v != 0.0), "the first clip is missing");
+        assert!(welded[at(4.1)..at(4.3)].iter().any(|v| *v != 0.0), "the last clip is missing");
+
+        // The glued clip, as `finish_audio_glue` makes it, over that file.
+        let len_s = (to - from) as f64 / r;
+        let glued = glue_clip(9, 1.0, 0.0, len_s, len_s, (0.0, 0.0), 1.0);
+        let file = Arc::new(tangent_record::decode::Clip {
+            samples: welded.clone(),
+            rate,
+            source: std::path::PathBuf::from("glued.wav"),
+        });
+        let replay = audio_clip_passes(&glued, &file, r, glued.gain as f32);
+        assert_eq!(replay.len(), 1, "the glued clip is one pass");
+        let mut heard = Vec::new();
+        render_placed_span(&replay, 2, from, to, |b| {
+            heard.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            heard.iter().zip(&welded).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the glued clip does not play the samples its clips did"
+        );
+    }
+
+    /// **A Float32 WAV at the engine's rate comes back bit for bit** - the
+    /// half of "the glued clip sounds the same" that is the file. The glue
+    /// writes exactly this and the decoder reads it natively.
+    #[test]
+    fn a_float_wav_at_the_engine_rate_decodes_bit_for_bit() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-glue-wav-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("glued.wav");
+        let samples: Vec<f32> = (0..9_000).map(|i| ((i as f32) * 0.37).sin() * 0.7).collect();
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let mut w = tangent_record::wav::WavWriter::create(&file, spec, &bext).unwrap();
+        w.write_interleaved(&samples).unwrap();
+        w.finish().unwrap();
+        let back = tangent_record::decode::decode(&file, 48_000).expect("the glued file decodes");
+        assert_eq!(back.samples.len(), samples.len());
+        assert!(
+            back.samples.iter().zip(&samples).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the glued file came back changed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The glue takes the roads playback takes, and no other.** A source
+    /// scan, because `DesktopApp` cannot be built in a test: the decode cache,
+    /// `stretched_clip_audio` for warp and stretch, `audio_clip_passes` with
+    /// the clip's own gain, the engine's mix through `render_placed_span`,
+    /// and the one door that makes a scratch real before the file is written.
+    /// A glue that did any of these its own way would weld a clip that sounds
+    /// different from the clips it replaced.
+    #[test]
+    fn the_glue_renders_through_playbacks_own_roads() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn glue_audio_clips(&mut self").expect("the glue");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        for road in [
+            "self.track_cache.get(&path)",
+            "stretched_clip_audio(clip, decoded, &path, &mut renders)",
+            "audio_clip_passes(clip, &audio, f64::from(rate), clip.gain as f32)",
+            "render_placed_span(&placed, lane_ch, from, to,",
+            "format: tangent_record::wav::SampleFormat::Float32",
+        ] {
+            assert!(body.contains(road), "the glue no longer goes through `{road}`");
+        }
+        for forget in [
+            "self.track_cache.remove(&file);",
+            "self.warm_refused.remove(&file);",
+            "self.refused_why.remove(&file);",
+            "glue_file_name(&media, &sanitize_file_stem(&first.name), &named)",
+        ] {
+            assert!(body.contains(forget), "the glue no longer does `{forget}`");
+        }
+        let door = body.find("self.app.materialize_project_dir();").expect("the glue makes its folder behind the door");
+        let write = body.find("WavWriter::create").expect("the write");
+        assert!(door < write, "the glue writes before the folder is made real");
+        assert!(
+            src.contains("self.announce(ctx, \"Gluing clips\", Some(detail), Chore::GlueAudio(ids));")
+                && src.contains("Chore::GlueAudio(ids) => self.glue_audio_clips(&ids),"),
+            "the glue request is not answered behind the busy cover"
+        );
+    }
+
+    /// **A stretch of warped audio is not a stretch of the file.** The
+    /// stretch is made from the warped render, so its cache key names the
+    /// warp: under file, ratio and mode alone, undoing a quantize on a
+    /// stretched clip went on playing the warp that had just been undone -
+    /// and glue, which renders what playback plays, would have baked it in.
+    #[test]
+    fn a_stretch_of_a_warp_is_keyed_apart_from_a_stretch_of_the_file() {
+        let path = std::path::Path::new("take.wav");
+        let plain = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            stretch: 1.5,
+            ..Default::default()
+        };
+        let warped = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, 0), (4_800, 5_000), (9_600, 9_600)],
+            ..plain.clone()
+        };
+        let (a, _) = stretch_key(&plain, path).expect("a stretched clip has a key");
+        let (b, _) = stretch_key(&warped, path).expect("a stretched clip has a key");
+        assert_ne!(a, b, "the warped and unwarped stretches share a cache entry");
+        // Undoing the warp is back to the plain key exactly.
+        let undone = tangent_ui::arrangement::ArrClip { warp: Vec::new(), ..warped };
+        assert_eq!(stretch_key(&undone, path).unwrap().0, a);
+    }
+
+    /// **The glued file's name answers to nothing yet**: not a file on disk,
+    /// and not a path some clip in the document still names - a clip whose
+    /// file went missing would otherwise wake up playing the weld.
+    #[test]
+    fn a_glued_files_name_is_one_nothing_answers_to() {
+        let media = std::env::temp_dir().join(format!(
+            "tangent-glue-name-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&media);
+        std::fs::create_dir_all(&media).unwrap();
+        let none = std::collections::HashSet::new();
+        assert_eq!(glue_file_name(&media, "take", &none), "take-glued-1.wav");
+        std::fs::write(media.join("take-glued-1.wav"), b"x").unwrap();
+        assert_eq!(glue_file_name(&media, "take", &none), "take-glued-2.wav", "a file on disk was overwritten");
+        let named: std::collections::HashSet<&str> = ["media/take-glued-2.wav"].into_iter().collect();
+        assert_eq!(
+            glue_file_name(&media, "take", &named),
+            "take-glued-3.wav",
+            "a name a missing clip still holds was reused"
+        );
+        let _ = std::fs::remove_dir_all(&media);
+    }
+
+    /// **A file stem every system can write.** A clip or an export named with
+    /// a character Windows refuses wrote here and failed there.
+    #[test]
+    fn a_file_stem_is_one_every_system_can_write() {
+        assert_eq!(sanitize_file_stem("take 1"), "take 1");
+        assert_eq!(sanitize_file_stem("a/b\\c:d"), "a-b-c-d");
+        assert_eq!(sanitize_file_stem("what? <mix> \"v2\" | *final*"), "what- -mix- -v2- - -final-");
+        assert_eq!(sanitize_file_stem("tab\tbell\u{7}"), "tab-bell-");
+        assert_eq!(sanitize_file_stem("ends with a dot."), "ends with a dot");
+        assert_eq!(sanitize_file_stem("  ...  "), "mix");
     }
 
     /// **A staged template takes the shelf's place, and a failure leaves one

@@ -2884,6 +2884,11 @@ fn copy_kit_samples(
     }
 }
 
+/// **Why glue said no**, in one place, for both roads through it.
+const GLUE_NEEDS: &str = "Glue needs two or more clips on one track, or one that \
+     repeats - pull a clip's edge past its first pass and glue welds the \
+     repeats into it.";
+
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
 ///
 /// Counted rather than timestamped: "Untitled 3" is a name a person can say
@@ -16010,6 +16015,109 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **The audio half of glue**: `true` when the selection held audio and
+    /// this answered it - with a request to the host, or with a refusal that
+    /// says why. `false` leaves the selection to the MIDI road.
+    ///
+    /// The rules are MIDI glue's, so the two cannot come to different
+    /// opinions: two or more clips, or one that shows more than one pass; one
+    /// track; one kind. And not on a frozen track, whose clips are not what
+    /// it plays.
+    fn arr_glue_audio(&mut self, ids: &[u64]) -> bool {
+        let picked: Vec<&crate::arrangement::ArrClip> =
+            self.arrangement.clips.iter().filter(|c| ids.contains(&c.id)).collect();
+        let audio: Vec<&crate::arrangement::ArrClip> = picked
+            .iter()
+            .copied()
+            .filter(|c| c.kind == crate::arrangement::ClipKind::Audio)
+            .collect();
+        if audio.is_empty() {
+            return false;
+        }
+        if audio.len() != picked.len() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Glue works on one kind of clip at a time - audio, or MIDI.",
+            );
+            return true;
+        }
+        let one_worth_gluing = audio.len() == 1 && audio[0].repeats();
+        if audio.len() < 2 && !one_worth_gluing {
+            self.notify(crate::notify::Kind::Info, GLUE_NEEDS);
+            return true;
+        }
+        let lane = audio[0].lane;
+        if audio.iter().any(|c| c.lane != lane) {
+            self.notify(crate::notify::Kind::Info, "Glue works on one track at a time.");
+            return true;
+        }
+        if self.lane_frozen(lane).is_some() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "That track is frozen - unfreeze it to glue its clips.",
+            );
+            return true;
+        }
+        let ids: Vec<u64> = audio.iter().map(|c| c.id).collect();
+        self.request_recorder(recorder::RecorderRequest::GlueAudio(ids));
+        true
+    }
+
+    /// **The host's answer to an audio glue**: the clips it was welded from
+    /// leave, and the one clip takes their place.
+    ///
+    /// The file holds everything the sources did - trim, passes, fades, gain,
+    /// warp and stretch, all rendered in - so the clip is a plain one: no
+    /// trim, no fade, unity gain, unstretched. And, like every clip the app
+    /// makes, a loop over its own length, so pulling its right edge lays the
+    /// welded phrase down again - the owner's ruling for glue: "Gluing two
+    /// items together regardless of status will now create a loop of those
+    /// two items, but as one clip now."
+    ///
+    /// The anchor carries over when the sources agree on one; a weld of
+    /// clips measured against different things is measured against time.
+    pub fn finish_audio_glue(&mut self, ids: &[u64], glued: crate::arrangement::GluedAudio) {
+        let anchors: Vec<crate::arrangement::Anchor> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| ids.contains(&c.id))
+            .map(|c| c.anchor)
+            .collect();
+        let anchor = match anchors.split_first() {
+            Some((a, rest)) if rest.iter().all(|b| b == a) => *a,
+            _ => crate::arrangement::Anchor::default(),
+        };
+        self.arrangement.clips.retain(|c| !ids.contains(&c.id));
+        let len_s = glued.len_s.max(0.05);
+        self.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
+            pedal: Vec::new(),
+            lane: glued.lane,
+            path: glued.path,
+            start_s: glued.start_s,
+            offset_s: 0.0,
+            len_s,
+            loop_s: len_s,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: glued.name,
+            id: 0,
+            anchor,
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            warp: Vec::new(),
+            warp_fit: String::new(),
+            gain: 1.0,
+            extra: Default::default(),
+        });
+        self.arr_multi.clear();
+        self.arr_selected = None;
+        self.arr_save_edits();
+    }
+
     /// Ask the host to normalise whatever audio is selected.
     ///
     /// **Glue the selected clips on ONE track into a single clip.**
@@ -16037,6 +16145,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// One track at a time. Clips on different lanes cannot become one clip,
     /// and quietly gluing the ones that happen to share a lane would be a
     /// command that does something other than what was asked.
+    ///
+    /// **Audio glues too**, by the same rules - the owner: "Audio clips don't
+    /// glue". Welding audio means RENDERING, so it is the host's to do (see
+    /// `RecorderRequest::GlueAudio`); this side decides whether the selection
+    /// can be glued at all and says why not in the same words.
     fn arr_glue_selection(&mut self) {
         let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
         if let Some(one) = self.arr_selected {
@@ -16044,8 +16157,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ids.push(one);
             }
         }
-        // MIDI only: welding two audio files means rendering, which is a
-        // different operation with a different cost.
+        if self.arr_glue_audio(&ids) {
+            return;
+        }
+        // MIDI from here on; the audio road above has had its turn.
         let mut picked: Vec<crate::arrangement::ArrClip> = self
             .arrangement
             .clips
@@ -16070,21 +16185,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A clip with no second pass is refused as before, and now says why
         // in the same breath, because "select two or more" was a lie the
         // moment one could be enough.
-        let one_worth_gluing = picked.len() == 1
-            && picked[0].loop_s > 1.0e-6
-            && picked[0].len_s > picked[0].loop_s + 1.0e-9;
+        // The seam the picture draws, trim and all - see `ArrClip::repeats`.
+        let one_worth_gluing = picked.len() == 1 && picked[0].repeats();
         if picked.len() < 2 && !one_worth_gluing {
             // **Not `report_take`.** These refusals went through the take
             // report because it was once the only way to say anything at all,
             // which meant they wore its title bar, and — worse — were
             // switched off by the setting that suppresses the after-a-take
             // receipt. A refusal to glue is neither a take nor a success.
-            self.notify(
-                crate::notify::Kind::Info,
-                "Glue needs two or more MIDI clips on one track, or one that \
-                 repeats — pull a clip's edge past its first pass and glue \
-                 welds the repeats into it.",
-            );
+            self.notify(crate::notify::Kind::Info, GLUE_NEEDS);
             return;
         }
         let lane = picked[0].lane;
@@ -17902,24 +18011,45 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         let id = st.id;
-        let Some(start) = self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.start_s)
+        // **Counted from where the passes are counted from**, which for a
+        // clip trimmed from its front is not its head - see
+        // `arrangement::midi_loop_origin_s`. The bar stood at `head + loop`
+        // and the loop turned over `offset` sooner, so on a trimmed part the
+        // bar and the sound disagreed about where the part ends.
+        let Some((start, origin)) = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.start_s, c.midi_loop_origin_s()))
         else {
             return;
         };
         if !t.is_finite() {
             return;
         }
-        let mut end = self.me_snap(t);
-        if end - start < Self::ME_LOOP_MIN_S {
+        // **The LENGTH is what snaps, laid from the clip's head.** A loop is
+        // a period, and a period that is not a whole number of grid steps
+        // walks the part off the bar a little further every pass. Snapping
+        // the bar's own position instead gave exactly that whenever the
+        // passes' origin sat off the grid - a take recorded off it and
+        // trimmed onto it - because the length is then the snapped end less
+        // an off-grid origin. Measured from the head, which a snapped trim
+        // put on the grid, the length is whole grid steps; on an untrimmed
+        // part the origin IS the head, and this is the old snap exactly.
+        let snap_len = |app: &Self, len: f64| app.me_snap(start + len) - start;
+        let mut len = snap_len(self, t - origin);
+        if len < Self::ME_LOOP_MIN_S {
             // Under the floor. With the magnet on, the answer is the first
             // grid line past the clip's head rather than the floor itself —
             // a loop dragged to its shortest should still be a note value,
             // not whatever fifty milliseconds happens to fall on. `max` after
             // it, because a grid fine enough (a 64th at 400bpm is nine
             // milliseconds) can land under the floor too, and the floor wins.
-            end = self.me_snap_ceil(start + Self::ME_LOOP_MIN_S);
-            end = end.max(start + Self::ME_LOOP_MIN_S);
+            len = self.me_snap_ceil(start + Self::ME_LOOP_MIN_S) - start;
+            len = len.max(Self::ME_LOOP_MIN_S);
         }
+        let end = origin + len;
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
@@ -17936,7 +18066,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // So the bar stops at the clip's end. It can still be dragged there
         // and no further, which is the same wall the roll's edge scroll keeps
         // and reads the same way under the hand.
-        let loop_s = (end - start).min(clip.len_s);
+        // The bar's wall is the clip's END, `start + len_s`, whatever the
+        // origin - so the longest loop is the clip plus the trim before it.
+        let loop_s = (end - origin).min(clip.len_s + (start - origin));
         if (clip.loop_s - loop_s).abs() < 1.0e-9 {
             return;
         }
@@ -18869,7 +19001,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 return;
             };
             let inside = play >= clip.start_s && play < clip.start_s + clip.len_s;
-            let raw = if inside { play } else { clip.start_s };
+            // Where the line is DRAWN in a loop (see `me_playhead`), and never
+            // before the clip's head, where nothing may be written.
+            let raw = if inside { clip.midi_fold_s(play).max(clip.start_s) } else { clip.start_s };
             (
                 // AT or after the playhead — see `me_snap_ceil`. Never
                 // behind it, which is where flooring put every paste.
@@ -19017,7 +19151,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A playhead parked outside the clip writes at the nearest end of it
         // rather than nowhere: the alternative is a key that silently does
         // nothing, which is the thing this editor's notes keep warning about.
-        let at = self.playhead_s().clamp(c0, c1 - 1.0e-6);
+        // Where the line is DRAWN, in a loop - see `me_playhead`.
+        let (at, shift) = self.me_playhead();
+        let at = at.clamp(c0, c1 - 1.0e-6);
         self.me_create_note(at, key);
         // **The mouse's create leaves a DRAG standing** so the hand can size
         // the note by pulling before it lets go. A keyboard insert has no
@@ -19025,13 +19161,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(st) = self.midi_edit.as_mut() {
             st.drag = None;
         }
+        // The end of the note just written, IN THE PASS THE SONG IS IN: the
+        // shift puts back the whole loops the fold took away, so a run of
+        // Enter on the third time round stays on the third time round.
         let to = self.arrangement.clips.iter().find(|c| c.id == id).and_then(|c| {
             let n = c.notes.last()?;
-            Some(c.start_s + (n.at_s - c.offset_s) + n.dur_s)
+            Some(c.start_s + (n.at_s - c.offset_s) + n.dur_s + shift)
         });
         if let Some(to) = to.filter(|t| *t < c1 - 1.0e-9) {
             self.me_locate(to);
         }
+    }
+
+    /// **The editor's playhead**: the song's second folded into the pass the
+    /// roll shows, and how far the song stands past it - a whole number of
+    /// loops, zero outside a loop.
+    ///
+    /// Everything that acts AT the playhead in the editor acts where the line
+    /// is drawn, or Enter on the third pass of a looping part wrote its note
+    /// two loops past the loop bar, where it sounds once instead of every
+    /// time round. And anything that then MOVES the playhead adds the shift
+    /// back, so the song stays in the pass it was in rather than jumping to
+    /// the first. See `arrangement::fold_into_midi_pass`.
+    fn me_playhead(&self) -> (f64, f64) {
+        let raw = self.playhead_s();
+        let folded = self
+            .midi_edit
+            .as_ref()
+            .and_then(|st| self.arrangement.clips.iter().find(|c| c.id == st.id))
+            .map_or(raw, |c| c.midi_fold_s(raw));
+        (folded, raw - folded)
     }
 
     /// Put the playhead here, on the engine and on this side at once.
@@ -19064,7 +19223,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         let view = self.midi_edit_view(st, clip);
-        let at = self.playhead_s();
+        // From where the line is DRAWN, so the hand walks the grid it can
+        // see; the shift carries the song along in its own pass.
+        let (at, shift) = self.me_playhead();
         // Through the snapper, so a swung grid walks its own uneven lines
         // rather than a uniform hop that lands between them.
         let to = if view.snap_on {
@@ -19077,7 +19238,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             at + steps * crate::midi_editor::grid_step_s(&view).max(0.01)
         };
         let (c0, c1) = (clip.start_s, clip.start_s + clip.len_s);
-        self.me_locate(to.clamp(c0, c1));
+        // **Across the turn of the loop**, a step lands on the other pass's
+        // own grid. Right over the bar is the top of the next pass - the grid
+        // line past the bar is past the loop and, where the loop is not whole
+        // grid steps, folds back between two of the roll's lines. Left from
+        // the top is the previous pass's last line, for the same reason.
+        let looped = clip.loop_s > 1.0e-6 && (c0..c1).contains(&self.playhead_s());
+        let to = if looped && view.snap_on {
+            let top = clip.midi_loop_origin_s();
+            let turn = top + clip.loop_s;
+            if steps > 0.0 && to > turn + 1.0e-9 {
+                turn
+            } else if steps < 0.0 && at <= top + 1.0e-9 {
+                crate::midi_editor::snap_floor_t(&view, turn - 1.0e-6) - clip.loop_s
+            } else {
+                to
+            }
+        } else if looped {
+            to.min(clip.midi_loop_origin_s() + clip.loop_s)
+        } else {
+            to
+        };
+        self.me_locate((to + shift).clamp(c0, c1));
     }
 
     /// **How long a cursor step is held**, seconds.
@@ -19325,7 +19507,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let at = self.playhead_s();
+        // Where the line is drawn - see `me_playhead`.
+        let (at, _) = self.me_playhead();
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
@@ -19503,7 +19686,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
-        let head = self.playhead_s();
+        // Where the line is drawn, and the loops the song stands past it -
+        // see `me_playhead`.
+        let (head, shift) = self.me_playhead();
         let start_of = |n: &crate::arrangement::ArrNote| clip.start_s + (n.at_s - clip.offset_s);
         if sel.is_empty() {
             let last = clip
@@ -19529,12 +19714,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .map(start_of)
             .fold(f64::INFINITY, f64::min);
         let floor = clip.start_s;
+        let (c1, lp) = (clip.start_s + clip.len_s, clip.loop_s);
         if let Some(st) = self.midi_edit.as_mut() {
             st.selected = sel;
         }
         self.me_delete_selected();
         if back.is_finite() {
-            self.me_locate(back.max(floor));
+            // In the pass the song is in - and where the last, PARTIAL pass
+            // has no such place, in the pass before it, rather than past the
+            // clip's end.
+            let mut to = back.max(floor) + shift;
+            while lp > 1.0e-6 && to >= c1 - 1.0e-9 && to - lp >= floor - 1.0e-9 {
+                to -= lp;
+            }
+            self.me_locate(to);
         }
     }
 
@@ -19729,7 +19922,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             bpm: f64::from(self.tempo_bpm()),
             sig_top: u32::from(sig.beats),
             sig_bottom: u32::from(sig.unit),
-            playhead_s: self.recorder.position_s,
+            // **Folded into the pass the roll shows.** The roll draws a
+            // looping clip's notes once and the repeats happen out on the
+            // timeline, so the song's own second walked off the end of the
+            // part while the part played on from its top. See
+            // `arrangement::fold_into_midi_pass`.
+            playhead_s: clip.midi_fold_s(self.recorder.position_s),
+            song_s: self.recorder.position_s,
             dark: self.settings.me_dark,
             pad_names: {
                 let drum_lane = (0..recorder::CHANNELS).find(|n| {
@@ -22161,7 +22360,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 });
                 if minus || equals {
                     let factor = if minus { 1.3 } else { 1.0 / 1.3 };
-                    let anchor = self.recorder.position_s;
+                    // Around the line as DRAWN: in a loop the song's own
+                    // second can be passes to the right of anything on the
+                    // roll, and a zoom there pushes the notes off screen.
+                    let (anchor, _) = self.me_playhead();
                     if let Some(st) = self.midi_edit.as_mut() {
                         let len = (st.view_len_s * factor).clamp(0.25, 600.0);
                         st.view_start_s =
@@ -22406,9 +22608,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 } else {
                     // Zoom at the PLAYHEAD, as the arrangement does now —
-                    // the pointer anchor left with the owner's ruling.
+                    // the pointer anchor left with the owner's ruling. The
+                    // line as DRAWN, which in a loop is not the song's own
+                    // second - see `me_playhead`.
                     let _ = anchor;
-                    let anchor = self.recorder.position_s;
+                    let (anchor, _) = self.me_playhead();
                     if let Some(st) = self.midi_edit.as_mut() {
                         if scroll.x.abs() > 0.0 {
                             st.view_start_s =
@@ -22657,7 +22861,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .clips
                             .iter()
                             .find(|c| c.id == id)
-                            .map_or(0.0, |c| c.start_s + c.loop_s);
+                            .map_or(0.0, |c| c.midi_loop_origin_s() + c.loop_s);
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = Some(MeDrag::LoopBar { grab_s: roll_at - end });
                         }
@@ -45169,6 +45373,178 @@ mod tests {
         (ctx, app)
     }
 
+    /// The editor's view of its own clip, as the roll would be handed it.
+    fn drawn_playhead(app: &TangentApp) -> f64 {
+        let st = app.midi_edit.as_ref().expect("the editor is open");
+        let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).expect("its clip");
+        app.midi_edit_view(st, clip).playhead_s
+    }
+
+    /// **In a loop, the editor's playhead is where the part IS.** The roll
+    /// draws a looping clip's notes once, so the song's own second walked off
+    /// the end of the part while the part played on from its top - the
+    /// owner's "the playhead for a loop when viewed in the midi editor doesn't
+    /// visually loop/wrap, it just keeps going". Inside the clip it folds into
+    /// the pass; before the clip, past its end, or on a clip that does not
+    /// loop it is the song's own second.
+    #[test]
+    fn the_editors_playhead_folds_into_the_pass_the_roll_shows() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        // A one-second part dragged out to four: the clip runs 2..6 s and
+        // the roll draws one pass of it, 2..3 s.
+        app.arrangement.clips[0].loop_s = 1.0;
+        for (song, drawn) in [
+            (2.25, 2.25),
+            (3.25, 2.25),
+            (5.5, 2.5),
+            (4.0, 2.0),
+            (5.999, 2.999),
+            (1.5, 1.5),
+            (6.5, 6.5),
+        ] {
+            app.recorder.position_s = song;
+            let at = drawn_playhead(&app);
+            assert!((at - drawn).abs() < 1.0e-9, "the song at {song} drew the playhead at {at}, not {drawn}");
+        }
+        // A part that does not loop plays its notes once, where they are drawn.
+        app.arrangement.clips[0].loop_s = 0.0;
+        app.recorder.position_s = 5.5;
+        assert!((drawn_playhead(&app) - 5.5).abs() < 1.0e-9);
+    }
+
+    /// **Enter and Backspace act where the line is drawn, and keep the song
+    /// in its pass.** On the third time round a looping part, Enter used to
+    /// write its note two loops past the loop bar - where it sounds once, not
+    /// every pass - and the walk after it, measured from the note, pulled the
+    /// song back to the first pass.
+    #[test]
+    fn step_entry_on_a_later_pass_writes_into_the_loop_and_stays_in_that_pass() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.arrangement.clips[0].loop_s = 1.0;
+        app.me_locate(4.25);
+        app.me_insert_at_playhead();
+        let n = app.arrangement.clips[0].notes.last().expect("Enter wrote nothing").clone();
+        assert!(
+            (n.at_s - 0.25).abs() < 1.0e-9,
+            "the note landed {} into the clip, not a quarter into its loop",
+            n.at_s
+        );
+        let walked = 4.25 + n.dur_s;
+        assert!(
+            (app.playhead_s() - walked).abs() < 1.0e-9,
+            "the head went to {} rather than on by the note, to {walked}",
+            app.playhead_s()
+        );
+        app.me_backspace();
+        assert!(app.arrangement.clips[0].notes.is_empty(), "Backspace did not take the note back");
+        assert!(
+            (app.playhead_s() - 4.25).abs() < 1.0e-9,
+            "Backspace put the head at {}, not back where the note began in this pass",
+            app.playhead_s()
+        );
+    }
+
+    /// **Paste lands where the line is drawn.** On the third pass of a
+    /// looping part it used to land two loops past the loop bar, where a
+    /// paste plays once instead of every time round.
+    #[test]
+    fn a_paste_in_a_loop_lands_in_the_loop() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.arrangement.clips[0].loop_s = 1.0;
+        app.note_clipboard = vec![crate::arrangement::ArrNote {
+            at_s: 0.0,
+            dur_s: 0.1,
+            key: 64,
+            vel: 90,
+            muted: false,
+        }];
+        app.me_locate(4.25);
+        app.me_paste();
+        let n = app.arrangement.clips[0].notes.last().expect("the paste wrote nothing");
+        assert!((n.at_s - 0.25).abs() < 1.0e-9, "the paste landed {} into the clip, not a quarter into its loop", n.at_s);
+    }
+
+    /// **A split cuts where the line is drawn.** The song on the third pass,
+    /// half way into it, is half way into the note the roll shows there.
+    #[test]
+    fn a_split_in_a_loop_cuts_at_the_drawn_playhead() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.arrangement.clips[0].loop_s = 1.0;
+        app.arrangement.clips[0].notes.push(crate::arrangement::ArrNote {
+            at_s: 0.0,
+            dur_s: 0.8,
+            key: 60,
+            vel: 100,
+            muted: false,
+        });
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        app.me_locate(4.5);
+        app.me_split_selection();
+        let mut cuts: Vec<(f64, f64)> =
+            app.arrangement.clips[0].notes.iter().map(|n| (n.at_s, n.dur_s)).collect();
+        cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(cuts.len(), 2, "nothing was split: {cuts:?}");
+        assert!((cuts[1].0 - 0.5).abs() < 1.0e-9, "cut at {} rather than half way in", cuts[1].0);
+    }
+
+    /// **The arrows walk the grid the roll draws.** A part whose loop is not
+    /// a whole number of grid steps puts the song's grid lines between the
+    /// roll's on every later pass; stepped from the song's second, the drawn
+    /// line landed between two of the roll's lines.
+    #[test]
+    fn the_arrows_walk_the_drawn_grid_in_a_loop() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.settings.midi_snap = true;
+        app.arrangement.clips[0].loop_s = 0.6;
+        // Third pass, a tenth in: drawn at 2.1 s.
+        app.me_locate(2.0 + 1.2 + 0.1);
+        let drawn = drawn_playhead(&app);
+        assert!((drawn - 2.1).abs() < 1.0e-9);
+        let want = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            crate::midi_editor::snap_next_t(&app.midi_edit_view(st, clip), drawn)
+        };
+        app.me_step_playhead(1.0);
+        assert!(
+            (drawn_playhead(&app) - want).abs() < 1.0e-9,
+            "the drawn head stepped to {}, not to the roll's next line at {want}",
+            drawn_playhead(&app)
+        );
+        assert!(
+            (app.playhead_s() - (want + 1.2)).abs() < 1.0e-9,
+            "the song left its pass: {}",
+            app.playhead_s()
+        );
+    }
+
+    /// **The loop bar stands where the loop turns over**, on a part trimmed
+    /// from its front too. The passes count from the clip's source origin,
+    /// `start - offset`, and the bar counted from the clip's head, so on a
+    /// trimmed part the bar and the sound disagreed about where it ends -
+    /// and dragging the bar set a loop `offset` shorter than it showed.
+    #[test]
+    fn the_loop_bar_counts_from_where_the_passes_do() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.offset_s = 0.5;
+            c.loop_s = 2.0;
+        }
+        // Dragged to 4.0 s: the pass runs from 1.5 s (2.0 - 0.5), so the
+        // loop is 2.5 s long.
+        app.me_set_loop_end(4.0);
+        assert!(
+            (app.arrangement.clips[0].loop_s - 2.5).abs() < 1.0e-9,
+            "the loop is {} long, counted from the clip's head",
+            app.arrangement.clips[0].loop_s
+        );
+        // And the wall is still the clip's END: dragged past 6 s it stops
+        // there, which is the clip plus the trim before it.
+        app.me_set_loop_end(9.0);
+        assert!((app.arrangement.clips[0].loop_s - 4.5).abs() < 1.0e-9);
+    }
+
     /// **Backspace takes the note back and the playhead with it.** Two
     /// Enters write two notes and leave the head after the second; one
     /// Backspace deletes the second and puts the head where it stood before
@@ -54018,6 +54394,159 @@ mod tests {
         assert!(!lit.contains(&60), "track two stayed after being switched off");
     }
 
+    /// An audio or MIDI clip for the glue tests, on `lane` from `start_s`.
+    fn glue_part(
+        app: &mut TangentApp,
+        kind: crate::arrangement::ClipKind,
+        lane: usize,
+        start_s: f64,
+        len_s: f64,
+        loop_s: f64,
+    ) -> u64 {
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind,
+            lane,
+            path: "a.wav".into(),
+            start_s,
+            len_s,
+            loop_s,
+            ..Default::default()
+        })
+    }
+
+    /// **Audio glues too** - the owner: "Audio clips don't glue". Welding
+    /// audio is a render, so the app hands the host the clips and changes
+    /// nothing itself; the host's answer is `finish_audio_glue`.
+    #[test]
+    fn glue_sends_audio_clips_to_the_host_to_be_welded() {
+        use crate::arrangement::ClipKind;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let a = glue_part(&mut app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+        let b = glue_part(&mut app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+        app.arr_multi.push(a);
+        app.arr_multi.push(b);
+        let before = app.arrangement.clips.clone();
+        app.arr_glue_selection();
+        match app.take_recorder_request() {
+            Some(recorder::RecorderRequest::GlueAudio(mut ids)) => {
+                ids.sort_unstable();
+                assert_eq!(ids, vec![a, b]);
+            }
+            other => panic!("audio glue asked the host for {other:?}"),
+        }
+        assert_eq!(app.arrangement.clips, before, "the app welded audio it cannot hear");
+
+        // One clip is enough when it repeats: glue flattens its passes.
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let one = glue_part(&mut app, ClipKind::Audio, 3, 0.0, 5.0, 2.0);
+        app.arr_selected = Some(one);
+        app.arr_glue_selection();
+        assert!(
+            matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::GlueAudio(ids)) if ids == vec![one]),
+            "a repeating clip was refused"
+        );
+    }
+
+    /// **Glue says no to audio in the same places it does to MIDI**, and to a
+    /// frozen track, whose clips are not what it plays - and in every case
+    /// it asks the host for nothing.
+    #[test]
+    fn glue_refuses_what_cannot_be_one_audio_clip() {
+        use crate::arrangement::ClipKind;
+        let refused = |setup: &dyn Fn(&mut TangentApp)| {
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            setup(&mut app);
+            app.arr_glue_selection();
+            app.take_recorder_request().is_none()
+        };
+        // One clip that shows one pass.
+        assert!(refused(&|app| {
+            let a = glue_part(app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+            app.arr_selected = Some(a);
+        }));
+        // Two tracks.
+        assert!(refused(&|app| {
+            let a = glue_part(app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+            let b = glue_part(app, ClipKind::Audio, 4, 4.0, 2.0, 2.0);
+            app.arr_multi.extend([a, b]);
+        }));
+        // Two kinds - with audio enough to glue on its own, so it is the
+        // kind that refuses and not the count.
+        assert!(refused(&|app| {
+            let a = glue_part(app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+            let b = glue_part(app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+            let c = glue_part(app, ClipKind::Midi, 3, 8.0, 2.0, 2.0);
+            app.arr_multi.extend([a, b, c]);
+        }));
+        // A frozen track.
+        assert!(refused(&|app| {
+            let a = glue_part(app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+            let b = glue_part(app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+            app.arr_multi.extend([a, b]);
+            app.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
+                lane: 3,
+                path: "media/frozen-04.wav".into(),
+                len_s: 8.0,
+            });
+        }));
+    }
+
+    /// **The host's weld lands as one plain loop in its sources' place**, and
+    /// one undo brings them back. Everything the sources carried is in the
+    /// file, so the clip carries none of it: no trim, no fades, unity gain,
+    /// unstretched, unwarped - and a loop over its own length, as every clip
+    /// the app makes is. The anchor stays when the sources agreed on one.
+    #[test]
+    fn a_finished_audio_glue_is_one_plain_loop_in_its_sources_place() {
+        use crate::arrangement::{Anchor, ClipKind};
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let a = glue_part(&mut app, ClipKind::Audio, 3, 1.0, 2.0, 1.0);
+        let b = glue_part(&mut app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+        let keep = glue_part(&mut app, ClipKind::Audio, 5, 0.0, 2.0, 2.0);
+        for c in app.arrangement.clips.iter_mut().filter(|c| c.id == a || c.id == b) {
+            c.anchor = Anchor::Beat;
+            c.fade_in_s = 0.25;
+            c.gain = 0.5;
+            c.stretch = 1.5;
+            c.offset_s = 0.3;
+        }
+        app.arr_save_edits();
+        let _ = app.take_clips_dirty();
+        let moments = app.history.len();
+        app.finish_audio_glue(
+            &[a, b],
+            crate::arrangement::GluedAudio {
+                lane: 3,
+                path: "media/C1-glued-1.wav".into(),
+                start_s: 1.0,
+                len_s: 5.0,
+                name: "C1 glued".into(),
+            },
+        );
+        let ids: Vec<u64> = app.arrangement.clips.iter().map(|c| c.id).collect();
+        assert!(!ids.contains(&a) && !ids.contains(&b), "a source outlived its weld");
+        assert!(ids.contains(&keep), "the glue took a clip it was not given");
+        let g = app
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.path == "media/C1-glued-1.wav")
+            .expect("no glued clip");
+        assert_eq!((g.kind, g.lane), (ClipKind::Audio, 3));
+        assert_eq!((g.start_s, g.len_s, g.loop_s, g.offset_s), (1.0, 5.0, 5.0, 0.0));
+        assert_eq!((g.fade_in_s, g.fade_out_s, g.gain, g.stretch), (0.0, 0.0, 1.0, 1.0));
+        assert!(g.warp.is_empty() && g.stretch_mode.is_empty());
+        assert_eq!(g.anchor, Anchor::Beat, "the sources' shared anchor was dropped");
+        assert!(app.take_clips_dirty(), "the new file would never be decoded");
+        assert_eq!(app.history.len(), moments + 1, "the weld is not its own undo step");
+
+        app.undo();
+        let ids: Vec<u64> = app.arrangement.clips.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&a) && ids.contains(&b), "one undo did not bring the sources back");
+        assert!(!app.arrangement.clips.iter().any(|c| c.path == "media/C1-glued-1.wav"));
+    }
+
+
     /// **Normalise acts on the selected AUDIO and asks the host to measure.**
     ///
     /// The peak lives behind the firewall with the decoder, so this crate's
@@ -60121,6 +60650,184 @@ mod tests {").expect("the tests module")];
         }
         let _ = run_frame(ctx, app);
         (app.midi_edit_rect.expect("the editor drew nowhere"), id)
+    }
+
+    /// **The editor's wheel zooms at the playhead the ROLL draws.** In a loop
+    /// the song's own second can be passes to the right of anything on the
+    /// roll; zoomed about it, the view slid off the notes and the line both.
+    /// About the drawn line, the line keeps its place in the window.
+    #[test]
+    fn the_editors_wheel_zooms_at_the_drawn_playhead() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        // A two-second loop over the eight-second clip, the song on its
+        // third pass, a second in: drawn at 5.0 s, the middle of the 4..6 s
+        // window.
+        app.arrangement.clips[0].loop_s = 2.0;
+        app.recorder.position_s = 9.0;
+        let drawn = drawn_playhead(&app);
+        assert!((drawn - 5.0).abs() < 1.0e-9);
+        let (s0, l0) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.view_len_s)
+        };
+        let frac0 = (drawn - s0) / l0;
+        let roll = crate::midi_editor::Layout::new(rect).roll.center();
+        for _ in 0..4 {
+            wheel_frame(&ctx, &mut app, roll, Vec2::new(0.0, 60.0), egui::Modifiers::NONE);
+        }
+        let (s1, l1) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.view_len_s)
+        };
+        assert!(l1 < l0 - 1.0e-6, "the wheel did not zoom: {l0} -> {l1}");
+        let frac1 = (drawn - s1) / l1;
+        assert!(
+            (frac1 - frac0).abs() < 1.0e-6,
+            "the zoom moved the drawn line from {frac0:.3} to {frac1:.3} of the window"
+        );
+    }
+
+    /// **And the `=` key zooms there too** - the keys' zoom is the wheel's
+    /// rule on keys, about the drawn line.
+    #[test]
+    fn the_editors_zoom_keys_zoom_at_the_drawn_playhead() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        app.arrangement.clips[0].loop_s = 2.0;
+        app.recorder.position_s = 9.0;
+        let drawn = drawn_playhead(&app);
+        let (s0, l0) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.view_len_s)
+        };
+        // The editor's keys answer while the hand is over it.
+        let roll = crate::midi_editor::Layout::new(rect).roll.center();
+        pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(roll)]);
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(roll), egui::Event::Key {
+                key: egui::Key::Equals,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let (s1, l1) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.view_len_s)
+        };
+        assert!(l1 < l0 - 1.0e-6, "= did not zoom: {l0} -> {l1}");
+        let (f0, f1) = ((drawn - s0) / l0, (drawn - s1) / l1);
+        assert!((f1 - f0).abs() < 1.0e-6, "= moved the drawn line from {f0:.3} to {f1:.3} of the window");
+    }
+
+    /// **The navigator's line is the song's; the roll's is the pass.** The
+    /// box is every pass of the clip, so its line says where in the clip the
+    /// song is - and a scrub on it shows where it put the transport rather
+    /// than snapping back into the first pass.
+    #[test]
+    fn the_navigator_shows_the_song_and_the_roll_shows_the_pass() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.arrangement.clips[0].loop_s = 1.0;
+        app.recorder.position_s = 4.25;
+        let st = app.midi_edit.as_ref().unwrap();
+        let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+        let v = app.midi_edit_view(st, clip);
+        assert!((v.playhead_s - 2.25).abs() < 1.0e-9, "the roll's line is {}", v.playhead_s);
+        assert!((v.song_s - 4.25).abs() < 1.0e-9, "the navigator's line is {}", v.song_s);
+    }
+
+    /// **Dragging the loop bar snaps the LENGTH, from the clip's head.** A
+    /// take recorded off the grid and trimmed onto it has its passes' origin
+    /// off the grid; snapping the bar's own position made every loop a
+    /// length that is not whole grid steps, and the part walked off the bar
+    /// a little further every pass.
+    #[test]
+    fn the_loop_bar_snaps_a_whole_length_on_an_off_grid_take() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.settings.midi_snap = true;
+        {
+            // Recorded from 1.37 s, trimmed onto the grid at 2.0 s.
+            let c = &mut app.arrangement.clips[0];
+            c.offset_s = 0.63;
+            c.loop_s = 2.0;
+        }
+        let step = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            crate::midi_editor::grid_step_s(&app.midi_edit_view(st, clip))
+        };
+        // The hand near the fourth second after the origin.
+        app.me_set_loop_end(1.37 + 4.1);
+        let lp = app.arrangement.clips[0].loop_s;
+        let steps = lp / step;
+        assert!(
+            (steps - steps.round()).abs() < 1.0e-6,
+            "the loop is {lp} s, {steps:.3} grid steps - it will walk off the bar"
+        );
+        // And an untrimmed part keeps the old snap exactly: the end on a line.
+        app.arrangement.clips[0].offset_s = 0.0;
+        app.me_set_loop_end(2.0 + 2.1);
+        let end = app.arrangement.clips[0].start_s + app.arrangement.clips[0].loop_s;
+        assert!(((end / step) - (end / step).round()).abs() < 1.0e-6, "the bar is off the grid at {end}");
+    }
+
+    /// **Backspace in the last, partial pass stays inside the clip.** The
+    /// note's place in the pass the song is in can lie past the clip's end;
+    /// the pass before it is where that place is.
+    #[test]
+    fn backspace_in_the_last_partial_pass_stays_in_the_clip() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.len_s = 4.5;
+            c.loop_s = 1.0;
+            c.notes.push(crate::arrangement::ArrNote { at_s: 0.75, dur_s: 0.1, key: 60, vel: 100, muted: false });
+        }
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        // The last pass runs 6.0..6.5; the song at 6.2 draws at 2.2.
+        app.me_locate(6.2);
+        app.me_backspace();
+        let at = app.playhead_s();
+        assert!(at < 6.5 - 1.0e-9, "Backspace put the song past the clip's end, at {at}");
+        assert!((at - 5.75).abs() < 1.0e-9, "Backspace put the song at {at}, not at 5.75");
+        assert!((drawn_playhead(&app) - 2.75).abs() < 1.0e-9);
+    }
+
+    /// **An arrow step across the turn of the loop lands on the other pass's
+    /// grid**: right over the bar is the next pass's top, left from the top is
+    /// the previous pass's last line - never between two of the roll's lines.
+    #[test]
+    fn an_arrow_across_the_loop_bar_lands_on_the_other_passs_grid() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.settings.midi_snap = true;
+        app.arrangement.clips[0].loop_s = 0.6;
+        let line = |app: &TangentApp, t: f64| {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            crate::midi_editor::snap_floor_t(&app.midi_edit_view(st, clip), t)
+        };
+        // Second pass (2.6..3.2), drawn at the last line before the bar.
+        let last = line(&app, 2.6 - 1.0e-6);
+        app.me_locate(last + 0.6);
+        app.me_step_playhead(1.0);
+        assert!(
+            (drawn_playhead(&app) - 2.0).abs() < 1.0e-9,
+            "stepping over the bar drew the line at {}, not at the pass's top",
+            drawn_playhead(&app)
+        );
+        assert!((app.playhead_s() - 3.2).abs() < 1.0e-9, "the song is at {}", app.playhead_s());
+        // And back: from the top, the previous pass's last line.
+        app.me_step_playhead(-1.0);
+        assert!(
+            (drawn_playhead(&app) - last).abs() < 1.0e-9,
+            "stepping back over the top drew the line at {}, not at {last}",
+            drawn_playhead(&app)
+        );
+        assert!((app.playhead_s() - (last + 0.6)).abs() < 1.0e-9, "the song is at {}", app.playhead_s());
     }
 
     /// **A double-click gesture that still works the fourth time.**
