@@ -5727,10 +5727,26 @@ impl Settings {
     /// nobody finds again and one that fails outright inside a signed
     /// `.app`.
     pub fn media_root(&self) -> PathBuf {
-        dirs::document_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Tangent Media")
+        // **Never the owner's own folder under test**, for the reason
+        // `Settings::path` gives: a test that built an app on
+        // `Settings::default()` and pressed New wrote a blank document over
+        // the real `Projects/Untitled` - the live session's own folder - on
+        // every `cargo test`. An override honoured in every build, as that
+        // one is, and this crate's own tests on a per-thread temp root.
+        if let Some(p) = std::env::var_os("TANGENT_MEDIA_ROOT") {
+            return PathBuf::from(p);
+        }
+        #[cfg(test)]
+        {
+            return test_path().with_file_name("Tangent Media");
+        }
+        #[cfg(not(test))]
+        {
+            dirs::document_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Tangent Media")
+        }
     }
 
     /// A folder the user actually chose, or nothing. An empty string is not

@@ -55,6 +55,40 @@ Related invariants that keep this working:
   `switch_project` gates the doc save on `project_dirty()` but always
   shelves plugin states — and `copy_states_to_project` stands down while
   the folder is unmaterialised.
+- **Save As Template is not a save of the session** (2026-09-22). A
+  scratch's template is written from memory (`write_template_into`) into
+  a staging folder and swapped onto the shelf; only a REAL folder is saved
+  and copied. The old road saved the scratch into `Projects/Untitled` first,
+  which was the pile's main source. Every template carries a
+  `drumpad.json`, because `kit_is_custom` compares against it.
+- **Every door out asks, and "Don't Save" sticks.** The Project window's New
+  and Open go through `ask_before` like the menu's; a "Don't Save" answer
+  reaches the host as `take_outgoing_discarded` and gates the document
+  save-back AND the plugin-state shelving in `switch_project`, the New arm
+  and `on_exit`, and it survives New's detour through the scratch warning
+  (`rearm_outgoing_discarded`). A scratch THIS session made real
+  (`made_real_this_session`), named Untitled, unnamed and clipless ON DISK,
+  off the shelf and holding no recording (`rec-*`) is removed when discarded
+  (`discard_scratch_made_here`) - its kit, imports and shelf were the
+  session's own litter.
+- **One door makes a scratch real**: `materialize_project_dir`, which brings
+  every lane's kit samples and writes the kit sidecar. Imports, pad loads,
+  arrangement takes with audio, freezes and exports go through it first; a
+  MIDI-only take makes no folder, and an UNDO never does (it writes the kit
+  only into a folder that is already real).
+- **The template's kit is adopted, not the last project's**: `adopt_template`
+  loads the kit beside the template once it has repointed. A template opened
+  from the Open panel is read without being inhabited, so it keeps the
+  session's own kit, where every kit write goes.
+- **No test resolves the owner's media folder**: `Settings::media_root`
+  honours `TANGENT_MEDIA_ROOT` in every build and is a per-thread temp root
+  under `tangent-ui`'s tests. One test wrote a blank document over the real
+  `Projects/Untitled` on every `cargo test` until 2026-09-22.
+- **The sweep counts takes, not litter**: `count_media` skips dotfiles
+  (Finder's `.DS_Store`), freeze renders and byte-copies of the template's own
+  media (length-checked first, so no take is read). A kit is compared by its
+  parsed kits, not its bytes; with no template kit, only a kit holding a
+  sample, or bytes nobody can parse, is work.
 - The canonical document name is `project.tan`; `project.tangent` reads
   forever. `arrangement::doc_in` is the one resolver; no call site may
   bare-join either name.

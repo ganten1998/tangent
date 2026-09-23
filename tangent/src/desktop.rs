@@ -8919,7 +8919,15 @@ impl DesktopApp {
             .project_doc()
             .and_then(|d| d.parent().map(|p| p.join("media")))
         {
-            let _ = std::fs::create_dir_all(&media);
+            // Through the one door that makes a scratch real, so the kit it
+            // adopted comes with it - a bare `create_dir_all` made the folder
+            // and left every pad reading a sample that was never copied. And
+            // only when there is audio to keep: a MIDI-only take lives in the
+            // document, and made an empty Untitled folder for nothing.
+            if rec.audio.iter().any(|(_, _, f)| f.len() as f64 / 2.0 / rate >= 0.05) {
+                self.app.materialize_project_dir();
+                let _ = std::fs::create_dir_all(&media);
+            }
             for (_input, lane, frames) in &rec.audio {
                 let seconds = frames.len() as f64 / 2.0 / rate;
                 if seconds < 0.05 {
@@ -9079,6 +9087,9 @@ impl DesktopApp {
                         })
                     }),
             ) {
+                // The one door, so a scratch made real by an export keeps
+                // its kit - see `finish_bounce`.
+                self.app.materialize_project_dir();
                 let _ = std::fs::create_dir_all(&dir);
                 let rate = e.output().sample_rate;
                 let spec = tangent_record::wav::WavSpec {
@@ -9262,6 +9273,8 @@ impl DesktopApp {
             self.app.notify_lower(EXPORT_RUNNING);
             return;
         };
+        // The one door, so a scratch made real by an export keeps its kit.
+        self.app.materialize_project_dir();
         let _ = std::fs::create_dir_all(&export_dir);
         let wav = std::fs::read_dir(&take_dir).ok().and_then(|rd| {
             rd.flatten()
@@ -9489,7 +9502,12 @@ impl DesktopApp {
             refuse!();
         }
         let out_dir = if freeze.is_some() {
-            // The frozen file is project media, beside the recordings.
+            // The frozen file is project media, beside the recordings - and
+            // a scratch becomes real through the one door that brings its
+            // kit, BEFORE the pad decode below: a bare mkdir switched the
+            // pads to the project, where the kit's samples had never been
+            // copied, and the drum lane froze silent.
+            self.app.materialize_project_dir();
             self.app
                 .project_doc()
                 .and_then(|d| d.parent().map(|p| p.join("media")))
@@ -10371,22 +10389,6 @@ impl DesktopApp {
                 );
             }
             tangent_ui::ports::ProjectRequest::Template(name) => {
-                // **Everything written down first, so the copy IS the
-                // session** — its plugins' knobs included, which is what
-                // `save_project_and_states` is for. This road is the reason
-                // that function exists: a template made from a launch's
-                // scratch used to be copied out of a folder that had only
-                // just been created, so it carried a rack and no state for
-                // it and handed every launch a plugin at its defaults.
-                self.save_project_and_states();
-                let Some(src) = self
-                    .app
-                    .project_doc()
-                    .and_then(std::path::Path::parent)
-                    .map(std::path::Path::to_path_buf)
-                else {
-                    return;
-                };
                 // The NAME only — a template has one home, and a name with a
                 // separator in it is a path pretending to be one.
                 let name: String = name
@@ -10396,19 +10398,66 @@ impl DesktopApp {
                 if name.is_empty() {
                     return;
                 }
-                let dst = self.templates_dir().join(&name);
-                let _ = std::fs::remove_dir_all(&dst);
-                // **And it says so, either way.** This row deletes a whole
-                // folder and writes another in its place - the stencil every
-                // New and every launch is made from, when the name is
-                // "default" - and it was the one write in this app that
-                // happened in silence. The Save row's own note says why that
-                // is not a style question: "a save is invisible otherwise",
-                // and a template nobody was told about is a template nobody
-                // checks. It matters more now that the copy carries the
-                // plugin shelf, because "did my noise profile go with it" is
-                // exactly the question this answers.
-                if let Err(e) = copy_dir_all(&src, &dst) {
+                // **Is the session's own folder REAL?** Asked before anything
+                // is written, because the answer decides what may be.
+                //
+                // A session that has never been saved has no folder, and
+                // this road used to give it one: it saved the session into
+                // its prospective home and copied that. The owner curates
+                // the template from a fresh launch, so every Save As
+                // Template left a `Projects/Untitled` behind - "why am i
+                // getting untitled tracks building up again". A template is
+                // not a save of the session; the scratch stays unwritten and
+                // the template is written straight from memory.
+                let src = self
+                    .app
+                    .project_doc()
+                    .and_then(std::path::Path::parent)
+                    .map(std::path::Path::to_path_buf);
+                let was_real = src.as_deref().is_some_and(std::path::Path::is_dir);
+                // **Everything written down first, so the copy IS the
+                // session** — its plugins' knobs included. A REAL folder is
+                // saved and copied whole, media and takes with it, as it
+                // always was; a scratch puts its knobs on the global shelf
+                // only, which is where they are mirrored from below.
+                if was_real {
+                    self.save_project_and_states();
+                } else {
+                    self.save_plugin_states();
+                }
+                // **Built beside the shelf and swapped in.** The old road
+                // deleted the template before writing its replacement, so a
+                // failed copy left no template at all - and a scratch adopted
+                // from "default" still reads its kit's samples OUT of
+                // "default", which must be copied before it is replaced.
+                let shelf = self.templates_dir();
+                let stage = shelf.join(format!(".{name}.writing"));
+                let _ = std::fs::remove_dir_all(&stage);
+                let built = match src.as_deref() {
+                    Some(src) if was_real => copy_dir_all(src, &stage).map(|()| {
+                        // A project whose kit was never edited has no sidecar
+                        // of its own, and a template without one makes every
+                        // later scratch's kit look like work to the sweep.
+                        if !stage.join(tangent_ui::drumpad::FILE_NAME).exists() {
+                            self.app.write_kit_into(&stage);
+                        }
+                    }),
+                    _ => self.app.write_template_into(&stage).map(|()| {
+                        let shelf_dir = stage.join("state");
+                        let _ = std::fs::create_dir_all(&shelf_dir);
+                        mirror_sidecars(&global_state_dir(), &shelf_dir);
+                    }),
+                };
+                let dst = shelf.join(&name);
+                // **And it says so, either way.** This row replaces a whole
+                // folder - the stencil every New and every launch is made
+                // from, when the name is "default" - and it was the one write
+                // in this app that happened in silence. The Save row's own
+                // note says why that is not a style question: "a save is
+                // invisible otherwise", and a template nobody was told about
+                // is a template nobody checks.
+                if let Err(e) = built.and_then(|()| swap_in_template(&stage, &dst)) {
+                    let _ = std::fs::remove_dir_all(&stage);
                     self.app.notify(
                         Kind::Error,
                         format!("could not write the template: {e}"),
@@ -10427,6 +10476,10 @@ impl DesktopApp {
                 if arr.named {
                     arr.named = false;
                     arr.save_to(&doc);
+                }
+                // The scratch IS the stencil now: nothing to ask at quit.
+                if !was_real {
+                    self.app.mark_template_saved();
                 }
                 self.app.notify(Kind::Success, format!("Template saved - {name}"));
             }
@@ -10541,6 +10594,11 @@ impl DesktopApp {
                     }
                 }
                 let root = self.app.project_root();
+                // "Don't Save" is taken first, so it cannot outlive the New it
+                // answered - put back if this New stops to ask about a
+                // leftover scratch below, and acted on only once nothing can
+                // stop it any more.
+                let discarded = self.app.take_outgoing_discarded();
                 // The scratch rule: an Untitled nobody SAVED is reclaimed,
                 // so New lands on "Untitled" instead of minting a pile.
                 let dir = tangent_ui::app::fresh_project_dir(&root);
@@ -10568,7 +10626,7 @@ impl DesktopApp {
                 // with takes in it that is NOT the session on screen, which
                 // the prompt was never asked about and which nobody has
                 // agreed to lose.
-                let takes = count_media(&dir);
+                let takes = count_media(&dir, &template);
                 let is_current = self
                     .app
                     .project_doc()
@@ -10577,7 +10635,12 @@ impl DesktopApp {
                     .unwrap_or(false);
                 if takes > 0 && !asked && !is_current {
                     // Ask, and do nothing else this frame. The answer comes
-                    // back as `NewKeeping` or `NewDiscarding`.
+                    // back as `NewKeeping` or `NewDiscarding` - a second New,
+                    // which must still know the session was discarded, or it
+                    // writes the edits "Don't Save" refused over the project.
+                    if discarded {
+                        self.app.rearm_outgoing_discarded();
+                    }
                     self.app.warn_about_scratch(tangent_ui::ports::ScratchWarning {
                         name: dir
                             .file_name()
@@ -10587,9 +10650,21 @@ impl DesktopApp {
                     });
                     return;
                 }
+                // **Past the point of no return, "Don't Save" is acted on**: a
+                // scratch this session made real and nobody kept is cleared,
+                // and the reclaim asked again - the folder it stepped past may
+                // be gone. That can only hand back the cleared name (free, so
+                // nothing to warn about) or the folder already vetted above.
+                let reclaimed = if discarded && self.discard_outgoing_scratch() {
+                    tangent_ui::app::fresh_project_dir(&root)
+                } else {
+                    dir.clone()
+                };
                 // Keeping it means not reclaiming it at all: mint the next
                 // free name and leave the recordings where they are.
-                let dir = if keeping && takes > 0 {
+                let dir = if reclaimed != dir {
+                    reclaimed
+                } else if keeping && takes > 0 {
                     next_untitled(&root, &dir)
                 } else {
                     dir
@@ -10611,15 +10686,25 @@ impl DesktopApp {
                     // **The EXACT question**, not the title bar's cheap one:
                     // a wrong "clean" here walks away from the outgoing
                     // session without writing it. See `project_dirty`.
-                    if self.app.project_dirty_exact() {
+                    //
+                    // **And never after "Don't Save".** The prompt was asked
+                    // and answered; writing the session anyway put the
+                    // discarded edits into a named project, or a scratch's
+                    // into a brand-new Untitled folder.
+                    if !discarded && self.app.project_dirty_exact() {
                         self.app.save_project_doc();
                     }
                     // AFTER that write, because it is the write that gives an
                     // unmaterialised scratch a folder to be shelved into —
                     // see `save_project_and_states`. Shelving first stranded
                     // the outgoing session's knobs in a folder that came into
-                    // existence on the next line.
-                    self.copy_states_to_project();
+                    // existence on the next line. Not after "Don't Save": the
+                    // discarded knobs would sit beside a document that never
+                    // named them, and a plugin whose state file belongs to
+                    // another tenant reopens at its defaults.
+                    if !discarded {
+                        self.copy_states_to_project();
+                    }
                 }
                 // **A clean slate, and NOTHING new on disk** - the owner's
                 // "no creating folders called untitled PERIOD". A
@@ -10687,6 +10772,20 @@ impl DesktopApp {
         }
         let _ = std::fs::create_dir_all(&dir);
         mirror_sidecars(&global_state_dir(), &dir);
+    }
+
+    /// **"Don't Save" clears the scratch it discarded.** A kit edit saves
+    /// itself and an import copies into `media/`, so a scratch that was only
+    /// touched is real on disk - and discarding the session left it there,
+    /// kept by that very kit or copy, pushing the next session on to
+    /// "Untitled N+1". See [`discard_scratch_made_here`] for exactly which
+    /// folders qualify; `true` when one was removed.
+    fn discard_outgoing_scratch(&self) -> bool {
+        discard_scratch_made_here(
+            self.app.made_real_this_session(),
+            self.app.project_doc().and_then(std::path::Path::parent),
+            &self.app.project_root(),
+        )
     }
 
     /// **Keep the session WHOLE: the document first, then the shelf beside
@@ -10761,7 +10860,7 @@ impl DesktopApp {
             if !dir.is_dir() || !(name == "Untitled" || name.starts_with("Untitled ")) {
                 continue;
             }
-            if count_media(&dir) == 0
+            if count_media(&dir, template) == 0
                 && TangentApp::scratch_is_disposable(&dir, template)
             {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -10831,15 +10930,22 @@ impl DesktopApp {
         self.save_plugin_states();
         // **The EXACT question** — the outgoing session is about to be
         // replaced, and a wrong "clean" loses it. See `project_dirty`.
-        if self.app.project_dirty_exact() {
+        // **Unless the prompt was answered "Don't Save"** - see the New arm.
+        let discarded = self.app.take_outgoing_discarded();
+        if !discarded && self.app.project_dirty_exact() {
             self.app.save_project_doc();
         }
         // **And the shelf AFTER that write**, which is the line that gives an
         // unmaterialised scratch a folder at all — see
         // `save_project_and_states`. The other order shelved the outgoing
         // knobs into a folder that did not exist until the next statement,
-        // and the session was gone by the time anything noticed.
-        self.copy_states_to_project();
+        // and the session was gone by the time anything noticed. Not after
+        // "Don't Save" - see the New arm.
+        if discarded {
+            self.discard_outgoing_scratch();
+        } else {
+            self.copy_states_to_project();
+        }
         self.app.open_project(doc);
         // **The shelf belongs to the session it was filled in.** A bay
         // holding the same bundle in the NEW project would otherwise be
@@ -14426,13 +14532,40 @@ impl DesktopApp {
 /// An unreadable directory counts as ZERO and the reclaim proceeds — the same
 /// way a missing one does. Refusing to start a new project because a folder
 /// could not be listed would turn a permissions problem into a stuck app.
-fn count_media(project_dir: &std::path::Path) -> usize {
+///
+/// **Three kinds of file are not work, and each kept scratches forever.** A
+/// dotfile - Finder writes `.DS_Store` into any folder somebody opens; a
+/// byte-for-byte copy of the TEMPLATE's own file of the same name, which is
+/// what a materialising scratch copies across for the kit it adopted (that
+/// sample is still in the template, so nothing is lost with the copy); and a
+/// freeze render. Each counted as a take, and a scratch holding one was never
+/// swept and never reclaimed, so the next session moved on to "Untitled N+1".
+fn count_media(project_dir: &std::path::Path, template: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(project_dir.join("media")) else {
         return 0;
     };
     entries
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // A freeze render is the lane's own audio played back through
+            // its chain once: remade by freezing again, and nothing without
+            // the document that froze it.
+            !name.starts_with('.') && !name.starts_with("frozen-")
+        })
+        .filter(|e| {
+            // Lengths first, from the directory entry: a take with no
+            // namesake in the template, or another length, is work without
+            // reading a byte of it. Takes run to a gigabyte an hour, and this
+            // runs over every Untitled at every launch.
+            let t = template.join("media").join(e.file_name());
+            let same_len = matches!(
+                (e.metadata(), std::fs::metadata(&t)),
+                (Ok(a), Ok(b)) if a.len() == b.len()
+            );
+            !(same_len && file_eq(&e.path(), &t))
+        })
         .count()
 }
 
@@ -14445,7 +14578,7 @@ fn count_media(project_dir: &std::path::Path) -> usize {
 /// refuses those folders outright, for New and launch alike.
 #[cfg(feature = "recorder")]
 fn launch_reclaimable(dir: &std::path::Path, template: &std::path::Path) -> bool {
-    count_media(dir) == 0
+    count_media(dir, template) == 0
         && file_eq(
             &tangent_ui::arrangement::doc_in(dir),
             &tangent_ui::arrangement::doc_in(template),
@@ -14566,6 +14699,71 @@ pub(crate) fn os_reader_attached() -> bool {
     {
         false
     }
+}
+
+/// **Which discarded scratch "Don't Save" may clear, and the clearing.**
+///
+/// Only a folder THIS session made real (`made_here`), so nothing that was on
+/// disk before the session - an old scratch reopened, a project kept by an
+/// earlier save - is ever touched; named `Untitled` or `Untitled N`; off the
+/// template shelf; whose document ON DISK is not a kept one (unnamed, no
+/// clips - the in-memory flag can be undone past a first save); and holding
+/// no recording (`rec-*`, the arrangement take's name), which is the one thing
+/// that cannot be made again and which New asks about on its own. What is
+/// left is the session's own litter - its kit, the samples and imports it
+/// copied in, its plugin shelf - and the user has just said not to keep it.
+fn discard_scratch_made_here(
+    made_here: bool,
+    dir: Option<&std::path::Path>,
+    root: &std::path::Path,
+) -> bool {
+    use tangent_ui::arrangement::{Arrangement, LoadOutcome};
+    let Some(dir) = dir else {
+        return false;
+    };
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !made_here
+        || !dir.is_dir()
+        || !(name == "Untitled" || name.starts_with("Untitled "))
+        || tangent_ui::app::inside_template_shelf(dir, root)
+    {
+        return false;
+    }
+    match Arrangement::read_from(&tangent_ui::arrangement::doc_in(dir)) {
+        LoadOutcome::Missing | LoadOutcome::Empty => {}
+        LoadOutcome::Loaded(a) if !a.named && a.clips.is_empty() => {}
+        _ => return false,
+    }
+    let recorded = std::fs::read_dir(dir.join("media")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("rec-"))
+    });
+    !recorded && std::fs::remove_dir_all(dir).is_ok()
+}
+
+/// **A staged template takes the shelf's place in two renames.** The old
+/// one steps aside first and is deleted only once the new one stands, so a
+/// failure anywhere leaves a template on the shelf - the old one put back
+/// when the second rename fails.
+fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let aside = dst.with_file_name(format!(
+        ".{}.old",
+        dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    let _ = std::fs::remove_dir_all(&aside);
+    let had = dst.exists();
+    if had {
+        std::fs::rename(dst, &aside)?;
+    }
+    if let Err(e) = std::fs::rename(stage, dst) {
+        if had {
+            let _ = std::fs::rename(&aside, dst);
+        }
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&aside);
+    Ok(())
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -18502,8 +18700,13 @@ impl eframe::App for DesktopApp {
         // The plugin STATES still go, because they are not the document:
         // they are the shelf a loaded plugin keeps its knobs on, and losing
         // them would mean a project that opens with its instruments reset
-        // even when the answer was Save.
-        self.copy_states_to_project();
+        // even when the answer was Save. Not when it was "Don't Save": the
+        // discarded knobs would sit beside a document that never named them.
+        if self.app.take_outgoing_discarded() {
+            self.discard_outgoing_scratch();
+        } else {
+            self.copy_states_to_project();
+        }
     }
 }
 
@@ -20555,6 +20758,8 @@ mod tests {
         // SAFETY: nothing else in this process has started a thread that
         // reads the environment, and the value is a path just created here.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        // And the media roots, or the app resolves the owner's own Documents.
+        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
 
         let mut names: Vec<String> = std::fs::read_dir(&root)
             .into_iter()
@@ -20635,6 +20840,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&shelf);
         // SAFETY: single-threaded here, and a path this process just made.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        // And the media roots, or the app resolves the owner's own Documents.
+        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
         let ctx = egui::Context::default();
         let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
         app.open_project(&doc);
@@ -23071,6 +23278,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The sweep counts takes, not litter.** A Finder `.DS_Store` and a
+    /// copy of the template's own sample are not work - the one is Finder's
+    /// and the other is still in the template - and either one kept a
+    /// scratch forever, so the next session moved on to "Untitled N+1".
+    #[test]
+    fn the_sweep_counts_takes_not_litter() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-count-media-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        let scratch = root.join("Untitled");
+        for d in [template.join("media"), scratch.join("media")] {
+            std::fs::create_dir_all(d).expect("media");
+        }
+        std::fs::write(template.join("media").join("Kick.wav"), b"kick").expect("template sample");
+        assert_eq!(count_media(&scratch, &template), 0);
+        std::fs::write(scratch.join("media").join(".DS_Store"), b"finder").expect("finder");
+        std::fs::write(scratch.join("media").join("Kick.wav"), b"kick").expect("the kit's copy");
+        assert_eq!(count_media(&scratch, &template), 0, "litter counted as a take");
+        // Same name, different bytes: somebody's own file, which is work.
+        std::fs::write(scratch.join("media").join("Kick.wav"), b"a take").expect("edited");
+        assert_eq!(count_media(&scratch, &template), 1, "an edited sample was not counted");
+        std::fs::write(scratch.join("media").join("take-1.wav"), b"take").expect("take");
+        assert_eq!(count_media(&scratch, &template), 2, "a take was not counted");
+        // A freeze render is remade by freezing again.
+        std::fs::write(scratch.join("media").join("frozen-03-1.wav"), b"frozen").expect("freeze");
+        assert_eq!(count_media(&scratch, &template), 2, "a freeze render counted as a take");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **"Don't Save" clears a scratch this session made real - and nothing
+    /// else.** A kit edit saves itself and an import copies in, so a touched
+    /// scratch is real on disk and that kit or copy kept it from every sweep.
+    /// A folder from before the session, a kept project (on disk, whatever
+    /// memory says), one not named Untitled, the template shelf, a document
+    /// with clips and a scratch holding a recording all stay.
+    #[test]
+    fn dont_save_clears_only_a_scratch_this_session_made() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-discard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let make = |name: &str| {
+            let d = root.join(name);
+            std::fs::create_dir_all(d.join("media")).expect("scratch");
+            std::fs::write(d.join(tangent_ui::drumpad::FILE_NAME), b"{}").expect("kit");
+            std::fs::write(d.join("media").join("solo.wav"), b"an import").expect("import");
+            d
+        };
+        let plain = make("Untitled");
+        assert!(discard_scratch_made_here(true, Some(&plain), &root));
+        assert!(!plain.exists(), "a discarded scratch was left to pile up");
+
+        let before = make("Untitled 2");
+        assert!(!discard_scratch_made_here(false, Some(&before), &root));
+        assert!(before.exists(), "Don't Save deleted a folder from before the session");
+
+        let kept = make("Untitled 3");
+        let mut named = tangent_ui::arrangement::Arrangement::default();
+        named.named = true;
+        named.save_to(&tangent_ui::arrangement::doc_in(&kept));
+        assert!(!discard_scratch_made_here(true, Some(&kept), &root));
+        assert!(kept.exists(), "Don't Save deleted a project kept on disk");
+
+        let song = make("song");
+        assert!(!discard_scratch_made_here(true, Some(&song), &root));
+        assert!(song.exists(), "Don't Save deleted a folder not named Untitled");
+
+        let shelf = root.join(tangent_ui::app::TEMPLATE_SHELF).join("Untitled");
+        std::fs::create_dir_all(&shelf).expect("shelf");
+        assert!(!discard_scratch_made_here(true, Some(&shelf), &root));
+        assert!(shelf.exists(), "Don't Save deleted a template");
+
+        let clips = make("Untitled 4");
+        let mut doc = tangent_ui::arrangement::Arrangement::default();
+        doc.add_clip(tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Midi,
+            len_s: 1.0,
+            ..Default::default()
+        });
+        doc.save_to(&tangent_ui::arrangement::doc_in(&clips));
+        assert!(!discard_scratch_made_here(true, Some(&clips), &root));
+        assert!(clips.exists(), "Don't Save deleted a document with clips in it");
+
+        let recorded = make("Untitled 5");
+        std::fs::write(recorded.join("media").join("rec-1-1.wav"), b"a take").expect("take");
+        assert!(!discard_scratch_made_here(true, Some(&recorded), &root));
+        assert!(recorded.exists(), "Don't Save deleted a recording");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A staged template takes the shelf's place, and a failure leaves one
+    /// there.** The old road deleted the template before writing its
+    /// replacement, so a failed copy left the shelf with none.
+    #[test]
+    fn a_staged_template_replaces_the_shelf_and_a_failure_keeps_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-swap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dst = root.join("default");
+        let stage = root.join(".default.writing");
+        std::fs::create_dir_all(&dst).expect("old");
+        std::fs::write(dst.join("old"), b"old").expect("old file");
+        std::fs::create_dir_all(&stage).expect("stage");
+        std::fs::write(stage.join("new"), b"new").expect("new file");
+        swap_in_template(&stage, &dst).expect("swapped");
+        assert!(dst.join("new").is_file() && !dst.join("old").exists(), "the stage did not replace the template");
+        assert!(!stage.exists(), "the stage was left behind");
+        assert_eq!(std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0), 1, "the old template was left beside it");
+        // No stage: an error, and the template still stands.
+        assert!(swap_in_template(&stage, &dst).is_err());
+        assert!(dst.join("new").is_file(), "a failed swap lost the template");
+        // No template yet: the stage simply becomes it.
+        let fresh = root.join("mine");
+        std::fs::create_dir_all(&stage).expect("stage again");
+        swap_in_template(&stage, &fresh).expect("a first template");
+        assert!(fresh.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **A rack that has not arrived yet holds the room shut**, and only for
     /// the inputs somebody is actually playing through.
     ///
@@ -24536,6 +24871,16 @@ mod tests {
             let mut at = 0usize;
             while let Some(hit) = body[at..].find("TangentApp::new") {
                 let abs = at + hit;
+                // A mention in a comment builds nothing, and neither does
+                // this scan's own spelling of the constructor's name.
+                let line_start = body[..abs].rfind('\n').map_or(0, |n| n + 1);
+                let in_self = body[..abs].rfind("\n    fn ").is_some_and(|f| {
+                    body[f..].starts_with("\n    fn no_test_in_this_crate_writes_the_real_settings_file")
+                });
+                if in_self || body[line_start..abs].trim_start().starts_with("//") {
+                    at = abs + "TangentApp::new".len();
+                    continue;
+                }
                 // The call's own argument list, which is where the caps are.
                 let tail = &body[abs..body.len().min(abs + 400)];
                 let desktop = tail.contains("Caps::DESKTOP");
@@ -24563,6 +24908,18 @@ mod tests {
                      IVORY_SETTINGS_PATH somewhere safe first, so running the \
                      suite writes the user's own settings file (byte {abs} of \
                      the test module)"
+                );
+                // **And the media roots with it.** `tangent-ui`'s own tests
+                // resolve a temp root, but this crate links the ordinary
+                // build, where `Settings::media_root` is the owner's own
+                // `Documents/Tangent Media` - projects, takes and templates.
+                // A test in `tangent-ui` wrote over the real
+                // `Projects/Untitled` on every run until 2026-09-22.
+                assert!(
+                    !redirected || back.contains("TANGENT_MEDIA_ROOT"),
+                    "{name}: a test redirects the settings file but not \
+                     TANGENT_MEDIA_ROOT, so the app it builds resolves the \
+                     user's own media folder (byte {abs} of the test module)"
                 );
                 at = abs + "TangentApp::new".len();
             }
@@ -24733,16 +25090,42 @@ mod tests {
                  which is a second spelling of an order that has exactly one"
             );
         }
-        // Save As Template copies the folder, so both writes have to have
+        // Save As Template copies a REAL folder, so both writes have to have
         // happened before the copy or the template is a session missing its
         // shelf — which is the whole fault.
         let template = between("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)");
+        let saved = template.find("self.save_project_and_states()").expect("the real-folder save");
+        let copied = template.find("copy_dir_all(src, &stage)").expect("the real-folder copy");
         assert!(
-            template.find("self.save_project_and_states()")
-                < template.find("copy_dir_all(&src, &dst)"),
+            saved < copied,
             "Save As Template copies the session folder before it writes the \
              session into it, so the template is a stencil with no plugin \
              state in it"
+        );
+        // **And a scratch is never written on the way.** The save is the
+        // REAL folder's alone: asked about before any write, and the scratch
+        // gets the template written from memory with its shelf mirrored.
+        // Without this every Save As Template from a fresh launch left a
+        // `Projects/Untitled` behind.
+        let real = template.find("let was_real").expect("the template road no longer asks whether the folder is real");
+        assert!(
+            real < saved && real < template.find("self.save_plugin_states()").unwrap_or(usize::MAX),
+            "the template road writes before it knows whether the session has a folder"
+        );
+        let scratch = template
+            .split("if was_real {")
+            .nth(1)
+            .and_then(|t| t.split("} else {").nth(1))
+            .and_then(|t| t.split('}').next())
+            .expect("the scratch branch of the template save");
+        assert!(
+            !scratch.contains("save_project") && scratch.contains("self.save_plugin_states()"),
+            "a template saved from a scratch writes the scratch: {scratch}"
+        );
+        assert!(
+            template.contains("self.app.write_template_into(&stage)")
+                && template.contains("mirror_sidecars(&global_state_dir(), &shelf_dir)"),
+            "a scratch's template is no longer written from memory with its shelf"
         );
 
         // And the two that write the outgoing document only if it is dirty.
@@ -24763,7 +25146,83 @@ mod tests {
                  the save that gives it a folder, so a scratch kept by that \
                  very save is written without them"
             );
+            // **"Don't Save" means it.** The save prompt's answer is taken
+            // BEFORE the dirt question and gates it; without this the
+            // discarded edits were written on the way out anyway - into a
+            // named project, or a scratch's into a new Untitled folder.
+            assert!(
+                body.contains("if !discarded && self.app.project_dirty_exact()"),
+                "`{road}` saves the outgoing document after \"Don't Save\""
+            );
         }
+        let switch = between("fn switch_project(&mut self, doc:", "self.app.open_project(doc)");
+        assert!(
+            switch.find("let discarded = self.app.take_outgoing_discarded();")
+                < switch.find("self.app.save_project_doc()"),
+            "an Open no longer asks whether the outgoing session was discarded"
+        );
+        // The New arm takes the answer before the reclaim decides, whichever
+        // branch runs, so an answer cannot outlive the New it was given for
+        // and a discarded kit cannot keep the scratch it was discarded from.
+        let new_arm = between("ProjectRequest::NewDiscarding => {", "// **A clean slate");
+        let taken = new_arm
+            .find("let discarded = self.app.take_outgoing_discarded();")
+            .expect("the New arm no longer takes \"Don't Save\"");
+        let reclaim = new_arm.find("fresh_project_dir(&root)").expect("the reclaim");
+        assert!(taken < reclaim, "the New arm decides the reclaim before the discard is known");
+        // The warning detour hands the answer back for the second New, and
+        // the clearing waits until nothing can stop the New any more.
+        let warn = new_arm.find("self.app.warn_about_scratch(").expect("the scratch warning");
+        let rearm = new_arm
+            .find("if discarded {\n                        self.app.rearm_outgoing_discarded();")
+            .expect("the warning spends \"Don't Save\" and the second New writes what it refused");
+        let cleared = new_arm
+            .find("if discarded && self.discard_outgoing_scratch()")
+            .expect("the New arm no longer clears a discarded scratch");
+        assert!(rearm < warn && warn < cleared, "the New arm clears the scratch before it may stop to ask");
+        assert!(
+            new_arm.contains("if !discarded {\n                        self.copy_states_to_project();"),
+            "the New arm shelves a discarded session's plugin states into its project"
+        );
+        // An Open, and a Quit, the same.
+        let switch_tail = between("let discarded = self.app.take_outgoing_discarded();\n        if !discarded && self.app.project_dirty_exact()", "self.app.open_project(doc)");
+        assert!(
+            switch_tail.contains("if discarded {\n            self.discard_outgoing_scratch();")
+                && switch_tail.contains("} else {\n            self.copy_states_to_project();"),
+            "an Open shelves a discarded session's plugin states into its project"
+        );
+        let exit = between("fn on_exit(&mut self", "\n}\n");
+        assert!(
+            exit.contains("if self.app.take_outgoing_discarded() {\n            self.discard_outgoing_scratch();")
+                && exit.contains("} else {\n            self.copy_states_to_project();"),
+            "a Quit answered Don't Save shelves the discarded plugin states"
+        );
+        // An arrangement take makes a scratch real through the one door that
+        // brings its kit across, and only when it has audio to keep.
+        let take = between("// The WAVs, one per armed input, into the project's own media/.", "for (_input, lane, frames) in &rec.audio");
+        assert!(
+            take.contains("if rec.audio.iter().any(|(_, _, f)| f.len() as f64 / 2.0 / rate >= 0.05) {\n                self.app.materialize_project_dir();"),
+            "an arrangement take makes its folder behind `materialize_project_dir`'s back"
+        );
+        // A freeze and an export make a scratch real through the same door,
+        // before their own mkdir - or the pads switch to a folder their
+        // samples were never copied into.
+        for (from, to) in [
+            ("let out_dir = if freeze.is_some() {", "} else {"),
+            ("fn finish_bounce(", "let _ = std::fs::create_dir_all(&export_dir);"),
+        ] {
+            let body = between(from, to);
+            assert!(
+                body.contains("self.app.materialize_project_dir();"),
+                "`{from}` makes its folder behind `materialize_project_dir`'s back"
+            );
+        }
+        let stems = between("fn start_bounce(", "let rate = e.output().sample_rate;");
+        let door = stems.find("self.app.materialize_project_dir();").expect("the stems road's door");
+        assert!(
+            Some(door) < stems.find("let _ = std::fs::create_dir_all(&dir);"),
+            "the stems road makes its folder before the door"
+        );
     }
 
     /// **Every edge where frames may stop drains the settings debounce.**
@@ -29606,6 +30065,8 @@ mod sidecar_walk_probe {
         let path = dir.join("settings.json");
         // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        // And the media roots, or the app resolves the owner's own Documents.
+        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", path.with_file_name("Tangent Media")) };
 
         let grow = tangent_ui::recorder::CHANNELS - 16;
         // The sixteen-channel era's master (19), its first pad (20), and the
@@ -29651,6 +30112,8 @@ mod sidecar_walk_probe {
         let path = dir.join("settings.json");
         // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        // And the media roots, or the app resolves the owner's own Documents.
+        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", path.with_file_name("Tangent Media")) };
         let t = std::time::Instant::now();
         shift_insert_states_for_v20();
         let one = t.elapsed();
