@@ -217,12 +217,16 @@ build_windows() {
   # exe; the setup, the app, and the Add/Remove entry are one mark.
   need "$ROOT/assets/tangent.ico" "the app icon is missing"
   local out="dist/$NAME-$VERSION-windows-setup.exe"
+  # SIGNCMD signs the uninstaller while makensis builds it (the .nsi's
+  # !uninstfinalize); the setup.exe itself is signed by build-cross.sh once
+  # makensis has written it.
   makensis -NOCD \
     "-DVERSION=$VERSION" \
     "-DNUMVERSION=${VERSION%%-*}" \
     "-DSRCDIR=$WORK/windows" \
     "-DICON=$ROOT/assets/tangent.ico" \
     "-DOUTFILE=$ROOT/$out" \
+    "-DSIGNCMD=$ROOT/scripts/sign-windows.sh" \
     installer/windows/tangent.nsi | sed 's/^/    /'
 
   echo "==> $out"

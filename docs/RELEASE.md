@@ -94,26 +94,40 @@ xcrun notarytool store-credentials "tangent-notary" \
 The `.pkg` is signed separately by `build-installer.sh` with a **Developer ID
 Installer** certificate; `release.sh` fails an unsigned pkg at check time.
 
-### Windows: both PEs are signed, and release.sh refuses either unsigned
+### Windows: every PE is signed, and release.sh refuses any unsigned
 
 `scripts/sign-windows.sh` Authenticode-signs a PE via **jsign** against
 Azure Artifact Signing (signtool is Windows-only and this binary is
-cross-built from macOS). `build-cross.sh` calls it twice: on the inner
-`tangent.exe` before staging, and on `setup.exe` after makensis writes it,
-because SmartScreen judges the OUTER installer. With none of
-`TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
+cross-built from macOS). Four PEs ship, and all four take that one route:
+`build-cross.sh` signs the inner `tangent.exe` and the bundled
+`tangent-ffmpeg.exe` as it stages them; makensis signs the uninstaller while
+it builds the installer (`!uninstfinalize` in `installer/windows/tangent.nsi`,
+with `= 0` so a failed signing fails the build - without it makensis ignores
+the exit code and ships the uninstaller unsigned, which was tested); and
+`build-cross.sh` signs `setup.exe` after makensis writes it.
+
+Two Windows gates, and they judge different files. SmartScreen judges the
+OUTER installer when it is first opened. **Smart App Control** (Windows 11)
+checks EVERY program each time it starts and has no per-app override, not
+even for an administrator: an unknown, unsigned program is simply blocked.
+A tester hit exactly that on 2026-09-24, days after installing, when Smart
+App Control left its evaluation mode. It needs a valid signature, not
+reputation, so a signed build runs there from its first release - but only
+if the encoder and the uninstaller are signed as well as the app.
+
+With none of `TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
 `TRUSTED_SIGNING_PROFILE` set, the PEs ship unsigned and the build says so
-once; with only some of them set the build **fails** rather than quietly
-shipping an unsigned binary you believe is signed. A token can be supplied
-directly as `TRUSTED_SIGNING_TOKEN`. `release.sh` then verifies both
-signatures at artifact-check time (`scripts/pe-signed.py`) and a Windows
-release runs RED until the Azure account exists, on purpose.
+for each one; with only some of them set the build **fails** rather than
+quietly shipping an unsigned binary you believe is signed. A token can be
+supplied directly as `TRUSTED_SIGNING_TOKEN`. `release.sh` then checks the
+signature of `setup.exe`, of each PE inside it (extracted with 7-Zip:
+`tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe`) and of each PE in the
+portable zip (`scripts/pe-signed.py`), and a Windows release runs RED until
+the Azure account exists, on purpose.
 
 Account setup, from zero, is `docs/WINDOWS-SIGNING.md` - the one-time Azure
-walkthrough (identity validation takes days; everything else takes minutes).
-
-Known residual: NSIS generates `Uninstall.exe` on the user's machine at
-install time, so it cannot be signed from here. Documented, out of scope.
+walkthrough (an individual's identity check takes minutes; an
+organization's takes business days).
 
 ### Linux: no signing, but a dependency contract
 

@@ -148,6 +148,11 @@ by sha256, and the Linux tarballs and the Windows artifact ship them as
   where it can still be fetched. Windows builds 4.4.1 through 5.0.0-beta.13
   bundled **n8.1.2-44-g7c533d0f86** from `autobuild-2026-08-17-13-05`
   (already gone upstream).
+* Once Windows signing is configured, the shipped `tangent-ffmpeg.exe`
+  carries Tangent's Authenticode signature, because Smart App Control
+  blocks unsigned programs. The program is still BtbN's build byte for
+  byte, apart from the appended signature and the header fields signing
+  updates; the cached copy in `dist/vendor` is never signed.
 
 macOS and FreeBSD are unaffected (AVFoundation, and the `multimedia/ffmpeg`
 port, respectively). Because the artifacts are handed out through

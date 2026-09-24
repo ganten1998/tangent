@@ -51,6 +51,20 @@ InstallDirRegKey HKLM "Software\Tangent" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
+; **The uninstaller is signed here, at build time, like every other PE we
+; ship.** NSIS 3.08+ generates the complete uninstaller while compiling and
+; runs this command on it before packing it into the installer, so the
+; Uninstall.exe that WriteUninstaller puts on the user's disk is the signed
+; one. Smart App Control checks every program each time it starts and has no
+; per-app override, so an unsigned uninstaller is one Windows refuses to run:
+; an app that cannot be removed. `= 0` because without it makensis ignores
+; the command's exit code, and a failed signing must fail the build.
+; build-installer.sh passes SIGNCMD (scripts/sign-windows.sh), which leaves
+; the file unsigned and says so when no signing account is configured.
+!ifdef SIGNCMD
+  !uninstfinalize '"${SIGNCMD}" "%1" Uninstall.exe' = 0
+!endif
+
 VIProductVersion "${NUMVERSION}.0"
 VIAddVersionKey "ProductName" "Tangent"
 VIAddVersionKey "ProductVersion" "${VERSION}"

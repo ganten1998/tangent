@@ -47,6 +47,23 @@ sha256() {  # shasum is Perl's and is not on every minimal Linux install
   else command sha256 -r "$@" | sed 's/ /  /'; fi
 }
 
+# pe_sig <label> <pe>: the Authenticode presence check for every Windows PE we
+# ship, in one wording. A presence check on the PE's certificate table
+# (scripts/pe-signed.py) rather than a verifier that may not be installed — a
+# gate that only runs where a tool happens to exist is a gate that is off on
+# the machine that cuts releases. Exit 1 is a clean-but-unsigned PE; anything
+# else means the file could not even be read as a PE, which is worse, not
+# better.
+pe_sig() {
+  local sig=0
+  python3 scripts/pe-signed.py "$2" >/dev/null 2>&1 || sig=$?
+  case "$sig" in
+    0) ;;
+    1) note "$1: UNSIGNED (Authenticode) — configure TRUSTED_SIGNING_* and rerun (docs/RELEASE.md § Windows)" ;;
+    *) note "$1: could not read the PE certificate table (pe-signed.py exit $sig)" ;;
+  esac
+}
+
 # ── FreeBSD's spelling of the version ────────────────────────────────────────
 # pkg(8) uses the hyphen to split a package NAME from its VERSION in a
 # filename, so build-freebsd.sh writes 5.0.0-rc.1 as 5.0.0.r1 (FreeBSD's own
@@ -369,18 +386,23 @@ for a in "${ARTIFACTS[@]}"; do
         note "$a: not inspected (install 7-zip to check: brew install sevenzip)"
       fi
       # The same refusal the .pkg gets, because SmartScreen judges the OUTER
-      # installer no matter what happened to the inner exe. A presence check
-      # on the PE's certificate table (scripts/pe-signed.py) rather than a
-      # verifier that may not be installed — a gate that only runs where a
-      # tool happens to exist is a gate that is off on the machine that cuts
-      # releases. Exit 1 is a clean-but-unsigned PE; anything else means the
-      # file could not even be read as a PE, which is worse, not better.
-      sig=0; python3 scripts/pe-signed.py "$a" >/dev/null 2>&1 || sig=$?
-      case "$sig" in
-        0) ;;
-        1) note "$a: UNSIGNED (Authenticode) — configure TRUSTED_SIGNING_* and rerun (docs/RELEASE.md § Windows)" ;;
-        *) note "$a: could not read the PE certificate table (pe-signed.py exit $sig)" ;;
-      esac
+      # installer no matter what happened to the inner exe.
+      pe_sig "$a" "$a"
+      # And every PE INSIDE it, because Smart App Control judges each program
+      # as it starts, with no way for the user to allow one: an unsigned
+      # tangent.exe, encoder or uninstaller is blocked however signed the
+      # setup was. Extracted, not listed, because a signature is in the bytes.
+      if command -v 7zz >/dev/null 2>&1; then
+        inner="$(mktemp -d)"
+        for pe in tangent.exe tangent-ffmpeg.exe Uninstall.exe; do
+          if 7zz e -y -o"$inner" "$a" "$pe" >/dev/null 2>&1 && [ -f "$inner/$pe" ]; then
+            pe_sig "$a: $pe" "$inner/$pe"
+          else
+            note "$a: could not extract $pe to check its signature"
+          fi
+        done
+        rm -rf "$inner"
+      fi
       continue
       ;;
   esac
@@ -416,6 +438,17 @@ for a in "${ARTIFACTS[@]}"; do
       # is missing here. Loud, like the glibc floor.
       printf '%s\n' "$list" | grep -Eq '(^|/)ASIO-NOTICE\.txt$' \
         || note "$a: NO ASIO (vendor/asiosdk_* was missing at build time)"
+      # The portable build meets Smart App Control exactly as the installed
+      # one does, so its programs are held to the same signatures.
+      inner="$(mktemp -d)"
+      for pe in tangent.exe tangent-ffmpeg.exe; do
+        if unzip -q -o "$a" "$pe" -d "$inner" 2>/dev/null && [ -f "$inner/$pe" ]; then
+          pe_sig "$a: $pe" "$inner/$pe"
+        else
+          note "$a: could not extract $pe to check its signature"
+        fi
+      done
+      rm -rf "$inner"
       ;;
     *-freebsd-*)
       check_freebsd_bundle "$a" "$list"
