@@ -76,6 +76,19 @@ account list`), which is exactly what the Individual route requires, and
 both roles are confirmed on the `tangent` account (`az role assignment
 list`), so **New identity** is not greyed out.
 
+2026-09-24, later: steps 3 and 4 DONE. The Individual identity validation
+is Completed and the certificate profile `tangent` is Public Trust, Active.
+The first real signing (a scratch copy of tangent.exe) produced a timestamped
+signature whose digest matches the file, from the publisher "Matthew
+Gantenbein", chained through Microsoft ID Verified CS AOC CA 03 and the
+Microsoft ID Verified Code Signing PCA 2021 to the Microsoft Identity
+Verification Root CA 2020. Each certificate lives three days; the RFC 3161
+timestamp is what keeps signatures valid after that. It took one fix:
+jsign's default timestamp protocol is the legacy Authenticode one, which
+Microsoft's server does not speak, so `sign-windows.sh` passes
+`--tsmode RFC3161`. What remains is step 6's three variables on whichever
+machine builds.
+
 1. **Azure account.** https://portal.azure.com - sign in or create the
    account (Microsoft account, credit card for the subscription; the
    service itself bills $9.99/month once created). Create a subscription

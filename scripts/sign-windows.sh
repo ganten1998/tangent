@@ -80,11 +80,16 @@ fi
 
 echo "==> Signing $NAME via Azure Artifact Signing"
 # RFC-3161 timestamp so the signature outlives the short-lived certificate.
+# `--tsmode RFC3161` is not optional: jsign defaults to the legacy
+# Authenticode timestamp protocol, Microsoft's server speaks only RFC 3161,
+# and the default fails AFTER Azure has signed, as "Malformed content" /
+# "Unable to complete the timestamping" (the first real signing, 2026-09-24).
 jsign --storetype TRUSTEDSIGNING \
       --keystore "$TRUSTED_SIGNING_ENDPOINT" \
       --storepass "$token" \
       --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
       --tsaurl http://timestamp.acs.microsoft.com \
+      --tsmode RFC3161 \
       --name "Tangent" \
       "$EXE" || { echo "jsign failed — $NAME NOT signed" >&2; exit 1; }
 
