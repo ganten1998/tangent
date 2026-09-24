@@ -4240,7 +4240,7 @@ struct UiParam {
 /// window could write from any of them: in the seat space, the two rows one
 /// and two past the channels are the DRUM BUS and the CLICK. A master curve
 /// filed by the old rule would have been read back by the drum bus's rack.
-fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
+pub(crate) fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
     if lane == MASTER_AUTO_LANE {
         return if bay < INSERTS {
             Some((tangent_ui::recorder::MASTER_SEAT, bay))

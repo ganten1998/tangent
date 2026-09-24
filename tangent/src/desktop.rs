@@ -1023,6 +1023,10 @@ pub struct DesktopApp {
     /// the reason `pushed_maps` gives. Invalidated in `start_engine` beside
     /// it — a fresh engine has no curves.
     pushed_auto: Option<tangent_ui::automation::Automation>,
+    /// **The built-in faces an automation overlay was handed to**, as
+    /// `(seat, bay)` — so one whose curve went, or whose window closed, is
+    /// told to stop. See `push_live_faces`.
+    live_faces: Vec<(usize, usize)>,
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
@@ -2060,40 +2064,7 @@ fn push_builtin_faces(
                 // so the curve the face paints IS the response the block
                 // loop runs.
                 curve_db: if spec.path == crate::builtin_fx::EQ_PATH {
-                    let mut eq = crate::units::eq::EqParams::default();
-                    for (i, node) in eq.nodes.iter_mut().enumerate() {
-                        let base = i as u32 * 5;
-                        let at = |k: u32| values.get((base + k) as usize).copied().unwrap_or(0.5);
-                        // A node past the face's three has no values at all;
-                        // absent must read as OFF, not as the toggle's noon.
-                        node.on = values
-                            .get(base as usize)
-                            .is_some_and(|v| *v >= 0.5);
-                        let last = (crate::units::eq::NodeKind::ALL.len() - 1) as f32;
-                        let k = ((at(1) * last).round() as usize)
-                            .min(crate::units::eq::NodeKind::ALL.len() - 1);
-                        node.kind = crate::units::eq::NodeKind::ALL[k];
-                        node.freq = at(2);
-                        node.gain = at(3);
-                        node.q = at(4);
-                    }
-                    let lo = tangent_ui::face::CURVE_LO_HZ;
-                    let hi = tangent_ui::face::CURVE_HI_HZ;
-                    let n = tangent_ui::face::CURVE_POINTS;
-                    let freqs: Vec<f32> = (0..n)
-                        .map(|i| lo * (hi / lo).powf(i as f32 / (n - 1) as f32))
-                        .collect();
-                    let live: Vec<crate::units::eq::Node> = eq
-                        .nodes
-                        .iter()
-                        .filter(|p| p.on)
-                        .map(|p| p.node())
-                        .collect();
-                    crate::units::eq::response_db(
-                        &live,
-                        &freqs,
-                        engine.output().sample_rate as f32,
-                    )
+                    eq_curve_db(values, engine.output().sample_rate as f32)
                 } else {
                     Vec::new()
                 },
@@ -2107,6 +2078,116 @@ fn push_builtin_faces(
         };
         app.set_builtin_face(face);
     }
+}
+
+/// **The EQ's picture, drawn by the audio path's own math on the UI's own
+/// grid** — the two crates share the constants, so the curve a face paints
+/// IS the response the block loop runs. One function for the saved face and
+/// the automated one, so the line cannot be drawn two ways.
+#[cfg(feature = "recorder")]
+fn eq_curve_db(values: &[f32], sample_rate: f32) -> Vec<f32> {
+    let mut eq = crate::units::eq::EqParams::default();
+    for (i, node) in eq.nodes.iter_mut().enumerate() {
+        let base = i as u32 * 5;
+        let at = |k: u32| values.get((base + k) as usize).copied().unwrap_or(0.5);
+        // A node past the face's three has no values at all; absent must
+        // read as OFF, not as the toggle's noon.
+        node.on = values.get(base as usize).is_some_and(|v| *v >= 0.5);
+        let last = (crate::units::eq::NodeKind::ALL.len() - 1) as f32;
+        let k = ((at(1) * last).round() as usize).min(crate::units::eq::NodeKind::ALL.len() - 1);
+        node.kind = crate::units::eq::NodeKind::ALL[k];
+        node.freq = at(2);
+        node.gain = at(3);
+        node.q = at(4);
+    }
+    let lo = tangent_ui::face::CURVE_LO_HZ;
+    let hi = tangent_ui::face::CURVE_HI_HZ;
+    let n = tangent_ui::face::CURVE_POINTS;
+    let freqs: Vec<f32> = (0..n).map(|i| lo * (hi / lo).powf(i as f32 / (n - 1) as f32)).collect();
+    let live: Vec<crate::units::eq::Node> =
+        eq.nodes.iter().filter(|p| p.on).map(|p| p.node()).collect();
+    crate::units::eq::response_db(&live, &freqs, sample_rate)
+}
+
+/// **A built-in face as the automation has it right now**, or `None` when
+/// nothing automates this bay.
+///
+/// The owner: "any plugin in-house needs proper visual reaction to the
+/// automation selected e.g. automation of 5th node of the EQ as HPF up and
+/// down should show that node moving in accordance with the automation if
+/// the plugin window is open."
+///
+/// Automation reaches a built-in unit only on the audio thread, as a private
+/// copy of its parameters (`BuiltinUnit::apply`). The face draws the bay's
+/// SAVED values, which automation never writes and must not: they are the
+/// resting setting a save keeps, as the desk's faders keep theirs. So this
+/// evaluates, at `at`, every curve in `auto` whose bay lands on this SEAT and
+/// bay (matched in seat space through `param_slot`, the one mapping the
+/// engine files curves by; the master's two racks are ordered the other way
+/// for display), and answers ONLY the automated params — their values, their
+/// readings (computed against the whole overlaid bay, since a reading can
+/// depend on a sibling) — plus the EQ's line drawn through them. Display
+/// only: the app overlays it on the saved face and never writes it back.
+#[cfg(feature = "recorder")]
+fn live_face(
+    spec: &crate::builtin_fx::UnitSpec,
+    saved: &[f32],
+    auto: &tangent_ui::automation::Automation,
+    at: f64,
+    seat: usize,
+    bay: usize,
+    sample_rate: f32,
+) -> Option<tangent_ui::ports::BuiltinFace> {
+    use tangent_ui::automation::AutoParam;
+    let mut values = saved.to_vec();
+    let mut moved: Vec<u32> = Vec::new();
+    for c in auto.curves() {
+        let AutoParam::Plugin { bay: b, id } = c.param else {
+            continue;
+        };
+        if crate::instrument::param_slot(c.lane, usize::from(b)) != Some((seat, bay)) {
+            continue;
+        }
+        let Some(k) = spec.params.iter().position(|p| p.id == id) else {
+            continue;
+        };
+        let (Some(v), Some(slot)) = (c.value_at(at), values.get_mut(k)) else {
+            continue;
+        };
+        *slot = v as f32;
+        moved.push(id);
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    Some(tangent_ui::ports::BuiltinFace {
+        strip: seat,
+        slot: bay,
+        path: spec.path.to_owned(),
+        params: spec
+            .params
+            .iter()
+            .zip(&values)
+            .filter(|(p, _)| moved.contains(&p.id))
+            .map(|(p, v)| tangent_ui::ports::BuiltinFaceParam {
+                id: p.id,
+                symbol: p.symbol.to_owned(),
+                name: p.name.to_owned(),
+                units: p.units.to_owned(),
+                default: p.default,
+                steps: p.steps,
+                reading: crate::builtin_fx::describe(spec.path, p.id, *v, &values),
+                choices: crate::builtin_fx::choices(spec.path, p.id),
+                value: *v,
+            })
+            .collect(),
+        curve_db: if spec.path == crate::builtin_fx::EQ_PATH {
+            eq_curve_db(&values, sample_rate)
+        } else {
+            Vec::new()
+        },
+        extra: Vec::new(),
+    })
 }
 
 /// One filter's slope, as a choice the panel can step through.
@@ -4278,6 +4359,9 @@ impl DesktopApp {
         if self.insert_announced.is_some() {
             self.comp_rows_stale = true;
         }
+        // **And the automated faces**, on the same cadence as the needles:
+        // an open EQ whose node is on a curve moves with the playhead.
+        self.push_live_faces();
         // **The denoise learn drain**, same cadence and same reason as the
         // needles above: while a learn runs (and on the frame after it
         // freezes) the audio thread publishes thresholds into one shared
@@ -14363,6 +14447,38 @@ impl DesktopApp {
         }
     }
 
+    /// **Every OPEN built-in face, as the automation has it now** — see
+    /// `live_face`. Each frame, because the playhead moves every frame; only
+    /// the open windows, because nothing else is looking. Evaluated against
+    /// `pushed_auto`, which is exactly what the engine plays (a bypassed row
+    /// is already out of it), at the same playhead the UI draws. An overlay
+    /// whose curve went or whose window closed is withdrawn, so the face
+    /// falls back to the saved setting it rests at.
+    #[cfg(feature = "recorder")]
+    fn push_live_faces(&mut self) {
+        let mut now: Vec<(usize, usize)> = Vec::new();
+        if let (Some(engine), Some(auto)) = (self.recorder.engine.as_ref(), self.pushed_auto.as_ref())
+        {
+            let rate = engine.output().sample_rate;
+            let at = self.recorder.transport.position_s(Some(engine), f64::from(rate));
+            for (seat, bay) in self.app.open_face_seats() {
+                let Some((spec, saved)) = engine.builtin_insert(seat, bay) else {
+                    continue;
+                };
+                if let Some(face) = live_face(spec, saved, auto, at, seat, bay, rate as f32) {
+                    self.app.set_live_face(seat, bay, Some(face));
+                    now.push((seat, bay));
+                }
+            }
+        }
+        for gone in std::mem::take(&mut self.live_faces) {
+            if !now.contains(&gone) {
+                self.app.set_live_face(gone.0, gone.1, None);
+            }
+        }
+        self.live_faces = now;
+    }
+
     /// Which lanes the curves must leave alone, pushed every frame.
     ///
     /// Unlike the curves themselves this is one atomic word, so it costs a
@@ -18343,6 +18459,7 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             pushed_maps: None,
             pushed_auto: None,
+            live_faces: Vec::new(),
             midi_lane,
             app,
             display_probe_at: None,
@@ -23648,6 +23765,81 @@ mod tests {
             rate: 8_000,
             source: std::path::PathBuf::from("g.wav"),
         })
+    }
+
+    /// **An automated built-in face moves with the playhead**: its value,
+    /// its reading and the EQ's line, and only the automated params come
+    /// back. The owner: "automation of 5th node of the EQ as HPF up and down
+    /// should show that node moving in accordance with the automation if the
+    /// plugin window is open."
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn an_automated_eq_face_moves_its_node_with_the_playhead() {
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::EQ_PATH).expect("the EQ");
+        let mut saved: Vec<f32> = spec.params.iter().map(|p| p.default).collect();
+        saved[20] = 1.0; // band 5 on...
+        saved[21] = 3.0 / 5.0; // ...as a high-pass, `NodeKind::ALL[3]`
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        // Channel 2's second insert: lane 2, bay 1, which is seat (2, 1).
+        let mut auto = Automation::default();
+        auto.set(Curve::sanitised(
+            2,
+            AutoParam::Plugin { bay: 1, id: 22 },
+            vec![pt(0.0, 0.1), pt(4.0, 0.9)],
+        ));
+        let at = |t: f64| {
+            live_face(spec, &saved, &auto, t, 2, 1, 48_000.0).expect("no overlay for an automated bay")
+        };
+        let mid = at(2.0);
+        let ids: Vec<u32> = mid.params.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![22], "only the automated param comes back");
+        assert!((mid.params[0].value - 0.5).abs() < 1.0e-6, "halfway read {}", mid.params[0].value);
+        // The line follows the node: the corner swept up cuts the lows harder.
+        let (early, late) = (at(0.5), at(3.5));
+        assert!(
+            early.curve_db[0] > late.curve_db[0] + 3.0,
+            "the EQ line did not follow the node: {} then {}",
+            early.curve_db[0],
+            late.curve_db[0]
+        );
+        assert_ne!(early.params[0].reading, late.params[0].reading, "the reading did not move");
+        // Nothing for a bay no curve names, nor for the same param one seat over.
+        assert!(live_face(spec, &saved, &auto, 2.0, 2, 0, 48_000.0).is_none());
+        assert!(live_face(spec, &saved, &auto, 2.0, 3, 1, 48_000.0).is_none());
+        // The master matches in SEAT space: a curve's bay 0 is the ORIGINAL
+        // rack's, whatever order the strip displays its two racks in.
+        let mut m = Automation::default();
+        m.set(Curve::sanitised(
+            crate::instrument::MASTER_AUTO_LANE,
+            AutoParam::Plugin { bay: 0, id: 22 },
+            vec![pt(0.0, 0.3)],
+        ));
+        let master = tangent_ui::recorder::MASTER_SEAT;
+        let extra = tangent_ui::recorder::MASTER_EXTRA_SEAT;
+        assert!(live_face(spec, &saved, &m, 1.0, master, 0, 48_000.0).is_some());
+        assert!(live_face(spec, &saved, &m, 1.0, extra, 0, 48_000.0).is_none());
+    }
+
+    /// **The host evaluates the open faces every frame** — beside the
+    /// needles in `fill_recorder_state`, against what the engine plays, and
+    /// it withdraws an overlay whose curve or window has gone.
+    #[test]
+    fn the_host_moves_the_open_faces_every_frame() {
+        let src = include_str!("desktop.rs");
+        let fill = &src[src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state")..];
+        let fill = &fill[..fill.find("\n    fn ").unwrap_or(fill.len())];
+        assert!(fill.contains("self.push_live_faces();"), "the faces are not refreshed each frame");
+        let push = &src[src.find("fn push_live_faces(&mut self)").expect("push_live_faces")..];
+        let push = &push[..push.find("\n    fn ").unwrap_or(push.len())];
+        for needle in [
+            "self.pushed_auto.as_ref()",
+            "self.app.open_face_seats()",
+            "self.app.set_live_face(gone.0, gone.1, None)",
+            "live_face(spec, saved, auto, at, seat, bay",
+        ] {
+            assert!(push.contains(needle), "push_live_faces lost `{needle}`");
+        }
     }
 
     /// **A glued clip plays the samples its clips did, to the bit.**

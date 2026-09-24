@@ -222,6 +222,14 @@ impl Shape {
     }
 }
 
+/// **Two points closer than this in time share an instant**: a STEP.
+///
+/// The owner: nodes "should be able to be dragged such that 2 are on the
+/// same timeline point -- this allows for instant movement of the value to
+/// another value". A curve arrives at the first point of a pair and leaves
+/// from the second, so the pair is a jump with no ramp between.
+pub const SAME_INSTANT_S: f64 = 1e-9;
+
 /// One point on a curve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -255,20 +263,35 @@ impl Curve {
         for p in &mut points {
             p.value = p.value.clamp(0.0, 1.0);
         }
-        points.sort_by(|a, b| {
-            a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        // Two points at one instant is a step somebody drew by hand, and the
-        // LAST of them wins — a later edit is the one they meant.
+        // STABLE, and that is load-bearing: points that share an instant
+        // keep the order they were given in, which is what says which of a
+        // step's two points the curve ARRIVES at and which it LEAVES from.
+        points.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        // **Two points may share an instant, and that is a step** — see
+        // [`SAME_INSTANT_S`]. The curve arrives at the first and leaves from
+        // the second. It used to keep only the last, so a node could never
+        // sit on its neighbour's time and a jump had to be faked with a ramp
+        // one grid step wide.
         //
-        // Written out rather than `dedup_by`, which keeps the FIRST of each
-        // run and would have quietly meant the opposite of this comment.
+        // A third point at the same instant would live for no time at all
+        // and could never be heard, so a run keeps its first and last; and
+        // two that agree on the VALUE as well are one point, not a step.
         let mut kept: Vec<Point> = Vec::with_capacity(points.len());
-        for p in points {
-            if kept.last().is_some_and(|q| (q.at_s - p.at_s).abs() < 1e-9) {
-                kept.pop();
+        let mut i = 0;
+        while i < points.len() {
+            let mut j = i + 1;
+            while j < points.len() && points[j].at_s - points[i].at_s < SAME_INSTANT_S {
+                j += 1;
             }
-            kept.push(p);
+            let first = points[i];
+            // Snapped onto the first's time exactly, so a step drawn by two
+            // hands a nanosecond apart is one instant everywhere downstream.
+            let last = Point { at_s: first.at_s, ..points[j - 1] };
+            if j - i > 1 && (first.value - last.value).abs() > 1e-12 {
+                kept.push(first);
+            }
+            kept.push(last);
+            i = j;
         }
         // **A curve always begins with a node at zero.**
         //
@@ -314,25 +337,22 @@ impl Curve {
     /// wherever it happened to start.
     pub fn value_at(&self, seconds: f64) -> Option<f64> {
         let first = self.points.first()?;
-        if seconds <= first.at_s {
+        // The segment `seconds` falls in, found as the LAST point at or
+        // before it. A binary search rather than a walk because this runs
+        // on the audio thread, once per block per lane.
+        //
+        // **The last, not any.** At an instant holding a step there are two
+        // points, and from that instant on it is the SECOND that plays: the
+        // curve arrives at the first and leaves from the second. The engine
+        // reads this same function, so what is drawn is what is heard.
+        let i = self.points.partition_point(|p| p.at_s <= seconds);
+        if i == 0 {
             return Some(first.value);
         }
-        let last = self.points.last()?;
-        if seconds >= last.at_s {
-            return Some(last.value);
-        }
-        // The segment `seconds` falls in. A binary search rather than a walk
-        // because this runs on the audio thread, once per block per lane.
-        let i = match self
-            .points
-            .binary_search_by(|p| p.at_s.partial_cmp(&seconds).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            Ok(i) => return Some(self.points[i].value),
-            Err(0) => 0,
-            Err(i) => i - 1,
+        let a = self.points[i - 1];
+        let Some(&b) = self.points.get(i) else {
+            return Some(a.value);
         };
-        let a = self.points[i];
-        let b = self.points[i + 1];
         match a.shape {
             Shape::Hold => Some(a.value),
             Shape::Linear => {
@@ -348,8 +368,12 @@ impl Curve {
 
     /// Add or replace a point, keeping the curve sorted.
     ///
-    /// Replaces rather than stacks when one is already at that instant:
-    /// dragging a point back over its neighbour must not leave two.
+    /// **Replaces rather than stacks** when a point is already at that
+    /// instant: a node ADDED on top of one, or a level written over one while
+    /// recording, means "this value here", not "a step here". A step is made
+    /// by DRAGGING a node onto its neighbour's time — see
+    /// [`Curve::set_points`]. At an instant that already holds a step it is
+    /// the second point, the one the curve leaves from, that is replaced.
     pub fn put(&mut self, point: Point) {
         let Point { at_s, value, shape } = point;
         let p = Point {
@@ -357,13 +381,30 @@ impl Curve {
             value: value.clamp(0.0, 1.0),
             shape,
         };
-        match self
-            .points
-            .binary_search_by(|q| q.at_s.partial_cmp(&p.at_s).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            Ok(i) => self.points[i] = p,
-            Err(i) => self.points.insert(i, p),
+        let from = self.points.partition_point(|q| q.at_s < p.at_s - SAME_INSTANT_S);
+        let to = self.points.partition_point(|q| q.at_s <= p.at_s + SAME_INSTANT_S);
+        if to > from {
+            self.points[to - 1] = p;
+        } else {
+            self.points.insert(from, p);
         }
+    }
+
+    /// Take out the point at `index`, if there is one.
+    ///
+    /// By index rather than by time, because a time no longer names one
+    /// point: the two halves of a step share it, and a delete aimed at the
+    /// second must not take the first.
+    pub fn remove_at(&mut self, index: usize) -> Option<Point> {
+        (index < self.points.len()).then(|| self.points.remove(index))
+    }
+
+    /// Replace every point at once, **keeping the given order among points
+    /// that share an instant** — which is how a drag lands a node exactly on
+    /// its neighbour's time and makes a step rather than a replacement. The
+    /// same sanitising a file gets: see [`Curve::sanitised`].
+    pub fn set_points(&mut self, points: Vec<Point>) {
+        *self = Self::sanitised(self.lane, self.param, points);
     }
 
     /// Take the point nearest `seconds` out, if one is within `reach`.
@@ -540,11 +581,78 @@ mod tests {
             ],
         );
         let p = c.points();
-        assert!(p.windows(2).all(|w| w[0].at_s < w[1].at_s), "not sorted: {p:?}");
+        assert!(p.windows(2).all(|w| w[0].at_s <= w[1].at_s), "not sorted: {p:?}");
+        assert!(
+            p.windows(3).all(|w| w[0].at_s < w[2].at_s),
+            "three points share an instant: {p:?}"
+        );
         assert!(p.iter().all(|q| (0.0..=1.0).contains(&q.value)), "{p:?}");
         assert!(p.iter().all(|q| q.at_s >= 0.0), "{p:?}");
-        // The later of two points at one instant wins.
+        // Two points at one instant are a STEP, in the order the file gave
+        // them, and from that instant on it is the later one that plays.
         assert_eq!(c.value_at(20.0), Some(0.9));
+        let at_20: Vec<f64> = p.iter().filter(|q| q.at_s == 20.0).map(|q| q.value).collect();
+        assert_eq!(at_20, vec![0.5, 0.9], "the step was not kept in order: {p:?}");
+    }
+
+    /// **Two nodes on one instant are a step**: the curve ARRIVES at the
+    /// first and LEAVES from the second, with no ramp between.
+    ///
+    /// The owner: nodes "should be able to be dragged such that 2 are on the
+    /// same timeline point -- this allows for instant movement of the value
+    /// to another value -- currently they cannot exist 2 on a single point
+    /// even when dragged."
+    #[test]
+    fn two_nodes_on_one_instant_are_a_step() {
+        let mut c = Curve::sanitised(0, AutoParam::Gain, vec![pt(0.0, 0.2), pt(4.0, 0.5)]);
+        // A node carried onto its neighbour's time, BEFORE it in order: the
+        // arrival. What a drag hands `set_points`.
+        c.set_points(vec![pt(0.0, 0.2), pt(4.0, 0.8), pt(4.0, 0.5), pt(8.0, 0.5)]);
+        assert_eq!(c.points().len(), 4, "the step lost a node: {:?}", c.points());
+        // Rising towards the ARRIVAL value right up to the instant...
+        let before = c.value_at(4.0 - 1e-6).expect("a value");
+        assert!((before - 0.8).abs() < 1e-4, "arrived at {before}, not 0.8");
+        let mid = c.value_at(2.0).expect("a value");
+        assert!((mid - 0.5).abs() < 1e-9, "the ramp in was {mid}, not 0.5");
+        // ...and leaving from the SECOND from the instant on: the jump.
+        assert_eq!(c.value_at(4.0), Some(0.5));
+        assert_eq!(c.value_at(6.0), Some(0.5));
+
+        // A step at the very FIRST instant jumps there too, rather than
+        // holding the arrival value at the instant itself.
+        let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(2.0, 0.1), pt(2.0, 0.9)]);
+        assert_eq!(c.value_at(0.0), Some(0.1), "before the step");
+        assert_eq!(c.value_at(2.0), Some(0.9), "at the step");
+
+        // A THIRD node on the instant lives for no time at all: the run keeps
+        // its first and last. Two that agree on the value are one node.
+        let c = Curve::sanitised(
+            0,
+            AutoParam::Gain,
+            vec![pt(3.0, 0.1), pt(3.0, 0.4), pt(3.0, 0.7), pt(5.0, 0.2), pt(5.0, 0.2)],
+        );
+        let at: Vec<(f64, f64)> = c.points().iter().map(|q| (q.at_s, q.value)).collect();
+        assert_eq!(at, vec![(3.0, 0.1), (3.0, 0.7), (5.0, 0.2)], "{at:?}");
+    }
+
+    /// **A step's halves are told apart by INDEX**, because they share a
+    /// time: removing the second must leave the first, and putting a level
+    /// on the instant replaces the one the curve leaves from.
+    #[test]
+    fn a_steps_two_halves_are_edited_apart() {
+        let steps = || {
+            Curve::sanitised(0, AutoParam::Gain, vec![pt(0.0, 0.2), pt(4.0, 0.8), pt(4.0, 0.3)])
+        };
+        let mut c = steps();
+        assert_eq!(c.remove_at(2).map(|q| q.value), Some(0.3));
+        assert_eq!(c.points().len(), 2);
+        assert_eq!(c.points()[1].value, 0.8, "the wrong half went");
+        assert_eq!(c.remove_at(9), None, "an index past the end removed something");
+
+        let mut c = steps();
+        c.put(pt(4.0, 0.6));
+        let at: Vec<f64> = c.points().iter().map(|q| q.value).collect();
+        assert_eq!(at, vec![0.2, 0.8, 0.6], "put did not replace the leaving half: {at:?}");
     }
 
     /// **A curve holds exactly the nodes that were drawn on it.**
@@ -591,9 +699,12 @@ mod tests {
         assert!(c.is_empty(), "an empty curve was given a point");
     }
 
-    /// Putting a point where one already is replaces it.
+    /// **PUTTING a point where one already is replaces it.** A node added,
+    /// or a level written while recording, on an instant that has one means
+    /// "this value here". A step is a DRAG's doing, through `set_points` —
+    /// see `two_nodes_on_one_instant_are_a_step`.
     #[test]
-    fn a_point_dragged_onto_its_neighbour_does_not_leave_two() {
+    fn a_point_put_on_an_occupied_instant_replaces_it() {
         // Two: nothing is seeded, so the curve holds what it was built
         // from. See `a_curve_holds_only_the_nodes_that_were_drawn`.
         let mut c = Curve::sanitised(0, AutoParam::Gain, vec![pt(1.0, 0.2), pt(2.0, 0.8)]);
