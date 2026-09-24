@@ -11753,6 +11753,14 @@ impl TangentApp {
         // doing something else.
         self.arr_auto_nodes.clear();
         self.arr_auto_sel = None;
+        // **The paste's aims are rows too** — `(lane, param)` — and a paste
+        // with nothing chosen lands on one: carried with the lane they name,
+        // or it would replace a span on whatever track moved into that row.
+        let carry = |aim: Option<(usize, crate::automation::AutoParam)>| {
+            aim.map(|(l, p)| (if l < CHANNELS { inv[l] } else { l }, p))
+        };
+        self.arr_auto_focus = carry(self.arr_auto_focus);
+        self.auto_clipboard_from = carry(self.auto_clipboard_from);
 
         // **The sidechain key edges, both ends.** They name channels the
         // same way the kits and the curves do, and an edge left behind is
@@ -14047,6 +14055,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_seed_first_node(lane, param);
         }
         self.arr_auto_hot = None;
+        // **The chosen nodes and row name SLOTS**, and the slots were just
+        // renumbered: kept, a choice on one row names another row's nodes,
+        // and Delete takes them. Pressing the header's A let the choice go on
+        // its own; Cmd+A opens this menu without a press, so it goes here.
+        self.arr_auto_nodes.clear();
+        self.arr_auto_sel = None;
     }
 
     /// **A lane that has just been opened gets ONE node, at the beginning.**
@@ -14475,8 +14489,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         true
     }
 
+    /// **End a node drag in flight**, because the curve under it is about
+    /// to change by another hand: a drag re-anchored on an edited curve
+    /// carries whatever node slid into its index, straight to the pointer.
+    fn arr_end_node_drag(&mut self) {
+        if matches!(self.arr_drag, Some(ArrDrag::AutoPoint(..))) {
+            self.arr_drag = None;
+        }
+        self.arr_auto_drag_from = None;
+    }
+
     /// Take every selected node out, as ONE moment.
     fn arr_delete_auto_nodes(&mut self) {
+        self.arr_end_node_drag();
         let doomed = self.arr_auto_node_picks();
         self.arr_auto_nodes.clear();
         self.arr_auto_hot = None;
@@ -14553,6 +14578,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.auto_clipboard.is_empty() {
             return false;
         }
+        self.arr_end_node_drag();
         let chosen = self
             .arr_auto_nodes
             .first()
@@ -14652,6 +14678,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
         if let Some(param) = self.arr_auto_param_at(lane, slot) {
             self.arr_auto_open.remove(&(lane, param));
+            // Slots renumber — see `arr_toggle_automation_param`.
+            self.arr_auto_nodes.clear();
+            self.arr_auto_sel = None;
         }
     }
 
@@ -14835,12 +14864,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         } else {
             Shape::Linear
         };
-        self.arrangement
+        // **The index `put` answers**, not a search by time: at a step's
+        // instant the time names two nodes, `put` replaces the second, and a
+        // search found the first — so the node chosen and dragged was not
+        // the one just made.
+        let at = self
+            .arrangement
             .automation
             .entry(lane, param)
             .put(Point { at_s, value: v.clamp(0.0, 1.0), shape });
         self.arr_save_edits();
-        self.arr_auto_index(lane, param, at_s)
+        Some(at)
     }
 
     // ── the tempo lane ──────────────────────────────────────────────────
@@ -14917,8 +14951,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_tempo_index(at_beat)
     }
 
-    /// Where a point at `at_beat` sits in the map now. Re-derived for the
-    /// reason [`Self::arr_auto_index`] gives.
+    /// Where a point at `at_beat` sits in the map now. Re-derived rather
+    /// than remembered: the map is kept sorted, so dragging a point past its
+    /// neighbour changes its index, and a carried index would then name
+    /// somebody else's point.
     fn arr_tempo_index(&self, at_beat: f64) -> Option<usize> {
         self.arrangement
             .tempo
@@ -15317,23 +15353,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.meter = crate::tempo::MeterMap::sanitised(pts);
     }
 
-    /// Where a point at `at_s` sits in its curve now.
-    ///
-    /// Re-derived rather than remembered, because `put` keeps the curve
-    /// sorted: dragging a point past its neighbour changes its index, and a
-    /// carried index would then be moving somebody else's point.
-    fn arr_auto_index(
-        &self,
-        lane: usize,
-        param: crate::automation::AutoParam,
-        at_s: f64,
-    ) -> Option<usize> {
-        self.arrangement
-            .automation
-            .get(lane, param)?
-            .points()
-            .iter()
-            .position(|p| (p.at_s - at_s).abs() < 1e-9)
+    /// **The song time under screen `x`**, by the mapping every arrange DRAG
+    /// uses — no edge snap. See the node press, which measures its grab this
+    /// way so the press frame and the drag agree to the pixel.
+    fn arr_time_under(&self, x: f32) -> Option<f64> {
+        let rect = self.arrangement_rect?;
+        let clips = self.arr_clip_views();
+        let view = self.arrange_view(&clips);
+        Some(crate::arrangement_panel::time_at(rect, &view, x))
     }
 
     /// **Where an automation row's lane is drawn**, or `None` while it is not
@@ -15450,8 +15477,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             None => (self.arr_snap_t(t).max(0.0), v.clamp(0.0, 1.0)),
         };
-        let dt = at_s - from.lead_at.at_s;
-        let dv = value - from.lead_at.value;
+        // **The group moves as ONE shape, and stops at the edges as one.**
+        // Clamped node by node, several would pile onto 0 s or onto the top
+        // or bottom of the row — and nodes sharing an instant collapse, so a
+        // group pushed past the start LOST its middle.
+        let (lo_t, lo_v, hi_v) = from
+            .curves
+            .iter()
+            .flat_map(|(_, _, pts, moving)| moving.iter().filter_map(move |&k| pts.get(k)))
+            .fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY), |(t, lo, hi), p| {
+                (t.min(p.at_s), lo.min(p.value), hi.max(p.value))
+            });
+        let (want_dt, want_dv) = (at_s - from.lead_at.at_s, value - from.lead_at.value);
+        let dt = if lo_t.is_finite() { want_dt.max(-lo_t) } else { want_dt };
+        let dv = if lo_v.is_finite() { want_dv.clamp(-lo_v, 1.0 - hi_v) } else { want_dv };
+        // Where the hand is, unless the group stopped it there.
+        let at_s = if dt == want_dt { at_s } else { from.lead_at.at_s + dt };
+        let value = if dv == want_dv { value } else { from.lead_at.value + dv };
         let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
         let mut lead_now: Option<(usize, usize)> = None;
         let mut produced: Vec<Vec<Point>> = Vec::with_capacity(from.curves.len());
@@ -17231,6 +17273,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ("Delete time sig.".to_owned(), A::DeleteSig(bar)),
             ],
         }
+    }
+
+    /// **The clip a menu was opened on is what its Delete and Copy act on**
+    /// — with the set it belongs to, the same rule as grabbing a clip body.
+    ///
+    /// And NOT the automation nodes still chosen: Delete and copy take nodes
+    /// first wherever nodes are chosen, a right-click on a clip opens this
+    /// menu without the press that would have let them go, and nodes stay
+    /// chosen after a paste. "Delete take" took the pasted nodes and left
+    /// the take.
+    fn arr_clip_menu_subject(&mut self, id: u64) {
+        if !self.arr_multi.contains(&id) {
+            self.arr_multi.clear();
+        }
+        self.arr_selected = Some(id);
+        self.arr_auto_nodes.clear();
+        self.arr_auto_sel = None;
     }
 
     fn clip_menu_rows_for(&self, id: u64) -> Vec<(String, ClipMenuAction, bool)> {
@@ -24100,17 +24159,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // copied or deleted one clip: the owner's "pasting the
                     // first of the selected group".
                     Some(ClipMenuAction::Delete) => {
-                        if !self.arr_multi.contains(&id) {
-                            self.arr_multi.clear();
-                        }
-                        self.arr_selected = Some(id);
+                        self.arr_clip_menu_subject(id);
                         self.arr_delete_selected();
                     }
                     Some(ClipMenuAction::Copy) => {
-                        if !self.arr_multi.contains(&id) {
-                            self.arr_multi.clear();
-                        }
-                        self.arr_selected = Some(id);
+                        self.arr_clip_menu_subject(id);
                         self.arr_copy();
                     }
                     // **The tick, flipped.** The row shows the state and
@@ -24376,6 +24429,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // By INDEX, like the alt-click: a step's two
                             // halves share the time a pointer would name.
                             if let Some(param) = self.arr_auto_param_at(lane, row) {
+                                self.arr_end_node_drag();
                                 if self.arr_take_auto_node(lane, param, i) {
                                     self.arr_auto_nodes.clear();
                                     self.arr_auto_hot = None;
@@ -24855,6 +24909,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             self.arr_select_auto_node(n, row, i);
                         }
                         self.arr_auto_hot = Some((n, i));
+                        // **A shift-press that took the node OUT is only
+                        // that**: it starts no drag. The drag's first frame
+                        // runs on the press itself, carries the node under
+                        // the hand, and would choose it straight back.
+                        if !self.arr_auto_nodes.contains(&(n, row, i)) {
+                            return;
+                        }
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                         // The anchor is taken HERE, with where the hand is,
                         // so the drag moves the nodes by the hand's travel
@@ -24864,9 +24925,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             (self.arr_auto_param_at(n, row), self.arr_auto_band(n, row))
                         {
                             let v = crate::arrangement_panel::auto_value_at(band, p.y);
+                            // The grab's time by the DRAG's own mapping, not
+                            // `t_at`: that one snaps a press near the left
+                            // edge to zero, the drag does not, and the two
+                            // disagreeing on the press frame itself moved the
+                            // base node off zero on a plain click.
+                            let gt = self.arr_time_under(p.x).unwrap_or(t_at);
                             self.arr_auto_drag_from =
                                 self.arr_auto_anchor(n, param, i).map(|mut a| {
-                                    a.grab = Some((t_at, v));
+                                    a.grab = Some((gt, v));
                                     a
                                 });
                         }
@@ -27717,6 +27784,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.builtin_faces.get(&(strip, slot))
     }
 
+    /// **Whether a curve owns this knob right now** — its open face wears the
+    /// automation's value for it (see `builtin_faces_live`).
+    ///
+    /// A face GESTURE does not write such a knob. The face draws the curve's
+    /// value, so a gesture starts from it, and several write more than they
+    /// change: dragging an EQ node sends its frequency AND gain, the fine
+    /// slider starts from the shown value. With the frequency on a curve, a
+    /// hand lifting the node's gain wrote the curve's momentary frequency
+    /// into the saved setting — and when the curve went, the band was not
+    /// where anybody had set it. The curve plays either way; what is kept is
+    /// the setting the knob was left at by hand. A value TYPED into the
+    /// reading is still written: typing is saying exactly that.
+    fn face_param_automated(&self, seat: usize, bay: usize, id: u32) -> bool {
+        self.builtin_faces_live
+            .get(&(seat, bay))
+            .is_some_and(|f| f.params.iter().any(|p| p.id == id))
+    }
+
     /// **The automation's overlay for one open built-in face**, from the
     /// host — `None` withdraws it. See `builtin_faces_live`.
     pub fn set_live_face(
@@ -30343,7 +30428,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             ahead: self.settings.render_ahead_ms,
             rate: self.settings.sample_rate(),
             systems,
-            system: self.settings.audio_system().map(str::to_owned),
+            // **What is RUNNING, not what was asked for** — see
+            // `AudioSetup::active_system`. The setting is empty on the
+            // platform default, and marking only what it named left a
+            // fresh install showing no system at all while it played.
+            system: self
+                .audio_setup
+                .as_ref()
+                .and_then(|s| s.active_system())
+                .or_else(|| self.settings.audio_system().map(str::to_owned)),
             outputs,
             output: self.settings.audio_output_device.clone(),
             rates,
@@ -34067,7 +34160,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         match action {
             DialogAction::SetInsertParam { strip, slot, id, value } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
-                self.set_insert_param(seat, bay, id, value);
+                if !self.face_param_automated(seat, bay, id) {
+                    self.set_insert_param(seat, bay, id, value);
+                }
             }
             DialogAction::TypeInsertParam { strip, slot, id, text } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
@@ -34085,8 +34180,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 value_b,
             } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
-                self.set_insert_param(seat, bay, id_a, value_a);
-                self.set_insert_param(seat, bay, id_b, value_b);
+                for (id, value) in [(id_a, value_a), (id_b, value_b)] {
+                    if !self.face_param_automated(seat, bay, id) {
+                        self.set_insert_param(seat, bay, id, value);
+                    }
+                }
             }
             // In order, through the one road a single one takes, so a run is
             // exactly N of the same thing and not a second way to set a
@@ -34094,7 +34192,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SetInsertParamsMany { strip, slot, sets } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 for (id, value) in sets {
-                    self.set_insert_param(seat, bay, id, value);
+                    if !self.face_param_automated(seat, bay, id) {
+                        self.set_insert_param(seat, bay, id, value);
+                    }
                 }
             }
             DialogAction::FaceSavePreset { strip, slot, name } => {
@@ -57032,6 +57132,201 @@ mod tests {
         assert_eq!(app.arrangement.clips.len(), clips + 1, "the copied clip was not pasted");
     }
 
+    /// A MIDI item on `lane`, two seconds long — the clip the node tests
+    /// set beside the curve.
+    fn bench_item(lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
+        crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane,
+            path: String::new(),
+            start_s,
+            offset_s: 0.0,
+            len_s: 2.0,
+            loop_s: 2.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+            warp: Vec::new(),
+            warp_fit: String::new(),
+        }
+    }
+
+    /// **Shift takes a chosen node back OUT**, through real frames. The drag
+    /// ran on the press frame itself and carried the node under the hand —
+    /// choosing it straight back, so a node could never be un-chosen.
+    #[test]
+    fn shift_clicking_a_chosen_node_takes_it_out() {
+        let (ctx, mut app) = auto_bench("autoshiftout");
+        let (a, b) = (auto_at(&app, 2.0, 0.8), auto_at(&app, 4.0, 0.2));
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
+        click_with(&ctx, &mut app, a, egui::Modifiers::SHIFT);
+        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 2)], "shift did not take the node back out");
+        key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (2.0, 0.8), (6.0, 0.6)], "Delete took the un-chosen node");
+    }
+
+    /// **The clip menu's Delete takes the CLIP**, not the nodes still chosen.
+    /// Delete takes nodes first wherever nodes are chosen, the menu opens on
+    /// a right-click with no press to let them go, and a paste leaves its
+    /// nodes chosen: "Delete take" deleted the pasted nodes and kept the take.
+    #[test]
+    fn the_clip_menus_delete_takes_the_clip_not_the_chosen_nodes() {
+        let (_ctx, mut app) = auto_bench("autoclipmenu");
+        let id = app.arrangement.add_clip(bench_item(1, 1.0));
+        let clips = app.arrangement.clips.len();
+        app.arr_auto_nodes = vec![(0, 0, 1)];
+        app.arr_clip_menu_subject(id);
+        app.arr_delete_selected();
+        assert_eq!(auto_nodes(&app).len(), 4, "the menu's Delete took a node");
+        assert_eq!(app.arrangement.clips.len(), clips - 1, "the take was not deleted");
+    }
+
+    /// **A node added on a step's instant is the node that comes chosen.**
+    /// `put` replaces the step's second half; the index was then found by
+    /// TIME, which names the first — so the first was chosen and dragged.
+    #[test]
+    fn a_node_added_on_a_steps_instant_is_the_one_chosen() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let (_ctx, mut app) = auto_bench("autostepadd");
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        app.arrangement.automation.set(Curve::sanitised(
+            0,
+            AutoParam::Gain,
+            vec![pt(0.0, 0.5), pt(4.0, 0.8), pt(4.0, 0.2), pt(6.0, 0.6)],
+        ));
+        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.4).expect("nothing landed");
+        assert_eq!(auto_nodes(&app)[i], (4.0, 0.4), "the index names another node: {:?}", auto_nodes(&app));
+        assert_eq!(auto_nodes(&app)[i - 1], (4.0, 0.8), "the step's arrival was touched");
+    }
+
+    /// **A group stops at the edges as ONE shape.** Clamped node by node, a
+    /// group pushed past the song's start piled onto 0 s, and nodes sharing
+    /// an instant collapse — the middle of the group was simply gone.
+    #[test]
+    fn a_group_drag_stops_at_the_edges_as_one_shape() {
+        use crate::automation::AutoParam;
+        let (_ctx, mut app) = auto_bench("autogroupedge");
+        // The 2, 4 and 6 s nodes chosen; the one at 6 s carried to 1 s.
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2), (0, 0, 3)];
+        app.arr_drag_auto_point(0, AutoParam::Gain, 3, 1.0, 0.6);
+        // The group stops when its first node reaches the start — where it
+        // meets the base, and carries its value in (no step at zero).
+        assert_eq!(auto_nodes(&app), vec![(0.0, 0.8), (2.0, 0.2), (4.0, 0.6)], "the group lost its shape");
+        // And in value: pulled down past the floor, the pair keeps its gap.
+        let (_ctx, mut app) = auto_bench("autogroupfloor");
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        app.arr_drag_auto_point(0, AutoParam::Gain, 1, 2.0, 0.0);
+        let got = auto_nodes(&app);
+        assert!((got[1].1 - 0.6).abs() < 1e-9 && got[2].1.abs() < 1e-9, "values merged at the floor: {got:?}");
+    }
+
+    /// **Clicking the base node off-centre leaves it at zero.** The press
+    /// measured its grab with an edge snap the drag does not have, so on the
+    /// press frame itself the two disagreed and the base walked off zero —
+    /// out of its own protection, with an undo step to show for a click.
+    #[test]
+    fn clicking_the_base_node_off_centre_leaves_it_at_zero() {
+        let (ctx, mut app) = auto_bench("autobaseclick");
+        app.settings.arr_snap = false;
+        let _ = run_frame(&ctx, &mut app);
+        let moments = app.history.len();
+        let at = auto_at(&app, 0.0, 0.5) + Vec2::new(2.0, 0.0);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(auto_nodes(&app)[0], (0.0, 0.5), "the base moved: {:?}", auto_nodes(&app));
+        assert_eq!(app.history.len(), moments, "a click left an undo step");
+    }
+
+    /// **Opening or closing a row lets the node choice go.** The choice names
+    /// SLOTS, the rows just renumbered, and Cmd+A opens the menu without the
+    /// press that used to clear it: kept, it named another row's nodes and
+    /// Delete took those.
+    #[test]
+    fn opening_a_row_lets_the_node_choice_go() {
+        use crate::automation::AutoParam;
+        let (_ctx, mut app) = auto_bench("autorowsel");
+        app.arr_auto_nodes = vec![(0, 0, 1)];
+        app.arr_toggle_automation_param(0, AutoParam::Pan);
+        assert!(app.arr_auto_nodes.is_empty(), "the choice outlived the renumbering");
+        app.arr_auto_sel = Some((0, 1));
+        app.arr_close_auto_row(0, 1);
+        assert!(app.arr_auto_sel.is_none(), "the row choice outlived the renumbering");
+    }
+
+    /// **A face gesture never writes a knob the curve owns.** Dragging an EQ
+    /// node sends its frequency AND gain; with the frequency automated, a
+    /// hand lifting the gain wrote the curve's momentary frequency into the
+    /// saved setting.
+    #[test]
+    fn a_face_gesture_never_writes_a_knob_the_curve_owns() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let param = |id: u32, value: f32| crate::ports::BuiltinFaceParam {
+            id,
+            symbol: format!("p{id}"),
+            name: format!("P{id}"),
+            units: String::new(),
+            default: 0.0,
+            reading: String::new(),
+            choices: Vec::new(),
+            steps: 0,
+            value,
+        };
+        let (seat, bay) = recorder::seat_bay(2, 1);
+        let face = |params| crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: "@tangent-eq".into(),
+            params,
+            ..Default::default()
+        };
+        app.set_builtin_face(face(vec![param(22, 0.2), param(23, 0.5)]));
+        app.set_live_face(seat, bay, Some(face(vec![param(22, 0.8)])));
+        app.apply_dialog_action(DialogAction::SetInsertParamPair {
+            strip: 2,
+            slot: 1,
+            id_a: 22,
+            value_a: 0.8,
+            id_b: 23,
+            value_b: 0.9,
+        });
+        let saved = |app: &TangentApp, id| {
+            app.builtin_face(seat, bay).and_then(|f| f.params.iter().find(|p| p.id == id)).map(|p| p.value)
+        };
+        assert_eq!(saved(&app, 22), Some(0.2), "the curve's frequency was written into the setting");
+        assert_eq!(saved(&app, 23), Some(0.9), "the gain the hand moved was not written");
+        // No curve: the same gesture writes both, as it always did.
+        app.set_live_face(seat, bay, None);
+        app.apply_dialog_action(DialogAction::SetInsertParam { strip: 2, slot: 1, id: 22, value: 0.4 });
+        assert_eq!(saved(&app, 22), Some(0.4));
+    }
+
+    /// **A Delete under a held node ends the drag.** The drag re-anchored on
+    /// the edited curve at its old index — another node now — and carried
+    /// THAT one to the pointer.
+    #[test]
+    fn a_delete_under_a_held_node_ends_the_drag() {
+        let (ctx, mut app) = auto_bench("autodeldrag");
+        let held = auto_at(&app, 4.0, 0.2);
+        press(&ctx, &mut app, held);
+        key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        let away = auto_at(&app, 9.0, 0.9);
+        move_to(&ctx, &mut app, away);
+        release(&ctx, &mut app, away);
+        assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (2.0, 0.8), (6.0, 0.6)], "another node was carried");
+    }
+
     /// **A paste replaces the span it covers** rather than interleaving two
     /// shapes.
     #[test]
@@ -57169,6 +57464,60 @@ mod tests {
         app.set_live_face(seat, bay, None);
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(shown(&app, 22).map(|p| p.0), Some(0.2), "the overlay outlived its curve");
+    }
+
+    /// **The Setup panel marks the system that is RUNNING.** The setting is
+    /// empty on the platform default, and the panel marked only a system the
+    /// setting named — so a fresh Windows install playing through WASAPI lit
+    /// neither WASAPI nor ASIO. The owner: "the initialized program doesn't
+    /// read as having asio or wasapi active despite it being audible."
+    #[test]
+    fn the_setup_panel_marks_the_system_that_is_running() {
+        struct Running(Option<&'static str>);
+        impl crate::ports::AudioSetup for Running {
+            fn systems(&self) -> Vec<String> {
+                vec!["ASIO".to_owned(), "WASAPI".to_owned()]
+            }
+            fn active_system(&self) -> Option<String> {
+                self.0.map(str::to_owned)
+            }
+            fn outputs(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn rates(&self) -> Vec<u32> {
+                Vec::new()
+            }
+            fn input_channels(&self) -> u16 {
+                0
+            }
+            fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+                Vec::new()
+            }
+            fn set_exposed(&mut self, _: Vec<(u16, Option<u16>)>) -> Vec<String> {
+                Vec::new()
+            }
+            fn output_path(&self, _: Option<&str>) -> crate::ports::OutputPath {
+                crate::ports::OutputPath::default()
+            }
+        }
+        let shown = |app: &TangentApp| match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { system, .. }) => system.clone(),
+            _ => panic!("Setup did not open"),
+        };
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        // A fresh install: nothing chosen, WASAPI playing.
+        app.settings.audio_system = String::new();
+        app.set_audio_setup(Some(Box::new(Running(Some("WASAPI")))));
+        app.open_audio_setup();
+        assert_eq!(shown(&app).as_deref(), Some("WASAPI"), "the running system is not marked");
+        // ASIO asked for but not what opened: the panel says what opened.
+        app.settings.audio_system = "ASIO".to_owned();
+        app.open_audio_setup();
+        assert_eq!(shown(&app).as_deref(), Some("WASAPI"), "the panel showed the wish, not the truth");
+        // Nobody can say: the setting is the best there is.
+        app.set_audio_setup(Some(Box::new(Running(None))));
+        app.open_audio_setup();
+        assert_eq!(shown(&app).as_deref(), Some("ASIO"));
     }
 
     /// One frame with no input at all, and whatever it asked for.

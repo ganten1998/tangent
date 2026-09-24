@@ -627,6 +627,12 @@ impl tangent_ui::ports::AudioSetup for Setup {
         tangent_record::audio::systems()
     }
 
+    /// Read off the one cached host the streams open through, on the UI
+    /// thread the panel opens on: no fresh host, no driver load.
+    fn active_system(&self) -> Option<String> {
+        Some(tangent_record::audio::active_system())
+    }
+
     /// Empty on failure, which the panel renders as "the system's own" and
     /// nothing else - the same answer `rates` gives, and the honest one: a
     /// host that cannot be enumerated has no names to offer.

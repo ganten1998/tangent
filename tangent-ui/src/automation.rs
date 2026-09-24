@@ -276,6 +276,13 @@ impl Curve {
         // A third point at the same instant would live for no time at all
         // and could never be heard, so a run keeps its first and last; and
         // two that agree on the VALUE as well are one point, not a step.
+        //
+        // **Except at the very start.** A step there would arrive at a value
+        // no time is left to play — the song begins AT the instant — and its
+        // unheard first half would still be what the row's dial reads (the
+        // base is the first node) while the second is what sounds. So a run
+        // at zero keeps its LAST point: a node dropped on the base carries
+        // its value in, and the base stays a single node.
         let mut kept: Vec<Point> = Vec::with_capacity(points.len());
         let mut i = 0;
         while i < points.len() {
@@ -287,7 +294,8 @@ impl Curve {
             // Snapped onto the first's time exactly, so a step drawn by two
             // hands a nanosecond apart is one instant everywhere downstream.
             let last = Point { at_s: first.at_s, ..points[j - 1] };
-            if j - i > 1 && (first.value - last.value).abs() > 1e-12 {
+            let at_start = first.at_s < SAME_INSTANT_S;
+            if j - i > 1 && !at_start && (first.value - last.value).abs() > 1e-12 {
                 kept.push(first);
             }
             kept.push(last);
@@ -374,7 +382,11 @@ impl Curve {
     /// by DRAGGING a node onto its neighbour's time — see
     /// [`Curve::set_points`]. At an instant that already holds a step it is
     /// the second point, the one the curve leaves from, that is replaced.
-    pub fn put(&mut self, point: Point) {
+    ///
+    /// Answers the INDEX it landed at — which is the only way a caller can
+    /// name it: at a step's instant the time names two points, and the one
+    /// replaced is the second.
+    pub fn put(&mut self, point: Point) -> usize {
         let Point { at_s, value, shape } = point;
         let p = Point {
             at_s: at_s.max(0.0),
@@ -385,8 +397,10 @@ impl Curve {
         let to = self.points.partition_point(|q| q.at_s <= p.at_s + SAME_INSTANT_S);
         if to > from {
             self.points[to - 1] = p;
+            to - 1
         } else {
             self.points.insert(from, p);
+            from
         }
     }
 
@@ -633,6 +647,18 @@ mod tests {
         );
         let at: Vec<(f64, f64)> = c.points().iter().map(|q| (q.at_s, q.value)).collect();
         assert_eq!(at, vec![(3.0, 0.1), (3.0, 0.7), (5.0, 0.2)], "{at:?}");
+    }
+
+    /// **No step at the very start.** The song begins AT the instant, so a
+    /// step there would arrive at a value no time is left to play — and the
+    /// row's dial (which reads the first node) would show that unheard half
+    /// while the second sounded. A run at zero keeps its last point.
+    #[test]
+    fn a_step_cannot_stand_at_the_start() {
+        let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(0.0, 0.2), pt(0.0, 0.7), pt(3.0, 0.5)]);
+        let at: Vec<(f64, f64)> = c.points().iter().map(|q| (q.at_s, q.value)).collect();
+        assert_eq!(at, vec![(0.0, 0.7), (3.0, 0.5)], "{at:?}");
+        assert_eq!(c.value_at(0.0), Some(0.7));
     }
 
     /// **A step's halves are told apart by INDEX**, because they share a

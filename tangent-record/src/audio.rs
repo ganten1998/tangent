@@ -1238,6 +1238,23 @@ pub fn system() -> Option<String> {
     }
 }
 
+/// **The system the streams actually open through**, by name: the chosen
+/// one when it could be built, the platform's default otherwise — every
+/// fallback [`build_host`] takes, taken here too, because this is read off
+/// THE host (see [`HOST_CACHE`]) rather than off the preference.
+///
+/// The preference alone cannot answer it. Empty means "the platform's", and
+/// the Setup panel marked a system only when the preference NAMED it — so a
+/// fresh install playing through WASAPI showed neither WASAPI nor ASIO as
+/// active. The owner: "the initialized program doesn't read as having asio
+/// or wasapi active despite it being audible."
+///
+/// Costs no driver load, even under ASIO: it reads the cached host's id, and
+/// asks nothing of a device.
+pub fn active_system() -> String {
+    with_host(|host| host.id().name().to_owned())
+}
+
 /// Build the host for the wanted system name.
 ///
 /// Falls back to the default host when the saved name names a system this
@@ -3517,6 +3534,17 @@ mod tests {
         // Put the process-global choice back for whoever runs next.
         set_system(baseline_system.as_deref());
         with_host(|_| ());
+    }
+
+    /// **The active system is the one the host was built as**, never the
+    /// bare preference: with none chosen (and with a name this build does not
+    /// have, which falls back) it is the platform default's own name, and it
+    /// is always one of the names the picker offers.
+    #[test]
+    fn the_active_system_is_the_one_the_host_was_built_as() {
+        let active = active_system();
+        assert_eq!(active, cpal::default_host().id().name(), "not the platform default");
+        assert!(systems().contains(&active), "{active} is not a system the panel offers");
     }
 
     /// The merge keeps whichever layer could see, and stays silent only when
