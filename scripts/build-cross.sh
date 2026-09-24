@@ -508,6 +508,11 @@ cp assets/font-licenses/*.txt "$WINSTAGE/font-licenses/"
 # Checksum-pinned and cached; offline after the first fetch.
 scripts/fetch-ffmpeg.sh windows
 cp dist/vendor/windows/tangent-ffmpeg.exe "$WINSTAGE/"
+# Signed like tangent.exe, because Smart App Control checks every program
+# each time it starts: an unsigned encoder is blocked the first time Tangent
+# runs it, however the app itself is signed. The STAGED copy, so the cache in
+# dist/vendor stays byte-for-byte BtbN's build.
+scripts/sign-windows.sh "$WINSTAGE/tangent-ffmpeg.exe"
 cp -R dist/vendor/windows/ffmpeg-licenses "$WINSTAGE/ffmpeg-licenses"
 # User-facing instructions travel with the build (SmartScreen steps, connecting a
 # keyboard, the teach/correct features, where settings live). Shipped as .txt, not
@@ -537,7 +542,8 @@ if command -v makensis >/dev/null 2>&1; then
   # route as the inner exe. After makensis, necessarily: NSIS writes its
   # output last, and Authenticode is appended to the finished PE (the NSIS
   # CRC lives inside it and is untouched — signing post-build is the standard
-  # flow). release.sh refuses an unsigned setup.exe at artifact-check time.
+  # flow). The uninstaller inside it was signed while makensis ran. release.sh
+  # refuses an unsigned setup.exe, or an unsigned PE inside it or the zip.
   scripts/sign-windows.sh "dist/Tangent-${VERSION}-windows-setup.exe"
   echo "==> dist/Tangent-${VERSION}-windows-setup.exe"
 else

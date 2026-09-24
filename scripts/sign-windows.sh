@@ -4,26 +4,29 @@
 # No certificate ever touches this machine: jsign sends the file hash to Azure,
 # Microsoft's HSM signs it and returns the signature.
 #
-#   scripts/sign-windows.sh path/to/some.exe
+#   scripts/sign-windows.sh path/to/some.exe [NAME-FOR-THE-LOG]
 #
-# One script and two callers, deliberately. build-cross.sh signs the inner
-# tangent.exe before it is staged, and signs the NSIS setup.exe after makensis
-# writes it — SmartScreen judges the OUTER installer, so signing the inner exe
-# alone ships the warning anyway. jsign signs any PE, NSIS output included
-# (Authenticode is appended to the PE; the NSIS CRC lives inside it and is not
-# disturbed — signing installers post-build is the standard flow). Keeping the
-# route in one file means the two signatures can never take different paths.
+# One script for every PE we ship, deliberately. build-cross.sh signs the
+# inner tangent.exe and the bundled tangent-ffmpeg.exe as it stages them;
+# makensis runs this on the uninstaller while it builds the installer (the
+# .nsi's !uninstfinalize); build-cross.sh signs the NSIS setup.exe after
+# makensis writes it. Two Windows gates want signatures, on different files:
+# SmartScreen judges the OUTER installer when it is first opened, so signing
+# the inner exe alone ships the warning anyway; Smart App Control checks EVERY
+# program each time it starts and has no per-app override, so any one
+# unsigned PE (the encoder, the uninstaller) is a program Windows refuses to
+# run. jsign signs any PE, NSIS output included (Authenticode is appended to
+# the PE; the NSIS CRC lives inside it and is not disturbed — signing
+# installers post-build is the standard flow). Keeping the route in one file
+# means the signatures can never take different paths.
 #
 # Unconfigured => the PE ships UNSIGNED (the documented pre-Azure state) and
-# this says so once. PARTIALLY configured => hard failure, because silently
-# shipping an unsigned binary while believing it is signed is the worst outcome
-# here. Either way release.sh has the last word: it refuses an unsigned
-# setup.exe at artifact-check time (scripts/pe-signed.py), exactly as it
-# refuses an unsigned .pkg.
-#
-# Residual gap, documented rather than hidden: NSIS generates Uninstall.exe on
-# the user's machine at install time, so it cannot be signed from here without
-# the NSIS uninstaller-stub signing dance. Out of scope.
+# this says so, per file. PARTIALLY configured => hard failure, because
+# silently shipping an unsigned binary while believing it is signed is the
+# worst outcome here. Either way release.sh has the last word: it refuses an
+# unsigned setup.exe, or an unsigned PE inside it or inside the zip, at
+# artifact-check time (scripts/pe-signed.py), exactly as it refuses an
+# unsigned .pkg.
 #
 # Setup (see docs/RELEASE.md § Windows):
 #   brew install jsign            # needs a JRE
@@ -36,8 +39,11 @@
 set -euo pipefail
 
 EXE="${1:-}"
-[ -n "$EXE" ] || { echo "usage: $0 PE-FILE" >&2; exit 2; }
+[ -n "$EXE" ] || { echo "usage: $0 PE-FILE [NAME]" >&2; exit 2; }
 [ -f "$EXE" ] || { echo "$0: no such file: $EXE" >&2; exit 2; }
+# What the log calls it. makensis hands the uninstaller over under a temp
+# name, so its caller says which file this really is.
+NAME="${2:-$(basename "$EXE")}"
 
 set_count=0
 for v in "${TRUSTED_SIGNING_ENDPOINT:-}" "${TRUSTED_SIGNING_ACCOUNT:-}" \
@@ -46,7 +52,7 @@ for v in "${TRUSTED_SIGNING_ENDPOINT:-}" "${TRUSTED_SIGNING_ACCOUNT:-}" \
 done
 
 if [ "$set_count" = 0 ]; then
-  echo "    (unsigned: TRUSTED_SIGNING_* not set — Windows will show SmartScreen)"
+  echo "    ($NAME unsigned: TRUSTED_SIGNING_* not set — SmartScreen warns, Smart App Control blocks)"
   exit 0
 fi
 if [ "$set_count" != 3 ]; then
@@ -72,7 +78,7 @@ if [ -z "$token" ]; then
     echo "az could not get a token — run 'az login' first." >&2; exit 1; }
 fi
 
-echo "==> Signing $(basename "$EXE") via Azure Artifact Signing"
+echo "==> Signing $NAME via Azure Artifact Signing"
 # RFC-3161 timestamp so the signature outlives the short-lived certificate.
 jsign --storetype TRUSTEDSIGNING \
       --keystore "$TRUSTED_SIGNING_ENDPOINT" \
@@ -80,7 +86,7 @@ jsign --storetype TRUSTEDSIGNING \
       --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
       --tsaurl http://timestamp.acs.microsoft.com \
       --name "Tangent" \
-      "$EXE" || { echo "jsign failed — $(basename "$EXE") NOT signed" >&2; exit 1; }
+      "$EXE" || { echo "jsign failed — $NAME NOT signed" >&2; exit 1; }
 
 # Best-effort local check; real proof is a first launch on Windows.
 if command -v osslsigncode >/dev/null 2>&1; then
