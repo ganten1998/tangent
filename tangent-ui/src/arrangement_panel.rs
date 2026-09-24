@@ -189,6 +189,20 @@ pub struct ClipView<'a> {
 /// exactly as the document holds them. The panel turns them into pixels; it
 /// is handed nothing that has already been through a rect, so a resize
 /// cannot leave a stale coordinate behind.
+/// **A box being drawn over one automation row** to choose the nodes inside
+/// it: times in song seconds, values normalised, so the row draws it through
+/// the same two mappings its nodes use and the box and the nodes it lights
+/// cannot disagree about what is inside.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoMarquee {
+    pub lane: usize,
+    pub slot: usize,
+    pub t0: f64,
+    pub t1: f64,
+    pub v0: f64,
+    pub v1: f64,
+}
+
 pub struct AutoView<'a> {
     pub param: crate::automation::AutoParam,
     /// **What to CALL it**, resolved by the app.
@@ -439,6 +453,9 @@ pub struct ArrangeView<'a> {
     /// A file is being dragged over this lane right now: it lights, so the
     /// drop lands somewhere the eye already picked.
     pub drop_lane: Option<usize>,
+    /// **A box being drawn over one automation row** to choose its nodes.
+    /// See [`AutoMarquee`].
+    pub auto_marquee: Option<AutoMarquee>,
     /// **The MASTER's own automation rows.**
     ///
     /// Separate from `lanes` because `lanes` is the sixteen CHANNELS and the
@@ -5512,6 +5529,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             }
             curve = shade(curve, 1.25);
         }
+        // **The box being drawn to choose nodes**, under the curve so the
+        // nodes it lights stay on top of it. Clipped to the row: a box is a
+        // question about THIS row's nodes.
+        if let Some(m) = view.auto_marquee.filter(|m| m.lane == lane && m.slot == slot) {
+            let (xa, xb) = (x_of_in(&l, view, m.t0), x_of_in(&l, view, m.t1));
+            let (ya, yb) = (auto_y_of(row.lane, m.v0), auto_y_of(row.lane, m.v1));
+            if xa.is_finite() && xb.is_finite() && ya.is_finite() && yb.is_finite() {
+                let r = Rect::from_two_pos(Pos2::new(xa, ya), Pos2::new(xb, yb))
+                    .intersect(row.lane);
+                if r.is_positive() {
+                    let rim = crate::recorder_panel::selection_rim(ground);
+                    painter.rect_filled(r, 0.0, rim.gamma_multiply(0.14));
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, rim), egui::StrokeKind::Inside);
+                }
+            }
+        }
         // **Only the points that can be seen**, found by binary search
         // rather than by walking. A curve is sorted, and a song with a
         // thousand points on a lane would otherwise cost a thousand
@@ -8340,6 +8373,7 @@ ArrangeView {
             snap_on: true,
             grip_lit: false,
             drop_lane: None,
+            auto_marquee: None,
             master_automation: Vec::new(),
             grid_exp: 0,
             pending: None,

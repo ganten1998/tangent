@@ -577,6 +577,13 @@ pub struct TangentApp {
     /// Pushed by the host on load/change ([`Self::set_builtin_face`]),
     /// mirrored optimistically by a local drag ([`Self::set_insert_param`]).
     builtin_faces: HashMap<(usize, usize), crate::ports::BuiltinFace>,
+    /// **What the automation has an open built-in face at right now**, by
+    /// the same `(seat, bay)` — only the automated params, their readings and
+    /// the EQ's line through them. Pushed by the host every frame for the
+    /// open windows (see its `live_face`), laid over the saved face when the
+    /// window is drawn, and NEVER written back: `builtin_faces` stays the
+    /// resting setting a save and a preset keep.
+    builtin_faces_live: HashMap<(usize, usize), crate::ports::BuiltinFace>,
     /// Knob edits the host has not echoed back yet: (seat, bay, id) →
     /// (value, frames left). During a drag the push is one frame behind
     /// the finger, and letting it win yanked the slider backward every
@@ -610,8 +617,9 @@ pub struct TangentApp {
     /// other, so there is never a question of which Delete meant.
     ///
     /// Indices, not identities — a `Curve`'s points have no ids. Anything
-    /// that reorders a curve therefore has to clear this, which is why every
-    /// mutator below ends by doing so.
+    /// that reorders a curve therefore has to REMAP or clear this: a drag
+    /// and a paste re-find the nodes they moved, and undo, delete and every
+    /// other press let the selection go.
     arr_auto_nodes: Vec<(usize, usize, usize)>,
     /// Copied nodes, with their times measured from the EARLIEST of them.
     ///
@@ -619,6 +627,20 @@ pub struct TangentApp {
     /// put them back exactly where they were copied from, which is the one
     /// place a paste is never wanted.
     auto_clipboard: Vec<crate::automation::Point>,
+    /// **The row the copied nodes came from**, as `(lane, param)`: where a
+    /// paste lands when nothing on the timeline names a row.
+    auto_clipboard_from: Option<(usize, crate::automation::AutoParam)>,
+    /// **The automation row the hand last pressed** — a node, the row's
+    /// empty room, or its name.
+    ///
+    /// Where Cmd+V aims when no node and no row is chosen. Moving the
+    /// playhead to a paste point IS a press on the row, and a press on empty
+    /// room lets the nodes go, so a paste used to find no row at all and fall
+    /// through to the CLIPS: copy, click where it should go, paste, nothing.
+    arr_auto_focus: Option<(usize, crate::automation::AutoParam)>,
+    /// **A node drag's anchor** — see `AutoDragFrom`. Taken on the drag's
+    /// first frame and dropped at the release.
+    arr_auto_drag_from: Option<AutoDragFrom>,
     /// The tempo point under the pointer, if any. Drawn a size larger.
     arr_tempo_hot: Option<usize>,
     /// The tempo point being dragged, if any.
@@ -2064,6 +2086,58 @@ enum FlagMenuAction {
 /// A gesture in flight on the arrangement. What the press grabbed, and the
 /// figures the drag needs to stay relative — the band's own rule: a press
 /// never makes the thing jump to the pointer.
+/// **How far the header seam must be carried before it resizes**, in points.
+/// Less than this and the press is still the seam's CLICK, which sends the
+/// playhead home — see `ArrDrag::HeaderGrip`.
+const HEADER_GRIP_DEAD: f32 = 8.0;
+
+/// **A node drag's anchor**: every curve the drag moves, as it stood when
+/// the drag began, and which of its points are moving.
+///
+/// Each frame rebuilds the curves FROM this, never from the frame before —
+/// which is what makes a drag harmless to what it passes. It used to take
+/// the node out and `put` it back every frame, and `put` replaces whatever
+/// sits at the instant it lands on, so a node carried across a neighbour's
+/// time on its way somewhere else destroyed the neighbour. Rebuilt from the
+/// anchor, a node passing over another takes nothing with it; and one
+/// DROPPED on another's time sits beside it as a step, the two in the order
+/// they had before (see `Curve::set_points`).
+#[derive(Debug, Clone)]
+struct AutoDragFrom {
+    /// The node under the hand, `(lane, param, index)` into the anchor, and
+    /// the point it was: the hand sets its time and value, and every other
+    /// moving node follows by the same step.
+    lead: (usize, crate::automation::AutoParam, usize),
+    lead_at: crate::automation::Point,
+    /// **Where the lead node sits NOW**, `(lane, param, index)`: the address
+    /// the next frame's call must name for this anchor to still be its own.
+    /// A call naming any other node is a new drag, and re-anchors — an
+    /// anchor carried over from a drag that never saw its release would
+    /// rebuild a curve from points it no longer has.
+    lead_now: (usize, crate::automation::AutoParam, usize),
+    /// `(lane, param, the curve's points at the press, the moving indices)`.
+    curves: Vec<(
+        usize,
+        crate::automation::AutoParam,
+        Vec<crate::automation::Point>,
+        Vec<usize>,
+    )>,
+    /// **Where the hand GRABBED**, `(song seconds, normalised value)` at the
+    /// press, when the drag began with one. The nodes then move by how far
+    /// the hand has moved from here — a press never makes a node jump to the
+    /// pointer, and a click that never moves changes nothing at all. It used
+    /// to put the node exactly under the pointer on the press frame itself,
+    /// so merely clicking a node to choose it re-wrote its value at the
+    /// pixel's precision. `None` (a drag with no press behind it) places the
+    /// node where it is told.
+    grab: Option<(f64, f64)>,
+    /// **What each curve looked like when this drag last wrote it**,
+    /// parallel to `curves`. If the document no longer matches — a node put,
+    /// a paste, an undo between two frames — the anchor is somebody else's
+    /// past and the drag re-anchors on what is there now.
+    produced: Vec<Vec<crate::automation::Point>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ArrDrag {
     /// An automation point being carried. `(lane, index)` — the index is
@@ -2073,6 +2147,19 @@ enum ArrDrag {
     /// `(lane, row, point)` — which lane, which of its open rows, and which
     /// point on that row's curve.
     AutoPoint(usize, usize, usize),
+    /// **A box drawn over an automation row's empty room**, choosing every
+    /// node inside it. `from` and `to` are `(song seconds, normalised
+    /// value)` at the press and under the hand now; `press` is where the
+    /// press was on screen. A press that never travels is a CLICK, and
+    /// locates at the release — what a press on the row's room always did.
+    AutoMarquee {
+        lane: usize,
+        slot: usize,
+        from: (f64, f64),
+        to: (f64, f64),
+        press: Pos2,
+        moved: bool,
+    },
     /// An automation row's dial being turned. Carries the PARAM rather than
     /// the slot: opening or closing another row mid-drag renumbers the slots
     /// and the drag would then be turning somebody else's control.
@@ -2120,10 +2207,20 @@ enum ArrDrag {
     },
     /// The GRIDBOX being dragged: up is finer, one step a notch.
     GridStep { from_y: f32, start: i64 },
-    /// The seam between headers and lanes: the pointer's x IS the width.
-    /// `from_x` remembers the press, so a motionless release reads as a
-    /// CLICK — which sends the playhead home.
-    HeaderGrip { from_x: f32 },
+    /// The seam between headers and lanes, which is two controls: dragged,
+    /// it sizes the header column; CLICKED, it sends the playhead home.
+    ///
+    /// **A dead zone keeps them apart.** The owner: the slider needs "a bit
+    /// of wiggle room before it will move -- remember that this slider
+    /// doubles as a single click playhead jump to beginning." It used to
+    /// follow the pointer from the first pixel, so a click with any wobble
+    /// both nudged the width and, past four points, stopped being a click.
+    /// Now nothing moves until the hand has gone `HEADER_GRIP_DEAD` from the
+    /// press (`engaged`), and a release before that is always the click.
+    /// `from_w` is the width at the press: once engaged the column follows
+    /// the hand RELATIVELY, so it does not jump to wherever on the strip
+    /// the press happened to land.
+    HeaderGrip { from_x: f32, from_w: f64, engaged: bool },
     /// The pointer's distance from the clip's start at the press, so the
     /// clip rides under the SAME point of the hand all the way.
     Move { id: u64, dt: f64 },
@@ -4085,6 +4182,7 @@ impl TangentApp {
             arr_auto_bypassed: HashSet::new(),
             fx_params: HashMap::new(),
             builtin_faces: HashMap::new(),
+            builtin_faces_live: HashMap::new(),
             pending_inserts: HashMap::new(),
             wheel_mixer_zoom: WheelSteps::default(),
             wheel_arr_zoom: WheelSteps::default(),
@@ -4094,6 +4192,9 @@ impl TangentApp {
             arr_auto_sel: None,
             arr_auto_nodes: Vec::new(),
             auto_clipboard: Vec::new(),
+            auto_clipboard_from: None,
+            arr_auto_focus: None,
+            arr_auto_drag_from: None,
             arr_tempo_hot: None,
             arr_tempo_drag: None,
             arr_tempo_drag_from: None,
@@ -11826,6 +11927,9 @@ impl TangentApp {
             return;
         }
         let at = recorder::Strip::Channel(n).index();
+        // A paste means what was copied LAST — see the clip copy.
+        self.auto_clipboard.clear();
+        self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
             from: n,
             kind: self.channel_kind(n),
@@ -14308,46 +14412,77 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// The selected nodes as `(lane, param, seconds)`, resolved NOW.
+    /// The selected nodes as `(lane, param, index)`, resolved NOW, each
+    /// curve's indices HIGHEST FIRST.
     ///
-    /// Indices are resolved to TIMES before anything is changed, because
-    /// removing a point renumbers every one after it — deleting by index in
-    /// a loop takes the wrong points from the second one on.
-    fn arr_auto_node_times(&self) -> Vec<(usize, crate::automation::AutoParam, f64)> {
-        let mut out = Vec::with_capacity(self.arr_auto_nodes.len());
-        for (lane, slot, index) in &self.arr_auto_nodes {
-            let Some(param) = self.arr_auto_param_at(*lane, *slot) else {
-                continue;
-            };
-            let Some(at) = self
-                .arrangement
-                .automation
-                .get(*lane, param)
-                .and_then(|c| c.points().get(*index))
-                .map(|p| p.at_s)
-            else {
-                continue;
-            };
-            out.push((*lane, param, at));
-        }
+    /// By index and not by time, because a time no longer names one node:
+    /// the two halves of a step share it. And highest first, because taking
+    /// a point out renumbers every one after it — deleting upwards would
+    /// take the wrong points from the second one on.
+    fn arr_auto_node_picks(&self) -> Vec<(usize, crate::automation::AutoParam, usize)> {
+        let mut out: Vec<(usize, crate::automation::AutoParam, usize)> = self
+            .arr_auto_nodes
+            .iter()
+            .filter_map(|(lane, slot, index)| {
+                self.arr_auto_param_at(*lane, *slot).map(|p| (*lane, p, *index))
+            })
+            .collect();
+        out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(b.2.cmp(&a.2)));
+        out.dedup();
         out
     }
 
-    /// Take every selected node out.
-    fn arr_delete_auto_nodes(&mut self) {
-        let doomed = self.arr_auto_node_times();
-        self.arr_auto_nodes.clear();
-        if doomed.is_empty() {
-            return;
+    /// **Which row an `AutoParam` is showing on**, if its lane has it open.
+    fn arr_auto_slot(&self, lane: usize, param: crate::automation::AutoParam) -> Option<usize> {
+        self.arr_auto_rows(lane).iter().position(|p| *p == param)
+    }
+
+    /// Take one node out by INDEX, the only address that tells a step's two
+    /// halves apart. Does not commit: the caller makes it one moment. A
+    /// curve left with no nodes is dropped rather than kept empty — see
+    /// `Automation::set`.
+    ///
+    /// **The BASE node does not come out.** A lane opens with one node at
+    /// the start, and that node is the lane's level: it is what the row's
+    /// dial reads and writes, and `value_at` holds it back to the left edge.
+    /// Deleting it would leave a curve resting at a number different from
+    /// the one its own dial is showing. The owner: "tied directly to the base
+    /// level, represented by the first node, which is NOT SUPPOSED TO BE
+    /// DELETABLE." Refused silently: a delete aimed at the base is a hand
+    /// asking for something the lane does not offer, not an error.
+    ///
+    /// The base is the node AT THE START, not merely the first: a curve whose
+    /// earliest node happens to be at bar forty has no base, and refusing
+    /// that one would make somebody's last drawn node permanent. Here, not in
+    /// `Curve::remove_at`, because that is a mechanism with no gesture in it.
+    fn arr_take_auto_node(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        index: usize,
+    ) -> bool {
+        let Some(curve) = self.arrangement.automation.get(lane, param) else {
+            return false;
+        };
+        if index == 0 && curve.points().first().is_some_and(|p| p.at_s.abs() <= 1.0e-9) {
+            return false;
         }
+        let mut curve = curve.clone();
+        if curve.remove_at(index).is_none() {
+            return false;
+        }
+        self.arrangement.automation.set(curve);
+        true
+    }
+
+    /// Take every selected node out, as ONE moment.
+    fn arr_delete_auto_nodes(&mut self) {
+        let doomed = self.arr_auto_node_picks();
+        self.arr_auto_nodes.clear();
+        self.arr_auto_hot = None;
         let mut changed = false;
-        for (lane, param, at) in doomed {
-            // A tight reach: these are exact times read out of the curve a
-            // moment ago, not a guess at what the pointer was near.
-            let curve = self.arrangement.automation.entry(lane, param);
-            if curve.remove_near(at, 1.0e-6) {
-                changed = true;
-            }
+        for (lane, param, index) in doomed {
+            changed |= self.arr_take_auto_node(lane, param, index);
         }
         if changed {
             self.arr_save_edits();
@@ -14362,15 +14497,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.arr_auto_nodes.is_empty() {
             return false;
         }
+        // In CURVE order, lowest index first, so a step's two halves keep
+        // the order that makes them a step — sorting by time alone would
+        // leave them in whatever order they happened to be chosen.
+        let mut picks = self.arr_auto_node_picks();
+        picks.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         let mut pts: Vec<crate::automation::Point> = Vec::new();
-        for (lane, slot, index) in &self.arr_auto_nodes {
-            let Some(param) = self.arr_auto_param_at(*lane, *slot) else {
-                continue;
-            };
+        for (lane, param, index) in &picks {
             if let Some(p) = self
                 .arrangement
                 .automation
-                .get(*lane, param)
+                .get(*lane, *param)
                 .and_then(|c| c.points().get(*index))
             {
                 pts.push(*p);
@@ -14384,6 +14521,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for p in &mut pts {
             p.at_s -= first;
         }
+        self.auto_clipboard_from = picks.first().map(|(l, p, _)| (*l, *p));
+        // **The stamp is what makes Cmd+V arrive at all** — see the field.
+        // Clips and notes stamped it and nodes did not, so with no text on
+        // the system clipboard the paste chord was swallowed whole.
+        self.clipboard_stamp = Some(format!("Tangent: {} automation node(s)", pts.len()));
         self.auto_clipboard = pts;
         // **The track clipboard stands down.** Both are consulted by one
         // chord, and a stale track copy would win a paste the hand meant for
@@ -14394,43 +14536,117 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Put the copied shape down at the playhead, on the chosen row.
     ///
-    /// **Which row**: the one whose node is selected, else the row the
-    /// keyboard is aimed at. With neither there is no answer — a paste onto
-    /// "whichever lane happens to be first" is a paste nobody asked for — so
-    /// it declines and lets the clips have the chord.
+    /// **Which row**, first that is OPEN: the one whose node is chosen, the
+    /// row the keyboard is aimed at, the row the hand last pressed, and last
+    /// the row the shape was copied from. The third is the ordinary case —
+    /// moving the playhead to the paste point is a press on the row, which
+    /// lets the nodes go — and without it a paste found nothing and fell
+    /// through to the clips. With none of them open it declines, so the
+    /// clips can have the chord.
+    ///
+    /// **The shape REPLACES the span it covers**: nodes already between its
+    /// first and last instant go, so what lands is what was copied rather
+    /// than the two shapes interleaved. What was pasted comes back CHOSEN,
+    /// ready to be carried or copied again.
     fn arr_paste_auto_nodes(&mut self) -> bool {
+        use crate::automation::SAME_INSTANT_S;
         if self.auto_clipboard.is_empty() {
             return false;
         }
-        let Some((lane, slot)) = self
+        let chosen = self
             .arr_auto_nodes
             .first()
-            .map(|(l, s, _)| (*l, *s))
-            .or(self.arr_auto_sel)
+            .and_then(|(l, s, _)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p)));
+        let aimed = self
+            .arr_auto_sel
+            .and_then(|(l, s)| self.arr_auto_param_at(l, s).map(|p| (l, p)));
+        let Some((lane, param)) = [chosen, aimed, self.arr_auto_focus, self.auto_clipboard_from]
+            .into_iter()
+            .flatten()
+            .find(|(l, p)| self.arr_auto_is_open(*l, *p))
         else {
             return false;
         };
-        let Some(param) = self.arr_auto_param_at(lane, slot) else {
-            return false;
-        };
         let at = self.arr_snap_t(self.playhead_s());
-        let pts = self.auto_clipboard.clone();
+        let pasted: Vec<crate::automation::Point> = self
+            .auto_clipboard
+            .iter()
+            .map(|p| crate::automation::Point { at_s: (at + p.at_s).max(0.0), ..*p })
+            .collect();
+        let lo = pasted.first().map_or(at, |p| p.at_s) - SAME_INSTANT_S;
+        let hi = pasted.last().map_or(at, |p| p.at_s) + SAME_INSTANT_S;
         {
             let curve = self.arrangement.automation.entry(lane, param);
-            for p in &pts {
-                curve.put(crate::automation::Point {
-                    at_s: (at + p.at_s).max(0.0),
-                    value: p.value,
-                    shape: p.shape,
-                });
-            }
+            let mut pts: Vec<crate::automation::Point> = curve
+                .points()
+                .iter()
+                .filter(|p| p.at_s < lo || p.at_s > hi)
+                .copied()
+                .collect();
+            pts.extend(pasted.iter().copied());
+            curve.set_points(pts);
         }
-        // The indices just moved under it, so the old selection means other
-        // points now. Cleared rather than remapped: a pasted shape is what
-        // the hand is looking at, and re-selecting it is one click.
-        self.arr_auto_nodes.clear();
+        let slot = self.arr_auto_slot(lane, param).unwrap_or(0);
+        let landed = self.arr_auto_find(lane, param, &pasted);
+        self.arr_auto_nodes = landed.into_iter().map(|i| (lane, slot, i)).collect();
+        self.arr_auto_hot = None;
         self.arr_save_edits();
         true
+    }
+
+    /// **The nodes a box covers** on one row: every point whose time and
+    /// value both fall inside the corners, as `(lane, slot, index)`.
+    fn arr_auto_boxed(
+        &self,
+        lane: usize,
+        slot: usize,
+        a: (f64, f64),
+        b: (f64, f64),
+    ) -> Vec<(usize, usize, usize)> {
+        let Some(param) = self.arr_auto_param_at(lane, slot) else {
+            return Vec::new();
+        };
+        let (t0, t1) = (a.0.min(b.0), a.0.max(b.0));
+        let (v0, v1) = (a.1.min(b.1), a.1.max(b.1));
+        self.arrangement
+            .automation
+            .get(lane, param)
+            .map(|c| {
+                c.points()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| (t0..=t1).contains(&p.at_s) && (v0..=v1).contains(&p.value))
+                    .map(|(i, _)| (lane, slot, i))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Where each of `pts` sits on a curve now, found by time AND value —
+    /// the pair that still names a node after its curve was re-sorted, a
+    /// step's halves included. A point the curve no longer holds (the
+    /// middle of three on one instant) is simply not found.
+    fn arr_auto_find(
+        &self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        pts: &[crate::automation::Point],
+    ) -> Vec<usize> {
+        let Some(curve) = self.arrangement.automation.get(lane, param) else {
+            return Vec::new();
+        };
+        let mut out: Vec<usize> = Vec::with_capacity(pts.len());
+        for p in pts {
+            let hit = curve.points().iter().enumerate().position(|(i, q)| {
+                !out.contains(&i)
+                    && (q.at_s - p.at_s).abs() < crate::automation::SAME_INSTANT_S * 2.0
+                    && (q.value - p.value).abs() < 1.0e-9
+            });
+            if let Some(i) = hit {
+                out.push(i);
+            }
+        }
+        out
     }
 
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
@@ -15120,7 +15336,75 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .position(|p| (p.at_s - at_s).abs() < 1e-9)
     }
 
-    /// Move the point being dragged to where the pointer is.
+    /// **Where an automation row's lane is drawn**, or `None` while it is not
+    /// — the band both the press and the drags read values through.
+    fn arr_auto_band(&self, lane: usize, slot: usize) -> Option<Rect> {
+        let rect = self.arrangement_rect?;
+        let clips = self.arr_clip_views();
+        let view = self.arrange_view(&clips);
+        crate::arrangement_panel::Layout::new(rect, &view)
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::arrangement_panel::RowKind::Automation(lane, slot))
+            .map(|r| r.lane)
+            .filter(Rect::is_positive)
+    }
+
+    /// **Every node a drag starting on `index` will carry**, as the curves
+    /// stand now: the chosen nodes, and always the one under the hand. See
+    /// `AutoDragFrom`.
+    fn arr_auto_anchor(
+        &self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        index: usize,
+    ) -> Option<AutoDragFrom> {
+        let lead_at = *self.arrangement.automation.get(lane, param)?.points().get(index)?;
+        let mut moving: Vec<(usize, crate::automation::AutoParam, usize)> = self
+            .arr_auto_nodes
+            .iter()
+            .filter_map(|(l, s, i)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p, *i)))
+            .collect();
+        if !moving.contains(&(lane, param, index)) {
+            moving.push((lane, param, index));
+        }
+        let mut curves: Vec<(
+            usize,
+            crate::automation::AutoParam,
+            Vec<crate::automation::Point>,
+            Vec<usize>,
+        )> = Vec::new();
+        for (l, p, i) in moving {
+            if let Some(c) = curves.iter_mut().find(|c| c.0 == l && c.1 == p) {
+                c.3.push(i);
+                continue;
+            }
+            let Some(pts) = self.arrangement.automation.get(l, p).map(|c| c.points().to_vec())
+            else {
+                continue;
+            };
+            curves.push((l, p, pts, vec![i]));
+        }
+        let produced = curves.iter().map(|c| c.2.clone()).collect();
+        Some(AutoDragFrom {
+            lead: (lane, param, index),
+            lead_at,
+            lead_now: (lane, param, index),
+            curves,
+            grab: None,
+            produced,
+        })
+    }
+
+    /// **Carry the dragged nodes**: the one under the hand to where the
+    /// pointer is, snapped in time and free in value, and every other chosen
+    /// node by the same step — a shape moves as a shape.
+    ///
+    /// Rebuilt each frame from the anchor the drag's first frame took (see
+    /// `AutoDragFrom`), so nothing the nodes pass over is harmed, and a node
+    /// DROPPED on a neighbour's time sits beside it as a step. The owner:
+    /// nodes "should be able to be dragged such that 2 are on the same
+    /// timeline point".
     fn arr_drag_auto_point(
         &mut self,
         lane: usize,
@@ -15130,31 +15414,98 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         v: f64,
     ) {
         use crate::automation::Point;
-        let Some(old) = self
-            .arrangement
-            .automation
-            .get(lane, param)
-            .and_then(|c| c.points().get(index).copied())
-        else {
+        // Taken on the first frame rather than at the press, so a drag that
+        // reaches here by any road still carries its nodes from where they
+        // stood — the tempo drag's rule, `arr_tempo_drag_from`.
+        let still_ours = self.arr_auto_drag_from.as_ref().is_some_and(|a| {
+            a.lead_now == (lane, param, index)
+                && a.curves.iter().zip(&a.produced).all(|(c, want)| {
+                    self.arrangement
+                        .automation
+                        .get(c.0, c.1)
+                        .map_or(want.is_empty(), |now| now.points() == want.as_slice())
+                })
+        });
+        if !still_ours {
+            self.arr_auto_drag_from = self.arr_auto_anchor(lane, param, index);
+        }
+        let Some(from) = self.arr_auto_drag_from.clone() else {
             return;
         };
-        let at_s = self.arr_snap_t(t);
-        let curve = self.arrangement.automation.entry(lane, param);
-        // Take the old one out before putting the new one in, or a move
-        // along the curve leaves a trail of points behind it.
-        curve.remove_near(old.at_s, 1e-9);
-        curve.put(Point { at_s, value: v.clamp(0.0, 1.0), shape: old.shape });
-        self.arr_auto_hot = self.arr_auto_index(lane, param, at_s).map(|i| (lane, i));
-        if let Some((_, i)) = self.arr_auto_hot {
-            // Which ROW this parameter is on, re-derived rather than passed:
-            // the drag re-arms itself every frame and the row it is on cannot
-            // change under it, so deriving is cheaper than threading a second
-            // index through four call sites.
-            let slot = self
-                .arr_auto_rows(lane)
-                .iter()
-                .position(|p| *p == param)
-                .unwrap_or(0);
+        let (at_s, value) = match from.grab {
+            Some((gt, gv)) => {
+                // Unmoved is untouched: no snap onto the grid and no value
+                // re-read through a pixel for a node the hand only pressed.
+                let at_s = if (t - gt).abs() < 1.0e-12 {
+                    from.lead_at.at_s
+                } else {
+                    self.arr_snap_t(from.lead_at.at_s + (t - gt)).max(0.0)
+                };
+                let value = if (v - gv).abs() < 1.0e-12 {
+                    from.lead_at.value
+                } else {
+                    (from.lead_at.value + (v - gv)).clamp(0.0, 1.0)
+                };
+                (at_s, value)
+            }
+            None => (self.arr_snap_t(t).max(0.0), v.clamp(0.0, 1.0)),
+        };
+        let dt = at_s - from.lead_at.at_s;
+        let dv = value - from.lead_at.value;
+        let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
+        let mut lead_now: Option<(usize, usize)> = None;
+        let mut produced: Vec<Vec<Point>> = Vec::with_capacity(from.curves.len());
+        for (c_lane, c_param, pts, moving) in &from.curves {
+            let mut out: Vec<Point> = pts.clone();
+            let mut moved: Vec<Point> = Vec::with_capacity(moving.len());
+            let mut lead_pt: Option<Point> = None;
+            for &k in moving {
+                let Some(p) = out.get_mut(k) else {
+                    continue;
+                };
+                if (*c_lane, *c_param, k) == from.lead {
+                    // The node under the hand goes exactly where the hand
+                    // is, not to "where it was plus the step": the same
+                    // number by another sum is a different float, and a
+                    // node meant to land on its neighbour's grid line would
+                    // miss it by an ulp.
+                    p.at_s = at_s;
+                    p.value = value;
+                    lead_pt = Some(*p);
+                } else {
+                    p.at_s = (p.at_s + dt).max(0.0);
+                    p.value = (p.value + dv).clamp(0.0, 1.0);
+                }
+                moved.push(*p);
+            }
+            self.arrangement.automation.entry(*c_lane, *c_param).set_points(out);
+            produced.push(
+                self.arrangement
+                    .automation
+                    .get(*c_lane, *c_param)
+                    .map(|c| c.points().to_vec())
+                    .unwrap_or_default(),
+            );
+            let Some(slot) = self.arr_auto_slot(*c_lane, *c_param) else {
+                continue;
+            };
+            let found = self.arr_auto_find(*c_lane, *c_param, &moved);
+            chosen.extend(found.iter().map(|i| (*c_lane, slot, *i)));
+            if let Some(lp) = lead_pt {
+                if let Some(i) = self.arr_auto_find(*c_lane, *c_param, &[lp]).first() {
+                    lead_now = Some((slot, *i));
+                }
+            }
+        }
+        self.arr_auto_nodes = chosen;
+        self.arr_auto_hot = lead_now.map(|(_, i)| (lane, i));
+        if let Some(anchor) = self.arr_auto_drag_from.as_mut() {
+            anchor.produced = produced;
+            if let Some((_, i)) = lead_now {
+                anchor.lead_now = (lane, param, i);
+            }
+        }
+        if let Some((slot, i)) = lead_now {
             self.arr_drag = Some(ArrDrag::AutoPoint(lane, slot, i));
         }
         // **The gesture is what gets saved, not the frame.** Mouse-up is the
@@ -15169,7 +15520,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_gesture_dirty = true;
     }
 
-    /// Take the point nearest `t` off a lane's curve.
+    /// Take the point nearest `t` off a lane's curve — by TIME, which is
+    /// what the tests speak. Every gesture names its node by index now (a
+    /// step's two halves share a time), through `arr_take_auto_node`, and
+    /// this is a thin way into the same rule.
+    #[cfg(test)]
     fn arr_remove_auto_point(
         &mut self,
         lane: usize,
@@ -15177,48 +15532,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         t: f64,
     ) {
         let reach = (self.arr_window_now().1 * 0.01).max(0.01);
-        // **The BASE node does not come out.**
-        //
-        // A lane opens with one node at the start, and that node is the
-        // lane's level: it is what the row's dial reads and writes, and
-        // `value_at` holds it back to the left edge. Deleting it would leave
-        // a curve resting at a number different from the one its own dial is
-        // showing. The owner: "tied directly to the base level, represented
-        // by the first node, which is NOT SUPPOSED TO BE DELETABLE."
-        //
-        // Here rather than in `Curve::remove_near`, because that is the
-        // mechanism a DRAG also uses to move a point — take it out, put it
-        // back — and guarding it there made the first node immovable and
-        // left a trail behind every drag.
-        // The base is the node AT THE START — which is where opening a lane
-        // puts it, and the only place it can be. Not merely "the first
-        // point": a curve whose earliest drawn node happens to be at bar
-        // forty has no base, and refusing to delete that node would make the
-        // last of somebody's drawn points permanent for no reason.
-        let base_at = self
-            .arrangement
-            .automation
-            .get(lane, param)
-            .and_then(|c| c.points().first())
-            .map(|p| p.at_s)
-            .filter(|at| at.abs() <= 1.0e-9);
-        if base_at.is_some_and(|b| (b - t).abs() <= reach) {
-            // Refused, and silently: an alt-click on the base is a hand
-            // asking for something the lane does not offer, not an error.
-            return;
-        }
-        if self
-            .arrangement
-            .automation
-            .entry(lane, param)
-            .remove_near(t, reach)
-        {
-            // An emptied curve is dropped rather than kept empty — see
-            // `Automation::set`, which is what `entry` leaves behind.
-            let curve = self.arrangement.automation.entry(lane, param).clone();
-            self.arrangement.automation.set(curve);
-            self.arr_auto_hot = None;
-            self.arr_save_edits();
+        let nearest = self.arrangement.automation.get(lane, param).and_then(|c| {
+            c.points()
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, (p.at_s - t).abs()))
+                .filter(|(_, d)| *d <= reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        if let Some(i) = nearest {
+            if self.arr_take_auto_node(lane, param, i) {
+                self.arr_auto_hot = None;
+                self.arr_save_edits();
+            }
         }
     }
 
@@ -15807,9 +16134,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // sidecar saves itself by design (see the CHANGELOG's exception) —
         // it is the one piece of a session the owner asked never to lose.
         self.clips_dirty = true;
-        // Everything that NAMES what may no longer exist stands down.
+        // Everything that NAMES what may no longer exist stands down —
+        // chosen automation nodes too: they are indices into curves this
+        // has just replaced, and would light (and delete) other nodes.
         self.arr_selected = None;
         self.arr_multi.clear();
+        self.arr_auto_nodes.clear();
+        self.arr_auto_hot = None;
+        self.arr_auto_drag_from = None;
         self.arr_drag = None;
         self.arr_move_orig.clear();
         self.arr_band = None;
@@ -17642,6 +17974,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The stamp is what makes Ctrl/Cmd+V arrive at all — see the field.
         self.clipboard_stamp = Some(format!("Tangent: {} clip(s)", clips.len()));
         self.clip_clipboard = clips;
+        // **A paste means what was copied LAST**: the node clipboard stands
+        // down, or the next Cmd+V would land old nodes where the hand meant
+        // these clips — the paste finds a row to aim at almost always now.
+        self.auto_clipboard.clear();
+        self.auto_clipboard_from = None;
     }
 
     /// PASTE at the playhead, snapped — and on the SELECTED track when one
@@ -24035,14 +24372,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             self.arr_remove_tempo_point(i);
                             return;
                         }
-                        Some(A::AutoPoint(lane, row, _)) => {
-                            let t = {
-                                let clips = self.arr_clip_views();
-                                let view = self.arrange_view(&clips);
-                                crate::arrangement_panel::time_at(rect, &view, p.x)
-                            };
+                        Some(A::AutoPoint(lane, row, i)) => {
+                            // By INDEX, like the alt-click: a step's two
+                            // halves share the time a pointer would name.
                             if let Some(param) = self.arr_auto_param_at(lane, row) {
-                                self.arr_remove_auto_point(lane, param, t);
+                                if self.arr_take_auto_node(lane, param, i) {
+                                    self.arr_auto_nodes.clear();
+                                    self.arr_auto_hot = None;
+                                    self.arr_save_edits();
+                                }
                             }
                             return;
                         }
@@ -24443,6 +24781,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if !matches!(hit, Some(A::AutoPoint(..))) {
                     self.arr_auto_nodes.clear();
                 }
+                // **The row the hand last pressed** is where a paste with
+                // nothing chosen lands — see `arr_auto_focus`.
+                if let Some(
+                    A::AutoPoint(n, row, _) | A::AutoLane(n, row, ..) | A::AutoParamPick(n, row),
+                ) = hit
+                {
+                    if let Some(param) = self.arr_auto_param_at(n, row) {
+                        self.arr_auto_focus = Some((n, param));
+                    }
+                }
+                // A new press is a new gesture: whatever anchor the last
+                // drag held is not this one's.
+                self.arr_auto_drag_from = None;
                 match hit {
                     // ── automation ────────────────────────────────────────
                     //
@@ -24479,15 +24830,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // makes a node, alt takes one away, and neither
                         // needs a second gesture or a menu.
                         if ctx.input(|k| k.modifiers.alt) {
+                            // By INDEX: a step's two halves share a time,
+                            // so a time would take whichever came first.
                             if let Some(param) = self.arr_auto_param_at(n, row) {
-                                let at = self
-                                    .arrangement
-                                    .automation
-                                    .get(n, param)
-                                    .and_then(|c| c.points().get(i))
-                                    .map(|q| q.at_s);
-                                if let Some(at) = at {
-                                    self.arr_remove_auto_point(n, param, at);
+                                if self.arr_take_auto_node(n, param, i) {
+                                    self.arr_save_edits();
                                 }
                             }
                             self.arr_auto_nodes.clear();
@@ -24509,6 +24856,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         }
                         self.arr_auto_hot = Some((n, i));
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
+                        // The anchor is taken HERE, with where the hand is,
+                        // so the drag moves the nodes by the hand's travel
+                        // and a plain click moves nothing — see
+                        // `AutoDragFrom::grab`.
+                        if let (Some(param), Some(band)) =
+                            (self.arr_auto_param_at(n, row), self.arr_auto_band(n, row))
+                        {
+                            let v = crate::arrangement_panel::auto_value_at(band, p.y);
+                            self.arr_auto_drag_from =
+                                self.arr_auto_anchor(n, param, i).map(|mut a| {
+                                    a.grab = Some((t_at, v));
+                                    a
+                                });
+                        }
                     }
                     // ── the tempo lane ────────────────────────────────
                     Some(A::TempoPoint(i)) => {
@@ -24605,14 +24966,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // so the two could not both stay. Shift is the add
                         // now, on the automation lane and the tempo lane
                         // alike, and a plain press still locates.
+                        //
+                        // **A plain press is a box or a click.** Dragged, it
+                        // draws a box that chooses the nodes inside it — the
+                        // multiselect the owner asked for; let go without
+                        // moving, it is a click and locates, at the RELEASE,
+                        // as the ruler's press does.
                         if !ctx.input(|i| i.modifiers.shift) {
-                            let to = self.arr_snap_t(t);
-                            self.request_recorder(recorder::RecorderRequest::Locate(to));
+                            self.arr_drag = Some(ArrDrag::AutoMarquee {
+                                lane: n,
+                                slot: row,
+                                from: (t, v),
+                                to: (t, v),
+                                press: p,
+                                moved: false,
+                            });
                             return;
                         }
                         if let Some(i) = self.arr_put_auto_point(n, param, t, v) {
+                            // The new node comes CHOSEN, so the Delete or the
+                            // copy that follows acts on what was just made.
+                            self.arr_auto_nodes = vec![(n, row, i)];
                             self.arr_auto_hot = Some((n, i));
                             self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
+                            self.arr_auto_drag_from = self.arr_auto_anchor(n, param, i).map(|mut a| {
+                                a.grab = Some((t, v));
+                                a
+                            });
                         }
                     }
                     // The header's switches are the mixer strip's own, by
@@ -24704,7 +25084,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // The seam: drag to resize the header column; a plain
                     // CLICK is the generous back-to-the-start target.
                     Some(A::HeaderGrip) => {
-                        self.arr_drag = Some(ArrDrag::HeaderGrip { from_x: p.x });
+                        // The width AS DRAWN, read off the seam itself: the
+                        // setting is zero while the column is on AUTO, and
+                        // starting a drag from the setting would jump the
+                        // column to the clamp's floor the moment it engaged.
+                        let from_w = f64::from(
+                            crate::arrangement_panel::Layout::frame(rect, self.arr_header_w_pt())
+                                .grip
+                                .left()
+                                - rect.left(),
+                        );
+                        self.arr_drag = Some(ArrDrag::HeaderGrip {
+                            from_x: p.x,
+                            from_w,
+                            engaged: false,
+                        });
                     }
                     // Through the desk, so a multiple selection carries — see
                     // the arm of the same name in `apply_arrange_hit`.
@@ -25061,6 +25455,46 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.arr_drag_auto_point(lane, param, index, t, v);
                     }
                 }
+                // **The box follows the hand** and chooses every node it
+                // covers, live, so what the release will leave chosen is
+                // lit while it is still being drawn. Through the same two
+                // mappings the row draws with, like the node drag above.
+                ArrDrag::AutoMarquee { lane, slot, from, press, moved, .. } => {
+                    let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
+                    let (band, t) = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let band = crate::arrangement_panel::Layout::new(rect, &view)
+                            .rows
+                            .iter()
+                            .find(|r| {
+                                r.kind
+                                    == crate::arrangement_panel::RowKind::Automation(
+                                        lane, slot,
+                                    )
+                            })
+                            .map(|r| r.lane);
+                        (band, crate::arrangement_panel::time_at(rect, &view, p.x))
+                    };
+                    if let Some(band) = band.filter(Rect::is_positive) {
+                        let v = crate::arrangement_panel::auto_value_at(band, p.y);
+                        // A few points of travel before it is a box: a
+                        // click's own wobble must not choose nothing and
+                        // swallow the locate.
+                        let moved = moved || p.distance(press) > 4.0;
+                        self.arr_drag = Some(ArrDrag::AutoMarquee {
+                            lane,
+                            slot,
+                            from,
+                            to: (t, v),
+                            press,
+                            moved,
+                        });
+                        if moved {
+                            self.arr_auto_nodes = self.arr_auto_boxed(lane, slot, from, (t, v));
+                        }
+                    }
+                }
                 // **Carrying a flag.** Only its time moves — a marker has
                 // no second dimension — and it is held relative to where it
                 // was grabbed rather than snapped to the pointer.
@@ -25134,13 +25568,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.arr_band = Some((a, p));
                     }
                 }
-                ArrDrag::HeaderGrip { .. } => {
-                    // The pointer's x IS the width, clamped where the
-                    // layout clamps. Persisted: a column somebody sized is
-                    // a decision, not a session whim.
-                    let w = f64::from((p.x - rect.left()).clamp(150.0, rect.width() * 0.5));
-                    self.settings.arr_header_w = w;
-                    self.save_settings_soon();
+                ArrDrag::HeaderGrip { from_x, from_w, engaged } => {
+                    // Inside the dead zone the column does not move and the
+                    // press is still a click — see the variant.
+                    let dx = p.x - from_x;
+                    if engaged || dx.abs() >= HEADER_GRIP_DEAD {
+                        self.arr_drag =
+                            Some(ArrDrag::HeaderGrip { from_x, from_w, engaged: true });
+                        // Clamped where the layout clamps. Persisted: a
+                        // column somebody sized is a decision, not a
+                        // session whim.
+                        let w = (from_w + f64::from(dx))
+                            .clamp(150.0, f64::from(rect.width() * 0.5).max(150.0));
+                        self.settings.arr_header_w = w;
+                        self.save_settings_soon();
+                    }
                 }
                 ArrDrag::Move { id, dt } => {
                     // **A clip on the move is also a drag SOURCE.** The
@@ -25570,10 +26012,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // **A motionless click on the resize strip sends the playhead
             // HOME** — the strip doubles as the back-to-bar-one target the
             // retired dead gutter used to be.
-            if let Some(ArrDrag::HeaderGrip { from_x }) = self.arr_drag {
-                if pointer.is_some_and(|p| (p.x - from_x).abs() < 4.0) {
-                    self.request_recorder(recorder::RecorderRequest::Locate(0.0));
-                }
+            if let Some(ArrDrag::HeaderGrip { engaged: false, .. }) = self.arr_drag {
+                self.request_recorder(recorder::RecorderRequest::Locate(0.0));
             }
             // A motionless click on the gridbox: one step FINER, the right
             // button's mirror.
@@ -25589,6 +26029,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.arr_gesture_dirty = false;
                 self.arr_save_edits();
             }
+            // An automation row's box that never travelled: a plain CLICK on
+            // the row's room, which locates — as a press there always did.
+            if let Some(ArrDrag::AutoMarquee { from, moved: false, .. }) = self.arr_drag {
+                self.request_recorder(recorder::RecorderRequest::Locate(
+                    self.arr_snap_t(from.0),
+                ));
+            }
+            self.arr_auto_drag_from = None;
             // A ruler press that never became a drag: a plain CLICK —
             // locate there, and the old selection clears with it.
             if let Some(ArrDrag::RulerPress { t0, .. }) = self.arr_drag {
@@ -25671,7 +26119,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // Clips first — they are the finer selection. With no clip
             // standing, the SELECTED TRACK answers Delete: the owner's
             // ask, same as the Track menu's Remove.
-            if self.arr_selected.is_none() && self.arr_multi.is_empty() {
+            //
+            // **Chosen automation answers before either** — nodes, or a
+            // row. Choosing nodes clears the clip selection, so this used
+            // to read chosen nodes as "nothing chosen" and hand Delete to
+            // the TRACK: the nodes stayed and the whole track went.
+            if !self.arr_auto_nodes.is_empty() || self.arr_auto_sel.is_some() {
+                self.arr_delete_selected();
+            } else if self.arr_selected.is_none() && self.arr_multi.is_empty() {
                 if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
                     self.remove_selected_channels(n);
                 }
@@ -25706,6 +26161,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             if paste_ev {
                 self.arr_paste();
+            }
+            // **Cmd/Ctrl+A: the selected track's automation lanes** — what
+            // the A on its header opens. The owner asked for a key for it.
+            // Not select-all here: the MIDI editor keeps that chord for its
+            // notes, and this block stands down while the editor is open.
+            if ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::A)
+            }) {
+                if let Some(n) = self.selected_channel {
+                    self.arr_open_automation_menu(n);
+                }
             }
             // **CUT is copy and then delete** — what it is everywhere else,
             // and what it was not here: the chord was simply unbound, so X
@@ -26286,6 +26754,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             snap_on: self.settings.arr_snap,
             grip_lit: self.arr_grip_lit,
             drop_lane: self.arr_drop_hover.then(|| self.arr_drop.map(|(l, _)| l)).flatten(),
+            // The node box, while it is really a box — a press that has not
+            // travelled yet is still a click and draws nothing.
+            auto_marquee: match self.arr_drag {
+                Some(ArrDrag::AutoMarquee { lane, slot, from, to, moved: true, .. }) => {
+                    Some(crate::arrangement_panel::AutoMarquee {
+                        lane,
+                        slot,
+                        t0: from.0,
+                        t1: to.0,
+                        v0: from.1,
+                        v1: to.1,
+                    })
+                }
+                _ => None,
+            },
             grid_exp: self.settings.arr_grid_exp as i8,
             pending: self.arr_pending,
             view_start_s,
@@ -27232,6 +27715,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The face data for one bay, by SEAT and bay — what a knob panel reads.
     pub fn builtin_face(&self, strip: usize, slot: usize) -> Option<&crate::ports::BuiltinFace> {
         self.builtin_faces.get(&(strip, slot))
+    }
+
+    /// **The automation's overlay for one open built-in face**, from the
+    /// host — `None` withdraws it. See `builtin_faces_live`.
+    pub fn set_live_face(
+        &mut self,
+        seat: usize,
+        bay: usize,
+        face: Option<crate::ports::BuiltinFace>,
+    ) {
+        match face {
+            Some(f) => {
+                self.builtin_faces_live.insert((seat, bay), f);
+            }
+            None => {
+                self.builtin_faces_live.remove(&(seat, bay));
+            }
+        }
+    }
+
+    /// **Which built-in faces are open**, as `(seat, bay)`: the dialog slot's
+    /// and the pedal window standing over it. What the host evaluates the
+    /// automation for each frame — nothing else is looking.
+    pub fn open_face_seats(&self) -> Vec<(usize, usize)> {
+        [self.dialog.as_ref(), self.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref())]
+            .into_iter()
+            .flatten()
+            .filter_map(|d| match d {
+                Dialog::InsertFace { strip, slot, .. } => Some(recorder::seat_bay(*strip, *slot)),
+                _ => None,
+            })
+            .collect()
     }
 
     // ── the sampler's two doors ─────────────────────────────────────────
@@ -29388,6 +29903,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The push is the truth; the optimistic mirror already rode
             // it, so this is a copy, never a fight.
             live.face = f.clone();
+        }
+        // **And the automation moves what it moves.** Only the automated
+        // params — everything else stays the saved truth above, optimistic
+        // edits included — plus the EQ's line redrawn through them: the
+        // owner's "automation of 5th node of the EQ as HPF up and down
+        // should show that node moving". A hand on an automated control is
+        // overruled by the curve here as it is in the audio, which is what
+        // reading automation means.
+        if let Some(auto) = self.builtin_faces_live.get(&(seat, bay)) {
+            if auto.path == live.face.path {
+                for p in live.face.params.iter_mut() {
+                    if let Some(q) = auto.params.iter().find(|q| q.id == p.id) {
+                        p.value = q.value;
+                        p.reading.clone_from(&q.reading);
+                    }
+                }
+                if !auto.curve_db.is_empty() {
+                    live.face.curve_db.clone_from(&auto.curve_db);
+                }
+            }
         }
         live.gr_db = self.insert_gr(seat, bay);
         live.preset_rows = self.preset_rows(&live.face.path).to_vec();
@@ -38799,9 +39334,11 @@ impl TangentApp {
         if !self.arrangement_open && self.midi_edit.is_some() {
             self.close_midi_editor();
         }
-        // **The view keys: ctrl+A / ctrl+M / ctrl+V** — arrange, mixer,
-        // visualizer, from anywhere a letter is not being typed. CTRL
-        // proper, not command: the editor's own Cmd+A keeps select-all.
+        // **The view keys: Shift+1 / 2 / 3** — arrange, mixer, visualizer,
+        // from anywhere a letter is not being typed (below). They were
+        // ctrl+A / M / V once; A is free again, and Cmd/Ctrl+A now opens the
+        // selected track's automation lanes on the timeline, while the MIDI
+        // editor keeps it for select-all.
         if !self.dialog_blocks_keys(&ctx) && !self.text_entry_active() {
             // **Ctrl+Z / Ctrl+Shift+Z — one line of time**, whatever view
             // wrote the moment (Cmd works too, for the muscle that has it).
@@ -56163,6 +56700,477 @@ mod tests {
         panic!("{key} has no row in the {} panel", fx.title())
     }
 
+    // ── automation nodes, driven by the hand ─────────────────────────────
+    //
+    // Every node test above calls the methods directly, and every one of
+    // the owner's reports lived in the wiring between the hand and those
+    // methods: Delete went to the TRACK, a paste after a click found no row,
+    // a drag destroyed what it crossed, and no gesture chose several at once.
+    // These drive real frames.
+
+    /// Lane 0's volume row, open, with four nodes: the base at 0 s and three
+    /// more two seconds apart. The magnet is ON, as a hand has it — a node
+    /// lands on a neighbour's time through the grid.
+    fn auto_bench(tag: &str) -> (egui::Context, TangentApp) {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let root = project_scratch(tag);
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.keytoggle_enabled = false;
+        app.settings.arr_snap = true;
+        app.arrangement_open = true;
+        app.arr_auto_open.insert((0, AutoParam::Gain));
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        app.arrangement.automation.set(Curve::sanitised(
+            0,
+            AutoParam::Gain,
+            vec![pt(0.0, 0.5), pt(2.0, 0.8), pt(4.0, 0.2), pt(6.0, 0.6)],
+        ));
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        app.dialog = None;
+        let _ = run_frame(&ctx, &mut app);
+        let _ = app.take_recorder_request();
+        (ctx, app)
+    }
+
+    /// Where `(t, v)` is drawn on lane 0's volume row, through the row's own
+    /// two mappings.
+    fn auto_at(app: &TangentApp, t: f64, v: f64) -> Pos2 {
+        let rect = app.arrangement_rect.expect("the arrangement was never drawn");
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::arrangement_panel::RowKind::Automation(0, 0))
+            .expect("the volume row is not drawn")
+            .lane;
+        Pos2::new(
+            crate::arrangement_panel::x_of_in(&l, &view, t),
+            crate::arrangement_panel::auto_y_of(row, v),
+        )
+    }
+
+    /// Lane 0's volume nodes as `(seconds, value)`.
+    fn auto_nodes(app: &TangentApp) -> Vec<(f64, f64)> {
+        app.arrangement
+            .automation
+            .get(0, crate::automation::AutoParam::Gain)
+            .map(|c| c.points().iter().map(|p| (p.at_s, p.value)).collect())
+            .unwrap_or_default()
+    }
+
+    /// One frame with `key` pressed and `mods` held — on the event AND on
+    /// the frame, the lesson `click_with` records.
+    fn key_with(ctx: &egui::Context, app: &mut TangentApp, key: egui::Key, mods: egui::Modifiers) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: mods,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: mods,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// One frame carrying a system event (Copy, Paste) with the command key
+    /// held, the way the winit layer delivers Cmd+C and Cmd+V.
+    fn chord_event(ctx: &egui::Context, app: &mut TangentApp, event: egui::Event) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: egui::Modifiers::COMMAND,
+                events: vec![event],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// Press on `from`, carry through `via`, let go on the last of them.
+    fn drag_through(ctx: &egui::Context, app: &mut TangentApp, from: Pos2, via: &[Pos2]) {
+        press(ctx, app, from);
+        for p in via {
+            move_to(ctx, app, *p);
+        }
+        release(ctx, app, *via.last().unwrap_or(&from));
+    }
+
+    /// **Delete takes the chosen NODES — and never the track.**
+    ///
+    /// Choosing nodes clears the clip selection, and the Delete key read "no
+    /// clip chosen" as "delete the chosen TRACK": the nodes stayed and the
+    /// whole track went. The owner asked for delete on nodes; the chord was
+    /// already there and went somewhere else entirely.
+    #[test]
+    fn delete_takes_the_chosen_nodes_and_never_the_track() {
+        let (ctx, mut app) = auto_bench("autodelete");
+        app.selected_channel = Some(0);
+        let used = app.channel_used(0);
+        // Choose two by the hand: a click, then a shift-click.
+        let (a, b) = (auto_at(&app, 2.0, 0.8), auto_at(&app, 4.0, 0.2));
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
+        assert_eq!(app.arr_auto_nodes.len(), 2, "two nodes were not chosen: {:?}", app.arr_auto_nodes);
+        key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (6.0, 0.6)], "Delete took the wrong nodes");
+        assert_eq!(app.channel_used(0), used, "Delete went to the TRACK");
+        // **The base stays** even when it is chosen with the rest.
+        app.arr_auto_nodes = vec![(0, 0, 0), (0, 0, 1)];
+        key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
+        assert_eq!(auto_nodes(&app), vec![(0.0, 0.5)], "the base node was deleted");
+    }
+
+    /// **A node DROPPED on its neighbour's time makes a step**; one CARRIED
+    /// over it takes nothing with it.
+    ///
+    /// The owner: nodes "should be able to be dragged such that 2 are on the
+    /// same timeline point -- this allows for instant movement of the value
+    /// to another value -- currently they cannot exist 2 on a single point
+    /// even when dragged." The drag used to `put` the node back each frame,
+    /// and `put` replaces what it lands on — so the neighbour vanished, and
+    /// it vanished even when the hand was only passing over it.
+    #[test]
+    fn a_node_dropped_on_its_neighbours_time_makes_a_step() {
+        let (ctx, mut app) = auto_bench("autostep");
+        // The node at 2 s (0.8) carried onto 4 s, at its own height.
+        let from = auto_at(&app, 2.0, 0.8);
+        let via = [auto_at(&app, 3.0, 0.8), auto_at(&app, 4.0, 0.8)];
+        drag_through(&ctx, &mut app, from, &via);
+        let got = auto_nodes(&app);
+        assert_eq!(got.len(), 4, "the step lost a node: {got:?}");
+        assert_eq!((got[1].0, got[2].0), (4.0, 4.0), "no step at 4 s: {got:?}");
+        assert!((got[1].1 - 0.8).abs() < 0.02, "the curve does not ARRIVE at the dragged node: {got:?}");
+        assert!((got[2].1 - 0.2).abs() < 1e-9, "the neighbour did not survive to leave from: {got:?}");
+        let curve = app.arrangement.automation.get(0, crate::automation::AutoParam::Gain).unwrap();
+        assert_eq!(curve.value_at(4.0), Some(0.2), "the jump is not at the instant");
+        // One moment for the whole drag: one undo puts it back.
+        let _ = run_frame(&ctx, &mut app);
+        app.undo();
+        assert_eq!(auto_nodes(&app).len(), 4);
+        assert!((auto_nodes(&app)[1].0 - 2.0).abs() < 1e-9, "undo did not put the node back");
+
+        // **Carried OVER the neighbour on the way to 5 s**: both survive.
+        let (ctx, mut app) = auto_bench("autocross");
+        let from = auto_at(&app, 2.0, 0.8);
+        let via = [auto_at(&app, 4.0, 0.8), auto_at(&app, 5.0, 0.8)];
+        drag_through(&ctx, &mut app, from, &via);
+        let got = auto_nodes(&app);
+        assert_eq!(got.len(), 4, "passing over the neighbour destroyed it: {got:?}");
+        assert!(got.iter().any(|p| p.0 == 4.0 && (p.1 - 0.2).abs() < 1e-9), "{got:?}");
+        assert!(got.iter().any(|p| p.0 == 5.0), "the dragged node is not at 5 s: {got:?}");
+    }
+
+    /// **Clicking a node to choose it changes nothing** — not its value, not
+    /// its time, not the undo line. The drag used to put the node exactly
+    /// under the pointer on the press frame, so a click re-wrote its value at
+    /// a pixel's precision (0.8 became 0.79999998) and left an undo step.
+    #[test]
+    fn clicking_a_node_to_choose_it_changes_nothing() {
+        let (ctx, mut app) = auto_bench("autoclick");
+        let _ = run_frame(&ctx, &mut app);
+        let before = auto_nodes(&app);
+        let moments = app.history.len();
+        // Off-centre on purpose: a press lands wherever on the handle it lands.
+        let a = auto_at(&app, 2.0, 0.8) + Vec2::new(2.0, 1.5);
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 1)], "the click did not choose the node");
+        assert_eq!(auto_nodes(&app), before, "a click moved the node");
+        assert_eq!(app.history.len(), moments, "a click left an undo step");
+    }
+
+    /// **Several chosen nodes move as ONE shape**, and stay chosen.
+    #[test]
+    fn a_drag_carries_every_chosen_node() {
+        let (ctx, mut app) = auto_bench("automulti");
+        let (a, b) = (auto_at(&app, 2.0, 0.8), auto_at(&app, 4.0, 0.2));
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
+        // Carry the one at 2 s one second later; its partner follows.
+        let via = [auto_at(&app, 2.5, 0.8), auto_at(&app, 3.0, 0.8)];
+        drag_through(&ctx, &mut app, a, &via);
+        let got = auto_nodes(&app);
+        assert!(got.iter().any(|p| p.0 == 3.0 && (p.1 - 0.8).abs() < 0.02), "the lead: {got:?}");
+        assert!(got.iter().any(|p| p.0 == 5.0 && (p.1 - 0.2).abs() < 0.02), "the partner: {got:?}");
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(app.arr_auto_nodes.len(), 2, "the moved nodes were not left chosen");
+    }
+
+    /// **A box drawn on empty room chooses the nodes inside it**, and a
+    /// press that never travels is still the click that locates.
+    #[test]
+    fn a_box_chooses_nodes_and_a_click_still_locates() {
+        let (ctx, mut app) = auto_bench("automarquee");
+        // From above-left of the 2 s node to below-right of the 4 s one.
+        let from = auto_at(&app, 1.0, 0.95);
+        let via = [auto_at(&app, 3.0, 0.5), auto_at(&app, 5.0, 0.05)];
+        drag_through(&ctx, &mut app, from, &via);
+        let mut got = app.arr_auto_nodes.clone();
+        got.sort();
+        assert_eq!(got, vec![(0, 0, 1), (0, 0, 2)], "the box chose the wrong nodes");
+        assert!(
+            !matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::Locate(_))),
+            "a box moved the playhead"
+        );
+        // A click on the room: no box, and the playhead goes there. Held for
+        // frames, as a hand holds one, and wobbling two points: a click that
+        // lived only between two frames would never run the drag at all.
+        let here = auto_at(&app, 3.0, 0.95);
+        press(&ctx, &mut app, here);
+        move_to(&ctx, &mut app, here);
+        move_to(&ctx, &mut app, here + Vec2::new(2.0, 1.0));
+        release(&ctx, &mut app, here + Vec2::new(2.0, 1.0));
+        match app.take_recorder_request() {
+            Some(recorder::RecorderRequest::Locate(t)) => {
+                assert!((t - 3.0).abs() < 0.3, "located at {t}, not near 3 s");
+            }
+            other => panic!("a click on the row did not locate: {other:?}"),
+        }
+        assert!(app.arr_auto_nodes.is_empty(), "a click kept the old choice");
+    }
+
+    /// **Copy, click where it should go, paste**: it lands on that row, at
+    /// the playhead, chosen — and undo and redo walk it.
+    ///
+    /// The click lets the nodes go, and the paste used to name its row only
+    /// through them: it found no row and fell through to the CLIPS. The copy
+    /// also never stamped the system clipboard, so with no text there the
+    /// winit layer swallowed Cmd+V whole.
+    #[test]
+    fn copy_click_paste_lands_on_the_row_and_undoes() {
+        let (ctx, mut app) = auto_bench("autopaste");
+        let (a, b) = (auto_at(&app, 2.0, 0.8), auto_at(&app, 4.0, 0.2));
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
+        chord_event(&ctx, &mut app, egui::Event::Copy);
+        assert_eq!(app.auto_clipboard.len(), 2, "copy took nothing");
+        // The copy STAMPS the system clipboard (flushed next frame), which is
+        // what makes the paste chord arrive at all — see `clipboard_stamp`.
+        assert!(
+            app.clipboard_stamp.as_deref().is_some_and(|s| s.contains("automation")),
+            "copying nodes did not stamp the system clipboard: {:?}",
+            app.clipboard_stamp
+        );
+        // Click at 10 s on the row's room — the hand's way to put the
+        // playhead there. The host answers the Locate; stand in for it.
+        let here = auto_at(&app, 10.0, 0.95);
+        press(&ctx, &mut app, here);
+        release(&ctx, &mut app, here);
+        assert!(app.arr_auto_nodes.is_empty());
+        app.recorder.position_s = 10.0;
+        chord_event(&ctx, &mut app, egui::Event::Paste(String::new()));
+        let got = auto_nodes(&app);
+        assert!(got.contains(&(10.0, 0.8)) && got.contains(&(12.0, 0.2)), "nothing landed: {got:?}");
+        assert_eq!(got.len(), 6, "{got:?}");
+        assert_eq!(app.arr_auto_nodes.len(), 2, "the pasted nodes did not come back chosen");
+        // Undo and redo, by the keys.
+        key_with(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(auto_nodes(&app).len(), 4, "undo did not take the paste back");
+        assert!(app.arr_auto_nodes.is_empty(), "undo left a choice naming nodes that moved");
+        key_with(&ctx, &mut app, egui::Key::Z, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert_eq!(auto_nodes(&app).len(), 6, "redo did not bring the paste back");
+    }
+
+    /// **A paste means what was copied LAST.** Nothing ever emptied the node
+    /// clipboard, and a paste now finds a row to aim at almost always (the
+    /// row last pressed, or the one the nodes came from) — so once nodes had
+    /// been copied, "copy these clips, paste" landed the OLD NODES instead.
+    /// Copying clips, or a track, stands the node clipboard down.
+    #[test]
+    fn copying_clips_after_nodes_leaves_the_paste_to_the_clips() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (_ctx, mut app) = auto_bench("autoclipslast");
+        app.arr_auto_nodes = vec![(0, 0, 1)];
+        assert!(app.arr_copy_auto_nodes());
+        let id = app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
+            kind: ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 1.0,
+            offset_s: 0.0,
+            len_s: 2.0,
+            loop_s: 2.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+            warp: Vec::new(),
+            warp_fit: String::new(),
+        });
+        app.arr_auto_nodes.clear();
+        app.arr_selected = Some(id);
+        app.arr_copy();
+        assert!(app.auto_clipboard.is_empty(), "copying a clip kept the old nodes on the clipboard");
+        // The row the hand last pressed is still there to aim at.
+        app.arr_auto_focus = Some((0, crate::automation::AutoParam::Gain));
+        let (before, clips) = (auto_nodes(&app), app.arrangement.clips.len());
+        app.recorder.position_s = 8.0;
+        app.arr_paste();
+        assert_eq!(auto_nodes(&app), before, "the paste landed old nodes");
+        assert_eq!(app.arrangement.clips.len(), clips + 1, "the copied clip was not pasted");
+    }
+
+    /// **A paste replaces the span it covers** rather than interleaving two
+    /// shapes.
+    #[test]
+    fn a_paste_replaces_what_its_span_covers() {
+        let (_ctx, mut app) = auto_bench("autospan");
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)]; // 2 s and 4 s: a 2 s span
+        assert!(app.arr_copy_auto_nodes());
+        app.recorder.position_s = 3.0;
+        app.arr_auto_nodes.clear();
+        app.arr_auto_focus = Some((0, crate::automation::AutoParam::Gain));
+        assert!(app.arr_paste_auto_nodes());
+        // 3..5 s is the pasted span: the old 4 s node inside it is gone.
+        let got = auto_nodes(&app);
+        assert_eq!(got, vec![(0.0, 0.5), (2.0, 0.8), (3.0, 0.8), (5.0, 0.2), (6.0, 0.6)], "{got:?}");
+    }
+
+    /// **Cmd+A opens the selected track's automation lanes** — what the A on
+    /// its header opens.
+    #[test]
+    fn cmd_a_opens_the_selected_tracks_automation_lanes() {
+        let (ctx, mut app) = auto_bench("autocmda");
+        app.selected_channel = Some(0);
+        key_with(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Automation { .. })),
+            "Cmd+A did not open the automation lanes: {:?}",
+            app.dialog.as_ref().map(|_| "another dialog")
+        );
+    }
+
+    /// **The width seam has wiggle room, and its click still goes home.**
+    ///
+    /// The owner: "make the slider for track width have a bit of wiggle room
+    /// before it will move -- remember that this slider doubles as a single
+    /// click playhead jump to beginning."
+    #[test]
+    fn the_width_seam_ignores_a_wobble_and_still_clicks_home() {
+        let (ctx, mut app) = auto_bench("autogrip");
+        let (grip, drawn) = {
+            let rect = app.arrangement_rect.expect("drawn");
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let g = crate::arrangement_panel::Layout::new(rect, &view).grip;
+            (g.center(), f64::from(g.left() - rect.left()))
+        };
+        let before = app.settings.arr_header_w;
+        // A click that wobbles five points: nothing moves, and it goes home.
+        press(&ctx, &mut app, grip);
+        move_to(&ctx, &mut app, grip + Vec2::new(5.0, 1.0));
+        release(&ctx, &mut app, grip + Vec2::new(5.0, 1.0));
+        assert_eq!(app.settings.arr_header_w, before, "a wobble resized the column");
+        assert!(
+            matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::Locate(t)) if t == 0.0),
+            "the wobbly click did not send the playhead home"
+        );
+        // A real drag: the column follows the hand from where it was, and
+        // it is not a click.
+        press(&ctx, &mut app, grip);
+        move_to(&ctx, &mut app, grip + Vec2::new(20.0, 0.0));
+        move_to(&ctx, &mut app, grip + Vec2::new(40.0, 0.0));
+        release(&ctx, &mut app, grip + Vec2::new(40.0, 0.0));
+        // From the width AS DRAWN — the setting is zero while the column is
+        // on auto, and a drag that started from it would jump to the floor.
+        assert!(
+            (app.settings.arr_header_w - (drawn + 40.0)).abs() < 1.0,
+            "the column is {} after a 40-point drag from {drawn} (setting was {before})",
+            app.settings.arr_header_w
+        );
+        assert!(
+            !matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::Locate(_))),
+            "a drag of the seam also sent the playhead home"
+        );
+    }
+
+    /// **An open built-in face wears the automation's overlay**: the
+    /// automated params move and read as the curve has them, the EQ line is
+    /// the overlay's, every other param stays the saved truth — and the
+    /// saved face itself, the one a save and a preset keep, is never touched.
+    /// Withdrawing the overlay puts the saved setting back on the window.
+    #[test]
+    fn an_open_face_shows_the_automation_and_keeps_the_saved_setting() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let param = |id: u32, value: f32| crate::ports::BuiltinFaceParam {
+            id,
+            symbol: format!("p{id}"),
+            name: format!("P{id}"),
+            units: String::new(),
+            default: 0.0,
+            reading: format!("{value:.2}"),
+            choices: Vec::new(),
+            steps: 0,
+            value,
+        };
+        let (seat, bay) = recorder::seat_bay(2, 1);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: "@tangent-eq".into(),
+            params: vec![param(21, 0.6), param(22, 0.2)],
+            curve_db: vec![-1.0; 4],
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { strip: 2, slot: 1, live: Box::default() });
+        assert_eq!(app.open_face_seats(), vec![(seat, bay)], "the host would not look at this face");
+        app.set_live_face(
+            seat,
+            bay,
+            Some(crate::ports::BuiltinFace {
+                strip: seat,
+                slot: bay,
+                path: "@tangent-eq".into(),
+                params: vec![param(22, 0.8)],
+                curve_db: vec![-9.0; 4],
+                ..Default::default()
+            }),
+        );
+        let _ = run_frame(&ctx, &mut app);
+        let shown = |app: &TangentApp, id: u32| match app.dialog.as_ref() {
+            Some(Dialog::InsertFace { live, .. }) => {
+                live.face.params.iter().find(|p| p.id == id).map(|p| (p.value, p.reading.clone()))
+            }
+            _ => None,
+        };
+        assert_eq!(shown(&app, 22), Some((0.8, "0.80".to_owned())), "the node did not follow the curve");
+        assert_eq!(shown(&app, 21).map(|p| p.0), Some(0.6), "an unautomated param moved");
+        let curve = match app.dialog.as_ref() {
+            Some(Dialog::InsertFace { live, .. }) => live.face.curve_db.clone(),
+            _ => Vec::new(),
+        };
+        assert_eq!(curve, vec![-9.0; 4], "the EQ line is not the automation's");
+        // The saved face is the resting setting and stays it.
+        let saved = app.builtin_face(seat, bay).and_then(|f| f.params.iter().find(|p| p.id == 22));
+        assert_eq!(saved.map(|p| p.value), Some(0.2), "the overlay was written into the saved face");
+        // Withdrawn: the window rests at the saved setting again.
+        app.set_live_face(seat, bay, None);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(shown(&app, 22).map(|p| p.0), Some(0.2), "the overlay outlived its curve");
+    }
+
     /// One frame with no input at all, and whatever it asked for.
     fn run_frame(ctx: &egui::Context, app: &mut TangentApp) -> Option<recorder::RecorderRequest> {
         let _ = ctx.run(
@@ -64025,9 +65033,10 @@ mod folder_tests {
         );
         assert!(pts.iter().any(|p| (p.at_s - 24.0).abs() < 1e-6), "the second did not follow");
 
-        // **Delete** takes exactly the chosen ones, and by TIME rather than
-        // by index — removing one renumbers the rest, so a loop over indices
-        // takes the wrong points from the second one on.
+        // **Delete** takes exactly the chosen ones — by index, highest
+        // first: removing one renumbers the rest, so a loop going upwards
+        // takes the wrong points from the second one on, and a TIME cannot
+        // tell a step's two halves apart.
         app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
         app.arr_delete_auto_nodes();
         assert_eq!(count(&app), 4, "delete took the wrong number of nodes");

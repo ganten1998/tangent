@@ -618,6 +618,10 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // the one nobody would guess from the word "glue", so it is the
             // half that has to be on the card.
             ("C-G", "glue the selected clips on a track - or one that repeats - into one"),
+            // **C-A opens the selected track's automation lanes** - the A on
+            // its header, from the keyboard. The editor keeps the same chord
+            // for selecting its notes; out here it was free.
+            ("C-A", "open the selected track's automation lanes"),
             // C-S-N, not C-N: the handler requires shift, and only audio
             // comes up — a note's velocity is a performance, not a level.
             ("C-S-N", "normalise the selected audio clips"),
