@@ -294,6 +294,16 @@ pub trait AudioSetup: Send {
     /// way, so the panel says what this build has rather than what was hoped.
     fn systems(&self) -> Vec<String>;
 
+    /// **The system the streams are running under NOW**, by name — the
+    /// chosen one when it opened, the platform's default otherwise — or
+    /// `None` when nothing can say.
+    ///
+    /// What the panel marks as active. The setting cannot: it is empty on
+    /// the platform default, and a panel that marked only what the setting
+    /// NAMED showed a fresh install playing through WASAPI with neither
+    /// WASAPI nor ASIO lit.
+    fn active_system(&self) -> Option<String>;
+
     /// **Every audio OUTPUT the chosen system offers**, in the backend's own
     /// order, or empty when they cannot be reached.
     ///
