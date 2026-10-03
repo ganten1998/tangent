@@ -885,7 +885,9 @@ pub enum ProjectRequest {
     /// and for the knobs the Apply moved, which `apply_quantize_window`
     /// leaves for that moment to record. The audio is re-rendered from that
     /// map, so the edit is undoable and survives the document like any
-    /// other.
+    /// other. Each clip is detected and warped on its own attacks, so the
+    /// mics of one kit quantized together are not moved as one (see the
+    /// `warp` module's header).
     ///
     /// Carries the whole question - grid, strength, window, detection
     /// sensitivity and fit - because the grid a quantize aims at is the one
