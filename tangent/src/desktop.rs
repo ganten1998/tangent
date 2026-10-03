@@ -13721,7 +13721,14 @@ impl DesktopApp {
         // ASIO or ASIO4ALL registered beside a real interface therefore
         // opened the wrapper, and nothing in the app could say otherwise.
         // See `Settings::audio_output_device`.
-        let want_out = self.app.audio_output_device();
+        //
+        // **Not carried to a set-aside open**, for the fallback's reason
+        // below: the name is an ASIO driver's, and the platform default asked
+        // for it either misses - and the miss was then logged and toasted as
+        // ASIO having no output, not as the set-aside it is - or finds it
+        // inside another endpoint's name ("Speakers (Komplete Audio 6 MK2)")
+        // and opens that instead of the system's own.
+        let want_out = if set_aside { None } else { self.app.audio_output_device() };
         let mut started = crate::instrument::Engine::start_sized(
             want_out.as_deref(),
             self.recorder.session.timebase(),
@@ -24790,7 +24797,9 @@ mod tests {
 
         // READ: the first open asks for it by name.
         assert!(
-            scan.contains("let want_out = self.app.audio_output_device();"),
+            scan.contains(
+                "let want_out = if set_aside { None } else { self.app.audio_output_device() };"
+            ),
             "the engine no longer asks which output to open"
         );
         assert!(
@@ -24824,6 +24833,32 @@ mod tests {
         assert!(
             fallback.contains("Engine::start_sized(\n                    None,"),
             "the fallback asks the platform default for an ASIO driver's name"
+        );
+    }
+
+    /// **The set-aside open carries no ASIO output name either.** A system
+    /// `DeadOnArrival` has set aside is opened as the platform default, and
+    /// it was still handed the ASIO driver's name: a miss was logged and
+    /// toasted as ASIO having no output - "is the interface plugged in?" -
+    /// instead of the set-aside sentence, and a name found inside another
+    /// endpoint's opened that endpoint instead of the system's own. A source
+    /// scan, for the reason the test above is one.
+    #[test]
+    fn the_set_aside_open_carries_no_asio_output_name() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body = {
+            let a = src.find("fn start_engine(&mut self").expect("`start_engine` is gone");
+            let b = src[a..].find("\n    fn ").expect("its end");
+            &src[a..a + b]
+        };
+        let decl = &body[body.find("let want_out").expect("`want_out` is gone")..];
+        let decl = &decl[..decl.find(';').expect("its end")];
+        assert!(
+            decl.contains("set_aside"),
+            "the set-aside open asks the platform default for an ASIO name: `{decl}`"
+        );
+    }
         );
     }
 
