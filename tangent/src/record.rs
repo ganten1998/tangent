@@ -1706,6 +1706,16 @@ impl Session {
         self.take_facts.2 = head_s;
     }
 
+    /// Where the take begins on the timeline and whether the transport rolls
+    /// under it, set by a press that MOVES the transport in the same call
+    /// that begins the take: the realtime export locates to its span's head
+    /// and rolls after this frame's facts were pushed, and its manifest kept
+    /// the parked playhead and a stopped transport.
+    pub fn set_take_place(&mut self, timeline_start_s: f64, rolling: bool) {
+        self.take_facts.0 = timeline_start_s;
+        self.take_facts.1 = rolling;
+    }
+
     /// **The count-in began earlier than the press** - it is the
     /// arrangement's, and this take joined it. Counted from there, the take
     /// begins on the same downbeat the arrangement record does; counted from
@@ -4171,6 +4181,32 @@ mod tests {
         let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
         assert!(json.contains("\"timeline_rolling\": false"), "{json}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A press that moves the transport as it begins its take places the
+    /// take where it moved it.** The realtime export locates to its span's
+    /// head and rolls after the frame's facts were pushed, so its manifest
+    /// kept the parked playhead, a stopped transport and the last cassette
+    /// press's head.
+    #[test]
+    fn a_press_that_moves_the_transport_places_its_take_where_it_moved_it() {
+        let dir = std::env::temp_dir().join(format!("tangent-take-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        // What the frame's push said: parked at 12 s, stopped, a 2 s head
+        // left over from the last take's count.
+        s.set_take_facts(12.0, false, 2.0, 0, 0);
+        // What the export did before it began its take.
+        s.set_take_head(0.0);
+        s.set_take_place(30.0, true);
+        s.toggle(&dir, Some("bounce"), 0, ExportSpec::default());
+        s.stop();
+        let folder = s.last_summary().expect("a summary").folder.clone();
+        let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(json.contains("\"timeline_start_seconds\": 30"), "{json}");
+        assert!(json.contains("\"timeline_rolling\": true"), "{json}");
+        assert!(json.contains("\"head_seconds\": 0"), "{json}");
     }
 
     /// **A downbeat that is not this take's count-in's is never its T0.**
