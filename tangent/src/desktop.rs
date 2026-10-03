@@ -6348,6 +6348,15 @@ impl DesktopApp {
                         }
                     }
                 }
+                // **No take starts while an export is still filing itself.**
+                // `tick_bounce` stops the pass, then files it a frame or more
+                // later from the session's LAST take - and this loop runs
+                // after it - so a take begun in between was filed as the
+                // export, and the pass it had rendered was orphaned. A press
+                // that ENDS the export is the arm below's, as ever.
+                R::Capture
+                    if self.recorder.bounce.is_some()
+                        && !self.recorder.session.is_recording() => {}
                 R::Capture => {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
@@ -22698,6 +22707,30 @@ mod tests {
             capture[join..].contains("self.recorder.take_count_pending = true;"),
             "a joined take does not hold the click its head is measured against"
         );
+    }
+
+    /// **No take starts while an export is still filing itself.**
+    /// `tick_bounce` stops the pass and files it a frame or more later from
+    /// the session's LAST take, and the request loop runs after it: a
+    /// cassette press in between began an ordinary take, the bounce still
+    /// pending took that take for its own, and the export filed its WAV
+    /// while the pass it had rendered was orphaned. A press that ENDS the
+    /// export is not refused.
+    #[test]
+    fn the_cassette_starts_no_take_while_an_export_files_itself() {
+        let whole = include_str!("desktop.rs");
+        let src = squash(&whole[..whole.find("\nmod tests {").expect("this module")]);
+        let guard = src
+            .find("R::Capture if ")
+            .expect("the cassette starts a take under an export that is still filing itself");
+        let cond = &src[guard..guard + src[guard..].find("=>").expect("the guard's arrow")];
+        assert!(
+            cond.contains("self.recorder.bounce.is_some()")
+                && cond.contains("!self.recorder.session.is_recording()"),
+            "the guard is not the export filing itself: {cond}"
+        );
+        let arm = src.find("R::Capture => {").expect("the cassette's arm");
+        assert!(guard < arm, "the guard comes after the arm it guards, so it never runs");
     }
 
 
