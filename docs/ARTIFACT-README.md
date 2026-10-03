@@ -31,9 +31,12 @@ Windows
   Run Tangent-windows-setup.exe and follow it. It installs the app, puts it in
   the Start menu, and includes an uninstaller.
 
-  The installer is not code-signed, so SmartScreen shows "Windows protected
-  your PC" the first time. Click "More info", then "Run anyway". Windows
-  remembers the choice.
+  In a release build the installer, the app, its video encoder and the
+  uninstaller are signed under the author's name, which is what Windows 11's
+  Smart App Control asks of a program it does not know before it will run
+  it. SmartScreen goes on reputation, which a new signature has to earn, so
+  it may still show "Windows protected your PC" the first time: click
+  "More info", then "Run anyway". Windows remembers the choice.
 
 Linux
 

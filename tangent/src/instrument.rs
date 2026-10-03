@@ -19736,7 +19736,10 @@ impl Engine {
     }
 
     /// True from the downbeat that ends the count-in until the next
-    /// [`Engine::start_count_in`].
+    /// [`Engine::start_count_in`] or [`Engine::cancel_count_in`] - and true
+    /// again from the first callback after a cancel, or after a count of zero
+    /// beats, with no downbeat at all. "A count reached its go" is
+    /// [`Engine::count_in_downbeat_ns`], not this latch.
     pub fn count_in_done(&self) -> bool {
         self.shared.count_in_done.load(Ordering::Relaxed)
     }
@@ -21490,9 +21493,10 @@ mod tests {
     /// Two clocks share this job. `Beats` counts the take in and sounds the
     /// downbeat that ends it; `BarClock` derives every beat after that from
     /// where the transport actually is. The handover is the bug: the
-    /// transport does not roll during a count-in, so it starts at frame ZERO
-    /// on the downbeat - and a `BarClock` resyncing at frame zero is exactly
-    /// on beat one and fires it. `resync`'s own comment worried about this
+    /// transport does not roll during a count-in, so it starts on the
+    /// downbeat from wherever the playhead stands - from 0:00, at frame ZERO -
+    /// and a `BarClock` resyncing at frame zero is exactly on beat one and
+    /// fires it. `resync`'s own comment worried about this
     /// and guessed the resync would land "a frame or two past beat one",
     /// which it does after a locate and does not after a count-in.
     ///

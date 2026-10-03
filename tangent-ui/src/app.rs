@@ -60790,8 +60790,8 @@ mod tests {
         assert_eq!(got, vec![(0.0, 0.5), (2.0, 0.8), (3.0, 0.8), (5.0, 0.2), (6.0, 0.6)], "{got:?}");
     }
 
-    /// **Cmd+A opens the selected track's automation lanes** — what the A on
-    /// its header opens.
+    /// **Cmd+A opens the selected track's automation lanes** — what the
+    /// wrench on its header opens.
     #[test]
     fn cmd_a_opens_the_selected_tracks_automation_lanes() {
         let (ctx, mut app) = auto_bench("autocmda");
