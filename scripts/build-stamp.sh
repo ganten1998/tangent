@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-stamp.sh — which tree built which file in dist/, so a tester build is
+# build-stamp.sh: which tree built which file in dist/, so a tester build is
 # named after the commit that is really in it.
 #
 #   scripts/build-stamp.sh tree                # the tree a build starting now is built from

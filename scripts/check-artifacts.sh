@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-artifacts.sh — every check an artifact must pass before it leaves this
+# check-artifacts.sh: every check an artifact must pass before it leaves this
 # machine, by either road: a release (release.sh) or a tester build
 # (publish-dropbox.sh).
 #

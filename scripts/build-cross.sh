@@ -487,10 +487,10 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
 # the README's and every supporter email's Linux link 404ed.
 LINUX_OK=1
 echo "==> Tangent $VERSION — Linux x86_64"
-package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed — see the log above"; }
+package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed: see the log above"; }
 
 echo "==> Tangent $VERSION — Linux aarch64"
-package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed — see the log above"; }
+package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed: see the log above"; }
 
 echo "==> Tangent $VERSION — Windows x86_64"
 # No mp3 on the Windows leg: LAME's autotools build cannot run under

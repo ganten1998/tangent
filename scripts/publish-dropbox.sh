@@ -151,9 +151,9 @@ elif [ ${#from_work[@]} -gt 0 ]; then
   # refused: handing a tester a build from uncommitted work is a real thing
   # to want, and a build nobody can trace back to a commit is not.
   DIRTY="-dirty"
-  echo "NOTE: built from uncommitted changes — publishing as ${COMMIT}${DIRTY}." >&2
+  echo "NOTE: built from uncommitted changes, so publishing as ${COMMIT}${DIRTY}." >&2
 else
-  echo "error: nothing to publish — nothing in dist/ was built from this tree." >&2
+  echo "error: nothing to publish: nothing in dist/ was built from this tree." >&2
   echo "       Rebuild: scripts/build-macos.sh, scripts/build-cross.sh" >&2
   exit 1
 fi
@@ -167,7 +167,7 @@ DEST="$DBOX/Tangent Development/builds/${COMMIT}${DIRTY}"
 # and release.sh runs it too. SKIP_CHECKS=1 publishes anyway, and must be
 # typed.
 if [ "${SKIP_CHECKS:-0}" = 1 ]; then
-  echo "NOTE: SKIP_CHECKS=1 — publishing WITHOUT the artifact checks." >&2
+  echo "NOTE: SKIP_CHECKS=1, so publishing WITHOUT the artifact checks." >&2
 elif ! scripts/check-artifacts.sh "$VERSION" "${files[@]}"; then
   echo "refusing: the build above fails the release's own checks (the !! lines)." >&2
   echo "  Fix the build, or SKIP_CHECKS=1 to publish it anyway, on purpose." >&2
