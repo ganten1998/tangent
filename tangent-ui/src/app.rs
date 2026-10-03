@@ -19866,7 +19866,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// kind of difference nobody remembers in time, and one rule should
     /// replace it.
     ///
-    /// Notes are kept inside their clip, exactly as the quantiser keeps them.
+    /// **Notes are kept wholly inside their clip**: each start is held where
+    /// the note still ends by the clip's end. That is not the quantize
+    /// window's rule any more, which holds only a note's START inside the
+    /// clip, lets its tail ring past the end, and leaves a note no pass plays
+    /// where it is (see `me_quantize_with`).
     fn me_humanize(&mut self, timing_pct: u8, vel_pct: u8, seed: u64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -44335,7 +44339,8 @@ mod tests {
             .map(|n| (n.at_s, n.vel))
             .collect();
 
-        // **Nothing selected is nothing done**, as the quantiser has it.
+        // **Nothing selected is nothing done** - unlike the quantize
+        // window, which takes the whole clip then. See `me_humanize`.
         app.me_humanize(50, 50, 1);
         let now: Vec<(f64, u8)> = app.arrangement.clips[0]
             .notes
@@ -44378,7 +44383,7 @@ mod tests {
                 n.vel
             );
             assert!(n.vel >= 1, "note {i} was humanized to silence");
-            // Never out of its own clip, the quantiser's wall.
+            // Never out of its own clip: the whole note stays inside.
             assert!(n.at_s >= -1e-9, "note {i} was pushed before the clip at {}", n.at_s);
             assert!(
                 n.at_s + n.dur_s.max(0.05) <= clip.len_s + 1e-9,
