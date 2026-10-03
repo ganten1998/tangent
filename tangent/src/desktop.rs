@@ -13969,8 +13969,8 @@ impl DesktopApp {
     /// **No count-in is running: the host forgets every one it was keeping.**
     ///
     /// The four flags name a count on ONE engine, so they go when it goes and
-    /// a new engine starts without them. Only the birth cleared them once,
-    /// and the drops that build no engine in the same breath - the band
+    /// a new engine starts without them. Only an engine's birth used to clear
+    /// them, and the drops that build no engine in the same breath - the band
     /// closing, the output dying, a reopen that then fails - left them up:
     /// `take_counting` then held the tempo and refused undo and redo for as
     /// long as the band stayed closed or the device stayed gone, with
