@@ -2654,7 +2654,13 @@ enum MeDrag {
     /// than most: the grab zone is ten points wide, so a bar that snapped to
     /// the hand would move by up to ten points on the press frame and the
     /// loop would change length before anybody had dragged anything.
-    LoopBar { grab_s: f64 },
+    ///
+    /// `from_x` is where the press landed, until the hand has travelled past
+    /// the tap slop (then `None`, and the bar follows). Even riding at its
+    /// grab, the bar is written THROUGH the magnet, and a loop no grid line
+    /// ends - a recorded part's - snapped to the nearest one on the press
+    /// frame, so a press alone was an edit and its release a moment.
+    LoopBar { grab_s: f64, from_x: Option<f32> },
 }
 
 /// Where the media explorer wakes up: the user's home, or the root.
@@ -15290,7 +15296,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .automation
             .entry(lane, param)
             .put(Point { at_s, value: v.clamp(0.0, 1.0), shape });
-        self.arr_save_edits();
+        // **The gesture's moment, not one of its own.** A put is the press
+        // of Shift-and-carry, and the release commits through this flag; a
+        // commit here made the add and the carry two moments, the first a
+        // node nobody had let go of. A Shift-click that never moves is one
+        // moment too, at its release.
+        self.clips_dirty = true;
+        self.arr_gesture_dirty = true;
         Some(at)
     }
 
@@ -15364,7 +15376,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.arrangement.tempo = map;
-        self.arr_save_edits();
+        // The gesture's moment, at its release - see `arr_put_auto_point`.
+        self.clips_dirty = true;
+        self.arr_gesture_dirty = true;
         self.arr_tempo_index(at_beat)
     }
 
@@ -23964,7 +23978,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .find(|c| c.id == id)
                             .map_or(0.0, |c| c.midi_loop_origin_s() + c.loop_s);
                         if let Some(st) = self.midi_edit.as_mut() {
-                            st.drag = Some(MeDrag::LoopBar { grab_s: roll_at - end });
+                            st.drag = Some(MeDrag::LoopBar {
+                                grab_s: roll_at - end,
+                                from_x: Some(p.x),
+                            });
                         }
                     }
                     // The right button means nothing on it either, and it must
@@ -24465,7 +24482,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let end = (nav_t - grab_s).min(dom.0 + dom.1);
                     self.me_steer(start, (end - start).max(0.25), dom);
                 }
-                MeDrag::LoopBar { grab_s } => self.me_set_loop_end(t_at - grab_s),
+                // Still until the hand travels past the tap slop: a press on
+                // the bar is not an edit (see `MeDrag::LoopBar`).
+                MeDrag::LoopBar { grab_s, from_x } => {
+                    if from_x.is_none_or(|x| (p.x - x).abs() > TAP_SLOP) {
+                        if let Some(MeDrag::LoopBar { from_x, .. }) =
+                            self.midi_edit.as_mut().and_then(|st| st.drag.as_mut())
+                        {
+                            *from_x = None;
+                        }
+                        self.me_set_loop_end(t_at - grab_s);
+                    }
+                }
                 MeDrag::NavScrub { dom, last } => {
                     // The band's scrub: the transport follows the hand for
                     // as long as the press is held, snapped as the press
@@ -53770,9 +53798,10 @@ mod tests {
     /// **A curve is drawn, moved and undrawn through the app's own hits.**
     ///
     /// The pieces each have their own test; this is the chain. Making a
-    /// point has to save the document (so undo has it), moving one must not
-    /// leave the old one behind, and emptying a curve must take it out of
-    /// the document rather than leave a curve with nothing in it.
+    /// point has to edit the document (its gesture's release commits it, so
+    /// undo has it), moving one must not leave the old one behind, and
+    /// emptying a curve must take it out of the document rather than leave a
+    /// curve with nothing in it.
     #[test]
     fn drawing_a_curve_edits_the_document_and_undrawing_it_removes_the_curve() {
         use crate::automation::AutoParam;
@@ -53990,7 +54019,7 @@ mod tests {
         app.settings.arr_snap = false;
         let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
 
-        // The initial press saves directly, so clear the flag and prove the
+        // The put marks the gesture too, so clear the flag and prove the
         // DRAG sets it on its own.
         app.arr_gesture_dirty = false;
         app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
@@ -53998,6 +54027,59 @@ mod tests {
             app.arr_gesture_dirty,
             "the drag did not mark the gesture, so mouse-up will not save it"
         );
+    }
+
+    /// **A Shift-added node and the carry that places it are one step
+    /// back**, on an automation row and on the tempo lane alike.
+    ///
+    /// The press PUT the node and committed, and the drag after it marked
+    /// the gesture, which committed again at the release: two moments for
+    /// one thing somebody did, the first a node nobody had let go of. The
+    /// put now marks the gesture instead, so the release takes the one
+    /// moment - and a Shift-click that never moves still takes it there.
+    #[test]
+    fn a_shift_add_and_the_carry_after_it_are_one_moment() {
+        use crate::automation::AutoParam;
+        let root = project_scratch("addcarry");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.arr_snap = false;
+        app.arr_save_edits();
+        app.commit_view_change();
+        // The release, as the pointer-up handler does it.
+        let release = |app: &mut TangentApp| {
+            if std::mem::take(&mut app.arr_gesture_dirty) {
+                app.arr_save_edits();
+            }
+        };
+        // An automation node: put at the press, carried by the frames, ended
+        // by the release.
+        let before = app.hist_at;
+        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.75).expect("no point landed");
+        assert_eq!(app.hist_at, before, "the press committed the node nobody had let go of");
+        for f in 1..=10 {
+            app.arr_drag_auto_point(0, AutoParam::Gain, i, 4.0 + f64::from(f) * 0.1, 0.5);
+        }
+        release(&mut app);
+        assert_eq!(app.hist_at, before + 1, "one node added and placed left {} moments", app.hist_at - before);
+        // The same gesture on the tempo lane.
+        let before = app.hist_at;
+        let i = app.arr_put_tempo_point(8.0, 100.0).expect("no tempo point landed");
+        for f in 1..=10 {
+            app.arr_drag_tempo_point(i, 8.0 + f64::from(f) * 0.25, 100.0 + f64::from(f));
+        }
+        release(&mut app);
+        assert_eq!(app.hist_at, before + 1, "one tempo point added and placed left {} moments", app.hist_at - before);
+        // A Shift-click that never moves: still one, at the release.
+        let before = app.hist_at;
+        app.arr_put_auto_point(0, AutoParam::Gain, 12.0, 0.25).expect("no point landed");
+        release(&mut app);
+        assert_eq!(app.hist_at, before + 1, "a motionless Shift-click left {} moments", app.hist_at - before);
+        // One step back takes the last node off, and leaves the others.
+        app.undo();
+        let nodes = app.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len());
+        assert_eq!(nodes, 1, "one Ctrl+Z did not take exactly the last node off");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A mute curve steps; a level curve ramps.
@@ -65755,6 +65837,45 @@ mod tests {").expect("the tests module")];
             after - before
         );
         release(&ctx, &mut app, at);
+    }
+
+    /// **A press on the loop bar is not an edit, even on a loop the grid
+    /// does not end.**
+    ///
+    /// The drag runs on the press frame (the button is down), and it wrote
+    /// the bar where the hand took hold of it - through the magnet. On a
+    /// recorded part's loop, which no grid line ends, that snapped the loop
+    /// to the nearest line before anything had been dragged, and the
+    /// release committed the change as a moment. The bar now waits for the
+    /// hand to travel past the tap slop.
+    #[test]
+    fn a_press_on_an_off_grid_loop_bar_is_not_an_edit() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // The fixture turns the magnet on.
+        let (rect, id) = midi_editor_on_a_loop(&ctx, &mut app);
+        // A recorded part's loop: no grid line ends it.
+        app.arrangement.clips.iter_mut().find(|c| c.id == id).expect("the clip").loop_s = 7.93;
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let l = crate::midi_editor::Layout::new(rect);
+        let bar_x = {
+            let st = app.midi_edit.as_ref().expect("the editor closed");
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            crate::midi_editor::loop_bar_x(&l, &view).expect("the loop drew no bar")
+        };
+        let at = Pos2::new(bar_x, l.ruler.center().y);
+        press(&ctx, &mut app, at);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::LoopBar { .. })),
+            "the press on the bar picked up something else"
+        );
+        release(&ctx, &mut app, at);
+        let loop_s = app.arrangement.clips.iter().find(|c| c.id == id).unwrap().loop_s;
+        assert!((loop_s - 7.93).abs() < 1.0e-9, "a motionless press moved the loop to {loop_s}");
+        assert_eq!(app.hist_at, before, "a press on the loop bar left a moment");
     }
 
     /// **The navigator's edges zoom the window, and the far end stands
