@@ -8717,6 +8717,62 @@ mod tests {
         assert!(carets_in(SetupShape::Machine, |l| l.audio_sig) > 0, "the cog's SIG takes typing with no caret");
     }
 
+    /// **Under a take the rows a press cannot reach look it.**
+    /// `setup_hit_test` refuses every row of the panel's `targets()` but DONE
+    /// while a take writes, and the cassette's TAKE panel still opens then -
+    /// with NAME, FOLDER, COUNT-IN, SIG, EXPORT and the rest drawn live,
+    /// swallowing every press. Their words go to the faint ink; DONE and the
+    /// two rows that stay live ("Count-in into take", "Hide elapsed time")
+    /// keep the panel's own.
+    #[test]
+    fn under_a_take_the_refused_rows_are_drawn_refused() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
+        let s = Settings::default();
+        let p = palette(&s);
+        let l = SetupLayout::new(screen, anchor, SetupShape::Take);
+        // The colour each of these words is painted in, inside its row.
+        let inks = |state: RecordState| -> Vec<(&'static str, Option<Color32>)> {
+            let view = RecorderView { state, take_name: "nocturne", ..RecorderView::empty() };
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                |ctx| {
+                    let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                    draw_setup(&painter, screen, anchor, &view, &s, SetupShape::Take);
+                },
+            );
+            fn walk(shape: &egui::Shape, row: Rect, word: &str, out: &mut Option<Color32>) {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, row, word, out)),
+                    egui::Shape::Text(t) if t.galley.text() == word && row.contains(t.visual_bounding_rect().center()) => {
+                        *out = t.galley.job.sections.first().map(|s| s.format.color);
+                    }
+                    _ => {}
+                }
+            }
+            [("nocturne", l.name), ("DONE", l.close), ("Hide elapsed time", l.hide_elapsed)]
+                .into_iter()
+                .map(|(word, row)| {
+                    let mut ink = None;
+                    for c in &out.shapes {
+                        walk(&c.shape, row, word, &mut ink);
+                    }
+                    (word, ink)
+                })
+                .collect()
+        };
+        for (word, ink) in inks(RecordState::Idle) {
+            assert_eq!(ink, Some(p.ink), "at rest {word:?} is not drawn live");
+        }
+        let rolling = inks(RecordState::Rolling);
+        assert_eq!(rolling[0].1, Some(p.faint), "under a take the refused NAME is drawn live");
+        for (word, ink) in &rolling[1..] {
+            assert_eq!(*ink, Some(p.ink), "under a take {word:?}, which stays live, was dimmed");
+        }
+    }
+
     /// **The PLUGINS row still reads after the resync button took its right
     /// end**, at every window size the card is drawn at.
     ///
@@ -14057,6 +14113,17 @@ pub fn draw_setup(
         return;
     }
     let p = palette(s);
+    // **Refused rows look refused.** While a take writes, `setup_hit_test`
+    // refuses every row of `targets()` but DONE - each one decides how the
+    // file being written was going to be written - and the cassette's TAKE
+    // panel opens mid-take anyway, because two of its rows still work there
+    // ("Count-in into take", and "Hide elapsed time", which hides the clock
+    // live). The refused rows were drawn live and swallowed every press.
+    // `rows` is the palette they are drawn in: their words in the faint ink
+    // under a take, the panel's own otherwise. DONE and the two live rows
+    // keep `p`.
+    let refused = Palette { ink: p.faint, ..p };
+    let rows = if view.state.is_active() { &refused } else { &p };
 
     // A scrim over the whole window. It is what says the panel is modal, and
     // it is what makes a dialog drawn in the app's own ink read as being IN
@@ -14132,7 +14199,7 @@ pub fn draw_setup(
     // Not required and not unique: the timestamp guarantees that. Type
     // "nocturne" once, press record five times, and get five adjacent folders
     // with no overwrite dialog ever.
-    control(painter, l.name, &p);
+    control(painter, l.name, rows);
     {
         let empty = view.take_name.is_empty();
         let shown = if empty { "(optional)" } else { view.take_name };
@@ -14141,8 +14208,8 @@ pub fn draw_setup(
             l.name,
             "NAME",
             shown,
-            if empty { p.faint } else { p.ink },
-            &p,
+            if empty { p.faint } else { rows.ink },
+            rows,
         );
         if view.name_focused {
             draw_caption_caret(
@@ -14151,7 +14218,7 @@ pub fn draw_setup(
                 "NAME",
                 shown,
                 view.take_name.chars().count(),
-                &p,
+                rows,
             );
         }
     }
@@ -14165,7 +14232,7 @@ pub fn draw_setup(
     // half of a small panel, and the path ran straight under the word. A
     // reserved zone rather than a clip, so the path shrinks to fit the room it
     // really has instead of being cut off mid-directory.
-    control(painter, l.dest, &p);
+    control(painter, l.dest, rows);
     if l.dest.is_positive() {
         let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
         let gap = if size >= MIN_TEXT {
@@ -14188,11 +14255,11 @@ pub fn draw_setup(
             l.dest.min,
             Pos2::new(l.dest.right() - gap, l.dest.bottom()),
         );
-        label_text(painter, value, "FOLDER", view.dest, p.ink, &p);
+        label_text(painter, value, "FOLDER", view.dest, rows.ink, rows);
     }
     // SHOW rather than OPEN, for the reason the tick beside Export has: nothing
     // is opened, a folder is shown.
-    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], &p);
+    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], rows);
 
     // **The PROJECT tier's three folders**, drawn exactly as the take's is —
     // a box carrying the word and the path, with a Choose... at its right
@@ -14204,7 +14271,7 @@ pub fn draw_setup(
         (l.preset_dest, l.preset_reveal, "PRESETS", view.preset_dest),
         (l.irs_dest, l.irs_reveal, "IRS", view.irs_dest),
     ] {
-        control(painter, box_, &p);
+        control(painter, box_, rows);
         if box_.is_positive() {
             let size = fit_text(box_, "Choose...", box_.height() * 0.45);
             let gap = if size >= MIN_TEXT {
@@ -14227,9 +14294,9 @@ pub fn draw_setup(
                 box_.min,
                 Pos2::new(box_.right() - gap, box_.bottom()),
             );
-            label_text(painter, value, word, path, p.ink, &p);
+            label_text(painter, value, word, path, rows.ink, rows);
         }
-        draw_word_button(painter, show, &["SHOW FOLDER", "SHOW"], &p);
+        draw_word_button(painter, show, &["SHOW FOLDER", "SHOW"], rows);
     }
 
     text_line(painter, l.folder, view.folder_preview, p.faint, false);
@@ -14248,8 +14315,8 @@ pub fn draw_setup(
         l.count_in,
         "COUNT-IN",
         &count_in_text(view.count_in_bars),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     // The AUDIO tier's own pair — the same two settings, standing where
     // the ARRANGEMENT's rules read as the arrangement's: the red button
@@ -14259,27 +14326,27 @@ pub fn draw_setup(
         l.audio_count_in,
         "COUNT-IN",
         &count_in_text(view.count_in_bars),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
             .clone()
             .unwrap_or_else(|| view.time_signature.label());
-        labelled(painter, l.audio_sig, "SIG", &shown, p.ink, &p);
+        labelled(painter, l.audio_sig, "SIG", &shown, rows.ink, rows);
         // The same caret the TAKE tier's SIG draws: this is the copy the
         // cog's panel and the red button's show, and the arrows moved a
         // caret here that nobody could see.
         if let Some(typed) = typing {
-            draw_caption_caret(painter, l.audio_sig, "SIG", &shown, typed.chars().count(), &p);
+            draw_caption_caret(painter, l.audio_sig, "SIG", &shown, typed.chars().count(), rows);
         }
     }
     // The two doors the cog carries now: the Project dialog and the
     // plugin folders — the menu's rows, reachable without the menu.
-    labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", p.ink, &p);
-    labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", p.ink, &p);
-    draw_resync(painter, l.plugin_rescan, &p);
+    labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", rows.ink, rows);
+    labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", rows.ink, rows);
+    draw_resync(painter, l.plugin_rescan, rows);
     // A readout as well as a way in, like AUDIO SETUP: whether the master is
     // going out over ReaStream right now.
     labelled(
@@ -14287,17 +14354,17 @@ pub fn draw_setup(
         l.stream_row,
         "STREAM",
         if s.reastream_enabled { "To OBS: on" } else { "To OBS: off" },
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
             .clone()
             .unwrap_or_else(|| view.time_signature.label());
-        labelled(painter, l.time_sig, "SIG", &shown, p.ink, &p);
+        labelled(painter, l.time_sig, "SIG", &shown, rows.ink, rows);
         if let Some(typed) = typing {
-            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), &p);
+            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), rows);
         }
     }
     labelled(
@@ -14305,23 +14372,25 @@ pub fn draw_setup(
         l.export,
         "EXPORT",
         &export_summary(&s.record_export),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
 
     // The four yes-or-no questions. Each is worded as the STATE it is in, not
     // as the action that changes it, because a tick already says which way it
     // is set and a row that says both is a row you have to read twice.
-    for (r, cap, on) in [
-        (l.open_when_done, "Show when done", s.record_open_when_done),
-        (l.click_in_take, "Click into takes", s.metronome_in_take),
-        (l.count_in_in_take, "Count-in into take", s.record_count_in_in_take),
-        (l.hide_elapsed, "Hide elapsed time", s.record_hide_elapsed),
+    //
+    // Two of them stay live under a take, and keep the panel's ink.
+    for (r, cap, on, ink) in [
+        (l.open_when_done, "Show when done", s.record_open_when_done, rows),
+        (l.click_in_take, "Click into takes", s.metronome_in_take, rows),
+        (l.count_in_in_take, "Count-in into take", s.record_count_in_in_take, &p),
+        (l.hide_elapsed, "Hide elapsed time", s.record_hide_elapsed, &p),
         // Session state, not a setting: monitoring is off at every launch by
         // construction, which is why it reads from the VIEW.
-        (l.hear_input, "Hear the input", view.input_monitor),
+        (l.hear_input, "Hear the input", view.input_monitor, rows),
     ] {
-        draw_tick(painter, r, cap, on, &p);
+        draw_tick(painter, r, cap, on, ink);
     }
 
     // **Setup**, showing the input it is about. The caption is a question the
@@ -14333,7 +14402,7 @@ pub fn draw_setup(
     //
     // Not `labelled`: a device name is as long as its driver makes it, and a
     // long one drew nothing at all there. See `DEVICE_FLOOR`.
-    draw_device_row(painter, l.audio, "AUDIO SETUP", view.audio.text(), p.ink, &p);
+    draw_device_row(painter, l.audio, "AUDIO SETUP", view.audio.text(), rows.ink, rows);
 }
 
 
