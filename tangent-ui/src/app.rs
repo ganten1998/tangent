@@ -13556,10 +13556,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         f64::from(sig.beats) * (60.0 / bpm) * (4.0 / f64::from(sig.unit))
     }
 
-    /// The grid in seconds — the gridbox's bars-as-a-power-of-two.
+    /// The grid in seconds: one rung of `grid_quarters`, the note value the
+    /// ruler draws, so an arrow step is one drawn line. It was the bar times
+    /// `2^exp`, which in 3/4, 6/8 and 7/8 is no line at all, and the magnet
+    /// after the step skipped lines. At the dial's tempo and signature, not
+    /// the maps', as `arr_bar_s` is.
     fn arr_grid_s(&self) -> f64 {
-        let exp = self.settings.arr_grid_exp.clamp(-6, 3) as i32;
-        self.arr_bar_s() * 2.0f64.powi(exp)
+        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
+        let sig = self.time_signature();
+        let exp = self.settings.arr_grid_exp.clamp(-6, 3) as i8;
+        crate::arrangement_panel::grid_quarters(exp, sig.beats, sig.unit) * (60.0 / bpm)
     }
 
     /// **The playhead walks the grid on the arrow keys**, in the arrange
@@ -13609,11 +13615,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// stepped in seconds walks away from the bars entirely once a tempo
     /// change is in front of it.
     ///
-    /// **Not yet the same below a bar, outside 4/4.** `draw` steps
-    /// `grid_quarters` note values through each bar, and this divides the
-    /// bar by `2^-exp`: in 3/4, 6/8 and 7/8 the two disagree, and the magnet
-    /// lands between the lines drawn. `arr_grid_s` has the same
-    /// `bar * 2^exp`.
+    /// **Below a bar, the note values `draw` steps.** Each bar is walked in
+    /// `grid_quarters` steps from its own line, exactly as the ruler draws
+    /// it. Dividing the bar by `2^-exp` agreed in 4/4 alone: in 3/4, 6/8 and
+    /// 7/8 the magnet landed between the lines drawn.
     ///
     /// A pure function of the map, the position and the gridbox, so the test
     /// can drive it without an app.
@@ -13621,6 +13626,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !q.is_finite() || q <= 0.0 {
             return 0.0;
         }
+        // The rung as the ruler is handed it: `grid_quarters` clamps it.
+        let rung = exp;
         let exp = i32::from(exp.clamp(-6, 6));
         let bar = meter.bar_beat_at_quarter(q).0;
         if exp >= 0 {
@@ -13640,14 +13647,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // to work with.
             if (q - lo).abs() < (hi - q).abs() { lo } else { hi }
         } else {
-            // A sub-bar grid: THIS bar, divided. Rounding to `div` lands on
+            // A sub-bar grid: THIS bar, in the note values the ruler draws
+            // it in. Every rung divides the bar exactly, so the last step is
             // the next bar's downbeat, which is right and is why the clamp
             // allows it.
-            let div = 1u32 << (-exp).min(20);
+            let sig = meter.sig_at_bar(bar);
             let q0 = meter.quarter_at_bar(bar);
             let qn = meter.quarters_in_bar(bar).max(1.0e-9);
-            let step = qn / f64::from(div);
-            let k = ((q - q0) / step).round().clamp(0.0, f64::from(div));
+            let step = crate::arrangement_panel::grid_quarters(rung, sig.beats, sig.unit).max(1.0e-9);
+            let n = (qn / step).round().max(1.0);
+            let k = ((q - q0) / step).round().clamp(0.0, n);
             q0 + k * step
         }
     }
@@ -46848,6 +46857,33 @@ mod tests {
         assert!(asked.iter().filter(|r| matches!(r, recorder::RecorderRequest::Locate(_))).count() >= 7, "the engine was not told about every step: {asked:?}");
     }
 
+    /// **An arrow press is one drawn line, in every meter.** The step was the
+    /// bar times `2^exp` - three quarters of a quarter at the default rung in
+    /// 3/4, where the ruler draws a line every half quarter - and the magnet
+    /// after each press rounded it onto a line further on, so the playhead
+    /// skipped lines.
+    #[test]
+    fn the_arrange_views_arrows_step_one_drawn_line_in_every_meter() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_snap = true;
+        app.settings.arr_grid_exp = -2;
+        app.settings.record_export.tempo_bpm = 120.0; // a quarter is half a second
+        for (beats, unit) in [(3u8, 4u8), (6, 8), (7, 8), (4, 4)] {
+            app.settings.record_time_signature = format!("{beats}/{unit}");
+            let line = crate::arrangement_panel::grid_quarters(-2, beats, unit) * 0.5;
+            app.locate(0.0);
+            for k in 1..=6u8 {
+                app.arr_step_playhead(1.0, false);
+                let want = f64::from(k) * line;
+                assert!(
+                    (app.playhead_s() - want).abs() < 1.0e-6,
+                    "{beats}/{unit}: press {k} landed at {}, not on line {k} at {want}",
+                    app.playhead_s()
+                );
+            }
+        }
+    }
+
     /// A desk with a saved document in a scratch folder and one MIDI clip
     /// on lane 0: the least a lane needs before it can be frozen.
     fn desk_with_a_clip_to_freeze() -> (egui::Context, TangentApp, u64) {
@@ -51766,11 +51802,12 @@ mod tests {
                 meter.quarter_at_bar(bar)
             );
         }
-        // A quarter-note grid (exp -2 is a quarter of a bar... in 3/4 that
-        // is not a quarter note, and that is the point: the gridbox says
-        // "divide the bar", so in 3/4 the halves are at 1.5).
+        // The rung under the bar is a NOTE VALUE, `grid_quarters`'s, the one
+        // the ruler draws: half the bar while the half is whole beats, the
+        // beat once it would not be. Half a 3/4 bar is a beat and a half, so
+        // there this rung's lines are the quarters.
         let half_bar = -1i8;
-        assert!((TangentApp::snap_quarter(&meter, 0.8, half_bar) - 1.5).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 0.8, half_bar) - 1.0).abs() < 1e-9);
         assert!((TangentApp::snap_quarter(&meter, 2.6, half_bar) - 3.0).abs() < 1e-9);
         // **And the third bar, which is 4/4**: its halves are at 6 and 8,
         // not at 7.5 — which is where a fixed 1.5-quarter step from zero
@@ -51810,11 +51847,12 @@ mod tests {
                 let q = f64::from(step) * 0.17;
                 let snapped = TangentApp::snap_quarter(&meter, q, exp);
                 // The line it landed on has to BE a line: either a bar
-                // boundary at a multiple of the grid's bar count, or an even
-                // division of the bar it is in.
+                // boundary at a multiple of the grid's bar count, or a whole
+                // number of the ruler's note values into the bar it is in -
+                // `grid_quarters`, asked independently, never the magnet's
+                // own arithmetic, which is what this once checked it against.
                 let bar = meter.bar_beat_at_quarter(snapped + 1e-9).0;
                 let q0 = meter.quarter_at_bar(bar);
-                let qn = meter.quarters_in_bar(bar);
                 let within = snapped - q0;
                 if exp >= 0 {
                     let every = 1u32 << exp;
@@ -51823,14 +51861,39 @@ mod tests {
                         "exp {exp}: {q} snapped to {snapped}, which is {within} into bar {bar}"
                     );
                 } else {
-                    let div = f64::from(1u32 << (-exp));
-                    let k = within / (qn / div);
+                    let sig = meter.sig_at_bar(bar);
+                    let k = within / crate::arrangement_panel::grid_quarters(exp, sig.beats, sig.unit);
                     assert!(
                         (k - k.round()).abs() < 1e-6,
                         "exp {exp}: {q} snapped to {snapped}, {k} of the way through bar {bar}"
                     );
                 }
                 assert!(snapped >= 0.0, "snapped below zero");
+            }
+        }
+    }
+
+    /// **The arrangement's magnet lands on the note-value lines it draws, in
+    /// every meter.** The ruler steps `grid_quarters` note values through
+    /// each bar; the magnet divided the bar by `2^-exp`, which agrees in 4/4
+    /// alone. At the default rung in 3/4 the lines stand every half quarter
+    /// and the magnet every three quarters of one, and in 6/8 it brought back
+    /// the dotted eighth the ladder exists to refuse.
+    #[test]
+    fn the_arrangement_magnet_lands_on_the_note_value_lines_it_draws() {
+        use crate::recorder::TimeSignature;
+        use crate::tempo::MeterMap;
+        for (beats, unit) in [(3u8, 4u8), (6, 8), (7, 8), (4, 4)] {
+            let meter = MeterMap::constant(TimeSignature { beats, unit });
+            for exp in [-1i8, -2, -3] {
+                let step = crate::arrangement_panel::grid_quarters(exp, beats, unit);
+                for i in 0..300 {
+                    let q = f64::from(i) * 0.07;
+                    let got = TangentApp::snap_quarter(&meter, q, exp);
+                    let bar = meter.bar_beat_at_quarter(got + 1e-9).0;
+                    let k = (got - meter.quarter_at_bar(bar)) / step;
+                    assert!((k - k.round()).abs() < 1e-6, "{beats}/{unit} exp {exp}: {q} -> {got}, lines every {step} q");
+                }
             }
         }
     }
