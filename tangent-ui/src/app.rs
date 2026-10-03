@@ -16203,9 +16203,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// must reproduce its words exactly. A value the apply declines to
     /// restore leaves the live walk different from the moment it stands on,
     /// so the next `undo` pushes the live desk, cuts the redo tail and
-    /// re-applies the same moment, on every press. (Not yet true of the
-    /// header width and the lane count: the apply skips their zero, which
-    /// is AUTO, so a Ctrl+Z past a first resize wedges there.)
+    /// re-applies the same moment, on every press. The header width and the
+    /// lane count are the apply's one exception - it skips their zero, which
+    /// is AUTO, for the open and the template - and `undo_apply` puts both
+    /// back verbatim after it.
     ///
     /// # Why this does NOT take the fingerprint
     ///
