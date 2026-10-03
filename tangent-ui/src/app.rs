@@ -18645,11 +18645,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and window, with every knob stated. [`Self::apply_quantize_window`] is
     /// the only caller.
     ///
-    /// Each start is clamped into `start_s .. start_s + len_s - dur`, the
-    /// clamp a drag uses. Not yet quantized where it is HEARD: a note is
-    /// placed at its first-pass position and then clamped, so one the trim
-    /// hides is moved onto the clip's head, and one that rings past the
-    /// clip's end is pulled in to end there, even when it sat on a line.
+    /// **Quantized where it is HEARD, and only if it is.** A note is placed
+    /// at the first pass that plays it ([`crate::arrangement::first_heard_shift_s`],
+    /// the schedule's own rule), moved there, and mapped back by the same
+    /// pass. One no pass plays - hidden by the trim on every pass, or only
+    /// ever past the clip's end - is left exactly where it is. It used to be
+    /// placed at its first-pass position and then clamped into the clip, so
+    /// a hidden note was dragged onto the clip's head, where it sounded; a
+    /// trimmed loop's downbeat, heard on every pass after the first, moved a
+    /// beat late in all of them; and with the trim a loop or more, the whole
+    /// loop stacked on one instant.
+    ///
+    /// Only the START is held inside the clip: pulled before the head it
+    /// stops at the head, and a note whose line is at or past the clip's end
+    /// stays put, since there it would sound nowhere. A note that rings past
+    /// the end may, as playback lets it.
     fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -18659,24 +18669,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
+        // Asked of every note before any moves: the answer reads the clip.
+        let heard: Vec<Option<f64>> = clip
+            .notes
+            .iter()
+            .map(|n| crate::arrangement::first_heard_shift_s(clip, n.at_s))
+            .collect();
         let mut moved = 0usize;
         for (i, n) in clip.notes.iter_mut().enumerate() {
             if !selected.is_empty() && selected.binary_search(&i).is_err() {
                 continue;
             }
-            // Clip-relative -> timeline, quantize, and back.
-            let abs = c0 + (n.at_s - offset);
-            let want = q.place(abs);
-            // **The clip's own edges still hold.** A note cannot be pushed
-            // out of the clip that owns it, and the tail has to fit: the set
-            // clamps the same way a drag does.
-            let dur = n.dur_s.max(0.05);
-            let want = want.clamp(c0, (c1 - dur).max(c0));
-            let at = offset + (want - c0);
-            if (n.at_s - at).abs() > 1.0e-9 {
-                n.at_s = at;
-                moved += 1;
+            let Some(shift) = heard[i] else {
+                continue;
+            };
+            // Clip-relative -> where this pass plays it, quantize, and back.
+            let abs = c0 + (n.at_s - offset) + shift;
+            let want = q.place(abs).max(c0);
+            if want >= c1 - 1.0e-9 || (want - abs).abs() <= 1.0e-9 {
+                continue;
             }
+            n.at_s = offset + (want - c0) - shift;
+            moved += 1;
         }
         if moved > 0 {
             // **Sorted by `at` is a contract of this list**, and a quantize
@@ -42446,6 +42460,89 @@ mod tests {
             (half - 0.27).abs() < 1e-9,
             "half strength moved the note to {half}, wanted 0.27 - half of the 40 ms"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A quantize leaves a trimmed loop's downbeat where every pass plays
+    /// it.** A note was placed at its FIRST-pass position and then clamped
+    /// into the clip, so on a loop trimmed from its front the downbeat - in
+    /// the trim on the first pass, heard on every later one - was dragged
+    /// onto the clip's head: a beat late in every pass, plus a new hit at the
+    /// head, from a quantize of notes that were all on the grid already.
+    #[test]
+    fn a_quantize_leaves_a_trimmed_loops_downbeat_where_every_pass_plays_it() {
+        let root = project_scratch("me-q-loop-trim");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key, vel: 100, muted: false };
+        // A two-bar loop (4 s at 120) drawn out to four passes, its head then
+        // trimmed by one beat: the source origin is 8.0 s, the clip starts at 8.5.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0, 36), n(2.0, 38)],
+            lane: 1, start_s: 8.5, offset_s: 0.5, len_s: 15.5, loop_s: 4.0,
+            name: "MIDI".to_owned(), ..Default::default()
+        });
+        let heard = |app: &TangentApp| -> Vec<f64> {
+            crate::arrangement::clip_notes_in_song_time(
+                app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"),
+            )
+            .iter().map(|n| n.at_s).collect()
+        };
+        let before = heard(&app);
+        assert_eq!(before, vec![10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0], "fixture: every heard note on a bar line");
+        app.open_midi_editor(id);
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2, triplet: false, swing_pct: 50.0, strength_pct: 100.0,
+            window_ms: 0.0, sensitivity: 0.5, fit: String::new(),
+        });
+        assert_eq!(heard(&app), before, "a quantize of notes already on the grid moved what the loop plays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A note no pass plays is left exactly where it is.** One the trim
+    /// hides on every pass, and one that only ever falls past the clip's
+    /// end, were clamped INTO the clip by the quantize and began to sound:
+    /// three notes heard where one was, even with a 50 ms window.
+    #[test]
+    fn a_quantize_leaves_the_notes_a_trim_hid_where_they_are() {
+        let root = project_scratch("me-q-hidden");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key, vel: 100, muted: false };
+        // One pass of a 4 s loop, trimmed by 0.5 at the front and to 2.5 s
+        // long: of the three notes only the one at 1.0 is ever heard.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62), n(3.5, 64)],
+            lane: 1, start_s: 8.0, offset_s: 0.5, len_s: 2.5, loop_s: 4.0, name: "MIDI".to_owned(), ..Default::default() });
+        let heard = |app: &TangentApp, id: u64| crate::arrangement::clip_notes_in_song_time(
+            app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"));
+        assert_eq!(heard(&app, id).len(), 1, "fixture: one heard note");
+        app.open_midi_editor(id);
+        app.apply_dialog_action(DialogAction::ApplyQuantize { grid_exp: -2, triplet: false, swing_pct: 50.0,
+            strength_pct: 100.0, window_ms: 50.0, sensitivity: 0.5, fit: String::new() });
+        let after = heard(&app, id);
+        assert_eq!(after.len(), 1, "the quantize made hidden notes audible: {after:?}");
+        let ats: Vec<f64> = app.arrangement.clips.iter().find(|c| c.id == id).unwrap().notes.iter().map(|n| n.at_s).collect();
+        assert_eq!(ats, vec![0.0, 1.0, 3.5], "notes the trim hid were moved: {ats:?}");
+
+        // **Trimmed by a loop or more**, every note stood before the head on
+        // its first pass and was clamped to it: the bar of quarters became
+        // one four-note chord per pass. Each is heard on a later pass, on a
+        // line, and stays there.
+        let deep = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0, 60), n(0.5, 62), n(1.0, 64), n(1.5, 65)],
+            lane: 2, start_s: 3.0, offset_s: 3.0, len_s: 5.0, loop_s: 2.0, name: "MIDI".to_owned(), ..Default::default() });
+        let at_s = |app: &TangentApp| -> Vec<f64> { heard(app, deep).iter().map(|n| n.at_s).collect() };
+        let before = at_s(&app);
+        assert_eq!(before.len(), 10, "fixture: two and a half passes of four quarters: {before:?}");
+        app.open_midi_editor(deep);
+        app.apply_dialog_action(DialogAction::ApplyQuantize { grid_exp: -2, triplet: false, swing_pct: 50.0,
+            strength_pct: 100.0, window_ms: 0.0, sensitivity: 0.5, fit: String::new() });
+        assert_eq!(at_s(&app), before, "a loop trimmed by more than a pass was stacked on its head");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -979,6 +979,45 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
     out
 }
 
+/// **Where a MIDI clip first PLAYS a note at source time `at_s`**: the shift
+/// of the first pass that sounds it (`loop_s * pass`, zero on a clip that
+/// does not loop), or `None` when no pass does.
+///
+/// A pass stands the note at `at_s - offset_s + shift` from the clip's head
+/// and sounds it only when that falls INSIDE the clip: [`clip_notes_in_song_time`]'s
+/// two skips (before the head; at or past the end of a looped clip) and its
+/// bound on the passes, plus the engine's wall at the end of a clip that
+/// does not loop - nothing past `PlacedMidi::len` sounds. So a note the trim
+/// hides on the first pass is first heard one loop later, and one the trim
+/// hides on every pass, or that only ever falls past the end, is heard
+/// nowhere. The quantize asks this, so it moves a note where it is heard and
+/// leaves alone the notes a clip does not play.
+pub fn first_heard_shift_s(clip: &ArrClip, at_s: f64) -> Option<f64> {
+    let at = at_s - clip.offset_s;
+    if !at.is_finite() || !clip.len_s.is_finite() {
+        return None;
+    }
+    let looped = clip.loop_s > 1.0e-6 && clip.loop_s.is_finite();
+    let pass = if looped && at < -1.0e-9 {
+        // The first pass that does not stand it before the head.
+        ((-1.0e-9 - at) / clip.loop_s).ceil()
+    } else {
+        0.0
+    };
+    let passes = if looped {
+        ((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s)
+            .ceil()
+            .clamp(1.0, 4_096.0)
+    } else {
+        1.0
+    };
+    // Zero for a clip that does not loop, whose `loop_s` may not even be
+    // finite: `inf * 0.0` is NaN.
+    let shift = if looped { clip.loop_s * pass } else { 0.0 };
+    let placed = at + shift;
+    (pass < passes && placed >= -1.0e-9 && placed < clip.len_s - 1.0e-9).then_some(shift)
+}
+
 /// **The twin of [`clip_notes_in_song_time`] for the pedal**, and it exists
 /// for the same reason: the loop is spelled out once, here, so that glue and
 /// the MIDI export cannot come to different opinions about what a repeating
