@@ -16,6 +16,7 @@
 # consequence is the thing this script answers: nothing in dist/ is in
 # Dropbox, so nothing in dist/ appears on dropbox.com, and the owner went
 # looking for it there and found an empty space where a folder should be.
+# (When dist/ inside Dropbox is a real directory instead, this says so.)
 #
 # **And ~/Library/Caches is not storage.** macOS purges it under disk
 # pressure, so a build that exists only in dist/ can vanish with no warning —
@@ -41,6 +42,22 @@ cd "$ROOT"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 COMMIT="$(git rev-parse --short HEAD)"
+
+# **Said where the link is explained, because nothing else notices.** `rm
+# -rf dist` deletes the LINK, and the next build's `mkdir -p dist` makes a
+# real directory in its place inside the Dropbox-synced repo: that happened
+# on 2026-09-22, every build since has been synced, and the cache behind the
+# old link sat unused. Only a checkout inside Dropbox is asked; anywhere
+# else a plain dist/ is the right thing.
+case "$ROOT" in
+  */Dropbox/*|*/CloudStorage/Dropbox*)
+    if [ -d dist ] && [ ! -L dist ]; then
+      echo "NOTE: dist/ is a real directory inside Dropbox, not the link to" >&2
+      echo "      ~/Library/Caches/tangent-dist that this script's header describes," >&2
+      echo "      so every build is synced. Move what it holds into the cache and put" >&2
+      echo "      the link back." >&2
+    fi ;;
+esac
 
 # The Dropbox root, asked of the filesystem rather than assumed: the modern
 # path is under CloudStorage and the old one is a plain ~/Dropbox, and which
