@@ -42,10 +42,10 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 
 # check_linux — compile the Linux target from macOS WITHOUT an ALSA sysroot.
 #
-# Linux release binaries still cannot be cross-built here (see the note above
-# package_linux), but a release build is not what is usually wanted: what is
-# wanted is to know whether the Linux target still COMPILES before pushing, and
-# for that the answer is yes.
+# Linux release binaries are cross-built here against a fetched sysroot (see
+# ensure_alsa_sysroot), but a release build is not what is usually wanted:
+# what is wanted is to know whether the Linux target still COMPILES before
+# pushing, and for that no sysroot is needed at all.
 #
 # `cargo check` never links, so libasound.so does not have to exist — only
 # `pkg-config --exists alsa` has to succeed, because that is all alsa-sys's
@@ -225,6 +225,23 @@ if [ "${1:-}" = "ico" ]; then
   exit 0
 fi
 
+# **No ASIO SDK, no Windows build, decided before anything is compiled.**
+# The Steinberg SDK lives in vendor/asiosdk_* (its licence forbids committing
+# it), so a fresh checkout does not have it, and this used to carry on to a
+# WASAPI-only tangent.exe, saying so in one line nobody re-reads, after both
+# Linux legs had spent their time. release.sh failed that build at the very
+# end and a tester build shipped it. ASIO is the standard on Windows and the
+# testers have interfaces (the owner's ruling, below): without it the build
+# is not the product. ALLOW_WASAPI_ONLY=1 builds one on purpose, and the
+# artifact checks (scripts/check-artifacts.sh) still keep it from shipping.
+ASIO_DIR="$(ls -d "$ROOT"/vendor/asiosdk_* 2>/dev/null | head -1 || true)"
+if [ -z "$ASIO_DIR" ] && [ "${ALLOW_WASAPI_ONLY:-0}" != 1 ]; then
+  echo "error: no ASIO SDK under vendor/asiosdk_*: refusing a WASAPI-only Windows build." >&2
+  echo "       Unpack Steinberg's ASIO SDK into vendor/ and rerun, or set" >&2
+  echo "       ALLOW_WASAPI_ONLY=1 to build one anyway (nothing will ship it)." >&2
+  exit 1
+fi
+
 mkdir -p dist
 
 # License bundle must exist before packaging.
@@ -232,6 +249,19 @@ mkdir -p dist
 
 # Windows icon must exist BEFORE cargo builds so build.rs embeds it.
 gen_ico
+
+# **The build stamp**: the tree this run builds from, taken once the icon is
+# regenerated and before anything compiles, and recorded beside each
+# artifact as it is finished (scripts/build-stamp.sh). It is how
+# publish-dropbox.sh tells this run's files from an earlier run's under the
+# same names - a failed leg keeps the previous tarball, by design.
+BUILD_TREE="$(scripts/build-stamp.sh tree 2>/dev/null || true)"
+[ -n "$BUILD_TREE" ] \
+  || echo "NOTE: no git tree to stamp with; publish-dropbox.sh will not take these artifacts" >&2
+build_stamp() {
+  [ -z "$BUILD_TREE" ] || scripts/build-stamp.sh write "$BUILD_TREE" "$@" \
+    || echo "warning: could not stamp $*; publish-dropbox.sh will not take it" >&2
+}
 
 # Authenticode signing lives in scripts/sign-windows.sh (jsign to Azure
 # Artifact Signing; unconfigured ships unsigned and says so, partially
@@ -442,19 +472,25 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
     rm -rf "$stage" "${stage}.tar.gz.new"; return 1;
   }
   rm -rf "$stage"
+  build_stamp "${stage}.tar.gz"
   echo "==> ${stage}.tar.gz"
 }
 
-# Linux stages are non-fatal: midir links ALSA, and alsa-sys cannot cross-compile
-# from macOS without an ALSA sysroot (see docs/RELEASE.md → "Cross-build blocker").
-# Build Linux on Linux (CI with libasound2-dev) or provide a sysroot. Windows
-# (no ALSA) still builds below regardless.
+# **A failed Linux leg lets the others run, and then fails the run.** Linux
+# has been built here since the bullseye sysroot (ensure_alsa_sysroot), so a
+# failure is a real one - the glibc floor refusing a binary, a file the
+# readme promises missing, a sysroot that would not download - and not "the
+# ALSA cross-build" this used to blame. The next leg still runs, so one
+# failure costs nothing else, and the exit status at the end says so. It
+# used to exit 0: release.sh then summed a release with no Linux tarball, or
+# with the previous run's (package_linux keeps the old one on failure), and
+# the README's and every supporter email's Linux link 404ed.
 LINUX_OK=1
 echo "==> Tangent $VERSION — Linux x86_64"
-package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
+package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed: see the log above"; }
 
 echo "==> Tangent $VERSION — Linux aarch64"
-package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
+package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed: see the log above"; }
 
 echo "==> Tangent $VERSION — Windows x86_64"
 # No mp3 on the Windows leg: LAME's autotools build cannot run under
@@ -462,9 +498,9 @@ echo "==> Tangent $VERSION — Windows x86_64"
 #
 # ASIO rides in when the Steinberg SDK is present (vendor/asiosdk_*,
 # fetched separately — its licence forbids committing it). The owner's
-# ruling: ASIO is the standard and the testers have interfaces.
+# ruling: ASIO is the standard and the testers have interfaces. ASIO_DIR was
+# found (or its absence refused) at the top, before the Linux legs.
 WIN_FEATURES="recorder"
-ASIO_DIR="$(ls -d "$ROOT"/vendor/asiosdk_* 2>/dev/null | head -1 || true)"
 if [ -n "$ASIO_DIR" ]; then
   export CPAL_ASIO_DIR="$ASIO_DIR"
   WIN_FEATURES="recorder,asio"
@@ -478,7 +514,7 @@ if [ -n "$ASIO_DIR" ]; then
   fi
   echo "==> ASIO backend in (SDK at $ASIO_DIR)"
 else
-  echo "==> ASIO SDK not found under vendor/ — Windows build is WASAPI-only"
+  echo "==> ALLOW_WASAPI_ONLY=1: no ASIO SDK, so this Windows build is WASAPI-only"
 fi
 cargo xwin build --release --target x86_64-pc-windows-msvc -p tangent --no-default-features --features "$WIN_FEATURES"
 WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
@@ -494,10 +530,14 @@ cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
 # meaningful against the exact binary that faulted.
 cp target/x86_64-pc-windows-msvc/release/tangent.pdb "dist/tangent-${VERSION}-windows-x86_64.pdb" 2>/dev/null || true
 scripts/sign-windows.sh "$WINSTAGE/tangent.exe"
-# Steinberg's required notice, when the ASIO backend rode in.
-if [ -n "${CPAL_ASIO_DIR:-}" ]; then
-  printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt"
-fi
+# Steinberg's required notice, when the ASIO backend rode in: keyed on the
+# features this build was compiled with, not on CPAL_ASIO_DIR. That is cpal's
+# own variable and a shell can export it, so a WASAPI-only build made with it
+# set used to carry the notice, which the artifact checks took for proof of
+# ASIO. (They read the host off tangent.exe now as well.)
+case ",$WIN_FEATURES," in
+  *,asio,*) printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt" ;;
+esac
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in tangent.exe.
@@ -532,9 +572,12 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # every one of those links would 404 — for exactly the people who paid (see
 # publish-github.sh's header: uploading the aliases is the release contract).
 # `build-installer.sh` still unzips exactly this file, so the installed files
-# and the portable files can never drift apart.
+# and the portable files are one build's: a failed installer build leaves no
+# setup.exe (it removes the old one first), and check-artifacts.sh compares
+# the two downloads' programs byte for byte.
 (cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
+build_stamp "$WINZIP"
 echo "==> $WINZIP"
 if command -v makensis >/dev/null 2>&1; then
   scripts/build-installer.sh windows
@@ -542,9 +585,13 @@ if command -v makensis >/dev/null 2>&1; then
   # route as the inner exe. After makensis, necessarily: NSIS writes its
   # output last, and Authenticode is appended to the finished PE (the NSIS
   # CRC lives inside it and is untouched — signing post-build is the standard
-  # flow). The uninstaller inside it was signed while makensis ran. release.sh
-  # refuses an unsigned setup.exe, or an unsigned PE inside it or the zip.
+  # flow). The uninstaller inside it was signed while makensis ran. The
+  # artifact checks (scripts/check-artifacts.sh: release.sh, and
+  # publish-dropbox.sh for testers) refuse an unsigned setup.exe, or an
+  # unsigned PE inside it or the zip.
   scripts/sign-windows.sh "dist/Tangent-${VERSION}-windows-setup.exe"
+  # Stamped once signed: the signature changes the bytes the stamp records.
+  build_stamp "dist/Tangent-${VERSION}-windows-setup.exe"
   echo "==> dist/Tangent-${VERSION}-windows-setup.exe"
 else
   # No installer toolchain: the zip alone is a real deliverable, but the
@@ -553,5 +600,18 @@ else
   echo "         Install it with: brew install makensis, then rerun." >&2
 fi
 
-ls -lh dist/tangent-"${VERSION}"-* dist/Tangent-"${VERSION}"-windows-setup.exe 2>/dev/null | sed 's/^/    /'
-[ "$LINUX_OK" = 1 ] || echo "NOTE: Linux artifacts were skipped (ALSA cross-build). Windows built OK."
+# A listing, not a check: `ls` exits non-zero for a name that is not there,
+# and under pipefail that was the only thing that failed a run with no
+# setup.exe - by accident, with no word about why.
+ls -lh dist/tangent-"${VERSION}"-* dist/Tangent-"${VERSION}"-windows-setup.exe 2>/dev/null | sed 's/^/    /' || true
+# **Any leg that failed fails the run**, now that every leg has had its turn.
+BUILD_OK=1
+[ "$LINUX_OK" = 1 ] || {
+  echo "!! a Linux leg failed (above): its tarball is missing, or is still the previous run's" >&2
+  BUILD_OK=0
+}
+[ -f "dist/Tangent-${VERSION}-windows-setup.exe" ] || {
+  echo "!! no setup.exe was built" >&2
+  BUILD_OK=0
+}
+[ "$BUILD_OK" = 1 ] || exit 1

@@ -16,6 +16,7 @@
 # consequence is the thing this script answers: nothing in dist/ is in
 # Dropbox, so nothing in dist/ appears on dropbox.com, and the owner went
 # looking for it there and found an empty space where a folder should be.
+# (When dist/ inside Dropbox is a real directory instead, this says so.)
 #
 # **And ~/Library/Caches is not storage.** macOS purges it under disk
 # pressure, so a build that exists only in dist/ can vanish with no warning —
@@ -26,14 +27,37 @@
 # between releases is `5.0.0-dev`, so a version-named folder would be
 # overwritten by the next one and a tester could never say which build they
 # were on. `tangent-windows-verification-ee6c2ce.md` already set that habit.
+#
+# **And it is the commit that BUILT the files, not the one checked out now.**
+# This used to name the folder after HEAD at publish time and copy every
+# same-version file in dist/, so `builds/c027116/` (2026-09-22) carried an
+# ARCH=host arm64 zip and dmg from four days and 84 commits earlier. Every
+# build script now stamps each artifact with the tree it was built from
+# (scripts/build-stamp.sh), and only a file whose stamp is this tree's goes:
+# HEAD's tree under `<HEAD>`, the uncommitted working state's under
+# `<HEAD>-dirty`. Anything else is left out, and the run says why.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 COMMIT="$(git rev-parse --short HEAD)"
-DIRTY=""
-git diff --quiet && git diff --cached --quiet || DIRTY="-dirty"
+
+# **Said where the link is explained, because nothing else notices.** `rm
+# -rf dist` deletes the LINK, and the next build's `mkdir -p dist` makes a
+# real directory in its place inside the Dropbox-synced repo: that happened
+# on 2026-09-22, every build since has been synced, and the cache behind the
+# old link sat unused. Only a checkout inside Dropbox is asked; anywhere
+# else a plain dist/ is the right thing.
+case "$ROOT" in
+  */Dropbox/*|*/CloudStorage/Dropbox*)
+    if [ -d dist ] && [ ! -L dist ]; then
+      echo "NOTE: dist/ is a real directory inside Dropbox, not the link to" >&2
+      echo "      ~/Library/Caches/tangent-dist that this script's header describes," >&2
+      echo "      so every build is synced. Move what it holds into the cache and put" >&2
+      echo "      the link back." >&2
+    fi ;;
+esac
 
 # The Dropbox root, asked of the filesystem rather than assumed: the modern
 # path is under CloudStorage and the old one is a plain ~/Dropbox, and which
@@ -43,13 +67,6 @@ for c in "$HOME/Library/CloudStorage/Dropbox" "$HOME/Dropbox"; do
   [ -d "$c" ] && { DBOX="$c"; break; }
 done
 [ -n "$DBOX" ] || { echo "error: no Dropbox folder found (looked in ~/Library/CloudStorage/Dropbox and ~/Dropbox)." >&2; exit 1; }
-
-DEST="$DBOX/Tangent Development/builds/${COMMIT}${DIRTY}"
-
-# **A dirty tree is published under a name that says so**, rather than
-# refused: handing a tester a build from uncommitted work is a real thing to
-# want, and a build nobody can trace back to a commit is not.
-[ -n "$DIRTY" ] && echo "NOTE: the tree is dirty — publishing as ${COMMIT}${DIRTY}." >&2
 
 want=("$@")
 [ ${#want[@]} -eq 0 ] && want=(windows macos linux)
@@ -91,6 +108,69 @@ shopt -u nullglob
 if [ ${#files[@]} -eq 0 ]; then
   echo "error: nothing to publish — no artifacts for $VERSION in dist/." >&2
   echo "       Build first: scripts/build-macos.sh, scripts/build-cross.sh" >&2
+  exit 1
+fi
+
+# **Only what this tree built** (the header says why). A file built from
+# HEAD's tree is published as <HEAD> even if you have started editing since;
+# one built from the working state you have now is published as
+# <HEAD>-dirty; the two are never mixed in one folder, because that folder
+# would describe neither. Skipped files are named, with the reason.
+HEAD_TREE="$(git rev-parse 'HEAD^{tree}')"
+WORK_TREE="$(scripts/build-stamp.sh tree)" \
+  || { echo "error: could not read the working tree's state (scripts/build-stamp.sh tree)." >&2; exit 1; }
+from_head=(); from_work=()
+for f in "${files[@]}"; do
+  st=0; built="$(scripts/build-stamp.sh read "$f")" || st=$?
+  if [ "$st" = 0 ] && [ "${built%% *}" = "$HEAD_TREE" ]; then
+    from_head+=("$f")
+  elif [ "$st" = 0 ] && [ "${built%% *}" = "$WORK_TREE" ]; then
+    from_work+=("$f")
+  else
+    case "$st" in
+      0) why="built from another tree (HEAD was ${built#* } when it was stamped)" ;;
+      1) why="no build stamp (built before stamps, or by hand)" ;;
+      *) why="changed since it was stamped" ;;
+    esac
+    echo "    (skipping $(basename "$f"): $why)" >&2
+  fi
+done
+if [ ${#from_head[@]} -gt 0 ] && [ ${#from_work[@]} -gt 0 ]; then
+  echo "error: some of these were built from $COMMIT and some from your uncommitted changes:" >&2
+  for f in "${from_head[@]}"; do echo "    ${f##*/}  (built from $COMMIT)" >&2; done
+  for f in "${from_work[@]}"; do echo "    ${f##*/}  (built from uncommitted changes)" >&2; done
+  echo "       One folder cannot be both: publish one platform at a time, or rebuild." >&2
+  exit 1
+fi
+DIRTY=""
+if [ ${#from_head[@]} -gt 0 ]; then
+  files=("${from_head[@]}")
+elif [ ${#from_work[@]} -gt 0 ]; then
+  files=("${from_work[@]}")
+  # **A dirty build is published under a name that says so**, rather than
+  # refused: handing a tester a build from uncommitted work is a real thing
+  # to want, and a build nobody can trace back to a commit is not.
+  DIRTY="-dirty"
+  echo "NOTE: built from uncommitted changes, so publishing as ${COMMIT}${DIRTY}." >&2
+else
+  echo "error: nothing to publish: nothing in dist/ was built from this tree." >&2
+  echo "       Rebuild: scripts/build-macos.sh, scripts/build-cross.sh" >&2
+  exit 1
+fi
+DEST="$DBOX/Tangent Development/builds/${COMMIT}${DIRTY}"
+
+# **The release's own checks, on what testers get.** release.sh refuses a
+# `-dev` version before it opens a single file, so a tester build used to
+# pass no gate at all: a PE without a signature (which Smart App Control
+# refuses to start, with no override) or a WASAPI-only Windows build went
+# straight out. scripts/check-artifacts.sh is the one copy of those checks,
+# and release.sh runs it too. SKIP_CHECKS=1 publishes anyway, and must be
+# typed.
+if [ "${SKIP_CHECKS:-0}" = 1 ]; then
+  echo "NOTE: SKIP_CHECKS=1, so publishing WITHOUT the artifact checks." >&2
+elif ! scripts/check-artifacts.sh "$VERSION" "${files[@]}"; then
+  echo "refusing: the build above fails the release's own checks (the !! lines)." >&2
+  echo "  Fix the build, or SKIP_CHECKS=1 to publish it anyway, on purpose." >&2
   exit 1
 fi
 

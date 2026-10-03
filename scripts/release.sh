@@ -49,23 +49,6 @@ sha256() {  # shasum is Perl's and is not on every minimal Linux install
   else command sha256 -r "$@" | sed 's/ /  /'; fi
 }
 
-# pe_sig <label> <pe>: the Authenticode presence check for every Windows PE we
-# ship, in one wording. A presence check on the PE's certificate table
-# (scripts/pe-signed.py) rather than a verifier that may not be installed — a
-# gate that only runs where a tool happens to exist is a gate that is off on
-# the machine that cuts releases. Exit 1 is a clean-but-unsigned PE; anything
-# else means the file could not even be read as a PE, which is worse, not
-# better.
-pe_sig() {
-  local sig=0
-  python3 scripts/pe-signed.py "$2" >/dev/null 2>&1 || sig=$?
-  case "$sig" in
-    0) ;;
-    1) note "$1: UNSIGNED (Authenticode) — configure TRUSTED_SIGNING_* and rerun (docs/RELEASE.md § Windows)" ;;
-    *) note "$1: could not read the PE certificate table (pe-signed.py exit $sig)" ;;
-  esac
-}
-
 # ── FreeBSD's spelling of the version ────────────────────────────────────────
 # pkg(8) uses the hyphen to split a package NAME from its VERSION in a
 # filename, so build-freebsd.sh writes 5.0.0-rc.1 as 5.0.0.r1 (FreeBSD's own
@@ -74,67 +57,6 @@ pe_sig() {
 # disagree about what a FreeBSD artifact is called; scripts/check.sh holds
 # the three copies (build, release, publish) byte-identical.
 freebsd_version() { printf '%s' "$1" | sed -E 's/-beta\.?/.b/; s/-alpha\.?/.a/; s/-rc\.?/.r/; s/-/./g'; }
-
-# ── The FreeBSD artifacts, checked as artifacts ──────────────────────────────
-# Functions rather than case arms so they can be exercised against a file in
-# dist/ without running the whole release — which is how they were tested,
-# against the artifacts the build box had already produced.
-#
-# A FreeBSD .pkg is pkg(8)'s archive, not Installer's flat package: a tar with
-# the two manifests at its head, readable with the bsdtar every host has. What
-# build-freebsd.sh asserts at create time is asserted AGAIN here, on the file
-# that actually reached dist/ — a copy from the build box is the thing being
-# blessed, not the box's log.
-check_freebsd_pkg() {
-  local a="$1" list cm want
-  list="$(tar -tf "$a" 2>/dev/null)" || { note "$a: not a readable pkg archive"; return; }
-  for want in '^\+MANIFEST$' '^\+COMPACT_MANIFEST$' \
-              '^/usr/local/bin/tangent$' '^/usr/local/bin/tangent-jack$' \
-              '/share/applications/tangent\.desktop$' \
-              '/icons/hicolor/128x128/apps/tangent\.png$' \
-              '^/usr/local/share/licenses/tangent/LICENSE$' \
-              '^/usr/local/share/licenses/tangent/OFL\.txt$' \
-              '^/usr/local/share/licenses/tangent/THIRD-PARTY-LICENSES$'; do
-    printf '%s\n' "$list" | grep -Eq "$want" || note "$a: missing $want"
-  done
-  cm="$(tar -xOf "$a" +COMPACT_MANIFEST 2>/dev/null || true)"
-  [ -n "$cm" ] || { note "$a: no readable +COMPACT_MANIFEST"; return; }
-  # alsa-lib decides whether the app STARTS on the machine this port exists
-  # for, lilv the same; a GhostBSD base dependency installs nowhere else.
-  for want in alsa-lib alsa-plugins lilv; do
-    case "$cm" in *"\"$want\""*) ;; *) note "$a: manifest does not declare $want" ;; esac
-  done
-  case "$cm" in *GhostBSD-*) note "$a: depends on a GhostBSD base package (will not install on plain FreeBSD)" ;; esac
-  printf '%s' "$cm" | grep -Eq "\"version\": ?\"${PKG_VERSION//./\\.}\"" \
-    || note "$a: manifest version is not $PKG_VERSION"
-}
-
-# An offline bundle: the app's own pkg, its dependency pkgs beside it, the
-# installer the README's first line names, and the same licence texts every
-# other archive carries. The generic README/LICENSE/OFL checks have already
-# run on the listing by the time this is called.
-check_freebsd_bundle() {
-  local a="$1" list="$2" dep
-  printf '%s\n' "$list" | grep -Eq "/tangent-${PKG_VERSION//./\\.}-freebsd-[^/]*\.pkg$" \
-    || note "$a: no tangent pkg inside"
-  printf '%s\n' "$list" | grep -Eq '/install\.sh$' \
-    || note "$a: no install.sh (README's first instruction)"
-  printf '%s\n' "$list" | grep -Eq '/THIRD-PARTY-LICENSES$' \
-    || note "$a: no THIRD-PARTY-LICENSES"
-  for dep in alsa-lib alsa-plugins lilv; do
-    printf '%s\n' "$list" | grep -Eq "/${dep}-[0-9][^/]*\.pkg$" \
-      || note "$a: no $dep pkg (the app does not start without it)"
-  done
-  case "$a" in
-    *-complete.tar.gz)
-      # 'complete' is for a box that has only ever had Xorg: the graphics
-      # stack and the encoder are exactly what it is for.
-      for dep in mesa-dri ffmpeg; do
-        printf '%s\n' "$list" | grep -Eq "/${dep}-[0-9][^/]*\.pkg$" \
-          || note "$a: 'complete' bundle without $dep"
-      done ;;
-  esac
-}
 
 # ── Verify the version ───────────────────────────────────────────────────────
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -295,8 +217,9 @@ if [ "$SUMS_ONLY" = 0 ]; then
       if [ "${SKIP_WINDOWS:-0}" = "1" ]; then
         echo "==> Skipping build-cross.sh (SKIP_WINDOWS=1)"
       else
-        # Its Linux stage is expected to fail on the ALSA cross-build and says
-        # so loudly; only a missing Windows zip is a real failure, caught below.
+        # A leg that fails (a Linux tarball, the installer) lets the others
+        # run and then exits non-zero; the set check below names what is
+        # missing, and a missing one is a red run.
         scripts/build-cross.sh || note "build-cross.sh exited non-zero"
       fi
       ;;
@@ -321,7 +244,15 @@ fi
 # Linux tarball without a binary is the exact thing that shipped before 2.1.0.
 shopt -s nullglob
 ARTIFACTS=()
-for f in dist/*-"${VERSION}"-*; do [ -f "$f" ] && ARTIFACTS+=("$f"); done
+# **Not the PDB.** build-cross.sh keeps the Windows symbols beside the
+# deliverables under the build's own name, so the glob finds them, and they
+# are never uploaded: summed here, they made every user's `shasum -c
+# SHA256SUMS` report a file that is not there, which reads as a failed
+# integrity check on a clean download.
+for f in dist/*-"${VERSION}"-*; do
+  case "$f" in *.pdb) continue ;; esac
+  [ -f "$f" ] && ARTIFACTS+=("$f")
+done
 # The FreeBSD artifacts wear pkg's spelling, which is only the same string
 # for a final release; a prerelease's are found by their own name.
 if [ "$PKG_VERSION" != "$VERSION" ]; then
@@ -340,131 +271,28 @@ if [ "$(uname -s)" = FreeBSD ] && [ "$SUMS_ONLY" = 0 ]; then
       || note "no $kind bundle for $PKG_VERSION (build-freebsd.sh needs root or doas to fetch it)"
   done
 fi
+# **And the set the Mac builds, every piece of it.** Only files that exist
+# are checked below, so a leg that produced nothing used to pass unseen: a
+# failed Linux leg gave a release with no Linux tarball, every check green,
+# and a `releases/latest/download` link in the README and in every
+# supporter email that 404ed. The dmg stays best-effort; SKIP_WINDOWS=1
+# waives the four the cross build makes.
+if [ "$(uname -s)" = Darwin ] && [ "$SUMS_ONLY" = 0 ]; then
+  case "${ARCH:-universal}" in host) MAC_ARCH="$(uname -m)" ;; *) MAC_ARCH=universal ;; esac
+  WANT="Tangent-${VERSION}-macos.pkg Tangent-${VERSION}-macos-${MAC_ARCH}.zip"
+  [ "${SKIP_WINDOWS:-0}" = 1 ] || WANT="$WANT Tangent-${VERSION}-windows-setup.exe
+    tangent-${VERSION}-windows-x86_64.zip tangent-${VERSION}-linux-x86_64.tar.gz
+    tangent-${VERSION}-linux-aarch64.tar.gz"
+  for w in $WANT; do
+    [ -f "dist/$w" ] || note "no $w: its build failed or was skipped (see above)"
+  done
+fi
 
 echo "==> Checking ${#ARTIFACTS[@]} artifact(s)"
-for a in "${ARTIFACTS[@]}"; do
-  # ── Installers, which carry BOTH payloads and are checked for both ────────
-  # An installer that quietly ships only the app is the same class of failure
-  # as the empty Linux tarball: it installs, it looks right, and the thing the
-  # user came for is not there.
-  case "$a" in
-    *-freebsd-*.pkg)
-      check_freebsd_pkg "$a"
-      continue
-      ;;
-    *.pkg)
-      exp="$(mktemp -d)"
-      if pkgutil --expand "$a" "$exp/x" 2>/dev/null; then
-        [ -d "$exp/x/Tangent-app.pkg" ]  || note "$a: no application component"
-        [ ! -d "$exp/x/Tangent-vst3.pkg" ] || note "$a: carries the RETIRED VST3 component"
-        grep -q 'choice.standalone' "$exp/x/Distribution" 2>/dev/null \
-          || note "$a: the installer offers no standalone choice"
-        # relocatable="true" would let a stray copy elsewhere on the disk
-        # receive the update instead of /Applications.
-        grep -q 'relocatable="false"' "$exp/x/Tangent-app.pkg/PackageInfo" 2>/dev/null \
-          || note "$a: the app component is RELOCATABLE (it must not be)"
-        pkgutil --check-signature "$a" 2>/dev/null | grep -q 'Status: signed' \
-          || note "$a: UNSIGNED (needs a Developer ID Installer certificate)"
-        # Signed-but-unnotarized passes the grep above and still warns on
-        # first open; the staple is a real part of the artifact, so validate
-        # it here rather than trust build-installer.sh's log line.
-        xcrun stapler validate "$a" >/dev/null 2>&1 \
-          || note "$a: signed but NOT stapled (notarization missing or failed)"
-      else
-        note "$a: could not be expanded — it is not a valid flat package"
-      fi
-      rm -rf "$exp"
-      continue
-      ;;
-    *setup.exe)
-      if command -v 7zz >/dev/null 2>&1; then
-        wl="$(7zz l "$a" 2>/dev/null)"
-        printf '%s\n' "$wl" | grep -q 'tangent\.exe' \
-          || note "$a: no tangent.exe"
-        printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3' \
-          && note "$a: carries the RETIRED VST3 payload"
-        printf '%s\n' "$wl" | grep -q 'Uninstall\.exe' \
-          || note "$a: no uninstaller"
-      else
-        note "$a: not inspected (install 7-zip to check: brew install sevenzip)"
-      fi
-      # The same refusal the .pkg gets, because SmartScreen judges the OUTER
-      # installer no matter what happened to the inner exe.
-      pe_sig "$a" "$a"
-      # And every PE INSIDE it, because Smart App Control judges each program
-      # as it starts, with no way for the user to allow one: an unsigned
-      # tangent.exe, encoder or uninstaller is blocked however signed the
-      # setup was. Extracted, not listed, because a signature is in the bytes.
-      if command -v 7zz >/dev/null 2>&1; then
-        inner="$(mktemp -d)"
-        for pe in tangent.exe tangent-ffmpeg.exe Uninstall.exe; do
-          if 7zz e -y -o"$inner" "$a" "$pe" >/dev/null 2>&1 && [ -f "$inner/$pe" ]; then
-            pe_sig "$a: $pe" "$inner/$pe"
-          else
-            note "$a: could not extract $pe to check its signature"
-          fi
-        done
-        rm -rf "$inner"
-      fi
-      continue
-      ;;
-  esac
-
-  case "$a" in
-    *.zip)    list="$(unzip -Z1 "$a")" ;;
-    *.tar.gz) list="$(tar -tzf "$a")" ;;
-    *)        continue ;;   # .dmg: mounting to inspect is not worth it
-  esac
-  # (^|/) so an AppleDouble "._LICENSE" can never satisfy the LICENSE check.
-  printf '%s\n' "$list" | grep -Eq '(^|/)README\.txt$' || note "$a: no README.txt"
-  printf '%s\n' "$list" | grep -Eq '(^|/)LICENSE$'           || note "$a: no LICENSE"
-  printf '%s\n' "$list" | grep -Eq '(^|/)OFL\.txt$'          || note "$a: no OFL.txt (font licence)"
-  case "$a" in
-    *macos*)
-      printf '%s\n' "$list" | grep -Eq '^__MACOSX'           && note "$a: carries __MACOSX junk"
-      printf '%s\n' "$list" | grep -Eq '/MacOS/tangent$'       || note "$a: no Tangent.app executable"
-      ;;
-    *windows*)
-      printf '%s\n' "$list" | grep -Eq '^tangent\.exe$'        || note "$a: no tangent.exe"
-      # **ASIO, or the release does not go out.**
-      #
-      # `build-cross.sh` writes this notice ONLY when `CPAL_ASIO_DIR` was set,
-      # which is only when `vendor/asiosdk_*` was present - the SDK's licence
-      # forbids committing it, so a fresh checkout silently produces a
-      # WASAPI-only Windows build and says so in one line of build output
-      # nobody re-reads. Steinberg require the notice anyway, which is what
-      # makes it an honest fingerprint rather than a flag we set ourselves.
-      #
-      # ASIO is the standard on Windows and the testers have interfaces: a
-      # build without it is not the product, and the way that failure
-      # presented was a user asking why the ASIO option FL Studio gives him
-      # is missing here. Loud, like the glibc floor.
-      printf '%s\n' "$list" | grep -Eq '(^|/)ASIO-NOTICE\.txt$' \
-        || note "$a: NO ASIO (vendor/asiosdk_* was missing at build time)"
-      # The portable build meets Smart App Control exactly as the installed
-      # one does, so its programs are held to the same signatures.
-      inner="$(mktemp -d)"
-      for pe in tangent.exe tangent-ffmpeg.exe; do
-        if unzip -q -o "$a" "$pe" -d "$inner" 2>/dev/null && [ -f "$inner/$pe" ]; then
-          pe_sig "$a: $pe" "$inner/$pe"
-        else
-          note "$a: could not extract $pe to check its signature"
-        fi
-      done
-      rm -rf "$inner"
-      ;;
-    *-freebsd-*)
-      check_freebsd_bundle "$a" "$list"
-      ;;
-    *linux*)
-      printf '%s\n' "$list" | grep -Eq '/tangent$'             || note "$a: NO BINARY (the pre-2.1.0 empty-tarball bug)"
-      # The 4.92.0 tarball shipped without either of these while its own
-      # README told the user to run install.sh. Named parts, not vibes.
-      printf '%s\n' "$list" | grep -Eq '/install\.sh$'         || note "$a: no install.sh (README's first instruction)"
-      printf '%s\n' "$list" | grep -Eq '/tangent-ffmpeg$'      || note "$a: no bundled encoder (video takes break on clean machines)"
-      ;;
-  esac
-done
+# The checks themselves are scripts/check-artifacts.sh, which
+# publish-dropbox.sh runs on every tester build as well; each problem is a
+# `!!` line of its own, and any of them makes this run red.
+PKG_VERSION="$PKG_VERSION" scripts/check-artifacts.sh "$VERSION" "${ARTIFACTS[@]}" || FAIL=1
 
 # ── Checksums ────────────────────────────────────────────────────────────────
 echo "==> Writing dist/SHA256SUMS"

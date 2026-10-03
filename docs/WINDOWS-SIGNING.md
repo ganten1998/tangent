@@ -4,7 +4,8 @@ One-time setup for Azure Artifact Signing (Microsoft renamed it from
 "Trusted Signing" when it went GA in January 2026). After this, every
 `build-cross.sh` run signs every Windows program Tangent ships
 automatically (`tangent.exe`, the bundled `tangent-ffmpeg.exe`, the
-uninstaller and `setup.exe`), and `release.sh` stops running red on
+uninstaller, `setup.exe` and the two NSIS plug-in DLLs the installer
+loads), and `release.sh` stops running red on
 Windows artifacts. **No company is needed**: an individual in the US or
 Canada signs under their own legal name (step 3).
 
@@ -38,8 +39,9 @@ to keep them apart:
    this on 2026-09-24, days after installing, when Smart App Control left
    its evaluation mode and switched itself on. Unlike SmartScreen this
    wants a valid signature, not reputation, so a signed build runs there
-   from its first release. It checks every program, which is why the
-   encoder and the uninstaller are signed too.
+   from its first release. It checks every program, and the DLLs they
+   load, which is why the encoder, the uninstaller and the installer's NSIS
+   plug-ins are signed too.
 
 For an individual: the alternatives are an OV/individual certificate from
 a commercial CA (Certum, SSL.com; a hardware token, similar money, no
@@ -165,8 +167,10 @@ three variables and an `az login`.
    ```
 
 From then on `build-cross.sh` signs `tangent.exe`, `tangent-ffmpeg.exe`,
-the uninstaller and the installer on every Windows build, and `release.sh`
-refuses to cut a release if any of them comes out unsigned - it reads the
-signature of the setup.exe, of each program inside it, and of each program
-in the portable zip. Unset the three variables and everything reverts to
-the documented unsigned state - loudly, never silently.
+the uninstaller, the installer and its NSIS plug-ins on every Windows build,
+and `release.sh` refuses to cut a release, and `publish-dropbox.sh` to hand
+a build to testers, if any of them comes out unsigned - both read
+(`scripts/check-artifacts.sh`) the signature of the setup.exe, of every PE
+inside it, and of each program in the portable zip. Unset the three
+variables and everything reverts to the documented unsigned state - loudly,
+never silently.
