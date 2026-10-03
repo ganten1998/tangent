@@ -2874,7 +2874,12 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
     let keeps = |dir: &std::path::Path| {
         use crate::arrangement::LoadOutcome;
         let held = match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(dir)) {
-            LoadOutcome::Loaded(a) => a.named,
+            // A document with clips is work, named or not, as the sweep and
+            // Don't Save have always read it (`scratch_is_disposable`).
+            // Open's save-back writes a scratch's document unnamed, clips and
+            // all - an arrangement take finished on the way out included -
+            // and New reclaimed that folder whole.
+            LoadOutcome::Loaded(a) => a.named || !a.clips.is_empty(),
             // Unreadable bytes are somebody's song until proven otherwise —
             // reclaiming a folder on the strength of a failed parse is how
             // a corrupt SAVED project would be deleted outright.
@@ -16085,6 +16090,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // an on-exit flush in the host finds nothing owed.
         self.flush_settings_now();
         false
+    }
+
+    /// **Ask New's question again, for unsaved work that arrived after it
+    /// was asked** - the host's call once a New has finished a running
+    /// arrangement record: the take is in the document only from that
+    /// moment, so the question asked when New was pressed (none at all, on a
+    /// clean session) never covered it. `true` when the prompt is up and the
+    /// New must wait; its Save or Discard raises New again, as the menu's
+    /// does.
+    pub fn ask_before_new(&mut self) -> bool {
+        self.ask_before(AfterSave::New)
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -58992,6 +59008,38 @@ mod tests {
         std::fs::remove_dir_all(scratch.join("Song")).unwrap();
         std::fs::create_dir_all(scratch.join("media").join("Takes")).unwrap();
         assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"), "a folder inside media/ was reclaimed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A scratch whose document holds clips is not a scratch either.**
+    /// Open writes the outgoing session's document back when it is dirty and
+    /// was not discarded - a scratch's unnamed, clips and all, an
+    /// arrangement take finished on the way out included - and the next New
+    /// reclaimed that folder whole, because only `named` held it. A MIDI
+    /// take lives in the document alone, so nothing in `media/` spoke for it.
+    #[test]
+    fn a_new_session_steps_past_an_untitled_whose_document_holds_clips() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-fresh-clips-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scratch = root.join("Untitled");
+        let mut doc = crate::arrangement::Arrangement::default();
+        doc.save_to(&crate::arrangement::doc_in(&scratch));
+        assert_eq!(fresh_project_dir(&root), scratch, "an empty unnamed scratch is no longer reclaimed");
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&scratch));
+        assert_eq!(
+            fresh_project_dir(&root),
+            root.join("Untitled 2"),
+            "New reclaimed an unnamed scratch whose document holds clips"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

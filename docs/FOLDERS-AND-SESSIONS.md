@@ -108,6 +108,18 @@ Related invariants that keep this working:
   gets no prompt, so New asks about its scratch's takes with the scratch
   warning first, as it does for a leftover one (`new_asks_about_scratch`);
   it used to reclaim it, a take undone off the timeline included.
+- **A running arrangement record ends in the session it was recorded in.**
+  Every road out finishes it first (`finish_arr_record`): a window close
+  before the quit question, so the question covers the take; Open before
+  the save-back, which keeps it; New before it decides anything, asking
+  New's question again when the take is unsaved work nobody was asked
+  about (`ask_before_new`); and `on_exit` for one still running. The
+  roads take the save prompt's answer before finishing and put it back
+  (`finish_arr_record_keeping_the_answer`), since the finish commits a
+  moment and a new moment clears Don't Save. A close used to drop the take
+  unwritten, and a New or an Open carried it into the next session. New's
+  reclaim treats a document holding clips as work, as the sweep and the
+  discard do, so a scratch Open wrote back with a take is never reclaimed.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
   every lane's kit samples and writes the kit sidecar. Imports, pad loads,
   arrangement takes with audio, freezes, glues and realtime exports go
