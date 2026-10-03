@@ -200,11 +200,19 @@ build_windows() {
   # the portable build receives — so the installed files and the unzipped
   # files cannot drift apart.
   local zip="dist/tangent-$VERSION-windows-x86_64.zip"
+  local out="dist/$NAME-$VERSION-windows-setup.exe"
   need "$zip"  "run scripts/build-cross.sh first"
   command -v makensis >/dev/null || {
     echo "makensis not found. Install it with: brew install makensis" >&2
     exit 1
   }
+  # **The previous installer goes first.** makensis writes its output last,
+  # so when it aborts an existing one can stay where it was, and anything
+  # below can abort it: a plug-in that will not sign, or the uninstaller's signing,
+  # which `!uninstfinalize ... = 0` turns into a failed makensis. The old
+  # setup.exe then sat beside a fresh zip, two builds under one version's
+  # names, and the checks passed both. Now a failed build leaves none.
+  rm -f "$out"
 
   echo "==> $NAME $VERSION — Windows installer"
   rm -rf "$WORK/windows"
@@ -216,7 +224,6 @@ build_windows() {
   # The installer wears the app's logo. Same icon build.rs embeds into the
   # exe; the setup, the app, and the Add/Remove entry are one mark.
   need "$ROOT/assets/tangent.ico" "the app icon is missing"
-  local out="dist/$NAME-$VERSION-windows-setup.exe"
 
   # **NSIS's own plug-ins are signed too.** The installer unpacks two of
   # NSIS's stock plug-in DLLs into $PLUGINSDIR and loads them: System.dll in

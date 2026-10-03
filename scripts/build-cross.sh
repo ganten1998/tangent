@@ -553,7 +553,9 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # every one of those links would 404 — for exactly the people who paid (see
 # publish-github.sh's header: uploading the aliases is the release contract).
 # `build-installer.sh` still unzips exactly this file, so the installed files
-# and the portable files can never drift apart.
+# and the portable files are one build's: a failed installer build leaves no
+# setup.exe (it removes the old one first), and check-artifacts.sh compares
+# the two downloads' programs byte for byte.
 (cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
 echo "==> $WINZIP"
