@@ -3772,6 +3772,25 @@ fn make_room<V>(
     }
 }
 
+/// **Whether a quantize over these files is as good as done already**:
+/// every one that is decoded has an analysis made from that decode, so
+/// what is left is a `pick` and a map per clip - milliseconds, the work the
+/// marks redo on every turn of a dial. A file with no decode is skipped by
+/// the quantize and costs nothing. `take_project_request` runs such a
+/// quantize at once instead of behind a cover.
+#[cfg(feature = "recorder")]
+fn attacks_known(
+    asked: &[std::path::PathBuf],
+    decodes: &std::collections::HashMap<std::path::PathBuf, Decoded>,
+    analyses: &std::collections::HashMap<std::path::PathBuf, Arc<crate::transient::Analysis>>,
+) -> bool {
+    asked.iter().all(|path| {
+        decodes
+            .get(path)
+            .is_none_or(|d| analyses.get(path).is_some_and(|a| a.fits(&d.clip)))
+    })
+}
+
 /// **A clip's warp map in the frames of a decode at `rate`**: the anchors
 /// every reader renders, projects and draws through, and the only road from
 /// `clip.warp` to them.
@@ -10944,9 +10963,9 @@ impl DesktopApp {
             Q::Template(name) => ("Saving template", Some(name.clone())),
             Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
             Q::ResetTemplate => ("Resetting the template", None),
-            // Announced like the rest: a detection pass per selected clip (a
-            // whole-file analysis for a file not cached yet, ~12 ms per three
-            // minutes) and a map each, behind the busy cover.
+            // Announced only when a file has to be analysed first (~12 ms per
+            // three minutes of audio, each); see below for the quantize that
+            // runs at once.
             Q::QuantizeClips(_) => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
@@ -10970,6 +10989,20 @@ impl DesktopApp {
         if matches!(req, Q::Save) && !self.has_plugin_state() {
             self.run_project_request(ctx, req);
             return;
+        }
+        // **A quantize whose attacks are already known is the same case.**
+        // The window is open while it is used, so its marks have analysed
+        // every file the Apply names, and what is left is a pick and a map
+        // per clip; the render goes to the crew. Under the cover every Apply
+        // stood for its 400 ms minimum and swallowed the clicks on the desk
+        // meanwhile, in a window whose whole shape is "select a clip, Apply,
+        // listen, select another". A file that still has to be analysed is
+        // a real wait, and keeps the cover.
+        if let Q::QuantizeClips(ask) = &req {
+            if attacks_known(&self.asked_files(ask), &self.track_cache, &self.attack_cache) {
+                self.run_project_request(ctx, req);
+                return;
+            }
         }
         self.announce(ctx, label, detail, Chore::Project(req));
     }
@@ -26712,6 +26745,52 @@ mod tests {
         cache.insert(p(20), 0);
         assert!(cache.contains_key(&p(0)), "a file the new ask names was thrown away");
         assert!(cache.len() <= 8, "the cache kept files no ask names past its cap: {}", cache.len());
+    }
+
+    /// **A quantize waits behind the busy cover only for a file it has to
+    /// analyse.** Every Apply was announced, and the cover stands for at
+    /// least 400 ms and swallows the desk's clicks meanwhile - for what,
+    /// with the window's marks up, is a pick and a map per clip. The cover
+    /// is for a real wait: a decoded file with no analysis yet, or only one
+    /// made from another decode of it. The rule is a function of the caches;
+    /// the road through it is `take_project_request`, scanned below because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_quantize_waits_behind_the_cover_only_for_a_file_it_must_analyse() {
+        let take = |rate: u32| {
+            Decoded::of(tangent_record::decode::Clip {
+                samples: (0..rate as usize * 2).map(|i| if i % 4000 < 40 { 0.8 } else { 0.0 }).collect(),
+                rate,
+                source: std::path::PathBuf::from("take.wav"),
+            })
+        };
+        let analysis = |d: &Decoded| Arc::new(crate::transient::analyse(&d.clip).expect("an analysis"));
+        let (a, b) = (std::path::PathBuf::from("a.wav"), std::path::PathBuf::from("b.wav"));
+        let mut decodes = std::collections::HashMap::new();
+        decodes.insert(a.clone(), take(8_000));
+        decodes.insert(b.clone(), take(8_000));
+        let mut analyses = std::collections::HashMap::new();
+        analyses.insert(a.clone(), analysis(&decodes[&a]));
+        let both = [a.clone(), b.clone()];
+        assert!(!attacks_known(&both, &decodes, &analyses), "a file still to analyse ran uncovered");
+        analyses.insert(b.clone(), analysis(&decodes[&b]));
+        assert!(attacks_known(&both, &decodes, &analyses), "a quantize with nothing to analyse was covered");
+        // A file with no decode is skipped by the quantize and costs nothing.
+        let gone = [a.clone(), std::path::PathBuf::from("gone.wav")];
+        assert!(attacks_known(&gone, &decodes, &analyses), "a file with no decode held the quantize back");
+        // An analysis of another decode of the file is not this decode's.
+        decodes.insert(b.clone(), take(16_000));
+        assert!(!attacks_known(&both, &decodes, &analyses), "another decode's analysis was taken as known");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn take_project_request(&mut self").expect("the request road");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let quick = body
+            .find("attacks_known(&self.asked_files(ask), &self.track_cache, &self.attack_cache)")
+            .expect("a quantize no longer asks whether its attacks are known");
+        let covered = body.find("self.announce(ctx, label, detail").expect("the cover");
+        assert!(quick < covered, "the quantize is announced before it is asked whether it must be");
     }
 
     /// **The LIVE path warps too, and carries a picture of what it warped.**
