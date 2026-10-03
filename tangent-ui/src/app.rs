@@ -40774,6 +40774,9 @@ impl TangentApp {
             }
             _ => None,
         };
+        // **The key the desk's window forwarded this frame**, so the stacked
+        // window cannot forward it a second time: see below.
+        let mut key_forwarded = None;
         if let Some(action) =
             {
                 // Read BEFORE the dialog is borrowed mutably.
@@ -40819,6 +40822,9 @@ impl TangentApp {
             if matches!(action, DialogAction::CycleTheme) {
                 ctx.request_repaint();
             }
+            if matches!(action, DialogAction::CycleTheme | DialogAction::Transport) {
+                key_forwarded = Some(std::mem::discriminant(&action));
+            }
             self.apply_dialog_action(action);
         }
         // **The pedal's window, over the amp's.**
@@ -40844,6 +40850,14 @@ impl TangentApp {
             // dropped a few lines down, once everything it had to say has
             // been said.
             self.pedal_stack = Some(st);
+            // **One key, one press, however many bars saw it.** Inline, both
+            // windows wear a chrome bar and both bars read the one keyboard,
+            // and once either window is drawn inline each claims the key as
+            // its own - so T with a pedal window over an amp cycled the theme
+            // twice, and Space queued two transport requests. On the desktop
+            // each window has its own keyboard and only the focused one can
+            // have seen the press, so dropping a repeat costs nothing there.
+            let action = action.filter(|a| key_forwarded != Some(std::mem::discriminant(a)));
             if let Some(action) = action {
                 if matches!(action, DialogAction::CycleTheme) {
                     ctx.request_repaint();
@@ -63723,6 +63737,66 @@ mod tests {").expect("the tests module")];
                 "{label}: the theme key closed the face"
             );
         }
+    }
+
+    /// **One key with a pedal window over the amp acts ONCE.**
+    ///
+    /// Inline - a plugin, or the desktop with child windows off - both
+    /// windows wear a chrome bar, both bars read the one keyboard, and each
+    /// window's key belongs to it once either window is drawn inline. So T
+    /// with a pedal window standing on an amp face cycled the theme twice
+    /// (it skipped a theme), and Space queued two transport requests, a
+    /// Play and then another. The face alone was always right, and that is
+    /// all the theme and transport tests beside this one open.
+    #[test]
+    fn one_key_with_a_pedal_window_over_the_amp_acts_once() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(app.pedal_stack.is_some(), "fixture: no pedal window over the amp");
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let all = crate::theme::factory();
+        let from = all
+            .iter()
+            .position(|t| t.name == app.settings.theme_name)
+            .expect("the shipped theme is in the factory list");
+        let _ = frame_words(
+            &ctx,
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![key(egui::Key::T, true), key(egui::Key::T, false)],
+        );
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
+        assert_eq!(
+            app.settings.theme_name,
+            all[(from + 1) % all.len()].name,
+            "one T with two inline windows up did not cycle the theme exactly once"
+        );
+
+        // **And Space**, which the band has to be shown for.
+        app.settings.show_recorder = true;
+        while app.take_recorder_request().is_some() {}
+        let _ = frame_words(
+            &ctx,
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![key(egui::Key::Space, true), key(egui::Key::Space, false)],
+        );
+        let first = app.take_recorder_request();
+        assert!(
+            matches!(first, Some(recorder::RecorderRequest::Play)),
+            "Space with two inline windows up answered with {first:?}"
+        );
+        assert!(
+            app.take_recorder_request().is_none(),
+            "one Space with two inline windows up queued a second transport request"
+        );
+        assert!(app.pedal_stack.is_some(), "the keys took the pedal window down");
     }
 
     /// **Space inside a plugin window rolls the transport ONCE.**
