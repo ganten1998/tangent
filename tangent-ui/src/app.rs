@@ -30565,6 +30565,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .or_else(|| self.settings.audio_system().map(str::to_owned)),
             outputs,
             output: self.settings.audio_output_device.clone(),
+            outputs_stale: false,
             rates,
             exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
             // The DEVICE's width, not the open stream's: a stream with one
@@ -34937,14 +34938,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.save_settings();
             }
             DialogAction::SetAudioSystem(name) => {
-                self.settings.audio_system = name.unwrap_or_default();
-                // **The output belongs to the system that offered it.**
-                // Every name in that list came from the old backend, and an
-                // ASIO driver name means nothing to WASAPI - carrying it
-                // across would ask for a device that cannot exist and land
-                // on the default anyway, with the panel still naming the
-                // one it could not open.
-                self.settings.audio_output_device = None;
+                let name = name.unwrap_or_default();
+                // **Only a system that really CHANGES forgets the output.**
+                // During a fallback the panel marks the stand-in that is
+                // running, so the chosen system's own chip is unlit and
+                // pressable - and pressing it to get back wiped the output
+                // chosen for it, so the reopen landed on the first driver
+                // instead of the interface.
+                let changed = name.trim() != self.settings.audio_system().unwrap_or("");
+                self.settings.audio_system = name;
+                if changed {
+                    // **The output belongs to the system that offered it.**
+                    // Every name in that list came from the old backend, and
+                    // an ASIO driver name means nothing to WASAPI - carrying
+                    // it across would ask for a device that cannot exist and
+                    // land on the default anyway, with the panel still naming
+                    // the one it could not open.
+                    self.settings.audio_output_device = None;
+                    // **And an open panel lets go of the old list too**, or
+                    // its next press saves one of the old system's names
+                    // against the new system. Not asked again here: the host
+                    // switches a frame later, so `outputs()` would still
+                    // answer for the old one. See `outputs_stale`.
+                    if let Some(Dialog::AudioSetup { outputs, output, outputs_stale, .. }) =
+                        self.dialog.as_mut()
+                    {
+                        outputs.clear();
+                        *output = None;
+                        *outputs_stale = true;
+                    }
+                }
                 self.save_settings();
             }
             // **Written and nothing else**, the `SetAudioSystem` shape: the
@@ -41894,6 +41917,78 @@ mod tests {
         // file leaves behind, and it must read as "the system's own".
         app.settings.audio_output_device = Some("   ".to_owned());
         assert_eq!(app.audio_output_device(), None, "whitespace was taken for a device");
+    }
+
+    /// **Pressing the system already chosen keeps its output.** During an
+    /// ASIO fallback the panel marks the stand-in that is running, so the
+    /// ASIO chip is unlit and pressable - and pressing it to get back wiped
+    /// the interface chosen for ASIO, so the reopen landed on whichever
+    /// driver came first. Only a real change of system forgets the output.
+    #[test]
+    fn re_choosing_the_chosen_system_keeps_its_output() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_system = "ASIO".to_owned();
+        app.settings.audio_output_device = Some("Komplete Audio 6 MK2".to_owned());
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        assert_eq!(app.audio_output_device().as_deref(), Some("Komplete Audio 6 MK2"));
+    }
+
+    /// **A SYSTEM press in an open Setup lets go of the old list.** The
+    /// panel's OUTPUT row is taken when it opens, so after a switch from
+    /// WASAPI to ASIO it went on offering - and lighting - WASAPI endpoints,
+    /// and the next press saved a WASAPI name as the ASIO output, which ASIO
+    /// cannot open.
+    #[test]
+    fn a_system_press_in_an_open_setup_lets_go_of_the_lit_output() {
+        struct Wasapi;
+        impl crate::ports::AudioSetup for Wasapi {
+            fn systems(&self) -> Vec<String> {
+                vec!["ASIO".to_owned(), "WASAPI".to_owned()]
+            }
+            fn active_system(&self) -> Option<String> {
+                Some("WASAPI".to_owned())
+            }
+            fn outputs(&self) -> Vec<String> {
+                vec!["Speakers (Komplete Audio 6 MK2)".to_owned()]
+            }
+            fn rates(&self) -> Vec<u32> {
+                Vec::new()
+            }
+            fn input_channels(&self) -> u16 {
+                0
+            }
+            fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+                Vec::new()
+            }
+            fn set_exposed(&mut self, _: Vec<(u16, Option<u16>)>) -> Vec<String> {
+                Vec::new()
+            }
+            fn output_path(&self, _: Option<&str>) -> crate::ports::OutputPath {
+                crate::ports::OutputPath::default()
+            }
+        }
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_system = "WASAPI".to_owned();
+        app.settings.audio_output_device = Some("Speakers (Komplete Audio 6 MK2)".to_owned());
+        app.set_audio_setup(Some(Box::new(Wasapi)));
+        app.open_audio_setup();
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        assert_eq!(app.audio_output_device(), None, "the system change kept the output");
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { output, outputs, outputs_stale, .. }) => {
+                assert_eq!(
+                    output.as_deref(),
+                    None,
+                    "the open panel still lights a WASAPI endpoint the switch to ASIO forgot"
+                );
+                assert!(
+                    outputs.is_empty(),
+                    "the open panel still offers WASAPI endpoints under ASIO: {outputs:?}"
+                );
+                assert!(*outputs_stale, "the row does not say its list belongs to the old system");
+            }
+            _ => panic!("Setup closed"),
+        }
     }
 
     /// **Q on a TRACK selects that track's clips.**
