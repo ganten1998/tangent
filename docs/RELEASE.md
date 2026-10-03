@@ -352,27 +352,34 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 
 ## Builds for testers: `scripts/publish-dropbox.sh`
 
-Between releases every build is `X.Y.Z-dev`, and `release.sh` refuses to
-touch one, so `publish-dropbox.sh` runs the release's artifact checks
-itself before it copies anything (`scripts/check-artifacts.sh`, above:
-signatures on every Windows PE, the ASIO notice, the payload lists). A
-build that fails one is not published; `SKIP_CHECKS=1` publishes it
-anyway, on purpose. `publish-dropbox.sh
-[windows|macos|linux …]` copies the current version's artifacts from
-`dist/` to `<Dropbox>/Tangent Development/builds/<HEAD>[-dirty]/`, installer
-first, and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/`
-is skipped with a line that names it, so the default run (all three)
-publishes whatever was built. What it does not know:
+`publish-dropbox.sh [windows|macos|linux …]` copies this version's
+artifacts from `dist/` to
+`<Dropbox>/Tangent Development/builds/<commit>[-dirty]/`, installer first,
+and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/` is
+skipped with a line that names it, so the default run (all three)
+publishes whatever was built. `release.sh` refuses to touch a `-dev`
+version, so before it copies anything this does two of its jobs itself:
 
-- **Which commit built the files.** The folder is named after the commit
-  checked out, and `-dirty` after the tracked files, WHEN YOU PUBLISH;
-  every `-dev` build has the same file names. Rebuild immediately before
-  publishing.
-- **What is left over.** Everything in `dist/` with this version's name
-  goes: an `ARCH=host` `macos-arm64` pair survives a later universal build,
-  and a failed Linux leg leaves the previous run's tarballs. (A failed
-  installer build leaves no setup.exe at all: `build-installer.sh` removes
-  the old one before it starts.)
+- **It takes only what this tree built, and names the folder after it.**
+  Every `-dev` build has the same file names, so `build-macos.sh`,
+  `build-cross.sh` and `build-linux-remote.sh` stamp each artifact they
+  finish with the git tree it was built from (`scripts/build-stamp.sh`; the
+  stamps live in `dist/.stamps/`). A file built from HEAD's tree goes out as
+  `<HEAD>`, even if you have started editing since; one built from the
+  uncommitted state you have now goes out as `<HEAD>-dirty`; a build you
+  commit afterwards, with exactly what was built, goes out as that commit.
+  Anything else is skipped with a line that says why: an `ARCH=host`
+  `macos-arm64` pair from an earlier build, the previous run's tarball
+  after a failed Linux leg, a file copied in by hand (it has no stamp).
+  Files built from HEAD and files built from uncommitted work never share a
+  folder: publish one platform at a time, or rebuild.
+- **It runs the release's artifact checks** (`scripts/check-artifacts.sh`,
+  above: signatures on every Windows PE, the ASIO notice and host, the
+  payload lists). A build that fails one is not published; `SKIP_CHECKS=1`
+  publishes it anyway, on purpose.
+
+A failed installer build leaves no setup.exe at all: `build-installer.sh`
+removes the old one before it starts.
 
 ## Store links: check them, then act in order
 

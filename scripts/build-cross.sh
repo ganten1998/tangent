@@ -250,6 +250,19 @@ mkdir -p dist
 # Windows icon must exist BEFORE cargo builds so build.rs embeds it.
 gen_ico
 
+# **The build stamp**: the tree this run builds from, taken once the icon is
+# regenerated and before anything compiles, and recorded beside each
+# artifact as it is finished (scripts/build-stamp.sh). It is how
+# publish-dropbox.sh tells this run's files from an earlier run's under the
+# same names - a failed leg keeps the previous tarball, by design.
+BUILD_TREE="$(scripts/build-stamp.sh tree 2>/dev/null || true)"
+[ -n "$BUILD_TREE" ] \
+  || echo "NOTE: no git tree to stamp with; publish-dropbox.sh will not take these artifacts" >&2
+build_stamp() {
+  [ -z "$BUILD_TREE" ] || scripts/build-stamp.sh write "$BUILD_TREE" "$@" \
+    || echo "warning: could not stamp $*; publish-dropbox.sh will not take it" >&2
+}
+
 # Authenticode signing lives in scripts/sign-windows.sh (jsign to Azure
 # Artifact Signing; unconfigured ships unsigned and says so, partially
 # configured is a hard failure). It moved out of this file the day the NSIS
@@ -459,6 +472,7 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
     rm -rf "$stage" "${stage}.tar.gz.new"; return 1;
   }
   rm -rf "$stage"
+  build_stamp "${stage}.tar.gz"
   echo "==> ${stage}.tar.gz"
 }
 
@@ -558,6 +572,7 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # the two downloads' programs byte for byte.
 (cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
+build_stamp "$WINZIP"
 echo "==> $WINZIP"
 if command -v makensis >/dev/null 2>&1; then
   scripts/build-installer.sh windows
@@ -570,6 +585,8 @@ if command -v makensis >/dev/null 2>&1; then
   # publish-dropbox.sh for testers) refuse an unsigned setup.exe, or an
   # unsigned PE inside it or the zip.
   scripts/sign-windows.sh "dist/Tangent-${VERSION}-windows-setup.exe"
+  # Stamped once signed: the signature changes the bytes the stamp records.
+  build_stamp "dist/Tangent-${VERSION}-windows-setup.exe"
   echo "==> dist/Tangent-${VERSION}-windows-setup.exe"
 else
   # No installer toolchain: the zip alone is a real deliverable, but the

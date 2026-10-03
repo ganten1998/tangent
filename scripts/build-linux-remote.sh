@@ -105,6 +105,10 @@ EOF
 fi
 
 # ── Copy the tree ────────────────────────────────────────────────────────────
+# The tree being copied is the tree being built: its build stamp
+# (scripts/build-stamp.sh) is taken here and written beside the tarball once
+# it comes back, for publish-dropbox.sh. The remote copy has no .git to ask.
+BUILD_TREE="$(scripts/build-stamp.sh tree 2>/dev/null || true)"
 echo "==> Syncing source"
 ssh_ "$HOST" "mkdir -p $REMOTE_DIR"
 # No trailing slashes on target/dist. `target/` matches a DIRECTORY only, and
@@ -171,6 +175,10 @@ for want in '/install.sh$' '/tangent-ffmpeg$' 'ffmpeg-licenses/'; do
     exit 1
   fi
 done
+
+if [ -n "$BUILD_TREE" ]; then
+  scripts/build-stamp.sh write "$BUILD_TREE" "$TARBALL" || echo "warning: could not stamp $TARBALL" >&2
+fi
 
 echo "==> OK  $TARBALL"
 ls -lh "$TARBALL" | sed 's/^/    /'
