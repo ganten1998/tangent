@@ -277,7 +277,8 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
 ///   tail is carried at its own length, moved with the last anchor (see
 ///   [`carry_tail`]), so under every fit it comes out as recorded.
 /// - The anchors and `clip` are in the SAME frame rate. A map is frames at
-///   the rate it was made at, and nothing here rescales it.
+///   the rate it was made at, and nothing here rescales it: the host hands
+///   over a clip's map already rescaled to the decode (`warp_anchors`).
 pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     let frames = clip.frames();
     if frames == 0 || anchors.is_empty() {
