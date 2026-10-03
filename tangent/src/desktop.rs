@@ -26065,10 +26065,13 @@ mod tests {
     /// because `DesktopApp` cannot be built in a test (see
     /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
     /// for the precedent). What this stops is the gate being quietly dropped
-    /// back to a bare `input_monitor()`.
+    /// back to a bare `input_monitor()`. Production only: both lines are
+    /// spelled in this test too, so a scan of the whole file found them here
+    /// and passed whatever the push did.
     #[test]
     fn the_per_frame_monitor_push_is_gated_on_the_racks() {
-        let src = include_str!("desktop.rs");
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         assert!(
             src.contains("e.set_monitor_on(self.app.input_monitor() && racks_ready);"),
             "the per-frame monitor push is no longer gated on the racks"
