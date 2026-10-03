@@ -60,12 +60,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a drum kit had been built in it. Such a folder is now kept, as one
   holding a recording is.
 
-- **A template keeps its own audio.** A template saved from a project with
-  audio clips or frozen tracks lost those files the next time it was saved
-  from a new session, and a session made from it left them behind once it
-  was saved or written to disk. They now come along. Not yet heard before
-  then: in a fresh session such a clip stays silent until something in
-  that session is written to disk.
+- **A new session plays its template's own audio.** A template's audio
+  clips and frozen tracks were silent in every session started from it,
+  drawn with no waveform and missing from an export, until the session was
+  saved under a name. A template saved from such a session lost those files,
+  and a session made from it left them behind once it was saved or written
+  to disk. They play from the start now, and they come along whenever the
+  session or the template is written. Save Kit and Duplicate in a new
+  session take the template's samples and audio with them too, and undoing
+  the deletion of a template clip brings its audio back.
 
 - **Undoing a track move puts its plugins back with their settings.**
   Undoing a drag, Insert Track, Paste Track or a grouping into a folder
@@ -134,6 +137,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   playing and gluing the previous one while an export used the new one, and
   changing a quantized clip's stretch algorithm kept the old one.
 
+- **A take quantized again after its project was reopened keeps its new
+  fit.** A take saved with the Slice or Stretch fit, reopened and quantized
+  again with Auto, played Auto until it was saved, and then reopened with
+  the old fit.
+
 - **A quantized bass, guitar or vocal stays in tune.** Small corrections
   were resampled, bending each corrected note's pitch by up to a third of a
   semitone; the stretch algorithm is now chosen once for the whole take and
@@ -169,6 +177,20 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **In 3/4, 6/8 and 7/8, the arrangement's snap lands on the grid lines it
   draws,** and the arrow keys no longer skip lines. 4/4 is unchanged.
 
+- **The MIDI editor's grid follows the song's tempo and meter changes.**
+  Its lines, its snap, step entry and the arrow keys were spaced by the
+  tempo dial and the time signature, so after a tempo or meter change they
+  no longer matched the arrangement's bars or the click. They follow the
+  song's tempo and meter now, and so does a quantize, in the MIDI editor
+  and on audio.
+
+- **With triplets or swing, every bar line is a grid line.** Triplets and
+  swung pairs were counted from the start of the song, so in a bar holding
+  an odd number of them (quarter-note triplets in 3/4, swung eighths in
+  7/8) every other downbeat fell between two lines and a note played on it
+  was quantized off the beat. Each run now starts again at the bar line,
+  in the quantize and in the MIDI editor.
+
 - **Step entry in the MIDI editor works at every tempo with the magnet
   on.** At most tempos, repeated Enter stacked notes on one grid line and
   the right arrow could get stuck on the line it stood on. Enter and both
@@ -191,15 +213,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **A chosen output that is missing plays through the system's own.** With
   an output chosen in Setup that was unplugged or would not open, every
   system but ASIO stayed silent and reopened the audio path every few
-  seconds. Tangent now uses the system's own output for the session and
-  says so once; your choice is kept and tried again when the band is
+  seconds. Tangent now plays through the system's own output and says so
+  once. Your choice is kept, and on macOS and Windows it is tried again the
+  moment it is plugged back in; on Linux and FreeBSD, when the band is
   reopened.
 
 - **Plugging the interface back in during an ASIO fallback brings ASIO
   back.** The stand-in was still running when the reopen came, so the input
   failed and ASIO only returned after the band was closed and reopened. A
   plugin dialled in while the stand-in played comes back on the interface
-  as it was left.
+  as it was left. A plug during a take or an arrangement record no longer
+  stops its monitoring and its instrument: the switch waits until the
+  record is over.
 
 - **Choosing an audio system in Setup is safer.** Pressing the system that
   is already chosen, as you might during an ASIO fallback to get back to
@@ -374,12 +399,6 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   inside it), unless the clips already selected are all on tracks you
   picked.
 
-  **Not yet right everywhere.** In a song whose tempo or meter changes,
-  the grid is one tempo and one meter counted from 0:00, so after the first
-  change it misses the lines the arrangement draws. And an audio quantize
-  is tied to the sample rate it was made at: exported at another rate, or
-  opened on a device running at another, it is applied to the wrong audio.
-
 - **Audio clips glue.** Cmd/Ctrl+G welds audio clips the way it has always
   welded MIDI ones: two or more on one track, or one that repeats, become
   one clip. They are rendered exactly as they play (trim, loops, fades,
@@ -443,11 +462,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   and nothing in the app could say otherwise. The output belongs to the
   computer, not the song, so projects do not carry it; changing the audio
   system forgets it, since a device name from one system means nothing to
-  another, and so does resetting Devices and Folders.
+  another, and so does resetting Devices and Folders. Under ASIO the row
+  reads Windows' list of installed drivers without loading any, so it is
+  complete even while one is playing; a driver whose hardware is not
+  plugged in is listed too, and choosing it plays through the system's own
+  audio and says so.
 
-  **Not yet right under ASIO.** While a driver is running, the row lists
-  only that driver, so the interface still cannot be picked from it, and
-  "the system's own" there is still the first driver in the list.
+  **Not yet right under ASIO.** "The system's own" there is still the
+  first driver in Windows' list that answers, which can be a wrapper such
+  as ASIO4ALL; choose the interface by name.
 
 - **A count-in being recorded into the take shows its beat in red** on the
   band's display.
