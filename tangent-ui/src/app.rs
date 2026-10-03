@@ -1085,8 +1085,17 @@ pub struct TangentApp {
     mixer_reorder: Option<(usize, Pos2, bool)>,
     /// A track reorder's permutation, waiting for the HOST to move the
     /// plugin-state sidecars and reload the racks: `order[new] = old`,
-    /// channel space. Taken once.
+    /// channel space. Taken once. Undo and redo of a reorder send one too,
+    /// its inverse and the order again (see `undo_apply`), and all three go
+    /// through `send_desk_perm`, which composes onto one the host has not
+    /// taken yet rather than overwriting it.
     desk_state_perm: Option<Vec<usize>>,
+    /// **The reorders since the standing moment**, composed into one
+    /// `order[new] = old`, waiting for the commit that keeps them in
+    /// `Moment::perm`. Survives a `begin_one_moment` batch, so Insert
+    /// Track's shift and the track that lands in the gap are one moment
+    /// carrying one permutation.
+    perm_since_moment: Option<Vec<usize>>,
     /// The marquee'd SET of clips, beside the single selection — the
     /// right-drag band fills it, Delete empties it with the clips.
     arr_multi: Vec<u64>,
@@ -2417,6 +2426,18 @@ struct Moment {
     /// The same walk as one `u64` — `project_dirty`'s number, from the
     /// SAME pass as the words so the two cannot describe different moments.
     mark: u64,
+    /// **The lane permutation that carried the desk INTO this moment** from
+    /// the one before it - `order[new] = old`, channel space - when the
+    /// gesture that made it reordered tracks, composed when it reordered
+    /// more than once.
+    ///
+    /// The words cannot say it. They name each bay's BUNDLE, and the plugin
+    /// playing in it, settings and all, is the host's: undoing a reorder put
+    /// every name back and handed the host nothing to carry, so each moved
+    /// bay was rebuilt from a sidecar written for another row. `undo_apply`
+    /// sends the host this order's inverse on the way back and the order
+    /// itself on the way forward, through the door a reorder uses.
+    perm: Option<std::sync::Arc<Vec<usize>>>,
 }
 
 impl Moment {
@@ -2425,6 +2446,37 @@ impl Moment {
     fn same_text(&self, other: &Self) -> bool {
         self.words == other.words
     }
+}
+
+/// **`first`, then `then`, as ONE permutation**, every order in the
+/// `order[new] = old` form.
+///
+/// The rows `then` reads are the rows `first` left, so new row `n` holds what
+/// `first` put at `then[n]`: old row `first[then[n]]`. Two channel orders
+/// compose in channel space. Anything else - the drumpad's pad-FX swap is a
+/// SEAT order - is lifted onto the whole seat space first, where both mean
+/// the same thing: `recorder::seat_order` is idempotent on an order it has
+/// already lifted.
+fn compose_orders(first: &[usize], then: &[usize]) -> Vec<usize> {
+    let (first, then) = if first.len() == then.len() {
+        (first.to_vec(), then.to_vec())
+    } else {
+        (recorder::seat_order(first), recorder::seat_order(then))
+    };
+    then.iter()
+        .map(|&mid| first.get(mid).copied().unwrap_or(mid))
+        .collect()
+}
+
+/// **The order that puts `order` back**: row `order[new]` returns from `new`.
+fn invert_order(order: &[usize]) -> Vec<usize> {
+    let mut back: Vec<usize> = (0..order.len()).collect();
+    for (new, &old) in order.iter().enumerate() {
+        if let Some(slot) = back.get_mut(old) {
+            *slot = new;
+        }
+    }
+    back
 }
 
 /// **What "saved" means**: the words of the moment that was written, and
@@ -4055,6 +4107,7 @@ impl TangentApp {
             media_sel: None,
             mixer_reorder: None,
             desk_state_perm: None,
+            perm_since_moment: None,
             arr_multi: Vec::new(),
             arr_sel_seen: (None, Vec::new()),
             arr_band: None,
@@ -11392,11 +11445,24 @@ impl TangentApp {
             || (self.settings.tracks_added >> n) & 1 == 1
     }
 
-    /// The host's cue that a reorder moved the channels: `order[new] = old`.
-    /// The host saves live plugin states, renames the sidecars to follow,
-    /// and reloads the racks.
+    /// The host's cue that the channels moved - a reorder, or the undo or
+    /// redo of one: `order[new] = old`. The host saves live plugin states,
+    /// carries the plugins and renames the sidecars to follow, and reloads
+    /// only what it could not carry.
     pub fn take_desk_state_perm(&mut self) -> Option<Vec<usize>> {
         self.desk_state_perm.take()
+    }
+
+    /// **Hand the host a permutation, composed onto one it has not taken
+    /// yet.** The host takes one a frame; a reorder and an undo in the same
+    /// frame, or two Ctrl+Z in one slow frame, each move the desk, and the
+    /// plugins have to be carried by both. A plain assignment kept the
+    /// second and the host carried by half of what happened.
+    fn send_desk_perm(&mut self, order: &[usize]) {
+        self.desk_state_perm = Some(match self.desk_state_perm.take() {
+            Some(first) => compose_orders(&first, order),
+            None => order.to_vec(),
+        });
     }
 
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
@@ -11789,7 +11855,14 @@ impl TangentApp {
             .insert_bypass
             .remap_seats(&recorder::seat_order(order));
 
-        self.desk_state_perm = Some(order.to_vec());
+        // **And the moment this gesture leaves keeps the order**, so undo
+        // can hand the host the way back - see `Moment::perm`. Composed, for
+        // a batch that reorders twice before it commits.
+        self.send_desk_perm(order);
+        self.perm_since_moment = Some(match self.perm_since_moment.take() {
+            Some(first) => compose_orders(&first, order),
+            None => order.to_vec(),
+        });
         self.save_settings();
         self.arr_save_edits();
     }
@@ -16025,6 +16098,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
             words: std::sync::Arc::new(words),
             mark,
+            // Attached where a moment is KEPT - see `undo_commit_moment`.
+            perm: None,
         }
     }
 
@@ -16146,14 +16221,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `undo_commit` with the moment already built — so `undo_reset`, which
     /// needs the same moment as its saved baseline AND as moment zero, walks
     /// the document once rather than twice.
-    fn undo_commit_moment(&mut self, state: Moment) {
+    fn undo_commit_moment(&mut self, mut state: Moment) {
         if self
             .history
             .get(self.hist_at)
             .is_some_and(|top| top.same_text(&state))
         {
+            // Nothing kept, so nothing to carry: a reorder that changed no
+            // word (two empty lanes trading places) must not ride into the
+            // NEXT gesture's moment and be undone with it.
+            self.perm_since_moment = None;
             return;
         }
+        // The reorders this gesture made ride in the moment they made.
+        state.perm = self.perm_since_moment.take().map(std::sync::Arc::new);
         self.history.truncate(self.hist_at.saturating_add(1));
         self.history.push(state);
         // New work since "Don't Save": nobody has been asked about THIS.
@@ -16178,6 +16259,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.saved_state = Some(SavedPoint::of(&state));
         self.history.clear();
         self.hist_at = 0;
+        // Moment zero has no moment before it to have been carried from.
+        self.perm_since_moment = None;
         self.undo_commit_moment(state);
     }
 
@@ -16186,7 +16269,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(moment) = self.history.get(at).cloned() else {
             return;
         };
+        let from = self.hist_at;
         self.hist_at = at;
+        // **The lanes the moments crossed, for the host to carry the plugins
+        // by.** Back across a reorder is its inverse, newest first; forward
+        // is the reorder again. The words put every bundle NAME back on its
+        // row, but the plugins, their settings and their sidecars are the
+        // host's, and with no permutation it rebuilt each moved bay from a
+        // file written for another row - see `Moment::perm`.
+        let perm_of = |k: usize| {
+            self.history.get(k).and_then(|m| m.perm.as_deref()).map(Vec::as_slice)
+        };
+        let steps: Vec<Vec<usize>> = if at < from {
+            (at + 1..=from).rev().filter_map(perm_of).map(invert_order).collect()
+        } else {
+            (from + 1..=at).filter_map(perm_of).map(<[usize]>::to_vec).collect()
+        };
+        let carry = steps.into_iter().reduce(|first, then| compose_orders(&first, &then));
+        if let Some(order) = carry {
+            self.send_desk_perm(&order);
+        }
         // The document moves, so an earlier "Don't Save" no longer covers it.
         self.outgoing_discarded = false;
         // **The kits first**, so the reload below this frame sees them: the
@@ -48671,6 +48773,44 @@ mod tests {
         want.splice(1..4, [2, 3, 1]);
         assert_eq!(perm, want);
         assert!(app.take_desk_state_perm().is_none(), "taken twice");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Undo and redo of a reorder hand the host the permutation**, so it
+    /// carries the plugins and their sidecars back exactly as the reorder
+    /// carried them forward.
+    ///
+    /// A moment names each bay's BUNDLE and nothing about the plugin playing
+    /// in it. Undoing Insert Track put every name back and told the host
+    /// nothing, so each moved bay was rebuilt from a sidecar written for
+    /// another row: every plugin on the shifted tracks came back at factory,
+    /// or with a neighbour's settings where both carried the same plugin.
+    /// The insert shifts three rows - a cycle, not a swap, which is the case
+    /// an adjacent swap's undo only got right by accident.
+    #[test]
+    fn undo_and_redo_of_a_reorder_hand_the_host_the_permutation() {
+        let root = project_scratch("permundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        for (n, p) in [(2usize, "/x/A.vst3"), (3, "/x/B.vst3"), (4, "/x/C.vst3")] {
+            app.add_bare_track(n);
+            app.set_insert(n, 0, Some(p));
+        }
+        app.commit_view_change();
+        // Insert Track under row 1: rows 2..4 shift down a row - a cycle, not a swap.
+        assert!(app.insert_track_below(1), "fixture: no free lane below row 1");
+        let forward = app.take_desk_state_perm().expect("the insert told the host nothing");
+        assert_eq!(app.insert(3, 0), Some("/x/A.vst3"), "fixture: the rows did not shift");
+        app.undo();
+        assert_eq!(app.insert(2, 0), Some("/x/A.vst3"), "fixture: undo did not put the rows back");
+        let back = app.take_desk_state_perm().expect(
+            "undo put the bundle NAMES back and told the host nothing, so every moved bay \
+             reloads from a sidecar written for another row");
+        for (new, &old) in forward.iter().enumerate() {
+            assert_eq!(back[old], new, "undo's permutation is not the insert's inverse");
+        }
+        app.redo();
+        assert_eq!(app.take_desk_state_perm(), Some(forward), "redo of the insert told the host nothing");
         let _ = std::fs::remove_dir_all(&root);
     }
 
