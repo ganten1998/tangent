@@ -44,10 +44,12 @@ counted. Do not rewrite history to tidy burnt numbers away.
    measurement rather than a gate; run it only when the learning re-ranker
    changed.
 
-   This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (exactly
-   the three commands above plus the clippy lint policy) and refuses to cut
-   a release on any failure. The checklist entry remains so a human knows
-   what the refusal means.
+   This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (the
+   three commands above, a compile of the Minimal build with
+   `cargo check -p tangent --no-default-features`, the clippy lint policy,
+   and the check that three scripts spell the FreeBSD version alike) and
+   refuses to cut a release on any failure. The checklist entry remains so
+   a human knows what the refusal means.
 
 2. **THIRD-PARTY-LICENSES current.** Regenerate after any dependency change:
    `scripts/gen-third-party-licenses.sh`. This gate has been skipped before

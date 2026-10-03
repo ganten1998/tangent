@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The release gate: every command docs/RELEASE.md gate 1 names, plus the lint
-# policy under the clippy driver, stopping at the first failure so release.sh
-# can refuse on a single exit code.
+# The release gate: every command docs/RELEASE.md gate 1 names, plus the
+# Minimal build and the lint policy under the clippy driver, stopping at the
+# first failure so release.sh can refuse on a single exit code.
 #
 # Three test suites, not one, because `cargo test --workspace` alone misses two
 # things (docs/RELEASE.md gate 1):
@@ -62,6 +62,25 @@ cargo test -p tangent-core
 
 echo "==> cargo test -p tangent-core --test differential -- --ignored  (full 13,133-row sweep)"
 cargo test -p tangent-core --test differential -- --ignored
+
+echo "==> cargo check -p tangent --no-default-features  (the Minimal build)"
+# **The Minimal build is part of the gate.** `tangent` with no features is the
+# chord display alone, the fallback for a platform that cannot carry the rest.
+# Its check lived only in check-firewall.sh, which nothing ran, and it failed
+# at every commit from 2026-09-16 until it moved here: six separate breakages,
+# two of them a gate and doc comment carried off their item by an insertion,
+# four of them recorder-only code added without the gate its neighbours carry.
+# A cfg that is wrong in Minimal is invisible in every build that has
+# `recorder`, which is every other build of `tangent` in this file.
+#
+# A compile check and nothing more. Whatever only the recorder calls is dead
+# code without it, so this build warns by the hundred; the warnings are dropped
+# on the way past, and the whole output is shown only when it fails.
+if ! cargo check -q -p tangent --no-default-features 2>/dev/null; then
+  cargo check -p tangent --no-default-features || true
+  echo "the Minimal build (no features) does not compile" >&2
+  exit 1
+fi
 
 echo "==> cargo clippy  (the Cargo.toml lint policy only — no broad groups)"
 # **Our five packages by name, not --workspace.**
