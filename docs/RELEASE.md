@@ -141,12 +141,16 @@ supplied directly as `TRUSTED_SIGNING_TOKEN`; set it around the signing
 only, since an exported variable reaches every child of the build. Either
 way `sign-windows.sh` hands the token to jsign through jsign's environment
 (`--storepass env:…`), never on its command line, where any process on the
-machine could read it for as long as a signing runs. `release.sh` then checks the
-signature of `setup.exe`, of every PE inside it (extracted with 7-Zip:
-`tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe` and the two NSIS
-plug-ins, and any other `.exe` or `.dll` it lists) and of each PE in the
-portable zip (`scripts/pe-signed.py`), and a Windows release runs RED until
-the Azure account exists, on purpose.
+machine could read it for as long as a signing runs.
+
+`release.sh` then checks the signature of `setup.exe`, of every PE inside
+it (extracted with 7-Zip: `tangent.exe`, `tangent-ffmpeg.exe`,
+`Uninstall.exe` and the two NSIS plug-ins, and any other `.exe` or `.dll`
+it lists) and of each PE in the portable zip (`scripts/pe-signed.py`), and
+fails the release on any that is unsigned; `publish-dropbox.sh` refuses a
+tester build the same way. The Azure account has signed since 2026-09-24,
+so an unsigned PE now means a machine without the three variables (the
+build said so, once per PE), not an account still to be set up.
 
 Account setup, from zero, is `docs/WINDOWS-SIGNING.md` - the one-time Azure
 walkthrough (an individual's identity check takes minutes; an
@@ -228,9 +232,10 @@ Details that matter and are easy to lose:
 
 - **A leg that fails lets the others run, then fails the run.** A Linux
   failure here is a real one (the glibc floor refusing a binary, a file
-  the readme promises missing, a sysroot that would not download), and the
-  previous run's tarball is kept when its leg fails, so `release.sh` names
-  every missing piece of the Mac's set and goes red.
+  the readme promises missing, a sysroot that would not download). The
+  previous run's tarball is kept when its leg fails, so the exit status is
+  what tells: `release.sh` goes red on it, and on any piece of the Mac's
+  set that is missing.
 - **The Linux and Windows legs build without `mp3`.** LAME's autotools build
   compiles and runs test programs, which a macOS host cannot do for a foreign
   target. Nothing is lost: MP3 delivery goes through the bundled ffmpeg
@@ -241,11 +246,12 @@ Details that matter and are easy to lose:
   before the Linux legs spend their time; `ALLOW_WASAPI_ONLY=1` builds a
   WASAPI-only Windows build on purpose, and the artifact checks then keep it
   from shipping, to a release or to testers, on the missing
-  `ASIO-NOTICE.txt` and ASIO host. Unpack the SDK into `vendor/` before any Windows
-  build. The notice is written when the build's features include `asio`,
-  and the checks also read the ASIO host off `tangent.exe` itself, so a
-  WASAPI-only build cannot pass on a notice (it once could: the notice was
-  keyed on `CPAL_ASIO_DIR`, cpal's own variable, which a shell can export).
+  `ASIO-NOTICE.txt` and ASIO host. Unpack the SDK into `vendor/` before any
+  Windows build. The notice is written when the build's features include
+  `asio`, and the checks also read the ASIO host off `tangent.exe` itself,
+  so a WASAPI-only build cannot pass on a notice (it once could: the notice
+  was keyed on `CPAL_ASIO_DIR`, cpal's own variable, which a shell can
+  export).
 - **`scripts/build-cross.sh check-linux`** type-checks the Linux target from
   macOS with a stub `alsa.pc`, so Linux-only code is checked before pushing
   rather than discovered broken on the Linux box.
@@ -352,10 +358,11 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    file that does not cover every artifact, or that names a file it would
    not upload, and a stable release with no asset for one of the permanent
    links `README.md`, `docs/STORE-CONTENT.md` or the supporter email hands
-   out (`scripts/check-store-links.sh --names` lists them). A version with a pre-release suffix is
-   published as a GitHub pre-release, deliberately: `latest/download`
-   resolves against the latest stable, so a correctly marked beta leaves the
-   permanent links alone. Release notes must include the SmartScreen note.
+   out (`scripts/check-store-links.sh --names` lists them). A version with a
+   pre-release suffix is published as a GitHub pre-release, deliberately:
+   `latest/download` resolves against the latest stable, so a correctly
+   marked beta leaves the permanent links alone. Release notes must include
+   the SmartScreen note.
    For 5.0.0 specifically they must also say that the pre-5.0
    `~/.config/ivory/` directory is removed at first launch rather than
    migrated (a clean break; supporter keys are re-sent by email).
