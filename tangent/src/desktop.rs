@@ -5263,7 +5263,15 @@ impl DesktopApp {
                     .map(std::path::Path::to_path_buf),
                 &full,
             );
-            permute_insert_states_in(self.project_state_dir(), &full);
+            // **The LIVE shelf only, never the project's.** The project
+            // folder changes when somebody saves, and a Save mirrors the live
+            // shelf into it whole (`copy_states_to_project`). Permuting
+            // `<project>/state/` here was a write left from when every edit
+            // saved the document; since nothing saves itself it put a saved
+            // project's plugin states in the new layout under a document
+            // still in the old one, and "Don't Save" - or a crash - reopened
+            // the moved tracks with each other's settings, or at factory.
+
             // **Only the rows that MOVED**, which is why this is not
             // `force_insert_reload`.
             //
@@ -25407,6 +25415,26 @@ mod tests {
         agree(&loaded, &[(2, "A"), (3, "B"), (4, "C")], "after its undo");
         assert_eq!(owner(5, 0), None, "the free lane kept a sidecar after the undo");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A reorder leaves the saved project's shelf alone** - the project
+    /// folder changes when somebody saves, and a Save mirrors the live shelf
+    /// into it anyway.
+    ///
+    /// The arm permuted `<project>/state/` too, a write left over from when
+    /// every edit saved the document. Since nothing saves itself, "Don't
+    /// Save" (or a crash) after a reorder left the document in the old
+    /// layout and its shelf in the new one, and the next open seated the
+    /// moved tracks' plugins from each other's files.
+    #[test]
+    fn a_reorder_leaves_the_saved_projects_shelf_alone() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("if let Some(order) = self.app.take_desk_state_perm() {").expect("the reorder arm");
+        let arm = &src[at..at + src[at..].find("// **A pasted track's plugin STATE").expect("the arm's end")];
+        assert!(!arm.contains("permute_insert_states_in(self.project_state_dir()"),
+            "a reorder rewrites the saved project's state shelf before anything is saved: Don't Save \
+             (or a crash) leaves the document in the old layout and its shelf in the new one");
     }
     use super::*;
 
