@@ -3844,7 +3844,11 @@ fn draw_camera(
 }
 
 fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
-    let playing = view.playing;
+    // **Lit while a Play waits on a count's downbeat too.** Pressed during a
+    // count-in, Play starts the song on the downbeat, and a triangle left dark
+    // until then read as a press that had not registered. The Pause lit with
+    // it is the one that takes it back.
+    let playing = view.playing || view.play_pending;
     if l.play.is_positive() {
         // **The same kind of thing as record and stop**: a filled shape with a
         // hairline, at the transport's own size — not a labelled row. A
@@ -3900,7 +3904,7 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
         let c = r.center();
         let bw = r.width() * 0.24;
         let gap = bw * 0.7;
-        let col = toward(PLAY_GREEN, p.bg, if view.playing { 0.0 } else { 0.35 });
+        let col = toward(PLAY_GREEN, p.bg, if playing { 0.0 } else { 0.35 });
         for side in [-1.0_f32, 1.0] {
             painter.rect_filled(
                 Rect::from_center_size(
@@ -11157,6 +11161,50 @@ mod tests {
         }
     }
 
+    /// **A Play waiting on a count's downbeat lights the triangle, and the
+    /// Pause that takes it back.** Play pressed during a count-in starts the
+    /// song on the downbeat, and nothing on the band showed it had been
+    /// pressed: the triangle stayed dark over a song about to start.
+    #[test]
+    fn a_play_waiting_on_the_downbeat_lights_the_play_triangle() {
+        for pending in [false, true] {
+            let view = RecorderView {
+                play_pending: pending,
+                ..furnished()
+            };
+            let r = band(1300.0);
+            let l = Layout::new(r, &view);
+            assert!(l.play.is_positive() && l.pause.is_positive(), "no transport at this width");
+            let shapes = band_shapes(r, &view);
+            let triangle = shapes
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Path(path)
+                        if path.closed
+                            && path.points.len() == 3
+                            && path.points.iter().all(|pt| l.play.expand(1.0).contains(*pt)) =>
+                    {
+                        Some(path.fill)
+                    }
+                    _ => None,
+                })
+                .expect("the play triangle is not drawn");
+            assert_eq!(triangle == PLAY_GREEN, pending, "pending {pending}: the triangle is {triangle:?}");
+            let bars: Vec<Color32> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Rect(rs) if l.pause.contains(rs.rect.center()) => Some(rs.fill),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(bars.len(), 2, "the pause bars: {bars:?}");
+            assert!(
+                bars.iter().all(|c| (*c == PLAY_GREEN) == pending),
+                "pending {pending}: the pause bars are {bars:?}"
+            );
+        }
+    }
+
     /// **The metronome panel's TEMPO row dims with the knob** - the other
     /// road to the same number wears the same rule.
     #[test]
@@ -11499,6 +11547,7 @@ mod tests {
                                 exporting: false,
                                 tempo_held: matches!(state, RecordState::CountIn { .. }),
                                 count_beat: None,
+                                play_pending: false,
                                 view_window: (0.0, 60.0),
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),

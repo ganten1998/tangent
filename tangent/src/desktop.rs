@@ -543,7 +543,8 @@ struct Recorder {
     /// **Play was pressed while a count-in was running**: the song starts on
     /// the downbeat instead of under the count. Pressing TAKE and then Play
     /// used to be "count me in, then the song plays" by force; this is that,
-    /// on purpose, and nothing clicks over a song on the wrong grid.
+    /// on purpose, and nothing clicks over a song on the wrong grid. Pause
+    /// takes it back, and the band shows it waiting (`play_pending`).
     play_on_go: bool,
     /// How long the next take's file will run before the music, decided at
     /// the cassette's press from what the press actually did - see
@@ -5084,6 +5085,9 @@ impl DesktopApp {
         // engine's own; with no engine the transport answers from its last
         // known truth, which is the whole reason it owns the number.
         state.playing = self.recorder.transport.playing();
+        // A Play pressed during a count, waiting on its downbeat - so the
+        // band can show it was heard, and Pause can take it back.
+        state.play_pending = self.recorder.play_on_go;
         state.exporting = self.recorder.bounce.is_some();
         // Any count a take saved, or COULD save, something from - see
         // `RecorderState::tempo_held`. The arrangement's count holds too even
@@ -6284,11 +6288,15 @@ impl DesktopApp {
                     }
                 }
                 R::Pause => {
-                    if self.recorder.bounce.is_none()
-                        && self.recorder.arr_rec.is_none()
-                        && self.recorder.transport.playing()
-                    {
-                        self.recorder.transport.toggle_play();
+                    if self.recorder.bounce.is_none() && self.recorder.arr_rec.is_none() {
+                        // **A Play still waiting on a count's downbeat is
+                        // taken back first** - nothing but Stop could do
+                        // that, and Stop cancels the arrangement's count with
+                        // it. Otherwise a rolling transport pauses.
+                        let waiting = std::mem::take(&mut self.recorder.play_on_go);
+                        if !waiting && self.recorder.transport.playing() {
+                            self.recorder.transport.toggle_play();
+                        }
                     }
                 }
                 R::Locate(seconds) => {
@@ -22731,6 +22739,32 @@ mod tests {
         );
         let arm = src.find("R::Capture => {").expect("the cassette's arm");
         assert!(guard < arm, "the guard comes after the arm it guards, so it never runs");
+    }
+
+    /// **Pause takes back a Play still waiting on a count's downbeat, and
+    /// the band is told one is waiting.** Play during a count arms
+    /// `play_on_go` instead of rolling; Pause acted only on a ROLLING
+    /// transport, so the Play could not be taken back but by Stop, and with
+    /// nothing on `RecorderState` the Play button stayed dark over a song
+    /// about to start.
+    #[test]
+    fn pause_takes_back_a_play_waiting_on_a_downbeat() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let a = src.find("                R::Pause => {").expect("the pause arm");
+        let end = src[a..].find("                R::Locate(seconds) => {").expect("its end");
+        let pause = &src[a..a + end];
+        let takes = pause
+            .find("std::mem::take(&mut self.recorder.play_on_go)")
+            .expect("Pause cannot take back a Play waiting on a downbeat");
+        assert!(
+            pause[..takes].contains("self.recorder.bounce.is_none()"),
+            "Pause takes a Play back under an export, which owns the transport"
+        );
+        assert!(
+            src.contains("state.play_pending = self.recorder.play_on_go;"),
+            "the band is not told a Play is waiting on a downbeat"
+        );
     }
 
 
