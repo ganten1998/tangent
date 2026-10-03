@@ -26932,19 +26932,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.freeze_selected();
             }
         }
-        // **The quantize window watches the selection.** It is not modal, so
-        // what it would act on changes under it; a window that said "1 audio
-        // clip" while three were selected would be lying.
-        // Asked BEFORE the window is borrowed: `quantize_target` reads the
-        // whole app and cannot run inside a mutable borrow of one field.
-        if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
-            let now = self.quantize_target();
-            if let Some(Dialog::Quantize { target, .. }) = self.dialog.as_mut() {
-                if *target != now {
-                    *target = now;
-                }
-            }
-        }
         // **Q opens the quantize window, every time.**
         //
         // It used to quantize immediately at whatever grid was on screen,
@@ -40801,9 +40788,26 @@ impl TangentApp {
                 // **The quantize window spells its GRID chips in the meter
                 // the grid is built in**, read on every frame it is drawn:
                 // it is not modal, so the meter can change while it is open.
-                if let Some(Dialog::Quantize { meter, .. }) = self.dialog.as_mut() {
+                //
+                // **And it watches the selection, here and not in an input
+                // pass.** What it would act on changes under it, and a window
+                // that said "1 audio clip" while three were selected would be
+                // lying. This was asked inside `arrangement_input`, after its
+                // early returns, so a frame with the hand on the MIDI editor,
+                // or on this window drawn inline over it, kept the old line:
+                // notes picked on the roll still read "all 3 notes". Asked
+                // BEFORE the window is borrowed: `quantize_target` reads the
+                // whole app and cannot run inside a mutable borrow of one
+                // field.
+                if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+                    let now = self.quantize_target();
                     let sig = self.settings.time_signature();
-                    *meter = (sig.beats, sig.unit);
+                    if let Some(Dialog::Quantize { meter, target, .. }) = self.dialog.as_mut() {
+                        *meter = (sig.beats, sig.unit);
+                        if *target != now {
+                            *target = now;
+                        }
+                    }
                 }
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
@@ -41883,6 +41887,56 @@ mod tests {
         assert_eq!(app.settings.quantize_fit, "slice");
         assert!((app.settings.quantize_window_ms - 30.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The window's line follows a selection made on the roll**, frame by
+    /// frame, wherever the hand is.
+    ///
+    /// The line was refreshed inside `arrangement_input`, after its early
+    /// returns, so every frame the hand spent on the MIDI editor - or on the
+    /// window itself, drawn inline over it in a plugin or with child windows
+    /// off - skipped it. Pick one note on the roll, move onto the window,
+    /// and it still said "all 3 notes" while Apply quantized one. Driven
+    /// through whole frames on the inline path, with the hand on the roll.
+    #[test]
+    fn the_quantize_windows_line_follows_a_selection_made_on_the_roll() {
+        let caps = Caps { child_windows: false, ..Caps::DESKTOP };
+        let (ctx, mut app) = headless(caps);
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let n = |at_s: f64| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key: 60, vel: 100, muted: false };
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0), n(0.5), n(1.0)],
+            lane: 0,
+            start_s: 4.0,
+            len_s: 2.0,
+            loop_s: 2.0,
+            name: "m".into(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        app.open_quantize_window();
+        for _ in 0..3 {
+            let _ = run_frame(&ctx, &mut app);
+        }
+        let roll = app.midi_edit_rect.expect("the editor drew nowhere");
+        // One note picked on the roll; the hand stays on the roll (or on the
+        // window drawn over it - both refuse the arrangement pass).
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected = vec![0];
+        }
+        for _ in 0..2 {
+            pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(roll.center())]);
+        }
+        match app.dialog.as_ref() {
+            Some(Dialog::Quantize { target, .. }) => assert_eq!(
+                target.as_deref(),
+                Some("1 selected notes"),
+                "the window still says what it said before the selection moved"
+            ),
+            _ => panic!("the quantize window closed"),
+        }
     }
 
     /// **The roll reads a bare Q once.** Two handlers sat in the one block
