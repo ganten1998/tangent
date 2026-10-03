@@ -5808,6 +5808,8 @@ struct LaneIo<'a> {
     fx_in: &'a mut Vec<Vec<f32>>,
     fx_out: &'a mut Vec<Vec<f32>>,
     dry_io: &'a mut Vec<Vec<f32>>,
+    /// The latency `dry_io` has already paid - see `Renderer::lane_dry_paid`.
+    dry_paid: &'a mut u32,
     key_io: &'a mut Vec<Vec<f32>>,
     builtin: &'a mut Vec<f32>,
     keys_scratch: &'a mut Vec<f32>,
@@ -6619,6 +6621,11 @@ fn render_lane(
     // second walk of the clip list and a second render of the
     // instrument — and the second render of a stateful instrument is
     // not the same sound as the first.
+    //
+    // **And it has paid no plugin delay**, so its wait is the whole of
+    // `max - folded` - until a bay voice below writes the row over and says
+    // what it paid. See `Renderer::lane_dry_paid`.
+    *io.dry_paid = 0;
     if plan.stems_dry {
         let (dry, fx) = (&mut io.dry_io, &io.fx_in);
         for c in 0..TAP_CHANNELS {
@@ -6713,7 +6720,7 @@ fn render_lane(
             });
         // Guarded by `!is_folder` at this block's head — a folder's
         // rack belongs to the fold, per the checklist's rule.
-        run_rack(
+        let paid = run_rack(
             seats.rack,
             &mut io.fx_in,
             frames,
@@ -6745,7 +6752,7 @@ fn render_lane(
         // **And bays 3..5, over what bays 0..2 just left.** Six bays
         // are one chain; see `run_extra_rack`, which holds the
         // is_folder guard this block's head already applied.
-        run_extra_rack(
+        let paid_extra = run_extra_rack(
             seats.extra,
             is_folder,
             &desk.auto_params,
@@ -6766,6 +6773,11 @@ fn render_lane(
             plan.stems_dry.then(|| &mut io.dry_io[..]),
             at,
         );
+        // The LAST voice to write the dry row is the one whose delay it
+        // carries: a voice replaces the row, as it replaces the channel.
+        if let Some(paid) = paid_extra.or(paid) {
+            *io.dry_paid = paid;
+        }
     }
     // **The lane does NOT wait here any more.** Its delay compensation used
     // to run on this line, on the two rings below, and it is clocked at
@@ -6843,12 +6855,12 @@ fn run_extra_rack(
     // sentinel, and is handed the published anchor, which is the END of
     // that block (see `rack_transport`).
     pos: u64,
-) {
+) -> Option<u32> {
     if is_folder {
-        return;
+        return None;
     }
     if rack.is_empty() {
-        return;
+        return None;
     }
     // This seat's own parameter queue, exactly as the first rack takes its
     // own: automation on bay 4 files to seat `extra`, bay 1.
@@ -6872,7 +6884,7 @@ fn run_extra_rack(
     
             dry.as_deref_mut(),
             pos,
-        );
+        )
 }
 
 /// **Where the song is, for a built-in voice inside a rack.**
@@ -6966,6 +6978,14 @@ fn run_rack(
     // pads keep their own dry sum, which they must, because a kit's racks run
     // inside its walk and there is no instant at which the summed kit exists
     // un-processed.
+    //
+    // **Answered with what the row has PAID.** The voice's output is already
+    // late by the figure the voice reports into its bay, which the lane's
+    // wait counts in `own`, so the rack returns that bay's figure when a
+    // voice wrote here (the last voice, if two did) and `None` when none
+    // did. `run_lane_pdc` takes it off the dry row's wait. Waiting the whole
+    // `max - folded` instead left a voice's dry stem behind its processed
+    // one by exactly that figure: the analog's 68 frames.
     mut dry: Option<&mut [Vec<f32>]>,
 
     // **The absolute sample position this rack is rendering**, or
@@ -6980,7 +7000,7 @@ fn run_rack(
     // sentinel, and is handed the published anchor, which is the END of
     // that block (see `rack_transport`).
     pos: u64,
-) {
+) -> Option<u32> {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
     // the entire disarmed cost; the seat comparison folds the armed-elsewhere
     // case into the same early-out. See `Shared::insert_tap_route`.
@@ -6999,7 +7019,7 @@ fn run_rack(
         if tap_bay.is_some() {
             push_insert_tap(shared, planar, frames);
         }
-        return;
+        return None;
     }
     // **The song's position, for a built-in voice.** The tempo MAP's beat
     // and tempo as `run_transport` published them: walked to this rack's
@@ -7035,6 +7055,9 @@ fn run_rack(
             b.resize(frames, 0.0);
         }
     }
+    // What the dry row has already paid, once a voice has written it - see
+    // the `dry` parameter. `None` while nothing has.
+    let mut paid: Option<u32> = None;
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
             // **An armed EMPTY bay taps what the bay WOULD see** — the
@@ -7258,6 +7281,15 @@ fn run_rack(
                     let n = frames.min(dst.len()).min(src.len());
                     dst[..n].copy_from_slice(&src[..n]);
                 }
+                // **And what the row has already paid**: this bay's figure,
+                // read back from the cell `Rack::latency` sums - so the dry
+                // copy is let off exactly the share of `own` it carries.
+                paid = Some(
+                    shared
+                        .seat_latency
+                        .get(seat * INSERTS + bay)
+                        .map_or(0, |c| c.load(Ordering::Relaxed)),
+                );
             }
         }
         // **The armed bay's POST audio, read after the copy-back** — `planar`
@@ -7269,6 +7301,7 @@ fn run_rack(
             push_insert_tap(shared, planar, frames);
         }
     }
+    paid
 }
 
 /// Whether a rack seats the amp in any bay — the switch that arms a
@@ -7950,6 +7983,13 @@ struct Renderer {
     /// The dry twin of [`Self::lane_out`], filled only while a dry stem is
     /// wanted. See the dry copy in `render_lane`.
     lane_dry: Vec<Vec<Vec<f32>>>,
+    /// **What each lane's dry row has already paid**: the latency a bay
+    /// VOICE reports into its bay, when that voice wrote the row, and zero
+    /// when the row is the tap's copy of `fx_in`. Written by the lane's
+    /// render, read by `run_lane_pdc` at consumption, which takes it off the
+    /// dry row's wait; the two share a chunk because stems turn the grain
+    /// clock off.
+    lane_dry_paid: [u32; CHANNELS],
     fx_in: Vec<Vec<f32>>,
     fx_out: Vec<Vec<f32>>,
     /// The effects bus's own buffer, one block long, interleaved like `mix`.
@@ -13040,16 +13080,21 @@ impl Renderer {
         // silently early on the one lane carrying the linear-phase EQ, which
         // is the worst possible distribution of a bug.
         //
-        // **Not yet true of a dry row a VOICE wrote** (`run_rack`'s `dry`).
-        // That copy is the voice's own output, already late by what the voice
-        // reports into its bay - a figure `own` counts - and it still waits
-        // the whole `max - folded` here, so it leaves the fold that much
-        // after the processed copy. Of today's bay voices only the analog
-        // reports anything (68 frames); a hosted voice and the sampler report
-        // zero to their bay.
+        // **Less what a VOICE already paid, when a voice wrote the row**
+        // (`run_rack`'s `dry`). That copy is the voice's own output, already
+        // late by what the voice reports into its bay - a figure `own`
+        // counts - so it waits `max - folded - paid`, and leaves the fold on
+        // the frame the processed copy does. It waited the whole
+        // `max - folded` once, and left that much after it. Of today's bay
+        // voices only the analog reports anything (68 frames); a hosted voice
+        // and the sampler report zero to their bay, so `paid` is zero for
+        // them. See `Self::lane_dry_paid`.
         if self.stems_dry {
-            let dry_want =
-                usize::try_from(pdc_max.saturating_sub(prep.folder_lat)).unwrap_or(0);
+            let paid = self.lane_dry_paid.get(ch).copied().unwrap_or(0);
+            let dry_want = usize::try_from(
+                pdc_max.saturating_sub(prep.folder_lat).saturating_sub(paid),
+            )
+            .unwrap_or(0);
             if let (Some(line), Some(row)) =
                 (self.dry_pdc.get_mut(ch), self.lane_dry.get_mut(ch))
             {
@@ -14156,6 +14201,7 @@ impl Renderer {
                 // have thrown away a grain it still owed the fold.
                 let mut outs = self.lane_grain.iter_mut();
                 let mut drys = self.lane_dry.iter_mut();
+                let mut paids = self.lane_dry_paid.iter_mut();
                 let mut scratches = self.lane_scratch.iter_mut();
                 for (ch, job) in jobs.iter_mut().enumerate() {
                     let (
@@ -14166,6 +14212,7 @@ impl Renderer {
                         Some(keys_lane),
                         Some(out),
                         Some(dry),
+                        Some(paid),
                         Some(scratch),
                     ) = (
                         primaries.next(),
@@ -14175,6 +14222,7 @@ impl Renderer {
                         keys.next(),
                         outs.next(),
                         drys.next(),
+                        paids.next(),
                         scratches.next(),
                     )
                     else {
@@ -14200,6 +14248,7 @@ impl Renderer {
                             fx_in: out.hold(lane_at, lane_len),
                             fx_out: &mut scratch.fx_out,
                             dry_io: dry,
+                            dry_paid: paid,
                             key_io: &mut scratch.key_io,
                             builtin: &mut scratch.builtin,
                             keys_scratch: &mut scratch.keys,
@@ -16231,6 +16280,7 @@ impl Engine {
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_dry_paid: [0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -22347,6 +22397,7 @@ mod tests {
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_dry_paid: [0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
@@ -26688,7 +26739,7 @@ mod tests {
     /// **What it does not pin.** A voice-only lane's dry and processed
     /// stems should be the same samples; this asserts only that the dry one
     /// is not silent - the processed peak is a fixture guard - and only for
-    /// a voice in bay 1.
+    /// a voice in bay 1. The two tests below pin bays 4..6 and the timing.
     #[test]
     fn a_voice_in_a_bay_reaches_the_dry_stem() {
         use std::sync::Arc;
@@ -26790,6 +26841,59 @@ mod tests {
             dry > processed * 0.5,
             "a voice in bays 4..6 is missing from the dry stem: dry peaked at {dry}, \
              processed at {processed}"
+        );
+    }
+
+    /// **A voice-only lane's dry stem and its processed stem are one signal
+    /// through one fader, so they leave the fold on the same frame.** The
+    /// analog reports its 68 frames into its bay, so the wet copy waits
+    /// `max - own - folded`; the dry row is written from the same voice
+    /// output, has already paid those 68, and must not then wait the whole
+    /// `max - folded`. It did, and every default stems export of a project
+    /// with an analog lane wrote that stem 68 frames behind the others.
+    #[test]
+    fn a_voice_dry_stem_is_not_late_by_the_voices_own_latency() {
+        use std::sync::Arc;
+        const CH: usize = 2;
+        let run = |dry: bool| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                .expect("the analog must load")
+                .expect("a load reports what it seated");
+            e.set_channel_gain(CH, 0.8);
+            e.set_master_gain(1.0);
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: CH,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote { at: 4_800, dur: 24_000, key: 48, vel: 110 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; 512 * 2];
+            let mut drained: Vec<f32> = Vec::new();
+            for _ in 0..40 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            let wide = CHANNELS * 2;
+            (0..drained.len() / wide).map(|f| drained[f * wide + CH * 2]).collect()
+        };
+        let (dry, wet) = (run(true), run(false));
+        let onset = |x: &[f32]| x.iter().position(|v| v.abs() > 1.0e-4);
+        let wet_on = onset(&wet).expect("the analog never sounded on the processed stem");
+        // Guard: anything sounding before the note would put both onsets on
+        // frame 0 and pass this vacuously.
+        assert!(wet_on >= 4_800, "the processed stem sounded at {wet_on}, before its note");
+        let dry_on = onset(&dry).expect("the dry stem is silent");
+        assert_eq!(
+            dry_on, wet_on,
+            "the dry stem starts {} frames after the processed one",
+            dry_on as i64 - wet_on as i64
         );
     }
 
