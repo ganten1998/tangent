@@ -16862,6 +16862,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             sensitivity: self.settings.quantize_sensitivity.clamp(0.0, 1.0),
             fit: self.settings.quantize_fit.clone(),
             target: self.quantize_target(),
+            meter: {
+                let sig = self.settings.time_signature();
+                (sig.beats, sig.unit)
+            },
         });
     }
 
@@ -40200,6 +40204,13 @@ impl TangentApp {
                     self.settings.scope_draw_color.to_color32(),
                     self.settings.meter_bg_color.to_color32(),
                 );
+                // **The quantize window spells its GRID chips in the meter
+                // the grid is built in**, read on every frame it is drawn:
+                // it is not modal, so the meter can change while it is open.
+                if let Some(Dialog::Quantize { meter, .. }) = self.dialog.as_mut() {
+                    let sig = self.settings.time_signature();
+                    *meter = (sig.beats, sig.unit);
+                }
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
         {
@@ -41278,6 +41289,76 @@ mod tests {
         assert_eq!(app.settings.quantize_fit, "slice");
         assert!((app.settings.quantize_window_ms - 30.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The chip CALLED "1/16" applies a sixteenth**, whatever the song's
+    /// meter. The window labelled its GRID chips in 4/4
+    /// (`grid_label_text(e, 4, 4)`) while the grid it applies is built in
+    /// the song's meter (`Grid::from_document(.., sig.beats, sig.unit, ..)`),
+    /// so in 3/4 the chip "1/16" quantized to a 32nd and the default "1/8" to
+    /// a sixteenth. Read off the painted chips, so it holds whichever side
+    /// is made to agree with the other.
+    #[test]
+    fn the_quantize_chip_called_a_sixteenth_applies_a_sixteenth_in_three_four() {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let (ctx, mut app) = headless_with(Caps::PLUGIN, Settings::default());
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let frame = |app: &mut TangentApp| -> Vec<String> {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            let mut painted = Vec::new();
+            for c in &out.shapes {
+                walk(&c.shape, &mut painted);
+            }
+            painted
+        };
+        let chips_of = |painted: &[String]| -> Vec<String> {
+            let grid = painted.iter().position(|s| s == "GRID").expect("the quantize window painted no GRID row");
+            painted[grid + 1..].iter().take_while(|s| *s != "triplet").cloned().collect()
+        };
+        // Settle first, so nothing a first frame adopts can put the meter back.
+        frame(&mut app);
+        frame(&mut app);
+        app.settings.record_time_signature = "3/4".to_owned();
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.open_quantize_window();
+        // Inline in a plugin; three frames, because an Area's first is a sizing pass.
+        let painted = (0..3).map(|_| frame(&mut app)).last().expect("three frames");
+        assert_eq!(app.settings.time_signature().beats, 3, "a frame put the meter back - this test proves nothing");
+        let chips = chips_of(&painted);
+        assert_eq!(chips.len(), 8, "the GRID row is not rungs 0 down to -7: {chips:?}");
+        // Painted coarse to fine: rung 0 first.
+        let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16");
+        let e = -i8::try_from(rung).expect("eight chips");
+        let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
+        let quarters = ask.step_s * app.tempo_bpm() / 60.0;
+        assert!(
+            (quarters - 0.25).abs() < 1.0e-9,
+            "in 3/4 the chip called 1/16 (rung {e}) quantizes to {quarters} quarter notes; a sixteenth is 0.25: {chips:?}"
+        );
+        // **And the window is not modal**, so the meter can change while it
+        // is open: the chips follow on the next frame, not at the next open.
+        app.settings.record_time_signature = "4/4".to_owned();
+        let painted = (0..2).map(|_| frame(&mut app)).last().expect("two frames");
+        let chips = chips_of(&painted);
+        let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16 in 4/4");
+        let e = -i8::try_from(rung).expect("eight chips");
+        let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
+        assert!(
+            (ask.step_s * app.tempo_bpm() / 60.0 - 0.25).abs() < 1.0e-9,
+            "the chips kept the meter the window opened in after it changed: {chips:?}"
+        );
     }
 
 

@@ -26,8 +26,9 @@
 //! Whoever LABELS a grid has to spell it in the meter it quantizes in -
 //! `grid_label_text` with the same `(beats, unit)` - or it is a magnet
 //! pointing somewhere the eye cannot see, and this app has already paid for
-//! that once: the box said "1/2" while the magnet snapped eighths. (The
-//! quantize window's GRID chips do not yet: they are spelled in 4/4.)
+//! that once: the box said "1/2" while the magnet snapped eighths. The
+//! quantize window's GRID chips are spelled in the song's meter, read on
+//! every frame the window is drawn.
 //!
 //! # The three knobs, and why each exists
 //!
