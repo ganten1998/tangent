@@ -593,6 +593,7 @@ struct FreezeJob {
 /// for a minute and then play; what decides is whether one sample off
 /// digital zero ever arrived, and a stem that never got one is removed
 /// when the render finishes rather than shipped. See [`any_sound`].
+#[cfg(feature = "recorder")]
 struct StemWriter {
     lane: usize,
     path: std::path::PathBuf,
@@ -2693,7 +2694,6 @@ const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis
 #[cfg(feature = "recorder")]
 const ENGINE_TRIES: u8 = 5;
 
-#[cfg(feature = "recorder")]
 /// **How long the engine may go without notes somebody has drawn.**
 ///
 /// `run_warm` hands the arrangement over on the frame the decode queue pops
@@ -2718,6 +2718,7 @@ const ENGINE_TRIES: u8 = 5;
 /// A quarter of a second: under what anybody would notice between drawing a
 /// note and pressing play, and far above a frame, so a drag that dirties the
 /// clips continuously still answers four times a second rather than sixty.
+#[cfg(feature = "recorder")]
 const CLIPS_OWED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// **How often the open device is asked what rate it is ACTUALLY running at**,
@@ -2728,6 +2729,7 @@ const CLIPS_OWED_DEADLINE: std::time::Duration = std::time::Duration::from_milli
 /// about two of those re-locking its clock, and during them it will report a
 /// rate that is neither the old one nor the new one — reopening on the first
 /// disagreement would catch it mid-stride and reopen again a moment later.
+#[cfg(feature = "recorder")]
 const RATE_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// **Take the old AUHAL road back**, for an A/B on a machine that crackles.
@@ -3394,7 +3396,6 @@ fn warped_clip_audio(
     made
 }
 
-#[cfg(feature = "recorder")]
 /// **The warp map one quantize would write**, and only the map: a caller
 /// that reports how many attacks it found counts its own `found`.
 ///
@@ -3488,6 +3489,7 @@ fn warp_plan(
 /// millionths, mode's key" is how a sweep quietly stops matching what was
 /// inserted — the doc on the live path used to warn the sweep to keep up
 /// with it by hand.
+#[cfg(feature = "recorder")]
 fn stretch_key(
     clip: &tangent_ui::arrangement::ArrClip,
     path: &std::path::Path,
@@ -3530,6 +3532,7 @@ fn stretch_key(
 /// an entry a clip still names, so playback and glue are then served the
 /// previous render. A stretch-mode change likewise keeps the old mode's
 /// warp.
+#[cfg(feature = "recorder")]
 fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
     if clip.warp.len() < 2 {
         return None;
@@ -3543,8 +3546,9 @@ fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
 // stolen once: a helper inserted between it and the block below made every
 // recorder method unconditional, and the Minimal build — `tangent` with no
 // features, the fallback for a platform that cannot carry the rest — stopped
-// compiling with five hundred errors. `scripts/check-firewall.sh` is what
-// says so, and nothing else in the repo ever builds this configuration.
+// compiling with five hundred errors. `scripts/check.sh`, the release gate,
+// builds this configuration now; until 2026-10-03 only
+// `scripts/check-firewall.sh` did, and nothing ran it.
 //
 // **And it is not only the impl.** A free item inserted between a doc block
 // and the item it documents takes the doc AND the `#[cfg]` with it, and the
@@ -3553,7 +3557,8 @@ fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
 // happened in this file to `insert_state_path`, `arm_stem_tap`,
 // `shift_insert_states_for_v19`, `RATE_ASK_EVERY`, `insert_walk` and
 // `stretch_key`. Insert new items ABOVE a doc block, never between a doc and
-// its item.
+// its item. `the_minimal_builds_gates_sit_on_their_own_items` holds each of
+// those to its gate.
 #[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
@@ -12376,7 +12381,6 @@ impl DesktopApp {
         }
     }
 
-    #[cfg(feature = "recorder")]
     /// **Shelve the settings a write is about to destroy.**
     ///
     /// A bay's sidecar is ONE file tagged with the bay's current tenant, so
@@ -12635,6 +12639,7 @@ impl DesktopApp {
     /// **Everything one quantize was asked for**, so the per-clip worker
     /// takes one argument instead of six and a knob added to the window
     /// cannot be forgotten at one of the two call sites.
+    #[cfg(feature = "recorder")]
     fn quantize_clip(&mut self, id: u64, ask: &tangent_ui::ports::QuantizeAsk) -> (usize, usize) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             return (0, 0);
@@ -14879,7 +14884,6 @@ impl DesktopApp {
     }
 }
 
-#[cfg(feature = "recorder")]
 /// How many files are sitting in a project's `media/`.
 ///
 /// **The one folder in a scratch project that holds work.** The document,
@@ -14898,6 +14902,7 @@ impl DesktopApp {
 /// sample is still in the template, so nothing is lost with the copy); and a
 /// freeze render. Each counted as a take, and a scratch holding one was never
 /// swept and never reclaimed, so the next session moved on to "Untitled N+1".
+#[cfg(feature = "recorder")]
 fn count_media(project_dir: &std::path::Path, template: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(project_dir.join("media")) else {
         return 0;
@@ -15288,6 +15293,7 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
 /// validated by bundle path on the way back, as the instrument slots' files
 /// were before the slots went - the wrong plugin's state is not a preset, it
 /// is arbitrary bytes to a `setState` that will believe them.
+#[cfg(feature = "recorder")]
 fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
     global_state_dir().join(sidecar_name(strip, bay))
 }
@@ -16026,6 +16032,7 @@ fn encode_mp3(
     tangent_record::encode::encode_mp3_via_ffmpeg(interleaved, rate, mono, path)
 }
 
+#[cfg(feature = "recorder")]
 fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
     let (owner, blob) = sidecar_owner_and_state(strip, bay)?;
     (owner == bundle).then_some(blob)
@@ -16127,8 +16134,8 @@ fn furnish_mirror_bay(
         .map(|_| ())
 }
 
-#[cfg(feature = "recorder")]
 /// The frozen lanes as the engine's mask - see `Shared::frozen`.
+#[cfg(feature = "recorder")]
 fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
     frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
 }
@@ -16153,6 +16160,7 @@ fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
 /// a third time on its own side, once a block, because five writers of the dry
 /// buffer have to agree and one place to agree in is cheaper than five — see
 /// `Shared::stems_dry`.
+#[cfg(feature = "recorder")]
 fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
     e.set_stems(stems);
     e.set_stems_dry(stems && dry);
@@ -18519,8 +18527,11 @@ impl DesktopApp {
             engine_epoch: 0,
             #[cfg(feature = "recorder")]
             comp_rows_epoch: u64::MAX,
+            #[cfg(feature = "recorder")]
             attack_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
             quantize_marked: None,
+            #[cfg(feature = "recorder")]
             displaced_states: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             reastream_pushed: None,
@@ -18719,7 +18730,6 @@ fn shift_insert_states_for_v18() {
     }
 }
 
-#[cfg(feature = "recorder")]
 /// 16 -> today's channels: every seat at or above the old channel block —
 /// drums, click, fx, master, master-extra and all the pad blocks — steps
 /// up by exactly the growth. Uniform because the seat map appends its
@@ -18727,6 +18737,7 @@ fn shift_insert_states_for_v18() {
 /// range is provably right for every old seat >= 16. Highest first, or
 /// the move eats itself. The old map's last seat was 2068 (frozen: the
 /// sixteen-channel era's own arithmetic).
+#[cfg(feature = "recorder")]
 fn shift_insert_states_for_v20() {
     let grow = tangent_ui::recorder::CHANNELS - 16;
     for bay in 0..3 {
@@ -18745,6 +18756,7 @@ fn shift_insert_states_for_v20() {
 /// 12.. -> 20... Highest first, or the move eats itself; numbers frozen as
 /// literals per the historical-migration rule. The upper bound covers the
 /// old master (11) and all 128 pads (12..139).
+#[cfg(feature = "recorder")]
 fn shift_insert_states_for_v19() {
     for bay in 0..3 {
         for old in (8..(12 + 128)).rev() {
@@ -18758,6 +18770,7 @@ fn shift_insert_states_for_v19() {
 
 /// v13 -> v14: the drum bus took seat 8, so the click's, the bus's and the
 /// master's sidecars walk UP one — highest first, or the move eats itself.
+#[cfg(feature = "recorder")]
 fn shift_insert_states_for_v14() {
     for bay in 0..3 {
         for old in (8..=10).rev() {
@@ -20809,7 +20822,6 @@ impl Counted {
     }
 }
 
-#[cfg(feature = "recorder")]
 /// **Whether an armed input is still waiting on a bay** - the decision
 /// behind [`DesktopApp::armed_racks_pending`], as a function of its inputs so
 /// that it can be driven by a test. `DesktopApp` cannot be built in one.
@@ -20885,6 +20897,7 @@ fn armed_rack_pending(
 /// eight. The fix belongs upstream, in what gets MARKED: `force_insert_reload`
 /// no longer marks a bay that is empty on both sides, so every bay this walk
 /// finds is a bay with work in it and the count is the number of frames left.
+#[cfg(feature = "recorder")]
 fn insert_walk(len: usize, mismatch: impl Fn(usize) -> bool) -> (Option<usize>, usize) {
     let mut next: Option<usize> = None;
     let mut outstanding = 0usize;
@@ -26149,6 +26162,94 @@ mod tests {").expect("the tests module")];
             "the hook can answer `NSTerminateNow`, which hands the process back \
              to `-[NSApplication terminate:]` and its `exit()` — the crash"
         );
+    }
+
+    /// **The Minimal build's gates sit on their own items.** `cargo check -p
+    /// tangent --no-default-features` is the real proof, and `scripts/check.sh`
+    /// runs it now; this runs in every recorder build, so a gate that wanders
+    /// off fails the suite before it fails the release. Six breakages so far:
+    /// two an insertion that carried a doc and its gate off onto the newcomer,
+    /// four recorder-only code added beside gated neighbours without the gate.
+    /// The rest of the list is every other gate an insertion once carried off,
+    /// and the shuffles that call `insert_state_path`, which is gated now that
+    /// its own `#[cfg]` is back on it.
+    ///
+    /// Every item is read before anything panics, so one run names each
+    /// breakage.
+    #[test]
+    fn the_minimal_builds_gates_sit_on_their_own_items() {
+        // The contiguous doc/attribute block directly above `anchor`'s line.
+        fn head<'a>(src: &'a str, anchor: &str, limit: usize) -> Vec<&'a str> {
+            let at = src.find(anchor).unwrap_or_else(|| panic!("`{anchor}` is gone"));
+            assert!(at < limit, "`{anchor}` survives only in this test: moved or renamed");
+            let line = src[..at].rfind('\n').map_or(0, |i| i + 1);
+            src[..line]
+                .lines()
+                .rev()
+                .take_while(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("///") || t.starts_with("#[")
+                })
+                .collect()
+        }
+        let gated = |src: &str, anchor: &str, limit: usize| {
+            head(src, anchor, limit)
+                .iter()
+                .any(|l| l.trim().replace(' ', "") == "#[cfg(feature=\"recorder\")]")
+        };
+        let doc = |src: &str, anchor: &str, limit: usize, first: &str| {
+            head(src, anchor, limit).iter().any(|l| l.trim_start().starts_with(first))
+        };
+        let main = include_str!("main.rs");
+        let desk = include_str!("desktop.rs");
+        let me = desk
+            .find("fn the_minimal_builds_gates_sit_on_their_own_items")
+            .expect("this test");
+        let mut broken: Vec<String> = Vec::new();
+        for m in ["mod transient;", "mod warp;"] {
+            if !gated(main, m, usize::MAX) {
+                broken.push(format!("main.rs: `{m}` is compiled into Minimal"));
+            }
+        }
+        for item in [
+            "struct StemWriter {",
+            "fn stretch_key(",
+            "fn warp_sig(",
+            "fn arm_stem_tap(",
+            "fn insert_walk(",
+            "fn insert_state_path(",
+            "fn shift_insert_states_for_v14(",
+            "fn shift_insert_states_for_v19(",
+            "fn shift_insert_states_for_v20(",
+            "const RATE_ASK_EVERY:",
+            "attack_cache: std::collections::HashMap::new(),",
+            "quantize_marked: None,",
+            "displaced_states: std::collections::HashMap::new(),",
+        ] {
+            if !gated(desk, item, me) {
+                broken.push(format!("desktop.rs: `{item}` is compiled into Minimal"));
+            }
+        }
+        if gated(desk, "fn saved_insert_state(", me) != gated(desk, "fn sidecar_owner_and_state(", me) {
+            broken.push(
+                "`saved_insert_state` calls `sidecar_owner_and_state`: gate both or neither".to_owned(),
+            );
+        }
+        let stretch_doc = "/// The stretch cache's key for a clip";
+        let stem_doc = "/// **Arm a pass's stem tap";
+        if !doc(desk, "fn stretch_key(", me, stretch_doc) {
+            broken.push("stretch_key lost its doc".to_owned());
+        }
+        if doc(desk, "fn quantize_map(", me, stretch_doc) {
+            broken.push("quantize_map wears stretch_key's doc".to_owned());
+        }
+        if !doc(desk, "fn arm_stem_tap(", me, stem_doc) {
+            broken.push("arm_stem_tap lost its doc".to_owned());
+        }
+        if doc(desk, "fn frozen_lane_mask(", me, stem_doc) {
+            broken.push("frozen_lane_mask wears arm_stem_tap's doc".to_owned());
+        }
+        assert!(broken.is_empty(), "{} breakage(s): {}", broken.len(), broken.join("; "));
     }
 
     /// **The host's frame ledger names every state that moves on its own.**
