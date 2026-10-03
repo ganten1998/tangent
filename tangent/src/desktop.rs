@@ -639,9 +639,10 @@ const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10)
 
 /// One press of the red button: what has been collected since, and where it
 /// lands. `finish_arr_record` is the only way out that keeps it, and it hands
-/// the clips to whatever document is open WHEN it runs: closing the window
-/// drops a running record unwritten, and a New or an Open made mid-record
-/// lands it in the next session.
+/// the clips to whatever document is open WHEN it runs - so every road that
+/// lets a session go runs it first: a window close before the quit question,
+/// New and Open before the outgoing session is written or replaced, and
+/// `on_exit` for one still running (`finish_arr_record_keeping_the_answer`).
 #[cfg(feature = "recorder")]
 struct ArrRec {
     /// The playhead second the record began at.
@@ -9402,6 +9403,29 @@ impl DesktopApp {
         self.app.add_recorded_clips(out);
     }
 
+    /// **A running arrangement record ends with the session it was recorded
+    /// in, and the save prompt's answer survives the ending.** For the roads
+    /// that let a session go: New and Open, before the outgoing session is
+    /// written or replaced, and `on_exit` for one still running at the end.
+    /// Without it the take rolled on into the next session and landed there
+    /// at Stop, or went down with the process unwritten.
+    ///
+    /// Finishing lands the clips through `add_recorded_clips`, which commits
+    /// a moment, and a new moment clears "Don't Save"
+    /// (`undo_commit_moment`): the answer would be gone by the time the road
+    /// asked for it, and the save-back would write the very edits the prompt
+    /// was told to throw away. So it is taken first and put back, and
+    /// returned. The take's files are in `media/` either way, and a scratch
+    /// holding one is never cleared (`discard_scratch_made_here`).
+    fn finish_arr_record_keeping_the_answer(&mut self) -> bool {
+        let discarded = self.app.take_outgoing_discarded();
+        self.finish_arr_record();
+        if discarded {
+            self.app.rearm_outgoing_discarded();
+        }
+        discarded
+    }
+
     /// Start an export: the whole arrangement, played from the top through
     /// the real engine — racks, limiter, master — into an audio-only take
     /// the finish copies into the project's `export/`.
@@ -10748,6 +10772,19 @@ impl DesktopApp {
             // `Settings::default`, and the session adopts it, so the desk on
             // screen is the one a fresh install would show.
             tangent_ui::ports::ProjectRequest::ResetTemplate => {
+                // **The outgoing session first, left as New leaves it.** The
+                // app asked about unsaved work before raising this; the
+                // plugins' knobs, which never dirty the document, go into its
+                // project unless the answer was Don't Save - the mirror off
+                // the template below CLEARS the live shelf - and a scratch
+                // this session made and discarded is cleared.
+                let discarded = self.app.take_outgoing_discarded();
+                self.save_plugin_states();
+                if discarded {
+                    self.discard_outgoing_scratch();
+                } else {
+                    self.copy_states_to_project();
+                }
                 let template = self.templates_dir().join("default");
                 let _ = std::fs::remove_file(tangent_ui::arrangement::doc_in(&template));
                 let _ = std::fs::remove_dir_all(template.join("state"));
@@ -10980,6 +11017,18 @@ impl DesktopApp {
                 let asked = !matches!(req, tangent_ui::ports::ProjectRequest::New);
                 let keeping =
                     matches!(req, tangent_ui::ports::ProjectRequest::NewKeeping);
+                // **A take still rolling ends here, in the session it was
+                // recorded in, and is then asked about like any unsaved
+                // work**: New's question was answered before the take was in
+                // the document, and a clean session got none. Not when that
+                // answer was Don't Save, which covers everything since the
+                // last save - the take's files stay in `media/` either way.
+                // See `finish_arr_record_keeping_the_answer`.
+                let recording = self.recorder.arr_rec.is_some();
+                let refused = self.finish_arr_record_keeping_the_answer();
+                if recording && !asked && !refused && self.app.ask_before_new() {
+                    return;
+                }
                 // The default template exists from the start: seeded here if
                 // nothing ever saved over it.
                 let template = self.templates_dir().join("default");
@@ -11035,10 +11084,11 @@ impl DesktopApp {
                 // continuously form untitled 1 2 3 etc if pressed
                 // consecutively."
                 //
-                // Kept for the one case the prompt cannot cover: a scratch
-                // with takes in it that is NOT the session on screen, which
-                // the prompt was never asked about and which nobody has
-                // agreed to lose.
+                // Kept for the cases the prompt cannot cover: a scratch with
+                // takes in it that is NOT the session on screen, which the
+                // prompt was never asked about and which nobody has agreed
+                // to lose, and the one on screen when no prompt was asked at
+                // all - see `new_asks_about_scratch`.
                 let takes = count_media(&dir, &template);
                 let is_current = self
                     .app
@@ -11046,7 +11096,7 @@ impl DesktopApp {
                     .and_then(std::path::Path::parent)
                     .map(|p| p == dir)
                     .unwrap_or(false);
-                if takes > 0 && !asked && !is_current {
+                if new_asks_about_scratch(takes, asked, is_current, discarded) {
                     // Ask, and do nothing else this frame. The answer comes
                     // back as `NewKeeping` or `NewDiscarding` - a second New,
                     // which must still know the session was discarded, or it
@@ -11074,10 +11124,12 @@ impl DesktopApp {
                     dir.clone()
                 };
                 // Keeping it means not reclaiming it at all: mint the next
-                // free name and leave the recordings where they are.
+                // free name and leave the recordings where they are. That is
+                // also the answer for the scratch on screen when the discard
+                // refused to clear it - see `new_starts_beside`.
                 let dir = if reclaimed != dir {
                     reclaimed
-                } else if keeping && takes > 0 {
+                } else if new_starts_beside(takes, keeping, is_current, discarded, dir.exists()) {
                     next_untitled(&root, &dir)
                 } else {
                     dir
@@ -11272,15 +11324,16 @@ impl DesktopApp {
     }
 
     /// **Clear the Untitled litter.** Every folder directly under the
-    /// project root named `Untitled` or `Untitled …` is removed WHOLE when
-    /// all three hold: `count_media` counts nothing in its `media/` (a
+    /// project root named `Untitled` or `Untitled <n>`
+    /// (`tangent_ui::app::is_scratch_name`) is removed WHOLE when all of
+    /// these hold: `count_media` counts nothing in its `media/` (a
     /// recording, an import or a glued file counts; dotfiles, `frozen-*`
     /// renders and byte-copies of the template's own media do not), its kit
-    /// is not custom against the template's, and its document is missing,
-    /// empty, or unnamed and clipless (`TangentApp::scratch_is_disposable`).
-    /// Nothing else in the folder is looked at - a subfolder, a nested
-    /// project or anybody's own files go with it - so a scratch must never
-    /// hold anything Tangent did not write there.
+    /// is not custom against the template's, its document is missing,
+    /// empty, or unnamed and clipless, and nothing in it is anything but
+    /// what Tangent writes into a scratch (`TangentApp::scratch_is_disposable`,
+    /// through `holds_only_scratch`). A subfolder, a nested project or
+    /// anybody's own file keeps the folder; it used to go with it.
     fn sweep_disposable_untitleds(root: &std::path::Path, template: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(root) else {
             return;
@@ -11288,7 +11341,7 @@ impl DesktopApp {
         for e in entries.flatten() {
             let dir = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
-            if !dir.is_dir() || !(name == "Untitled" || name.starts_with("Untitled ")) {
+            if !dir.is_dir() || !tangent_ui::app::is_scratch_name(&name) {
                 continue;
             }
             if count_media(&dir, template) == 0
@@ -11346,6 +11399,9 @@ impl DesktopApp {
         // incoming one replaces it; the open writes synchronously anyway, so
         // this costs a write only when one was actually pending.
         self.app.flush_settings_now();
+        // A take still rolling lands in THIS session, and the save-back
+        // below keeps it - see `finish_arr_record_keeping_the_answer`.
+        self.finish_arr_record_keeping_the_answer();
         // The old session first, while it is still the one on the desk.
         //
         // **The plugin states go UNCONDITIONALLY** - a knob turned in a
@@ -11384,9 +11440,21 @@ impl DesktopApp {
         // holding the same bundle in the NEW project would otherwise be
         // seated with the old project's knobs. See `displaced_states`.
         self.displaced_states.clear();
-        // `open_project` applied the document's desk when it carried one;
-        // the flag says so, and the states follow the desk.
-        if self.app.take_desk_reload() {
+        // **A template from the panel was ADOPTED** (`TangentApp::
+        // open_project`), so its states come off the template's own shelf
+        // as New takes them: the scratch it stands on has none. While the
+        // session stayed in the previous project's folder, that project's
+        // states were seated on the template desk, and the template desk's
+        // were mirrored back into its `state/` at the next Open or Quit.
+        if tangent_ui::app::inside_template_shelf(doc, &self.app.project_root()) {
+            if let Some(template) = doc.parent() {
+                self.copy_states_from_shelf(&template.join("state"));
+            }
+            self.force_insert_reload();
+            let _ = self.app.take_desk_reload();
+        } else if self.app.take_desk_reload() {
+            // `open_project` applied the document's desk when it carried
+            // one; the flag says so, and the states follow the desk.
             self.copy_states_from_project();
             self.force_insert_reload();
         }
@@ -15339,6 +15407,42 @@ fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::
     taken.to_path_buf()
 }
 
+/// **Whether New must stop and ask about the scratch it would reclaim**
+/// (the scratch warning) before anything else happens. `takes` is what
+/// `count_media` found in it, `asked` that this New is the warning's own
+/// answer, `current` that the outgoing session stands on it, `discarded`
+/// that the save prompt was answered Don't Save.
+///
+/// The prompt covers the scratch on screen only when it was asked and
+/// answered Don't Save, and that answer keeps a recording - see
+/// [`new_starts_beside`]. A clean session gets no prompt at all, so its own
+/// scratch is asked about like any other: New used to skip the question for
+/// the scratch on screen and reclaim it, a take undone off the timeline (it
+/// is still in `media/`) included.
+#[cfg(feature = "recorder")]
+fn new_asks_about_scratch(takes: usize, asked: bool, current: bool, discarded: bool) -> bool {
+    takes > 0 && !asked && !(current && discarded)
+}
+
+/// **Whether New must leave the folder it landed on standing and start
+/// beside it** (`next_untitled`), read after Don't Save's discard has run:
+/// `still_stands` is whether the folder is on disk NOW. A folder that still
+/// stands is kept when the warning was answered Keep, or when it is the
+/// discarded session's own scratch and the discard refused to clear it - a
+/// recording in it, a document with clips, a kit somebody built, or a
+/// folder this session never made. Open and Quit leave exactly those on
+/// disk; New reclaimed them, recordings and all.
+#[cfg(feature = "recorder")]
+fn new_starts_beside(
+    takes: usize,
+    keeping: bool,
+    current: bool,
+    discarded: bool,
+    still_stands: bool,
+) -> bool {
+    still_stands && ((keeping && takes > 0) || (current && discarded))
+}
+
 /// Whether AccessKit is live — which is to say, whether an assistive
 /// technology has actually attached.
 ///
@@ -15436,41 +15540,44 @@ pub(crate) fn os_reader_attached() -> bool {
 /// removal:
 /// - `made_here`: `materialize_project_dir` turned nothing into this folder
 ///   since the session was opened or adopted (`made_real_here`, in memory);
-/// - the folder is named `Untitled` or starts with `Untitled `, and is not on
-///   the template shelf (`inside_template_shelf`);
+/// - the folder is named `Untitled` or `Untitled <n>`
+///   (`tangent_ui::app::is_scratch_name`), and is not on the template shelf
+///   (`inside_template_shelf`);
+/// - everything in it is something Tangent writes into a scratch
+///   (`tangent_ui::app::holds_only_scratch`) - a subfolder, a project filed
+///   inside or a file of anybody's own spares it;
 /// - its document is missing, empty, or unnamed with no clips - a damaged,
 ///   named or clip-holding one spares it (the in-memory flag can be undone
 ///   past a first save);
+/// - its kit is the template's (`kit_is_custom` against `Templates/default`):
+///   a kit built in it spares it, as `fresh_project_dir` and the launch
+///   sweep spare it, because a kit saves itself for being hours of work and
+///   Don't Save is no exception until the owner says otherwise. These three
+///   are `TangentApp::scratch_is_disposable`, the sweep's own judge;
 /// - nothing in `media/` is named `rec-*`, the arrangement take's name.
 ///
-/// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar - a kit
-/// built in this scratch included - the samples and imports it copied in,
-/// freeze renders, glued files, `state/` and the export staging in `export/`.
-/// Nothing but the document and the names in `media/` is looked at. Open and
-/// Quit stop here; New calls this too, but when it spares a recording New's
-/// own reclaim then removes the scratch it stands on regardless - see the
-/// New arm.
+/// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar (a clone
+/// of the template's), the samples and imports it copied in, freeze renders,
+/// glued files, `state/` and the export staging in `export/`. Open and Quit
+/// stop here; New calls this too, and starts beside a scratch it spares
+/// rather than reclaiming it (`new_starts_beside`).
 fn discard_scratch_made_here(
     made_here: bool,
     dir: Option<&std::path::Path>,
     root: &std::path::Path,
 ) -> bool {
-    use tangent_ui::arrangement::{Arrangement, LoadOutcome};
     let Some(dir) = dir else {
         return false;
     };
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let template = root.join(tangent_ui::app::TEMPLATE_SHELF).join("default");
     if !made_here
         || !dir.is_dir()
-        || !(name == "Untitled" || name.starts_with("Untitled "))
+        || !tangent_ui::app::is_scratch_name(&name)
         || tangent_ui::app::inside_template_shelf(dir, root)
+        || !TangentApp::scratch_is_disposable(dir, &template)
     {
         return false;
-    }
-    match Arrangement::read_from(&tangent_ui::arrangement::doc_in(dir)) {
-        LoadOutcome::Missing | LoadOutcome::Empty => {}
-        LoadOutcome::Loaded(a) if !a.named && a.clips.is_empty() => {}
-        _ => return false,
     }
     let recorded = std::fs::read_dir(dir.join("media")).is_ok_and(|entries| {
         entries
@@ -19349,6 +19456,13 @@ impl eframe::App for DesktopApp {
         // not. Asked BEFORE the frame is drawn, so the dialog appears in the
         // same frame the close was requested in.
         if ctx.input(|i| i.viewport().close_requested()) {
+            // **A running arrangement record lands first, so the question can
+            // ask about it.** Its clips are in the document only once
+            // `finish_arr_record` has run, and a close used to drop the take
+            // unwritten - on a clean session without a word. Here, before
+            // anything rewinds the transport: it reads the playhead.
+            #[cfg(feature = "recorder")]
+            self.finish_arr_record();
             if self.app.intercept_quit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
@@ -19577,6 +19691,10 @@ impl eframe::App for DesktopApp {
     /// `.wav` keeps the placeholder sizes in its header — a file most players
     /// treat as zero-length. Somebody who left the recorder running for a
     /// practice session and then quit would lose the whole thing.
+    ///
+    /// So is an arrangement record, whose audio lives only in `ArrRec`'s
+    /// buffers until it is written: `update` lands one before the quit
+    /// question, and this catches one still running here.
     #[cfg(feature = "recorder")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // **The settings write the debounce still owes goes FIRST.** A fader
@@ -19585,6 +19703,10 @@ impl eframe::App for DesktopApp {
         // drain it. See `TangentApp::flush_settings_now`.
         self.app.flush_settings_now();
         self.recorder.session.stop();
+        // **And the arrangement record, finished the same way.** `update`
+        // lands one before the quit question; this is the backstop for one
+        // still running here, before the answer is read below.
+        self.finish_arr_record_keeping_the_answer();
         self.save_plugin_states();
         // **The document is NOT written here.**
         //
@@ -24360,6 +24482,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The launch sweep and Don't Save spare a folder that holds more than
+    /// a scratch.** Both matched any folder whose name began `Untitled ` and
+    /// judged it by its document, its kit and its `media/` alone, then
+    /// removed it WHOLE: a saved project filed inside a folder of the user's
+    /// (GNOME Files names a new one "Untitled Folder") went with it at the
+    /// next launch, takes and all, and so did a first save typed into a
+    /// scratch's own folder. Runs on a TEMP root only: the sweep lists that
+    /// root and can remove only its own `Untitled …` children.
+    #[test]
+    fn the_sweep_spares_a_folder_that_holds_more_than_a_scratch() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sweep-nested-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).expect("template");
+        let song = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir.join("media")).expect("song");
+            std::fs::write(dir.join("media").join("rec-1-1.wav"), b"a take").expect("take");
+            let mut song = tangent_ui::arrangement::Arrangement::default();
+            song.named = true;
+            song.save_to(&tangent_ui::arrangement::doc_in(dir));
+        };
+        // A folder of the user's, holding a saved project...
+        let filed = root.join("Untitled Folder").join("Song");
+        song(&filed);
+        // ...one of the user's that holds nothing, which is still not ours...
+        let theirs = root.join("Untitled draft");
+        std::fs::create_dir_all(&theirs).expect("their folder");
+        // ...a scratch's own name with a saved project inside it...
+        let nested = root.join("Untitled 2").join("Song");
+        song(&nested);
+        // ...and the litter the sweep is for: everything in it is Tangent's.
+        let litter = root.join("Untitled 3");
+        std::fs::create_dir_all(litter.join("media")).expect("litter");
+        std::fs::create_dir_all(litter.join("state")).expect("its shelf");
+        std::fs::write(litter.join("media").join(".DS_Store"), b"finder").expect("finder");
+        DesktopApp::sweep_disposable_untitleds(&root, &template);
+        let survived = filed.join("media").join("rec-1-1.wav").is_file();
+        let theirs_kept = theirs.is_dir();
+        let nested_kept = nested.join("media").join("rec-1-1.wav").is_file();
+        let litter_gone = !litter.exists();
+        // Don't Save on the scratch that holds the nested project.
+        let discarded = discard_scratch_made_here(true, Some(&root.join("Untitled 2")), &root);
+        let nested_kept_by_discard = nested.join("media").join("rec-1-1.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(survived, "the launch sweep deleted a saved project nested in a folder named Untitled …");
+        assert!(theirs_kept, "the launch sweep deleted a folder whose name Tangent never mints");
+        assert!(nested_kept, "the launch sweep deleted a saved project nested in an Untitled scratch");
+        assert!(litter_gone, "the sweep no longer clears a scratch holding only its own litter");
+        assert!(
+            !discarded && nested_kept_by_discard,
+            "Don't Save deleted a saved project nested in the scratch it discarded"
+        );
+    }
+
     /// **"Don't Save" clears a scratch this session made real - and nothing
     /// else.** A kit edit saves itself and an import copies in, so a touched
     /// scratch is real on disk and that kit or copy kept it from every sweep.
@@ -24421,6 +24601,92 @@ mod tests {
         assert!(!discard_scratch_made_here(true, Some(&recorded), &root));
         assert!(recorded.exists(), "Don't Save deleted a recording");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Don't Save keeps a drum kit built in the scratch.** The discard
+    /// tested the name, the shelf, the document on disk and `rec-*`, and
+    /// never the kit - against what every other kit road promises: the kit
+    /// saves itself because it is hours of sample assignment, and both
+    /// `fresh_project_dir` and the launch sweep spare a scratch whose kit is
+    /// not the template's. Whether Don't Save should take it is the owner's
+    /// call; until then the conservative answer holds, and a built kit keeps
+    /// the scratch as a recording does. Runs on a TEMP root only: the one
+    /// thing it can delete is the `Untitled` it builds there.
+    #[test]
+    fn dont_save_keeps_a_kit_built_in_the_scratch() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-discard-kit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let built = root.join("Untitled");
+        std::fs::create_dir_all(built.join("media")).expect("scratch");
+        std::fs::write(built.join("media").join("Kick.wav"), b"RIFFxxxxWAVE").expect("sample");
+        let mut kit = tangent_ui::drumpad::DrumpadDoc::default();
+        kit.pads[36].path = "media/Kick.wav".to_owned();
+        kit.save_beside(&tangent_ui::arrangement::doc_in(&built));
+        let removed = discard_scratch_made_here(true, Some(&built), &root);
+        let kept = built.join(tangent_ui::drumpad::FILE_NAME).is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!removed && kept, "Don't Save deleted a drum kit built in the scratch");
+    }
+
+    /// **New keeps a recording in the scratch it stands on.** New reclaimed
+    /// the session's own Untitled whole on the theory that the save prompt
+    /// had covered it - but Don't Save on Open and Quit keeps a recording,
+    /// and a clean session (a take undone off the timeline is still in
+    /// `media/`) gets no prompt at all. Either way the take was deleted. The
+    /// arm's two decisions are free functions so the rule can be driven; the
+    /// tail pins that the arm still decides by them, the question before the
+    /// discard and the landing after it.
+    #[test]
+    fn new_keeps_a_recording_in_the_scratch_it_stands_on() {
+        // (takes, asked, current, discarded): Don't Save on the scratch on
+        // screen is the prompt's answer, acted on by the discard...
+        assert!(!new_asks_about_scratch(1, false, true, true));
+        // ...which refused (a take is in it): New starts beside it.
+        assert!(
+            new_starts_beside(1, false, true, true, true),
+            "New reclaimed the scratch on screen after Don't Save refused to clear it, recording and all"
+        );
+        // A clean session was never asked: its own scratch is asked about.
+        assert!(
+            new_asks_about_scratch(1, false, true, false),
+            "New reclaimed a clean session's scratch, recording and all, without a question"
+        );
+        // The discard cleared it: New lands on the freed name.
+        assert!(!new_starts_beside(1, false, true, true, false), "New stepped past a folder that is gone");
+        // An unwritten scratch: nothing to ask about and nothing to keep.
+        assert!(!new_asks_about_scratch(0, false, true, false));
+        assert!(!new_starts_beside(0, false, true, false, false));
+        // A leftover scratch with takes is asked about, as it always was,
+        // and Keep leaves it standing; Discard it reclaims it.
+        assert!(new_asks_about_scratch(2, false, false, false));
+        assert!(new_asks_about_scratch(2, false, false, true));
+        assert!(!new_asks_about_scratch(2, true, false, false), "the warning's own answer asked again");
+        assert!(new_starts_beside(2, true, false, true, true));
+        assert!(new_starts_beside(2, true, true, false, true));
+        assert!(!new_starts_beside(2, false, false, false, true));
+        assert!(!new_starts_beside(2, false, true, false, true), "Discard it, from the warning, kept the scratch");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("ProjectRequest::NewDiscarding => {").expect("the New arm");
+        let arm = &src[at..at + src[at..].find("// **A clean slate").expect("its clearing")];
+        let asks = arm
+            .find("if new_asks_about_scratch(takes, asked, is_current, discarded) {")
+            .expect("the New arm no longer asks through `new_asks_about_scratch`");
+        let discard = arm
+            .find("if discarded && self.discard_outgoing_scratch()")
+            .expect("the New arm no longer acts on Don't Save");
+        let lands = arm
+            .find("new_starts_beside(takes, keeping, is_current, discarded, dir.exists())")
+            .expect("the New arm no longer lands through `new_starts_beside`");
+        assert!(
+            asks < discard && discard < lands,
+            "the New arm decides before the question, or reads the folder before the discard"
+        );
     }
 
     /// An audio clip for the glue tests: everything playback reads, spelled.
@@ -25476,21 +25742,37 @@ mod tests {
     #[test]
     fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
         // `insert_state_path` is per-install, and `(CHANNELS + 3, 2)` is
-        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf
-        // beside the real settings file. Not yet redirected: this reads and
-        // rewrites that file, unlocked against the tests that move
-        // `IVORY_SETTINGS_PATH`, and only puts it back at the end.
-        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
-        let path = insert_state_path(strip, bay);
-        let had = std::fs::read(&path).ok();
-        let restore = || match &had {
-            Some(raw) => {
-                let _ = std::fs::write(&path, raw);
+        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf -
+        // so this runs under `SIDECAR_ENV` with `IVORY_SETTINGS_PATH`
+        // pointed at a scratch folder, and puts the variable back after.
+        let _lock = super::sidecar_walk_probe::SIDECAR_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shelf = std::env::temp_dir().join(format!(
+            "tangent-displaced-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&shelf);
+        std::fs::create_dir_all(&shelf).expect("a scratch shelf");
+        let was = std::env::var_os("IVORY_SETTINGS_PATH");
+        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        let restore = || {
+            // SAFETY: still under `SIDECAR_ENV`.
+            unsafe {
+                match &was {
+                    Some(v) => std::env::set_var("IVORY_SETTINGS_PATH", v),
+                    None => std::env::remove_var("IVORY_SETTINGS_PATH"),
+                }
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+            let _ = std::fs::remove_dir_all(&shelf);
         };
+        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
+        assert!(
+            insert_state_path(strip, bay).starts_with(&shelf),
+            "the sidecar is still on the live shelf"
+        );
 
         // A plugin saved at one setting and dialled to another since.
         write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as saved");
@@ -25528,6 +25810,34 @@ mod tests {
             "the last save outranked what the plugin was playing when it left"
         );
         restore();
+    }
+
+    /// **The displaced-state test stays off the live shelf.** It read and
+    /// rewrote `insert-state-35-2.bin` - the master's sixth slot - beside
+    /// the owner's own settings, with no redirect and no lock against the
+    /// tests that move `IVORY_SETTINGS_PATH`, and put the file back only at
+    /// the end: a failed assert left a foreign-tagged sidecar, and a live
+    /// save in between was overwritten. A source scan of that test, whose
+    /// redirect must stand before the first sidecar path is worked out.
+    #[test]
+    fn the_displaced_state_test_stays_off_the_live_shelf() {
+        let whole = include_str!("desktop.rs");
+        // Built at run time so this test's own source cannot match.
+        let name = format!("fn {}() {{", "a_displaced_plugin_state_survives_the_write_that_buried_it");
+        let at = whole.find(&name).expect("the test");
+        let body = &whole[at..at + whole[at..].find("\n    }\n").expect("its end")];
+        // Whitespace out, so a line break inside a call cannot hide it.
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let lock = body.find("SIDECAR_ENV.lock()");
+        // To the scratch shelf - not the restore's own `set_var` at the end.
+        let redirect = body.find("std::env::set_var(\"IVORY_SETTINGS_PATH\",shelf");
+        let first = body.find("insert_state_path(").expect("the test reads a sidecar path");
+        assert!(
+            lock.is_some_and(|l| redirect.is_some_and(|r| l < r && r < first)),
+            "it reads and rewrites insert-state-35-2.bin - the master's sixth slot - \
+             on the live shelf beside the owner's settings.json, unlocked against \
+             the tests that move IVORY_SETTINGS_PATH"
+        );
     }
 
     /// **A full shelf drops its OLDEST entry, never all of them.**
@@ -25719,6 +26029,30 @@ mod tests {
             carried.push("Reset Template carries the last session's shelf into the next one");
         }
         assert!(carried.is_empty(), "{}", carried.join("; "));
+    }
+
+    /// **A template opened from the Open panel takes its plugin states from
+    /// its own shelf.** It is adopted into a fresh scratch now
+    /// (`TangentApp::open_project`), and a scratch has no `state/`:
+    /// mirroring the project's shelf as an ordinary open does would clear
+    /// every live sidecar, and while the session stayed in the previous
+    /// project's folder it seated that project's states on the template
+    /// desk. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_template_opened_from_the_panel_takes_its_states_from_its_own_shelf() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn switch_project(&mut self, doc:").expect("switch_project");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let open = body.find("self.app.open_project(doc);").expect("the open");
+        let branch = body
+            .find("if tangent_ui::app::inside_template_shelf(doc, &self.app.project_root()) {")
+            .expect("switch_project no longer tells a template from a project");
+        assert!(open < branch, "the template's states are decided before it is adopted");
+        assert!(
+            body[branch..].contains("self.copy_states_from_shelf(&template.join(\"state\"));"),
+            "an adopted template's plugin states no longer come off its own shelf"
+        );
     }
 
     /// **The ticks on the waveform and the warp the Apply writes come from
@@ -27024,6 +27358,31 @@ mod tests {
         );
     }
 
+    /// **Reset Template lets the outgoing session go as New does.** The app
+    /// asks about unsaved work first now (`AfterSave::ResetTemplate`), and
+    /// the host carries the answer out: the plugins' knobs, which never
+    /// dirty the document, are shelved into the outgoing project unless the
+    /// answer was Don't Save - the adopt mirrors the template's shelf, which
+    /// CLEARS the live one - and a discarded scratch this session made is
+    /// cleared. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn reset_template_lets_the_outgoing_session_go_as_new_does() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("ProjectRequest::ResetTemplate => {").expect("the Reset Template arm");
+        let arm = &src[at..at + src[at..].find("ProjectRequest::Save =>").expect("the arm after it")];
+        let adopt = arm.find("self.adopt_fresh_from_template(").expect("the adopt");
+        let answer = arm.find("let discarded = self.app.take_outgoing_discarded();");
+        let shelved = arm.find("self.copy_states_to_project();");
+        let cleared = arm.find("self.discard_outgoing_scratch();");
+        assert!(
+            answer.is_some_and(|a| shelved.is_some_and(|s| cleared.is_some_and(|c| a < s && a < c && s < adopt && c < adopt))),
+            "Reset Template replaces the session without carrying out the save \
+             prompt's answer: knobs turned since the last save are lost, or a \
+             discarded scratch is left behind"
+        );
+    }
+
     /// **Every road that writes a project writes the DOCUMENT before it
     /// shelves the plugin states, because the document is what makes the
     /// folder exist.**
@@ -27291,6 +27650,93 @@ mod tests {").expect("the tests module")];
             focus < flush && minimised < flush,
             "the flush in update is not driven by the focus and minimise edges"
         );
+    }
+
+    /// **A window close finishes a running arrangement record.** No road out
+    /// of the window called `finish_arr_record`, so a take rolling at Cmd+Q,
+    /// or at the window's close button, was dropped unwritten with its
+    /// `ArrRec` - and on a clean session nothing even asked. It lands before
+    /// the quit question now, so the question can ask about it, and `on_exit`
+    /// finishes one still running before it reads the question's answer,
+    /// which the finish would otherwise clear. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_window_close_finishes_a_running_arrangement_record() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let update = &src[src
+            .find("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)")
+            .expect("update")..];
+        let close = update.find("i.viewport().close_requested()").expect("the close");
+        let question = update.find("self.app.intercept_quit()").expect("the quit question");
+        let exit = &src[src.find("fn on_exit(&mut self").expect("on_exit")..];
+        let exit = &exit[..exit.find("\n    }\n").expect("the end of on_exit")];
+        let finish = exit.find("self.finish_arr_record_keeping_the_answer();");
+        let answer = exit.find("self.app.take_outgoing_discarded()").expect("on_exit reads the answer");
+        assert!(
+            close < question && update[close..question].contains("self.finish_arr_record();"),
+            "no road out of the window finishes the arrangement record before the \
+             quit question: a take rolling at Cmd+Q is dropped unwritten with its ArrRec"
+        );
+        assert!(
+            finish.is_some_and(|f| f < answer),
+            "on_exit drops a record still running, or finishes it after reading the \
+             quit question's answer, which the finish clears"
+        );
+    }
+
+    /// **A session switch never carries a running record into the next
+    /// session.** Neither Open nor New touched `arr_rec`, so a take rolling
+    /// through the switch kept recording, and at Stop its audio went into the
+    /// NEXT session's folder and its clips into the next document, carving
+    /// that document's clips on those lanes from the record's start. Both
+    /// roads finish it first, while the outgoing session is still the one on
+    /// the desk and before the save-back that keeps it. A source scan.
+    #[test]
+    fn a_session_switch_never_carries_a_running_record_into_the_next_session() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let between = |from: &str, to: &str| {
+            let a = src.find(from).unwrap_or_else(|| panic!("`{from}` is gone"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("`{to}` after `{from}` is gone"));
+            src[a..a + b].to_owned()
+        };
+        // Both roads are read before anything panics, so one run names each
+        // one that lets the record through.
+        let mut carried: Vec<String> = Vec::new();
+        for (road, body) in [
+            ("switch_project", between("fn switch_project(&mut self, doc:", "self.app.open_project(doc)")),
+            ("the New arm", between("ProjectRequest::NewDiscarding => {", "self.app.adopt_template(&template, &dir)")),
+        ] {
+            let finish = body.find("self.finish_arr_record_keeping_the_answer();");
+            let save = body.find("self.app.save_project_doc()").expect("the save-back");
+            if !finish.is_some_and(|f| f < save) {
+                carried.push(format!(
+                    "{road} replaces the session under a running arrangement record, or \
+                     finishes it after the save-back, so the take lands in the NEXT \
+                     session's folder and document, or in no document at all"
+                ));
+            }
+        }
+        // New's question came before the take was in the document, so a New
+        // that finishes one asks again before it decides anything - or a
+        // MIDI take, which has no file to keep its scratch, is reclaimed.
+        let new_arm = between("ProjectRequest::NewDiscarding => {", "self.app.adopt_template(&template, &dir)");
+        let asks = match (
+            new_arm.find("self.finish_arr_record_keeping_the_answer();"),
+            new_arm.find("self.app.ask_before_new()"),
+            new_arm.find("fresh_project_dir(&root)"),
+        ) {
+            (Some(f), Some(a), Some(r)) => f < a && a < r,
+            _ => false,
+        };
+        if !asks {
+            carried.push(
+                "the New arm lets a session go without asking about the take it just finished"
+                    .to_owned(),
+            );
+        }
+        assert!(carried.is_empty(), "{}", carried.join("; "));
     }
 
     /// **Every road out of this app ends at the hardened exit.**
@@ -31812,8 +32258,10 @@ mod sidecar_walk_probe {
     /// and tests are not.** Same reason and same shape as `SETTINGS_PATH_ENV`
     /// in `settings.rs`: cargo runs these on parallel threads in ONE process,
     /// so a count read here would otherwise include another test's walk, and a
-    /// settings path set here would be taken away under it.
-    static SIDECAR_ENV: Mutex<()> = Mutex::new(());
+    /// settings path set here would be taken away under it. Shared with
+    /// `tests::a_displaced_plugin_state_survives_the_write_that_buried_it`,
+    /// which moves the settings path too.
+    pub(super) static SIDECAR_ENV: Mutex<()> = Mutex::new(());
 
     /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
     /// question is about — the shelf that matters is a PROJECT folder, and a

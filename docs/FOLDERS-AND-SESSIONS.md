@@ -50,10 +50,14 @@ makes no folder. Renaming before that repoints alone, so the folder is
 born under the chosen name; any of those writers makes `Untitled` real
 without a save. The launch sweep (`sweep_disposable_untitleds`) removes,
 WHOLE, every folder directly under the project root named `Untitled` or
-`Untitled …` whose `media/` holds nothing `count_media` counts, whose kit
-is not custom and whose document is missing, empty, or unnamed and
-clipless. It looks nowhere else in the folder: a subfolder or a nested
-project goes with it.
+`Untitled <n>` (`is_scratch_name`) whose `media/` holds nothing
+`count_media` counts, whose kit is not custom, whose document is missing,
+empty, or unnamed and clipless, and which holds nothing but what Tangent
+writes into a scratch (`holds_only_scratch`: the document, the kit and its
+write temp, `state/`, `export/`, `media/` with files only, dotfiles). A
+subfolder, a nested project or anybody's own file keeps the folder; it used
+to go with it. New's reclaim (`fresh_project_dir`) and Don't Save
+(`discard_scratch_made_here`) apply the same contents rule.
 
 Related invariants that keep this working:
 
@@ -82,35 +86,71 @@ Related invariants that keep this working:
   kit `kit_is_custom` calls a kit work only when it holds a sample or
   cannot be parsed.
 - **New, Open and Quit ask, and "Don't Save" sticks.** The menu's and the
-  Project window's New and Open go through `ask_before`, as Quit does
-  (Settings > Reset does not: The Default Template replaces the session
-  without asking, and Everything opens a fresh one through New). The
+  Project window's New and Open go through `ask_before`, as Quit does, and
+  so does Settings > Reset > The Default Template, which replaces the
+  session with a fresh one from the rebuilt template
+  (`AfterSave::ResetTemplate`; the host's arm then shelves or discards the
+  outgoing session as New does). Everything does not ask: it opens a fresh
+  session through New with the session DISCARDED - `reset_settings`
+  commits the reset as a moment, then
+  gives Discard's answer, so the emptied desk is never written into the
+  open project's document - and keeping, so a leftover Untitled with takes
+  is never reclaimed unasked. The
   prompt's Discard reaches the host as `take_outgoing_discarded` and gates
   the document save-back AND the project plugin-state mirror in
   `switch_project`, the New arm and `on_exit`, and it survives New's detour
   through the scratch warning (`rearm_outgoing_discarded`). Then a scratch
-  THIS session made real (`made_real_this_session`), named Untitled,
-  unnamed and clipless ON DISK, off the shelf and holding no recording
-  (`rec-*`) is removed WHOLE (`discard_scratch_made_here`): its kit (a kit
-  built there included), the samples and imports it copied in, freeze
-  renders, glued files, `state/` and the export staging. Open and Quit
-  leave a scratch holding a recording on disk; New's reclaim of the
-  scratch it stands on removes it, recordings and all, unless its kit
-  differs from the template's (New then steps past it to `Untitled 2`).
+  THIS session made real (`made_real_this_session`), named `Untitled` or
+  `Untitled <n>`, unnamed and clipless ON DISK, off the shelf, holding
+  nothing but Tangent's own files, still on the template's kit and with no
+  recording (`rec-*`) is removed WHOLE (`discard_scratch_made_here`): its
+  kit sidecar, the samples and imports it copied in, freeze renders, glued
+  files, `state/` and the export staging. A kit built there keeps the
+  scratch, as it keeps it from New's reclaim and the sweep: the
+  conservative answer, pending the owner's ruling on whether Don't Save may
+  take a kit. Open, Quit and
+  New all leave a scratch the discard refuses on disk: New starts beside
+  it (`new_starts_beside`, the next free `Untitled <n>`). A clean session
+  gets no prompt, so New asks about its scratch's takes with the scratch
+  warning first, as it does for a leftover one (`new_asks_about_scratch`);
+  it used to reclaim it, a take undone off the timeline included.
+- **A running arrangement record ends in the session it was recorded in.**
+  Every road out finishes it first (`finish_arr_record`): a window close
+  before the quit question, so the question covers the take; Open before
+  the save-back, which keeps it; New before it decides anything, asking
+  New's question again when the take is unsaved work nobody was asked
+  about (`ask_before_new`); and `on_exit` for one still running. The
+  roads take the save prompt's answer before finishing and put it back
+  (`finish_arr_record_keeping_the_answer`), since the finish commits a
+  moment and a new moment clears Don't Save. A close used to drop the take
+  unwritten, and a New or an Open carried it into the next session. New's
+  reclaim treats a document holding clips as work, as the sweep and the
+  discard do, so a scratch Open wrote back with a take is never reclaimed.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
-  every lane's kit samples and writes the kit sidecar. Imports, pad loads,
+  every lane's kit samples and writes the kit sidecar, and brings the files
+  the document's own clips and frozen lanes stand on out of the template
+  too (`copy_doc_media`; `write_template_into` carries them the same way,
+  so a template re-saved from a scratch keeps them). Imports, pad loads,
   arrangement takes with audio, freezes, glues and realtime exports go
   through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
-  only into a folder that is already real).
+  only into a folder that is already real). Not yet heard BEFORE it is
+  real: the host resolves a clip and a frozen lane against the unmade
+  folder, not the template the way the kit's `kit_doc` does, so a
+  template's own audio is silent in a scratch until something makes it
+  real.
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
-  from the Open panel is READ, not inhabited, and that road is not yet
-  safe: `project_doc`, the kit and the plugin-state shelf all stay the
-  previous session's, so the template's unnamed document stands in that
-  project's folder. The next Save MOVES that folder to the name typed and
-  writes the template over its document, and the next Open or Quit mirrors
-  the template desk's plugin states into that project's `state/`.
+  from the Open panel is ADOPTED the same way (`open_project`), into the
+  first free `Untitled` name that is not on disk, and its plugin states come
+  off its own `state/` (`switch_project`). It used to be read and not
+  inhabited: the session stayed in the previous project's folder, so the
+  next Save moved that folder to the name typed and wrote the template over
+  its document, and the next Open or Quit mirrored the template desk's
+  plugin states into that project's `state/`. And a first save never moves
+  a folder whose document on disk is named (`save_project_first`): an undo
+  past a first save leaves the session unnamed inside a kept project, and
+  that folder is copied from, not moved.
 - **No test resolves the owner's media folder**: `Settings::media_root`
   honours `TANGENT_MEDIA_ROOT` in every build and is a per-thread temp root
   under `tangent-ui`'s tests. One test wrote a blank document over the real
