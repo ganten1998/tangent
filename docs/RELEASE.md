@@ -100,13 +100,17 @@ Installer** certificate; `release.sh` fails an unsigned pkg at check time.
 
 `scripts/sign-windows.sh` Authenticode-signs a PE via **jsign** against
 Azure Artifact Signing (signtool is Windows-only and this binary is
-cross-built from macOS). Four PEs ship, and all four take that one route:
+cross-built from macOS). Six PEs ship, and all six take that one route:
 `build-cross.sh` signs the inner `tangent.exe` and the bundled
-`tangent-ffmpeg.exe` as it stages them; makensis signs the uninstaller while
-it builds the installer (`!uninstfinalize` in `installer/windows/tangent.nsi`,
-with `= 0` so a failed signing fails the build - without it makensis ignores
-the exit code and ships the uninstaller unsigned, which was tested); and
-`build-cross.sh` signs `setup.exe` after makensis writes it.
+`tangent-ffmpeg.exe` as it stages them; `build-installer.sh` signs copies of
+the two NSIS plug-in DLLs the installer unpacks and loads (`System.dll`,
+which `.onInit` calls to ask whether Windows is 64-bit, and `nsDialogs.dll`)
+and hands makensis a private `NSISDIR` holding them; makensis signs the
+uninstaller while it builds the installer (`!uninstfinalize` in
+`installer/windows/tangent.nsi`, with `= 0` so a failed signing fails the
+build - without it makensis ignores the exit code and ships the uninstaller
+unsigned, which was tested); and `build-cross.sh` signs `setup.exe` after
+makensis writes it.
 
 **The timestamp is RFC 3161, and that is not optional.**
 `timestamp.acs.microsoft.com` speaks only RFC 3161; jsign's default is the
@@ -126,17 +130,27 @@ even for an administrator: an unknown, unsigned program is simply blocked.
 A tester hit exactly that on 2026-09-24, days after installing, when Smart
 App Control left its evaluation mode. It needs a valid signature, not
 reputation, so a signed build runs there from its first release - but only
-if the encoder and the uninstaller are signed as well as the app.
+if the encoder, the uninstaller and the installer's NSIS plug-ins are
+signed as well as the app.
 
 With none of `TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
 `TRUSTED_SIGNING_PROFILE` set, the PEs ship unsigned and the build says so
 for each one; with only some of them set the build **fails** rather than
 quietly shipping an unsigned binary you believe is signed. A token can be
-supplied directly as `TRUSTED_SIGNING_TOKEN`. `release.sh` then checks the
-signature of `setup.exe`, of each PE inside it (extracted with 7-Zip:
-`tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe`) and of each PE in the
-portable zip (`scripts/pe-signed.py`), and a Windows release runs RED until
-the Azure account exists, on purpose.
+supplied directly as `TRUSTED_SIGNING_TOKEN`; set it around the signing
+only, since an exported variable reaches every child of the build. Either
+way `sign-windows.sh` hands the token to jsign through jsign's environment
+(`--storepass env:…`), never on its command line, where any process on the
+machine could read it for as long as a signing runs.
+
+`release.sh` then checks the signature of `setup.exe`, of every PE inside
+it (extracted with 7-Zip: `tangent.exe`, `tangent-ffmpeg.exe`,
+`Uninstall.exe` and the two NSIS plug-ins, and any other `.exe` or `.dll`
+it lists) and of each PE in the portable zip (`scripts/pe-signed.py`), and
+fails the release on any that is unsigned; `publish-dropbox.sh` refuses a
+tester build the same way. The Azure account has signed since 2026-09-24,
+so an unsigned PE now means a machine without the three variables (the
+build said so, once per PE), not an account still to be set up.
 
 Account setup, from zero, is `docs/WINDOWS-SIGNING.md` - the one-time Azure
 walkthrough (an individual's identity check takes minutes; an
@@ -180,11 +194,12 @@ Notes on the set:
   (`docs/STORE-CONTENT.md`), the legacy `ivory-windows-x86_64.zip` is in
   supporter emails sent before the installers took over at 3.0.0, and
   `publish-github.sh` can only upload an alias for a file that exists in
-  `dist/`. If `makensis` is missing, only the zip is built and the run warns
-  loudly that no setup.exe was produced. The
+  `dist/`. If `makensis` is missing, only the zip is built and the run
+  fails, saying no setup.exe was produced. The
   `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
-  function name; it is not a deliverable and `publish-github.sh` does not
-  upload it.
+  function name; it is not a deliverable, `publish-github.sh` does not
+  upload it, and `release.sh` leaves it out of `SHA256SUMS` (a summed file
+  nobody can download fails every user's `shasum -c`).
 - **The VST3 plugin is retired** (2026-08-24, the owner's ruling). No
   installer may carry a `Tangent.vst3`; `release.sh` fails any that does.
 - **FreeBSD ships.** `scripts/release.sh` on a FreeBSD host runs
@@ -215,19 +230,28 @@ that is wanted (a toolchain regression, a glibc question, the suite on Linux).
 
 Details that matter and are easy to lose:
 
+- **A leg that fails lets the others run, then fails the run.** A Linux
+  failure here is a real one (the glibc floor refusing a binary, a file
+  the readme promises missing, a sysroot that would not download). The
+  previous run's tarball is kept when its leg fails, so the exit status is
+  what tells: `release.sh` goes red on it, and on any piece of the Mac's
+  set that is missing.
 - **The Linux and Windows legs build without `mp3`.** LAME's autotools build
   compiles and runs test programs, which a macOS host cannot do for a foreign
   target. Nothing is lost: MP3 delivery goes through the bundled ffmpeg
   sidecar on both platforms.
 - **ASIO rides into the Windows build** when the Steinberg SDK is present
   under `vendor/asiosdk_*` (its licence forbids committing it, so a fresh
-  checkout does not have it). Without it `build-cross.sh` still produces a
-  WASAPI-only build and says so in one line, and `release.sh` then fails
-  the release on the missing `ASIO-NOTICE.txt`. Unpack the SDK into
-  `vendor/` before any Windows build meant for a tester or a release. (The
-  notice is written whenever `CPAL_ASIO_DIR` is set, and that is cpal's own
-  variable: one exported in the shell writes it over a WASAPI-only build
-  too, and that build then passes.)
+  checkout does not have it). Without it `build-cross.sh` refuses to start,
+  before the Linux legs spend their time; `ALLOW_WASAPI_ONLY=1` builds a
+  WASAPI-only Windows build on purpose, and the artifact checks then keep it
+  from shipping, to a release or to testers, on the missing
+  `ASIO-NOTICE.txt` and ASIO host. Unpack the SDK into `vendor/` before any
+  Windows build. The notice is written when the build's features include
+  `asio`, and the checks also read the ASIO host off `tangent.exe` itself,
+  so a WASAPI-only build cannot pass on a notice (it once could: the notice
+  was keyed on `CPAL_ASIO_DIR`, cpal's own variable, which a shell can
+  export).
 - **`scripts/build-cross.sh check-linux`** type-checks the Linux target from
   macOS with a stub `alsa.pc`, so Linux-only code is checked before pushing
   rather than discovered broken on the Linux box.
@@ -246,7 +270,15 @@ Run on each OS, copy the artifacts into one `dist/`, then
 artifacts, which are otherwise purged so no stale file rides a checksum or
 upload glob.)
 
-Per artifact, it verifies and refuses to bless a release on failure:
+On the Mac a full run (not `--sums-only`) first requires the whole set the
+Mac builds: the pkg, the macOS zip, the setup.exe, the Windows zip and both
+Linux tarballs (the dmg stays best-effort; `SKIP_WINDOWS=1` waives the four
+the cross build makes). Only files that exist can be checked, so a leg that
+produced nothing used to leave every check green.
+
+Per artifact it runs `scripts/check-artifacts.sh`, the one copy of these
+checks (`publish-dropbox.sh` runs it on every tester build too), and
+refuses to bless a release on failure:
 
 - **pkg**: expands it and requires the app component, NO retired VST3
   component, a standalone install choice, `relocatable="false"` (so a stray
@@ -254,17 +286,20 @@ Per artifact, it verifies and refuses to bless a release on failure:
   signature, and a stapled notarization ticket (`stapler validate`).
 - **setup.exe** (needs `7zz`; without it the run FAILS rather than
   skipping): requires `tangent.exe`, NO VST3 payload and `Uninstall.exe`;
-  an Authenticode signature on setup.exe itself and on `tangent.exe`,
-  `tangent-ffmpeg.exe` and `Uninstall.exe` as extracted from it.
+  an Authenticode signature on setup.exe itself and on every PE 7-Zip
+  lists inside it, as extracted: `tangent.exe`, `tangent-ffmpeg.exe`,
+  `Uninstall.exe`, and NSIS's own `System.dll` and `nsDialogs.dll`. Its
+  `tangent.exe` and `tangent-ffmpeg.exe` must be the portable zip's, byte
+  for byte, when both are checked: two builds under one version's names
+  fail.
   `scripts/pe-signed.py` checks PRESENCE (a non-empty certificate table),
   not chain validity, which only a first launch on Windows proves.
 - **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.
 - **macOS zip**: the `Tangent.app` executable present, no `__MACOSX` junk.
-- **Windows zip**: `tangent.exe` at the top level; `ASIO-NOTICE.txt`, the
-  fingerprint of an ASIO build, so a WASAPI-only Windows build fails the
-  release (unless an exported `CPAL_ASIO_DIR` wrote the notice anyway: see
-  the ASIO bullet above); and signatures on `tangent.exe` and
-  `tangent-ffmpeg.exe`.
+- **Windows zip**: `tangent.exe` at the top level; Steinberg's
+  `ASIO-NOTICE.txt` and the ASIO host in `tangent.exe` itself (the SDK's
+  `software\asio` registry key, compiled in), so a WASAPI-only Windows build
+  fails; and signatures on `tangent.exe` and `tangent-ffmpeg.exe`.
 - **Linux tarballs**: the `tangent` binary (the pre-2.1.0 empty-tarball bug),
   `install.sh` (the README's first instruction; 4.92.0 shipped without it),
   and `tangent-ffmpeg` (video on a clean machine; also shipped missing once).
@@ -319,10 +354,15 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    supporter-key email and in `README.md`; **a release published without the
    aliases 404s for everyone who has already paid, silently.** The script
    re-checks every permalink after upload and exits non-zero if one is dead,
-   so a red run is never cosmetic. A version with a pre-release suffix is
-   published as a GitHub pre-release, deliberately: `latest/download`
-   resolves against the latest stable, so a correctly marked beta leaves the
-   permanent links alone. Release notes must include the SmartScreen note.
+   so a red run is never cosmetic. Before uploading it refuses a checksum
+   file that does not cover every artifact, or that names a file it would
+   not upload, and a stable release with no asset for one of the permanent
+   links `README.md`, `docs/STORE-CONTENT.md` or the supporter email hands
+   out (`scripts/check-store-links.sh --names` lists them). A version with a
+   pre-release suffix is published as a GitHub pre-release, deliberately:
+   `latest/download` resolves against the latest stable, so a correctly
+   marked beta leaves the permanent links alone. Release notes must include
+   the SmartScreen note.
    For 5.0.0 specifically they must also say that the pre-5.0
    `~/.config/ivory/` directory is removed at first launch rather than
    migrated (a clean break; supporter keys are re-sent by email).
@@ -332,30 +372,43 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 
 ## Builds for testers: `scripts/publish-dropbox.sh`
 
-Between releases every build is `X.Y.Z-dev`, and `release.sh` refuses to
-touch one, so NONE of its artifact checks (signatures, the ASIO notice, the
-payload lists) run on what testers receive. `publish-dropbox.sh
-[windows|macos|linux …]` copies the current version's artifacts from
-`dist/` to `<Dropbox>/Tangent Development/builds/<HEAD>[-dirty]/`, installer
-first, and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/`
-is skipped with a line that names it, so the default run (all three)
-publishes whatever was built. What it does not know:
+`publish-dropbox.sh [windows|macos|linux …]` copies this version's
+artifacts from `dist/` to
+`<Dropbox>/Tangent Development/builds/<commit>[-dirty]/`, installer first,
+and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/` is
+skipped with a line that names it, so the default run (all three)
+publishes whatever was built. `release.sh` refuses to touch a `-dev`
+version, so before it copies anything this does two of its jobs itself:
 
-- **Which commit built the files.** The folder is named after the commit
-  checked out, and `-dirty` after the tracked files, WHEN YOU PUBLISH;
-  every `-dev` build has the same file names. Rebuild immediately before
-  publishing.
-- **What is left over.** Everything in `dist/` with this version's name
-  goes: an `ARCH=host` `macos-arm64` pair survives a later universal build,
-  a failed Linux leg leaves the previous run's tarballs, and nothing
-  removes an old setup.exe before `makensis` runs again.
+- **It takes only what this tree built, and names the folder after it.**
+  Every `-dev` build has the same file names, so `build-macos.sh`,
+  `build-cross.sh` and `build-linux-remote.sh` stamp each artifact they
+  finish with the git tree it was built from (`scripts/build-stamp.sh`; the
+  stamps live in `dist/.stamps/`). A file built from HEAD's tree goes out as
+  `<HEAD>`, even if you have started editing since; one built from the
+  uncommitted state you have now goes out as `<HEAD>-dirty`; a build you
+  commit afterwards, with exactly what was built, goes out as that commit.
+  Anything else is skipped with a line that says why: an `ARCH=host`
+  `macos-arm64` pair from an earlier build, the previous run's tarball
+  after a failed Linux leg, a file copied in by hand (it has no stamp).
+  Files built from HEAD and files built from uncommitted work never share a
+  folder: publish one platform at a time, or rebuild.
+- **It runs the release's artifact checks** (`scripts/check-artifacts.sh`,
+  above: signatures on every Windows PE, the ASIO notice and host, the
+  payload lists). A build that fails one is not published; `SKIP_CHECKS=1`
+  publishes it anyway, on purpose.
+
+A failed installer build leaves no setup.exe at all: `build-installer.sh`
+removes the old one before it starts.
 
 ## Store links: check them, then act in order
 
 `scripts/check-store-links.sh` fetches every `releases/latest/download/` URL
 in `README.md`, `docs/STORE-CONTENT.md` and `tools/tangent-fulfil/src/main.rs`.
 They resolve by EXACT asset name against whatever release is currently
-latest, so a new name 404s until it has shipped.
+latest, so a new name 404s until it has shipped. `--names` prints just the
+asset names, fetching nothing, which is how `publish-github.sh` knows what a
+stable release must carry.
 
 The order that keeps this honest: **publish, check, paste, deploy.** It has
 gone wrong twice, both times by getting ahead of the publish: the key email

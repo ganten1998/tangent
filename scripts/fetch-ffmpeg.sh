@@ -165,11 +165,34 @@ keep() {
     return 0
 }
 
-provenance() { # provenance <dir> <url> <sha>
+# provenance <dir> <url> <sha>: the SOURCE.txt that travels beside the binary.
+#
+# **"Unmodified", except for the signature on Windows.** build-cross.sh signs
+# the STAGED tangent-ffmpeg.exe (Smart App Control refuses an unsigned
+# program), which appends a certificate table and updates the PE checksum and
+# certificate-table entry, and this file ships beside that copy; it used to
+# call it unmodified. **And the URL is where the archive came from, not where
+# its source is**: neither server hosts this build's source at that address,
+# and BtbN prunes dated releases within weeks. The hosted source the GPL
+# wants named here is W31 in the 5.1 worklist (LICENSING.md, the hosting
+# plan); until it exists, this says only what is true.
+provenance() {
+    local how="This ffmpeg build is bundled unmodified."
+    if [ "$PLATFORM" = windows ]; then
+        how="This is BtbN's ffmpeg build, unmodified but for one thing: in a signed
+Tangent build (every Windows release is one) it carries Tangent's Authenticode
+signature, which appends a certificate table and updates the PE checksum and
+certificate-table entry. The program code is BtbN's, byte for byte."
+    fi
     cat > "$1/SOURCE.txt" <<EOF
-This ffmpeg build is bundled unmodified. Tangent invokes it as a separate
-process; it is GPL-licensed (see the licence text beside this file) and its
-source code is available from https://ffmpeg.org/ and from the build's page:
+$how
+
+Tangent invokes it as a separate process. It is GPL-licensed (see the licence
+text beside this file), and ffmpeg's source code is available from
+https://ffmpeg.org/.
+
+The archive it came from, so the build can be identified after the link is
+gone (dated builds are pruned upstream):
 
   $2
   sha256 of the downloaded archive: $3

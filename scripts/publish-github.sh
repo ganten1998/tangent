@@ -117,6 +117,21 @@ for a in "${ARTIFACTS[@]}"; do
   grep -Fq "  ${a#dist/}" "$SUMS" \
     || { echo "$SUMS does not cover ${a#dist/} (stale?) — scripts/release.sh --sums-only" >&2; exit 1; }
 done
+# **And the other way round: every file the sums name goes up with them.** A
+# user checks a download with `shasum -c SHA256SUMS`, which fails on any line
+# whose file was never published; the Windows PDB rode in exactly that way,
+# summed by release.sh and uploaded by nobody.
+while read -r _ named; do
+  [ -n "$named" ] || continue
+  named="${named#\*}"   # a binary-mode sum marks the name with `*`
+  hit=0
+  for a in "${ARTIFACTS[@]}"; do [ "${a#dist/}" = "$named" ] && { hit=1; break; }; done
+  [ "$hit" = 1 ] || {
+    echo "$SUMS names $named, which this publish does not upload: a user's" >&2
+    echo "  \`shasum -c\` would fail on it. Rerun scripts/release.sh --sums-only." >&2
+    exit 1
+  }
+done < "$SUMS"
 echo "==> Checksums: $SUMS"
 
 # ── Build the alias set in a temp dir ────────────────────────────────────────
@@ -191,6 +206,34 @@ done
 
 echo "==> ${#UPLOADS[@]} assets (${#ARTIFACTS[@]} artifacts, each in both spellings)"
 for u in "${UPLOADS[@]}"; do echo "    $(basename "$u")"; done
+
+# **Every permanent link a buyer holds gets its asset.** The links in
+# README.md, the store page and the supporter email resolve by exact name
+# against the latest stable release, and the check after the upload only
+# asks about what WAS uploaded: a release built without its Linux tarball
+# would publish "OK" and 404 tangent-linux-x86_64.tar.gz for everyone who
+# had paid. check-store-links.sh reads those three sources; nothing here
+# keeps a second list of the names.
+if [ "$PRERELEASE" = 0 ]; then
+  NEED="$(scripts/check-store-links.sh --names)" \
+    || { echo "could not read the permanent links (scripts/check-store-links.sh --names)" >&2; exit 1; }
+  MISSING=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    hit=0
+    for u in "${UPLOADS[@]}"; do
+      if [ "$(basename "$u")" = "$name" ]; then hit=1; break; fi
+    done
+    [ "$hit" = 1 ] || MISSING="$MISSING $name"
+  done <<< "$NEED"
+  if [ -n "$MISSING" ]; then
+    echo "refusing: this release has no asset for these permanent links:" >&2
+    for m in $MISSING; do echo "    https://github.com/${REPO}/releases/latest/download/$m" >&2; done
+    echo "  README.md, docs/STORE-CONTENT.md or the supporter email hands them out." >&2
+    echo "  Build what is missing (scripts/release.sh names it), then publish." >&2
+    exit 1
+  fi
+fi
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "==> DRY_RUN=1, nothing uploaded"

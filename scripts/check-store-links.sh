@@ -2,6 +2,7 @@
 # Fetch every download link the store page and the supporter email hand out.
 #
 #   scripts/check-store-links.sh
+#   scripts/check-store-links.sh --names   # the asset names only; fetches nothing
 #
 # These links resolve by EXACT asset name against whatever release is currently
 # latest, so a rename or a new name that has not shipped yet is a 404 in the
@@ -35,6 +36,14 @@ URLS="$(
 if [ -z "$URLS" ]; then
   echo "no download links found in ${SOURCES[*]}" >&2
   exit 1
+fi
+
+# `--names`: the asset names those links ask for, one per line, and nothing
+# fetched. publish-github.sh refuses a stable publish that would leave one
+# of them without an asset, so the list lives here, read the same way.
+if [ "${1:-}" = "--names" ]; then
+  printf '%s\n' "$URLS" | sed 's#.*/##' | sort -u
+  exit 0
 fi
 
 fail=0

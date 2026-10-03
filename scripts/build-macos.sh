@@ -201,6 +201,11 @@ mkdir -p dist
 # License bundle must exist before packaging.
 [ -f THIRD-PARTY-LICENSES ] || scripts/gen-third-party-licenses.sh
 
+# The build stamp's tree (scripts/build-stamp.sh), taken before anything
+# compiles; the zip and dmg are stamped with it once they exist, so
+# publish-dropbox.sh can tell them from an older build of the same name.
+BUILD_TREE="$(scripts/build-stamp.sh tree 2>/dev/null || true)"
+
 # ── Build ────────────────────────────────────────────────────────────────────
 case "$ARCH" in
   host)
@@ -522,6 +527,14 @@ echo "==> Packaging $DMG (best-effort)"
 hdiutil create -volname "Tangent" -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
   || echo "warn: DMG creation failed; the zip is the primary artifact"
 rm -rf "$STAGE"
+
+if [ -n "$BUILD_TREE" ]; then
+  scripts/build-stamp.sh write "$BUILD_TREE" "$ZIP" || echo "warning: could not stamp $ZIP" >&2
+  [ ! -f "$DMG" ] || scripts/build-stamp.sh write "$BUILD_TREE" "$DMG" \
+    || echo "warning: could not stamp $DMG" >&2
+else
+  echo "NOTE: no git tree to stamp with; publish-dropbox.sh will not take these artifacts" >&2
+fi
 
 du -h "$APP/Contents/MacOS/tangent" "$ZIP" 2>/dev/null | sed 's/^/    /'
 [ -f "$DMG" ] && du -h "$DMG" | sed 's/^/    /'
