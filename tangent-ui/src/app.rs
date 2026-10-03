@@ -8169,7 +8169,7 @@ impl TangentApp {
                             // The RECORDING shape shows COUNT-IN and SIG only:
                             // a take name focused in the TAKE shape would be
                             // left invisible and eating keys.
-                            self.name_focused = false;
+                            self.focus_take_name(false);
                             self.setup_open = true;
                             self.setup_shape = recorder_panel::SetupShape::Rolling;
                             return;
@@ -8391,7 +8391,7 @@ impl TangentApp {
                     // number commits it. This branch returns before that
                     // rule runs, so a press on SIG and then NAME left both
                     // editors live, fed the same keys.
-                    self.name_focused = matches!(hit, Some(recorder_panel::Hit::NameField));
+                    self.focus_take_name(matches!(hit, Some(recorder_panel::Hit::NameField)));
                     self.commit_number_unless(hit);
                     if let Some(hit) = hit {
                         self.apply_recorder_hit(hit);
@@ -8499,7 +8499,7 @@ impl TangentApp {
                     // A press anywhere in the band that is not the name field
                     // takes focus off it, which is what makes clicking away
                     // commit the name the way every other text field does.
-                    self.name_focused = matches!(hit, Some(recorder_panel::Hit::NameField));
+                    self.focus_take_name(matches!(hit, Some(recorder_panel::Hit::NameField)));
                     // The same for a number being typed: pressing anything else
                     // commits it. Committing rather than discarding, because a
                     // half-typed tempo that vanishes when you look away is a
@@ -8577,7 +8577,7 @@ impl TangentApp {
                 }
                 // Clicking anywhere else also drops the field's focus, or the
                 // next letter typed at the piano would go into the take name.
-                self.name_focused = false;
+                self.focus_take_name(false);
                 self.commit_number_unless(None);
                 // **The mixer and the arrangement cover everything below the
                 // band while they are up — and the piano is still THERE.**
@@ -15641,7 +15641,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             recorder::NumField::MarkerName(i),
             m.name.clone(),
         ));
-        self.name_focused = false;
+        self.focus_take_name(false);
     }
 
     /// Take one out. Any field open on it goes too — an index into a list
@@ -15696,7 +15696,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             recorder::NumField::MeterAt(bar),
             format!("{}/{}", sig.beats, sig.unit),
         ));
-        self.name_focused = false;
+        self.focus_take_name(false);
     }
 
     /// Set — or clear — the signature that starts at `bar`.
@@ -18182,7 +18182,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// abandons it, in `edit_number`.
     fn close_setup(&mut self) {
         self.setup_open = false;
-        self.name_focused = false;
+        self.focus_take_name(false);
         if self
             .num_edit
             .as_ref()
@@ -31891,7 +31891,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.field_seed(recorder::NumField::Meter),
                     ));
                 }
-                self.name_focused = false;
+                self.focus_take_name(false);
             }
             Hit::CycleCountIn => {
                 // **BARS.** `COUNT_IN_CHOICES` became bars when the time
@@ -31961,7 +31961,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // the digits.
                 let seed = self.field_seed(field);
                 self.num_edit = Some(recorder::NumEdit::prefilled(field, seed));
-                self.name_focused = false;
+                self.focus_take_name(false);
             }
             Hit::SetTempo(bpm) => {
                 // **The dial edits the tempo that PLAYS.** A session-only
@@ -33105,6 +33105,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let events = ctx.input(|i| i.events.clone());
         let mut name = self.settings.record_take_name.clone().unwrap_or_default();
         let before = name.clone();
+        let mut let_go = false;
         for event in events {
             match event {
                 egui::Event::Text(text) => {
@@ -33131,7 +33132,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     pressed: true,
                     ..
                 } => {
-                    self.name_focused = false;
+                    let_go = true;
                 }
                 _ => {}
             }
@@ -33143,6 +33144,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // takes called "".
             self.settings.record_take_name = (!name.is_empty()).then_some(name);
             self.save_settings();
+        }
+        // After the write, so the moment holds this frame's last letters.
+        if let_go {
+            self.focus_take_name(false);
+        }
+    }
+
+    /// **Put the caret in the take name, or take it out.** Taking it out is
+    /// the end of the edit, so it is the edit's moment.
+    ///
+    /// The name is hashed (`DeskSnap::take_name`), and `edit_take_name`
+    /// writes it on every keystroke - a commit there would be a moment per
+    /// letter - so the moment is taken here, on whichever road lets go:
+    /// Enter, Escape or Tab, DONE, a press anywhere else, another field
+    /// opening, the band hidden. It lands BEFORE the press that let go does
+    /// anything of its own, so that press is a second step, not the same
+    /// one. A name left as it was pushes nothing.
+    fn focus_take_name(&mut self, on: bool) {
+        let leaving = self.name_focused && !on;
+        self.name_focused = on;
+        if leaving {
+            self.undo_commit();
         }
     }
 
@@ -38836,7 +38859,7 @@ impl TangentApp {
             if self.num_edit.as_ref().is_some_and(|e| e.field.lives_in_band()) {
                 self.num_edit = None;
             }
-            self.name_focused = false;
+            self.focus_take_name(false);
             self.grabbed = None;
         }
         if let Some(rect) = recorder_rect_for_hit {
@@ -40580,7 +40603,7 @@ impl TangentApp {
                 // REPLACES it with a fresh one and discards everything typed.
                 // The recorder is the only popout whose hits open dialogs,
                 // which is what makes this a bug here and not in the other two.
-                self.name_focused = matches!(hit, recorder_panel::Hit::NameField);
+                self.focus_take_name(matches!(hit, recorder_panel::Hit::NameField));
                 self.apply_recorder_hit(hit);
             } else if let Some(pos) = outcome.context_menu_at {
                 if !self.dialog_blocks_pointer(&ctx) {
@@ -66020,6 +66043,61 @@ mod tests {").expect("the tests module")];
         app.recorder.playing = true;
         assert_eq!(space(&ctx, &mut app), Some(recorder::RecorderRequest::Stop), "Space did not reach the song");
         assert_eq!(app.settings.record_take_name.as_deref(), Some("nocturne"), "the name gained a key");
+    }
+
+    /// **A typed take name is one step back, taken when the field lets go.**
+    ///
+    /// The name is a desk field and hashed (`DeskSnap::take_name`), and
+    /// `edit_take_name` writes it on every keystroke and committed on none
+    /// of the roads out of the field, so the name rode the next gesture's
+    /// step back: type "nocturne", tick "Count-in into takes", Ctrl+Z, and
+    /// the name went with the tick. A moment per keystroke would be the
+    /// other way to get it wrong.
+    ///
+    /// The let-go commits BEFORE the press that caused it does anything, so
+    /// a press that is a moment of its own is a second step, not the same
+    /// one.
+    #[test]
+    fn a_typed_take_name_is_one_step_back_when_the_field_lets_go() {
+        use recorder_panel::Hit;
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.record_take_name = None;
+        let anchor = open_take_panel(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let name = panel_point(&app, anchor, Hit::NameField);
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        assert!(app.name_focused, "the name field did not take the caret");
+        for part in ["noc", "tur", "ne"] {
+            pointer_frame(&ctx, &mut app, vec![egui::Event::Text(part.into())]);
+        }
+        assert_eq!(app.settings.record_take_name.as_deref(), Some("nocturne"));
+        assert_eq!(app.hist_at, before, "typing pushed {} moments", app.hist_at - before);
+        // Let go by a press on another row, one that is a moment itself.
+        let tick = panel_point(&app, anchor, Hit::ToggleCountInInTake);
+        let in_take = app.settings.record_count_in_in_take;
+        click_with(&ctx, &mut app, tick, egui::Modifiers::NONE);
+        assert!(!app.name_focused, "the press elsewhere left the caret in the name");
+        assert_ne!(app.settings.record_count_in_in_take, in_take, "the tick did not land");
+        assert_eq!(app.hist_at, before + 2, "the name and the tick are not a step each");
+        app.undo();
+        assert_eq!(app.settings.record_count_in_in_take, in_take, "one Ctrl+Z did not undo the tick");
+        assert_eq!(
+            app.settings.record_take_name.as_deref(),
+            Some("nocturne"),
+            "one Ctrl+Z took the name along with the tick"
+        );
+        app.redo();
+        // Enter lets go too.
+        click_with(&ctx, &mut app, name, egui::Modifiers::NONE);
+        assert!(app.name_focused, "the name field did not take the caret again");
+        let before = app.hist_at;
+        pointer_frame(&ctx, &mut app, vec![egui::Event::Text(" two".into())]);
+        key_with(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(!app.name_focused, "Enter left the caret in the name");
+        assert_eq!(app.settings.record_take_name.as_deref(), Some("nocturne two"));
+        assert_eq!(app.hist_at, before + 1, "Enter left {} moments", app.hist_at - before);
     }
 
     /// **The metronome panel's tempo grabs nothing while held** - a drag
