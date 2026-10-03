@@ -26,6 +26,10 @@ PKG_VERSION="${PKG_VERSION:-$VERSION}"
 
 FAIL=0
 note() { echo "!! $*"; FAIL=1; }
+# The programs the setup.exe and the portable zip carry, kept for the
+# comparison after the loop.
+SAME="$(mktemp -d)"
+trap 'rm -rf "$SAME"' EXIT
 
 # pe_sig <label> <pe>: the Authenticode presence check for every Windows PE we
 # ship, in one wording. A presence check on the PE's certificate table
@@ -189,6 +193,10 @@ for a in "$@"; do
             note "$a: could not extract $pe to check its signature"
           fi
         done
+        mkdir -p "$SAME/setup"
+        for pe in tangent.exe tangent-ffmpeg.exe; do
+          if [ -f "$inner/$pe" ]; then cp "$inner/$pe" "$SAME/setup/"; fi
+        done
         rm -rf "$inner"
       fi
       continue
@@ -244,6 +252,10 @@ for a in "$@"; do
       if [ -f "$inner/tangent.exe" ] && ! LC_ALL=C grep -a -q -F 'software\asio' "$inner/tangent.exe"; then
         note "$a: tangent.exe has no ASIO host in it (a WASAPI-only build)"
       fi
+      mkdir -p "$SAME/zip"
+      for pe in tangent.exe tangent-ffmpeg.exe; do
+        if [ -f "$inner/$pe" ]; then cp "$inner/$pe" "$SAME/zip/"; fi
+      done
       rm -rf "$inner"
       ;;
     *-freebsd-*)
@@ -257,6 +269,18 @@ for a in "$@"; do
       printf '%s\n' "$list" | grep -Eq '/tangent-ffmpeg$'      || note "$a: no bundled encoder (video takes break on clean machines)"
       ;;
   esac
+done
+
+# **The installer and the portable zip carry the same programs.**
+# build-installer.sh packs exactly the zip's files, so one build's two
+# Windows downloads hold byte-identical tangent.exe and tangent-ffmpeg.exe.
+# A failed installer build used to leave the previous setup.exe beside a
+# fresh zip, both passing every check above on their own; compared, they
+# are two builds under one version's names.
+for pe in tangent.exe tangent-ffmpeg.exe; do
+  if [ -f "$SAME/setup/$pe" ] && [ -f "$SAME/zip/$pe" ] && ! cmp -s "$SAME/setup/$pe" "$SAME/zip/$pe"; then
+    note "$pe differs between the setup.exe and the portable zip: they are from two different builds"
+  fi
 done
 
 [ "$FAIL" = 0 ]

@@ -271,7 +271,10 @@ refuses to bless a release on failure:
   skipping): requires `tangent.exe`, NO VST3 payload and `Uninstall.exe`;
   an Authenticode signature on setup.exe itself and on every PE 7-Zip
   lists inside it, as extracted: `tangent.exe`, `tangent-ffmpeg.exe`,
-  `Uninstall.exe`, and NSIS's own `System.dll` and `nsDialogs.dll`.
+  `Uninstall.exe`, and NSIS's own `System.dll` and `nsDialogs.dll`. Its
+  `tangent.exe` and `tangent-ffmpeg.exe` must be the portable zip's, byte
+  for byte, when both are checked: two builds under one version's names
+  fail.
   `scripts/pe-signed.py` checks PRESENCE (a non-empty certificate table),
   not chain validity, which only a first launch on Windows proves.
 - **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.
@@ -367,8 +370,9 @@ publishes whatever was built. What it does not know:
   publishing.
 - **What is left over.** Everything in `dist/` with this version's name
   goes: an `ARCH=host` `macos-arm64` pair survives a later universal build,
-  a failed Linux leg leaves the previous run's tarballs, and nothing
-  removes an old setup.exe before `makensis` runs again.
+  and a failed Linux leg leaves the previous run's tarballs. (A failed
+  installer build leaves no setup.exe at all: `build-installer.sh` removes
+  the old one before it starts.)
 
 ## Store links: check them, then act in order
 
