@@ -11107,9 +11107,21 @@ impl DesktopApp {
         // holding the same bundle in the NEW project would otherwise be
         // seated with the old project's knobs. See `displaced_states`.
         self.displaced_states.clear();
-        // `open_project` applied the document's desk when it carried one;
-        // the flag says so, and the states follow the desk.
-        if self.app.take_desk_reload() {
+        // **A template from the panel was ADOPTED** (`TangentApp::
+        // open_project`), so its states come off the template's own shelf
+        // as New takes them: the scratch it stands on has none. While the
+        // session stayed in the previous project's folder, that project's
+        // states were seated on the template desk, and the template desk's
+        // were mirrored back into its `state/` at the next Open or Quit.
+        if tangent_ui::app::inside_template_shelf(doc, &self.app.project_root()) {
+            if let Some(template) = doc.parent() {
+                self.copy_states_from_shelf(&template.join("state"));
+            }
+            self.force_insert_reload();
+            let _ = self.app.take_desk_reload();
+        } else if self.app.take_desk_reload() {
+            // `open_project` applied the document's desk when it carried
+            // one; the flag says so, and the states follow the desk.
             self.copy_states_from_project();
             self.force_insert_reload();
         }
@@ -24958,6 +24970,30 @@ mod tests {
         assert!(
             switch.contains("self.displaced_states.clear();"),
             "the shelf outlives the session it was filled in"
+        );
+    }
+
+    /// **A template opened from the Open panel takes its plugin states from
+    /// its own shelf.** It is adopted into a fresh scratch now
+    /// (`TangentApp::open_project`), and a scratch has no `state/`:
+    /// mirroring the project's shelf as an ordinary open does would clear
+    /// every live sidecar, and while the session stayed in the previous
+    /// project's folder it seated that project's states on the template
+    /// desk. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_template_opened_from_the_panel_takes_its_states_from_its_own_shelf() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn switch_project(&mut self, doc:").expect("switch_project");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let open = body.find("self.app.open_project(doc);").expect("the open");
+        let branch = body
+            .find("if tangent_ui::app::inside_template_shelf(doc, &self.app.project_root()) {")
+            .expect("switch_project no longer tells a template from a project");
+        assert!(open < branch, "the template's states are decided before it is adopted");
+        assert!(
+            body[branch..].contains("self.copy_states_from_shelf(&template.join(\"state\"));"),
+            "an adopted template's plugin states no longer come off its own shelf"
         );
     }
 

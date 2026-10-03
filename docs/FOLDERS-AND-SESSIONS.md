@@ -112,12 +112,16 @@ Related invariants that keep this working:
   only into a folder that is already real).
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
-  from the Open panel is READ, not inhabited, and that road is not yet
-  safe: `project_doc`, the kit and the plugin-state shelf all stay the
-  previous session's, so the template's unnamed document stands in that
-  project's folder. The next Save MOVES that folder to the name typed and
-  writes the template over its document, and the next Open or Quit mirrors
-  the template desk's plugin states into that project's `state/`.
+  from the Open panel is ADOPTED the same way (`open_project`), into the
+  first free `Untitled` name that is not on disk, and its plugin states come
+  off its own `state/` (`switch_project`). It used to be read and not
+  inhabited: the session stayed in the previous project's folder, so the
+  next Save moved that folder to the name typed and wrote the template over
+  its document, and the next Open or Quit mirrored the template desk's
+  plugin states into that project's `state/`. And a first save never moves
+  a folder whose document on disk is named (`save_project_first`): an undo
+  past a first save leaves the session unnamed inside a kept project, and
+  that folder is copied from, not moved.
 - **No test resolves the owner's media folder**: `Settings::media_root`
   honours `TANGENT_MEDIA_ROOT` in every build and is a per-thread temp root
   under `tangent-ui`'s tests. One test wrote a blank document over the real
