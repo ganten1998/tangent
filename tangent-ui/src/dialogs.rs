@@ -1910,8 +1910,13 @@ pub enum DialogAction {
     /// There is deliberately no unconfirmed road to this: the menu row opens
     /// a [`Dialog::Confirm`] and this arrives from its button.
     ResetTo(crate::settings::ResetScope),
-    /// Put the settings back to the copy taken just before the last reset.
-    UndoReset,
+    /// Put the settings back to the copy taken just before the last reset,
+    /// which was of this scope. The scope rides along so the undo touches
+    /// the window only where the reset did: an Everything reset resizes it,
+    /// and undoing a Colours one must not take a full-screen window out of
+    /// full screen. The only Undo is on the latest receipt, so it cannot go
+    /// stale.
+    UndoReset(crate::settings::ResetScope),
     /// Put the whole song back to one tempo, dropping its map.
     FlattenTempo,
     /// Start a new project, and take the unsaved one's directory with it.
