@@ -560,11 +560,13 @@ pub enum Dialog {
         /// find out. `None` when nothing is selected.
         target: Option<String>,
         /// **The song's meter, `(beats, unit)`, that the GRID chips are
-        /// spelled in** - the meter the grid they apply is built in
-        /// (`Grid::from_document`), so the chip called "1/16" applies a
-        /// sixteenth. Spelled in 4/4, every chip in 3/4 or 6/8 quantized a
-        /// note value finer than it said. Refreshed by the app every frame,
-        /// because the window is not modal and the meter can change under it.
+        /// spelled in** - the dial's signature, which is the meter the grid
+        /// they apply is built in while the song keeps one (the grid steps
+        /// each bar in its own signature, on the meter map), so the chip
+        /// called "1/16" applies a sixteenth. Spelled in 4/4, every chip in
+        /// 3/4 or 6/8 quantized a note value finer than it said. Refreshed by
+        /// the app every frame, because the window is not modal and the
+        /// meter can change under it.
         meter: (u8, u8),
     },
     /// Name the colours the app is wearing and write them to the user themes
