@@ -356,6 +356,9 @@ pub struct RecorderView<'a> {
     /// The count-in beat clicking now while a take is ALREADY writing - see
     /// [`RecorderState::count_beat`]. Appended.
     pub count_beat: Option<u32>,
+    /// A Play waiting on a count's downbeat - see
+    /// [`RecorderState::play_pending`]. Appended.
+    pub play_pending: bool,
 }
 
 /// The band timeline's overview of the ARRANGEMENT: every clip as a block
@@ -447,6 +450,7 @@ impl RecorderView<'_> {
             limiter_off: false,
             tempo_held: false,
             count_beat: None,
+            play_pending: false,
         }
     }
 }
@@ -1943,6 +1947,11 @@ pub struct RecorderState {
     /// joined by it - and folds the engine's CLICK count by the signature's
     /// beats.
     pub count_beat: Option<u32>,
+    /// **Play was pressed during a count-in and waits on its downbeat**, when
+    /// the song starts. The host's fact; the band lights the Play triangle
+    /// for it, and Pause takes it back. Nothing showed it, so the triangle
+    /// stayed dark over a song about to start.
+    pub play_pending: bool,
 }
 
 /// Hand-written because `strip_peaks` is a thirty-five-row array and std
@@ -1982,6 +1991,7 @@ impl Default for RecorderState {
             last_take_folder: None,
             take_counting: false,
             count_beat: None,
+            play_pending: false,
         }
     }
 }
@@ -2057,6 +2067,7 @@ impl RecorderState {
             limiter_off: false,
             tempo_held: self.tempo_held(),
             count_beat: self.count_beat,
+            play_pending: self.play_pending,
             gr_db: self.gr_db,
             dest: &self.dest,
             project_dest: &self.project_dest,
