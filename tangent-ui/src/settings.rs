@@ -2374,7 +2374,9 @@ impl ResetScope {
                 "Every launch opens the default template, and every New is a \
                  copy of it. This puts its DESK back to the one Tangent \
                  ships with. Use it if the app keeps starting on a session \
-                 you recognise instead of a clean one."
+                 you recognise instead of a clean one. The open session is \
+                 then replaced by a fresh one from it, and unsaved changes \
+                 are asked about first."
             }
         }
     }
