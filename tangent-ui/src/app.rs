@@ -43461,6 +43461,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The notes and the audio read one swing from one set of knobs.**
+    /// The MIDI Apply built its grid a second way, from the raw percentage,
+    /// where the audio road clamped it first: a swing past 95% (which the
+    /// slider cannot reach today, but the action carries unclamped) was
+    /// swing on the audio and straight on the notes. Both now read the
+    /// ask's one grid.
+    #[test]
+    fn notes_and_audio_read_one_swing_from_one_set_of_knobs() {
+        let root = project_scratch("q-swing-one-road");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let act = || DialogAction::ApplyQuantize {
+            grid_exp: -3,
+            triplet: false,
+            swing_pct: 99.0,
+            strength_pct: 100.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        };
+        let audio = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(audio);
+        app.apply_dialog_action(act());
+        let swing = match app.take_project_request() {
+            Some(crate::ports::ProjectRequest::QuantizeClips(ask)) => ask.grid.swing(),
+            other => panic!("no quantize was asked for: {:?}", other.is_some()),
+        };
+        assert_eq!(swing, Some(0.95), "fixture: the audio road clamps 99% to 95%");
+        // The MIDI road, same knobs: a note ON the 95% off-beat of the first eighth pair.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote { at_s: 0.5 * 0.95, dur_s: 0.1, key: 60, vel: 100, muted: false }],
+            lane: 1,
+            len_s: 2.0,
+            loop_s: 2.0,
+            name: "m".into(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        app.apply_dialog_action(act());
+        let at = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").notes[0].at_s;
+        let _ = std::fs::remove_dir_all(&root);
+        assert!((at - 0.5 * 0.95).abs() < 1e-9, "the MIDI road read 99% as straight and moved the note to {at}");
+    }
+
     /// **A cursor step is held, and the step after it takes over cleanly.**
     ///
     /// Two things that have to be true together. The note has to OUTLAST the
