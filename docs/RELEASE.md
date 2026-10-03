@@ -230,11 +230,11 @@ Details that matter and are easy to lose:
   before the Linux legs spend their time; `ALLOW_WASAPI_ONLY=1` builds a
   WASAPI-only Windows build on purpose, and the artifact checks then keep it
   from shipping, to a release or to testers, on the missing
-  `ASIO-NOTICE.txt`. Unpack the SDK into `vendor/` before any Windows
-  build. (The
-  notice is written whenever `CPAL_ASIO_DIR` is set, and that is cpal's own
-  variable: one exported in the shell writes it over a WASAPI-only build
-  too, and that build then passes.)
+  `ASIO-NOTICE.txt` and ASIO host. Unpack the SDK into `vendor/` before any Windows
+  build. The notice is written when the build's features include `asio`,
+  and the checks also read the ASIO host off `tangent.exe` itself, so a
+  WASAPI-only build cannot pass on a notice (it once could: the notice was
+  keyed on `CPAL_ASIO_DIR`, cpal's own variable, which a shell can export).
 - **`scripts/build-cross.sh check-linux`** type-checks the Linux target from
   macOS with a stub `alsa.pc`, so Linux-only code is checked before pushing
   rather than discovered broken on the Linux box.
@@ -269,11 +269,10 @@ refuses to bless a release on failure:
   not chain validity, which only a first launch on Windows proves.
 - **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.
 - **macOS zip**: the `Tangent.app` executable present, no `__MACOSX` junk.
-- **Windows zip**: `tangent.exe` at the top level; `ASIO-NOTICE.txt`, the
-  fingerprint of an ASIO build, so a WASAPI-only Windows build fails the
-  release (unless an exported `CPAL_ASIO_DIR` wrote the notice anyway: see
-  the ASIO bullet above); and signatures on `tangent.exe` and
-  `tangent-ffmpeg.exe`.
+- **Windows zip**: `tangent.exe` at the top level; Steinberg's
+  `ASIO-NOTICE.txt` and the ASIO host in `tangent.exe` itself (the SDK's
+  `software\asio` registry key, compiled in), so a WASAPI-only Windows build
+  fails; and signatures on `tangent.exe` and `tangent-ffmpeg.exe`.
 - **Linux tarballs**: the `tangent` binary (the pre-2.1.0 empty-tarball bug),
   `install.sh` (the README's first instruction; 4.92.0 shipped without it),
   and `tangent-ffmpeg` (video on a clean machine; also shipped missing once).
