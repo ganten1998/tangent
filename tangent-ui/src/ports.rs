@@ -920,15 +920,21 @@ pub enum ProjectRequest {
 /// `fit` were simply never passed, so three dials in the window reached
 /// nothing on the audio side. A field added here is a compile error at
 /// every site.
+///
+/// Plain data, the grid included: it holds copies of the song's tempo and
+/// meter maps, not a handle on the document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuantizeAsk {
     /// **Ids, not one id**, because `project_request` carries one request a
     /// frame and a marquee over eight takes is one gesture.
     pub ids: Vec<u64>,
-    /// Seconds per grid step.
-    pub step_s: f64,
-    /// Where the swung off-beat sits, as a fraction; `None` is straight.
-    pub swing: Option<f64>,
+    /// **The grid itself, as the window built it**: its rung, triplet and
+    /// swing on the song's tempo and meter maps, so the host aims each
+    /// attack, and draws each tick, on the lines the arrangement draws. A
+    /// step in seconds could not: after a tempo or a meter change the lines
+    /// are not evenly spaced, and a step counted from 0:00 aimed at lines
+    /// nobody could see.
+    pub grid: crate::quantize::Grid,
     /// 0..=1. A partial move, not a switch.
     pub strength: f64,
     /// **Leave an attack further than this from every line alone**, in
