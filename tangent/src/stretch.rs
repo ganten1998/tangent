@@ -105,6 +105,31 @@ impl Mode {
             Mode::Tonal
         }
     }
+
+    /// **The algorithm for a warp, chosen once for the whole clip.**
+    ///
+    /// A warp is not one ratio but one per segment, so [`Mode::pick`]'s first
+    /// question - is this barely a stretch at all - does not apply to it. A
+    /// tape resample moves the pitch by its ratio; asked per segment it
+    /// detuned every corrected note by its own correction, up to a third of
+    /// a semitone either way under the two-percent rule, and a different
+    /// amount on each note. That bargain holds for one ratio over a whole
+    /// clip and for nothing else, so inside a warp `Auto` - and `Tape`, named
+    /// outright - becomes the algorithm the material wants, asked once of the
+    /// whole clip: Rhythmic for anything with edges in it, Tonal for the
+    /// rest. Either of those, chosen, is kept.
+    pub fn for_warp(self, clip: &Clip) -> Mode {
+        match self {
+            Mode::Auto | Mode::Tape => {
+                if percussiveness(clip) >= PERCUSSIVE_AT {
+                    Mode::Rhythmic
+                } else {
+                    Mode::Tonal
+                }
+            }
+            chosen => chosen,
+        }
+    }
 }
 
 /// Above this, material counts as having edges in it. See [`percussiveness`].
