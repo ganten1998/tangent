@@ -16715,6 +16715,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_auto_hot = None;
         self.arr_auto_drag_from = None;
         self.arr_drag = None;
+        // The gesture goes with its drag (`undo` has committed what it did,
+        // and this moment's document stands over it either way), and a
+        // moment left owed would hold the frame's view commit off until some
+        // later release paid it.
+        self.arr_gesture_dirty = false;
         self.arr_move_orig.clear();
         self.arr_band = None;
         if let Some(st) = self.midi_edit.as_mut() {
@@ -23220,6 +23225,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.midi_edit.is_none() {
             return;
         }
+        // **A release nobody saw still ends the note gesture**, by the
+        // lanes' rule (see `arrangement_input`). A menu, a dialog or an
+        // editor not drawn this frame returns below before the release
+        // block, and a drag that outlived its release kept the lanes
+        // standing down (`midi_edit_owns`), its preview sounding and its
+        // moment owed. The first frame with no button down and no release
+        // ends it, keeping what it did.
+        if self.midi_edit.as_ref().is_some_and(|m| m.drag.is_some())
+            && ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released())
+        {
+            self.me_quiet_preview();
+            let dirty = self.midi_edit.as_ref().is_some_and(|m| m.dirty);
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.drag = None;
+                st.marquee = None;
+            }
+            if dirty {
+                self.arr_save_edits();
+                if let Some(st) = self.midi_edit.as_mut() {
+                    st.dirty = false;
+                }
+            }
+        }
         // **Before every early return below it.** A menu opening over a
         // sounding preview, a dialog taking the pointer, the drumpad claiming
         // it — each of those used to return with the note still on.
@@ -24678,6 +24706,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
+        // **A release nobody saw still ends the gesture.** A dialog raised
+        // mid-drag, a menu, a view that closed under the hand: every early
+        // return below comes before the release block, and a gesture whose
+        // release one of them swallowed never ended. `arr_drag` stood, its
+        // moment stayed owed (which held `commit_view_change` off), and the
+        // next press on a control that arms no drag of its own ran the stale
+        // one on its press frame. The first frame with no button down and
+        // no release says the hand let go some frame ago, so the gesture
+        // ends here and keeps what it did; what only its release would have
+        // done (a lane landing, a drawn item, a locate) is not guessed at.
+        if (self.arr_drag.is_some() || self.arr_gesture_dirty)
+            && ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released())
+        {
+            self.arr_drag = None;
+            self.arr_tempo_drag = None;
+            self.arr_tempo_drag_from = None;
+            self.arr_auto_drag_from = None;
+            self.arr_move_orig.clear();
+            self.arr_stretch_orig.clear();
+            self.arr_band = None;
+            self.arr_pending = None;
+            if std::mem::take(&mut self.arr_gesture_dirty) {
+                self.arr_save_edits();
+            }
+        }
         // **While a take rolls, the window holds the WHOLE of it** — the
         // owner's ruling: the viewport and the growing clip scale together,
         // so the recording is never running blind off the right edge. Only
@@ -24901,9 +24954,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
         // The MIDI editor's ground: while the hand is on the popup — or a
         // note gesture is in flight — the lanes under it stand down. The
-        // drumpad floats over both, on the same rule.
-        if self.midi_edit_owns(pointer)
-            || (self.drumpad_owns(pointer) && self.arr_drag.is_none())
+        // drumpad floats over both, on the same rule. **Unless a drag of the
+        // lanes' own is in flight**, for either: the release frame reads the
+        // pointer where the hand came up, and a carry let go over the popup
+        // returned here, before its release, and never ended.
+        if (self.midi_edit_owns(pointer) || self.drumpad_owns(pointer))
+            && self.arr_drag.is_none()
         {
             return;
         }
@@ -37248,11 +37304,15 @@ impl TangentApp {
     /// `Look` are hashed too and nothing watches them here: a gesture that
     /// writes one of those owes its own commit.
     ///
-    /// **The guard sees the arrangement's gestures only**: `arr_drag` and
-    /// `arr_gesture_dirty`. A band (`grabbed`), mixer (`mixer_grab`),
-    /// metronome (`met_drag`) or editor (`MidiEdit::drag`) drag in flight
-    /// is invisible to it, so a `View` change made during one commits that
-    /// drag's half-way state as a moment of its own.
+    /// **The guard sees every drag that writes the document as it goes**,
+    /// not only the arrangement's (`arr_drag`, `arr_gesture_dirty`): a band
+    /// knob (`grabbed`), a mixer fader (`mixer_grab`), the metronome's tempo
+    /// (`met_drag`), an effect panel's row (`fx_drag`), a drum pad's knob
+    /// (`drumpad_grab`) and the editor's (`MidiEdit::drag`). It saw the
+    /// first two only, so a magnet key pressed with the other hand during
+    /// one of the rest committed that drag's half-way state as a moment of
+    /// its own. The change waits, and lands with the drag's release or on
+    /// the first frame after it.
     ///
     /// **Nor can it see a host request raised in the same frame**: an
     /// audio Apply in the quantize window that moves a knob has the knobs
@@ -37260,7 +37320,15 @@ impl TangentApp {
     /// a second moment when it lands, frames later. One press, two moments.
     fn commit_view_change(&mut self) {
         let now = Self::desk_view(&self.settings).view;
-        if self.arr_drag.is_some() || self.arr_gesture_dirty {
+        let carrying = self.arr_drag.is_some()
+            || self.arr_gesture_dirty
+            || self.grabbed.is_some()
+            || self.mixer_grab.is_some()
+            || self.met_drag
+            || self.fx_drag.is_some()
+            || self.drumpad_grab.is_some()
+            || self.midi_edit.as_ref().is_some_and(|m| m.drag.is_some());
+        if carrying {
             // Whatever it is now is not what it will be when the hand lets
             // go, so it is not remembered either - or the release would
             // find nothing changed and commit nothing.
@@ -42100,6 +42168,166 @@ mod tests {
             "one step back landed on the document with no signature at all"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A carry let go over the MIDI editor still ends, in one moment.**
+    ///
+    /// The arrangement stands down while the hand is on the editor's popup,
+    /// and the release frame reads the pointer where it came up - over the
+    /// popup - so it returned before its own release block. The carry never
+    /// ended: `arr_drag` stayed set, `arr_gesture_dirty` stayed owed (which
+    /// also stopped `commit_view_change` for good), and the next press on a
+    /// header switch or a toolbar button ran the stale carry on its own
+    /// frame and jumped the clip under the pointer.
+    #[test]
+    fn a_carry_let_go_over_the_midi_editor_still_ends_in_one_moment() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (ed, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        let b = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            start_s: 1.0,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        // The carry in flight, as the press and the travel leave it.
+        app.arrangement.clips.iter_mut().find(|c| c.id == b).expect("clip B").start_s = 3.0;
+        app.arr_drag = Some(ArrDrag::Move { id: b, dt: 0.0 });
+        app.arr_gesture_dirty = true;
+        // The hand comes up over the editor's popup: the release itself ends
+        // the carry, on its own frame.
+        let over = ed.center();
+        pointer_frame(&ctx, &mut app, vec![
+            egui::Event::PointerMoved(over),
+            egui::Event::PointerButton {
+                pos: over,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        assert!(app.arr_drag.is_none(), "the carry outlived its release over the editor");
+        assert!(!app.arr_gesture_dirty, "the carry still owes its moment");
+        assert_eq!(app.hist_at, before + 1, "the carry left {} moments", app.hist_at - before);
+        // And the quiet frame after it adds nothing.
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.hist_at, before + 1, "the frame after the release pushed another moment");
+    }
+
+    /// **A release nobody saw still ends the gesture, on the next frame
+    /// with no button down.**
+    ///
+    /// A dialog raised mid-drag (a host's question, a plugin that failed to
+    /// load) swallows the release: the lanes and the editor both return
+    /// before their release blocks while it stands. Their drags then never
+    /// ended, owed their moment for ever, and held `commit_view_change`
+    /// off; the editor's stale drag also kept the lanes standing down. Now
+    /// the first frame with no button down and no release ends each one,
+    /// and commits what it changed.
+    #[test]
+    fn a_drag_whose_release_nobody_saw_ends_on_the_next_quiet_frame() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (ed, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        let let_go_under_a_question = |ctx: &egui::Context, app: &mut TangentApp, at: Pos2| {
+            app.dialog = Some(Dialog::About);
+            release(ctx, app, at);
+            app.dialog = None;
+        };
+
+        // The lanes: a clip carried, the hand let go under the question.
+        let before = app.hist_at;
+        app.arrangement.clips.iter_mut().find(|c| c.id == id).expect("the clip").start_s = 5.0;
+        app.arr_drag = Some(ArrDrag::Move { id, dt: 0.0 });
+        app.arr_gesture_dirty = true;
+        let lanes = Pos2::new(rect.right() - 20.0, rect.bottom() - 20.0);
+        let_go_under_a_question(&ctx, &mut app, lanes);
+        assert!(app.arr_drag.is_some(), "fixture: the question did not swallow the release");
+        let _ = run_frame(&ctx, &mut app);
+        assert!(app.arr_drag.is_none(), "the lost release left the carry standing");
+        assert!(!app.arr_gesture_dirty, "the lost release left the carry's moment owed");
+        assert_eq!(app.hist_at, before + 1, "the carry left {} moments", app.hist_at - before);
+
+        // The editor: a note dragged, the hand let go under the question.
+        let before = app.hist_at;
+        if let Some(c) = app.arrangement.clips.iter_mut().find(|c| c.id == id) {
+            c.notes[0].at_s = 1.25;
+        }
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.drag = Some(MeDrag::Move { i: 0, dt: 0.0, orig: vec![(0, 0.5, 60)] });
+            st.dirty = true;
+        }
+        let_go_under_a_question(&ctx, &mut app, ed.center());
+        assert!(
+            app.midi_edit.as_ref().is_some_and(|m| m.drag.is_some()),
+            "fixture: the question did not swallow the editor's release"
+        );
+        let _ = run_frame(&ctx, &mut app);
+        let st = app.midi_edit.as_ref().expect("the editor closed");
+        assert!(st.drag.is_none(), "the lost release left the note drag standing");
+        assert!(!st.dirty, "the lost release left the note drag's moment owed");
+        assert_eq!(app.hist_at, before + 1, "the note drag left {} moments", app.hist_at - before);
+    }
+
+    /// **The frame's own commit waits for every drag in flight, not only
+    /// the arrangement's.**
+    ///
+    /// `commit_view_change` held off for `arr_drag` and `arr_gesture_dirty`
+    /// alone, so a magnet or grid key pressed with the other hand during a
+    /// band knob, mixer fader, tempo, effect-panel, drum-pad or editor drag
+    /// committed that drag's half-way state as a moment of its own, and the
+    /// drag's release then made a second.
+    #[test]
+    fn the_frames_view_commit_waits_for_every_drag_in_flight() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let drags: Vec<(&str, fn(&mut TangentApp, bool))> = vec![
+            ("a band knob", |a, on| {
+                a.grabbed = on.then_some(Grab {
+                    hit: recorder_panel::Hit::SetMaster(0.5),
+                    from: Pos2::ZERO,
+                    moved: true,
+                    from_value: 0.5,
+                });
+            }),
+            ("a mixer fader", |a, on| {
+                a.mixer_grab = on.then_some(MixerGrab {
+                    hit: crate::mixer_panel::Hit::Fader(recorder::Column(1)),
+                    from: Pos2::ZERO,
+                    moved: true,
+                    from_value: 0.5,
+                });
+            }),
+            ("the metronome's tempo", |a, on| a.met_drag = on),
+            ("an effect panel's row", |a, on| a.fx_drag = on.then_some("chorus_depth")),
+            ("a drum pad's knob", |a, on| {
+                a.drumpad_grab = on.then_some(DrumpadGrab {
+                    param: crate::drumpad_panel::Param::Gain,
+                    from: Pos2::ZERO,
+                    from_value: 0.5,
+                    moved: true,
+                    on_number: false,
+                });
+            }),
+        ];
+        for (what, set) in drags {
+            let before = app.hist_at;
+            set(&mut app, true);
+            app.settings.arr_snap = !app.settings.arr_snap;
+            app.commit_view_change();
+            assert_eq!(app.hist_at, before, "the magnet committed during {what}");
+            set(&mut app, false);
+            app.commit_view_change();
+            assert_eq!(app.hist_at, before + 1, "the magnet never committed after {what}");
+        }
     }
 
     /// **Changing the timeline's grid or window is its own step back.**
