@@ -87,9 +87,9 @@ const FLOOR_HALF: usize = 100;
 /// It is in the frames of the decode it was made from (`rate`, `frames`).
 /// Positions picked from it mean nothing against a decode at another rate
 /// or of another file, so a cache of these has to be emptied wherever the
-/// decode cache it was filled from is. Not yet true of the host's
-/// (`DesktopApp::attacks_of`): it is keyed by path alone and emptied only
-/// when it reaches its cap.
+/// decode cache it was filled from is. The host's (`DesktopApp::attacks_of`)
+/// is emptied and swept with `track_cache`, and asks [`Analysis::fits`]
+/// before it reads one back.
 pub struct Analysis {
     env: Vec<f32>,
     /// Every hop the flux PEAKS on, with the local median it stands over.
@@ -104,6 +104,17 @@ pub struct Analysis {
     hop: usize,
     rate: u32,
     frames: usize,
+}
+
+impl Analysis {
+    /// **Whether this was made from a decode like `clip`**: the same rate
+    /// and the same length. Its positions are frames of ITS decode, so
+    /// against any other - the same path decoded at another device's rate,
+    /// or another take written under the same name - they mean nothing.
+    #[must_use]
+    pub fn fits(&self, clip: &Clip) -> bool {
+        self.rate == clip.rate.max(1) && self.frames == clip.frames()
+    }
 }
 
 /// One rise that turned over, and what it has to beat.
@@ -462,6 +473,20 @@ mod tests {
         assert!(detect(&clip_of(vec![0.0; 48_000 * 2]), 0.5).is_empty(), "silence");
         assert!(detect(&clip_of(vec![0.1; 40]), 0.5).is_empty(), "a scrap");
         assert!(detect(&clip_of(Vec::new()), 0.5).is_empty(), "nothing at all");
+    }
+
+    /// **An analysis answers only for the decode it was made from.** Its
+    /// positions are frames of that decode, so the same file decoded at
+    /// another rate, or another take written under the same name, has to be
+    /// analysed afresh - the host's cache, keyed by path, asks this first.
+    #[test]
+    fn an_analysis_fits_only_the_decode_it_was_made_from() {
+        let take = clicks(2.0, 0.25);
+        let a = analyse(&take).expect("a two-second take analyses");
+        assert!(a.fits(&take), "an analysis does not fit its own decode");
+        let other_rate = Clip { rate: 44_100, ..take.clone() };
+        assert!(!a.fits(&other_rate), "an analysis fit a decode at another rate");
+        assert!(!a.fits(&clicks(3.0, 0.25)), "an analysis fit another take under the same name");
     }
 
     /// **The hits are found THROUGH sustained material**, which is the case
