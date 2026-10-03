@@ -31009,13 +31009,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// sixty times a second is the mistake `CaptureDevices::current_name`
     /// already exists to avoid.
     fn open_audio_setup(&mut self) {
-        // **Asked at OPEN and never per frame.** Under ASIO, `outputs()`
-        // names only the running driver while a stream holds one, which is
-        // the usual state here (the band Setup opens from starts the
-        // engine), so the row cannot offer another driver then. With no
-        // stream held it loads and unloads every registered driver in turn,
-        // on this thread: seconds of work, and exactly the "Not Responding"
-        // the reprobe exists to keep off it.
+        // **Asked at OPEN and never per frame.** Listing outputs asks the
+        // host about every device it has, and ALSA answers by opening each
+        // one. Under ASIO `outputs()` reads the registry's driver names and
+        // loads no driver, so the row offers every driver even while the
+        // engine holds one, which is the usual state here (the band Setup
+        // opens from starts the engine).
         let (systems, rates, outputs) = match self.audio_setup.as_ref() {
             Some(s) => (s.systems(), s.rates(), s.outputs()),
             None => (Vec::new(), Vec::new(), Vec::new()),
