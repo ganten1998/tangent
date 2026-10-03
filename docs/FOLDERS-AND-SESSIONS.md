@@ -98,10 +98,12 @@ Related invariants that keep this working:
   nothing but Tangent's own files and no recording (`rec-*`) is removed
   WHOLE (`discard_scratch_made_here`): its kit (a kit
   built there included), the samples and imports it copied in, freeze
-  renders, glued files, `state/` and the export staging. Open and Quit
-  leave a scratch holding a recording on disk; New's reclaim of the
-  scratch it stands on removes it, recordings and all, unless its kit
-  differs from the template's (New then steps past it to `Untitled 2`).
+  renders, glued files, `state/` and the export staging. Open, Quit and
+  New all leave a scratch the discard refuses on disk: New starts beside
+  it (`new_starts_beside`, the next free `Untitled <n>`). A clean session
+  gets no prompt, so New asks about its scratch's takes with the scratch
+  warning first, as it does for a leftover one (`new_asks_about_scratch`);
+  it used to reclaim it, a take undone off the timeline included.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
   every lane's kit samples and writes the kit sidecar. Imports, pad loads,
   arrangement takes with audio, freezes, glues and realtime exports go

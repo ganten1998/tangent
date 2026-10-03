@@ -10767,10 +10767,11 @@ impl DesktopApp {
                 // continuously form untitled 1 2 3 etc if pressed
                 // consecutively."
                 //
-                // Kept for the one case the prompt cannot cover: a scratch
-                // with takes in it that is NOT the session on screen, which
-                // the prompt was never asked about and which nobody has
-                // agreed to lose.
+                // Kept for the cases the prompt cannot cover: a scratch with
+                // takes in it that is NOT the session on screen, which the
+                // prompt was never asked about and which nobody has agreed
+                // to lose, and the one on screen when no prompt was asked at
+                // all - see `new_asks_about_scratch`.
                 let takes = count_media(&dir, &template);
                 let is_current = self
                     .app
@@ -10778,7 +10779,7 @@ impl DesktopApp {
                     .and_then(std::path::Path::parent)
                     .map(|p| p == dir)
                     .unwrap_or(false);
-                if takes > 0 && !asked && !is_current {
+                if new_asks_about_scratch(takes, asked, is_current, discarded) {
                     // Ask, and do nothing else this frame. The answer comes
                     // back as `NewKeeping` or `NewDiscarding` - a second New,
                     // which must still know the session was discarded, or it
@@ -10806,10 +10807,12 @@ impl DesktopApp {
                     dir.clone()
                 };
                 // Keeping it means not reclaiming it at all: mint the next
-                // free name and leave the recordings where they are.
+                // free name and leave the recordings where they are. That is
+                // also the answer for the scratch on screen when the discard
+                // refused to clear it - see `new_starts_beside`.
                 let dir = if reclaimed != dir {
                     reclaimed
-                } else if keeping && takes > 0 {
+                } else if new_starts_beside(takes, keeping, is_current, discarded, dir.exists()) {
                     next_untitled(&root, &dir)
                 } else {
                     dir
@@ -14969,6 +14972,42 @@ fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::
     taken.to_path_buf()
 }
 
+/// **Whether New must stop and ask about the scratch it would reclaim**
+/// (the scratch warning) before anything else happens. `takes` is what
+/// `count_media` found in it, `asked` that this New is the warning's own
+/// answer, `current` that the outgoing session stands on it, `discarded`
+/// that the save prompt was answered Don't Save.
+///
+/// The prompt covers the scratch on screen only when it was asked and
+/// answered Don't Save, and that answer keeps a recording - see
+/// [`new_starts_beside`]. A clean session gets no prompt at all, so its own
+/// scratch is asked about like any other: New used to skip the question for
+/// the scratch on screen and reclaim it, a take undone off the timeline (it
+/// is still in `media/`) included.
+#[cfg(feature = "recorder")]
+fn new_asks_about_scratch(takes: usize, asked: bool, current: bool, discarded: bool) -> bool {
+    takes > 0 && !asked && !(current && discarded)
+}
+
+/// **Whether New must leave the folder it landed on standing and start
+/// beside it** (`next_untitled`), read after Don't Save's discard has run:
+/// `still_stands` is whether the folder is on disk NOW. A folder that still
+/// stands is kept when the warning was answered Keep, or when it is the
+/// discarded session's own scratch and the discard refused to clear it - a
+/// recording in it, a document with clips, a kit somebody built, or a
+/// folder this session never made. Open and Quit leave exactly those on
+/// disk; New reclaimed them, recordings and all.
+#[cfg(feature = "recorder")]
+fn new_starts_beside(
+    takes: usize,
+    keeping: bool,
+    current: bool,
+    discarded: bool,
+    still_stands: bool,
+) -> bool {
+    still_stands && ((keeping && takes > 0) || (current && discarded))
+}
+
 /// Whether AccessKit is live — which is to say, whether an assistive
 /// technology has actually attached.
 ///
@@ -15080,9 +15119,8 @@ pub(crate) fn os_reader_attached() -> bool {
 /// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar - a kit
 /// built in this scratch included - the samples and imports it copied in,
 /// freeze renders, glued files, `state/` and the export staging in `export/`.
-/// Open and Quit stop here; New calls this too, but when it spares a
-/// recording New's own reclaim then removes the scratch it stands on
-/// regardless - see the New arm.
+/// Open and Quit stop here; New calls this too, and starts beside a scratch
+/// it spares rather than reclaiming it (`new_starts_beside`).
 fn discard_scratch_made_here(
     made_here: bool,
     dir: Option<&std::path::Path>,
@@ -23886,6 +23924,63 @@ mod tests {
         assert!(!discard_scratch_made_here(true, Some(&recorded), &root));
         assert!(recorded.exists(), "Don't Save deleted a recording");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **New keeps a recording in the scratch it stands on.** New reclaimed
+    /// the session's own Untitled whole on the theory that the save prompt
+    /// had covered it - but Don't Save on Open and Quit keeps a recording,
+    /// and a clean session (a take undone off the timeline is still in
+    /// `media/`) gets no prompt at all. Either way the take was deleted. The
+    /// arm's two decisions are free functions so the rule can be driven; the
+    /// tail pins that the arm still decides by them, the question before the
+    /// discard and the landing after it.
+    #[test]
+    fn new_keeps_a_recording_in_the_scratch_it_stands_on() {
+        // (takes, asked, current, discarded): Don't Save on the scratch on
+        // screen is the prompt's answer, acted on by the discard...
+        assert!(!new_asks_about_scratch(1, false, true, true));
+        // ...which refused (a take is in it): New starts beside it.
+        assert!(
+            new_starts_beside(1, false, true, true, true),
+            "New reclaimed the scratch on screen after Don't Save refused to clear it, recording and all"
+        );
+        // A clean session was never asked: its own scratch is asked about.
+        assert!(
+            new_asks_about_scratch(1, false, true, false),
+            "New reclaimed a clean session's scratch, recording and all, without a question"
+        );
+        // The discard cleared it: New lands on the freed name.
+        assert!(!new_starts_beside(1, false, true, true, false), "New stepped past a folder that is gone");
+        // An unwritten scratch: nothing to ask about and nothing to keep.
+        assert!(!new_asks_about_scratch(0, false, true, false));
+        assert!(!new_starts_beside(0, false, true, false, false));
+        // A leftover scratch with takes is asked about, as it always was,
+        // and Keep leaves it standing; Discard it reclaims it.
+        assert!(new_asks_about_scratch(2, false, false, false));
+        assert!(new_asks_about_scratch(2, false, false, true));
+        assert!(!new_asks_about_scratch(2, true, false, false), "the warning's own answer asked again");
+        assert!(new_starts_beside(2, true, false, true, true));
+        assert!(new_starts_beside(2, true, true, false, true));
+        assert!(!new_starts_beside(2, false, false, false, true));
+        assert!(!new_starts_beside(2, false, true, false, true), "Discard it, from the warning, kept the scratch");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("ProjectRequest::NewDiscarding => {").expect("the New arm");
+        let arm = &src[at..at + src[at..].find("// **A clean slate").expect("its clearing")];
+        let asks = arm
+            .find("if new_asks_about_scratch(takes, asked, is_current, discarded) {")
+            .expect("the New arm no longer asks through `new_asks_about_scratch`");
+        let discard = arm
+            .find("if discarded && self.discard_outgoing_scratch()")
+            .expect("the New arm no longer acts on Don't Save");
+        let lands = arm
+            .find("new_starts_beside(takes, keeping, is_current, discarded, dir.exists())")
+            .expect("the New arm no longer lands through `new_starts_beside`");
+        assert!(
+            asks < discard && discard < lands,
+            "the New arm decides before the question, or reads the folder before the discard"
+        );
     }
 
     /// An audio clip for the glue tests: everything playback reads, spelled.
