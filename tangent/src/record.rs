@@ -2120,15 +2120,13 @@ impl Session {
     ///
     /// **The beat number comes from the wall clock, not from the audio
     /// thread's sample count**, and the click the user hears comes from the
-    /// audio thread. They are two clocks, and they agree only while the
-    /// engine counts one click per beat of the signature: the engine's count
-    /// is `beats` CLICKS at the click's division (`Shared::metronome_div`),
-    /// this one is `beats` beats of the signature, and the go the host arms
-    /// T0 (`arm_at`) and Play-on-go from is the ENGINE's. Even at one click a
-    /// beat the two land within about a buffer of each other - the engine
-    /// starts its count at its next callback and latches the go when it
-    /// renders it - so whichever a UI frame sees first decides whether T0 is
-    /// the heard downbeat or that frame's `now` (in one frame, the host's
+    /// audio thread. They are two clocks counting the same thing - `beats`
+    /// beats of the signature, which the engine's count is at every click
+    /// division - and the go the host arms T0 (`arm_at`) and Play-on-go from
+    /// is the ENGINE's. They land within about a buffer of each other - the
+    /// engine starts its count at its next callback and latches the go when
+    /// it renders it - so whichever a UI frame sees first decides whether T0
+    /// is the heard downbeat or that frame's `now` (in one frame, the host's
     /// handover runs first).
     pub fn tick(&mut self, root: &std::path::Path, name: Option<&str>) -> bool {
         let Some(from) = self.count_in_from else {
