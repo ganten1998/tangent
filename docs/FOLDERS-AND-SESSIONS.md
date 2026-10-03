@@ -99,10 +99,13 @@ Related invariants that keep this working:
   through the scratch warning (`rearm_outgoing_discarded`). Then a scratch
   THIS session made real (`made_real_this_session`), named `Untitled` or
   `Untitled <n>`, unnamed and clipless ON DISK, off the shelf, holding
-  nothing but Tangent's own files and no recording (`rec-*`) is removed
-  WHOLE (`discard_scratch_made_here`): its kit (a kit
-  built there included), the samples and imports it copied in, freeze
-  renders, glued files, `state/` and the export staging. Open, Quit and
+  nothing but Tangent's own files, still on the template's kit and with no
+  recording (`rec-*`) is removed WHOLE (`discard_scratch_made_here`): its
+  kit sidecar, the samples and imports it copied in, freeze renders, glued
+  files, `state/` and the export staging. A kit built there keeps the
+  scratch, as it keeps it from New's reclaim and the sweep: the
+  conservative answer, pending the owner's ruling on whether Don't Save may
+  take a kit. Open, Quit and
   New all leave a scratch the discard refuses on disk: New starts beside
   it (`new_starts_beside`, the next free `Untitled <n>`). A clean session
   gets no prompt, so New asks about its scratch's takes with the scratch
