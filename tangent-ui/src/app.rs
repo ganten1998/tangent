@@ -900,7 +900,9 @@ pub struct TangentApp {
     /// `bootstrap_project`, saved atomically on every edit.
     arrangement: crate::arrangement::Arrangement,
     /// Where the document lives (`…/project.tangent`). Empty until the host
-    /// bootstraps; every clip path resolves against it.
+    /// bootstraps. What the project keeps is written beside it, and its clip
+    /// paths resolve against it too, except in a scratch whose folder is not
+    /// real yet - see `clip_doc`.
     project_doc: std::path::PathBuf,
     /// **Where a not-yet-real project's MEDIA still lives** — the folder its
     /// document was adopted from, or `None` for a project that owns its own.
@@ -914,6 +916,10 @@ pub struct TangentApp {
     /// exist. A template with an EMPTY kit never noticed. The owner built a
     /// seventeen-pad kit into his on 2 September, and after that every
     /// launch had seventeen missing samples in it.
+    ///
+    /// The document's own clips and frozen lanes name their audio the same
+    /// way (`media/Loop.wav`), and are read out of the same folder until the
+    /// scratch is real: `kit_doc` and `clip_doc` share one rule, `media_doc`.
     ///
     /// Runtime only, never serialised: it is a fact about how THIS session
     /// started, and a settings file that carried it would point the next
@@ -3110,6 +3116,29 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
     }
 }
 
+/// **The document a session's relative MEDIA resolves against** - a pad's
+/// sample, a clip's audio, a frozen lane's render - given the document the
+/// session stands on (`doc`) and the folder it was adopted from, if any
+/// (`source`, the session's `media_source`).
+///
+/// The session's own document whenever its folder is real, and always when
+/// nothing was adopted: a folder that exists owns its media. Only a scratch
+/// whose folder does not exist yet answers its template's document, because
+/// that is where the files still are until `materialize_project_dir` brings
+/// them across. The one rule behind `kit_doc` and `clip_doc`, so the pads and
+/// the clips can never disagree about where a scratch's media is.
+///
+/// One `is_dir` per call, and none without a `source`: the callers ask once
+/// and fan out over every pad or clip.
+fn media_doc(doc: &std::path::Path, source: Option<&std::path::Path>) -> std::path::PathBuf {
+    match source {
+        Some(src) if !doc.parent().is_some_and(std::path::Path::is_dir) => {
+            crate::arrangement::doc_in(src)
+        }
+        _ => doc.to_path_buf(),
+    }
+}
+
 /// Every RELATIVE sample the kits name, from `src` into `dst` - only files
 /// that exist there and are missing here. An absolute path is somebody's own
 /// file elsewhere and is not ours to duplicate; a file already in `dst` is
@@ -3127,10 +3156,10 @@ fn copy_kit_samples(
 /// **The files the DOCUMENT stands on**, by the kit samples' rules: every
 /// clip's `path` and every frozen lane's render. A template Save As Template
 /// copied whole from a real project carries them, and a scratch adopted
-/// from it reads them out of the template until it is real - so they came
-/// across neither when it was made real nor when it was saved back as the
-/// template, and the swap that replaced the old template then deleted them
-/// while the new document still named them.
+/// from it reads them out of the template until it is real (`clip_doc`) -
+/// so they came across neither when it was made real nor when it was saved
+/// back as the template, and the swap that replaced the old template then
+/// deleted them while the new document still named them.
 fn copy_doc_media(
     clips: &[crate::arrangement::ArrClip],
     frozen: &[crate::arrangement::FrozenLane],
@@ -9715,7 +9744,6 @@ impl TangentApp {
         self.undo_reset();
     }
 
-    /// The open document's path, for the host to resolve clip paths against.
     /// **The document a pad's relative sample resolves against**, which is
     /// not always the project's own.
     ///
@@ -9724,22 +9752,41 @@ impl TangentApp {
     /// that is where they are read from. The moment the folder is real the
     /// project owns them, because `materialize_project_dir` brings them
     /// across; from then on this answers the project and the template is out
-    /// of the picture.
+    /// of the picture. The rule is `media_doc`, which `clip_doc` asks too.
     ///
     /// One `is_dir` per call, not per pad: the callers ask once and fan out
     /// over a hundred and twenty-eight slots.
     fn kit_doc(&self) -> Option<std::path::PathBuf> {
-        let doc = self.project_doc()?;
-        let real = doc.parent().is_some_and(std::path::Path::is_dir);
-        if real {
-            return Some(doc.to_path_buf());
-        }
-        match self.media_source.as_ref() {
-            Some(src) => Some(crate::arrangement::doc_in(src)),
-            None => Some(doc.to_path_buf()),
-        }
+        Some(media_doc(self.project_doc()?, self.media_source.as_deref()))
     }
 
+    /// **The document a clip's or a frozen lane's relative audio resolves
+    /// against** - `kit_doc`'s twin, for every road that turns a clip's path
+    /// into a file to read: the host's playback and its warm-up, the
+    /// pictures, an export and a freeze, glue, normalize and quantize, and a
+    /// clip dragged out as a sample.
+    ///
+    /// A launch and New adopt the template IN MEMORY, and its clips name
+    /// their audio relative to the document (`media/Loop.wav`). Resolved
+    /// against `project_doc` - the scratch folder nobody has made yet -
+    /// every template clip with audio and every frozen lane was a decode
+    /// refusal, and the refusal was remembered, so the clip stayed silent
+    /// even once the folder was real. Until then they are read out of the
+    /// template; from the moment the folder is real,
+    /// `materialize_project_dir` has brought them across and this answers
+    /// the project. A session that adopted nothing answers `project_doc`,
+    /// exactly. The rule is `media_doc`.
+    ///
+    /// **Where to READ, never where to write.** A take, a freeze render, a
+    /// weld, the document and `state/` go beside `project_doc`. An absolute
+    /// clip path is itself whichever document answers (`Arrangement::resolve`).
+    pub fn clip_doc(&self) -> Option<std::path::PathBuf> {
+        Some(media_doc(self.project_doc()?, self.media_source.as_deref()))
+    }
+
+    /// The open document's path: where the project is WRITTEN - the
+    /// document, the kit, `state/`, takes and freeze renders. Not always
+    /// where its media is read from; see `clip_doc` and `kit_doc`.
     pub fn project_doc(&self) -> Option<&std::path::Path> {
         (!self.project_doc.as_os_str().is_empty()).then_some(self.project_doc.as_path())
     }
@@ -12973,7 +13020,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(src) = self.media_source.as_ref() {
             copy_kit_samples(&self.drumpad_kits, src, dir);
             // And what the document's own clips and frozen lanes stand on,
-            // out of the same template - see `copy_doc_media`.
+            // out of the same template and for the same reason: `clip_doc`
+            // turns to the project with `kit_doc` - see `copy_doc_media`.
             copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, src, dir);
         }
         // **And the kit itself**, when there is one and the folder has none.
@@ -28520,14 +28568,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if path.is_empty() {
             return;
         }
-        let Some(doc) = self.project_doc() else {
+        // Against `clip_doc`, as the timeline plays it: a fresh session's
+        // template clip is still in the template.
+        let Some(doc) = self.clip_doc() else {
             return;
         };
         // `Arrangement::resolve` is the one place a clip's path becomes a
         // file: `media/<file>` inside a project, or an absolute path taken
         // as it stands. A second spelling of that join is a clip that
         // resolves one way for the timeline and another for a drag.
-        let file = crate::arrangement::Arrangement::resolve(doc, &path);
+        let file = crate::arrangement::Arrangement::resolve(&doc, &path);
         egui::DragAndDrop::set_payload(ctx, crate::drumpad_panel::DraggedMedia(file));
     }
 
@@ -46656,6 +46706,141 @@ mod tests {
             "materialising lost the sample: {} does not exist, so every pad              goes missing the moment somebody records a take",
             at.display()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A template's clips and frozen lanes play before the scratch folder
+    /// exists**, as its kit does (the test above). A clip names its audio
+    /// relative to the document, `media/Loop.wav`, and the host resolved it
+    /// against `project_doc` - the scratch nobody has made - so every
+    /// template clip with audio and every frozen lane was a decode refusal in
+    /// every fresh session. `clip_doc` answers the template until the folder
+    /// is real and the project from then on, by the kit's own rule; a path
+    /// named absolute is itself either way, and a session that adopted
+    /// nothing resolves against its own document exactly as before.
+    ///
+    /// Revert-check: make `clip_doc` answer `project_doc` and the first half
+    /// goes red.
+    #[test]
+    fn an_adopted_clip_reads_from_the_template_until_the_project_is_real() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-adopt-clips-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        for f in ["Loop.wav", "frozen-03-1.wav"] {
+            std::fs::write(template.join("media").join(f), b"RIFFxxxxWAVE").expect("template audio");
+        }
+        // And a file of somebody's own, named by its absolute path.
+        let own = root.join("Elsewhere").join("Own.wav");
+        std::fs::create_dir_all(root.join("Elsewhere")).expect("elsewhere");
+        std::fs::write(&own, b"RIFFxxxxWAVE").expect("an own file");
+        let own_path = own.to_string_lossy().into_owned();
+        let mut doc = crate::arrangement::Arrangement::default();
+        for path in ["media/Loop.wav", own_path.as_str()] {
+            doc.add_clip(crate::arrangement::ArrClip {
+                kind: crate::arrangement::ClipKind::Audio,
+                path: path.to_owned(),
+                len_s: 1.0,
+                ..Default::default()
+            });
+        }
+        let mut desk = TangentApp::template_desk();
+        desk.frozen = Some(vec![crate::arrangement::FrozenLane {
+            lane: 2,
+            path: "media/frozen-03-1.wav".to_owned(),
+            len_s: 1.0,
+        }]);
+        doc.desk = Some(desk);
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        // Where the host reads each file the document names: the clip, the
+        // frozen lane's render and the absolute one, in that order.
+        let files = |app: &TangentApp| -> Vec<std::path::PathBuf> {
+            let doc = app.clip_doc().expect("an adopted session has a document");
+            ["media/Loop.wav", "media/frozen-03-1.wav", own_path.as_str()]
+                .iter()
+                .map(|p| crate::arrangement::Arrangement::resolve(&doc, p))
+                .collect()
+        };
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        app.adopt_template(&template, &scratch);
+        assert!(!scratch.exists(), "adopting a template must create nothing");
+        assert_eq!(
+            app.frozen_lanes().iter().map(|z| z.path.as_str()).collect::<Vec<_>>(),
+            ["media/frozen-03-1.wav"],
+            "the template's frozen lane did not arrive with it"
+        );
+        let before = files(&app);
+        for at in &before[..2] {
+            assert!(
+                at.starts_with(&template) && at.is_file(),
+                "an adopted clip's audio resolved to {}, which is not the \
+                 template's file - every template clip and frozen lane is \
+                 silent in a fresh session",
+                at.display()
+            );
+        }
+        assert_eq!(before[2], own, "an absolute path was moved");
+        assert_eq!(
+            app.clip_doc(),
+            app.kit_doc(),
+            "the clips and the kit disagree about where the scratch's media is"
+        );
+
+        // Real: `materialize_project_dir` brought the files across, and from
+        // here on the project's own `media/` answers.
+        app.materialize_project_dir();
+        let after = files(&app);
+        for at in &after[..2] {
+            assert!(
+                at.starts_with(&scratch) && at.is_file(),
+                "a real scratch should read its own media, got {}",
+                at.display()
+            );
+        }
+        assert_eq!(after[2], own, "an absolute path was moved");
+
+        // A session that adopted nothing: its own document, real or not.
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).expect("song media");
+        doc.named = true;
+        doc.save_to(&crate::arrangement::doc_in(&song));
+        app.open_project(&crate::arrangement::doc_in(&song));
+        assert_eq!(app.clip_doc().as_deref(), app.project_doc(), "an opened project borrowed media");
+        let _ = std::fs::remove_dir_all(&song);
+        assert_eq!(
+            app.clip_doc().as_deref(),
+            app.project_doc(),
+            "a project whose folder went missing borrowed the template's media"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The one rule behind `kit_doc` and `clip_doc`**, without an app: a
+    /// session adopted from a template reads its media out of the template
+    /// while its own folder does not exist, and out of its own folder once
+    /// it does; a session that adopted nothing always reads its own.
+    #[test]
+    fn a_scratch_reads_its_media_from_its_template_until_its_folder_is_real() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-media-doc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).expect("template");
+        let doc = crate::arrangement::doc_in(&root.join("Untitled"));
+        assert_eq!(media_doc(&doc, Some(template.as_path())), crate::arrangement::doc_in(&template));
+        assert_eq!(media_doc(&doc, None), doc, "nothing adopted, nothing borrowed");
+        std::fs::create_dir_all(root.join("Untitled")).expect("the scratch made real");
+        assert_eq!(media_doc(&doc, Some(template.as_path())), doc, "a real folder owns its media");
+        assert_eq!(media_doc(&doc, None), doc);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -73110,6 +73295,41 @@ mod sampler_road_tests {
             )
         );
         assert!(app.said().is_empty(), "an ordinary drag said something");
+    }
+
+    /// **A template's clip dragged out of a fresh session carries the file
+    /// the timeline plays: the template's.** The scratch folder does not
+    /// exist until something is written, so the join against `project_doc`
+    /// handed a sampler a file that was not there. The drag resolves through
+    /// `clip_doc`, as the timeline does.
+    #[test]
+    fn a_template_clip_dragged_out_of_a_fresh_session_carries_the_templates_file() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-drag-template-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFxxxxWAVE").expect("loop");
+        let mut doc = Arrangement::default();
+        doc.add_clip(a_clip(ClipKind::Audio, "media/Loop.wav"));
+        doc.save_to(&template.join(DOC_NAME));
+
+        let (ctx, mut app) = tests::headless(Caps::PLUGIN);
+        app.adopt_template(&template, &root.join("Untitled"));
+        let id = app.arrangement.clips[0].id;
+        a_drag_in_flight(&ctx);
+        app.arm_clip_drag(&ctx, id);
+        let got = egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx)
+            .expect("the clip published nothing");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            got.0,
+            template.join("media").join("Loop.wav"),
+            "the drag carried a file in a folder that does not exist"
+        );
     }
 
     /// **A MIDI clip publishes nothing, and says nothing about it.**
