@@ -18484,12 +18484,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
             // negative count-in; eight bars is already longer than anybody
-            // waits through twice.
+            // waits through twice. Through `set_count_in_bars`, the chip's
+            // road, which keeps the legacy beats key in step and commits:
+            // writing the bars here alone left `CountIn::beats` behind.
             Some(MetHit::CountIn(d)) => {
-                self.settings.record_count_in_bars =
-                    (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
-                self.save_settings();
-                self.undo_commit();
+                let bars = (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
+                self.set_count_in_bars(bars as u32);
             }
             Some(MetHit::CountInInTake) => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
@@ -32086,13 +32086,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // the band no longer reads. So the control cycled a number
                 // nothing displayed, and the band appeared not to react to
                 // clicks at all.
-                let choices = recorder::COUNT_IN_CHOICES;
-                let now = self.settings.count_in_bars();
-                let next = choices
-                    .iter()
-                    .position(|c| *c == now)
-                    .map_or(choices[0], |i| choices[(i + 1) % choices.len()]);
-                self.set_count_in_bars(next);
+                //
+                // **Stepped by `next_count_in`**, not by a walk of its own:
+                // this arm's copy started a length off the list (the
+                // metronome panel's 3 or 5-8 bars) over at OFF.
+                self.set_count_in_bars(recorder_panel::next_count_in(
+                    self.settings.count_in_bars(),
+                ));
             }
             Hit::Export => self.open_export_dialog(),
             // The knobs write to settings and are pushed to the engine after
@@ -33706,9 +33706,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **Set the count-in, in bars, and keep the legacy beats key in step**,
     /// as one moment: `CountIn::bars` and `CountIn::beats` are both hashed.
-    /// The setup panel's COUNT-IN chip comes through here; the metronome
-    /// panel's COUNT row still writes the bars on its own and leaves the
-    /// beats behind.
+    /// Every road that sets the count-in comes through here - the setup
+    /// panel's chip and the metronome panel's COUNT row - so the legacy
+    /// beats key and the moment cannot differ by road.
     ///
     /// **Meant to be the one place**, because two roads once disagreed: the
     /// band cycled the legacy BEATS key while the display read bars, so
@@ -33720,9 +33720,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
-        // Both callers are single presses (the setup panel's count-in chip,
-        // and the menu's `SetCountIn` arm, which no menu row builds today),
-        // so one moment each. `CountIn::bars` is hashed.
+        // Every caller is a single press (the setup panel's count-in chip,
+        // the metronome panel's COUNT row, and the menu's `SetCountIn` arm,
+        // which no menu row builds today), so one moment each.
+        // `CountIn::bars` is hashed.
         self.undo_commit();
     }
 
@@ -67840,6 +67841,63 @@ mod tests {").expect("the tests module")];
         app.undo();
         assert_eq!(app.time_signature(), Sig { beats: 8, unit: 8 }, "one Ctrl+Z took two signature changes");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A count-in set in the metronome panel steps ON at the setup panel's
+    /// chip, and the legacy beats key follows either road.**
+    ///
+    /// The two count-in controls step differently: the metronome panel's
+    /// COUNT row a bar at a time over 0..=8, the chip through
+    /// `COUNT_IN_CHOICES` (off, 1, 2, 4). The chip read any length off its
+    /// list as unknown and started again at off, so 3 bars set in the panel
+    /// went to OFF at one press of the chip - and the panel wrote the bars
+    /// alone, leaving `record_count_in_beats` (hashed as `CountIn::beats`)
+    /// at the old length. Both roads go through `set_count_in_bars` now, and
+    /// the chip steps to the next choice ABOVE the length it shows.
+    #[test]
+    fn a_count_in_set_in_the_metronome_panel_steps_on_at_the_chip() {
+        use crate::recorder_panel::MetHit;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_count_in_bars(2);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        app.met_menu = Some(());
+        app.met_at = Some(screen.center());
+        let anchor = app.met_anchor(screen);
+        let panel = recorder_panel::met_popup_rect(screen, anchor);
+        let mut plus = None;
+        let mut y = panel.top();
+        'find: while y <= panel.bottom() {
+            let mut x = panel.left();
+            while x <= panel.right() {
+                let p = Pos2::new(x, y);
+                if recorder_panel::met_hit_test(screen, anchor, p) == Some(MetHit::CountIn(1)) {
+                    plus = Some(p);
+                    break 'find;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        assert!(app.met_menu_press(screen, plus.expect("the panel has no COUNT +"), true));
+        assert_eq!(app.settings.count_in_bars(), 3, "COUNT + did not step");
+        assert_eq!(
+            app.settings.record_count_in_beats,
+            i64::from(app.time_signature().beats_in(3)),
+            "the metronome panel left the legacy beats key (hashed as CountIn::beats) behind"
+        );
+        // The setup panel's chip - the TAKE, RECORDING and SETTINGS shapes
+        // all press this.
+        app.apply_recorder_hit(recorder_panel::Hit::CycleCountIn);
+        assert_eq!(
+            app.settings.count_in_bars(),
+            4,
+            "a 3-bar count stepped to {} at the chip",
+            app.settings.count_in_bars()
+        );
+        // Past the last choice the chip wraps round to off, as it does from 4.
+        app.set_count_in_bars(6);
+        app.apply_recorder_hit(recorder_panel::Hit::CycleCountIn);
+        assert_eq!(app.settings.count_in_bars(), 0, "a 6-bar count did not wrap round to off");
     }
 
     /// **The DONE press is spent on DONE.** The take panel hangs below the

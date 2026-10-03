@@ -2547,8 +2547,8 @@ pub enum Hit {
     PickAudio,
     /// Step the count-in through `COUNT_IN_CHOICES` - off, 1, 2, 4 BARS - and
     /// back round to off. A length off that list (the metronome panel's 3 or
-    /// 5-8 bars) starts the cycle over at off. Stepped in
-    /// `TangentApp::apply_recorder_hit`; see also [`next_count_in`].
+    /// 5-8 bars) steps to the next choice above it: 3 to 4, and 5-8 round to
+    /// off. Stepped by [`next_count_in`], in `TangentApp::apply_recorder_hit`.
     CycleCountIn,
     Export,
     /// Whether the click is also recorded into the file. Lives in the
@@ -3490,18 +3490,21 @@ pub fn timeline_fraction(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Opti
 
 /// The next count-in length in the cycle, in BARS (`COUNT_IN_CHOICES`).
 ///
-/// Meant as the one place the chip's cycle is decided, so that the control's
-/// label and the effect of clicking it cannot disagree - but only a test
-/// calls it today: the chip's own arm in `TangentApp::apply_recorder_hit`
-/// repeats the same walk. An unknown value (a hand-edited file, or a length
-/// the metronome panel set off this list) lands on the first choice rather
-/// than sticking.
+/// The one place the chip's cycle is decided: the chip's arm in
+/// `TangentApp::apply_recorder_hit` steps through it, so the control's label
+/// and the effect of clicking it cannot disagree.
+///
+/// **The next choice ABOVE the length shown, not the one after it in the
+/// list.** A length off the list - the metronome panel's COUNT row steps a
+/// bar at a time, and a hand-edited file can hold anything - used to start
+/// the cycle over at off, so 3 bars went to OFF at one press. It steps to 4
+/// now; past the last choice it wraps round to off, as 4 itself does.
 pub fn next_count_in(current: u32) -> u32 {
-    let i = COUNT_IN_CHOICES
+    COUNT_IN_CHOICES
         .iter()
-        .position(|&c| c == current)
-        .map_or(0, |i| i + 1);
-    COUNT_IN_CHOICES[i % COUNT_IN_CHOICES.len()]
+        .copied()
+        .find(|&c| c > current)
+        .unwrap_or(COUNT_IN_CHOICES[0])
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────
@@ -11373,6 +11376,9 @@ mod tests {
         // A value a hand-edited settings file could hold lands somewhere real
         // rather than sticking.
         assert_eq!(next_count_in(97), COUNT_IN_CHOICES[0]);
+        // And a length the metronome panel steps to, off the list, steps ON
+        // to the next choice above it rather than starting over at off.
+        assert_eq!(next_count_in(3), 4, "3 bars stepped back to off");
         // And the label says BARS, because that is what the choices are now
         // that there is a time signature to count them in. It said beats, and
         // went on saying beats after the setting became bars — so the cell
