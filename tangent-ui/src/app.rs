@@ -686,8 +686,9 @@ pub struct TangentApp {
     /// the host's editor hook can drive it — and putting the font back needs
     /// one. The same shape as `pending_resize` beside it.
     pending_reset: Option<crate::settings::ResetScope>,
-    /// The Undo on the box a reset leaves behind was pressed.
-    pending_undo_reset: bool,
+    /// The Undo on the box a reset leaves behind was pressed, for a reset of
+    /// this scope.
+    pending_undo_reset: Option<crate::settings::ResetScope>,
     /// What the host found in the scratch New would reclaim, pushed when it
     /// declines to act. Cleared as soon as the question is asked.
     scratch_warning: Option<crate::ports::ScratchWarning>,
@@ -4120,7 +4121,7 @@ impl TangentApp {
             caps,
             pending_resize: None,
             pending_reset: None,
-            pending_undo_reset: false,
+            pending_undo_reset: None,
             scratch_warning: None,
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
@@ -34581,7 +34582,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             choices: if undoable {
                 vec![dialogs::ConfirmChoice::new(
                     "Undo",
-                    DialogAction::UndoReset,
+                    DialogAction::UndoReset(scope),
                     false,
                 )]
             } else {
@@ -34791,8 +34792,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.report_the_reset(scope, undoable);
     }
 
-    /// Put the settings back to the copy taken just before the last reset.
-    fn undo_the_reset(&mut self, ctx: &egui::Context) {
+    /// Put the settings back to the copy taken just before the last reset,
+    /// which was of `scope`.
+    fn undo_the_reset(&mut self, ctx: &egui::Context, scope: crate::settings::ResetScope) {
         let Some(back) = Settings::load_backup() else {
             return;
         };
@@ -34808,20 +34810,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::fonts::install(ctx, font, custom.as_deref());
         self.rebuild_voicing();
         self.request_natural_size();
-        // **And the window goes back too.** The reset resizes it to 100% on
-        // the spot now, so an Undo that restored the settings alone would
-        // leave a window whose size the file no longer names - and the
-        // geometry write-back would then overwrite the restored size with
-        // the reset one. The size it had, or the size its restored percent
-        // asks for, through the same two slots the reset used.
-        let size = self
-            .settings
-            .window_size_for_use()
-            .unwrap_or_else(|| initial_window_size(&self.settings));
-        if self.caps.window_sizing {
-            self.pending_window_size = Some(size);
-        } else {
-            self.pending_resize = Some(size);
+        // **And the window goes back too - after the one reset that moved
+        // it.** Everything resizes it to 100% on the spot now, so an Undo
+        // that restored the settings alone would leave a window whose size
+        // the file no longer names - and the geometry write-back would then
+        // overwrite the restored size with the reset one. The size it had,
+        // or the size its restored percent asks for, through the same two
+        // slots the reset used.
+        //
+        // **Only there.** No other scope touches the window (Layout resets
+        // the remembered geometry, not the window on screen), and a size
+        // request is honoured wherever the window is: undoing a Colours
+        // reset took a full-screen desk out of full screen and brought a
+        // maximised one down.
+        if scope == crate::settings::ResetScope::Everything {
+            let size = self
+                .settings
+                .window_size_for_use()
+                .unwrap_or_else(|| initial_window_size(&self.settings));
+            if self.caps.window_sizing {
+                self.pending_window_size = Some(size);
+            } else {
+                self.pending_resize = Some(size);
+            }
         }
         self.save_settings();
         self.desk_reload = true;
@@ -35387,9 +35398,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = None;
                 self.pending_reset = Some(scope);
             }
-            DialogAction::UndoReset => {
+            DialogAction::UndoReset(scope) => {
                 self.dialog = None;
-                self.pending_undo_reset = true;
+                self.pending_undo_reset = Some(scope);
             }
             DialogAction::FlattenTempo => {
                 self.dialog = None;
@@ -41239,8 +41250,8 @@ impl TangentApp {
         if let Some(scope) = self.pending_reset.take() {
             self.reset_settings(&ctx, scope);
         }
-        if std::mem::take(&mut self.pending_undo_reset) {
-            self.undo_the_reset(&ctx);
+        if let Some(scope) = self.pending_undo_reset.take() {
+            self.undo_the_reset(&ctx, scope);
         }
         // **The host declined to reclaim a scratch with recordings in it and
         // handed the fact back.** Ask, defaulting to keeping them.
@@ -61289,10 +61300,10 @@ mod tests {
             panic!("nothing reported the reset");
         };
         assert_eq!(choices.len(), 1);
-        assert!(matches!(choices[0].action, DialogAction::UndoReset));
+        assert!(matches!(choices[0].action, DialogAction::UndoReset(crate::settings::ResetScope::Colours)));
 
         // And it works, across everything the reset touched.
-        app.apply_dialog_action(DialogAction::UndoReset);
+        app.apply_dialog_action(choices[0].action.clone());
         run_frame(&ctx, &mut app);
         assert_eq!(app.settings.theme_name, "Rhodes", "Undo did not put the theme back");
         assert_eq!(
@@ -61300,6 +61311,49 @@ mod tests {
             Rgb { r: 9, g: 9, b: 9 }
         );
 
+        let _ = std::fs::remove_file(Settings::backup_path());
+    }
+
+    /// **Undoing a reset touches the window only if the reset did.**
+    ///
+    /// Undo asked the window for a size after EVERY scope, and a size
+    /// request is honoured wherever the window is: a full-screen window
+    /// leaves full screen and a maximised one comes down, so undoing a
+    /// COLOURS reset - which never touched the window - took the desk out
+    /// of full screen. The receipt's Undo now carries the scope it undoes,
+    /// and only a scope whose reset resized the window (Everything) has its
+    /// undo put the size back.
+    #[test]
+    fn undoing_a_reset_asks_the_window_for_a_size_only_if_the_reset_did() {
+        use crate::settings::ResetScope as R;
+        let _ = std::fs::remove_file(Settings::backup_path());
+        for (scope, sized) in [(R::Colours, false), (R::Everything, true)] {
+            let mut s = Settings::first_launch();
+            s.theme_name = "Rhodes".into();
+            let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+            app.apply_dialog_action(DialogAction::ResetTo(scope));
+            run_frame(&ctx, &mut app);
+            let Some(Dialog::Confirm { choices, .. }) = app.open_dialog() else {
+                panic!("nothing reported the {scope:?} reset");
+            };
+            let Some(DialogAction::UndoReset(undoes)) = choices.first().map(|c| c.action.clone()) else {
+                panic!("the {scope:?} reset left no way back, so the undo below would test nothing");
+            };
+            assert_eq!(undoes, scope, "the receipt's Undo names another scope");
+            app.pending_window_size = None;
+            let _ = app.take_pending_resize();
+            app.undo_the_reset(&ctx, undoes);
+            assert_eq!(app.settings.theme_name, "Rhodes", "the {scope:?} undo did not run");
+            assert_eq!(
+                app.pending_window_size.is_some(),
+                sized,
+                "undoing the {scope:?} reset {} the window for a size - and a size request first \
+                 takes a full-screen window out of full screen ({:?})",
+                if sized { "did not ask" } else { "asked" },
+                size_request_step(true, true, false, None)
+            );
+            assert_eq!(app.take_pending_resize(), None, "the desktop request went to the plugin's slot");
+        }
         let _ = std::fs::remove_file(Settings::backup_path());
     }
 
