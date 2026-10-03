@@ -380,6 +380,8 @@ fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
         "follow_tempo" => v.is_boolean(),
         "notes" | "pedal" => v.is_array(),
         "warp_rate" => v.is_number(),
+        "warp" => v.is_array(),
+        "warp_fit" => v.is_string(),
         // A name not in the list is not a key this build claims, so nothing
         // is about to consume it either way.
         _ => true,
@@ -426,7 +428,7 @@ pub fn stretch_mode_label(key: &str) -> &'static str {
 /// read and `tangent-ui` cannot name a constant that lives with the DSP.
 pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
 
-const CLIP_KEYS: [&str; 19] = [
+const CLIP_KEYS: [&str; 21] = [
     "kind",
     "lane",
     "path",
@@ -446,6 +448,8 @@ const CLIP_KEYS: [&str; 19] = [
     "gain",
     "loop_s",
     "warp_rate",
+    "warp",
+    "warp_fit",
 ];
 
 /// What a clip is made of.
@@ -3669,13 +3673,14 @@ impl Arrangement {
                     // the plain one is a swap and would rotate a preserved
                     // key into the hole it just made.
                     //
-                    // The list below is the eleven names read above and must
+                    // The list below is every name read above and must
                     // stay in step with them. A field added to `ArrClip`
                     // without a name added here comes back DUPLICATED: once
                     // as itself and once inside `extra`, and the extras merge
                     // in `to_json` would then be writing a stale copy of a
                     // live field. `a_clip_knows_which_of_its_keys_are_its_own`
-                    // is what catches that.
+                    // is what catches that, for a field its clip SETS: `warp`
+                    // and `warp_fit` went uncaught while it left them empty.
                     extra: {
                         for known in CLIP_KEYS {
                             // **A key we own but cannot READ stays where it
@@ -5158,8 +5163,8 @@ mod tests {
             stretch_mode: "tonal".into(),
             gain: 0.5,
             extra: Map::new(),
-            warp: Vec::new(),
-            warp_fit: String::new(),
+            warp: vec![(0, 0), (24_000, 25_000)],
+            warp_fit: "slice".into(),
             warp_rate: 48_000,
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {
@@ -5191,6 +5196,42 @@ mod tests {
         assert!(
             Arrangement::from_json(&a.to_json()).clips[0].extra.is_empty(),
             "a clip claimed one of its own keys as a stranger's"
+        );
+    }
+
+    /// **A quantize changed after a load is saved as changed.** `warp` and
+    /// `warp_fit` were read but missing from [`CLIP_KEYS`], so every loaded
+    /// clip also kept a copy of both in `extra`, and the writer's merge put
+    /// the copy back wherever the live field writes nothing: a take
+    /// re-quantized under the auto fit (which writes no fit) reopened under
+    /// the fit it was loaded with, and a map taken off came back from the
+    /// copy. Claiming the names must not eat a newer build's map in a shape
+    /// this one cannot read, either.
+    #[test]
+    fn a_quantize_changed_after_a_load_is_saved_as_changed() {
+        let mut a = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+                 "warp": [[0, 0], [24000, 22050]], "warp_fit": "slice",
+                 "warp_rate": 48000}]}"#,
+        );
+        a.clips[0].warp_fit = "auto".to_owned();
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back.clips[0].warp_fit, "", "the fit the take was loaded with came back");
+        a.clips[0].warp.clear();
+        a.clips[0].warp_rate = 0;
+        let back = Arrangement::from_json(&a.to_json());
+        assert!(back.clips[0].warp.is_empty(), "a map taken off came back: {:?}", back.clips[0].warp);
+
+        let newer = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+                 "warp": {"segments": 3}, "warp_fit": 7}]}"#,
+        );
+        let out = newer.to_json();
+        assert!(
+            out.contains(r#""segments": 3"#) && out.contains(r#""warp_fit": 7"#),
+            "a newer build's quantize was eaten: {out}"
         );
     }
 
