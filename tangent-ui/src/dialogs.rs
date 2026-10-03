@@ -443,6 +443,14 @@ pub enum Dialog {
         outputs: Vec<String>,
         /// The one to open, or `None` for the system's own default.
         output: Option<String>,
+        /// **The OUTPUT list belonged to the LAST system**: raised by a
+        /// SYSTEM press while this panel is open, which empties `outputs` and
+        /// `output` with it. Every name in that list came from the old
+        /// backend, and asking the new one at once would ask the old one
+        /// again - the host only switches a frame later - so the row says
+        /// when the new list comes rather than offering names that cannot
+        /// open. See `DialogAction::SetAudioSystem`.
+        outputs_stale: bool,
         /// The rates the selected input device offers.
         rates: Vec<u32>,
         /// How many inputs the selected device has, so the channel row can say
@@ -9444,6 +9452,7 @@ fn show_on(
             system,
             outputs,
             output,
+            outputs_stale,
             rates,
             input_channels,
             exposed,
@@ -9987,9 +9996,13 @@ fn show_on(
                             ui.label(RichText::new("OUTPUT").font(bold(11.0)).color(t.text));
                             if outputs.is_empty() {
                                 ui.label(
-                                    RichText::new("none reported")
-                                        .font(plain(11.0))
-                                        .color(dim),
+                                    RichText::new(if *outputs_stale {
+                                        "the new system's outputs are listed when Setup next opens"
+                                    } else {
+                                        "none reported"
+                                    })
+                                    .font(plain(11.0))
+                                    .color(dim),
                                 );
                             } else {
                                 ui.horizontal_wrapped(|ui| {
@@ -15739,6 +15752,7 @@ at: None,
                 "Komplete Audio 6 MK2".to_owned(),
             ],
             output: None,
+            outputs_stale: false,
             rates: Vec::new(),
             input_channels: 0,
             exposed: Vec::new(),
@@ -15803,6 +15817,7 @@ at: None,
             system: Some("WASAPI".to_owned()),
             outputs: Vec::new(),
             output: None,
+            outputs_stale: false,
             rates: Vec::new(),
             input_channels: 0,
             exposed: Vec::new(),
@@ -15813,6 +15828,18 @@ at: None,
         bare.settle();
         assert!(bare.says("OUTPUT"), "the row vanished with no devices");
         assert!(bare.says("none reported"), "an empty output list said nothing");
+
+        // **And a list a SYSTEM press left behind says when the new one
+        // comes**, rather than "none reported" about a system nobody has
+        // asked yet. See `outputs_stale`.
+        if let Some(Dialog::AudioSetup { outputs_stale, .. }) = bare.dialog.as_mut() {
+            *outputs_stale = true;
+        }
+        assert!(
+            bare.says("the new system's outputs are listed when Setup next opens"),
+            "a list a system press left behind does not say when the new one comes"
+        );
+        assert!(!bare.says("none reported"), "a system not yet asked reads as one with no outputs");
     }
 
     /// **The buffer chip and the readout above it cannot disagree about who
@@ -15870,6 +15897,7 @@ at: None,
             system: None,
             outputs: Vec::new(),
             output: None,
+            outputs_stale: false,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),
@@ -15970,6 +15998,7 @@ at: None,
             system: None,
             outputs: Vec::new(),
             output: None,
+            outputs_stale: false,
             rates: Vec::new(),
             input_channels: 2,
             exposed: Vec::new(),
@@ -16051,6 +16080,7 @@ at: None,
             system: None,
             outputs: Vec::new(),
             output: None,
+            outputs_stale: false,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),
