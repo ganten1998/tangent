@@ -187,8 +187,9 @@ Notes on the set:
   `dist/`. If `makensis` is missing, only the zip is built and the run warns
   loudly that no setup.exe was produced. The
   `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
-  function name; it is not a deliverable and `publish-github.sh` does not
-  upload it.
+  function name; it is not a deliverable, `publish-github.sh` does not
+  upload it, and `release.sh` leaves it out of `SHA256SUMS` (a summed file
+  nobody can download fails every user's `shasum -c`).
 - **The VST3 plugin is retired** (2026-08-24, the owner's ruling). No
   installer may carry a `Tangent.vst3`; `release.sh` fails any that does.
 - **FreeBSD ships.** `scripts/release.sh` on a FreeBSD host runs
@@ -323,7 +324,9 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    supporter-key email and in `README.md`; **a release published without the
    aliases 404s for everyone who has already paid, silently.** The script
    re-checks every permalink after upload and exits non-zero if one is dead,
-   so a red run is never cosmetic. A version with a pre-release suffix is
+   so a red run is never cosmetic. Before uploading it refuses a checksum
+   file that does not cover every artifact, or that names a file it would
+   not upload. A version with a pre-release suffix is
    published as a GitHub pre-release, deliberately: `latest/download`
    resolves against the latest stable, so a correctly marked beta leaves the
    permanent links alone. Release notes must include the SmartScreen note.

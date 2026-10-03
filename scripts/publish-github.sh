@@ -117,6 +117,21 @@ for a in "${ARTIFACTS[@]}"; do
   grep -Fq "  ${a#dist/}" "$SUMS" \
     || { echo "$SUMS does not cover ${a#dist/} (stale?) — scripts/release.sh --sums-only" >&2; exit 1; }
 done
+# **And the other way round: every file the sums name goes up with them.** A
+# user checks a download with `shasum -c SHA256SUMS`, which fails on any line
+# whose file was never published; the Windows PDB rode in exactly that way,
+# summed by release.sh and uploaded by nobody.
+while read -r _ named; do
+  [ -n "$named" ] || continue
+  named="${named#\*}"   # a binary-mode sum marks the name with `*`
+  hit=0
+  for a in "${ARTIFACTS[@]}"; do [ "${a#dist/}" = "$named" ] && { hit=1; break; }; done
+  [ "$hit" = 1 ] || {
+    echo "$SUMS names $named, which this publish does not upload: a user's" >&2
+    echo "  \`shasum -c\` would fail on it. Rerun scripts/release.sh --sums-only." >&2
+    exit 1
+  }
+done < "$SUMS"
 echo "==> Checksums: $SUMS"
 
 # ── Build the alias set in a temp dir ────────────────────────────────────────

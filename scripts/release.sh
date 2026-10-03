@@ -321,7 +321,15 @@ fi
 # Linux tarball without a binary is the exact thing that shipped before 2.1.0.
 shopt -s nullglob
 ARTIFACTS=()
-for f in dist/*-"${VERSION}"-*; do [ -f "$f" ] && ARTIFACTS+=("$f"); done
+# **Not the PDB.** build-cross.sh keeps the Windows symbols beside the
+# deliverables under the build's own name, so the glob finds them, and they
+# are never uploaded: summed here, they made every user's `shasum -c
+# SHA256SUMS` report a file that is not there, which reads as a failed
+# integrity check on a clean download.
+for f in dist/*-"${VERSION}"-*; do
+  case "$f" in *.pdb) continue ;; esac
+  [ -f "$f" ] && ARTIFACTS+=("$f")
+done
 # The FreeBSD artifacts wear pkg's spelling, which is only the same string
 # for a final release; a prerelease's are found by their own name.
 if [ "$PKG_VERSION" != "$VERSION" ]; then
