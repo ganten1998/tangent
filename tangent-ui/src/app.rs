@@ -17042,6 +17042,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.notify(crate::notify::Kind::Info, GLUE_FROZEN);
             return true;
         }
+        // **Said, where no host will weld.** `request_recorder` drops what
+        // a host cannot take - a build with no recorder, the plugin - and
+        // the key did nothing and said nothing.
+        if !self.caps.capture_devices {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Gluing audio needs the audio engine, which this build does not have.",
+            );
+            return true;
+        }
         let ids: Vec<u64> = audio.iter().map(|c| c.id).collect();
         self.request_recorder(recorder::RecorderRequest::GlueAudio(ids));
         true
@@ -58333,6 +58343,23 @@ mod tests {
             matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::GlueAudio(ids)) if ids == vec![one]),
             "a repeating clip was refused"
         );
+    }
+
+    /// **Where no host will weld, Cmd+G on audio says so.** Glue hands audio
+    /// to the host, and `request_recorder` drops a request a host cannot
+    /// take - a build with no recorder, or the plugin - so the key did
+    /// nothing and said nothing, where an audio selection used to get the
+    /// MIDI road's refusal at least.
+    #[test]
+    fn audio_glue_says_why_where_the_host_cannot_weld() {
+        use crate::arrangement::ClipKind;
+        let (_ctx, mut app) = headless(Caps::MINIMAL);
+        let a = glue_part(&mut app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+        let b = glue_part(&mut app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+        app.arr_multi.extend([a, b]);
+        let before = app.messages.len();
+        app.arr_glue_selection();
+        assert!(app.messages.len() > before, "Cmd+G on audio did nothing and said nothing");
     }
 
     /// **Glue says no to audio in the same places it does to MIDI**, and to a
