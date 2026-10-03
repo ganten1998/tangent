@@ -17868,19 +17868,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// paint you could click straight through. The other half of that fault
     /// is in `met_anchor`, which was reading the master's rectangles.
     fn met_menu_owns_press(&mut self, ctx: &egui::Context) -> bool {
+        // **The tempo drag is ONE moment, at its release** - the band knob's
+        // rule; `retime_arrangement` holds its commit while `met_drag`
+        // stands. Let go before the panel is even looked for, so a drag the
+        // panel was closed under (Cmd+M) still ends, and still commits.
+        if self.met_drag && ctx.input(|i| !i.pointer.primary_down()) {
+            self.met_drag = false;
+            self.arr_save_edits();
+        }
         let Some(rect) = self.met_stage().filter(|_| self.met_menu.is_some()) else {
             return false;
         };
-        let (down, released, pointer) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                !i.pointer.primary_down(),
-                i.pointer.interact_pos(),
-            )
-        });
-        if released {
-            self.met_drag = false;
-        }
+        let (down, pointer) =
+            ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.interact_pos()));
         if let Some(p) = pointer {
             // Outside it: the press closes it and is spent, the way
             // every other menu on this desk dismisses.
@@ -17958,10 +17958,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // fields and all hashed - and none of them committed, so
                 // choosing one folded into whatever the user did next.
                 // Not yet the signature's two rows above, which end in
-                // `set_time_signature` and commit nothing, nor the tempo
-                // track, a drag (`met_drag`) that `retime_arrangement`
-                // commits on every frame it moves the bpm, and never on an
-                // empty song.
+                // `set_time_signature` and commit nothing. The tempo track
+                // is a drag (`met_drag`): one moment, at its release.
                 self.undo_commit();
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
@@ -31563,14 +31561,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// trim and notes are rescaled by `old/new`, and every AUDIO clip keeps
     /// its bar seat (start only — audio itself cannot stretch). Before this,
     /// a clip written at 120 was, in the owner's words, "made unusable at
-    /// 180". Mid-drag the doc save waits for the knob's release (the release
-    /// path calls `arr_save_edits`); a typed or tapped tempo saves at once.
+    /// 180". Mid-drag - the band's knob or the metronome panel's track - the
+    /// doc save waits for the release (each release path calls
+    /// `arr_save_edits`); a typed or tapped tempo saves at once, on an empty
+    /// song too: the tempo is a desk field, and its own moment.
     fn retime_arrangement(&mut self, old_bpm: f64, new_bpm: f64) {
         if old_bpm <= 0.0 || new_bpm <= 0.0 {
             return;
         }
         let r = old_bpm / new_bpm;
-        if (r - 1.0).abs() < 1.0e-12 || self.arrangement.clips.is_empty() {
+        if (r - 1.0).abs() < 1.0e-12 {
             return;
         }
         for c in &mut self.arrangement.clips {
@@ -31585,9 +31585,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.clips_dirty = true;
-        let mid_drag = self
-            .grabbed
-            .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0)));
+        let mid_drag = self.met_drag
+            || self
+                .grabbed
+                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0)));
         if !mid_drag {
             self.arr_save_edits();
         }
@@ -64165,6 +64166,79 @@ mod tests {").expect("the tests module")];
             assert_eq!(app.met_drag, !held, "held {held}: the drag");
             assert_eq!(app.tempo_bpm() == before, held, "held {held}: {before} -> {}", app.tempo_bpm());
         }
+    }
+
+    /// **A tempo drag on the metronome panel is ONE moment, at its release**
+    /// - the band knob's rule. `retime_arrangement` held its commit only for
+    /// the band's grab, so the panel's drag committed a moment, and cloned
+    /// the desk, on every frame that crossed a whole BPM: one Ctrl+Z took
+    /// back one BPM of a sweep, and a long one drained the history.
+    #[test]
+    fn a_tempo_drag_on_the_metronome_panel_is_one_moment() {
+        use crate::recorder_panel::MetHit;
+        let root = project_scratch("metdrag");
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("Projects"));
+        app.arrangement_open = true;
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            start_s: 2.0,
+            len_s: 2.0,
+            loop_s: 2.0,
+            ..Default::default()
+        });
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.arr_save_edits();
+        let stage = app.met_stage().expect("the arrangement was not laid out");
+        app.met_menu = Some(());
+        app.met_at = Some(stage.center());
+        let anchor = app.met_anchor(stage);
+        let track = recorder_panel::met_tempo_track(stage, anchor);
+        assert!(track.is_positive(), "the panel has no tempo track");
+        let at = |f: f32| Pos2::new(track.left() + f * track.width(), track.center().y);
+        assert!(
+            matches!(recorder_panel::met_hit_test(stage, anchor, at(0.2)), Some(MetHit::Tempo(_))),
+            "the press point is not on the tempo row"
+        );
+        let before = app.hist_at;
+        let bpm0 = app.tempo_bpm();
+        // The press grabs the track; each later call is one frame of the
+        // drag, exactly as `met_menu_owns_press` drives it.
+        assert!(app.met_menu_press(stage, at(0.2), true), "the press fell through the panel");
+        assert!(app.met_drag, "the press did not grab the tempo");
+        for k in 1..=8u8 {
+            let _ = app.met_menu_press(stage, at(0.2 + 0.05 * f32::from(k)), false);
+        }
+        assert!((app.tempo_bpm() - bpm0).abs() > 1.0, "the drag never moved the tempo");
+        assert_eq!(app.hist_at, before, "the drag pushed {} moment(s) while the hand was still on it", app.hist_at - before);
+        // The release: a frame with the button up, where the panel lets go.
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(!app.met_drag, "the release frame did not end the drag");
+        assert_eq!(app.hist_at, before + 1, "the drag is not ONE moment at its release");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **With nothing on the timeline the tempo is still its own moment.**
+    /// `retime_arrangement` returned early on an empty song, before its only
+    /// commit, so a typed tempo (or a panel drag) there left no moment and
+    /// folded into whatever came next - while the band's knob, which commits
+    /// at its own release, made one.
+    #[test]
+    fn a_typed_tempo_on_an_empty_song_is_its_own_moment() {
+        let root = project_scratch("emptytempo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        assert!(app.arrangement.clips.is_empty(), "fixture: the song is not empty");
+        app.commit_view_change();
+        let before = app.hist_at;
+        let to = if (app.tempo_bpm() - 90.0).abs() < 0.5 { 100.0 } else { 90.0 };
+        app.num_edit = Some(recorder::NumEdit::prefilled(recorder::NumField::Tempo, format!("{to:.0}")));
+        app.commit_number();
+        app.commit_view_change();
+        assert!((app.tempo_bpm() - to).abs() < 0.5, "fixture: the typed tempo did not land");
+        assert_eq!(app.hist_at, before + 1, "a typed tempo on an empty song left no moment");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The DONE press is spent on DONE.** The take panel hangs below the
