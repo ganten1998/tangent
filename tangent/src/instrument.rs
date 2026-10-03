@@ -19680,7 +19680,10 @@ fn output_is_live(device: &cpal::Device) -> bool {
 /// card — cpal has no stable device identifier on any backend, `name()` is the
 /// only identity method there is (`tangent-record`'s `audio.rs` documents the dig
 /// through the backends), so a name and a substring are all a caller has.
-fn match_output_name(names: &[String], want: &str) -> Option<usize> {
+///
+/// The reprobe asks it too (`desktop::OutputReturn`), so the plug it waits for
+/// is the device this open would find.
+pub(crate) fn match_output_name(names: &[String], want: &str) -> Option<usize> {
     if let Some(i) = names.iter().position(|n| n == want) {
         return Some(i);
     }

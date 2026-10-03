@@ -308,10 +308,11 @@ pub trait AudioSetup: Send {
     /// the backend's own order, or empty when they cannot be reached. That
     /// host follows the process-wide system (`tangent_record::audio::system`),
     /// not the setting, so during an ASIO fallback it is the stand-in's.
-    /// Under ASIO, while a stream holds a driver, only that driver; with none
-    /// held, every registered driver, loaded and unloaded in turn on the
-    /// calling thread. Asked when the panel OPENS, like [`Self::systems`] and
-    /// [`Self::rates`], and never per frame.
+    /// Under ASIO, every registered driver by name, read from the registry
+    /// with none loaded, so the list is the same whether or not a stream
+    /// holds one; a driver listed there with no hardware behind it fails at
+    /// the open, which falls back. Asked when the panel OPENS, like
+    /// [`Self::systems`] and [`Self::rates`], and never per frame.
     ///
     /// **This exists because ASIO has no default.** cpal's ASIO host
     /// implements `default_output_device` as, verbatim, "ASIO has no concept
