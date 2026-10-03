@@ -3408,10 +3408,14 @@ fn warped_clip_audio(
 /// **Units.** `found` and each pair's `from` are frames of the decode the
 /// analysis was made from, at `rate`, and `file_s` is that decode's length;
 /// each `to` is a frame of the warped render, at the same rate. The clip's
-/// `start_s` is where it stands and its `offset_s` its trim, read here as
-/// SOURCE seconds - which a stretched clip's trim is not (it is in the
-/// stretched file's seconds). Two attacks that land on one line keep only
-/// the first, and the second is carried inside the segment.
+/// `start_s` is where it stands; its trim, length and loop are on the axis
+/// it is HEARD on, the stretched file's seconds. Warp first, stretch after,
+/// as the render runs: a frame of the warp's render is heard `stretch`
+/// times as far in (see [`heard_ratio`]), so an attack is placed on the grid
+/// in heard seconds and its target brought back by the same ratio. Placed in
+/// the file's own seconds, a stretched take that was ON the grid came off
+/// it, by up to a quarter of a second. Two attacks that land on one line
+/// keep only the first, and the second is carried inside the segment.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
@@ -3421,16 +3425,17 @@ fn quantize_map(
     q: &tangent_ui::quantize::Quantize,
 ) -> Vec<(u64, u64)> {
     let rate = f64::from(rate.max(1));
+    let r = heard_ratio(clip);
     let start_s = clip.start_s;
     // The played window, in the frames `from` and `to` count.
-    let offset = (clip.offset_s * rate).max(0.0).round();
-    let len_s = clip.play_len_s(file_s);
+    let offset = (clip.offset_s * rate / r).max(0.0).round();
+    let len_s = clip.play_len_s(file_s * r);
     let played_s = if clip.loop_s > 1.0e-6 {
         clip.loop_s.min(len_s)
     } else {
         len_s
     };
-    let end = offset + played_s.max(0.0) * rate;
+    let end = offset + played_s.max(0.0) * rate / r;
     let inside = |f: f64| f >= offset && f < end;
     let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
     for t in found {
@@ -3439,9 +3444,9 @@ fn quantize_map(
             continue;
         }
         // Where this attack is heard, and where it should be heard.
-        let heard = start_s + (from - offset) / rate;
+        let heard = start_s + (from - offset) * r / rate;
         let want = q.place(heard);
-        let to = (offset + (want - start_s) * rate).round();
+        let to = (offset + (want - start_s) * rate / r).round();
         if !inside(to) {
             continue;
         }
@@ -3451,6 +3456,20 @@ fn quantize_map(
         }
     }
     map
+}
+
+/// **Heard seconds per second of the warp's render**: the clip's stretch as
+/// `stretch::stretch` applies it (clamped to its range), or 1.0 for a clip
+/// that is not stretched - `stretch_key`'s own test. The stretch runs AFTER
+/// the warp, so this is what carries a place in the warp's render onto the
+/// axis the clip's trim, length and loop are measured on, for the quantize
+/// and for the ticks that preview it.
+#[cfg(feature = "recorder")]
+fn heard_ratio(clip: &tangent_ui::arrangement::ArrClip) -> f64 {
+    if !clip.stretch.is_finite() || (clip.stretch - 1.0).abs() <= 1.0e-9 {
+        return 1.0;
+    }
+    clip.stretch.clamp(crate::stretch::RATIO.0, crate::stretch::RATIO.1)
 }
 
 /// **What a warp render would be asked for**, or `None` when this clip has
@@ -12516,8 +12535,8 @@ impl DesktopApp {
     /// **Where the asked clips are, as one number.**
     ///
     /// Everything `quantize_marks_for` reads that the ask does not carry:
-    /// the file, the placement, the trim, the loop and the warp map. A
-    /// clip that moves changes this and the ticks are rebuilt.
+    /// the file, the placement, the trim, the loop, the warp map and the
+    /// stretch. A clip that moves changes this and the ticks are rebuilt.
     ///
     /// **Not the document's own fingerprint**, which is the obvious
     /// one-liner and is wrong: it includes the desk, so a fader moved with
@@ -12537,13 +12556,17 @@ impl DesktopApp {
                 c.len_s.to_bits().hash(&mut h);
                 c.loop_s.to_bits().hash(&mut h);
                 c.warp.hash(&mut h);
+                c.stretch.to_bits().hash(&mut h);
             }
         }
         h.finish()
     }
 
     /// **The ticks one ask comes to**, per clip, in seconds from the start
-    /// of each FILE.
+    /// of the audio each clip PLAYS - its file warped and then stretched,
+    /// the axis its trim is on - so the painter lays them down by
+    /// subtracting the trim. In the file's own seconds a stretched clip wore
+    /// its ticks off its hits by the ratio.
     ///
     /// Split from the pusher so that one has a single exit and can hand
     /// `late_change` an ANSWER rather than a bare `true` - see
@@ -12617,6 +12640,8 @@ impl DesktopApp {
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
+            // Heard seconds per second of the warp's render. See `heard_ratio`.
+            let r = heard_ratio(&a.clip);
             let found = self.attacks_of(&path, &decoded, ask.sensitivity);
             let map = quantize_map(&found, decoded.rate, decoded.seconds(), &a.clip, &q);
             let anchors = &a.anchors;
@@ -12630,7 +12655,7 @@ impl DesktopApp {
                             anchors,
                             usize::try_from(f).unwrap_or(usize::MAX),
                         );
-                        ((at as f64 / rate) as f32, (t as f64 / rate) as f32)
+                        ((at as f64 * r / rate) as f32, (t as f64 * r / rate) as f32)
                     })
                     .collect(),
             ));
@@ -24692,6 +24717,7 @@ mod tests {
             "c.len_s.to_bits",
             "c.loop_s.to_bits",
             "c.warp.hash",
+            "c.stretch.to_bits",
         ] {
             assert!(
                 sig.contains(field),
@@ -25028,6 +25054,41 @@ mod tests {
         }
         assert!(map.contains(&(384_144, 384_000)), "the clip's own downbeat was dropped: {map:?}");
         assert!(map.contains(&(396_480, 396_000)), "the clip's next hit was not quantized: {map:?}");
+    }
+
+    /// **A stretched take already on the grid is left on it.** Warp first,
+    /// stretch after: an attack at warped frame `f` is HEARD at
+    /// `f * stretch / rate`, and `quantize_map` placed it on the song's grid
+    /// in the file's own seconds instead - a take stretched to 1.25 whose
+    /// hits were heard exactly on the beat came out up to 250 ms off it.
+    #[test]
+    fn a_stretched_take_already_on_the_grid_is_left_on_it() {
+        use crate::transient::Transient;
+        // A take stretched to 1.25 whose hits fall every 0.4 s of FILE - every
+        // 0.5 s as played, the quarter grid at 120 bpm.
+        let r = 1.25;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::new(0.5, None).expect("a quarter grid at 120 bpm"),
+        );
+        let found: Vec<Transient> = (0..5)
+            .map(|i| Transient { at: (0.4 * f64::from(i) * 48_000.0) as usize, strength: 10.0 })
+            .collect();
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            stretch: r,
+            ..Default::default()
+        };
+        // Two seconds of file, two and a half as played.
+        let map = quantize_map(&found, 48_000, 2.0, &clip, &q);
+        assert_eq!(map.len(), found.len(), "a hit the stretched clip plays was left out: {map:?}");
+        for &(_, to) in &map {
+            // Warp first, stretch after: result frame `to` is heard at to*r/rate.
+            let heard = to as f64 * r / 48_000.0;
+            assert!(
+                (heard - (heard / 0.5).round() * 0.5).abs() < 0.002,
+                "a hit that was on the grid is heard at {heard} s after the quantize: {map:?}"
+            );
+        }
     }
 
     /// **A file's attacks are detected once per dial position.**

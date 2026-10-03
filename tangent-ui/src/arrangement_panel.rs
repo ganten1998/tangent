@@ -172,12 +172,12 @@ pub struct ClipView<'a> {
     /// visually see these things better".
     pub gain: f32,
     /// **Where the quantize window's detector finds attacks, and where it
-    /// would put them** - `(found, target)`, in seconds of the file AS THE
-    /// CLIP'S WARP MAP LEAVES IT, from the file's start: `found` is the attack
+    /// would put them** - `(found, target)`, in seconds of the audio the
+    /// clip PLAYS from its start: the file as its warp map leaves it, then
+    /// stretched, which is the axis `offset_s` is on. `found` is the attack
     /// projected through the current map (`warp::project_frame`), so a take
     /// quantized once wears its ticks on its hits, and the trim is subtracted
-    /// here, at the draw. Not through the clip's STRETCH: a stretched clip's
-    /// ticks stand in unstretched seconds. Only the attacks the clip plays
+    /// here, at the draw. Only the attacks the clip plays
     /// arrive - inside `offset_s ..` its end, or one pass of its loop, the
     /// span `wave_band` folds each pass into - so a looped clip repeats them
     /// in every pass, as it repeats its sound. Empty unless that window is
