@@ -2698,11 +2698,11 @@ struct Shared {
     /// **A dry stem is that strip's OWN inserts taken out, and nothing
     /// else's.** One sentence, applied identically at every writer: a
     /// channel's dry stem is its clip, built-in instrument or input before
-    /// its pedalboard and its rack - or, when a bay of its FIRST rack holds a
+    /// its pedalboard and its rack - or, when one of its six bays holds a
     /// voice (the analog, the sampler, a hosted instrument), that voice's own
     /// output as it leaves the bay, before the bays after it (`run_rack`'s
-    /// `dry`; the lane pass hands `run_extra_rack` `None`, so a voice in bays
-    /// 4-6 is not reached yet); a kit's is its voices before the pad bays
+    /// `dry`, and `run_extra_rack` hands the same rows to bays 4-6 - the
+    /// extra seat); a kit's is its voices before the pad bays
     /// and the kit's bus rack; a group's is the sum of its children —
     /// exactly as those children reach the mix — before the group's own two
     /// bus racks; a routed arrival's is what was sent before the
@@ -6763,7 +6763,7 @@ fn render_lane(
                 io: &mut io.key_io,
             }),
         
-            None,
+            plan.stems_dry.then(|| &mut io.dry_io[..]),
             at,
         );
     }
@@ -6827,8 +6827,8 @@ fn run_extra_rack(
     // **Forwarded to the voice road in `run_rack`.** Bays 3..5 are the same
     // chain as 0..2 and a voice may sit in any of them, so the dry stem has
     // to be reachable from here too. See `run_rack`'s `dry`. The lane pass
-    // does not hand it one yet (`render_lane` passes `None`), so a voice in
-    // bays 4..6 is still missing from the dry stem.
+    // hands it the same rows it hands the first rack; it once handed it
+    // `None`, and a voice in bays 4..6 exported a silent dry stem.
     mut dry: Option<&mut [Vec<f32>]>,
 
     // **The absolute sample position this rack is rendering**, or
@@ -26733,6 +26733,63 @@ mod tests {
             dry > 0.0,
             "the dry stem of a lane played by a bay voice is SILENT \
              ({dry}) while its processed stem peaked at {processed}"
+        );
+    }
+
+    /// **A voice in bays 4..6 reaches the dry stem too.** Those bays are the
+    /// channel's EXTRA seat, run by `run_extra_rack`, and the dry road has to
+    /// reach it exactly as it reaches the first three: the lane pass handed
+    /// the second rack no dry rows at all, so an analog seated in the second
+    /// row of an otherwise empty track exported a silent dry stem.
+    #[test]
+    fn a_voice_in_the_extra_rack_reaches_the_dry_stem() {
+        use std::sync::Arc;
+        const CH: usize = 2;
+        let run = |dry: bool| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.load_insert(
+                tangent_ui::recorder::folder_extra_seat(CH),
+                0,
+                Some(Path::new(crate::builtin_fx::ANALOG_PATH)),
+                None,
+            )
+            .expect("the analog must load")
+            .expect("a load reports what it seated");
+            e.set_channel_gain(CH, 0.8);
+            e.set_master_gain(1.0);
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: CH,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 110 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; 512 * 2];
+            let mut drained: Vec<f32> = Vec::new();
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            let wide = CHANNELS * 2;
+            (0..drained.len() / wide)
+                .map(|f| drained[f * wide + CH * 2].abs())
+                .fold(0.0f32, f32::max)
+        };
+        let processed = run(false);
+        assert!(
+            processed > 0.002,
+            "the fixture never made sound: an analog in bay 4 played nothing ({processed})"
+        );
+        let dry = run(true);
+        assert!(
+            dry > processed * 0.5,
+            "a voice in bays 4..6 is missing from the dry stem: dry peaked at {dry}, \
+             processed at {processed}"
         );
     }
 
