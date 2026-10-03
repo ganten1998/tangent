@@ -23,8 +23,9 @@ use tangent_ui::notify::Kind;
 use tangent_ui::ports::MidiPorts;
 use tangent_ui::settings::Settings;
 use std::sync::{mpsc, Arc};
-// Only the recorder's camera-permission latch uses it, and a Minimal build has
-// no recorder — so an ungated import is an unused-import warning there.
+// Only the recorder uses it (the camera-permission latch and the rate
+// follower), and a Minimal build has no recorder — so an ungated import is an
+// unused-import warning there.
 #[cfg(feature = "recorder")]
 use std::sync::Mutex;
 
@@ -2791,7 +2792,7 @@ struct RatePoll {
     /// **The output to ask: the one the engine OPENED**, by the name it
     /// opened with (`OutputInfo::device`), or `None` before any engine has.
     /// See [`RatePoll::follow`].
-    device: Arc<std::sync::Mutex<Option<String>>>,
+    device: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(feature = "recorder")]
@@ -2799,7 +2800,7 @@ impl RatePoll {
     fn start() -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         let seen = Arc::new(AtomicU32::new(0));
-        let device: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let device: Arc<Mutex<Option<String>>> = Arc::default();
         let weak = Arc::downgrade(&seen);
         let followed = Arc::clone(&device);
         let _ = std::thread::Builder::new()
