@@ -4519,10 +4519,8 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 /// to ask this, with the meter it is working in: the arrangement's lines
 /// (per bar), the gridbox (`grid_label_text`), the MIDI editor
 /// (`midi_editor::grid_step_s`), the quantize `Grid` and the quantize
-/// window's chips do. One does not yet: the arrangement's magnet
-/// (`TangentApp::snap_quarter`, and `arr_grid_s` beside it) still divides
-/// the bar by `2^-exp`, which in 3/4, 6/8 and 7/8 lands between these
-/// lines.
+/// window's chips, and the arrangement's magnet (`TangentApp::snap_quarter`)
+/// and arrow step (`arr_grid_s`) all do.
 pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     let beat = 4.0 / f64::from(unit.max(1));
     let per_bar = f64::from(beats.max(1));

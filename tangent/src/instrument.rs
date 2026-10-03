@@ -1135,9 +1135,10 @@ struct Beat {
 /// beat every half hour.
 #[derive(Debug)]
 struct Beats {
+    /// One beat of the SIGNATURE, whatever the click's division: a count-in
+    /// is a countdown in beats, and the take's wait, the glass digit and
+    /// `count_in_beats()` all count beats. See `render_program`.
     period: f64,
-    /// Clicks per beat; 0 means one a bar. See `Shared::metronome_div`.
-    div: u32,
     to_next: f64,
     /// Beats since the phase was last restarted, for the bar accent.
     index: u64,
@@ -1157,7 +1158,6 @@ impl Beats {
     fn new(rate: f64, bpm: f64) -> Self {
         Self {
             period: period_frames(rate, bpm, 4),
-            div: 1,
             to_next: 0.0,
             index: 0,
             count_in_left: 0,
@@ -1212,14 +1212,10 @@ impl Beats {
         // prevent.
         self.to_next += self.period - 1.0;
 
-        // Ticks in a bar, not beats: at two clicks a beat there are twice as
-        // many before the accent comes round again, and at "once a bar" there
-        // is exactly one. The accent must land on the DOWNBEAT either way.
-        let bar = if self.div == 0 {
-            1
-        } else {
-            (beats_per_bar.max(1) as u64).saturating_mul(u64::from(self.div)).max(1)
-        };
+        // A bar of the signature's BEATS, because that is what this clock
+        // counts at every click division: the accent lands on each bar's
+        // "1", where the glass digit starts again.
+        let bar = u64::from(beats_per_bar.max(1));
         let accent = self.index % bar == 0;
         self.index += 1;
 
@@ -1472,10 +1468,10 @@ struct BarClock {
     /// `play_on_go` both just toggle play, and neither locates. From 0:00, or
     /// any playhead parked on a beat line, the first beat this clock reaches
     /// is the one the go just was, and it sounded it a frame or two behind
-    /// the count-in's: measured at 96000 and 96001. Parked BETWEEN beats the
-    /// go stands in for nothing, and this flag still steps past the next
-    /// beat, so the song's first click after the go is lost there. `resync`
-    /// is where that is known, and it does not clear the flag yet.
+    /// the count-in's: measured at 96000 and 96001. Parked between beats the
+    /// go stands in for nothing, and `resync` drops the flag there rather
+    /// than swallow the next beat: it keeps it only for a beat within
+    /// [`GO_STANDS_IN_S`] of the roll.
     ///
     /// `resync`'s note once guessed the resync would land "a frame or two
     /// past beat one". It does after a LOCATE, where the transport was
@@ -1528,6 +1524,17 @@ impl Default for BarClock {
 /// to reach for Play.
 const SOUNDED_GRACE_S: f64 = 0.25;
 
+/// **How close to the roll a beat must land for the count-in's "go" to stand
+/// in for it**, in seconds.
+///
+/// The host rolls the transport from wherever the playhead stands, so the
+/// first beat the bar clock reaches is not always the one the go just was.
+/// ON a beat line it is, and a hair BEFORE one it would sound a poll behind
+/// the go, as a flam: the go stands in for both. Half a beat past a line the
+/// next beat is the song's own, and stepping past it lost the song's first
+/// click. A beat further from the roll than this is the song's.
+const GO_STANDS_IN_S: f64 = 0.03;
+
 impl BarClock {
     /// How many clicks a bar carries at this division.
     ///
@@ -1556,11 +1563,12 @@ impl BarClock {
         //
         // But a resync a frame or two INTO a beat must not fire it: that beat
         // has already been and gone. That is the LOCATE case, where the
-        // transport was already moving. The count-in is NOT handled here: the
+        // transport was already moving. The count-in is a third case: the
         // host rolls the transport from wherever the playhead stands, a UI
         // poll after the go, and a playhead parked ON a beat line resyncs
         // exactly onto it and would fire it as a second "go". `tick` steps
-        // past that beat on `already_sounded`.
+        // past that beat on `already_sounded`, and the end of this function
+        // decides whether the beat found is one the go stood in for.
         // `bar_beat_at_quarter` answers in the signature's BEATS; the clock
         // counts in ticks, which is beats times the division.
         let sig = maps.meter.sig_at_bar(bar);
@@ -1573,6 +1581,13 @@ impl BarClock {
             self.beat += 1;
             self.normalise(maps);
             self.at_frame = self.frame_of(maps, rate);
+        }
+        // **The go stands in only for a beat the transport starts ON.**
+        // Parked half a beat past a line, the beat found above is half a beat
+        // from the roll and has nothing to do with the go; stepping past it
+        // lost the song's first click. See [`GO_STANDS_IN_S`].
+        if self.already_sounded && self.at_frame - pos as f64 > rate.max(1.0) * GO_STANDS_IN_S {
+            self.already_sounded = false;
         }
         self.armed = true;
     }
@@ -1612,9 +1627,16 @@ impl BarClock {
     /// The count-in's downbeat, and the only caller. See
     /// [`already_sounded`](Self::already_sounded) for why a flag and not a
     /// frame number.
+    ///
+    /// **And the clock forgets where it was**, so the first frame that rolls
+    /// re-derives it and `resync` decides whether the go stood in for the
+    /// beat it lands on. A song paused and resumed in place skipped that: the
+    /// clock still expected exactly the frame the transport resumed on, so
+    /// the flag stepped past the next beat however far from the roll it was.
     fn sounded_elsewhere(&mut self) {
         self.already_sounded = true;
         self.sounded_wait = 0;
+        self.armed = false;
     }
 
     /// A frame with the transport NOT rolling. The go stops standing in for
@@ -8086,7 +8108,9 @@ struct Renderer {
     /// the count-in by that flag alone would cut the last click off mid-decay,
     /// and the downbeat, which is the one everybody listens for, not at all.
     /// Reset to a beat's worth of frames every time a count-in beat or the
-    /// downbeat fires.
+    /// downbeat fires, and ended by the first beat of the SONG: that click
+    /// takes the voice over, and at two clicks a beat it lands half-way
+    /// through the go's tail, where it would be taped with the count.
     count_in_tail: u64,
 
     /// `process` calls made since the stream opened. Not a statistic: it is how
@@ -9140,31 +9164,30 @@ impl Renderer {
                 self.bar_clock.armed = false;
             }
         }
-        // **The division, into both clocks, before either is asked.**
+        // **The division, into the bar clock, before it is asked.**
         //
         // Read once a block like the tempo beside it: it is published at
-        // human speed, and the two clocks disagreeing about how many clicks a
-        // bar holds is a click that drifts a whole bar per bar.
+        // human speed. Only the SONG's clock takes it: `Beats` counts a take
+        // in and never free-runs here (the bar clock owns every click while
+        // the transport rolls), and a count-in is a countdown in beats.
         let div = self.shared.metronome_div.load(Ordering::Relaxed).min(8);
-        if self.beats.div != div || self.bar_clock.div != div {
-            self.beats.div = div;
+        if self.bar_clock.div != div {
             self.bar_clock.div = div;
             // The bar lines just moved under it, exactly as a new map does.
             self.bar_clock.armed = false;
         }
-        let beat_period = period_frames(
+        // **One BEAT of the signature, at every click division.** This was
+        // the CLICK period, and `Beats` spends one count-in beat per tick, so
+        // a count of four beats was four clicks: at two clicks a beat the go
+        // came half-way through the take's wait - which counts beats, on the
+        // wall clock - and the head of every counted-in take was lost; at one
+        // click a bar the count ran four BARS. Play-on-go, `arm_at` and a
+        // joined arrangement record all act on this clock's go.
+        self.beats.period = period_frames(
             self.rate,
             f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
             self.shared.beat_unit.load(Ordering::Relaxed),
         );
-        // A division of the BEAT, except at zero, where the click is once a
-        // bar and the period is the whole bar's worth of beats.
-        self.beats.period = if div == 0 {
-            beat_period * f64::from(self.shared.beats_per_bar.load(Ordering::Relaxed).max(1))
-        } else {
-            beat_period / f64::from(div)
-        }
-        .max(1.0);
         // Acquire pairs with `start_count_in`'s Release on the bump, so a new
         // generation is seen with its OWN beat count — the beats are read
         // once per generation and a stale zero here is a count-in that never
@@ -9542,8 +9565,6 @@ impl Renderer {
             for i in 0..n {
                 let frame_index = done + i;
 
-                let counting_in = self.count_in_tail > 0;
-                self.count_in_tail = self.count_in_tail.saturating_sub(1);
                 // **The click only speaks while the transport does** — armed
                 // by M, HEARD under play or record (the count-in rides its
                 // own gate inside `tick`). A practice click that started at
@@ -9586,6 +9607,13 @@ impl Renderer {
                         // and the one anybody trimming to the count will look
                         // for.
                         self.count_in_tail = self.beats.period.max(1.0) as u64;
+                    } else {
+                        // **A beat of the SONG ends the count's tail.** It
+                        // has just retriggered the voice, so nothing the
+                        // voice plays from here belongs to the count - and at
+                        // two clicks a beat it lands half a beat into the
+                        // go's beat-long tail.
+                        self.count_in_tail = 0;
                     }
                     self.shared.beat_now.store(beat.count_in, Ordering::Relaxed);
                     if beat.downbeat {
@@ -9610,6 +9638,10 @@ impl Renderer {
                         }
                     }
                 }
+                // Read AFTER this frame's beat, so a count-in click is taped
+                // from its first sample and a song click from none of its.
+                let counting_in = self.count_in_tail > 0;
+                self.count_in_tail = self.count_in_tail.saturating_sub(1);
 
                 self.metro_gain += (click_level - self.metro_gain) * self.gain_coeff;
                 let click = self.voice.next(&self.click) * self.metro_gain;
@@ -19464,17 +19496,18 @@ impl Engine {
 
     /// Count `beats` in at `bpm`, then report [`Engine::count_in_done`].
     ///
-    /// **Beats, not seconds** — the pre-roll is N clicks at the take's tempo and
+    /// **Beats, not seconds** — the pre-roll is N beats of the signature at the
+    /// take's tempo, one click each at every click division
+    /// (`Shared::metronome_div` divides the SONG's click, not the count), and
     /// recording starts on the downbeat after them, which is one further beat
     /// period. The clicks and the countdown are the same event: both come from
     /// the audio thread's frame counter, so what the UI shows cannot drift from
     /// what the player hears.
     ///
-    /// **Not yet true at every click division, nor for a pre-roll take.** The
-    /// count is `beats` CLICKS at the click's division (`Shared::metronome_div`,
-    /// once a bar at zero), so the go lands `beats` beats in only at one click
-    /// a beat; and a pre-roll take's countdown and its start run on the wall
-    /// clock in `record::Session::tick`, not on this frame counter.
+    /// **Not yet true for a pre-roll take.** Its countdown and its start run on
+    /// the wall clock in `record::Session::tick`, not on this frame counter.
+    /// Both count the same beats, so the two land within about a buffer of
+    /// each other, and whichever a UI frame sees first sets the take's T0.
     pub fn start_count_in(&self, beats: u32, bpm: f64) {
         let s = &self.shared;
         s.bpm.store(bpm.to_bits(), Ordering::Relaxed);
@@ -21388,6 +21421,80 @@ mod tests {
             after[..hand].contains("if !rolling {"),
             "the go hands its beat over even when the song is already rolling"
         );
+    }
+
+    /// **A count-in into a song parked OFF a beat line keeps the song's first
+    /// click.**
+    ///
+    /// The host rolls the transport from wherever the playhead stands
+    /// (`start_arr_record`, `play_on_go`), never from a beat line. The go
+    /// stands in for the bar clock's first beat only when that beat lands as
+    /// the transport rolls: ON the line, or a hair before it, where sounding
+    /// it would be a flam a poll behind the go. Half a beat past a line the
+    /// next beat is the song's own, and the go - on the press's grid, not
+    /// the song's - stepped past it in silence. Parked there two ways: a
+    /// playhead put there, where the clock has never run, and a song PAUSED
+    /// there, which leaves the clock armed and expecting exactly the frame
+    /// the transport resumes on, so it never resyncs on its own.
+    #[test]
+    fn a_count_in_into_a_song_parked_off_the_beat_keeps_its_first_click() {
+        let rate = 48_000.0;
+        let maps = Maps::default(); // 120 bpm, 4/4: 24_000 frames a beat
+        let poll = 800u64; // the host rolls a UI poll after the go
+        // (the road, where the playhead stands, the song played up to it
+        // first, the first song beat that must SOUND after the go)
+        for (road, parked, paused, first) in [
+            ("parked half a beat past beat two", 36_000u64, false, 48_000u64),
+            ("paused half a beat past beat two", 36_000, true, 48_000),
+            ("parked a hair before beat two", 23_990, false, 48_000),
+        ] {
+            let mut b = Beats::new(rate, 120.0);
+            let mut bar = BarClock::default();
+            let mut pos = 0u64;
+            if paused {
+                while pos < parked {
+                    let _ = bar.tick(pos, &maps, rate);
+                    pos += 1;
+                }
+            }
+            pos = parked;
+            b.restart(4);
+            let mut rolling = false;
+            let mut go_at: Option<u64> = None;
+            let mut song: Vec<u64> = Vec::new();
+            for now in 0..(24_000u64 * 10) {
+                if let Some(g) = go_at {
+                    if !rolling && now >= g + poll {
+                        rolling = true;
+                    }
+                }
+                let heard = if b.counting_in() || !rolling {
+                    bar.idle(rate);
+                    b.tick(false, 4)
+                } else {
+                    let h = bar.tick(pos, &maps, rate);
+                    if h.is_some() {
+                        song.push(pos);
+                    }
+                    h
+                };
+                if let Some(beat) = heard {
+                    if beat.downbeat {
+                        go_at = Some(now);
+                        bar.sounded_elsewhere();
+                    }
+                }
+                if rolling {
+                    pos += 1;
+                }
+            }
+            assert!(go_at.is_some(), "{road}: the count-in never reached its downbeat");
+            assert_eq!(
+                song.first().copied(),
+                Some(first),
+                "{road}: the song's first beat after the go: {song:?}"
+            );
+        }
     }
 
     #[test]
@@ -29545,6 +29652,130 @@ mod tests {
         assert!(
             done_at.is_some(),
             "the count-in never finished — the record waits forever"
+        );
+    }
+
+    /// **A count-in is BEATS of the signature, whatever the click's
+    /// division.**
+    ///
+    /// The take's pre-roll waits `count_in_beats()` beats on the wall clock,
+    /// and Play-on-go, `arm_at` and a joined arrangement record act on the
+    /// ENGINE's go. A count of CLICKS put that go half-way through the take's
+    /// wait at two clicks a beat, so the first second of a performance that
+    /// came in on it reached neither the .wav nor the .mid, and four BARS
+    /// late at one click a bar. Driven through the real engine, because the
+    /// division reaches the count in `render_program` and nowhere else.
+    #[test]
+    fn a_count_in_lasts_its_beats_at_every_click_division() {
+        // 120 bpm, 4/4, 48 kHz: a beat is 24 000 frames, so a one-bar count's
+        // go is due 96 000 frames after it starts.
+        const BLOCK: usize = 256;
+        let frames_to_go = |div: u32| -> usize {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_tempo(120.0);
+            e.set_meter(4, 4);
+            e.set_metronome_div(div);
+            e.start_count_in(4, 120.0);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let mut rendered = 0usize;
+            while !e.count_in_done() && rendered < 48_000 * 20 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                rendered += BLOCK;
+            }
+            assert!(e.count_in_done(), "division {div}: the count never reached its go");
+            rendered
+        };
+        // Every division is measured before anything panics, so one run
+        // names each one that counts clicks.
+        let mut wrong: Vec<String> = Vec::new();
+        for div in [1u32, 0, 2, 3, 4] {
+            let got = frames_to_go(div);
+            if got.abs_diff(96_000) > 2 * BLOCK {
+                wrong.push(format!(
+                    "click division {div}: the go came {got} frames after the count began, not \
+                     four beats (96 000) - the count is counting clicks"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("; "));
+    }
+
+    /// **A take that records its count-in tapes the count, and not the
+    /// song's first click.**
+    ///
+    /// The count's click is taped for a beat after each count-in beat and the
+    /// go, so its decay is in the file. At two clicks a beat the song's first
+    /// click lands half a beat after the transport rolls - inside the go's
+    /// beat-long tail - and it is the SONG's click, which only "click in the
+    /// take" puts in the file. The real engine and its take tap, with the
+    /// host rolling the transport from 0:00 a poll after the go.
+    #[test]
+    fn a_take_that_records_its_count_in_tapes_the_count_and_not_the_songs_first_click() {
+        const BLOCK: usize = 256;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_tempo(120.0);
+        e.set_meter(4, 4);
+        e.set_metronome_div(2);
+        e.set_metronome_gain(0.5);
+        e.set_metronome_enabled(true);
+        e.set_metronome_in_take(false);
+        e.set_count_in_in_take(true);
+        let mut tap = e.take_recorder_tap().expect("a tap");
+        tap.arm();
+        let mut out = vec![0.0f32; BLOCK * 2];
+        // (what the take is handed, what the room hears), both interleaved
+        let mut taped: Vec<f32> = Vec::new();
+        let mut heard: Vec<f32> = Vec::new();
+        let mut render = |e: &mut Engine,
+                          tap: &mut RecorderTap,
+                          taped: &mut Vec<f32>,
+                          heard: &mut Vec<f32>| {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard.extend_from_slice(&out);
+            tap.drain(taped);
+        };
+        e.start_count_in(4, 120.0);
+        let mut blocks = 0usize;
+        while !e.count_in_done() && blocks < 2_000 {
+            render(&mut e, &mut tap, &mut taped, &mut heard);
+            blocks += 1;
+        }
+        assert!(e.count_in_done(), "the count never reached its go");
+        // The go sounded somewhere in the last block rendered.
+        let go = (blocks - 1) * BLOCK;
+        // A UI poll later the host rolls the transport, from 0:00.
+        for _ in 0..4 {
+            render(&mut e, &mut tap, &mut taped, &mut heard);
+        }
+        let roll = (blocks + 4) * BLOCK;
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        // Beat one is the go's (the bar clock steps past it); the song's
+        // first click is the half-beat after it.
+        for _ in 0..(24_000 / BLOCK) {
+            render(&mut e, &mut tap, &mut taped, &mut heard);
+        }
+        let loud = |of: &[f32], from: usize, to: usize| -> f32 {
+            of.get(from * 2..(to * 2).min(of.len()))
+                .unwrap_or(&[])
+                .iter()
+                .fold(0.0f32, |a, s| a.max(s.abs()))
+        };
+        assert!(
+            loud(&taped, go, go + BLOCK + 2_400) > 0.01,
+            "the go itself was not taped, so this proves nothing"
+        );
+        let first = roll + 12_000;
+        assert!(
+            loud(&heard, first, first + 2_400) > 0.01,
+            "the song's first click never sounded, so this proves nothing"
+        );
+        assert!(
+            loud(&taped, first, first + 2_400) == 0.0,
+            "the song's first click after the go was taped with the count: {}",
+            loud(&taped, first, first + 2_400)
         );
     }
 
