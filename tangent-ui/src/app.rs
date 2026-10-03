@@ -18337,22 +18337,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let sig = self.time_signature();
                 let beats = (i32::from(sig.beats) + i32::from(d)).clamp(1, 32) as u8;
                 self.set_time_signature(recorder::TimeSignature { beats, unit: sig.unit });
+                self.undo_commit();
             }
             Some(MetHit::Unit(unit)) => {
                 let sig = self.time_signature();
                 self.set_time_signature(recorder::TimeSignature { beats: sig.beats, unit });
+                self.undo_commit();
             }
             Some(MetHit::Div(div)) => {
                 self.settings.metronome_div = div.clamp(0, 8);
                 self.save_settings();
                 // **Every row of this panel is a press, so a gesture, so a
-                // moment.** The click's division, its count-in, whether it
-                // counts into the take and what it plays are all desk
-                // fields and all hashed - and none of them committed, so
-                // choosing one folded into whatever the user did next.
-                // Not yet the signature's two rows above, which end in
-                // `set_time_signature` and commit nothing. The tempo track
-                // is a drag (`met_drag`): one moment, at its release.
+                // moment.** The signature, the click's division, its
+                // count-in, whether it counts into the take and what it
+                // plays are all desk fields and all hashed - and none of
+                // them committed, so choosing one folded into whatever the
+                // user did next. `set_time_signature` itself only saves, so
+                // the two signature rows above commit as these do. The
+                // tempo track is a drag (`met_drag`): one moment, at its
+                // release.
                 self.undo_commit();
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
@@ -33173,9 +33176,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         use recorder_panel::Hit;
         // The signature is not a `Hit` — there is no value to carry along a
         // control — so it is committed here and returns nothing to apply.
+        // **And it is a moment**: the field is accepted (Enter, Tab, DONE, a
+        // click away), the signature is hashed, and the setter only saves.
         if edit.field == F::Meter {
             if let Some(sig) = recorder::TimeSignature::parse(&edit.text) {
                 self.set_time_signature(sig);
+                self.undo_commit();
             }
             return;
         }
@@ -66125,6 +66131,73 @@ mod tests {").expect("the tests module")];
         app.commit_view_change();
         assert!((app.tempo_bpm() - to).abs() < 0.5, "fixture: the typed tempo did not land");
         assert_eq!(app.hist_at, before + 1, "a typed tempo on an empty song left no moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A signature change is its own step back, typed or stepped.**
+    ///
+    /// The signature is a desk field and hashed (`sig_beats`, `sig_unit`),
+    /// and none of its band roads committed: the typed SIG ends in
+    /// `commit_number`'s Meter arm (Enter, Tab, DONE and a click away all
+    /// reach it) and the metronome panel's BEATS and UNIT rows end in
+    /// `set_time_signature`, and both only saved - while every other row of
+    /// that panel commits where it is pressed. So typing 7/8 and then
+    /// pressing "Click into takes" was one Ctrl+Z for both.
+    #[test]
+    fn a_signature_change_is_its_own_moment_on_every_band_road() {
+        use crate::recorder_panel::MetHit;
+        use recorder::TimeSignature as Sig;
+        let root = project_scratch("sigundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        // Typed into SIG, then DONE or a click away: `close_setup` commits
+        // the field.
+        app.setup_open = true;
+        app.num_edit = Some(recorder::NumEdit::prefilled(recorder::NumField::Meter, "7/8".to_owned()));
+        let before = app.hist_at;
+        app.close_setup();
+        assert_eq!(app.time_signature(), Sig { beats: 7, unit: 8 }, "the typed signature did not land");
+        assert_eq!(app.hist_at, before + 1, "a typed signature left no moment of its own");
+
+        // The metronome panel's BEATS + and a UNIT, found by asking the
+        // panel where they are.
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        app.met_menu = Some(());
+        app.met_at = Some(screen.center());
+        let anchor = app.met_anchor(screen);
+        let panel = recorder_panel::met_popup_rect(screen, anchor);
+        let find = |want: MetHit| {
+            let mut y = panel.top();
+            while y <= panel.bottom() {
+                let mut x = panel.left();
+                while x <= panel.right() {
+                    let p = Pos2::new(x, y);
+                    if recorder_panel::met_hit_test(screen, anchor, p) == Some(want) {
+                        return Some(p);
+                    }
+                    x += 2.0;
+                }
+                y += 2.0;
+            }
+            None
+        };
+        for (what, hit, sig) in [
+            ("BEATS +", MetHit::Beats(1), Sig { beats: 8, unit: 8 }),
+            ("UNIT 4", MetHit::Unit(4), Sig { beats: 8, unit: 4 }),
+        ] {
+            let at = find(hit).unwrap_or_else(|| panic!("the panel has no {what}"));
+            let before = app.hist_at;
+            assert!(app.met_menu_press(screen, at, true), "{what} fell through the panel");
+            assert_eq!(app.time_signature(), sig, "{what} did not step the signature");
+            assert_eq!(app.hist_at, before + 1, "the {what} row left no moment of its own");
+        }
+
+        // One Ctrl+Z takes back one of them, not two.
+        app.undo();
+        assert_eq!(app.time_signature(), Sig { beats: 8, unit: 8 }, "one Ctrl+Z took two signature changes");
         let _ = std::fs::remove_dir_all(&root);
     }
 
