@@ -2484,6 +2484,9 @@ struct TrackCopy {
     /// time, so a copy survives the track it came from being deleted — the
     /// same reason `clips` and `inserts` are here rather than looked up.
     kit: Option<crate::drumpad::DrumpadDoc>,
+    /// **Its automation**, every curve on the lane: a volume ride is part of
+    /// how a track sounds, and a copy without it was a different mix.
+    automation: Vec<crate::automation::Curve>,
 }
 
 #[derive(Clone)]
@@ -6424,13 +6427,10 @@ impl TangentApp {
     /// clips, its sidechain key edges, and all six bays (its own three and
     /// its folder seat's) with their bypass flags. Leaving any of it behind
     /// would make the next thing added here inherit a stranger's settings,
-    /// which is worse than either keeping the channel or losing it. The
-    /// pedal seats keep their plugins and flags on purpose (see the note at
-    /// the end).
-    ///
-    /// **Not yet all of it**: its pan, polarity and icon, its drum kit, and
-    /// its automation (the curves, and the open, armed and bypassed rows)
-    /// stay on the slot, and the next track made there inherits them.
+    /// which is worse than either keeping the channel or losing it. Its pan,
+    /// polarity and icon, its drum kit, and its automation go too: the
+    /// curves, and the open, armed and bypassed rows. The pedal seats keep
+    /// their plugins and flags on purpose (see the note at the end).
     fn remove_channel(&mut self, n: usize) {
         // **ONE moment for the whole removal.** A track is clips, six bays,
         // a sidechain table and a bypass table, and `arr_save_edits` and
@@ -6525,12 +6525,50 @@ impl TangentApp {
         self.settings.strip_muted &= !(1 << at);
         self.settings.strip_soloed &= !(1 << at);
         self.set_armed_mask(self.armed_mask() & !(1 << n));
+        // Its pan, polarity and icon, which the next track made here took
+        // over: hard left and phase-inverted from the first frame.
+        if let Some(p) = self.settings.channel_pans.get_mut(n) {
+            *p = d.channel_pans.get(n).copied().unwrap_or(0.0);
+        }
+        self.settings.strip_phase &= !(1 << at);
+        if let Some(i) = self.settings.channel_icons.get_mut(n) {
+            *i = d.channel_icons.get(n).copied().unwrap_or(0);
+        }
         // And the lane's CLIPS: a removed channel that kept invisible clips
         // would keep playing them. The media copies stay in the project.
         let had = self.arrangement.clips.iter().any(|c| c.lane == n);
         if had {
             self.arrangement.clips.retain(|c| c.lane != n);
             self.arr_save_edits();
+        }
+        // **And its AUTOMATION.** The curves are keyed by lane, so a removed
+        // track's ride went on driving the next track made in its slot, and
+        // its rows stood open, armed and bypassed under the empty slot - an
+        // armed one writing into the stranger's curve on the next pass. The
+        // hand's aims at those rows go too; they name rows that are gone.
+        let curves = self.arrangement.automation.curves();
+        if curves.iter().any(|c| c.lane == n) {
+            let kept = curves.iter().filter(|c| c.lane != n).cloned().collect();
+            self.arrangement.automation = crate::automation::Automation::from_curves(kept);
+            self.arr_save_edits();
+        }
+        self.arr_auto_open.retain(|(l, _)| *l != n);
+        self.arr_auto_armed.retain(|(l, _)| *l != n);
+        self.arr_auto_bypassed.retain(|(l, _)| *l != n);
+        self.arr_auto_nodes.retain(|(l, _, _)| *l != n);
+        let gone = |aim: Option<(usize, crate::automation::AutoParam)>| aim.filter(|(l, _)| *l != n);
+        self.arr_auto_focus = gone(self.arr_auto_focus);
+        self.auto_clipboard_from = gone(self.auto_clipboard_from);
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| *l != n);
+        self.arr_auto_hot = self.arr_auto_hot.filter(|(l, _)| *l != n);
+        // And its drum KIT: a drum track made here later played the old
+        // one's samples at the old one's settings.
+        if self.drumpad_kits.get(n).is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default()) {
+            if let Some(k) = self.drumpad_kits.get_mut(n) {
+                *k = crate::drumpad::DrumpadDoc::default();
+            }
+            self.drumpad_dirty = true;
+            self.drumpad_edited();
         }
         // And the sidechain key edges, at BOTH ends: an edge keyed BY this
         // track would go on ducking to whatever slides into its index, and
@@ -11991,6 +12029,14 @@ impl TangentApp {
                 .drumpad_kit_of(n)
                 .filter(|k| !k.is_empty())
                 .cloned(),
+            automation: self
+                .arrangement
+                .automation
+                .curves()
+                .iter()
+                .filter(|c| c.lane == n)
+                .cloned()
+                .collect(),
         });
     }
 
@@ -12146,6 +12192,18 @@ impl TangentApp {
             self.arrangement.add_clip(c);
         }
         if !copy.clips.is_empty() {
+            self.arr_save_edits();
+        }
+        // **Its automation, re-laned**, and in place of whatever the lane
+        // held: a curve left on an empty slot would play under the copy.
+        let curves = self.arrangement.automation.curves();
+        if !copy.automation.is_empty() || curves.iter().any(|c| c.lane == into) {
+            let mut kept: Vec<crate::automation::Curve> =
+                curves.iter().filter(|c| c.lane != into).cloned().collect();
+            kept.extend(copy.automation.iter().map(|c| {
+                crate::automation::Curve::sanitised(into, c.param, c.points().to_vec())
+            }));
+            self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
         }
         // **The kit, which is the sound.** Bay 0 naming the drumpad is what
@@ -66804,6 +66862,85 @@ mod folder_tests {
         assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
         // Which the engine agrees with.
         assert_eq!(a.folder_parents().len(), recorder::CHANNELS);
+    }
+
+    /// **A removed track takes its automation with it.** The curves are
+    /// keyed by lane, so a removed track's ride went on driving the next
+    /// track made in its slot (Cmd+T reuses the first free one), and its
+    /// open and armed rows stood under the empty slot: an armed row writes
+    /// into the stranger's curve on the next pass.
+    #[test]
+    fn removing_a_track_takes_its_automation_with_it() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.arr_toggle_automation_param(3, AutoParam::Mute);
+        a.arrangement
+            .automation
+            .entry(3, AutoParam::Mute)
+            .put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
+        a.arr_auto_armed.insert((3, AutoParam::Mute));
+        a.remove_channel(3);
+        assert!(a.arrangement.automation.get(3, AutoParam::Mute).is_none(), "the curve stayed on the slot");
+        assert!(!a.arr_auto_open.contains(&(3, AutoParam::Mute)), "the row stayed open under an empty slot");
+        assert!(!a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the arm stayed for the next track");
+        a.add_bare_track(3);
+        assert_eq!(
+            a.engine_automation().value_at(3, AutoParam::Mute, 5.0),
+            None,
+            "the new track plays a stranger's curve"
+        );
+    }
+
+    /// **A copied track carries its automation**, re-laned onto the lane it
+    /// lands on: `TrackCopy` is everything a track is, and a volume ride is
+    /// part of how it sounds. The paste REPLACES whatever curves the target
+    /// lane held, so nothing of a stranger's plays under the copy.
+    #[test]
+    fn a_copied_track_carries_its_automation() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.arrangement
+            .automation
+            .entry(3, AutoParam::Gain)
+            .put(Point { at_s: 2.0, value: 0.2, shape: Shape::Linear });
+        // A curve some older build left on the empty slot the copy lands on.
+        a.arrangement
+            .automation
+            .entry(5, AutoParam::Pan)
+            .put(Point { at_s: 1.0, value: 0.9, shape: Shape::Linear });
+        a.copy_track(3);
+        a.paste_track(5);
+        let pasted = a
+            .arrangement
+            .automation
+            .get(5, AutoParam::Gain)
+            .expect("the pasted track lost its volume curve");
+        assert_eq!(pasted.value_at(2.0), Some(0.2), "the pasted curve is not the copied one");
+        assert!(a.arrangement.automation.get(5, AutoParam::Pan).is_none(), "a stranger's curve plays under the copy");
+        assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "the copy took the source's curve");
+    }
+
+    /// **A removed track leaves no pan, polarity, icon or kit for the next
+    /// one.** The owner's rule for the x: "anything left behind is inherited
+    /// by the next thing added there". A track panned hard left with its
+    /// polarity flipped came back from Cmd+T hard left and inverted.
+    #[test]
+    fn a_removed_track_leaves_no_pan_or_polarity_for_the_next_one() {
+        let mut a = app();
+        a.add_bare_track(3);
+        a.settings.channel_pans[3] = -1.0;
+        a.settings.strip_phase |= 1 << 3;
+        a.settings.channel_icons[3] = 5;
+        a.drumpad_kits[3].pads[36].path = "media/kick.wav".to_owned();
+        a.remove_channel(3);
+        a.add_bare_track(3);
+        let d = Settings::default();
+        assert_eq!(a.settings.channel_pans[3], d.channel_pans[3], "the new track inherited the old one's pan");
+        assert_eq!(a.settings.strip_phase & (1 << 3), 0, "the new track inherited the old one's polarity");
+        assert_eq!(a.settings.channel_icons[3], d.channel_icons[3], "the new track inherited the old one's icon");
+        assert!(a.drumpad_kits[3].is_empty(), "the new track inherited the old one's drum kit");
     }
 
     /// **A reorder carries both ends of a sidechain key edge; a delete takes
