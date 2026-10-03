@@ -18695,6 +18695,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// A new note under the pen: snapped, one grid step long, born at the
     /// last velocity anybody set — and heard, so drawing is playing.
     fn me_create_note(&mut self, t: f64, key: u8) {
+        self.me_create_note_above(t, key, None);
+    }
+
+    /// As [`Self::me_create_note`], refusing a note that starts before
+    /// `floor` rather than before the clip's head. The head is the floor for
+    /// a hand on the roll; Enter in a later pass of a part trimmed from its
+    /// front writes down to the loop's origin, where that pass plays (see
+    /// `me_insert_at_playhead`).
+    fn me_create_note_above(&mut self, t: f64, key: u8, floor: Option<f64>) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
@@ -18716,7 +18725,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             (dur, (clip.start_s, clip.start_s + clip.len_s, clip.offset_s))
         };
         let (c0, c1, offset) = span;
-        if t0 < c0 - 1.0e-9 || t0 >= c1 - 1.0e-9 {
+        if t0 < floor.unwrap_or(c0) - 1.0e-9 || t0 >= c1 - 1.0e-9 {
             return;
         }
         let dur = step.min(c1 - t0).max(0.05);
@@ -19605,14 +19614,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         };
         let id = st.id;
         let play = self.recorder.position_s;
-        let (anchor_abs, c0, c1, offset) = {
+        let (anchor_abs, c0, c1, offset, floor) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
             let inside = play >= clip.start_s && play < clip.start_s + clip.len_s;
             // Where the line is DRAWN in a loop (see `me_playhead`), and never
-            // before the clip's head, where nothing may be written.
-            let raw = if inside { clip.midi_fold_s(play).max(clip.start_s) } else { clip.start_s };
+            // before the clip's head, where nothing may be written - except
+            // in a later pass, down to the loop's origin, which that pass
+            // plays (see `me_insert_at_playhead`).
+            let folded = clip.midi_fold_s(play);
+            let floor = if inside && play - folded > 1.0e-9 {
+                clip.midi_loop_origin_s().min(clip.start_s)
+            } else {
+                clip.start_s
+            };
+            let raw = if inside { folded.max(floor) } else { clip.start_s };
             (
                 // AT or after the playhead — see `me_snap_ceil`. Never
                 // behind it, which is where flooring put every paste.
@@ -19620,6 +19637,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 clip.start_s,
                 clip.start_s + clip.len_s,
                 clip.offset_s,
+                floor,
             )
         };
         let pasted = self.note_clipboard.clone();
@@ -19629,7 +19647,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let first = clip.notes.len();
         for n in &pasted {
             let abs = anchor_abs + n.at_s;
-            if abs < c0 - 1.0e-9 || abs >= c1 - 1.0e-9 {
+            if abs < floor - 1.0e-9 || abs >= c1 - 1.0e-9 {
                 continue;
             }
             clip.notes.push(crate::arrangement::ArrNote {
@@ -19751,12 +19769,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         let (id, key) = (st.id, st.cursor_key);
-        let Some((c0, c1)) = self
+        let Some((c0, c1, origin, had)) = self
             .arrangement
             .clips
             .iter()
             .find(|c| c.id == id)
-            .map(|c| (c.start_s, c.start_s + c.len_s))
+            .map(|c| (c.start_s, c.start_s + c.len_s, c.midi_loop_origin_s(), c.notes.len()))
         else {
             return;
         };
@@ -19766,9 +19784,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Where the line is DRAWN, in a loop - see `me_playhead`. The end is
         // held off by more than the snaps' tolerance, or a clip ending on a
         // line floors the head onto its end, where nothing can be written.
+        //
+        // **In a later pass the floor is the loop's ORIGIN, not the head.**
+        // A part trimmed from its front starts mid-loop, so the top of every
+        // pass after the first folds before the head: that pass plays there
+        // (the first never does), and clamping to the head wrote the note
+        // later in the pass than the line stood. A later pass stands whole
+        // loops past the fold; a hair of shift is the fold's own rounding.
         let (at, shift) = self.me_playhead();
-        let at = at.clamp(c0, c1 - 2.0 * crate::midi_editor::SNAP_EPS_S);
-        self.me_create_note(at, key);
+        let floor = if shift > 1.0e-9 { origin.min(c0) } else { c0 };
+        let at = at.clamp(floor, c1 - 2.0 * crate::midi_editor::SNAP_EPS_S);
+        self.me_create_note_above(at, key, Some(floor));
         // **The mouse's create leaves a DRAG standing** so the hand can size
         // the note by pulling before it lets go. A keyboard insert has no
         // hand to let go, and a drag left in flight takes the next click.
@@ -19777,8 +19803,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The end of the note just written, IN THE PASS THE SONG IS IN: the
         // shift puts back the whole loops the fold took away, so a run of
-        // Enter on the third time round stays on the third time round.
-        let to = self.arrangement.clips.iter().find(|c| c.id == id).and_then(|c| {
+        // Enter on the third time round stays on the third time round. Only
+        // when one WAS written: a refused Enter walked the song to the end of
+        // whichever note was last in the list.
+        let to = self.arrangement.clips.iter().find(|c| c.id == id).filter(|c| c.notes.len() > had).and_then(|c| {
             let n = c.notes.last()?;
             Some(c.start_s + (n.at_s - c.offset_s) + n.dur_s + shift)
         });
@@ -20334,7 +20362,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .filter_map(|&i| clip.notes.get(i))
             .map(start_of)
             .fold(f64::INFINITY, f64::min);
-        let floor = clip.start_s;
+        // The loop's origin in a later pass, as Enter's floor is - see
+        // `me_insert_at_playhead` - or the step back moved the song FORWARD.
+        let floor = if shift > 1.0e-9 { clip.midi_loop_origin_s().min(clip.start_s) } else { clip.start_s };
         let (c1, lp) = (clip.start_s + clip.len_s, clip.loop_s);
         if let Some(st) = self.midi_edit.as_mut() {
             st.selected = sel;
@@ -46430,6 +46460,79 @@ mod tests {
             "Backspace put the head at {}, not back where the note began in this pass",
             app.playhead_s()
         );
+    }
+
+    /// **Enter at the top of a trimmed loop's later pass writes where the
+    /// line is.** A part trimmed from its front starts mid-loop, so the first
+    /// `offset` seconds of every later pass fold BEFORE the clip's head: the
+    /// first pass never plays them, every later one does. Enter there was
+    /// clamped to the head - the note sounded later in the pass than the line
+    /// stood - and its walk moved the song forward past where it was.
+    #[test]
+    fn enter_at_the_top_of_a_trimmed_loops_later_pass_acts_where_the_line_is() {
+        let (_ctx, mut app) = editor_on_an_empty_clip(); // magnet off
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.offset_s = 0.5;
+            c.loop_s = 2.0;
+            c.len_s = 6.0;
+        }
+        app.me_locate(3.6);
+        app.me_insert_at_playhead();
+        let n = app.arrangement.clips[0].notes.last().expect("Enter wrote nothing").clone();
+        let sounds = 2.0 + (n.at_s - 0.5) + 2.0;
+        assert!((sounds - 3.6).abs() < 1.0e-9, "the note sounds at {sounds}, not at 3.6");
+        assert!(app.playhead_s() <= 3.6 + n.dur_s + 1.0e-9, "Enter walked the song forward to {}", app.playhead_s());
+    }
+
+    /// **Backspace and paste at the top of a trimmed loop's later pass act
+    /// where the line is too.** Backspace floored its step back at the head
+    /// and moved the song FORWARD; a paste landed at the head.
+    #[test]
+    fn backspace_and_paste_at_the_top_of_a_trimmed_loops_later_pass_act_where_the_line_is() {
+        let (_ctx, mut app) = editor_on_an_empty_clip(); // magnet off
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.offset_s = 0.5;
+            c.loop_s = 2.0;
+            c.len_s = 6.0;
+            // Drawn at 1.7, before the head: it sounds at 3.7 in pass two.
+            c.notes.push(crate::arrangement::ArrNote { at_s: 0.2, dur_s: 0.1, key: 60, vel: 100, muted: false });
+        }
+        app.me_locate(3.9);
+        app.me_backspace();
+        assert!(app.arrangement.clips[0].notes.is_empty(), "Backspace did not take the note back");
+        assert!(
+            (app.playhead_s() - 3.7).abs() < 1.0e-9,
+            "Backspace moved the song to {}, not back to where the note began in this pass",
+            app.playhead_s()
+        );
+        app.note_clipboard = vec![crate::arrangement::ArrNote { at_s: 0.0, dur_s: 0.1, key: 64, vel: 90, muted: false }];
+        app.me_locate(3.6);
+        app.me_paste();
+        let n = app.arrangement.clips[0].notes.last().expect("the paste wrote nothing");
+        let sounds = 2.0 + (n.at_s - 0.5) + 2.0;
+        assert!((sounds - 3.6).abs() < 1.0e-9, "the paste sounds at {sounds}, not at 3.6");
+    }
+
+    /// **An Enter that writes nothing leaves the playhead alone.** With the
+    /// magnet on and the clip's head between two lines, the floor lands
+    /// before the head and nothing is written - and the walk still ran, to
+    /// the end of whichever note was last in the list.
+    #[test]
+    fn enter_that_writes_nothing_leaves_the_playhead_alone() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.settings.midi_snap = true;
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.start_s = 2.08;
+            c.notes.push(crate::arrangement::ArrNote { at_s: 3.0, dur_s: 0.25, key: 60, vel: 100, muted: false });
+        }
+        app.me_locate(2.08);
+        let before = app.arrangement.clips[0].notes.len();
+        app.me_insert_at_playhead();
+        let wrote = app.arrangement.clips[0].notes.len() > before;
+        assert!(wrote || (app.playhead_s() - 2.08).abs() < 1.0e-9, "Enter wrote nothing and moved the playhead to {}", app.playhead_s());
     }
 
     /// **Paste lands where the line is drawn.** On the third pass of a
