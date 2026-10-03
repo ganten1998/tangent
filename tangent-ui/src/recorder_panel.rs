@@ -5066,8 +5066,9 @@ fn typing_for(view: &RecorderView<'_>, field: NumField) -> Option<String> {
 /// The caret inside a caption+value box, after `typed_chars` characters of the
 /// value.
 ///
-/// Shared by the take name and the tempo. They looked identical when they were
-/// two copies, which is exactly when two copies start to drift.
+/// Shared by the take name and both SIG fields, the TAKE tier's and the AUDIO
+/// tier's. They looked identical when they were copies, which is exactly when
+/// copies start to drift: the AUDIO tier's SIG drew no caret at all.
 fn draw_caption_caret(
     painter: &Painter,
     r: Rect,
@@ -8677,6 +8678,43 @@ mod tests {
                 assert!(value.2.right() <= l.audio.right() && value.2.left() >= cap.2.right());
             }
         }
+    }
+
+    /// **Every SIG field shows its caret.** The signature is typed into the
+    /// TAKE panel's SIG and into the AUDIO tier's, which the cog's panel and
+    /// the red button's RECORDING panel show; only the TAKE panel's drew a
+    /// caret, so in the other two the arrow keys moved one nobody could see.
+    #[test]
+    fn every_sig_field_shows_its_caret() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
+        let edit = crate::recorder::NumEdit::prefilled(NumField::Meter, "7/8".to_owned());
+        let view = RecorderView { editing: Some(&edit), ..RecorderView::empty() };
+        let carets_in = |shape: SetupShape, row: fn(&SetupLayout) -> Rect| -> usize {
+            let r = row(&SetupLayout::new(screen, anchor, shape));
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                |ctx| {
+                    let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                    draw_setup(&painter, screen, anchor, &view, &Settings::default(), shape);
+                },
+            );
+            fn count(s: &egui::Shape, row: Rect) -> usize {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().map(|s| count(s, row)).sum(),
+                    egui::Shape::LineSegment { points, .. } => {
+                        usize::from(row.contains(points[0].lerp(points[1], 0.5)))
+                    }
+                    _ => 0,
+                }
+            }
+            out.shapes.iter().map(|c| count(&c.shape, r)).sum()
+        };
+        assert!(carets_in(SetupShape::Take, |l| l.time_sig) > 0, "the fixture draws no caret even in the TAKE panel");
+        assert!(carets_in(SetupShape::Rolling, |l| l.audio_sig) > 0, "the RECORDING panel's SIG takes typing with no caret");
+        assert!(carets_in(SetupShape::Machine, |l| l.audio_sig) > 0, "the cog's SIG takes typing with no caret");
     }
 
     /// **The PLUGINS row still reads after the resync button took its right
@@ -14230,6 +14268,12 @@ pub fn draw_setup(
             .clone()
             .unwrap_or_else(|| view.time_signature.label());
         labelled(painter, l.audio_sig, "SIG", &shown, p.ink, &p);
+        // The same caret the TAKE tier's SIG draws: this is the copy the
+        // cog's panel and the red button's show, and the arrows moved a
+        // caret here that nobody could see.
+        if let Some(typed) = typing {
+            draw_caption_caret(painter, l.audio_sig, "SIG", &shown, typed.chars().count(), &p);
+        }
     }
     // The two doors the cog carries now: the Project dialog and the
     // plugin folders — the menu's rows, reachable without the menu.
