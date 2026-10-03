@@ -74,9 +74,17 @@ for p in "${want[@]}"; do
     linux)   pats=(dist/"tangent-${VERSION}-linux-"*.tar.gz) ;;
     *) echo "error: unknown platform '$p' (want: windows, macos, linux)" >&2; exit 1 ;;
   esac
-  for f in "${pats[@]}"; do
+  # `${pats[@]+"${pats[@]}"}` and not `"${pats[@]}"`: under `set -u`, bash
+  # 3.2 - which is what macOS ships, and what `env bash` finds here - treats
+  # an EMPTY array expansion as an unbound variable and aborts, and nullglob
+  # empties this one for a platform with nothing in dist/. The default run
+  # asks for all three, so one platform not built stopped it before anything
+  # was copied. publish-github.sh names the same trap.
+  before=${#files[@]}
+  for f in ${pats[@]+"${pats[@]}"}; do
     [ -f "$f" ] && files+=("$f")
   done
+  [ ${#files[@]} -gt "$before" ] || echo "    ($p: nothing in dist/)" >&2
 done
 shopt -u nullglob
 
