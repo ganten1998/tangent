@@ -1309,7 +1309,17 @@ channels play back their clips and nothing else. "Ready to play" and
   every reader rescales it to its own decode with `warp_anchors`; 0, in a
   document older than the field, means as it stands), is in the undo
   fingerprint, renders on the decode crew (`Work::Warp`) BEFORE
-  any stretch, and the drawn wave is the warped render's. While the window
+  any stretch, and the drawn wave is the warped render's. Each clip is
+  quantized ALONE: `quantize_clip` detects on that clip's own file and
+  writes a map from its own attacks. So the takes of a multi-mic kit
+  quantized together (a drums folder's row selects them all) are not moved
+  as one: a hit two mics both catch is pulled onto the line in each, which
+  takes out the 1-3 ms the sound took to travel between them, and a hit
+  only one mic's detector keeps leaves its bleed in the others to move with
+  their own corrections, so the kit flams and combs against itself. A kit
+  kept phase-coherent needs one detection for the group (a reference clip,
+  or their sum), one map rebased onto each clip, and a way to say which
+  clips are one kit; none of it exists yet. While the window
   is open, `quantize_preview` asks the host for marks: amber where an
   attack was found, a fainter tick in the clip's ink where the grid pulls
   it. GLUE welds audio too (`RecorderRequest::GlueAudio`): the host lays
