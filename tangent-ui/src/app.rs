@@ -17617,8 +17617,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// quarters of an import on screen.
     ///
     /// Nests, so a batch inside a batch is still one moment. **Every call
-    /// must be answered by a `commit_undo_moment`** - see
-    /// `every_held_moment_is_released`, which is what says so.
+    /// must be answered by a `commit_undo_moment`**, on every exit of the
+    /// function that made it - see
+    /// `every_hold_is_released_on_every_exit_of_its_own_function`, which is
+    /// what says so.
     ///
     /// **A hold never outlives the function, or the frame, that took it.**
     /// `undo_reset` does not lower `undo_hold`, so one unreleased hold stops
@@ -42513,33 +42515,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Every held moment is released**, in the same function that held it.
+    /// **Every held moment is released on every exit of the function that
+    /// held it.**
     ///
-    /// `begin_one_moment` is a counter, so a path that raises it and returns
-    /// without lowering it silently stops the undo timeline for the rest of
-    /// the session - every edit after it folding into one moment that never
-    /// gets pushed. A source scan, because the imbalance is a property of
-    /// the TEXT rather than of any one run.
+    /// `begin_one_moment` is a counter, and `undo_reset` does not lower it,
+    /// so a path that raises it and leaves without lowering it stops the
+    /// timeline recording for the rest of the session. A source scan,
+    /// because the imbalance is a property of the TEXT rather than of any
+    /// one run - and per FUNCTION, methods and free functions alike: each
+    /// hold needs a release, plus one more for every `return` or `?` after
+    /// it. A whole-file count cannot do this: plain `commit_undo_moment`
+    /// commits and early-exit releases count as releases too, and the
+    /// whole-file version of this test passed with `insert_track_below`'s
+    /// early-exit release deleted.
     ///
-    /// **Not yet per function.** What it compares is two whole-file counts,
-    /// and plain `commit_undo_moment` commits and early-exit releases count
-    /// as releases too, so it stays green with an early-exit release
-    /// deleted (`insert_track_below`'s, for one).
+    /// Comments are stripped before anything is counted, so a doc that says
+    /// "returns" (the next function's doc sits at the end of this one's
+    /// window) is not read as an exit.
     #[test]
-    fn every_held_moment_is_released() {
+    fn every_hold_is_released_on_every_exit_of_its_own_function() {
+        const STARTS: [&str; 6] = [
+            "\nfn ",
+            "\npub fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(super) fn ",
+        ];
+        let code = |f: &str| -> String {
+            f.lines()
+                .map(|l| l.find("//").map_or(l, |c| &l[..c]))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut holding = 0;
         for (what, src) in [
             ("the app", include_str!("app.rs")),
             ("the host", include_str!("../../tangent/src/desktop.rs")),
         ] {
-            // The definition and this test itself are not call sites.
-            let body = &src[..src.find("mod tests {").unwrap_or(src.len())];
-            let held = body.matches("begin_one_moment();").count();
-            let freed = body.matches("commit_undo_moment();").count();
-            assert!(
-                freed >= held,
-                "{what}: {held} moments held and only {freed} released"
-            );
+            // The definitions are not call sites, and the tests (this one
+            // included, with its own literals) are cut away.
+            let body = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+            let mut starts: Vec<usize> = STARTS
+                .iter()
+                .flat_map(|p| body.match_indices(*p).map(|(i, _)| i))
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            starts.push(body.len());
+            for w in starts.windows(2) {
+                let f = code(&body[w[0]..w[1]]);
+                let Some(at) = f.find("begin_one_moment();") else {
+                    continue;
+                };
+                holding += 1;
+                let held = f.matches("begin_one_moment();").count();
+                let freed = f.matches("commit_undo_moment();").count();
+                let tail = &f[at..];
+                let exits = tail.matches("return").count()
+                    + tail.matches("?;").count()
+                    + tail.matches(")?").count();
+                let name = f.trim_start().lines().next().unwrap_or("");
+                assert!(
+                    freed >= held + exits,
+                    "{what}: `{name}` holds {held}, has {exits} exit(s) after the hold \
+                     and releases {freed} - one of those exits leaves undo frozen"
+                );
+            }
         }
+        assert!(
+            holding >= 9,
+            "the scan found {holding} holding functions; it is reading the wrong text"
+        );
     }
 
     /// **Two edits are two steps back, even when the host made them.**
