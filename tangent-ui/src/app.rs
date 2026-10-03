@@ -23558,15 +23558,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.me_insert_at_playhead();
             }
 
-            // **Q raises the quantize window**, the one letter every desk
-            // agrees on. Bare, because every modifier on it means something
-            // else here and a quantize is not a thing to make somebody reach
-            // for. The window quantizes notes while the editor is open and
-            // audio when it is not, so one key is right in both places.
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
-                self.open_quantize_window();
-            }
-
             // **Delete deletes; Backspace also steps back.** See `me_backspace`.
             if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.me_delete_selected();
@@ -41892,6 +41883,25 @@ mod tests {
         assert_eq!(app.settings.quantize_fit, "slice");
         assert!((app.settings.quantize_window_ms - 30.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The roll reads a bare Q once.** Two handlers sat in the one block
+    /// of keys the editor owns, the leftovers of the two quantize commands
+    /// the window replaced, so one press opened the window twice: harmless
+    /// only while opening is idempotent, and a toggle would have made Q do
+    /// nothing at all. A source scan, because a second identical call
+    /// leaves nothing a frame can see.
+    #[test]
+    fn the_editor_reads_bare_q_once() {
+        let src = include_str!("app.rs");
+        let body = &src[..src.find("\nmod tests {").expect("the test module")];
+        let at = body.find("fn midi_editor_input").expect("the roll's input");
+        let end = body[at..].find("\n    fn ").map_or(body.len(), |n| at + n);
+        assert_eq!(
+            body[at..end].matches("key_pressed(egui::Key::Q)").count(),
+            1,
+            "one press of Q runs two handlers in the editor"
+        );
     }
 
     /// **The chip CALLED "1/16" applies a sixteenth**, whatever the song's
