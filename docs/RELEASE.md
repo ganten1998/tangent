@@ -226,10 +226,12 @@ Details that matter and are easy to lose:
   sidecar on both platforms.
 - **ASIO rides into the Windows build** when the Steinberg SDK is present
   under `vendor/asiosdk_*` (its licence forbids committing it, so a fresh
-  checkout does not have it). Without it `build-cross.sh` still produces a
-  WASAPI-only build and says so in one line, and `release.sh` then fails
-  the release on the missing `ASIO-NOTICE.txt`. Unpack the SDK into
-  `vendor/` before any Windows build meant for a tester or a release. (The
+  checkout does not have it). Without it `build-cross.sh` refuses to start,
+  before the Linux legs spend their time; `ALLOW_WASAPI_ONLY=1` builds a
+  WASAPI-only Windows build on purpose, and the artifact checks then keep it
+  from shipping, to a release or to testers, on the missing
+  `ASIO-NOTICE.txt`. Unpack the SDK into `vendor/` before any Windows
+  build. (The
   notice is written whenever `CPAL_ASIO_DIR` is set, and that is cpal's own
   variable: one exported in the shell writes it over a WASAPI-only build
   too, and that build then passes.)
@@ -251,7 +253,9 @@ Run on each OS, copy the artifacts into one `dist/`, then
 artifacts, which are otherwise purged so no stale file rides a checksum or
 upload glob.)
 
-Per artifact, it verifies and refuses to bless a release on failure:
+Per artifact it runs `scripts/check-artifacts.sh`, the one copy of these
+checks (`publish-dropbox.sh` runs it on every tester build too), and
+refuses to bless a release on failure:
 
 - **pkg**: expands it and requires the app component, NO retired VST3
   component, a standalone install choice, `relocatable="false"` (so a stray
@@ -340,8 +344,11 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 ## Builds for testers: `scripts/publish-dropbox.sh`
 
 Between releases every build is `X.Y.Z-dev`, and `release.sh` refuses to
-touch one, so NONE of its artifact checks (signatures, the ASIO notice, the
-payload lists) run on what testers receive. `publish-dropbox.sh
+touch one, so `publish-dropbox.sh` runs the release's artifact checks
+itself before it copies anything (`scripts/check-artifacts.sh`, above:
+signatures on every Windows PE, the ASIO notice, the payload lists). A
+build that fails one is not published; `SKIP_CHECKS=1` publishes it
+anyway, on purpose. `publish-dropbox.sh
 [windows|macos|linux …]` copies the current version's artifacts from
 `dist/` to `<Dropbox>/Tangent Development/builds/<HEAD>[-dirty]/`, installer
 first, and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/`

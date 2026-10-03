@@ -94,6 +94,21 @@ if [ ${#files[@]} -eq 0 ]; then
   exit 1
 fi
 
+# **The release's own checks, on what testers get.** release.sh refuses a
+# `-dev` version before it opens a single file, so a tester build used to
+# pass no gate at all: a PE without a signature (which Smart App Control
+# refuses to start, with no override) or a WASAPI-only Windows build went
+# straight out. scripts/check-artifacts.sh is the one copy of those checks,
+# and release.sh runs it too. SKIP_CHECKS=1 publishes anyway, and must be
+# typed.
+if [ "${SKIP_CHECKS:-0}" = 1 ]; then
+  echo "NOTE: SKIP_CHECKS=1 — publishing WITHOUT the artifact checks." >&2
+elif ! scripts/check-artifacts.sh "$VERSION" "${files[@]}"; then
+  echo "refusing: the build above fails the release's own checks (the !! lines)." >&2
+  echo "  Fix the build, or SKIP_CHECKS=1 to publish it anyway, on purpose." >&2
+  exit 1
+fi
+
 mkdir -p "$DEST"
 # **The INSTALLER first**, and that is not cosmetic: Dropbox uploads in the
 # order files land, and a 50 MB exe that arrives before a 67 MB zip is a

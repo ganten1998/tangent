@@ -166,7 +166,9 @@ three variables and an `az login`.
 
 From then on `build-cross.sh` signs `tangent.exe`, `tangent-ffmpeg.exe`,
 the uninstaller and the installer on every Windows build, and `release.sh`
-refuses to cut a release if any of them comes out unsigned - it reads the
-signature of the setup.exe, of each program inside it, and of each program
-in the portable zip. Unset the three variables and everything reverts to
-the documented unsigned state - loudly, never silently.
+refuses to cut a release, and `publish-dropbox.sh` to hand a build to
+testers, if any of them comes out unsigned - both read
+(`scripts/check-artifacts.sh`) the signature of the setup.exe, of each
+program inside it, and of each program in the portable zip. Unset the three
+variables and everything reverts to the documented unsigned state - loudly,
+never silently.
