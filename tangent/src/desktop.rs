@@ -6400,6 +6400,10 @@ impl DesktopApp {
                     } else {
                         self.app.count_in_beats()
                     };
+                    // Whether this press set its own count clicking: with no
+                    // engine nothing clicks, and a count in the file is then
+                    // no count at all - see `press_wait_and_head`.
+                    let mut clicked = false;
                     if let Some(e) = self.recorder.engine.as_ref() {
                         // The click's own switch for the count, which is not
                         // `metronome_in_take` — see `Shared::count_in_in_take`.
@@ -6410,6 +6414,7 @@ impl DesktopApp {
                             // When it began, for a red press that joins it
                             // and for a take pressed into it after that.
                             self.recorder.count_from = Some((std::time::Instant::now(), beats));
+                            clicked = true;
                         } else if self.recorder.take_count_pending && !self.recorder.arr_rec_wait {
                             // Ending or cancelling a take that is still
                             // counting: the count was the take's, so it goes.
@@ -6441,17 +6446,15 @@ impl DesktopApp {
                     //
                     // And the HEAD the file will carry, decided here from what
                     // this press actually did: the whole count when the take's
-                    // own count goes in, what is LEFT of the arrangement's when
-                    // it joins one, nothing otherwise.
-                    let (wait, head) = match joined {
-                        Some((_, of)) if !in_take => (of, 0.0),
-                        Some((from, of)) => (
-                            0,
-                            (f64::from(of) * beat_s - from.elapsed().as_secs_f64()).max(0.0),
-                        ),
-                        None if in_take => (0, f64::from(beats) * beat_s),
-                        None => (beats, 0.0),
-                    };
+                    // own count goes in and clicks, what is LEFT of the
+                    // arrangement's when it joins one, nothing otherwise.
+                    let (wait, head) = press_wait_and_head(
+                        joined.map(|(from, of)| (of, from.elapsed().as_secs_f64())),
+                        in_take,
+                        beats,
+                        clicked,
+                        beat_s,
+                    );
                     if starting {
                         self.recorder.take_head_s = head;
                         self.recorder.session.set_take_head(head);
@@ -9757,6 +9760,14 @@ impl DesktopApp {
             Kind::Info,
             "Exporting — a real pass from the top…",
         );
+        // **The pass's own placement, not the last press's.** `begin`
+        // latches the facts pushed at the top of this frame - the playhead
+        // before the locate above, the transport before it rolled, and the
+        // head the last cassette press decided - so a pass after a take with
+        // its count in the file said `head_seconds: 2` over a file with no
+        // count in it. It begins at its span's head, rolling, with no count.
+        self.recorder.session.set_take_head(0.0);
+        self.recorder.session.set_take_place(from_s, true);
         self.recorder.session.toggle(&root, Some("bounce"), 0, spec);
         // The stems: one writer per USED lane — clips on it, or a kind —
         // fed live from the engine's tap so nothing is buffered whole.
@@ -15731,6 +15742,42 @@ fn new_starts_beside(
     still_stands: bool,
 ) -> bool {
     still_stands && ((keeping && takes > 0) || (current && discarded))
+}
+
+/// **What one cassette press waits before its file opens, and the head
+/// that file will carry** - decided from what the press actually did, so
+/// `take.json` says what happened and not what the settings say.
+///
+/// `joined` is the count a press joins (the red button's, already
+/// clicking): its beats and the seconds since it began. `beats` is the
+/// press's own count from the settings, and `clicked` whether that count is
+/// actually clicking - with no engine nothing is.
+///
+/// - Joining, pre-roll: wait the whole joined count (the session counts it
+///   from when it began, `count_in_began_at`), and no head.
+/// - Joining with the count in the file: write now, and the head is what is
+///   LEFT of the joined count.
+/// - Its own count in the file: write now, and the head is the whole count -
+///   if one clicks. It was the whole count either way, so a take pressed
+///   with no engine said two bars of head over a file with no count in it,
+///   and dropped onto a lane it landed two bars late.
+/// - Its own count, pre-roll: wait the count (on the wall clock when no
+///   engine clicks it, the no-engine fallback), and no head.
+#[cfg(feature = "recorder")]
+fn press_wait_and_head(
+    joined: Option<(u32, f64)>,
+    in_take: bool,
+    beats: u32,
+    clicked: bool,
+    beat_s: f64,
+) -> (u32, f64) {
+    match joined {
+        Some((of, _)) if !in_take => (of, 0.0),
+        Some((of, since)) => (0, (f64::from(of) * beat_s - since).max(0.0)),
+        None if in_take && clicked => (0, f64::from(beats) * beat_s),
+        None if in_take => (0, 0.0),
+        None => (beats, 0.0),
+    }
 }
 
 /// Whether AccessKit is live — which is to say, whether an assistive
@@ -22765,6 +22812,60 @@ mod tests {
             src.contains("state.play_pending = self.recorder.play_on_go;"),
             "the band is not told a Play is waiting on a downbeat"
         );
+    }
+
+    /// **An export's take is placed where the export put it.** `begin`
+    /// latches the facts pushed at the top of the frame: the playhead
+    /// before `start_bounce` located to its span's head, the transport
+    /// before it rolled, and the head the LAST cassette press decided - so a
+    /// pass after a take with its count in the file said `head_seconds: 2`
+    /// over a file with no count in it, and placed itself where the playhead
+    /// had been parked.
+    #[test]
+    fn an_export_take_carries_its_own_head_and_place() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let toggles = body
+            .find(".toggle(&root, Some(\"bounce\"), 0, spec);")
+            .expect("the pass no longer begins its take");
+        for needle in [
+            "self.recorder.session.set_take_head(0.0);",
+            "self.recorder.session.set_take_place(from_s, true);",
+        ] {
+            let set = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("the pass's take latches the last press's facts: no `{needle}`"));
+            assert!(set < toggles, "`{needle}` comes after the take has already latched");
+        }
+    }
+
+    /// **A press writes a head only for a count that clicks.** With the
+    /// count recorded into the take and no engine to click it, the file
+    /// opens at the press with no count in it, and its `take.json` said a
+    /// head of the whole count anyway: dropped onto a lane at its
+    /// `timeline_start_seconds`, the take landed that many bars late. The
+    /// other answers are pinned beside it.
+    #[test]
+    fn a_press_writes_a_head_only_for_a_count_that_clicks() {
+        let beat = 0.5; // 120 bpm, a quarter-note beat
+        // Its own count in the file: the whole count when it clicks, and
+        // nothing when nothing does.
+        assert_eq!(press_wait_and_head(None, true, 4, true, beat), (0, 2.0));
+        assert_eq!(
+            press_wait_and_head(None, true, 4, false, beat),
+            (0, 0.0),
+            "a count that never clicked is written as the take's head"
+        );
+        // Pre-roll: the wait and no head, on the wall clock with no engine.
+        assert_eq!(press_wait_and_head(None, false, 4, true, beat), (4, 0.0));
+        assert_eq!(press_wait_and_head(None, false, 4, false, beat), (4, 0.0));
+        // Joining the red button's count: all of it to wait, or what is left
+        // of it in the file.
+        assert_eq!(press_wait_and_head(Some((4, 0.5)), false, 0, false, beat), (4, 0.0));
+        assert_eq!(press_wait_and_head(Some((4, 0.5)), true, 0, false, beat), (0, 1.5));
+        assert_eq!(press_wait_and_head(Some((4, 9.0)), true, 0, false, beat), (0, 0.0));
     }
 
 
