@@ -15178,9 +15178,9 @@ pub(crate) fn os_reader_attached() -> bool {
 /// - its document is missing, empty, or unnamed with no clips - a damaged,
 ///   named or clip-holding one spares it (the in-memory flag can be undone
 ///   past a first save);
-/// - its kit is the template's (`kit_is_custom` against `Templates/default`)
-///   - a kit built in it spares it, as `fresh_project_dir` and the launch
-///   sweep spare it: a kit saves itself because it is hours of work, and
+/// - its kit is the template's (`kit_is_custom` against `Templates/default`):
+///   a kit built in it spares it, as `fresh_project_dir` and the launch
+///   sweep spare it, because a kit saves itself for being hours of work and
 ///   Don't Save is no exception until the owner says otherwise. These three
 ///   are `TangentApp::scratch_is_disposable`, the sweep's own judge;
 /// - nothing in `media/` is named `rec-*`, the arrangement take's name.
