@@ -557,7 +557,8 @@ pub enum Dialog {
         fit: String,
         /// **What Apply would act on, worked out by the app**, so the
         /// window can say so rather than leaving somebody to press and
-        /// find out. `None` when nothing is selected.
+        /// find out. `None` when nothing is selected. Refreshed by the app
+        /// on every frame the window is drawn, beside `meter`.
         target: Option<String>,
         /// **The song's meter, `(beats, unit)`, that the GRID chips are
         /// spelled in** - the dial's signature, which is the meter the grid

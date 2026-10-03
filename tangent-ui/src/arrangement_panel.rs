@@ -179,9 +179,12 @@ pub struct ClipView<'a> {
     /// quantized once wears its ticks on its hits, and the trim is subtracted
     /// here, at the draw. Only the attacks the clip plays
     /// arrive - inside `offset_s ..` its end, or one pass of its loop, the
-    /// span `wave_band` folds each pass into - so a looped clip repeats them
-    /// in every pass, as it repeats its sound. Empty unless that window is
-    /// open over this clip.
+    /// span `wave_band` folds each pass into - and a looped clip repeats
+    /// them in every pass, as it repeats its sound. Each pass draws only the
+    /// marks inside that span, whatever arrives: the host chooses in the
+    /// frames it anchors in, and a hit the current map carries across the
+    /// seam is projected outside it. Empty unless that window is open over
+    /// this clip.
     ///
     /// The owner asked for these: "the waveform should have transient marks
     /// shown as the different settings are tweaked in its menu". A
@@ -5095,12 +5098,31 @@ fn draw_clip_marks(
     } else {
         1
     };
+    // A hair either side of a pass's span, for the fold below: the host
+    // rounds the trim to a whole frame and sends seconds as `f32`, so a hit
+    // ON the loop's first frame can arrive a fraction of a frame before
+    // `offset_s`, and dropping it would take the downbeat off every pass.
+    const SEAM_SLACK_S: f64 = 5.0e-4;
     for pass in 0..passes {
         // Zero for an unlooped clip, whose `loop_s` may not even be finite -
         // `inf * 0.0` is NaN, and a NaN x is a line drawn nowhere in
         // particular.
         let shift = if looped { clip.loop_s * pass as f64 } else { 0.0 };
         for &(found_s, target_s) in clip.marks {
+            // **Only what THIS pass plays**: `offset_s .. offset_s +
+            // loop_s`, the span `wave_band` folds the pass's picture into.
+            // Every pass drew every mark it was handed, so one from outside
+            // the loop stood in the next pass's audio, over a place the loop
+            // plays something else. The host sends only what the clip plays,
+            // but in the axis it anchors in; a hit the current warp carries
+            // across the seam is projected outside the span, and the fold is
+            // the painter's to keep, as the picture's is.
+            if looped {
+                let into = f64::from(found_s) - clip.offset_s;
+                if !(into > -SEAM_SLACK_S && into < clip.loop_s + SEAM_SLACK_S) {
+                    continue;
+                }
+            }
             // Source seconds -> the clip's own drawn timeline.
             let at = clip.start_s + (f64::from(found_s) - clip.offset_s) + shift;
             let to = clip.start_s + (f64::from(target_s) - clip.offset_s) + shift;
@@ -12001,6 +12023,39 @@ selected: false,
         assert_eq!(ticks(1.0, 4.0), 4, "a looped clip was marked in its first pass only");
         // A loop longer than the clip is one pass, not a fraction of one.
         assert_eq!(ticks(6.0, 4.0), 1, "a loop longer than its clip drew twice");
+    }
+
+    /// **Each pass of a loop is marked with the attacks THAT pass plays**:
+    /// the ones inside `offset_s .. offset_s + loop_s`, the span `wave_band`
+    /// folds the pass's picture into. Every pass repeated every mark it was
+    /// handed, so a mark from outside the loop stood in the next pass's
+    /// audio, over a place the loop plays something else.
+    #[test]
+    fn a_looped_clip_marks_only_the_attacks_its_loop_plays() {
+        let area = rect();
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let notes: Vec<crate::arrangement::ArrNote> = Vec::new();
+        // Attacks at 0.3, 1.5 and 2.8 s of the FILE; the clip loops 1.0..2.0 of it, four passes.
+        let marks = [(0.3_f32, 0.3_f32), (1.5, 1.5), (2.8, 2.8)];
+        let clips = [ClipView {
+            peaks: Some(&peaks),
+            len_s: 4.0,
+            max_len_s: 8.0,
+            loop_s: 1.0,
+            offset_s: 1.0,
+            marks: &marks,
+            ..a_looped_clip(&notes, 2.0, 2.0)
+        }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 8.0;
+        v.song_s = 12.0;
+        let body = clip_rect(area, &v, &clips[0]);
+        let n = wave_columns_xy_in(&v, body)
+            .into_iter()
+            .filter(|(_, top, bot)| bot - top > body.height() * 0.8)
+            .count();
+        assert_eq!(n, 4, "drew {n} ticks where each of four passes plays one attack");
     }
 
     /// **The quantize window's marks are drawn, where the detector put

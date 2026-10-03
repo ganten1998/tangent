@@ -1263,7 +1263,8 @@ pub struct TangentApp {
     arr_gesture_dirty: bool,
     /// The arrangement's grid and window as they stood at the last moment,
     /// so a frame that did not move them costs one compare. See
-    /// `commit_view_change`.
+    /// `commit_view_change` - and `apply_quantize_window`, which sets it
+    /// ahead of the host's moment that will record them.
     view_committed: Option<crate::arrangement::View>,
     /// **How many batches are holding their moment back.** See
     /// [`TangentApp::begin_one_moment`]: a gesture that reaches several
@@ -17220,8 +17221,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // **No track picked at all**: `lanes` is empty, nothing is on it,
         // and `all` over a selection answers false - which then meets the
-        // adopter's own empty-lanes guard and changes nothing. One guard,
-        // in the place that acts.
+        // adopter's own no-track guard and changes nothing. One guard, in
+        // the place that acts.
         let lanes = self.quantize_fallback_lanes();
         ids.iter().all(|id| {
             self.arrangement
@@ -17267,16 +17268,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   selection is not what it acts on;
     /// - the selected clips already lie on the picked tracks, which is the
     ///   "unless" in the ask;
-    /// - the tracks hold no audio, so there is nothing to adopt and the
-    ///   window should say "nothing to quantize" rather than lie.
+    /// - NO track is picked, so the clip selection is all there is.
+    ///
+    /// And one answer that adopts nothing: picked tracks that hold no audio
+    /// (an empty track, a MIDI one, a folder with nothing in it) let go of
+    /// any clip selected elsewhere, so the window says "nothing to quantize"
+    /// rather than naming a take on a track the hand has left.
     fn adopt_track_clips_for_quantize(&mut self) {
         if self.midi_edit.is_some() || self.clip_selection_is_on_a_picked_track() {
             return;
         }
-        let lanes = self.quantize_fallback_lanes();
-        if lanes.is_empty() {
+        if self.selected_tracks.is_empty() {
             return;
         }
+        let lanes = self.quantize_fallback_lanes();
         let ids: Vec<u64> = self
             .arrangement
             .clips
@@ -17286,12 +17291,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             })
             .map(|c| c.id)
             .collect();
-        // Nothing to adopt: leave whatever was selected. With nothing
-        // selected the window says so ("nothing selected"). Not yet right
-        // with a clip selected on ANOTHER track: it stays the target, so the
-        // window names it and Apply quantizes it, although the tracks picked
-        // last hold no audio.
+        // **Nothing to adopt.** With no clip selection the window says
+        // "nothing selected"; with a selection on ANOTHER track the tracks
+        // have won and hold nothing, so that selection is cleared too.
+        // Keeping it aimed the window at a track the hand had left: it named
+        // the take there and Apply quantized it.
         if ids.is_empty() {
+            self.arr_selected = None;
+            self.arr_multi.clear();
             return;
         }
         // The earliest is the primary, so the rim lands somewhere a hand
@@ -17306,11 +17313,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_multi = ids;
     }
 
-    /// **Open the quantize window**, filled from what was last used.
+    /// **Open the quantize window**, filled from what was last used - or,
+    /// when it is already open, re-aim it and leave its dials alone.
     pub fn open_quantize_window(&mut self) {
         // Before the window is filled, so its target line and its marks are
         // built from the selection this just made.
         self.adopt_track_clips_for_quantize();
+        // **Q on a window already up is a re-aim, not a reopen.** Q is the
+        // one road that adopts a picked track's audio, so it is how a
+        // standing window is pointed somewhere else, and the window keeps
+        // working copies of its dials that reach the settings only on
+        // Apply. Rebuilt from the settings, a strength of 40 and a grid of
+        // 1/16 turned and not yet applied snapped back to the last Apply's,
+        // the ticks with them, and the Apply after used the old numbers.
+        if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+            let now = self.quantize_target();
+            if let Some(Dialog::Quantize { target, .. }) = self.dialog.as_mut() {
+                *target = now;
+            }
+            return;
+        }
         self.dialog = Some(Dialog::Quantize {
             grid_exp: self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
             triplet: self.settings.quantize_triplet,
@@ -17505,6 +17527,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips(ask));
+        // **The knobs ride in the host's moment.** The Apply has just written
+        // them, and they are in the session's `View`, so `commit_view_change`
+        // would commit them alone at the end of this frame, with the old
+        // warp, and the host's warp would land frames later as a second
+        // moment: one press, two Ctrl+Z. Marked as committed here instead,
+        // the host's one `commit_undo_moment` after the quantize takes knobs
+        // and warp together, however many frames its cover waits. Only where
+        // a host takes the request - the gate `request_recorder` uses: a
+        // plugin never drains it, and there the knobs are the whole press
+        // and keep their own moment.
+        if self.caps.capture_devices {
+            self.view_committed = Self::desk_view(&self.settings).view.map(|v| v.to_view());
+        }
     }
 
     /// Ask the host to normalise whatever audio is selected.
@@ -19831,7 +19866,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// kind of difference nobody remembers in time, and one rule should
     /// replace it.
     ///
-    /// Notes are kept inside their clip, exactly as the quantiser keeps them.
+    /// **Notes are kept wholly inside their clip**: each start is held where
+    /// the note still ends by the clip's end. That is not the quantize
+    /// window's rule any more, which holds only a note's START inside the
+    /// clip, lets its tail ring past the end, and leaves a note no pass plays
+    /// where it is (see `me_quantize_with`).
     fn me_humanize(&mut self, timing_pct: u8, vel_pct: u8, seed: u64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -23558,15 +23597,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.me_insert_at_playhead();
             }
 
-            // **Q raises the quantize window**, the one letter every desk
-            // agrees on. Bare, because every modifier on it means something
-            // else here and a quantize is not a thing to make somebody reach
-            // for. The window quantizes notes while the editor is open and
-            // audio when it is not, so one key is right in both places.
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
-                self.open_quantize_window();
-            }
-
             // **Delete deletes; Backspace also steps back.** See `me_backspace`.
             if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.me_delete_selected();
@@ -26939,19 +26969,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     && i.key_pressed(egui::Key::F)
             }) {
                 self.freeze_selected();
-            }
-        }
-        // **The quantize window watches the selection.** It is not modal, so
-        // what it would act on changes under it; a window that said "1 audio
-        // clip" while three were selected would be lying.
-        // Asked BEFORE the window is borrowed: `quantize_target` reads the
-        // whole app and cannot run inside a mutable borrow of one field.
-        if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
-            let now = self.quantize_target();
-            if let Some(Dialog::Quantize { target, .. }) = self.dialog.as_mut() {
-                if *target != now {
-                    *target = now;
-                }
             }
         }
         // **Q opens the quantize window, every time.**
@@ -37188,10 +37205,10 @@ impl TangentApp {
     /// is invisible to it, so a `View` change made during one commits that
     /// drag's half-way state as a moment of its own.
     ///
-    /// **Nor can it see a host request raised in the same frame**: an
-    /// audio Apply in the quantize window that moves a knob has the knobs
-    /// committed here at the end of its frame, and the host's warp commits
-    /// a second moment when it lands, frames later. One press, two moments.
+    /// **Nor can it see a host request raised in the same frame**, so the
+    /// one that carries `View` fields says so itself: an audio Apply in the
+    /// quantize window marks its knobs committed (`apply_quantize_window`),
+    /// and the host's warp moment takes them when it lands, frames later.
     fn commit_view_change(&mut self) {
         let now = Self::desk_view(&self.settings).view;
         if self.arr_drag.is_some() || self.arr_gesture_dirty {
@@ -40796,6 +40813,9 @@ impl TangentApp {
             }
             _ => None,
         };
+        // **The key the desk's window forwarded this frame**, so the stacked
+        // window cannot forward it a second time: see below.
+        let mut key_forwarded = None;
         if let Some(action) =
             {
                 // Read BEFORE the dialog is borrowed mutably.
@@ -40810,9 +40830,26 @@ impl TangentApp {
                 // **The quantize window spells its GRID chips in the meter
                 // the grid is built in**, read on every frame it is drawn:
                 // it is not modal, so the meter can change while it is open.
-                if let Some(Dialog::Quantize { meter, .. }) = self.dialog.as_mut() {
+                //
+                // **And it watches the selection, here and not in an input
+                // pass.** What it would act on changes under it, and a window
+                // that said "1 audio clip" while three were selected would be
+                // lying. This was asked inside `arrangement_input`, after its
+                // early returns, so a frame with the hand on the MIDI editor,
+                // or on this window drawn inline over it, kept the old line:
+                // notes picked on the roll still read "all 3 notes". Asked
+                // BEFORE the window is borrowed: `quantize_target` reads the
+                // whole app and cannot run inside a mutable borrow of one
+                // field.
+                if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+                    let now = self.quantize_target();
                     let sig = self.settings.time_signature();
-                    *meter = (sig.beats, sig.unit);
+                    if let Some(Dialog::Quantize { meter, target, .. }) = self.dialog.as_mut() {
+                        *meter = (sig.beats, sig.unit);
+                        if *target != now {
+                            *target = now;
+                        }
+                    }
                 }
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
@@ -40823,6 +40860,9 @@ impl TangentApp {
             // left a theme behind until something else moves.
             if matches!(action, DialogAction::CycleTheme) {
                 ctx.request_repaint();
+            }
+            if matches!(action, DialogAction::CycleTheme | DialogAction::Transport) {
+                key_forwarded = Some(std::mem::discriminant(&action));
             }
             self.apply_dialog_action(action);
         }
@@ -40849,6 +40889,14 @@ impl TangentApp {
             // dropped a few lines down, once everything it had to say has
             // been said.
             self.pedal_stack = Some(st);
+            // **One key, one press, however many bars saw it.** Inline, both
+            // windows wear a chrome bar and both bars read the one keyboard,
+            // and once either window is drawn inline each claims the key as
+            // its own - so T with a pedal window over an amp cycled the theme
+            // twice, and Space queued two transport requests. On the desktop
+            // each window has its own keyboard and only the focused one can
+            // have seen the press, so dropping a repeat costs nothing there.
+            let action = action.filter(|a| key_forwarded != Some(std::mem::discriminant(a)));
             if let Some(action) = action {
                 if matches!(action, DialogAction::CycleTheme) {
                     ctx.request_repaint();
@@ -41894,6 +41942,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The window's line follows a selection made on the roll**, frame by
+    /// frame, wherever the hand is.
+    ///
+    /// The line was refreshed inside `arrangement_input`, after its early
+    /// returns, so every frame the hand spent on the MIDI editor - or on the
+    /// window itself, drawn inline over it in a plugin or with child windows
+    /// off - skipped it. Pick one note on the roll, move onto the window,
+    /// and it still said "all 3 notes" while Apply quantized one. Driven
+    /// through whole frames on the inline path, with the hand on the roll.
+    #[test]
+    fn the_quantize_windows_line_follows_a_selection_made_on_the_roll() {
+        let caps = Caps { child_windows: false, ..Caps::DESKTOP };
+        let (ctx, mut app) = headless(caps);
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let n = |at_s: f64| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key: 60, vel: 100, muted: false };
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0), n(0.5), n(1.0)],
+            lane: 0,
+            start_s: 4.0,
+            len_s: 2.0,
+            loop_s: 2.0,
+            name: "m".into(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        app.open_quantize_window();
+        for _ in 0..3 {
+            let _ = run_frame(&ctx, &mut app);
+        }
+        let roll = app.midi_edit_rect.expect("the editor drew nowhere");
+        // One note picked on the roll; the hand stays on the roll (or on the
+        // window drawn over it - both refuse the arrangement pass).
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected = vec![0];
+        }
+        for _ in 0..2 {
+            pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(roll.center())]);
+        }
+        match app.dialog.as_ref() {
+            Some(Dialog::Quantize { target, .. }) => assert_eq!(
+                target.as_deref(),
+                Some("1 selected notes"),
+                "the window still says what it said before the selection moved"
+            ),
+            _ => panic!("the quantize window closed"),
+        }
+    }
+
+    /// **The roll reads a bare Q once.** Two handlers sat in the one block
+    /// of keys the editor owns, the leftovers of the two quantize commands
+    /// the window replaced, so one press opened the window twice: harmless
+    /// only while opening is idempotent, and a toggle would have made Q do
+    /// nothing at all. A source scan, because a second identical call
+    /// leaves nothing a frame can see.
+    #[test]
+    fn the_editor_reads_bare_q_once() {
+        let src = include_str!("app.rs");
+        let body = &src[..src.find("\nmod tests {").expect("the test module")];
+        let at = body.find("fn midi_editor_input").expect("the roll's input");
+        let end = body[at..].find("\n    fn ").map_or(body.len(), |n| at + n);
+        assert_eq!(
+            body[at..end].matches("key_pressed(egui::Key::Q)").count(),
+            1,
+            "one press of Q runs two handlers in the editor"
+        );
+    }
+
     /// **The chip CALLED "1/16" applies a sixteenth**, whatever the song's
     /// meter. The window labelled its GRID chips in 4/4
     /// (`grid_label_text(e, 4, 4)`) while the grid it applies is built in
@@ -42894,6 +43011,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Q on a track with no audio lets go of a take on another track.**
+    ///
+    /// The tracks win when the clip selection disagrees with them - a
+    /// header click is what makes the two disagree - but when the picked
+    /// track held nothing to adopt, the adopter gave up and left the old
+    /// selection standing. So: select a take on track 1, click the header of track 3
+    /// (empty, or MIDI only), press Q, and the window said "1 audio clip"
+    /// and Apply quantized the take on track 1, a track the hand had left.
+    /// An empty folder took the same road one step earlier.
+    #[test]
+    fn q_on_a_track_with_no_audio_lets_go_of_a_take_on_another_track() {
+        let root = project_scratch("qtrack-none");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let take = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 1,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(take);
+        app.select_track(1, egui::Modifiers::NONE); // what the clip click leaves
+        app.select_track(3, egui::Modifiers::NONE); // a header with no audio on it
+        app.open_quantize_window();
+        assert_eq!(
+            app.quantize_target(),
+            None,
+            "Q on an empty track aimed the window at a take on track 1"
+        );
+        assert_eq!(app.arr_selected, None, "the take on track 1 is still selected");
+
+        // **An empty FOLDER is a picked track with nothing in it**, not "no
+        // track picked".
+        app.set_is_folder(5, true);
+        app.arr_selected = Some(take);
+        app.arr_multi = vec![take];
+        app.select_track(1, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert_eq!(
+            app.arr_quantize_ids(),
+            Vec::<u64>::new(),
+            "Q on an empty folder aimed the window at a take on track 1"
+        );
+
+        // And with no track picked at all, the take is still all there is.
+        app.arr_selected = Some(take);
+        app.arr_multi.clear();
+        app.selected_tracks.clear();
+        app.selected_channel = None;
+        app.open_quantize_window();
+        assert_eq!(app.arr_quantize_ids(), vec![take], "a take with no track picked was let go");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Q with the window up re-aims it and keeps its dials.**
+    ///
+    /// Q is the one road that aims a standing window at another track - the
+    /// per-frame refresh only follows the selection, it never adopts - and
+    /// it rebuilt the whole window from the settings, which the window
+    /// writes only on Apply. So turning the strength to 40 and the grid to
+    /// 1/16, clicking another track's header and pressing Q snapped both
+    /// dials back to what was last applied, the ticks with them, and the
+    /// Apply that followed used the old numbers.
+    #[test]
+    fn q_with_the_window_up_keeps_its_unapplied_dials() {
+        let root = project_scratch("q-keeps-dials");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let clip = |lane| crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane,
+            len_s: 2.0,
+            ..Default::default()
+        };
+        let a = app.arrangement.add_clip(clip(0));
+        let b = app.arrangement.add_clip(clip(1));
+        app.arr_selected = Some(a);
+        app.select_track(0, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        if let Some(Dialog::Quantize { strength_pct, grid_exp, .. }) = app.dialog.as_mut() {
+            *strength_pct = 40.0;
+            *grid_exp = -4;
+        }
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        match app.dialog.as_ref() {
+            Some(Dialog::Quantize { strength_pct, grid_exp, target, .. }) => {
+                assert_eq!(
+                    (*strength_pct, *grid_exp),
+                    (40.0, -4),
+                    "Q threw away the dials nobody had applied"
+                );
+                assert_eq!(target.as_deref(), Some("1 audio clip"), "the line did not follow");
+            }
+            _ => panic!("Q closed the quantize window"),
+        }
+        assert_eq!(app.arr_quantize_ids(), vec![b], "Q did not re-aim at the picked track");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The window asks for marks while it is open, and for nothing when
     /// it is not.**
     ///
@@ -43099,6 +43319,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **An audio Apply that moves a knob is ONE moment, in the order the
+    /// host runs it.**
+    ///
+    /// The seven knobs are in the session's `View`, so in the undo
+    /// fingerprint, and the Apply writes them at once; the warp is the
+    /// host's and lands frames later. So the end of the Apply's frame
+    /// (`commit_view_change`) committed the knobs alone, with the old warp,
+    /// and the host's commit then made the warp a second moment: normalize,
+    /// quantize at 80%, and the second Ctrl+Z only put the remembered knobs
+    /// back while the third took the normalize. The MIDI Apply was always
+    /// one moment.
+    ///
+    /// Driven in the host's frame order: the request is taken at the end of
+    /// the Apply's frame, the busy cover paints another, and the quantize
+    /// lands at the top of the one after - so a guard that only waits while
+    /// the request is still queued commits the knobs a frame later instead.
+    /// And in a plugin, where nothing ever takes the request, the knobs are
+    /// the whole press and still owe it a moment.
+    #[test]
+    fn an_audio_apply_that_moves_a_knob_is_one_moment_in_the_hosts_frame_order() {
+        let apply_at_80 = || DialogAction::ApplyQuantize {
+            grid_exp: -3,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 80.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        };
+        let take = || crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        };
+        let root = project_scratch("q-knobs-one-moment");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let a = app.arrangement.add_clip(take());
+        app.arr_selected = Some(a);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let strength = app.settings.midi_quantize_pct;
+        assert!((strength - 80.0).abs() > 1.0, "fixture: the strength already stands at 80");
+        // Frame N: Apply, with the strength moved.
+        app.apply_dialog_action(apply_at_80());
+        app.commit_view_change(); // the end of `frame` N
+        // `after_frame` N takes the request and announces it under a cover...
+        let ask = match app.take_project_request() {
+            Some(crate::ports::ProjectRequest::QuantizeClips(ask)) => ask,
+            other => panic!("Apply asked for {:?}", other.is_some()),
+        };
+        app.commit_view_change(); // ...frame N+1, while the cover paints again...
+        // ...and `run_chore` at the top of frame N+2 quantizes and commits.
+        for id in ask.ids.clone() {
+            app.set_clip_warp_with_fit(id, vec![(0, 100), (48_000, 47_900)], ask.fit.clone(), 48_000);
+        }
+        app.commit_undo_moment();
+        app.commit_view_change(); // the end of frame N+2
+        assert_eq!(app.hist_at, before + 1, "one Apply left {} undo moments", app.hist_at - before);
+        // ONE step back takes the warp and the knobs together.
+        app.undo();
+        assert!(
+            app.arrangement.clips.iter().all(|c| c.warp.is_empty()),
+            "one Ctrl+Z did not take the quantize off"
+        );
+        assert!(
+            (app.settings.midi_quantize_pct - strength).abs() < 1e-9,
+            "one Ctrl+Z left the strength at {}",
+            app.settings.midi_quantize_pct
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // **A plugin never takes the request**, so the knobs are all the
+        // Apply did there, and they are still a moment of their own.
+        let (_ctx, mut plugin) = headless(Caps::PLUGIN);
+        let a = plugin.arrangement.add_clip(take());
+        plugin.arr_selected = Some(a);
+        plugin.commit_undo_moment();
+        plugin.commit_view_change();
+        let before = plugin.hist_at;
+        plugin.apply_dialog_action(apply_at_80());
+        plugin.commit_view_change();
+        assert_eq!(
+            plugin.hist_at,
+            before + 1,
+            "in a plugin the Apply's knobs left {} moments",
+            plugin.hist_at - before
+        );
+    }
+
     /// **The quantize window's Apply, in the arrangement, asks the host to
     /// quantize the selected AUDIO.**
     ///
@@ -43207,6 +43520,9 @@ mod tests {
         let agree = |app: &mut TangentApp, exp: i8, lines: &[f64]| {
             app.settings.arr_grid_exp = i64::from(exp);
             app.settings.quantize_grid_exp = i64::from(exp);
+            // Shut first: Q on a window already up re-aims it and keeps its
+            // dials, and this wants one opened on the setting just written.
+            app.dialog = None;
             app.open_quantize_window();
             let ask = app.quantize_preview().expect("an open window asks");
             let grid = ask.grid;
@@ -44023,7 +44339,8 @@ mod tests {
             .map(|n| (n.at_s, n.vel))
             .collect();
 
-        // **Nothing selected is nothing done**, as the quantiser has it.
+        // **Nothing selected is nothing done** - unlike the quantize
+        // window, which takes the whole clip then. See `me_humanize`.
         app.me_humanize(50, 50, 1);
         let now: Vec<(f64, u8)> = app.arrangement.clips[0]
             .notes
@@ -44066,7 +44383,7 @@ mod tests {
                 n.vel
             );
             assert!(n.vel >= 1, "note {i} was humanized to silence");
-            // Never out of its own clip, the quantiser's wall.
+            // Never out of its own clip: the whole note stays inside.
             assert!(n.at_s >= -1e-9, "note {i} was pushed before the clip at {}", n.at_s);
             assert!(
                 n.at_s + n.dur_s.max(0.05) <= clip.len_s + 1e-9,
@@ -63659,6 +63976,66 @@ mod tests {").expect("the tests module")];
                 "{label}: the theme key closed the face"
             );
         }
+    }
+
+    /// **One key with a pedal window over the amp acts ONCE.**
+    ///
+    /// Inline - a plugin, or the desktop with child windows off - both
+    /// windows wear a chrome bar, both bars read the one keyboard, and each
+    /// window's key belongs to it once either window is drawn inline. So T
+    /// with a pedal window standing on an amp face cycled the theme twice
+    /// (it skipped a theme), and Space queued two transport requests, a
+    /// Play and then another. The face alone was always right, and that is
+    /// all the theme and transport tests beside this one open.
+    #[test]
+    fn one_key_with_a_pedal_window_over_the_amp_acts_once() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(app.pedal_stack.is_some(), "fixture: no pedal window over the amp");
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let all = crate::theme::factory();
+        let from = all
+            .iter()
+            .position(|t| t.name == app.settings.theme_name)
+            .expect("the shipped theme is in the factory list");
+        let _ = frame_words(
+            &ctx,
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![key(egui::Key::T, true), key(egui::Key::T, false)],
+        );
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
+        assert_eq!(
+            app.settings.theme_name,
+            all[(from + 1) % all.len()].name,
+            "one T with two inline windows up did not cycle the theme exactly once"
+        );
+
+        // **And Space**, which the band has to be shown for.
+        app.settings.show_recorder = true;
+        while app.take_recorder_request().is_some() {}
+        let _ = frame_words(
+            &ctx,
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![key(egui::Key::Space, true), key(egui::Key::Space, false)],
+        );
+        let first = app.take_recorder_request();
+        assert!(
+            matches!(first, Some(recorder::RecorderRequest::Play)),
+            "Space with two inline windows up answered with {first:?}"
+        );
+        assert!(
+            app.take_recorder_request().is_none(),
+            "one Space with two inline windows up queued a second transport request"
+        );
+        assert!(app.pedal_stack.is_some(), "the keys took the pedal window down");
     }
 
     /// **Space inside a plugin window rolls the transport ONCE.**

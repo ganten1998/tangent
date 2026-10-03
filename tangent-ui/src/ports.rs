@@ -881,11 +881,13 @@ pub enum ProjectRequest {
     ///
     /// The host does the work because the UI cannot reach the samples: it
     /// detects the attacks, asks where each should land, and writes the
-    /// result into each clip's `warp` map, one undo moment for the batch. The
-    /// audio is re-rendered from that map, so the edit is undoable and
-    /// survives the document like any other. (Not yet one moment for the
-    /// whole Apply: knobs the Apply moved are committed at the end of the
-    /// frame that asked, before this lands.)
+    /// result into each clip's `warp` map, one undo moment for the batch -
+    /// and for the knobs the Apply moved, which `apply_quantize_window`
+    /// leaves for that moment to record. The audio is re-rendered from that
+    /// map, so the edit is undoable and survives the document like any
+    /// other. Each clip is detected and warped on its own attacks, so the
+    /// mics of one kit quantized together are not moved as one (see the
+    /// `warp` module's header).
     ///
     /// Carries the whole question - grid, strength, window, detection
     /// sensitivity and fit - because the grid a quantize aims at is the one
