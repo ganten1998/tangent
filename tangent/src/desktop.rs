@@ -15165,35 +15165,35 @@ pub(crate) fn os_reader_attached() -> bool {
 /// - its document is missing, empty, or unnamed with no clips - a damaged,
 ///   named or clip-holding one spares it (the in-memory flag can be undone
 ///   past a first save);
+/// - its kit is the template's (`kit_is_custom` against `Templates/default`)
+///   - a kit built in it spares it, as `fresh_project_dir` and the launch
+///   sweep spare it: a kit saves itself because it is hours of work, and
+///   Don't Save is no exception until the owner says otherwise. These three
+///   are `TangentApp::scratch_is_disposable`, the sweep's own judge;
 /// - nothing in `media/` is named `rec-*`, the arrangement take's name.
 ///
-/// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar - a kit
-/// built in this scratch included - the samples and imports it copied in,
-/// freeze renders, glued files, `state/` and the export staging in `export/`.
-/// Open and Quit stop here; New calls this too, and starts beside a scratch
-/// it spares rather than reclaiming it (`new_starts_beside`).
+/// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar (a clone
+/// of the template's), the samples and imports it copied in, freeze renders,
+/// glued files, `state/` and the export staging in `export/`. Open and Quit
+/// stop here; New calls this too, and starts beside a scratch it spares
+/// rather than reclaiming it (`new_starts_beside`).
 fn discard_scratch_made_here(
     made_here: bool,
     dir: Option<&std::path::Path>,
     root: &std::path::Path,
 ) -> bool {
-    use tangent_ui::arrangement::{Arrangement, LoadOutcome};
     let Some(dir) = dir else {
         return false;
     };
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let template = root.join(tangent_ui::app::TEMPLATE_SHELF).join("default");
     if !made_here
         || !dir.is_dir()
         || !tangent_ui::app::is_scratch_name(&name)
         || tangent_ui::app::inside_template_shelf(dir, root)
-        || !tangent_ui::app::holds_only_scratch(dir)
+        || !TangentApp::scratch_is_disposable(dir, &template)
     {
         return false;
-    }
-    match Arrangement::read_from(&tangent_ui::arrangement::doc_in(dir)) {
-        LoadOutcome::Missing | LoadOutcome::Empty => {}
-        LoadOutcome::Loaded(a) if !a.named && a.clips.is_empty() => {}
-        _ => return false,
     }
     let recorded = std::fs::read_dir(dir.join("media")).is_ok_and(|entries| {
         entries
@@ -23990,6 +23990,35 @@ mod tests {
         assert!(!discard_scratch_made_here(true, Some(&recorded), &root));
         assert!(recorded.exists(), "Don't Save deleted a recording");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Don't Save keeps a drum kit built in the scratch.** The discard
+    /// tested the name, the shelf, the document on disk and `rec-*`, and
+    /// never the kit - against what every other kit road promises: the kit
+    /// saves itself because it is hours of sample assignment, and both
+    /// `fresh_project_dir` and the launch sweep spare a scratch whose kit is
+    /// not the template's. Whether Don't Save should take it is the owner's
+    /// call; until then the conservative answer holds, and a built kit keeps
+    /// the scratch as a recording does. Runs on a TEMP root only: the one
+    /// thing it can delete is the `Untitled` it builds there.
+    #[test]
+    fn dont_save_keeps_a_kit_built_in_the_scratch() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-discard-kit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let built = root.join("Untitled");
+        std::fs::create_dir_all(built.join("media")).expect("scratch");
+        std::fs::write(built.join("media").join("Kick.wav"), b"RIFFxxxxWAVE").expect("sample");
+        let mut kit = tangent_ui::drumpad::DrumpadDoc::default();
+        kit.pads[36].path = "media/Kick.wav".to_owned();
+        kit.save_beside(&tangent_ui::arrangement::doc_in(&built));
+        let removed = discard_scratch_made_here(true, Some(&built), &root);
+        let kept = built.join(tangent_ui::drumpad::FILE_NAME).is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!removed && kept, "Don't Save deleted a drum kit built in the scratch");
     }
 
     /// **New keeps a recording in the scratch it stands on.** New reclaimed
