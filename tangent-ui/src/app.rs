@@ -31473,11 +31473,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **The document FOLLOWS the tempo.** A MIDI clip is beats, and beats
     /// are what the player wrote — storing seconds is an encoding, not a
     /// meaning. So when the tempo moves, every MIDI clip's start, length,
-    /// trim and notes are rescaled by `old/new`, and every AUDIO clip keeps
-    /// its bar seat (start only — audio itself cannot stretch). Before this,
-    /// a clip written at 120 was, in the owner's words, "made unusable at
-    /// 180". Mid-drag the doc save waits for the knob's release (the release
-    /// path calls `arr_save_edits`); a typed or tapped tempo saves at once.
+    /// trim, loop, notes and pedal are rescaled by `old/new`, and every
+    /// AUDIO clip keeps its bar seat (start only — audio itself cannot
+    /// stretch). Before this, a clip written at 120 was, in the owner's
+    /// words, "made unusable at 180". The loop is in the same seconds as the
+    /// notes it repeats: left unscaled, slowing down restarted every pass
+    /// halfway through its notes. Mid-drag the doc save waits for the knob's
+    /// release (the release path calls `arr_save_edits`); a typed or tapped
+    /// tempo saves at once.
     fn retime_arrangement(&mut self, old_bpm: f64, new_bpm: f64) {
         if old_bpm <= 0.0 || new_bpm <= 0.0 {
             return;
@@ -31491,9 +31494,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if c.kind == crate::arrangement::ClipKind::Midi {
                 c.len_s *= r;
                 c.offset_s *= r;
+                c.loop_s *= r;
                 for n in &mut c.notes {
                     n.at_s *= r;
                     n.dur_s *= r;
+                }
+                for e in &mut c.pedal {
+                    e.at_s *= r;
                 }
             }
         }
@@ -31509,8 +31516,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// One arrange-stretch tick. The grabbed clip's ORIGINAL edge and the
     /// snapped hand give the factor; every MIDI clip in the press-time
     /// snapshot scales from its originals — starts and lengths around the
-    /// group's fixed end, trims, fades and every note with them. "Shrink
-    /// them to half size", exactly, when the edge lands a half-span in.
+    /// group's fixed end, trims, fades, loops, every note and the pedal with
+    /// them. "Shrink them to half size", exactly, when the edge lands a
+    /// half-span in.
     fn arr_stretch(&mut self, id: u64, from_left: bool, anchor: f64, t_raw: f64) {
         let t = self.arr_snap_t(t_raw);
         let Some(g0) = self.arr_stretch_orig.iter().find(|c| c.id == id) else {
@@ -31542,9 +31550,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             c.offset_s = o.offset_s * k;
             c.fade_in_s = o.fade_in_s * k;
             c.fade_out_s = o.fade_out_s * k;
+            // **The loop is a length on the same axis**: a MIDI part's in the
+            // seconds its notes speak, an audio clip's in the stretched
+            // file's. Left as it was, a part pulled to twice its length
+            // played its first half over its second.
+            c.loop_s = o.loop_s * k;
             for (n, n0) in c.notes.iter_mut().zip(o.notes.iter()) {
                 n.at_s = n0.at_s * k;
                 n.dur_s = (n0.dur_s * k).max(0.01);
+            }
+            for (e, e0) in c.pedal.iter_mut().zip(o.pedal.iter()) {
+                e.at_s = e0.at_s * k;
             }
             // **Audio carries the ratio; MIDI does not need to.**
             //
@@ -53700,6 +53716,75 @@ mod tests {
         assert!((a.start_s - 8.0 * r).abs() < 1e-9, "audio lost its bar seat");
         assert!((a.len_s - 3.0).abs() < 1e-9, "audio length must NOT stretch");
         assert!((a.offset_s - 1.0).abs() < 1e-9, "audio trim must NOT stretch");
+    }
+
+    /// **A tempo change keeps a MIDI loop the length of its notes**, and its
+    /// pedal under them. The retime scaled a clip's start, length, trim and
+    /// notes and left `loop_s` in the old tempo's seconds, so slowing from
+    /// 120 to 60 restarted every pass halfway through its notes - the first
+    /// half of every MIDI clip layered over its second - and speeding up
+    /// left a gap in each. The pedal's edges, in the same source seconds as
+    /// the notes, stayed where they were too.
+    #[test]
+    fn a_tempo_change_keeps_a_midi_loop_the_length_of_its_notes() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.25, key, vel: 100, muted: false };
+        let p = |at_s: f64, value: u8| crate::arrangement::ArrPedal { at_s, cc: 64, value };
+        // One bar at 120 (2 s), drawn out to two passes - every clip is born a loop.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62)],
+            pedal: vec![p(0.5, 127), p(1.5, 0)],
+            lane: 1, len_s: 4.0, loop_s: 2.0, name: "m".into(), ..Default::default() });
+        let heard = |app: &TangentApp| -> Vec<(f64, u8)> {
+            crate::arrangement::clip_notes_in_song_time(
+                app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"))
+                .iter().map(|n| (n.at_s, n.key)).collect()
+        };
+        assert_eq!(heard(&app), vec![(0.0, 60), (1.0, 62), (2.0, 60), (3.0, 62)]);
+        app.apply_recorder_hit(recorder_panel::Hit::SetTempo(60.0));
+        assert_eq!(heard(&app), vec![(0.0, 60), (2.0, 62), (4.0, 60), (6.0, 62)],
+            "the loop kept its 120-bpm length while its notes were retimed to 60");
+        let pedal: Vec<f64> = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip")
+            .pedal.iter().map(|e| e.at_s).collect();
+        assert_eq!(pedal, vec![1.0, 3.0], "the pedal kept its 120-bpm seconds while its notes moved");
+    }
+
+    /// **An arrange-stretch carries each clip's loop with it.** The stretch
+    /// scaled a clip's length, trim, fades and notes (and an audio clip's
+    /// ratio) and left `loop_s` as it was, so a MIDI clip pulled to twice its
+    /// length played its first half over its second, and an audio clip -
+    /// whose loop is measured in the STRETCHED file's seconds - replayed half
+    /// of its stretched pass. A MIDI clip's pedal stayed behind its notes.
+    #[test]
+    fn an_arrange_stretch_carries_each_clips_loop_with_it() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.25, key, vel: 100, muted: false };
+        let p = |at_s: f64, value: u8| crate::arrangement::ArrPedal { at_s, cc: 64, value };
+        // Two passes of a two-second loop each: a MIDI part with a pedal,
+        // and an audio take beside it.
+        let m = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62)],
+            pedal: vec![p(0.5, 127), p(1.5, 0)],
+            lane: 1, len_s: 4.0, loop_s: 2.0, name: "m".into(), ..Default::default() });
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio, path: "a.wav".into(),
+            lane: 2, len_s: 4.0, loop_s: 2.0, name: "a".into(), ..Default::default() });
+        app.arr_stretch_orig = app.arrangement.clips.clone();
+        // The right edge from 4 s to 8 s: both twice as long.
+        app.arr_stretch(m, false, 0.0, 8.0);
+        let of = |id: u64| app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").clone();
+        let (mc, ac) = (of(m), of(a));
+        assert!((mc.len_s - 8.0).abs() < 1e-9 && (ac.len_s - 8.0).abs() < 1e-9, "the stretch did not double them");
+        assert!((mc.loop_s - 4.0).abs() < 1e-9, "the MIDI loop is {} while its notes doubled", mc.loop_s);
+        let heard: Vec<(f64, u8)> = crate::arrangement::clip_notes_in_song_time(&mc)
+            .iter().map(|n| (n.at_s, n.key)).collect();
+        assert_eq!(heard, vec![(0.0, 60), (2.0, 62), (4.0, 60), (6.0, 62)]);
+        let pedal: Vec<f64> = mc.pedal.iter().map(|e| e.at_s).collect();
+        assert_eq!(pedal, vec![1.0, 3.0], "the pedal stayed behind the notes it holds");
+        assert!((ac.stretch - 2.0).abs() < 1e-9, "the audio did not take the ratio");
+        assert!((ac.loop_s - 4.0).abs() < 1e-9, "the audio loop is {} while its audio doubled", ac.loop_s);
     }
 
     /// **Seven notes into the space of four.** The editor's shift-drag
