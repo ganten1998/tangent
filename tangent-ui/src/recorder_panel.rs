@@ -2113,7 +2113,25 @@ impl Layout {
         }
         self.fill_vari(cell);
         self.fill_vari_label();
+        self.unseat_an_undrawable_vari();
         self.centre_lufs_between_the_word_and_the_master();
+    }
+
+    /// **A pitch dial that cannot be drawn is not seated.** `fill_vari`
+    /// seats on `knob_fits` - a knob's face - while the painter draws the
+    /// dial only when `vari_face` finds room, and that also keeps the PITCH
+    /// CONT word's whole line above it: a cell between the two floors was a
+    /// live drag target over blank panel. Asked once the word's strip is
+    /// known, with the very pair `draw_varispeed` and the right-click
+    /// (`on_knob_circle`) ask. No window the app opens reaches such a cell
+    /// today; `Layout::new` takes any rect, and this keeps the rule the
+    /// layout's rather than the window's. (The road taken when the master is
+    /// refused seats no dial at all: `vari_cell` has no foot to stand it on.)
+    fn unseat_an_undrawable_vari(&mut self) {
+        if self.vari.is_positive() && vari_face(self.vari, self.vari_label).is_none() {
+            self.vari = Rect::NOTHING;
+            self.vari_label = Rect::NOTHING;
+        }
     }
 
     /// **Put the loudness meter midway between the PITCH CONT text and the
@@ -9211,6 +9229,48 @@ mod tests {
         for d in [DETACHED_DEFAULT, DETACHED_MIN] {
             let r = Rect::from_min_size(Pos2::ZERO, d);
             assert!(cog_fits(Layout::new(r, &idle()).setup), "the detached window at {d:?} has no cog");
+        }
+    }
+
+    /// **The pitch dial is never a drag target without a picture either.**
+    /// It was seated on `knob_fits` (a knob's face) and painted only when
+    /// `vari_face` - which reserves the PITCH CONT word's whole line above
+    /// the dial - found room, so a cell between the two floors was seated,
+    /// pressable and blank: a drag there changed the varispeed with nothing
+    /// on screen. The band's own widths are swept from well below the
+    /// window's floor, because `app::fit_bands` letterboxes the band
+    /// narrower than that whenever a window manager hands the window a pane
+    /// shorter than its natural stack; none of them failed. The short, wide
+    /// rects below did (760 x 80 seated a blank dial): no window the app
+    /// opens is that shape, but `Layout::new` takes any rect, and the rule
+    /// is the layout's.
+    #[test]
+    fn the_pitch_dial_is_never_seated_where_it_is_not_drawn() {
+        let mut rects: Vec<Rect> = Vec::new();
+        let mut w = 200.0_f32;
+        while w <= 2600.0 {
+            rects.push(band(w));
+            w += 0.5;
+        }
+        let mut dw = 400.0_f32;
+        while dw <= 1400.0 {
+            let mut dh = 60.0_f32;
+            while dh <= 800.0 {
+                rects.push(Rect::from_min_size(Pos2::ZERO, Vec2::new(dw, dh)));
+                dh += 4.0;
+            }
+            dw += 20.0;
+        }
+        for r in rects {
+            for view in [idle(), rolling()] {
+                let l = Layout::new(r, &view);
+                assert!(
+                    !l.vari.is_positive() || vari_face(l.vari, l.vari_label).is_some(),
+                    "at {r:?} ({:?}) the pitch dial is seated at {:?} - a live drag target - but not drawn",
+                    view.state,
+                    l.vari
+                );
+            }
         }
     }
 
