@@ -11506,8 +11506,9 @@ impl TangentApp {
 
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
     /// Everything a channel is follows it: kind, input, icon, colour, name,
-    /// fader, pan, send, mute, solo, arm, bays (the host moves their saved
-    /// states), and every clip on its lane. The rows between shift by one.
+    /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
+    /// their saved states), and every clip on its lane. The rows between
+    /// shift by one.
     pub fn move_channel(&mut self, from: usize, to: usize) {
         use crate::recorder::CHANNELS;
         if from >= CHANNELS || to >= CHANNELS || from == to {
@@ -11644,6 +11645,7 @@ impl TangentApp {
         self.settings.channel_armed = Some(move_bits_u32(self.armed_mask()));
         self.settings.strip_muted = move_bits_u64(self.settings.strip_muted);
         self.settings.strip_soloed = move_bits_u64(self.settings.strip_soloed);
+        self.settings.strip_phase = move_bits_u64(self.settings.strip_phase);
         {
             let mask = self.settings.tracks_added;
             let mut out = mask & !((1i64 << CHANNELS) - 1);
@@ -70076,6 +70078,28 @@ mod folder_tests {
         assert!(!a.settings.strip_to_theory[3], "T was left behind");
         assert!(a.is_folder(0), "the folder flag did not follow");
         assert!(!a.is_folder(3));
+    }
+
+    /// **Mute, solo and polarity follow a reorder.** The mute and solo masks
+    /// moved with their tracks and the polarity mask did not, so after
+    /// Insert Track Below, Paste Track Below, a drag or a grouping into a
+    /// folder, a flipped track played the right way up and the track that
+    /// took its old row played upside down.
+    #[test]
+    fn mute_solo_and_polarity_follow_their_tracks_through_a_reorder() {
+        let mut a = app();
+        a.settings.strip_muted = 1 << 3;
+        a.settings.strip_soloed = 1 << 3;
+        a.settings.strip_phase = 1 << 3;
+
+        // Move track 3 to the top: rows 0 to 2 shift down one.
+        a.move_channel(3, 0);
+        assert_eq!(a.settings.strip_muted, 1, "the mute did not follow its track");
+        assert_eq!(a.settings.strip_soloed, 1, "the solo did not follow its track");
+        assert_eq!(
+            a.settings.strip_phase, 1,
+            "the polarity flip stayed on the row its track left"
+        );
     }
 
     /// **A project's folders are the PROJECT's.** The three folder vectors
