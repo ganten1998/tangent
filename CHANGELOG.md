@@ -1800,10 +1800,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Every launch opens the default session.** Tangent no longer reopens the
   project that was on screen when it quit; it stands on a fresh copy of the
   default template every time, and the last session is a File > Open away.
-  A scratch stays on disk for that panel if it holds an audio recording or
-  a drum kit built in it, or was saved with clips in it; one this session
-  created that holds none of them is deleted, with its imported copies and
-  plugin settings, when you answer Don't Save on New, Open or Quit. The
+  A scratch stays on disk for that panel if it holds an audio recording, a
+  drum kit built in it or anything Tangent did not put there, or was saved
+  with clips in it; one this session created that holds none of them is
+  deleted, with its imported copies and plugin settings, when you answer
+  Don't Save on New, Open or Quit. The
   owner: "make it so every launch opens the default session, and doesn't
   open the previously open session."
 
