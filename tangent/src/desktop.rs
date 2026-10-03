@@ -1022,7 +1022,9 @@ pub struct DesktopApp {
     /// **In memory**, never on disk: the sidecar naming round-trips
     /// strictly, so a second file would be invisible to the shelf sweep and
     /// would leak another project's knobs into this one's bays. Cleared by
-    /// `switch_project`; bounded by `shelve_displaced`, oldest first.
+    /// every road to another session - an Open (`switch_project`), New, and
+    /// Reset Template (`adopt_fresh_from_template`); bounded by
+    /// `shelve_displaced`, oldest first.
     #[cfg(feature = "recorder")]
     displaced_states: DisplacedShelf,
     /// The ReaStream config the sender was last handed. See
@@ -8247,6 +8249,9 @@ impl DesktopApp {
         self.copy_states_from_shelf(&template.join("state"));
         self.force_insert_reload();
         let _ = self.app.take_desk_reload();
+        // And the displaced-state shelf goes with the session it was filled
+        // in - New's reason, for Reset Template, which comes this way.
+        self.displaced_states.clear();
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -10921,6 +10926,14 @@ impl DesktopApp {
                 self.copy_states_from_shelf(&template.join("state"));
                 self.force_insert_reload();
                 let _ = self.app.take_desk_reload();
+                // **The displaced-state shelf belongs to the session it was
+                // filled in**, as an Open already knew: a bay of the new desk
+                // holding a bundle the old one shelved at that seat came up
+                // with the old session's settings. Nothing refills it from
+                // the old desk - `force_insert_reload` raised
+                // `racks_restoring`, and the reconcile shelves nothing while
+                // a whole desk is rebuilt.
+                self.displaced_states.clear();
                 self.track_cache.clear();
                 self.warm_refused.clear();
                 self.refused_why.clear();
@@ -25078,6 +25091,41 @@ mod tests {
         assert!(src[at..load].contains(".save_insert_state(i / inserts, i % inserts)"),
             "the reconcile replaces a bay's tenant without asking it for its settings: undoing a \
              paste, a swap or a delete brings the plugin back at its last SAVED settings, or factory");
+    }
+
+    /// **Every road to another session leaves the displaced-state shelf
+    /// behind**, or the next session's bays are seated with the last one's
+    /// knobs.
+    ///
+    /// Only an Open cleared it. New and Reset Template adopt a whole new
+    /// desk too, and a bay there holding a bundle the old session had
+    /// shelved at the same seat came up with the old session's settings. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn every_road_to_another_session_clears_the_displaced_shelf() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let between = |from: &str, to: &str| {
+            let a = src.find(from).unwrap_or_else(|| panic!("`{from}` is gone"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("`{to}` after `{from}` is gone"));
+            src[a..a + b].to_owned()
+        };
+        let clear = "self.displaced_states.clear();";
+        // Every road is read before anything panics, so one run names each
+        // one that carries the shelf.
+        let mut carried: Vec<&str> = Vec::new();
+        if !between("fn switch_project(&mut self, doc:", "fn run_warm(").contains(clear) {
+            carried.push("Open carries the last session's shelf into the next one");
+        }
+        if !between("ProjectRequest::NewDiscarding => {", "fn project_state_dir(").contains(clear) {
+            carried.push("New carries the last session's shelf into the next one");
+        }
+        let reset = between("ProjectRequest::ResetTemplate => {", "ProjectRequest::Save =>");
+        let adopt = between("fn adopt_fresh_from_template(", "fn finish_dir_choice(");
+        if !(reset.contains(clear) || adopt.contains(clear)) {
+            carried.push("Reset Template carries the last session's shelf into the next one");
+        }
+        assert!(carried.is_empty(), "{}", carried.join("; "));
     }
 
     /// **The ticks on the waveform and the warp the Apply writes come from
