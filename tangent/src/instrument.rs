@@ -21470,13 +21470,18 @@ mod tests {
                 if sounds { "was swallowed" } else { "doubled the go" }
             );
         }
-        // And the engine really does age the flag where the model does.
-        let src = include_str!("instrument.rs");
+        // And the engine really does age the flag where the model does. In
+        // the production code only: this test spells the branch and the call,
+        // so on the whole file a reworded branch was "found" at the literal
+        // below, the call right after it, and the scan passed whatever the
+        // engine did.
+        let whole = include_str!("instrument.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         let at = src
             .find("let heard_beat = if self.beats.counting_in() || !rolling {")
             .expect("the click's two-clock branch");
         assert!(
-            src[at..at + 600].contains("self.bar_clock.idle(self.rate);"),
+            src[at..(at + 600).min(src.len())].contains("self.bar_clock.idle(self.rate);"),
             "the engine does not age the go while the transport is still"
         );
     }

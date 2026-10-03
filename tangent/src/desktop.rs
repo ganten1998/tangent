@@ -25417,9 +25417,15 @@ mod tests {
     /// **The host evaluates the open faces every frame** — beside the
     /// needles in `fill_recorder_state`, against what the engine plays, and
     /// it withdraws an overlay whose curve or window has gone.
+    ///
+    /// Production only: both anchors and every needle are spelled in this
+    /// test too, so on the whole file a renamed or re-signed function was
+    /// "found" at this test's own literal, the needles right below it, and
+    /// the scan passed with the faces no longer refreshed.
     #[test]
     fn the_host_moves_the_open_faces_every_frame() {
-        let src = include_str!("desktop.rs");
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         let fill = &src[src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state")..];
         let fill = &fill[..fill.find("\n    fn ").unwrap_or(fill.len())];
         assert!(fill.contains("self.push_live_faces();"), "the faces are not refreshed each frame");
