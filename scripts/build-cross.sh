@@ -42,10 +42,10 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 
 # check_linux — compile the Linux target from macOS WITHOUT an ALSA sysroot.
 #
-# Linux release binaries still cannot be cross-built here (see the note above
-# package_linux), but a release build is not what is usually wanted: what is
-# wanted is to know whether the Linux target still COMPILES before pushing, and
-# for that the answer is yes.
+# Linux release binaries are cross-built here against a fetched sysroot (see
+# ensure_alsa_sysroot), but a release build is not what is usually wanted:
+# what is wanted is to know whether the Linux target still COMPILES before
+# pushing, and for that no sysroot is needed at all.
 #
 # `cargo check` never links, so libasound.so does not have to exist — only
 # `pkg-config --exists alsa` has to succeed, because that is all alsa-sys's
