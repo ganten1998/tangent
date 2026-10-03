@@ -16686,6 +16686,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut arr = (*moment.arr).clone();
         arr.desk = Some((*moment.desk).clone());
         self.arrangement = arr;
+        // **The files a restored clip or pad stands on**, out of the template
+        // this session was adopted from, once its folder is real. Making it
+        // real brought across only what the document named at that moment,
+        // so a template clip deleted before it and undone after it came back
+        // naming a file nothing had copied: silent. Only missing files are
+        // copied, never over one the project has (`copy_named_file`).
+        if let Some(src) = self.media_source.clone() {
+            let dir = self
+                .project_doc()
+                .and_then(std::path::Path::parent)
+                .filter(|d| d.is_dir())
+                .map(std::path::Path::to_path_buf);
+            if let Some(dir) = dir {
+                copy_kit_samples(&self.drumpad_kits, &src, &dir);
+                copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, &src, &dir);
+            }
+        }
         // No document write. Undo and redo used to save the doc to disk on
         // every step — the loudest of the four implicit writers, and the
         // one that turned a damaged file's empty stand-in permanent the
@@ -69502,6 +69519,43 @@ mod folder_tests {
         let got = ["Kick.wav", "Loop.wav"].map(|f| copy.join("media").join(f).is_file());
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(got, [true, true], "the copy's pad or clip names a file nothing brought across");
+    }
+
+    /// **Undo brings a template clip back WITH its audio.** Making the
+    /// folder real copies only the files the document names at that moment,
+    /// so a template clip deleted before a take made the folder real, and
+    /// undone after it, came back naming a file nothing had copied.
+    #[test]
+    fn undoing_a_template_clips_delete_after_the_folder_is_real_brings_its_audio() {
+        let root = temp_root("tpl-undo");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFxxxxWAVE").expect("template audio");
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        // Delete the template's clip, then let a take make the folder real.
+        app.arrangement.clips.retain(|c| c.path != "media/Loop.wav");
+        app.arr_save_edits();
+        app.materialize_project_dir();
+        let copied_early = scratch.join("media").join("Loop.wav").exists();
+        app.undo();
+        let clip_back = app.arrangement.clips.iter().any(|c| c.path == "media/Loop.wav");
+        let audio_back = scratch.join("media").join("Loop.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!copied_early, "fixture: the materialise copied a file the document no longer named");
+        assert!(clip_back, "fixture: undo did not bring the clip back");
+        assert!(audio_back, "the clip came back naming a file nothing copied into the project");
     }
 
     /// **Save Kit from a session never written carries the template's
