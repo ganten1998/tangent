@@ -23,10 +23,11 @@
 # Unconfigured => the PE ships UNSIGNED (the documented pre-Azure state) and
 # this says so, per file. PARTIALLY configured => hard failure, because
 # silently shipping an unsigned binary while believing it is signed is the
-# worst outcome here. Either way release.sh has the last word: it refuses an
-# unsigned setup.exe, or an unsigned PE inside it or inside the zip, at
-# artifact-check time (scripts/pe-signed.py), exactly as it refuses an
-# unsigned .pkg.
+# worst outcome here. Either way the artifact checks have the last word
+# (scripts/check-artifacts.sh, run by release.sh and by publish-dropbox.sh):
+# they refuse an unsigned setup.exe, or an unsigned PE inside it or inside
+# the zip (scripts/pe-signed.py), exactly as release.sh refuses an unsigned
+# .pkg.
 #
 # Setup (see docs/RELEASE.md § Windows):
 #   brew install jsign            # needs a JRE

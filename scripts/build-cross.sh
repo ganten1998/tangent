@@ -225,6 +225,23 @@ if [ "${1:-}" = "ico" ]; then
   exit 0
 fi
 
+# **No ASIO SDK, no Windows build, decided before anything is compiled.**
+# The Steinberg SDK lives in vendor/asiosdk_* (its licence forbids committing
+# it), so a fresh checkout does not have it, and this used to carry on to a
+# WASAPI-only tangent.exe, saying so in one line nobody re-reads, after both
+# Linux legs had spent their time. release.sh failed that build at the very
+# end and a tester build shipped it. ASIO is the standard on Windows and the
+# testers have interfaces (the owner's ruling, below): without it the build
+# is not the product. ALLOW_WASAPI_ONLY=1 builds one on purpose, and the
+# artifact checks (scripts/check-artifacts.sh) still keep it from shipping.
+ASIO_DIR="$(ls -d "$ROOT"/vendor/asiosdk_* 2>/dev/null | head -1 || true)"
+if [ -z "$ASIO_DIR" ] && [ "${ALLOW_WASAPI_ONLY:-0}" != 1 ]; then
+  echo "error: no ASIO SDK under vendor/asiosdk_*: refusing a WASAPI-only Windows build." >&2
+  echo "       Unpack Steinberg's ASIO SDK into vendor/ and rerun, or set" >&2
+  echo "       ALLOW_WASAPI_ONLY=1 to build one anyway (nothing will ship it)." >&2
+  exit 1
+fi
+
 mkdir -p dist
 
 # License bundle must exist before packaging.
@@ -462,9 +479,9 @@ echo "==> Tangent $VERSION — Windows x86_64"
 #
 # ASIO rides in when the Steinberg SDK is present (vendor/asiosdk_*,
 # fetched separately — its licence forbids committing it). The owner's
-# ruling: ASIO is the standard and the testers have interfaces.
+# ruling: ASIO is the standard and the testers have interfaces. ASIO_DIR was
+# found (or its absence refused) at the top, before the Linux legs.
 WIN_FEATURES="recorder"
-ASIO_DIR="$(ls -d "$ROOT"/vendor/asiosdk_* 2>/dev/null | head -1 || true)"
 if [ -n "$ASIO_DIR" ]; then
   export CPAL_ASIO_DIR="$ASIO_DIR"
   WIN_FEATURES="recorder,asio"
@@ -478,7 +495,7 @@ if [ -n "$ASIO_DIR" ]; then
   fi
   echo "==> ASIO backend in (SDK at $ASIO_DIR)"
 else
-  echo "==> ASIO SDK not found under vendor/ — Windows build is WASAPI-only"
+  echo "==> ALLOW_WASAPI_ONLY=1: no ASIO SDK, so this Windows build is WASAPI-only"
 fi
 cargo xwin build --release --target x86_64-pc-windows-msvc -p tangent --no-default-features --features "$WIN_FEATURES"
 WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
@@ -542,8 +559,10 @@ if command -v makensis >/dev/null 2>&1; then
   # route as the inner exe. After makensis, necessarily: NSIS writes its
   # output last, and Authenticode is appended to the finished PE (the NSIS
   # CRC lives inside it and is untouched — signing post-build is the standard
-  # flow). The uninstaller inside it was signed while makensis ran. release.sh
-  # refuses an unsigned setup.exe, or an unsigned PE inside it or the zip.
+  # flow). The uninstaller inside it was signed while makensis ran. The
+  # artifact checks (scripts/check-artifacts.sh: release.sh, and
+  # publish-dropbox.sh for testers) refuse an unsigned setup.exe, or an
+  # unsigned PE inside it or the zip.
   scripts/sign-windows.sh "dist/Tangent-${VERSION}-windows-setup.exe"
   echo "==> dist/Tangent-${VERSION}-windows-setup.exe"
 else
