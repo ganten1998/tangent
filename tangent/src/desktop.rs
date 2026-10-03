@@ -25745,7 +25745,7 @@ mod tests {
         // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf -
         // so this runs under `SIDECAR_ENV` with `IVORY_SETTINGS_PATH`
         // pointed at a scratch folder, and puts the variable back after.
-        let _lock = super::sidecar_walk_probe::SIDECAR_ENV
+        let _lock = sidecar_walk_probe::SIDECAR_ENV
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let shelf = std::env::temp_dir().join(format!(
