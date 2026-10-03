@@ -13891,11 +13891,32 @@ impl DesktopApp {
     /// reconcile has not reached yet still holds its outgoing tenant. The
     /// ledger is wiped here too, because "`inserts_loaded` is all `None`
     /// whenever the engine goes" is what `force_insert_reload` and the
-    /// reconcile both rely on.
+    /// reconcile both rely on. And the counts it was clicking go with it -
+    /// see `forget_counts`.
     fn retire_engine(&mut self) {
         self.save_plugin_states_as_loaded_for(None);
         self.recorder.engine = None;
         self.recorder.inserts_loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        self.forget_counts();
+    }
+
+    /// **No count-in is running: the host forgets every one it was keeping.**
+    ///
+    /// The four flags name a count on ONE engine, so they go when it goes and
+    /// a new engine starts without them. Only the birth cleared them once,
+    /// and the drops that build no engine in the same breath - the band
+    /// closing, the output dying, a reopen that then fails - left them up:
+    /// `take_counting` then held the tempo and refused undo and redo for as
+    /// long as the band stayed closed or the device stayed gone, with
+    /// nothing on screen saying why, and a stranded `arr_rec_wait` made the
+    /// next cassette press skip its own count and the next red press a
+    /// silent "cancel". No downbeat can come to clear them: the count was on
+    /// the engine that went.
+    fn forget_counts(&mut self) {
+        self.recorder.arr_rec_wait = false;
+        self.recorder.arr_count_from = None;
+        self.recorder.take_count_pending = false;
+        self.recorder.play_on_go = false;
     }
 
     /// Start the monitor output, once, when the band opens.
@@ -14571,10 +14592,7 @@ impl DesktopApp {
                 // count on the engine this one replaces; left up, a stranded
                 // `arr_rec_wait` made the next cassette press skip its own
                 // count and the next red press a silent "cancel".
-                self.recorder.arr_rec_wait = false;
-                self.recorder.arr_count_from = None;
-                self.recorder.take_count_pending = false;
-                self.recorder.play_on_go = false;
+                self.forget_counts();
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -22588,9 +22606,10 @@ mod tests {
             .find("// **The tap belongs to the ENGINE, so it is taken when the")
             .expect("start_engine's tap handoff");
         let before = &src[birth.saturating_sub(700)..birth];
-        for flag in ["arr_rec_wait = false", "take_count_pending = false", "play_on_go = false", "arr_count_from = None"] {
-            assert!(before.contains(flag), "an engine is born with {flag} left over from the last one");
-        }
+        assert!(
+            before.contains("self.forget_counts();"),
+            "an engine is born with the counts of the one before it"
+        );
     }
 
 
@@ -29230,6 +29249,38 @@ mod tests {").expect("the tests module")];
         assert_eq!(calls("fn fill_recorder_state(&mut self"), 3, "a fill_recorder_state teardown skips the save");
         assert_eq!(calls("fn follow_device_rate("), 1, "following the device's rate skips the save");
         assert_eq!(calls("fn after_frame(&mut self"), 1, "closing the band skips the save");
+    }
+
+    /// **An engine that goes takes its counts with it.** The four count
+    /// flags name a count on ONE engine. `start_engine` cleared them for
+    /// the engine it replaced and nothing cleared them for the one that
+    /// went, so the two drops that build no engine in the same breath - the
+    /// band closing, the output dying - left them up, and so did a reopen
+    /// that then failed. A stranded flag is `take_counting`, which holds the
+    /// tempo and refuses undo and redo with nothing on screen to say why.
+    /// Every drop is `retire_engine` (see the test above), so that is where
+    /// the counts go.
+    #[test]
+    fn an_engine_that_goes_takes_its_counts_with_it() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let rest = &src[at..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let forget = body("fn forget_counts(&mut self)");
+        for flag in ["arr_rec_wait = false", "take_count_pending = false", "play_on_go = false", "count_from = None"] {
+            assert!(forget.contains(flag), "`forget_counts` leaves `{flag}` up");
+        }
+        assert!(
+            body("fn retire_engine(&mut self)").contains("self.forget_counts();"),
+            "an engine goes and leaves its counts up"
+        );
+        assert!(
+            body("fn start_engine(&mut self").contains("self.forget_counts();"),
+            "an engine is born with the counts of the one before it"
+        );
     }
 
     /// **The MP3 pass writes a real MPEG stream.** A sine goes in, a file
