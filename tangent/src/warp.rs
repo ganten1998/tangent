@@ -180,8 +180,8 @@ fn usable(frames: usize, anchors: &[Anchor]) -> Vec<Anchor> {
 /// predicted here and the render is checked against it (see
 /// `a_predicted_length_is_the_length_the_render_comes_out`). Every segment is
 /// trimmed or padded to exactly the length the anchor list demands, so the
-/// total is the last output cut and nothing else: the tail carried at the
-/// ratio of the segment before it, on top of the last anchor's landing.
+/// total is the last output cut and nothing else: the last anchor's landing
+/// plus the tail, carried at its own length (see [`carry_tail`]).
 pub fn projected_frames(frames: usize, anchors: &[Anchor]) -> usize {
     if frames == 0 || anchors.is_empty() {
         return frames;
@@ -190,21 +190,30 @@ pub fn projected_frames(frames: usize, anchors: &[Anchor]) -> usize {
     let Some(last) = pts.last().copied() else {
         return frames;
     };
-    let tail_src = frames - last.from;
-    let tail_ratio = if pts.len() >= 2 {
-        let a = pts[pts.len() - 2];
-        (last.to - a.to) as f64 / (last.from - a.from).max(1) as f64
-    } else {
-        1.0
-    };
-    last.to + ((tail_src as f64) * tail_ratio).round() as usize
+    carry_tail(last, frames)
+}
+
+/// **Where a frame past the last anchor lands: carried, never stretched.**
+///
+/// Source frame `at`, at or past `last.from`, comes out `at - last.from`
+/// after `last.to`: the rest of the take moves with the last anchor and
+/// plays at its own length. It was carried at the ratio of the last segment,
+/// "so the clip does not change character at its end", which laid one
+/// segment's correction over everything after it: two hits 30 ms apart
+/// pulled 125 ms apart stretched the whole tail 4.17x (the stretcher clamps
+/// at 4x and holds its last frame for the rest), and under [`Fit::Slice`] a
+/// last segment pulled together cut the tail off. Nothing past the last
+/// attack was asked to move. The one spelling, for [`warp`],
+/// [`projected_frames`] and [`project_frame`].
+fn carry_tail(last: Anchor, at: usize) -> usize {
+    last.to + at.saturating_sub(last.from)
 }
 
 /// **Where one source frame ends up in the render**, without making it.
 ///
 /// The same piecewise map [`warp`] renders through: linear between the
-/// anchors that survive the clean-up, and the tail carried at the ratio of
-/// the segment before it. The quantize window's marks need it - an attack
+/// anchors that survive the clean-up, and the tail carried at its own length
+/// (see [`carry_tail`]). The quantize window's marks need it - an attack
 /// is FOUND in the file and DRAWN over the warped audio, so a clip that has
 /// already been quantized would otherwise wear ticks a whole correction
 /// away from the hits they name.
@@ -238,14 +247,8 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
             return (a.to as f64 + f * (b.to - a.to) as f64).round() as usize;
         }
     }
-    // The tail, at the ratio of the segment before it.
-    let ratio = if pts.len() >= 2 {
-        let a = pts[pts.len() - 2];
-        (last.to - a.to) as f64 / (last.from - a.from).max(1) as f64
-    } else {
-        1.0
-    };
-    last.to + ((at - last.from) as f64 * ratio).round() as usize
+    // The tail, carried at its own length.
+    carry_tail(last, at)
 }
 
 /// **Warp `clip` so every anchor's `from` lands on its `to`.**
@@ -271,7 +274,8 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
 ///   a segment within 2% of its slot is resampled and its pitch moves.
 /// - The head is mapped from `0..first.from` onto `0..first.to`; a first
 ///   anchor at frame zero that moves later gets silence in front of it. The
-///   tail keeps the ratio of the last segment.
+///   tail is carried at its own length, moved with the last anchor (see
+///   [`carry_tail`]), so under every fit it comes out as recorded.
 /// - The anchors and `clip` are in the SAME frame rate. A map is frames at
 ///   the rate it was made at, and nothing here rescales it.
 pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
@@ -308,16 +312,8 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
         outs.push(a.to);
     }
     cuts.push(frames);
-    // The tail keeps the ratio of the segment before it, so the clip does
-    // not snap back to 1.0 at its end.
-    let tail_src = frames - pts[pts.len() - 1].from;
-    let tail_ratio = if pts.len() >= 2 {
-        let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
-        (b.to - a.to) as f64 / (b.from - a.from).max(1) as f64
-    } else {
-        1.0
-    };
-    outs.push(pts[pts.len() - 1].to + ((tail_src as f64) * tail_ratio).round() as usize);
+    // The tail is carried at its own length. See `carry_tail`.
+    outs.push(carry_tail(pts[pts.len() - 1], frames));
 
     let mut samples: Vec<f32> = Vec::with_capacity(outs[outs.len() - 1] * 2);
     // **A first attack that is at frame zero and has to move later needs
@@ -495,9 +491,9 @@ mod tests {
 
         // **The three pieces, each on its own.** A map whose first anchor
         // MOVES carries the head with it, the middle is linear between
-        // anchors, and the tail keeps the last segment's ratio - and each
-        // of the three is a branch that can be written as the identity
-        // without the rest noticing.
+        // anchors, and the tail is carried at its own length - and each of
+        // the three is a branch that can be written as the identity without
+        // the rest noticing.
         let three = vec![a(0.40, 0.20), a(0.80, 0.60)];
         // Head: half of the way to the first anchor is half of the way to
         // its target, so 0.20 s of source lands at 0.10 s.
@@ -526,12 +522,12 @@ mod tests {
             "a clip opening on its downbeat projected frame 0 to {at_zero}"
         );
 
-        // Tail: the segment before it runs at 1.0, so 0.20 s past the last
-        // anchor is 0.20 s past its target.
+        // Tail: carried at its own length, so 0.20 s past the last anchor
+        // is 0.20 s past its target.
         let tail = project_frame(frames, &three, (f64::from(RATE) * 1.00) as usize);
         assert!(
             tail.abs_diff((f64::from(RATE) * 0.80) as usize) <= 2,
-            "the tail did not keep its ratio: 1.00 s projected to {} s",
+            "the tail was not carried at its own length: 1.00 s projected to {} s",
             tail as f64 / f64::from(RATE)
         );
 
@@ -624,6 +620,45 @@ mod tests {
         }
         // And an empty clip predicts its own nothing rather than panicking.
         assert_eq!(projected_frames(0, &[a(0.0, 0.1)]), 0);
+    }
+
+    /// **A flam at the end does not stretch the whole tail.** The tail past
+    /// the last anchor was carried at the LAST segment's ratio, so two hits
+    /// 30 ms apart pulled 125 ms apart stretched the rest of the take 4.17x
+    /// (a 2.4 s ring came out 10 s long, the stretcher's clamp held with its
+    /// last frame) - and under Slice a last segment pulled together cut the
+    /// tail off.
+    #[test]
+    fn a_flam_at_the_end_does_not_stretch_the_whole_tail() {
+        let c = clicks_at(4.0, &[0.0, 0.5, 1.0, 1.55, 1.58]);
+        let at = |s: f64| (f64::from(RATE) * s) as usize;
+        // The last two hits, 30 ms apart, straddle the midpoint of a 1/16 step
+        // at 120 bpm and are pulled 125 ms apart: a 4.17x last segment.
+        let a = [
+            Anchor { from: 0, to: 0 },
+            Anchor { from: at(0.5), to: at(0.5) },
+            Anchor { from: at(1.0), to: at(1.0) },
+            Anchor { from: at(1.55), to: at(1.5) },
+            Anchor { from: at(1.58), to: at(1.625) },
+        ];
+        let tail_src = c.frames() - at(1.58);
+        let tail_out = projected_frames(c.frames(), &a) - at(1.625);
+        assert!(
+            tail_out.abs_diff(tail_src) < tail_src / 20,
+            "a flam stretched the tail from {tail_src} to {tail_out} frames"
+        );
+        // And the render plays the tail as it was, whatever the fit: past
+        // the last anchor the source comes out frame for frame, moved.
+        for fit in [Fit::Slice, Fit::Stretch] {
+            let out = warp(&c, &a, Mode::Rhythmic, fit);
+            assert_eq!(out.frames(), at(1.625) + tail_src, "{fit:?} rendered a tail of another length");
+            let (src, got) = (at(1.58) + 2_000, at(1.625) + 2_000);
+            assert_eq!(
+                &out.samples[got * 2..(got + 4_000) * 2],
+                &c.samples[src * 2..(src + 4_000) * 2],
+                "{fit:?} did not carry the tail through untouched"
+            );
+        }
     }
 
     /// **The whole feature, end to end: a sloppy take comes out on the
@@ -762,9 +797,9 @@ mod tests {
             })
             .collect();
         let out = warp(&c, &anchors, Mode::Rhythmic, Fit::Stretch);
-        // The last anchor is at 3.78 s and the tail carries the same ratio:
-        // 0.5 s of source left, times 1.08.
-        let want = anchors[7].to + ((f64::from(RATE) * 0.5) as f64 * 1.08).round() as usize;
+        // The last anchor is at 3.78 s and the tail is carried at its own
+        // length: the 0.5 s of source left after it.
+        let want = anchors[7].to + (f64::from(RATE) * 0.5) as usize;
         assert!(
             out.frames().abs_diff(want) <= 2,
             "the warp came out {} frames long, the anchors demand {want}",
