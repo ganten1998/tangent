@@ -6491,7 +6491,7 @@ impl TangentApp {
                             self.set_insert_bypass(seat, bay, on);
                             // A menu row, so a press, so a moment: the flag is
                             // hashed, and the setter commits nothing because
-                            // the host's pedalboard seed writes it too.
+                            // the pedalboard seed writes it too.
                             self.undo_commit();
                         }
                     }
@@ -30850,7 +30850,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **And which of them are out of circuit**, off the same seat
         // arithmetic in the same breath, so a chip's word and its state can
         // never come from two different pedals. The board ships bypassed
-        // (see `desktop::seed_amp_board`), so this is the difference
+        // (see `seed_amp_board`), so this is the difference
         // between a seeded board and a broken one, on screen.
         live.pedals_off = recorder::pedal_owner(seat).map_or([false; recorder::AMP_PEDALS], |ch| {
             std::array::from_fn(|p| self.insert_bypassed(recorder::amp_pedal_seat(ch, p), 0))
@@ -32726,8 +32726,95 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if changed {
             self.settings.insert_bypass.drop_bay(strip, slot);
         }
+        // **An amp seated here arrives wearing its board** - in this same
+        // moment, before the commit below. See `seed_amp_board`.
+        if changed && path == Some(crate::faces_amp::AMP_PATH) {
+            self.seed_amp_board(strip);
+        }
         self.save_settings();
         self.undo_commit();
+    }
+
+    /// Which channel's board an amp seated in rack `seat` should seed, and
+    /// with what - asked with a lookup instead of the settings so the
+    /// once-only rule can be tested as plain logic. `pedal_filled(pedal,
+    /// bay)` answers whether that cell of the OWNING channel's board holds
+    /// anything.
+    ///
+    /// **"Any non-empty pedal cell" is the whole marker, deliberately** -
+    /// the simpler of the two honest options (the other was a settings flag
+    /// per channel, a key carried forever for a fact the slots already
+    /// state). The seeded board itself trips it, so one amp seeds exactly
+    /// once; a player who empties all twenty-one cells by hand AND re-seats
+    /// the amp gets a fresh board, which is the reading of that gesture we
+    /// want.
+    ///
+    /// **It takes a SEAT and answers with a CHANNEL.** A folder's bays 3..5
+    /// live in an appended seat far past the channels (`folder_extra_seat`),
+    /// and an amp dropped there seeded nothing at all while the same amp one
+    /// bay up seeded the full board. Routing through `pedal_owner` gives
+    /// both racks the same answer - the channel's one board - and the
+    /// once-only marker keeps its meaning, because the two racks share the
+    /// cells it counts.
+    fn amp_board_to_seed(
+        seat: usize,
+        pedal_filled: impl Fn(usize, usize) -> bool,
+    ) -> Option<(usize, [&'static str; recorder::AMP_PEDALS])> {
+        let ch = recorder::pedal_owner(seat)?;
+        let untouched = (0..recorder::AMP_PEDALS)
+            .all(|p| (0..recorder::INSERTS).all(|b| !pedal_filled(p, b)));
+        untouched.then_some((ch, recorder::AMP_DEFAULT_BOARD))
+    }
+
+    /// **Seed the board an amp seated in `seat` should wear - and switch
+    /// every pedal of it OFF.**
+    ///
+    /// **The board arrives dressed, and it arrives silent.** Seven pedals in
+    /// series is a sound nobody asked for on an amp somebody has only just
+    /// loaded - a compressor, a wah, a drive, a chorus, a tremolo, a delay
+    /// and a plate, all at their defaults, between a guitar and the first
+    /// note played through it. The owner's words on the shipped build: they
+    /// "should be off by default for beta testing". Off means BYPASSED and
+    /// not absent: every pedal is loaded, named on its chip, openable in its
+    /// own window and one shift-click from being in circuit, which is only
+    /// honest because the state can be SEEN (`faces_amp` strikes a bypassed
+    /// chip through, and the pedal's face carries a BYPASS button).
+    ///
+    /// **At the GESTURE, inside `set_insert`, and never at a load.** The
+    /// host used to seed whenever an amp LOADED into a bay whose board was
+    /// empty, and a load is also an undo, a redo, an open and an engine
+    /// rebuild. So a redo across an amp re-seeded its board as a new moment
+    /// and cut the redo tail, a project opened with an emptied board came up
+    /// dirty with seven moments, and the seed's seven `set_insert`s were
+    /// seven moments of their own, each with its newest pedal still in
+    /// circuit. Here the seed is one batch inside the moment of whatever put
+    /// the amp in the bay - the picker, a carried copy or move, a paste, a
+    /// swap, Paste Track - and a moment applied by undo or an open never
+    /// passes through `set_insert`, so it never seeds.
+    ///
+    /// **The bypass is written AFTER the tenant, and that ordering is
+    /// load-bearing.** `set_insert` drops a bay's bypass whenever the tenant
+    /// really changes, so a flag written first would be wiped by the very
+    /// write that puts the pedal in the seat.
+    fn seed_amp_board(&mut self, seat: usize) {
+        // The SEAT the amp landed in, which for a group's bays 3..5 is not
+        // its channel - `amp_board_to_seed` is the one place that
+        // translates, and it hands back the channel it decided on so the
+        // cells written below cannot drift from the cells that were counted.
+        let owner = recorder::pedal_owner(seat);
+        let seed = Self::amp_board_to_seed(seat, |pedal, bay| {
+            owner.is_some_and(|ch| self.insert(recorder::amp_pedal_seat(ch, pedal), bay).is_some())
+        });
+        let Some((ch, board)) = seed else {
+            return;
+        };
+        self.begin_one_moment();
+        for (pedal, path) in board.iter().enumerate() {
+            let pedal_seat = recorder::amp_pedal_seat(ch, pedal);
+            self.set_insert(pedal_seat, 0, Some(path));
+            self.set_insert_bypass(pedal_seat, 0, true);
+        }
+        self.commit_undo_moment();
     }
 
     /// Whether this bay's tenant is out of circuit — kept, loaded, editable,
@@ -32771,15 +32858,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// [`Self::toggle_insert_bypass`] is the gesture — a hand on a chip, and
     /// the hand can see what it is flipping. This is for a caller that knows
-    /// what it wants and cannot see: the host's default-pedalboard seed
-    /// (`desktop::seed_amp_board`) writes seven pedals into a channel's
+    /// what it wants and cannot see: the default-pedalboard seed
+    /// (`seed_amp_board`) writes seven pedals into a channel's
     /// board and needs all seven OUT of circuit, and a toggle there would
     /// switch back on any seat a previous seed had already switched off.
     ///
     /// Saved only when the flag actually moved, exactly as
-    /// `BypassBays::set` answers: the seed runs inside a per-frame reconcile
-    /// and a settings write per frame for a file that is already correct is
-    /// the kind of thing that shows up as a disk light nobody can explain.
+    /// `BypassBays::set` answers: a settings write for a file that is
+    /// already correct is the kind of thing that shows up as a disk light
+    /// nobody can explain.
     ///
     /// **Commits nothing**, so the seed's writes stay one batch. The FX
     /// menus' Bypass and Unbypass rows also land here, and each takes its
@@ -63831,6 +63918,15 @@ mod tests {").expect("the tests module")];
         }
         app.toggle_folder(1);
         app.set_insert(seat, bay, Some(crate::faces_amp::AMP_PATH));
+        // The amp arrives wearing the default board (`seed_amp_board`). This
+        // fixture is about WHICH channel's board the face reads, so the
+        // seeded board comes off again, and one recognisable pedal per
+        // channel goes on below.
+        if let Some(ch) = recorder::pedal_owner(seat) {
+            for p in 0..recorder::AMP_PEDALS {
+                app.set_insert(recorder::amp_pedal_seat(ch, p), 0, None);
+            }
+        }
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: seat,
             slot: bay,
@@ -63928,6 +64024,162 @@ mod tests {").expect("the tests module")];
         );
     }
 
+    /// **The default pedalboard seeds exactly once, on a track or a group,
+    /// and onto the board its CHANNEL owns.** The once-only marker is "any
+    /// non-empty pedal cell" - the seeded board itself trips it - so the
+    /// decision is held here as the plain logic it is.
+    ///
+    /// It takes a SEAT, because an amp landing in a group's bay 4 lands in
+    /// the appended `folder_extra_seat`, which is past `CHANNELS` and used to
+    /// seed nothing; two amps in one group behaving differently was the bug,
+    /// and the assertions below are that pair. (Moved from the host with the
+    /// seed itself, which is the app's now.)
+    #[test]
+    fn the_default_pedalboard_seeds_once_and_only_on_channels() {
+        use recorder::{folder_extra_seat, AMP_DEFAULT_BOARD, AMP_PEDALS, CHANNELS, MASTER_SEAT};
+        let empty = |_p: usize, _b: usize| false;
+        let (ch, board) =
+            TangentApp::amp_board_to_seed(3, empty).expect("an untouched channel seeds");
+        assert_eq!(ch, 3, "a channel seeds its own board");
+        assert_eq!(board.len(), AMP_PEDALS);
+        assert!(board.iter().all(|p| p.starts_with("@tangent-")));
+        assert_eq!(board[0], "@tangent-comp", "dynamics lead the chain");
+        assert_eq!(board[AMP_PEDALS - 1], "@tangent-plate", "the room comes last");
+        // ONE non-empty cell anywhere on the board - the seeded board itself
+        // included - blocks a second seeding, first and last cells both
+        // checked because the walk has two loops to get wrong.
+        assert!(TangentApp::amp_board_to_seed(3, |p, b| p == 0 && b == 0).is_none());
+        assert!(
+            TangentApp::amp_board_to_seed(3, |p, b| p == AMP_PEDALS - 1 && b == 2).is_none(),
+            "a tenant in the last pedal's last bay did not count as touched"
+        );
+        // **A GROUP's second rack seeds the group's own board.**
+        let (ch, board) = TangentApp::amp_board_to_seed(folder_extra_seat(5), empty)
+            .expect("a group's extra rack seeds");
+        assert_eq!(ch, 5, "the extra rack seeded somebody else's board");
+        assert_eq!(board, AMP_DEFAULT_BOARD, "a different board on the extra rack");
+        // ...and once, across BOTH racks, because they share the one board.
+        assert!(
+            TangentApp::amp_board_to_seed(folder_extra_seat(5), |p, b| p == 0 && b == 0).is_none(),
+            "a group's two racks each seeded the shared board"
+        );
+        // Everything with no board of its own - the master, the buses, the
+        // pads, a pedal seat itself - seeds nothing: those amps play bare.
+        assert!(TangentApp::amp_board_to_seed(MASTER_SEAT, empty).is_none());
+        assert!(TangentApp::amp_board_to_seed(CHANNELS, empty).is_none());
+        assert!(
+            TangentApp::amp_board_to_seed(folder_extra_seat(CHANNELS - 1) + 1, empty).is_none(),
+            "the seat just past the folder block claimed a board"
+        );
+        assert!(TangentApp::amp_board_to_seed(usize::MAX, empty).is_none());
+    }
+
+    /// **The seeded board arrives loaded, named - and switched OFF.**
+    ///
+    /// The owner, on the freshly installed build: the pedals make no sound
+    /// difference, "which should be off by default for beta testing". So
+    /// seating an amp writes both halves and this reads both back: the
+    /// tenant is in the seat AND the seat is bypassed - a seat somebody can
+    /// see, open and shift-click back into circuit, which is the whole
+    /// reason to seed a board at all. Swapping the seed's two writes makes
+    /// this red: `set_insert` drops a bay's bypass whenever the tenant
+    /// changes, so the flag has to be written second. (Moved from the host,
+    /// and driven now through `set_insert`, the writer every road that seats
+    /// an amp ends in.)
+    #[test]
+    fn the_seeded_pedalboard_arrives_switched_off() {
+        use recorder::{amp_pedal_seat, folder_extra_seat, AMP_DEFAULT_BOARD, AMP_PEDALS};
+        for amp_seat in [3usize, folder_extra_seat(5)] {
+            let ch = recorder::pedal_owner(amp_seat).expect("the seat owns a board");
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            for pedal in 0..AMP_PEDALS {
+                assert_eq!(app.insert(amp_pedal_seat(ch, pedal), 0), None, "the board was dressed before the amp landed");
+            }
+            app.set_insert(amp_seat, 0, Some(crate::faces_amp::AMP_PATH));
+            for pedal in 0..AMP_PEDALS {
+                let seat = amp_pedal_seat(ch, pedal);
+                assert_eq!(
+                    app.insert(seat, 0),
+                    Some(AMP_DEFAULT_BOARD[pedal]),
+                    "pedal {pedal} of the seeded board is not the one the chain names"
+                );
+                assert!(
+                    app.insert_bypassed(seat, 0),
+                    "pedal {pedal} of the seeded board arrived IN circuit, which is \
+                     seven effects nobody asked for between a guitar and its amp"
+                );
+            }
+            // And the once-only rule holds with the flags standing: the amp
+            // seated again on the same channel finds a board that has been
+            // touched and writes nothing - including nothing that would
+            // switch a pedal somebody had put back into circuit off again.
+            app.set_insert_bypass(amp_pedal_seat(ch, 2), 0, false);
+            app.set_insert(amp_seat, 0, None);
+            app.set_insert(amp_seat, 0, Some(crate::faces_amp::AMP_PATH));
+            assert!(
+                !app.insert_bypassed(amp_pedal_seat(ch, 2), 0),
+                "a second amp re-seeded the board and switched a pedal back off"
+            );
+        }
+    }
+
+    /// **An amp and the board it arrives wearing are ONE step of undo, and
+    /// undo, redo and an open never seed it again.**
+    ///
+    /// The host seeded the board when the amp LOADED, through seven
+    /// `set_insert`s with no hold: seven moments a frame after the amp's
+    /// own, each with its newest pedal still in circuit. And a load is also
+    /// an undo, a redo and an open - so a redo across the amp re-seeded its
+    /// board as a new moment and cut the redo tail, and a project opened
+    /// with an emptied board came up dirty. The seed is the app's now, a
+    /// batch inside the moment that seats the amp, and a moment applied by
+    /// undo or an open never passes through the writer that seeds.
+    #[test]
+    fn an_amp_and_its_board_are_one_moment_and_undo_never_seeds_again() {
+        use recorder::{amp_pedal_seat, AMP_PEDALS};
+        let root = project_scratch("ampboard");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+        let dressed = |app: &TangentApp| {
+            (0..AMP_PEDALS)
+                .filter(|&p| {
+                    app.insert(amp_pedal_seat(3, p), 0).is_some() && app.insert_bypassed(amp_pedal_seat(3, p), 0)
+                })
+                .count()
+        };
+        let before = app.hist_at;
+        app.set_insert(3, 0, Some(crate::faces_amp::AMP_PATH));
+        assert_eq!(dressed(&app), AMP_PEDALS, "the amp did not arrive wearing its board, bypassed");
+        assert_eq!(app.hist_at, before + 1, "the amp and its board left {} moments", app.hist_at - before);
+        // Something after it, for the redo tail to carry.
+        app.add_bare_track(5);
+        let top = app.hist_at;
+        app.undo();
+        app.undo();
+        assert_eq!(app.insert(3, 0), None, "two Ctrl+Z left the amp");
+        assert_eq!(dressed(&app), 0, "one Ctrl+Z took the amp and left its board");
+        app.redo();
+        assert_eq!(dressed(&app), AMP_PEDALS, "redo brought the amp back without its board");
+        app.redo();
+        assert_eq!(app.hist_at, top, "the redo tail was cut");
+        assert_ne!(app.settings.tracks_added & (1 << 5), 0, "the track after the amp never came back");
+        // A document whose amp's board was emptied by hand opens as it was
+        // left: the apply writes the bays, it does not seat anything.
+        for p in 0..AMP_PEDALS {
+            app.set_insert(amp_pedal_seat(3, p), 0, None);
+        }
+        let emptied = app.desk_snapshot();
+        app.set_insert(3, 0, None);
+        let before = app.hist_at;
+        app.apply_desk_snapshot(&emptied);
+        assert_eq!(app.insert(3, 0), Some(crate::faces_amp::AMP_PATH), "the apply lost the amp");
+        assert_eq!(dressed(&app), 0, "an applied desk re-dressed a board somebody had emptied");
+        assert_eq!(app.hist_at, before, "the apply pushed a moment");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── the pedal window standing on the amp ────────────────────────────
 
     /// **The shape this feature has to be tested in: ONE canvas.**
@@ -63944,6 +64196,12 @@ mod tests {").expect("the tests module")];
         let caps = Caps { child_windows: false, ..Caps::DESKTOP };
         let (ctx, mut app) = headless(caps);
         app.set_insert(0, 0, Some(crate::faces_amp::AMP_PATH));
+        // The amp arrives wearing the default board (`seed_amp_board`); this
+        // desk wants EMPTY chips beside the one dressed below, so the seeded
+        // board comes off again.
+        for p in 0..recorder::AMP_PEDALS {
+            app.set_insert(recorder::amp_pedal_seat(0, p), 0, None);
+        }
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: 0,
             slot: 0,
