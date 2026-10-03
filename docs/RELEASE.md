@@ -132,7 +132,11 @@ With none of `TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
 `TRUSTED_SIGNING_PROFILE` set, the PEs ship unsigned and the build says so
 for each one; with only some of them set the build **fails** rather than
 quietly shipping an unsigned binary you believe is signed. A token can be
-supplied directly as `TRUSTED_SIGNING_TOKEN`. `release.sh` then checks the
+supplied directly as `TRUSTED_SIGNING_TOKEN`; set it around the signing
+only, since an exported variable reaches every child of the build. Either
+way `sign-windows.sh` hands the token to jsign through jsign's environment
+(`--storepass env:…`), never on its command line, where any process on the
+machine could read it for as long as a signing runs. `release.sh` then checks the
 signature of `setup.exe`, of each PE inside it (extracted with 7-Zip:
 `tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe`) and of each PE in the
 portable zip (`scripts/pe-signed.py`), and a Windows release runs RED until
