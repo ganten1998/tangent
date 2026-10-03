@@ -269,9 +269,9 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
 ///   or slot is under [`MIN_SEGMENT`], and every segment under
 ///   [`Fit::Slice`], is copied, then trimmed or padded with a hold of its
 ///   last frame.
-/// - The fit is resolved once for the whole clip; the stretch ALGORITHM is
-///   resolved per segment by [`stretch::Mode::pick`], so under `Mode::Auto`
-///   a segment within 2% of its slot is resampled and its pitch moves.
+/// - The fit and the stretch ALGORITHM are each resolved once for the whole
+///   clip ([`Fit::pick`], [`stretch::Mode::for_warp`]), and the algorithm is
+///   never a tape resample, so no segment's pitch moves with its correction.
 /// - The head is mapped from `0..first.from` onto `0..first.to`; a first
 ///   anchor at frame zero that moves later gets silence in front of it. The
 ///   tail is carried at its own length, moved with the last anchor (see
@@ -291,6 +291,11 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     // differently for the quiet bars than for the loud ones and the take
     // would change character halfway through.
     let fit = fit.pick(clip);
+    // **And the algorithm once too, and never a tape resample.** Picked per
+    // segment, `Mode::Auto` resampled every segment within 2% of its slot,
+    // which moves its pitch by its own correction: each note of a bass take
+    // came back detuned by a different amount. See `Mode::for_warp`.
+    let mode = mode.for_warp(clip);
 
     // **The cut list, in source frames**: the head, every anchor, the tail.
     // Segment `i` runs from `cuts[i]` to `cuts[i + 1]` and has to come out
@@ -658,6 +663,53 @@ mod tests {
                 &c.samples[src * 2..(src + 4_000) * 2],
                 "{fit:?} did not carry the tail through untouched"
             );
+        }
+    }
+
+    /// **A small correction does not retune the segment it moves.** `warp`
+    /// resolved the fit once per clip but handed each segment its own
+    /// `Mode::pick`, and under `Mode::Auto` a segment within 2% of its slot
+    /// was tape-resampled: a 1.5% correction played a 220 Hz note at
+    /// 216.75 Hz, a quarter of a semitone flat, and the next one sharp - a
+    /// different detune on every note of a bass or vocal take.
+    #[test]
+    fn a_small_correction_does_not_retune_the_segment() {
+        let n = RATE as usize * 4;
+        let tone = clip_of(
+            (0..n)
+                .flat_map(|f| {
+                    let v = (std::f32::consts::TAU * 220.0 * f as f32 / RATE as f32).sin() * 0.5;
+                    [v, v]
+                })
+                .collect(),
+        );
+        // Two segments corrected by 1.5% either way, then two left alone.
+        let a = [
+            Anchor { from: 0, to: 0 },
+            Anchor { from: 48_000, to: 48_720 },
+            Anchor { from: 96_000, to: 96_000 },
+            Anchor { from: 144_000, to: 144_000 },
+        ];
+        let hz_of = |out: &Clip, lo: usize, hi: usize| {
+            let z = (lo..hi - 1)
+                .filter(|&f| (out.samples[f * 2] <= 0.0) != (out.samples[(f + 1) * 2] <= 0.0))
+                .count();
+            z as f64 / 2.0 / ((hi - lo) as f64 / f64::from(RATE))
+        };
+        // Auto, and Tape named outright: inside a warp neither may resample.
+        for mode in [Mode::Auto, Mode::Tape] {
+            let out = warp(&tone, &a, mode, Fit::Stretch);
+            // The measure itself, on a segment nothing moved.
+            let still = hz_of(&out, 100_000, 140_000);
+            assert!((still - 220.0).abs() < 1.5, "the fixture reads {still} Hz");
+            // Inside each corrected segment, clear of the copied attack.
+            for (lo, hi) in [(10_000, 40_000), (60_000, 90_000)] {
+                let f = hz_of(&out, lo, hi);
+                assert!(
+                    (f - 220.0).abs() < 1.5,
+                    "under {mode:?} a warped segment plays at {f:.1} Hz, not 220"
+                );
+            }
         }
     }
 
