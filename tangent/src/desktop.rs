@@ -630,9 +630,10 @@ const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10)
 
 /// One press of the red button: what has been collected since, and where it
 /// lands. `finish_arr_record` is the only way out that keeps it, and it hands
-/// the clips to whatever document is open WHEN it runs: closing the window
-/// drops a running record unwritten, and a New or an Open made mid-record
-/// lands it in the next session.
+/// the clips to whatever document is open WHEN it runs - so every road that
+/// lets a session go runs it first: a window close before the quit question,
+/// New and Open before the outgoing session is written or replaced, and
+/// `on_exit` for one still running (`finish_arr_record_keeping_the_answer`).
 #[cfg(feature = "recorder")]
 struct ArrRec {
     /// The playhead second the record began at.
@@ -9134,6 +9135,29 @@ impl DesktopApp {
         self.app.add_recorded_clips(out);
     }
 
+    /// **A running arrangement record ends with the session it was recorded
+    /// in, and the save prompt's answer survives the ending.** For the roads
+    /// that let a session go: New and Open, before the outgoing session is
+    /// written or replaced, and `on_exit` for one still running at the end.
+    /// Without it the take rolled on into the next session and landed there
+    /// at Stop, or went down with the process unwritten.
+    ///
+    /// Finishing lands the clips through `add_recorded_clips`, which commits
+    /// a moment, and a new moment clears "Don't Save"
+    /// (`undo_commit_moment`): the answer would be gone by the time the road
+    /// asked for it, and the save-back would write the very edits the prompt
+    /// was told to throw away. So it is taken first and put back, and
+    /// returned. The take's files are in `media/` either way, and a scratch
+    /// holding one is never cleared (`discard_scratch_made_here`).
+    fn finish_arr_record_keeping_the_answer(&mut self) -> bool {
+        let discarded = self.app.take_outgoing_discarded();
+        self.finish_arr_record();
+        if discarded {
+            self.app.rearm_outgoing_discarded();
+        }
+        discarded
+    }
+
     /// Start an export: the whole arrangement, played from the top through
     /// the real engine — racks, limiter, master — into an audio-only take
     /// the finish copies into the project's `export/`.
@@ -10712,6 +10736,18 @@ impl DesktopApp {
                 let asked = !matches!(req, tangent_ui::ports::ProjectRequest::New);
                 let keeping =
                     matches!(req, tangent_ui::ports::ProjectRequest::NewKeeping);
+                // **A take still rolling ends here, in the session it was
+                // recorded in, and is then asked about like any unsaved
+                // work**: New's question was answered before the take was in
+                // the document, and a clean session got none. Not when that
+                // answer was Don't Save, which covers everything since the
+                // last save - the take's files stay in `media/` either way.
+                // See `finish_arr_record_keeping_the_answer`.
+                let recording = self.recorder.arr_rec.is_some();
+                let refused = self.finish_arr_record_keeping_the_answer();
+                if recording && !asked && !refused && self.app.ask_before_new() {
+                    return;
+                }
                 // The default template exists from the start: seeded here if
                 // nothing ever saved over it.
                 let template = self.templates_dir().join("default");
@@ -11069,6 +11105,9 @@ impl DesktopApp {
         // incoming one replaces it; the open writes synchronously anyway, so
         // this costs a write only when one was actually pending.
         self.app.flush_settings_now();
+        // A take still rolling lands in THIS session, and the save-back
+        // below keeps it - see `finish_arr_record_keeping_the_answer`.
+        self.finish_arr_record_keeping_the_answer();
         // The old session first, while it is still the one on the desk.
         //
         // **The plugin states go UNCONDITIONALLY** - a knob turned in a
@@ -18939,6 +18978,13 @@ impl eframe::App for DesktopApp {
         // not. Asked BEFORE the frame is drawn, so the dialog appears in the
         // same frame the close was requested in.
         if ctx.input(|i| i.viewport().close_requested()) {
+            // **A running arrangement record lands first, so the question can
+            // ask about it.** Its clips are in the document only once
+            // `finish_arr_record` has run, and a close used to drop the take
+            // unwritten - on a clean session without a word. Here, before
+            // anything rewinds the transport: it reads the playhead.
+            #[cfg(feature = "recorder")]
+            self.finish_arr_record();
             if self.app.intercept_quit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
@@ -19167,6 +19213,10 @@ impl eframe::App for DesktopApp {
     /// `.wav` keeps the placeholder sizes in its header — a file most players
     /// treat as zero-length. Somebody who left the recorder running for a
     /// practice session and then quit would lose the whole thing.
+    ///
+    /// So is an arrangement record, whose audio lives only in `ArrRec`'s
+    /// buffers until it is written: `update` lands one before the quit
+    /// question, and this catches one still running here.
     #[cfg(feature = "recorder")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // **The settings write the debounce still owes goes FIRST.** A fader
@@ -19175,6 +19225,10 @@ impl eframe::App for DesktopApp {
         // drain it. See `TangentApp::flush_settings_now`.
         self.app.flush_settings_now();
         self.recorder.session.stop();
+        // **And the arrangement record, finished the same way.** `update`
+        // lands one before the quit question; this is the backstop for one
+        // still running here, before the answer is read below.
+        self.finish_arr_record_keeping_the_answer();
         self.save_plugin_states();
         // **The document is NOT written here.**
         //
@@ -26234,6 +26288,93 @@ mod tests {").expect("the tests module")];
             focus < flush && minimised < flush,
             "the flush in update is not driven by the focus and minimise edges"
         );
+    }
+
+    /// **A window close finishes a running arrangement record.** No road out
+    /// of the window called `finish_arr_record`, so a take rolling at Cmd+Q,
+    /// or at the window's close button, was dropped unwritten with its
+    /// `ArrRec` - and on a clean session nothing even asked. It lands before
+    /// the quit question now, so the question can ask about it, and `on_exit`
+    /// finishes one still running before it reads the question's answer,
+    /// which the finish would otherwise clear. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_window_close_finishes_a_running_arrangement_record() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let update = &src[src
+            .find("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)")
+            .expect("update")..];
+        let close = update.find("i.viewport().close_requested()").expect("the close");
+        let question = update.find("self.app.intercept_quit()").expect("the quit question");
+        let exit = &src[src.find("fn on_exit(&mut self").expect("on_exit")..];
+        let exit = &exit[..exit.find("\n    }\n").expect("the end of on_exit")];
+        let finish = exit.find("self.finish_arr_record_keeping_the_answer();");
+        let answer = exit.find("self.app.take_outgoing_discarded()").expect("on_exit reads the answer");
+        assert!(
+            close < question && update[close..question].contains("self.finish_arr_record();"),
+            "no road out of the window finishes the arrangement record before the \
+             quit question: a take rolling at Cmd+Q is dropped unwritten with its ArrRec"
+        );
+        assert!(
+            finish.is_some_and(|f| f < answer),
+            "on_exit drops a record still running, or finishes it after reading the \
+             quit question's answer, which the finish clears"
+        );
+    }
+
+    /// **A session switch never carries a running record into the next
+    /// session.** Neither Open nor New touched `arr_rec`, so a take rolling
+    /// through the switch kept recording, and at Stop its audio went into the
+    /// NEXT session's folder and its clips into the next document, carving
+    /// that document's clips on those lanes from the record's start. Both
+    /// roads finish it first, while the outgoing session is still the one on
+    /// the desk and before the save-back that keeps it. A source scan.
+    #[test]
+    fn a_session_switch_never_carries_a_running_record_into_the_next_session() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let between = |from: &str, to: &str| {
+            let a = src.find(from).unwrap_or_else(|| panic!("`{from}` is gone"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("`{to}` after `{from}` is gone"));
+            src[a..a + b].to_owned()
+        };
+        // Both roads are read before anything panics, so one run names each
+        // one that lets the record through.
+        let mut carried: Vec<String> = Vec::new();
+        for (road, body) in [
+            ("switch_project", between("fn switch_project(&mut self, doc:", "self.app.open_project(doc)")),
+            ("the New arm", between("ProjectRequest::NewDiscarding => {", "self.app.adopt_template(&template, &dir)")),
+        ] {
+            let finish = body.find("self.finish_arr_record_keeping_the_answer();");
+            let save = body.find("self.app.save_project_doc()").expect("the save-back");
+            if !finish.is_some_and(|f| f < save) {
+                carried.push(format!(
+                    "{road} replaces the session under a running arrangement record, or \
+                     finishes it after the save-back, so the take lands in the NEXT \
+                     session's folder and document, or in no document at all"
+                ));
+            }
+        }
+        // New's question came before the take was in the document, so a New
+        // that finishes one asks again before it decides anything - or a
+        // MIDI take, which has no file to keep its scratch, is reclaimed.
+        let new_arm = between("ProjectRequest::NewDiscarding => {", "self.app.adopt_template(&template, &dir)");
+        let asks = match (
+            new_arm.find("self.finish_arr_record_keeping_the_answer();"),
+            new_arm.find("self.app.ask_before_new()"),
+            new_arm.find("fresh_project_dir(&root)"),
+        ) {
+            (Some(f), Some(a), Some(r)) => f < a && a < r,
+            _ => false,
+        };
+        if !asks {
+            carried.push(
+                "the New arm lets a session go without asking about the take it just finished"
+                    .to_owned(),
+            );
+        }
+        assert!(carried.is_empty(), "{}", carried.join("; "));
     }
 
     /// **Every road out of this app ends at the hardened exit.**
