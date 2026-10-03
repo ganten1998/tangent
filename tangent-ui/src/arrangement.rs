@@ -2901,7 +2901,10 @@ impl DeskSnap {
             // `visible` is AUTO, the shipped default, not "unset".
             view: m.get("view").and_then(Value::as_object).map(|vm| View {
                 snap: vm.get("snap").and_then(Value::as_bool).unwrap_or(true),
-                grid_exp: vm.get("grid_exp").and_then(Value::as_i64).unwrap_or(-2).clamp(-7, 3),
+                // -6, the timeline's finest line (`grid_quarters`), as the
+                // settings reader clamps it: -7 is the editor's floor, not
+                // the arrangement's.
+                grid_exp: vm.get("grid_exp").and_then(Value::as_i64).unwrap_or(-2).clamp(-6, 3),
                 tempo_lane: vm.get("tempo_lane").and_then(Value::as_bool).unwrap_or(false),
                 master_row: vm.get("master_row").and_then(Value::as_bool).unwrap_or(true),
                 header_w: vm
