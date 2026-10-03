@@ -1304,8 +1304,11 @@ channels play back their clips and nothing else. "Ready to play" and
   `transient` finds the attacks; `warp` renders the clip with each attack
   copied as recorded and only the sustain stretched (`Fit::Stretch`), moves
   segments untouched (`Fit::Slice`), or asks `stretch::percussiveness` once
-  per clip (`Fit::Auto`). The map lives on the clip (`warp`, `warp_fit`), is
-  in the undo fingerprint, renders on the decode crew (`Work::Warp`) BEFORE
+  per clip (`Fit::Auto`). The map lives on the clip (`warp`, `warp_fit`,
+  and `warp_rate`, the rate of the decode it was measured in, from which
+  every reader rescales it to its own decode with `warp_anchors`; 0, in a
+  document older than the field, means as it stands), is in the undo
+  fingerprint, renders on the decode crew (`Work::Warp`) BEFORE
   any stretch, and the drawn wave is the warped render's. While the window
   is open, `quantize_preview` asks the host for marks: amber where an
   attack was found, a fainter tick in the clip's ink where the grid pulls
