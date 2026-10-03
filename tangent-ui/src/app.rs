@@ -5283,8 +5283,9 @@ impl TangentApp {
         if folder >= CHANNELS || !self.is_folder(folder) {
             return;
         }
-        // The same rule as `move_channel`, and for the same reason.
-        if self.recorder.exporting || self.recorder.arr_recording {
+        // The same rule as `move_channel`, and for the same reason - said out
+        // loud, like the other drops (`lane_order_held`).
+        if self.lane_order_held() {
             return;
         }
         let mut group = self.drag_block(from);
@@ -11665,6 +11666,31 @@ impl TangentApp {
         });
     }
 
+    /// **Whether the lane ORDER is held, saying so when it is.** An export's
+    /// stems and an arrangement record's lanes and punches are bound to lane
+    /// INDICES at their press, so a permutation under either would write, or
+    /// carve, the wrong lane: the lane drags refuse for exactly that reason.
+    /// An ordinary take holds no lane and is not asked about.
+    ///
+    /// Asked by every other gesture that reaches `reorder_channels` -
+    /// Insert and Paste Track Below, Cmd/Ctrl+F grouping, a drag that comes
+    /// home or lands - BEFORE it changes anything. None of them asked, and a
+    /// refusal inside the reorder alone would leave them half-applied: a
+    /// folder flag set on the row at the top, a member's flag cleared, a
+    /// bare track added onto the live row below.
+    fn lane_order_held(&mut self) -> bool {
+        let held = self.recorder.exporting || self.recorder.arr_recording;
+        if held {
+            let why = if self.recorder.exporting {
+                "Tracks keep their order while an export runs - it writes each track by its row."
+            } else {
+                "Tracks keep their order while the arrangement records - it records each track by its row."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+        }
+        held
+    }
+
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
     /// Everything a channel is follows it: kind, input, icon, colour, name,
     /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
@@ -11752,6 +11778,11 @@ impl TangentApp {
     fn reorder_channels(&mut self, order: &[usize]) {
         use crate::recorder::{CHANNELS, INSERTS, STRIPS};
         if order.len() != CHANNELS {
+            return;
+        }
+        // The backstop only: every gesture asks `lane_order_held` before it
+        // changes anything, and refusing here alone half-applies them.
+        if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
         // And the inverse, for everything that NAMES a lane.
@@ -12100,10 +12131,16 @@ impl TangentApp {
     /// gesture never mentioned, moving in the opposite direction to the one
     /// the user asked for. Taken from below, the only rows that move are the
     /// ones under the click, which is what "insert below" looks like. A desk
-    /// with nothing free under `n` answers `None`, and the caller says so.
+    /// with nothing free under `n` answers `None`, and the caller says so -
+    /// and so does a lane order an export or an arrangement record holds
+    /// (`lane_order_held`, which says why).
     fn open_lane_below(&mut self, n: usize) -> Option<usize> {
         use recorder::CHANNELS;
         if n >= CHANNELS {
+            return None;
+        }
+        // Not under an export or an arrangement record, which write by row.
+        if self.lane_order_held() {
             return None;
         }
         let free = (n + 1..CHANNELS).find(|c| !self.channel_used(*c) && !self.is_folder(*c))?;
@@ -26608,12 +26645,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // (`moved`), so a plain click on the name stays
                             // a click.
                             self.eject_from_folder(from);
-                        } else if to != from {
+                        } else if to != from && !self.lane_order_held() {
                             // An ordinary move. Membership is decided by
                             // where the block LANDS, which is what makes
                             // dragging out of a folder work without a second
                             // gesture: drop anywhere that is not inside one
-                            // and the flags come off.
+                            // and the flags come off. (Not under an export or
+                            // an arrangement record, asked first: the
+                            // membership line below ran before
+                            // `move_selection` refused one.)
                             //
                             // **The LEADERS' membership, not the block's.** A
                             // child carried along by its folder is inside
@@ -29598,6 +29638,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(folder) = self.folder_of(from) else {
             return;
         };
+        // A lane drag like the others: refused whole under an export or an
+        // arrangement record, before a flag is cleared - see `lane_order_held`.
+        if self.lane_order_held() {
+            return;
+        }
         let run_end = self
             .folder_run(folder)
             .last()
@@ -29678,6 +29723,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let top = sel[0];
         let bottom = *sel.last().unwrap_or(&top);
         let span = bottom - top + 1;
+        // Grouping MOVES a spare row into place above the run, so it is
+        // refused under an export or an arrangement record - before anything
+        // is set, see `lane_order_held`.
+        if self.lane_order_held() {
+            return false;
+        }
         // A spare row to BE the folder, taken from the bottom so the search
         // never disturbs anything above the group.
         let Some(free) = (0..self.active_channels())
@@ -31762,7 +31813,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // - the band's dial, TAP, the TEMPO word, a typed commit, the
         // metronome panel's row, the double-click reset. Before a tap is
         // recorded, so a refused tap leaves nothing in `tap_times`. See
-        // `RecorderState::tempo_held`: a take's count-in, or an export.
+        // `RecorderState::tempo_held`: a take's count-in, or an export. The
+        // Export dialog's tempo arrives by its own road and is held there
+        // (`hold_dialog_tempo`).
         if self.recorder.tempo_held()
             && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
         {
@@ -32841,6 +32894,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             spec.composite.display = true;
         }
         spec
+    }
+
+    /// **A held tempo stays where it is through the Export dialog too.**
+    /// `apply_recorder_hit` refuses every tempo control while the tempo is
+    /// held - see `RecorderState::tempo_held` - and the dialog's OK never went
+    /// through it: during the arrangement's count-in it moved the engine's
+    /// count while the knob, TAP and the metronome panel were refused. The
+    /// rest of the dialog still lands; only the tempo is kept, and the OK
+    /// says so.
+    fn hold_dialog_tempo(&mut self, spec: &mut recorder::ExportSpec) {
+        if self.recorder.tempo_held() && spec.tempo_bpm != self.tempo_bpm() {
+            spec.tempo_bpm = self.tempo_bpm();
+            self.notify(
+                crate::notify::Kind::Info,
+                "The tempo holds through a count-in and an export - the rest of the export settings were kept.",
+            );
+        }
     }
 
     /// **Where the window is right now**, for the window capture: its content
@@ -36067,8 +36137,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             // This session only. Deliberately NOT written to settings: the
             // tick is what makes a choice outlive the session.
-            DialogAction::SetExport(spec) => self.export_override = Some(spec),
-            DialogAction::SetExportAndRemember(spec) => {
+            DialogAction::SetExport(mut spec) => {
+                self.hold_dialog_tempo(&mut spec);
+                self.export_override = Some(spec);
+            }
+            DialogAction::SetExportAndRemember(mut spec) => {
+                self.hold_dialog_tempo(&mut spec);
                 // The override is cleared as well as the setting written, or
                 // the session copy would keep shadowing the thing the user just
                 // asked to be permanent.
@@ -40164,7 +40238,9 @@ impl TangentApp {
                                 self.snap_into_folder(from, folder);
                             } else if to == from && self.in_folder(from) {
                                 self.eject_from_folder(from);
-                            } else if to != from {
+                            } else if to != from && !self.lane_order_held() {
+                                // Asked before the membership line, which
+                                // `move_selection`'s own refusal comes after.
                                 let joins = self.folder_of(to);
                                 for n in self.reorder_group(from) {
                                     self.set_in_folder(n, joins.is_some());
@@ -45920,6 +45996,66 @@ mod tests {
         // The last channel is the one a naive search would have spent.
         assert!(app.channel_used(recorder::CHANNELS - 1), "a track was eaten");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **No lane moves under an export or an arrangement record.** Both bind
+    /// lane INDICES at their press - an export's stems, the record's lanes
+    /// and its punches - and the lane drags refuse for exactly that reason.
+    /// Insert and Paste Track Below, Cmd/Ctrl+F grouping and a drag that
+    /// comes home on a folder's middle child reach `reorder_channels` by
+    /// roads of their own, and none of them asked: a stem went on writing
+    /// whatever had moved onto its row, and the record landed on the wrong
+    /// track. Each one refuses now before it changes anything, and says why.
+    #[test]
+    fn no_lane_moves_under_an_export_or_an_arrangement_record() {
+        for (exporting, arr) in [(true, false), (false, true)] {
+            let root = project_scratch("lanes-held");
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.bootstrap_project(&root.join("Projects"));
+            app.settings.strip_names.resize(recorder::STRIPS + 1, String::new());
+            app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+            app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+            // Two tracks to insert under and group, and further down a
+            // folder with two children for the drag that comes home.
+            for (ch, name) in [(2usize, "CLICKED"), (3, "UNDER"), (8, "GROUP"), (9, "KID A"), (10, "KID B")] {
+                app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+                app.settings.strip_names[recorder::Strip::Channel(ch).index()] = name.to_owned();
+            }
+            app.settings.strip_is_folder[8] = true;
+            app.settings.strip_in_folder[9] = true;
+            app.settings.strip_in_folder[10] = true;
+            assert_eq!(app.folder_children(8), vec![9, 10], "the fixture's folder");
+            app.copy_track(2);
+            let lanes = |app: &TangentApp| -> Vec<(Option<recorder::ChannelKind>, String, bool, bool)> {
+                (0..recorder::CHANNELS)
+                    .map(|ch| {
+                        (
+                            app.channel_kind(ch),
+                            app.settings.strip_names[recorder::Strip::Channel(ch).index()].clone(),
+                            app.settings.strip_is_folder[ch],
+                            app.settings.strip_in_folder[ch],
+                        )
+                    })
+                    .collect()
+            };
+            let before = lanes(&app);
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            let held = format!("export={exporting} record={arr}");
+            assert!(!app.insert_track_below(2), "Insert Track Below opened a lane under {held}");
+            assert_eq!(lanes(&app), before, "Insert Track Below moved the lanes under {held}");
+            assert!(!app.paste_track_below(2), "Paste Track Below opened a lane under {held}");
+            assert_eq!(lanes(&app), before, "Paste Track Below moved the lanes under {held}");
+            app.selected_tracks = vec![2, 3];
+            app.selected_channel = Some(2);
+            assert!(!app.make_folder(), "Cmd/Ctrl+F grouped tracks under {held}");
+            assert_eq!(lanes(&app), before, "Cmd/Ctrl+F moved the lanes under {held}");
+            app.eject_from_folder(9);
+            assert_eq!(lanes(&app), before, "a drag home ejected a middle child under {held}");
+            assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// **Cmd+C and Cmd+V carry a whole TRACK when no clip is selected.**
@@ -57659,6 +57795,84 @@ mod tests {
         assert!(app.channel_used(2), "the child lost its track");
     }
 
+    /// **A lane dropped under an export or an arrangement record lands
+    /// nowhere, its folder included**, in both views, driven by real pointer
+    /// events. The ordinary drop decided membership from where the block
+    /// landed and only then asked `move_selection`, which refused: the child
+    /// left its folder while its row stayed where it was, a group changed
+    /// under a pass that writes it by row.
+    #[test]
+    fn a_lane_dropped_under_an_export_or_a_record_keeps_its_folder() {
+        for ((exporting, arr), mixer) in [(true, false), (false, true)]
+            .into_iter()
+            .flat_map(|held| [(held, false), (held, true)])
+        {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.arrangement_open = !mixer;
+            app.mixer_open = mixer;
+            for n in 0..5 {
+                app.add_bare_track(n);
+            }
+            app.toggle_folder(1);
+            app.set_in_folder(2, true);
+            let _ = run_frame(&ctx, &mut app);
+            let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.frame(ctx),
+                );
+            };
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            // Out of the folder, onto the BODY of a row or strip outside it:
+            // an ordinary move, not a snap and not a drag home.
+            let (grab, drop) = if mixer {
+                let rect = app.mixer_rect.expect("mixer rect");
+                let view = app.mixer_view();
+                let l = crate::mixer_panel::Layout::new(rect, &view);
+                let body = l.strips[4].panel;
+                (
+                    l.strips[2].name.center(),
+                    Pos2::new(body.left() + body.width() * 0.3, body.center().y),
+                )
+            } else {
+                let rect = app.arrangement_rect.expect("arrange rect");
+                let clips = app.arr_clip_views();
+                let view = app.arrange_view(&clips);
+                let l = crate::arrangement_panel::Layout::new(rect, &view);
+                (l.header_rows[2].name.center(), l.header_rows[4].panel.center())
+            };
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            let held = format!("export={exporting} record={arr} mixer={mixer}");
+            frame(&mut app, vec![egui::Event::PointerMoved(grab), button(grab, true)]);
+            assert!(
+                if mixer {
+                    app.mixer_reorder.is_some()
+                } else {
+                    matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 2, .. }))
+                },
+                "the press did not arm the carry under {held}"
+            );
+            frame(&mut app, vec![egui::Event::PointerMoved(drop)]);
+            frame(&mut app, vec![egui::Event::PointerMoved(drop), button(drop, false)]);
+            assert!(
+                app.in_folder(2),
+                "the dropped child left its folder under {held} (children: {:?})",
+                app.folder_children(1)
+            );
+            assert_eq!(app.folder_children(1), vec![2], "the group changed under {held}");
+        }
+    }
+
     /// **A child dragged out lands on its own row** - the owner's "drag a
     /// child on track 6 OUT and have it land on track 6". The run's last
     /// child ejects by flag alone; a middle child steps just past the run.
@@ -61220,6 +61434,41 @@ mod tests {
             forever,
             "the session copy must not go on shadowing it"
         );
+    }
+
+    /// **The Export dialog cannot move a held tempo.** `apply_recorder_hit`
+    /// refuses the knob, TAP, the typed TEMPO and the metronome panel while
+    /// the tempo is held, and the dialog's OK never went through it: during
+    /// the arrangement's count-in it moved the engine's count while every
+    /// other tempo control was refused. The rest of the dialog still lands;
+    /// only the tempo stays, and the OK says so.
+    #[test]
+    fn the_export_dialog_cannot_move_a_held_tempo() {
+        for remember in [false, true] {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.settings.record_export.tempo_bpm = 120.0;
+            app.recorder.take_counting = true;
+            assert!(app.recorder.tempo_held(), "the fixture holds no tempo");
+            app.messages.clear();
+            let mut spec = app.export_spec();
+            spec.tempo_bpm = 90.0;
+            spec.midi = !spec.midi;
+            let midi = spec.midi;
+            app.apply_dialog_action(if remember {
+                DialogAction::SetExportAndRemember(spec)
+            } else {
+                DialogAction::SetExport(spec)
+            });
+            assert_eq!(app.tempo_bpm(), 120.0, "the Export dialog moved a held tempo (remember: {remember})");
+            assert_eq!(app.export_spec().midi, midi, "the rest of the dialog went with the tempo");
+            assert!(!app.said().notes().is_empty(), "the held tempo was kept without a word");
+            // Nothing holding it, the dialog's tempo lands as before.
+            app.recorder.take_counting = false;
+            let mut spec = app.export_spec();
+            spec.tempo_bpm = 90.0;
+            app.apply_dialog_action(DialogAction::SetExport(spec));
+            assert_eq!(app.tempo_bpm(), 90.0, "the dialog's tempo is refused with nothing holding it");
+        }
     }
 
     /// Transposing moves the notes and the chord name with them.
