@@ -10633,14 +10633,9 @@ impl TangentApp {
             // (`template_desk`), and taking it literally would put a column
             // somebody sized back on AUTO at every launch and New. (A
             // document from before these keys has no `view` block at all;
-            // `from_value` answers `None` and none of this runs.)
-            //
-            // **Not yet right for an undo.** A moment is the live desk, so
-            // its zero IS the auto value; but `undo_apply` comes through
-            // here too and skips it, so a Ctrl+Z past a first resize leaves
-            // the dragged width (or the wheeled count) standing, and the next
-            // Ctrl+Z commits that desk, cuts the redo tail and lands on the
-            // same moment again. See `TangentApp::undo_commit`.
+            // `from_value` answers `None` and none of this runs.) An undo
+            // comes through here too, and `undo_apply` then puts both back
+            // verbatim: a moment is the live desk, so its zero IS auto.
             if v.header_w > 0.0 && v.header_w.is_finite() {
                 self.settings.arr_header_w = v.header_w;
             }
@@ -16281,6 +16276,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // `Moment`. The document carries the moment's desk afterwards, as
         // the parsed one used to, for the two roads that read it.
         self.apply_desk_snapshot(&moment.desk);
+        // **An AUTO width and lane count come back too.** The apply skips a
+        // zero for the open and the template adopt, and an undo through the
+        // same skip left a dragged width or a wheeled count standing: the
+        // next Ctrl+Z committed that desk, cut the redo tail and landed on
+        // the same moment again, forever. A moment is the live desk, so its
+        // zero IS auto, and it is put back verbatim here and only here.
+        if let Some(v) = moment.desk.view.as_ref() {
+            if v.header_w.is_finite() {
+                self.settings.arr_header_w = v.header_w;
+            }
+            self.settings.arr_visible = v.visible;
+            self.settings.arr_visible_at = if v.visible_at.is_finite() {
+                v.visible_at.clamp(0.0, f64::from(f32::MAX)) as f32
+            } else {
+                0.0
+            };
+        }
         // The settings file is a MIRROR of a desk the document already
         // holds, so the write it is owed rides the fader debounce rather
         // than landing synchronously on every Ctrl+Z — it was a 15,000-line
@@ -41496,6 +41508,61 @@ mod tests {
         app.arr_drag = None;
         app.commit_view_change();
         assert_eq!(app.hist_at, at + 1, "the release left the drag uncommitted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Undo puts an AUTO width and lane count back, and never wedges.**
+    ///
+    /// Zero is AUTO for the header's width and the lane count, and the desk
+    /// apply skips a zero so an open or New never un-sizes a column from the
+    /// template. An undo came through the same skip: Ctrl+Z past the first
+    /// seam drag left the dragged width standing, so the next Ctrl+Z
+    /// committed that desk, cut the redo tail and landed on the same moment
+    /// again - forever, until the next open. A fresh install, or a Reset
+    /// Layout, is all it takes.
+    #[test]
+    fn undo_puts_an_auto_width_and_lane_count_back_and_never_wedges() {
+        let root = project_scratch("autoview");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.commit_view_change();
+        assert!(app.settings.arr_header_w.abs() < 1e-9, "fixture: the width is not on AUTO");
+        assert_eq!(app.settings.arr_visible, 0, "fixture: the lane count is not on AUTO");
+        let n = (0..recorder::CHANNELS)
+            .find(|&n| (app.settings.tracks_added >> n) & 1 == 0)
+            .expect("a free slot");
+        app.add_bare_track(n);
+        let m1 = app.hist_at;
+        assert!(m1 >= 1, "fixture: the track add left no moment");
+        // The seam drag's write (`ArrDrag::HeaderGrip`), committed on the release frame...
+        app.settings.arr_header_w = 220.0;
+        app.commit_view_change();
+        // ...and the first Shift+wheel notch's.
+        app.settings.arr_visible = 9;
+        app.settings.arr_visible_at = 700.0;
+        app.commit_view_change();
+        assert_eq!(app.hist_at, m1 + 2, "fixture: the width and the count are a moment each");
+        for _ in 0..3 {
+            app.undo();
+            app.commit_view_change(); // the end of that frame
+        }
+        assert_eq!(app.hist_at, m1 - 1, "three Ctrl+Z from the top stopped at moment {} - undo is wedged", app.hist_at);
+        assert_eq!((app.settings.tracks_added >> n) & 1, 0, "the track add was never undone");
+        assert!(app.settings.arr_header_w.abs() < 1e-9, "undo left the dragged width at {}", app.settings.arr_header_w);
+        assert_eq!(app.settings.arr_visible, 0, "undo left the wheeled lane count standing");
+        for _ in 0..3 {
+            app.redo();
+            app.commit_view_change();
+        }
+        assert!((app.settings.arr_header_w - 220.0).abs() < 1e-9, "redo lost the width");
+        assert_eq!(app.settings.arr_visible, 9, "redo lost the lane count");
+        assert_eq!((app.settings.tracks_added >> n) & 1, 1, "redo lost the track");
+        // **Only an undo takes a zero literally.** The shipped template is
+        // seeded on AUTO, and the open or adopt that applies it keeps a sized
+        // column, or every launch and New would un-size it.
+        app.apply_desk_snapshot(&TangentApp::template_desk());
+        assert!((app.settings.arr_header_w - 220.0).abs() < 1e-9, "the template put a sized column back on AUTO");
+        assert_eq!(app.settings.arr_visible, 9, "the template put a chosen lane count back on AUTO");
         let _ = std::fs::remove_dir_all(&root);
     }
 
