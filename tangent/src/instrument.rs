@@ -6401,10 +6401,9 @@ fn fill_automation_params(
 /// the one the callback is on, which is what a lane rendered ahead needs.
 /// The other half of the automation, the one-shot knob and preset edits that
 /// arrive on a ring, is NOT a function of position and stays where it is:
-/// see `resolve_automation`. `param_lanes` only keeps a lane those land on
-/// from PARKING; it is not in the pin set, so a lane served from its grain
-/// ring that block runs no rack and the edit goes with the queue's clear at
-/// the next block.
+/// see `resolve_automation`. `param_lanes` keeps a lane those land on from
+/// PARKING, and `Renderer::ui_held` keeps an edit for a lane served from its
+/// grain ring that block, which runs no rack, until the lane's rack runs.
 fn automation_now(
     automation: &tangent_ui::automation::Automation,
     suspend: u64,
@@ -7982,8 +7981,8 @@ struct Renderer {
     /// That is why a lane with a parameter waiting counts as live. See
     /// `a_parked_lane_still_hears_a_knob`. Counting as live stops a lane
     /// PARKING; it does not stop `plan_grains` serving the lane from its grain
-    /// ring, which runs no rack either, so an edit popped on such a block is
-    /// still lost (see `automation_now`).
+    /// ring, which runs no rack either, so an edit for such a lane is kept in
+    /// `ui_held` and applied again until its rack runs.
     param_lanes: u32,
     /// **Which lanes carry a plugin-parameter CURVE**, from this chunk's walk
     /// of the document (`fill_automation_params`), kept apart from the knob
@@ -7997,6 +7996,25 @@ struct Renderer {
     /// curve at the grain's own position instead would still hold one value
     /// for the whole grain, which is the staircase back again.
     curve_lanes: u32,
+    /// **Knob and preset edits a lane served from its grain ring has not
+    /// heard yet.**
+    ///
+    /// The `ui_params` drain is destructive and `auto_params` is cleared
+    /// every block, and a lane `plan_grains` serves from its ring runs no
+    /// rack that block (`lane_skip`). So an edit for it was cleared before
+    /// anything read it, while the face and the saved project kept the new
+    /// value: a grained lane runs its rack once a grain, and a knob turned in
+    /// an LV2 plugin's own window was lost on every other callback. Pinning
+    /// would not have saved it, because a newly pinned lane is still served
+    /// from its ring until the ring runs out.
+    ///
+    /// Every edit for a lane's seat is kept here as it is applied, the last
+    /// value per id, and the next block's `resolve_automation` applies again,
+    /// ahead of anything new, those whose lane was served from its ring;
+    /// the rest were delivered and go. So the edit lands on the lane's next
+    /// rendered grain, as a curve edit does. Sized once at the ring's own
+    /// size; an edit past it is applied but not kept.
+    ui_held: Vec<UiParam>,
     /// Which lanes the deciding walk left for the render walk to do.
     lane_wants: [bool; CHANNELS],
     /// **The span each lane is rendering this chunk**, which is the chunk's
@@ -11564,15 +11582,51 @@ impl Renderer {
             q.clear();
         }
         // **Which lanes are owed a parameter this block.** See
-        // `param_lanes`: a lane that skips its render loses the point
-        // rather than deferring it, so this is what keeps it awake.
+        // `param_lanes`: a parked lane would lose the point rather than
+        // defer it, so this is what keeps it awake.
         self.param_lanes = 0;
         self.curve_lanes = 0;
+        // **The edits a lane served from its grain ring has not heard yet** -
+        // see `ui_held`. `lane_skip` still holds the LAST block's plan here
+        // (`plan_grains` runs later in the chunk), so what stays is exactly
+        // the edits whose lane ran no rack; the rest were delivered.
+        let skipped = self.lane_skip;
+        self.ui_held.retain(|u| {
+            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| skipped[ch.min(CHANNELS - 1)])
+        });
+        let held = self.ui_held.len();
+        let mut next_held = 0usize;
         // **Before the early return below, not after it.** A plugin's own
         // window works in a song with no automation at all — which is most
         // songs — and draining these after the `is_empty` shortcut would have
         // meant every LV2 knob was dead until somebody drew a curve.
-        while let Ok(u) = self.ui_params.pop() {
+        //
+        // The held edits first, as the older: a fresh one for the same id
+        // then wins in place, below.
+        loop {
+            let u = if next_held < held {
+                let Some(u) = self.ui_held.get(next_held).copied() else {
+                    break;
+                };
+                next_held += 1;
+                u
+            } else if let Ok(u) = self.ui_params.pop() {
+                // Kept until the lane's rack has run, last value per id.
+                if lane_of_seat(usize::from(u.lane)).is_some() {
+                    if let Some(k) = self
+                        .ui_held
+                        .iter_mut()
+                        .find(|k| k.lane == u.lane && k.bay == u.bay && k.id == u.id)
+                    {
+                        k.value = u.value;
+                    } else if self.ui_held.len() < self.ui_held.capacity() {
+                        self.ui_held.push(u);
+                    }
+                }
+                u
+            } else {
+                break;
+            };
             let (lane, bay) = (usize::from(u.lane), usize::from(u.bay));
             // `RACK_SEATS`, not `CHANNELS`: the queues cover every seat now,
             // and bounding this at the channel count would have dropped every
@@ -16434,6 +16488,7 @@ impl Engine {
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
             curve_lanes: 0,
+            ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
@@ -22640,6 +22695,7 @@ mod tests {
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
             curve_lanes: 0,
+            ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],

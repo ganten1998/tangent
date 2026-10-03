@@ -2130,6 +2130,50 @@ fn a_grained_lanes_plugin_automation_steps_where_a_chunked_one_does() {
     assert!(peak > 0.001, "the render was silent");
 }
 
+/// **A knob turned while a lane is served from its grain still reaches the
+/// plugin.**
+///
+/// A knob and a preset reach the audio thread on `ui_params`, and the drain
+/// is destructive: the point is popped into a queue that is cleared next
+/// block, and the only reader is the lane's rack. A grained lane runs its
+/// rack on one callback in four here (128 frames into a 512-frame grain), so
+/// an edit popped on any of the other three was dropped, while the face and
+/// the saved project kept the new value. Every phase of the grain, one
+/// engine each, because a lost edit is never sent again.
+#[test]
+fn a_knob_turned_while_a_lane_is_served_from_its_grain_still_lands() {
+    for wait in 0..8usize {
+        let mut e = audio_desk(1, &["@tangent-trim"]);
+        e.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let energy = |out: &[f32]| out.iter().map(|s| s * s).sum::<f32>();
+        for _ in 0..(8 + wait) {
+            e.render_offline(&mut out);
+        }
+        let mut before = 0.0f32;
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+            before += energy(&out);
+        }
+        // 0.9 of the trim's travel: +19.2 dB.
+        assert!(e.set_insert_param(0, 0, 0, 0.9), "the trim refused the knob");
+        for _ in 0..(RATE as usize / BLOCK / 2) {
+            e.render_offline(&mut out);
+        }
+        let mut after = 0.0f32;
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+            after += energy(&out);
+        }
+        assert!(before > 0.0, "the reference was silent");
+        assert!(
+            after > before * 20.0,
+            "an edit {wait} blocks into the steady state never reached the trim: \
+             {before} -> {after}"
+        );
+    }
+}
+
 /// **Auto picks the grain the measurements picked.**
 ///
 /// The rule is one line - eight callbacks' worth, capped at `MAX_BLOCK` -
