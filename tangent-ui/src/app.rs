@@ -6001,11 +6001,12 @@ impl TangentApp {
         self.apply_mixer_hit_spread(hit, value);
         // **A SWITCH is a press, so it is a gesture, so it is a moment.**
         //
-        // Mute, solo, arm, polarity and the theory send are all desk fields
-        // and all hashed, and none of them committed in EITHER panel: the
-        // mixer's release commit fires only for a control that armed
-        // `mixer_grab`, which a switch never does. So pressing M on a track
-        // left no moment and folded into whatever the user did next.
+        // Mute, solo, arm, polarity, the theory send and the master's mono
+        // fold are all desk fields and all hashed, and none of them
+        // committed in EITHER panel: the mixer's release commit fires only
+        // for a control that armed `mixer_grab`, which a switch never does.
+        // So pressing M on a track left no moment and folded into whatever
+        // the user did next.
         //
         // **Out here rather than at the end of the spread**, because that
         // function returns from four places - the plain single-track press
@@ -6018,7 +6019,7 @@ impl TangentApp {
         // the release, through `arr_gesture_dirty`.
         if matches!(
             hit,
-            H::Mute(_) | H::Solo(_) | H::Arm(_) | H::ToTheory(_) | H::Phase(_)
+            H::Mute(_) | H::Solo(_) | H::Arm(_) | H::ToTheory(_) | H::Phase(_) | H::Mono(_)
         ) {
             self.undo_commit();
         }
@@ -6480,6 +6481,10 @@ impl TangentApp {
                         if self.insert(seat, bay).is_some() {
                             let on = action == crate::mixer_panel::FxAction::Bypass;
                             self.set_insert_bypass(seat, bay, on);
+                            // A menu row, so a press, so a moment: the flag is
+                            // hashed, and the setter commits nothing because
+                            // the host's pedalboard seed writes it too.
+                            self.undo_commit();
                         }
                     }
                     crate::mixer_panel::FxAction::Delete => {
@@ -24758,6 +24763,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         if self.insert(seat, bay).is_some() {
                             let on = a == crate::mixer_panel::FxAction::Bypass;
                             self.set_insert_bypass(seat, bay, on);
+                            // The desk's row commits here too; see there.
+                            self.undo_commit();
                         }
                     }
                     Some(crate::mixer_panel::FxAction::Delete) => {
@@ -32625,9 +32632,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Saved on the spot, like every other desk fact a click changes: the
     /// engine reads the published table next frame and a crash between the
     /// two must not lose which of two plugins somebody was comparing.
+    ///
+    /// **And one moment**, because this is the GESTURE (a shift-click, or a
+    /// face's BYPASS) and the flag is hashed: it saved and committed
+    /// nothing, so a bypass folded into the next edit's step back.
     pub fn toggle_insert_bypass(&mut self, strip: usize, slot: usize) -> bool {
         let on = self.settings.insert_bypass.toggle(strip, slot);
         self.save_settings();
+        self.undo_commit();
         on
     }
 
@@ -32645,6 +32657,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `BypassBays::set` answers: the seed runs inside a per-frame reconcile
     /// and a settings write per frame for a file that is already correct is
     /// the kind of thing that shows up as a disk light nobody can explain.
+    ///
+    /// **Commits nothing**, so the seed's writes stay one batch. The FX
+    /// menus' Bypass and Unbypass rows also land here, and each takes its
+    /// moment where it is pressed.
     pub fn set_insert_bypass(&mut self, strip: usize, slot: usize, on: bool) -> bool {
         let moved = self.settings.insert_bypass.set(strip, slot, on);
         if moved {
@@ -42260,6 +42276,70 @@ mod tests {
             "the automation dial no longer asks for its moment"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The master's mono fold and a plugin's bypass are each their own
+    /// step back, on every road to them.**
+    ///
+    /// Both are desk fields and both are hashed (`master_mono`,
+    /// `insert_bypass`), and none of the five roads committed: the mixer's
+    /// switch list named mute, solo, arm, polarity and the theory send and
+    /// missed MONO, and the bypass setters only saved. So pressing MONO, or
+    /// bypassing a plugin to compare, folded into whatever came next and one
+    /// Ctrl+Z took both away.
+    ///
+    /// Driven through the gesture entry points, not the setters: the mixer's
+    /// hit, the arrangement's bay menu by a real click, the shift-click and
+    /// the face's own BYPASS.
+    #[test]
+    fn the_mono_fold_and_every_bypass_road_are_their_own_moments() {
+        use crate::mixer_panel::{FxAction, Hit as H};
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        let col = recorder::Column(3);
+        let (seat, bay) = app.slot_seat(col, 0);
+        app.set_insert(seat, bay, Some("/x/comp.vst3"));
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        // The master's switch. The arm ignores its column.
+        let before = app.hist_at;
+        app.apply_mixer_hit(H::Mono(col), 0.0);
+        assert!(app.settings.master_mono, "the fixture's mono fold did not land");
+        assert_eq!(app.hist_at, before + 1, "the master's mono fold left no moment");
+        // The mixer's FX menu.
+        let before = app.hist_at;
+        app.apply_mixer_hit(H::FxMenu(col, 0, FxAction::Bypass), 0.0);
+        assert!(app.insert_bypassed(seat, bay), "the FX menu's Bypass did not land");
+        assert_eq!(app.hist_at, before + 1, "the FX menu's Bypass left no moment");
+        // The arrangement's bay menu, pressed on its own row.
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        let at = rect.center();
+        app.arr_fx_menu = Some((seat, bay, at));
+        let actions = app.arr_fx_menu_actions(seat, bay);
+        let row = actions
+            .iter()
+            .position(|a| *a == FxAction::Unbypass)
+            .expect("a bypassed bay's menu offers Unbypass");
+        let row = TangentApp::clip_menu_rows(at, actions.len())[row].center();
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, row, egui::Modifiers::NONE);
+        assert!(!app.insert_bypassed(seat, bay), "the bay menu's Unbypass did not land");
+        assert_eq!(app.hist_at, before + 1, "the bay menu's Unbypass left no moment");
+        // Shift on a loaded bay.
+        let before = app.hist_at;
+        assert!(app.bay_gesture(seat, bay, false, true), "shift on a loaded bay is a bypass");
+        assert!(app.insert_bypassed(seat, bay), "the shift-click did not bypass");
+        assert_eq!(app.hist_at, before + 1, "a shift-click bypass left no moment");
+        // The face's own BYPASS, in desk terms.
+        let before = app.hist_at;
+        app.apply_dialog_action(DialogAction::SetInsertBypass { strip: 3, slot: 0, on: false });
+        assert!(!app.insert_bypassed(seat, bay), "the face's BYPASS did not land");
+        assert_eq!(app.hist_at, before + 1, "the face's BYPASS left no moment");
+        // One step back takes the last one off, and only that one.
+        app.undo();
+        assert!(app.insert_bypassed(seat, bay), "one Ctrl+Z did not undo the face's BYPASS");
+        assert!(app.settings.master_mono, "one Ctrl+Z also undid the mono fold");
     }
 
     /// **The metronome panel's rows and the band's take toggles are each
