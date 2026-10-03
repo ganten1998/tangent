@@ -36,6 +36,9 @@
 #   export TRUSTED_SIGNING_PROFILE=<your-certificate-profile>
 #   # token: taken from `az account get-access-token` unless you set
 #   # TRUSTED_SIGNING_TOKEN yourself (e.g. from a CI federated credential).
+#   # Set that one around the signing step only: an exported variable reaches
+#   # every child of the build, the build scripts of every dependency
+#   # included.
 set -euo pipefail
 
 EXE="${1:-}"
@@ -84,9 +87,19 @@ echo "==> Signing $NAME via Azure Artifact Signing"
 # Authenticode timestamp protocol, Microsoft's server speaks only RFC 3161,
 # and the default fails AFTER Azure has signed, as "Malformed content" /
 # "Unable to complete the timestamping" (the first real signing, 2026-09-24).
+#
+# **The token goes in jsign's ENVIRONMENT, never on its command line.** A
+# command line is readable by every process on the machine for as long as
+# the signing runs (`ps -axo args`); an environment only by its own user and
+# root. `--storepass env:NAME` makes jsign read the password from NAME (its
+# man page documents the prefix; jsign has had it since 4.1 and TRUSTEDSIGNING
+# only since 7.0, so every jsign this script can use reads it), and the
+# assignment in front of the command exports the variable to jsign alone, not
+# to this shell.
+TANGENT_SIGNING_TOKEN="$token" \
 jsign --storetype TRUSTEDSIGNING \
       --keystore "$TRUSTED_SIGNING_ENDPOINT" \
-      --storepass "$token" \
+      --storepass env:TANGENT_SIGNING_TOKEN \
       --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
       --tsaurl http://timestamp.acs.microsoft.com \
       --tsmode RFC3161 \
