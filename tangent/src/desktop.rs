@@ -15114,6 +15114,12 @@ impl DesktopApp {
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
+        // Polarity, one bit per strip - see `Shared::strip_phase`. **Take or
+        // no take**: the switch is a desk control like mute, and a take is
+        // capture only. It sat in the meter's gate below, so a flip during a
+        // take or its count-in lit and changed nothing, then landed when the
+        // take ended, in the middle of playback.
+        e.set_strip_phase(self.app.strip_phase());
         // The signature drives both halves of the click: which beat is accented
         // and how long a beat lasts. In 6/8 those are "every sixth" and "half a
         // quarter" — get the second wrong and the count-in is twice as long as
@@ -15129,8 +15135,6 @@ impl DesktopApp {
             // Beside the meter, because it is read with it: how many clicks
             // a beat of that signature carries.
             e.set_metronome_div(self.app.metronome_div());
-            // Polarity, one bit per strip — see `Shared::strip_phase`.
-            e.set_strip_phase(self.app.strip_phase());
         }
         // **The instances themselves, last, with the `&mut` the walk above
         // never needed.** Everything before this line is an atomic store;
@@ -28794,6 +28798,34 @@ mod tests {").expect("the tests module")];
         assert!(gate < routes && gate < desk, "a table publish sits outside the change gate");
         assert!(body[gate..routes].contains("self.engine_epoch"), "the gate is not keyed on the engine");
         assert_eq!(body.matches("self.app.desk()").count(), 1, "the desk is built more than once a frame");
+    }
+
+    /// **Polarity is pushed under a take.** Only the meter and the click's
+    /// division are held while a take runs (`Session::set_meter` refuses
+    /// mid-take, and the division is read with the meter). The Ø switch is a
+    /// desk control like mute, and a take is capture only, but it sat inside
+    /// the same gate: flipped during a take or its count-in, it lit and was
+    /// neither heard nor recorded, and landed when the take ended, in the
+    /// middle of playback. A scan, because `DesktopApp` cannot be built in a
+    /// test.
+    #[test]
+    fn polarity_reaches_the_engine_under_a_take() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn push_monitor_settings(&mut self)").expect("push_monitor_settings");
+        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+        let body = &src[at..end];
+        let gate = body
+            .find("if !self.recorder.session.is_recording() {")
+            .expect("the meter's take gate");
+        let gate_end = gate + body[gate..].find("\n        }\n").expect("the gate's end");
+        let push = body
+            .find("e.set_strip_phase(self.app.strip_phase());")
+            .expect("polarity is not pushed to the live engine at all");
+        assert!(
+            !(gate..gate_end).contains(&push),
+            "polarity is pushed only while no take runs: the switch lights and the engine never hears it"
+        );
     }
 
     /// **What the four table publishes cost per frame**, release, on an
