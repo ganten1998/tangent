@@ -6305,10 +6305,7 @@ impl TangentApp {
                         }
                     }
                     // The metronome IS the click switch, here as in the band.
-                    Some(Strip::Click) => {
-                        self.settings.metronome_on = !self.settings.metronome_on;
-                        self.save_settings();
-                    }
+                    Some(Strip::Click) => self.toggle_metronome(),
                     _ => {}
                 }
                 return;
@@ -25859,8 +25856,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // button actually arrives, at the top of this
                         // function. A `secondary_down()` test in here is
                         // unreachable: this arm only runs on a PRIMARY press.
-                        self.settings.metronome_on = !self.settings.metronome_on;
-                        self.save_settings();
+                        self.toggle_metronome();
                     }
                     Some(A::ToolSnap) => {
                         self.settings.arr_snap = !self.settings.arr_snap;
@@ -31683,10 +31679,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             A::AutoBypass(n, slot) => self.arr_toggle_auto_bypass(n, slot),
             A::AutoDial(..) => {}
             A::TempoHeader => self.arr_ask_flatten_tempo(),
-            A::ToolMetronome => {
-                self.settings.metronome_on = !self.settings.metronome_on;
-                self.save_settings();
-            }
+            A::ToolMetronome => self.toggle_metronome(),
             A::ToolSnap => {
                 self.settings.arr_snap = !self.settings.arr_snap;
                 self.save_settings();
@@ -32315,6 +32308,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     pub fn metronome_on(&self) -> bool {
         self.settings.metronome_on
+    }
+
+    /// **Switch the click on or off: one road for the four switches** (the
+    /// mixer's click strip, the arrangement toolbar's button and its
+    /// keyboard twin, and M on either desk surface).
+    ///
+    /// A press, so a moment. `metronome_on` is a desk field and hashed, and
+    /// each of the four only saved the settings, so the switch folded into
+    /// the next gesture's step back: the click turned on, a take recorded,
+    /// and one Ctrl+Z took the take away and the click off with it.
+    fn toggle_metronome(&mut self) {
+        self.settings.metronome_on = !self.settings.metronome_on;
+        self.save_settings();
+        self.undo_commit();
     }
 
     /// **Which strips are polarity-inverted**, one bit per strip.
@@ -38054,8 +38061,7 @@ impl TangentApp {
                     // toggle met on in mixer, not be bound to change taught
                     // chords there". Teaching a chord from the mixer is not a
                     // thing anybody does; reaching for the click is.
-                    self.settings.metronome_on = !self.settings.metronome_on;
-                    self.save_settings();
+                    self.toggle_metronome();
                 } else {
                     self.apply_key_action(&ctx, action);
                 }
@@ -42381,6 +42387,59 @@ mod tests {
             "one Ctrl+Z on the loudness window also undid the count-in"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Switching the click on or off is its own step back, on every road
+    /// to the switch.**
+    ///
+    /// `metronome_on` is a desk field and hashed (the click switched on is
+    /// part of the document), and none of the four switches committed: the
+    /// mixer's click strip, the arrangement toolbar's button and its
+    /// keyboard twin, and M on either desk surface. So turning the click on
+    /// and then recording a take was one Ctrl+Z for both: the take went, and
+    /// the click went off with it.
+    #[test]
+    fn switching_the_click_is_its_own_moment_on_every_road() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        // The mixer's click strip: its switch is the `Add` hit on the click's
+        // column.
+        let click = recorder::Strip::Click.column_of().expect("the click has a column");
+        let was = app.settings.metronome_on;
+        let before = app.hist_at;
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Add(click), 0.0);
+        assert_ne!(app.settings.metronome_on, was, "the strip's switch did not switch");
+        assert_eq!(app.hist_at, before + 1, "the click strip's switch left no moment");
+        // The arrangement toolbar's button, pressed.
+        let tool = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).tool_met
+        };
+        let was = app.settings.metronome_on;
+        let before = app.hist_at;
+        click_with(&ctx, &mut app, tool.center(), egui::Modifiers::NONE);
+        assert_ne!(app.settings.metronome_on, was, "the toolbar's button did not switch");
+        assert_eq!(app.hist_at, before + 1, "the toolbar's click switch left no moment");
+        // Its keyboard twin.
+        let was = app.settings.metronome_on;
+        let before = app.hist_at;
+        app.apply_arrange_key(crate::arrangement_panel::Hit::ToolMetronome, None);
+        assert_ne!(app.settings.metronome_on, was, "the toolbar's keyboard road did not switch");
+        assert_eq!(app.hist_at, before + 1, "the toolbar's keyboard road left no moment");
+        // M, on the arrangement.
+        let was = app.settings.metronome_on;
+        let before = app.hist_at;
+        key_with(&ctx, &mut app, egui::Key::M, egui::Modifiers::NONE);
+        assert_ne!(app.settings.metronome_on, was, "M did not switch the click");
+        assert_eq!(app.hist_at, before + 1, "M left no moment");
+        // One step back takes M's switch off, and only that one.
+        app.undo();
+        assert_eq!(app.settings.metronome_on, was, "one Ctrl+Z did not undo M's switch");
     }
 
     /// **A folder is made, shut and opened in one step each.**
