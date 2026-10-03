@@ -14892,8 +14892,16 @@ impl DesktopApp {
             let head = self.recorder.take_head_s;
             // Whether `timeline_start` places frame 0 at all: a take no
             // longer rolls the transport, so a take over a stopped song has
-            // no single place on the timeline.
-            let rolling = self.recorder.transport.playing();
+            // no single place on the timeline - unless a Play waits on the
+            // downbeat its pre-roll begins on. See `take_rolls_from_frame_0`.
+            let rolling = take_rolls_from_frame_0(
+                self.recorder.transport.playing(),
+                self.recorder.play_on_go,
+                matches!(
+                    self.recorder.session.state(),
+                    tangent_ui::recorder::RecordState::CountIn { .. }
+                ),
+            );
             let mask = |bits: &[bool]| {
                 bits.iter()
                     .enumerate()
@@ -15778,6 +15786,22 @@ fn press_wait_and_head(
         None if in_take => (0, 0.0),
         None => (beats, 0.0),
     }
+}
+
+/// **Whether the song rolls from a take's first frame**, for its
+/// `timeline_rolling`: the transport rolling now, or a Play waiting on the
+/// downbeat a pre-roll take begins on (`play_on_go`), which starts the song
+/// on that downbeat from where the playhead waits.
+///
+/// Decided by the press, not by a race. The facts are pushed at the top of
+/// the frame and the downbeat's handover fires Play-on-go after them, so a
+/// pre-roll whose wall clock ended on the handover's frame latched a
+/// stopped transport and one that ended a frame later a rolling one - two
+/// identical presses, two different manifests. A take with its count in
+/// the file (`pre_roll` false) began at its press, before the song.
+#[cfg(feature = "recorder")]
+fn take_rolls_from_frame_0(playing: bool, play_on_go: bool, pre_roll: bool) -> bool {
+    playing || (play_on_go && pre_roll)
 }
 
 /// Whether AccessKit is live — which is to say, whether an assistive
@@ -22866,6 +22890,35 @@ mod tests {
         assert_eq!(press_wait_and_head(Some((4, 0.5)), false, 0, false, beat), (4, 0.0));
         assert_eq!(press_wait_and_head(Some((4, 0.5)), true, 0, false, beat), (0, 1.5));
         assert_eq!(press_wait_and_head(Some((4, 9.0)), true, 0, false, beat), (0, 0.0));
+    }
+
+    /// **A pre-roll take under a waiting Play says the song rolled from its
+    /// first frame, every time.** The facts are pushed at the top of the
+    /// frame, the downbeat's handover fires Play-on-go after them, and the
+    /// wall clock's `begin` latches them after that: `timeline_rolling`
+    /// came out false when the two landed on one frame and true when the
+    /// handover was a frame earlier, so two identical presses wrote two
+    /// different manifests. A take whose count is in the file began at the
+    /// press, before the song, and stays false.
+    #[test]
+    fn a_pre_roll_take_under_a_waiting_play_rolls_from_its_first_frame() {
+        // (rolling now, a Play waiting, counting a pre-roll) -> the answer
+        assert!(take_rolls_from_frame_0(false, true, true), "a pre-roll under a waiting Play");
+        assert!(take_rolls_from_frame_0(true, false, true), "the frame after the handover");
+        assert!(!take_rolls_from_frame_0(false, true, false), "a take already writing its count");
+        assert!(!take_rolls_from_frame_0(false, false, true), "a pre-roll with no Play");
+        assert!(take_rolls_from_frame_0(true, false, false), "a take over a rolling song");
+        // And it is the answer the facts carry.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn push_monitor_settings(&mut self)").expect("push_monitor_settings");
+        let end = src[at..].find("self.recorder.session.set_take_facts(").expect("the facts' push");
+        let facts = squash(&src[at..at + end]);
+        assert!(
+            facts.contains("let rolling = take_rolls_from_frame_0(")
+                && facts.contains("self.recorder.play_on_go"),
+            "the facts say the song is still when a Play waits on the downbeat the take begins on"
+        );
     }
 
 

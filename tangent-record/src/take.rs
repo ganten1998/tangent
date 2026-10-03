@@ -1271,6 +1271,11 @@ pub struct Manifest {
     pub timeline_start_seconds: f64,
     /// Whether the transport was ROLLING at frame 0. See
     /// [`timeline_start_seconds`](Manifest::timeline_start_seconds).
+    ///
+    /// True as well for a take that waited out its count-in before its file
+    /// opened, when Play was pressed during that count: the song starts on
+    /// the downbeat the take begins on, from where the playhead waited - the
+    /// press decides it, so two identical presses write the same answer.
     pub timeline_rolling: bool,
     /// How long the head of the FILE runs before the musical downbeat, in
     /// seconds. Zero unless the count-in was recorded into the take.
