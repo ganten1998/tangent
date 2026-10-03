@@ -8344,6 +8344,12 @@ impl TangentApp {
                         self.settings.effect_params.shift_remove(key);
                         self.save_settings();
                     }
+                    // **The drag's one moment, at the release** - and the
+                    // double-click reset's, which lands here too. The rack's
+                    // parameters are hashed, and the row saved per frame and
+                    // committed nothing, so a turned decay rode the next
+                    // gesture's step back.
+                    self.undo_commit();
                 }
                 self.fx_drag = None;
             }
@@ -9334,12 +9340,18 @@ impl TangentApp {
                 // every menu in the app does and what a hand expects.
                 self.fx_choice = (self.fx_choice != Some(key)).then_some(key);
             }
+            // A pick and RESET are presses, so each is a moment where it is
+            // pressed. A row's drag takes its moment at the release.
             Some(recorder_panel::FxHit::PickChoice { key, index }) => {
                 self.pick_choice(key, index);
                 self.fx_choice = None;
+                self.undo_commit();
             }
             Some(recorder_panel::FxHit::CloseChoice) => self.fx_choice = None,
-            Some(recorder_panel::FxHit::Reset(fx)) => self.reset_effect(fx),
+            Some(recorder_panel::FxHit::Reset(fx)) => {
+                self.reset_effect(fx);
+                self.undo_commit();
+            }
             Some(recorder_panel::FxHit::Close) => {
                 self.fx_open = None;
                 self.fx_choice = None;
@@ -58737,6 +58749,94 @@ mod tests {
         );
         // By REMOVING the key, so an old file and a reset file read alike.
         assert!(!app.settings.effect_params.contains_key("chorus_depth"));
+    }
+
+    /// **Everything an effect's panel changes is one step back: a row
+    /// dragged, a choice picked, RESET.**
+    ///
+    /// The rack's parameters are desk fields and hashed (`rack.params`), and
+    /// none of the panel's roads committed: the drag, its double-click reset,
+    /// the choice rows and RESET each only saved. So setting a reverb's
+    /// decay and then muting a track was one Ctrl+Z for both - the mute came
+    /// off and the decay went back with it.
+    ///
+    /// A press commits where it is pressed; a drag commits once, when the
+    /// hand comes up - read here from a real release frame.
+    #[test]
+    fn the_bands_effect_panel_is_one_moment_per_gesture() {
+        use crate::recorder_panel::{Fx, FxHit};
+        let (ctx, mut app) = headless_with_fx(Caps::DESKTOP);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        app.arr_save_edits();
+        app.commit_view_change();
+
+        // ── a row DRAGGED: nothing while the hand is on it, one at the end ──
+        let fx = Fx::Chorus;
+        app.fx_open = Some(fx);
+        let anchor = app.fx_anchor(fx);
+        let before = app.hist_at;
+        let from = row_probe(screen, anchor, fx, "chorus_depth", 0.2);
+        app.press_in_fx_panel(screen, fx, from, true);
+        assert_eq!(app.fx_drag, Some("chorus_depth"), "the press picked up no row");
+        for t in [0.3_f32, 0.5, 0.7, 0.9] {
+            let at = row_probe(screen, anchor, fx, "chorus_depth", t);
+            app.press_in_fx_panel(screen, fx, at, false);
+        }
+        assert_eq!(app.hist_at, before, "the drag pushed {} moments mid-drag", app.hist_at - before);
+        release(&ctx, &mut app, row_probe(screen, anchor, fx, "chorus_depth", 0.9));
+        assert_eq!(app.fx_drag, None, "the release did not let go of the row");
+        assert_eq!(app.hist_at, before + 1, "the drag left {} moments", app.hist_at - before);
+        let dragged = app.effect_param("chorus_depth");
+
+        // ── a CHOICE picked: opening the list is nothing, the pick is one ──
+        let fx = Fx::Delay;
+        app.fx_open = Some(fx);
+        let anchor = app.fx_anchor(fx);
+        let before = app.hist_at;
+        let was = app.choice_key("delay_division");
+        app.press_in_fx_panel(screen, fx, row_probe(screen, anchor, fx, "delay_division", 0.5), true);
+        assert_eq!(app.fx_choice, Some("delay_division"), "the row did not open its list");
+        let (labels, at) = app.choice_list("delay_division");
+        let rows = recorder_panel::fx_choice_list(screen, anchor, fx, "delay_division", labels.len());
+        app.press_in_fx_panel(screen, fx, rows[(at + 1) % rows.len()].center(), true);
+        assert_ne!(app.choice_key("delay_division"), was, "the pick did not land");
+        assert_eq!(app.hist_at, before + 1, "the choice left {} moments", app.hist_at - before);
+
+        // ── RESET, a press ──
+        let fx = Fx::Chorus;
+        app.fx_open = Some(fx);
+        let anchor = app.fx_anchor(fx);
+        let panel = recorder_panel::fx_popup_rect(screen, anchor);
+        let free = app.delay_is_free();
+        let mut reset = None;
+        let mut y = panel.top();
+        'find: while y < panel.bottom() {
+            let mut x = panel.left();
+            while x < panel.right() {
+                let p = Pos2::new(x, y);
+                if matches!(
+                    recorder_panel::fx_hit_test(screen, anchor, fx, p, None, free),
+                    Some(FxHit::Reset(_))
+                ) {
+                    reset = Some(p);
+                    break 'find;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        let before = app.hist_at;
+        app.press_in_fx_panel(screen, fx, reset.expect("the panel draws a RESET"), true);
+        assert!(!app.settings.effect_params.contains_key("chorus_depth"), "RESET left the row dialled");
+        assert_eq!(app.hist_at, before + 1, "RESET left {} moments", app.hist_at - before);
+
+        // One step back takes the reset off, and leaves the pick and the drag.
+        app.undo();
+        assert!(
+            (app.effect_param("chorus_depth") - dragged).abs() < 1.0e-6,
+            "one Ctrl+Z did not put the dragged depth back"
+        );
+        assert_ne!(app.choice_key("delay_division"), was, "one Ctrl+Z also undid the pick");
     }
 
     /// A named parameter steps through its list and wraps.
