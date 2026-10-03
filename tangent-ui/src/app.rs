@@ -3060,19 +3060,49 @@ fn copy_kit_samples(
     dst: &std::path::Path,
 ) {
     for slot in kits.iter().flat_map(|k| k.pads.iter()) {
-        let rel = std::path::Path::new(&slot.path);
-        if slot.path.is_empty() || rel.is_absolute() {
-            continue;
-        }
-        let (from, to) = (src.join(rel), dst.join(rel));
-        if to.exists() || !from.is_file() {
-            continue;
-        }
-        if let Some(parent) = to.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&from, &to);
+        copy_named_file(&slot.path, src, dst);
     }
+}
+
+/// **The files the DOCUMENT stands on**, by the kit samples' rules: every
+/// clip's `path` and every frozen lane's render. A template Save As Template
+/// copied whole from a real project carries them, and a scratch adopted
+/// from it reads them out of the template until it is real - so they came
+/// across neither when it was made real nor when it was saved back as the
+/// template, and the swap that replaced the old template then deleted them
+/// while the new document still named them.
+fn copy_doc_media(
+    clips: &[crate::arrangement::ArrClip],
+    frozen: &[crate::arrangement::FrozenLane],
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) {
+    let named = clips.iter().map(|c| c.path.as_str()).chain(frozen.iter().map(|f| f.path.as_str()));
+    for path in named {
+        copy_named_file(path, src, dst);
+    }
+}
+
+/// One RELATIVE file a kit or a document names, from `src` into `dst`: only
+/// a file that exists there and is missing here, never over one already in
+/// `dst`. An absolute path is somebody's own file elsewhere and not ours to
+/// duplicate, and one that climbs out with `..` would land outside `dst`.
+fn copy_named_file(path: &str, src: &std::path::Path, dst: &std::path::Path) {
+    let rel = std::path::Path::new(path);
+    let inside = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+    if path.is_empty() || !inside {
+        return;
+    }
+    let (from, to) = (src.join(rel), dst.join(rel));
+    if to.exists() || !from.is_file() {
+        return;
+    }
+    if let Some(parent) = to.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&from, &to);
 }
 
 /// **Why glue said no**, in one place, for both roads through it.
@@ -12792,6 +12822,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if let Some(src) = self.media_source.as_ref() {
             copy_kit_samples(&self.drumpad_kits, src, dir);
+            // And what the document's own clips and frozen lanes stand on,
+            // out of the same template - see `copy_doc_media`.
+            copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, src, dir);
         }
         // **And the kit itself**, when there is one and the folder has none.
         // The samples alone left a real project whose kit lived only in
@@ -12809,9 +12842,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **The session as a TEMPLATE, written straight into `dir`** - the
-    /// document with the live desk and `named` off, the kit sidecar, and
-    /// the samples the kit names. Nothing else is touched: not the
-    /// session's own folder, not its path, not its saved mark.
+    /// document with the live desk and `named` off, the kit sidecar, the
+    /// samples the kit names, and the files the document's own clips and
+    /// frozen lanes stand on. Nothing else is touched: not the session's own
+    /// folder, not its path, not its saved mark.
     ///
     /// Save As Template used to save the session into its own folder first
     /// and copy that folder, so a scratch that had never been saved was
@@ -12835,9 +12869,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.write_kit_into(dir);
         // The samples from wherever the kit reads them NOW: the project when
-        // it is real, the template it was adopted from when it is not.
+        // it is real, the template it was adopted from when it is not - and
+        // the files the document's own clips and frozen lanes stand on, from
+        // the same place (`copy_doc_media`).
         if let Some(src) = self.kit_doc().as_deref().and_then(std::path::Path::parent) {
             copy_kit_samples(&self.drumpad_kits, src, dir);
+            copy_doc_media(&arr.clips, &self.settings.frozen_lanes, src, dir);
         }
         Ok(())
     }
@@ -67845,6 +67882,84 @@ mod folder_tests {
             "a named session minted a named template"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A template re-saved from a scratch keeps the audio its own clips
+    /// stand on.** Save As Template from a real project copies the whole
+    /// folder, so a template can carry a clip's `media/Loop.wav` and a
+    /// frozen lane's render. A scratch adopted from it, saved back as the
+    /// template, staged the KIT's samples alone, and the swap then removed
+    /// the old template: the files were gone while the new document still
+    /// named them.
+    #[test]
+    fn a_template_resaved_from_a_scratch_keeps_the_audio_its_clips_stand_on() {
+        let root = temp_root("tpl-audio");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFloopWAVE").expect("loop");
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        app.adopt_template(&template, &projects.join("Untitled"));
+        let stage = projects.join(TEMPLATE_SHELF).join(".default.writing");
+        app.write_template_into(&stage).expect("the template is written");
+        let kept = stage.join("media").join("Loop.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(kept, "a template re-saved from a scratch dropped the file its own clip plays");
+    }
+
+    /// **A scratch made real brings the audio its template's clips stand
+    /// on**, as it brings the kit's samples: a clip's file and a frozen
+    /// lane's render. Until the folder is real they are read out of the
+    /// template; from then on the project's own `media/` answers, and a
+    /// first save is born with only what the materialise carried.
+    #[test]
+    fn a_scratch_made_real_brings_the_audio_its_template_clips_stand_on() {
+        let root = temp_root("tpl-clips-real");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        for f in ["Loop.wav", "frozen-02-1.wav"] {
+            std::fs::write(template.join("media").join(f), b"RIFFxxxxWAVE").expect("template audio");
+        }
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        let mut desk = TangentApp::template_desk();
+        desk.frozen = Some(vec![crate::arrangement::FrozenLane {
+            lane: 2,
+            path: "media/frozen-02-1.wav".to_owned(),
+            len_s: 1.0,
+        }]);
+        doc.desk = Some(desk);
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        app.materialize_project_dir();
+        let brought = ["Loop.wav", "frozen-02-1.wav"].map(|f| scratch.join("media").join(f).is_file());
+        // And the first save of a scratch never made real.
+        let _ = std::fs::remove_dir_all(&scratch);
+        app.adopt_template(&template, &scratch);
+        let song = projects.join("Song");
+        assert!(app.save_project_first(&song), "the first save");
+        let saved = ["Loop.wav", "frozen-02-1.wav"].map(|f| song.join("media").join(f).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(brought, [true, true], "a scratch made real left its clip's or its freeze's audio in the template");
+        assert_eq!(saved, [true, true], "a first save left its clip's or its freeze's audio in the template");
     }
 
     /// **New hands over the TEMPLATE's kit, never the last project's.** A

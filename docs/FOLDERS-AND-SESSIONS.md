@@ -127,11 +127,18 @@ Related invariants that keep this working:
   reclaim treats a document holding clips as work, as the sweep and the
   discard do, so a scratch Open wrote back with a take is never reclaimed.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
-  every lane's kit samples and writes the kit sidecar. Imports, pad loads,
+  every lane's kit samples and writes the kit sidecar, and brings the files
+  the document's own clips and frozen lanes stand on out of the template
+  too (`copy_doc_media`; `write_template_into` carries them the same way,
+  so a template re-saved from a scratch keeps them). Imports, pad loads,
   arrangement takes with audio, freezes, glues and realtime exports go
   through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
-  only into a folder that is already real).
+  only into a folder that is already real). Not yet heard BEFORE it is
+  real: the host resolves a clip and a frozen lane against the unmade
+  folder, not the template the way the kit's `kit_doc` does, so a
+  template's own audio is silent in a scratch until something makes it
+  real.
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
   from the Open panel is ADOPTED the same way (`open_project`), into the
