@@ -1416,6 +1416,100 @@ fn clip_picture(
     }
 }
 
+/// **What a clip PLAYS, as far as the render cache can say right now** -
+/// see [`clip_audio`].
+#[cfg(feature = "recorder")]
+struct ClipAudio {
+    /// What to play and draw: the last render in the chain the cache holds,
+    /// or, while one is owed, the audio that render will be made from.
+    audio: Decoded,
+    /// `Some(ratio)` while a render is owed: `audio` is then drawn at
+    /// `1/ratio` of the clip's time and measured `ratio` times as long (see
+    /// `clip_picture`). The warp's projected length over the file's while
+    /// the warp is out, the stretch while it is.
+    stand_in: Option<f64>,
+    /// The warp render the clip names, when it has a map.
+    warp_key: Option<StretchKey>,
+    /// What rendering that warp takes, when the cache does not hold it yet.
+    warp_owed: Option<(Vec<crate::warp::Anchor>, crate::stretch::Mode, crate::warp::Fit)>,
+    /// The stretch render the clip names next, with its algorithm - unless
+    /// a warp still owed holds it back.
+    stretch: Option<(StretchKey, crate::stretch::Mode)>,
+    /// Whether the cache lacks that stretch render.
+    stretch_owed: bool,
+}
+
+/// **What a clip plays, resolved ONCE for both roads that draw it**: its
+/// warp render, then the stretch of that, each the cached render when there
+/// is one and the audio standing in for it while it is owed. `reload_clips`
+/// asks this and then submits whatever is owed; `refresh_pictures` asks it
+/// and only draws. The picture road used to spell its own resolution, and
+/// spelled only the stretch: every zoom past the threshold redrew a
+/// quantized take from the unwarped file while it played warped, and a
+/// pending warp at the file's length instead of the render's.
+///
+/// **A warp still owed holds the stretch back.** The stretch key already
+/// names the warp it is MEANT to be made from (`warp_sig`), but while the
+/// warp is out `decoded` is still the unwarped file - so a stretch made now
+/// would be of unwarped audio, cached under the warped key, and the quantize
+/// would be lost for as long as the entry lived.
+#[cfg(feature = "recorder")]
+fn clip_audio(
+    clip: &tangent_ui::arrangement::ArrClip,
+    path: &std::path::Path,
+    decoded: &Decoded,
+    cache: &std::collections::HashMap<StretchKey, Decoded>,
+) -> ClipAudio {
+    let (mut warp_key, mut warp_owed) = (None, None);
+    let (audio, warp_stand_in) = match warp_plan(clip, path) {
+        None => (decoded.clone(), None),
+        Some((key, anchors, mode, fit)) => {
+            let made = cache.get(&key).cloned();
+            warp_key = Some(key);
+            match made {
+                Some(made) => (made, None),
+                None => {
+                    // **The length the render will be**, so the clip keeps
+                    // its seconds and its picture while it waits. See
+                    // `warp::projected_frames`.
+                    //
+                    // The stand-in picture is the unwarped pyramid read at
+                    // `1/ratio`, which for a warp is a uniform smear of a
+                    // thing that is not uniform - the LENGTH is exact and
+                    // the hits inside it are not. It stands for one render
+                    // and the right picture replaces it; a clip drawn at the
+                    // wrong length would move every trim under the hand.
+                    let src = decoded.clip.frames();
+                    let out = crate::warp::projected_frames(src, &anchors);
+                    let ratio = if src == 0 {
+                        1.0
+                    } else {
+                        out as f64 / src as f64
+                    };
+                    warp_owed = Some((anchors, mode, fit));
+                    (decoded.clone(), Some(ratio))
+                }
+            }
+        }
+    };
+    let stretch = stretch_key(clip, path).filter(|_| warp_stand_in.is_none());
+    let (audio, stand_in, stretch_owed) = match &stretch {
+        None => (audio, warp_stand_in, false),
+        Some((key, _)) => match cache.get(key) {
+            Some(made) => (made.clone(), None, false),
+            None => (audio, Some(clip.stretch), true),
+        },
+    };
+    ClipAudio {
+        audio,
+        stand_in,
+        warp_key,
+        warp_owed,
+        stretch,
+        stretch_owed,
+    }
+}
+
 /// How many buckets a clip's picture wants, and which of its seconds.
 ///
 /// **Only what is on screen, at the pixels it occupies.**
@@ -11749,83 +11843,64 @@ impl DesktopApp {
             // warp map changes when somebody quantizes and never sixty times
             // a second the way a stretch drag does. There is nothing to wait
             // for a hand to settle on.
-            let (decoded, warp_stand_in) = match warp_plan(clip, &path) {
-                None => (decoded, None),
-                Some((key, anchors, mode, fit)) => {
-                    // Warm as long as a clip wants it, exactly like a
-                    // stretch render - the sweep below frees the rest.
-                    //
-                    // **And NOT into `stretched_ids`**, which is the retain
-                    // list for `stretch_seen` - the per-clip record of which
-                    // ratio was last seen, kept for `stretch_step`. A warp
-                    // does not go through that gate, so a warped clip with no
-                    // stretch has nothing to remember and keeping a row for
-                    // it would only outlive the clip.
-                    live_stretches.insert(key.clone());
-                    match self.stretch_cache.get(&key) {
-                        Some(made) => (made.clone(), None),
-                        None => {
-                            if !self.pool.holds_stretch(&key) {
-                                self.pool.submit(
-                                    Warm::Stretch(key),
-                                    Work::Warp {
-                                        source: Arc::clone(&decoded.clip),
-                                        anchors: anchors.clone(),
-                                        mode,
-                                        fit,
-                                    },
-                                    rate,
-                                    ctx,
-                                );
-                            }
-                            deferred = true;
-                            // **The length the render will be**, so the clip
-                            // keeps its seconds and its picture while it
-                            // waits. See `warp::projected_frames`.
-                            //
-                            // The stand-in picture is the unwarped pyramid
-                            // read at `1/ratio`, which for a warp is a
-                            // uniform smear of a thing that is not uniform -
-                            // the LENGTH is exact and the hits inside it are
-                            // not. It stands for one render and the right
-                            // picture replaces it; a clip drawn at the wrong
-                            // length would move every trim under the hand.
-                            let src = decoded.clip.frames();
-                            let out = crate::warp::projected_frames(src, &anchors);
-                            let ratio = if src == 0 {
-                                1.0
-                            } else {
-                                out as f64 / src as f64
-                            };
-                            (decoded, Some(ratio))
-                        }
+            //
+            // **One resolution for this road and the picture road**, so the
+            // two cannot draw a clip two ways - see `clip_audio`. What it
+            // says is owed is submitted here.
+            let ClipAudio {
+                audio,
+                stand_in,
+                warp_key,
+                warp_owed,
+                stretch,
+                stretch_owed,
+            } = clip_audio(clip, &path, &decoded, &self.stretch_cache);
+            if let Some(key) = warp_key {
+                // Warm as long as a clip wants it, exactly like a stretch
+                // render - the sweep below frees the rest.
+                //
+                // **And NOT into `stretched_ids`**, which is the retain list
+                // for `stretch_seen` - the per-clip record of which ratio was
+                // last seen, kept for `stretch_step`. A warp does not go
+                // through that gate, so a warped clip with no stretch has
+                // nothing to remember and keeping a row for it would only
+                // outlive the clip.
+                live_stretches.insert(key.clone());
+                if let Some((anchors, mode, fit)) = warp_owed {
+                    if !self.pool.holds_stretch(&key) {
+                        self.pool.submit(
+                            Warm::Stretch(key),
+                            Work::Warp {
+                                source: Arc::clone(&decoded.clip),
+                                anchors,
+                                mode,
+                                fit,
+                            },
+                            rate,
+                            ctx,
+                        );
                     }
+                    deferred = true;
                 }
-            };
-            // **A pending warp holds the stretch back.** The stretch key
-            // already names the warp it is MEANT to be made from
-            // (`warp_sig`), but while the warp is out `decoded` is still the
-            // unwarped file - so a render submitted now would be made from
-            // unwarped audio and cached under the warped key, and the
-            // quantize would be lost for as long as the entry lived.
-            let (decoded, stand_in) = match stretch_key(clip, &path)
-                .filter(|_| warp_stand_in.is_none())
-            {
-                None => (decoded, warp_stand_in),
+            }
+            // **A pending warp holds the stretch back**, which `clip_audio`
+            // has already done: `stretch` is `None` while the warp is out.
+            let (decoded, stand_in) = match stretch {
+                None => (audio, stand_in),
                 Some((key, mode)) => {
                     live_stretches.insert(key.clone());
                     stretched_ids.push(clip.id);
-                    if let Some(made) = self.stretch_cache.get(&key) {
-                        (made.clone(), None)
-                    } else if stretch_over_ceiling(decoded.clip.frames(), clip.stretch) {
+                    if !stretch_owed {
+                        (audio, stand_in)
+                    } else if stretch_over_ceiling(audio.clip.frames(), clip.stretch) {
                         notes.push(format!(
                             "{} stretched by {:.2} would be longer than the {}-minute ceiling - it plays unstretched",
                             clip.name,
                             clip.stretch,
                             tangent_record::decode::MAX_FRAMES / 60 / 48_000
                         ));
-                        self.stretch_cache.insert(key, decoded.clone());
-                        (decoded, None)
+                        self.stretch_cache.insert(key, audio.clone());
+                        (audio, None)
                     } else {
                         let in_flight = self.pool.holds_stretch(&key);
                         if stretch_step(&mut self.stretch_seen, clip.id, &key, in_flight)
@@ -11834,7 +11909,7 @@ impl DesktopApp {
                             self.pool.submit(
                                 Warm::Stretch(key),
                                 Work::Stretch {
-                                    source: Arc::clone(&decoded.clip),
+                                    source: Arc::clone(&audio.clip),
                                     ratio: clip.stretch,
                                     mode,
                                 },
@@ -11843,7 +11918,7 @@ impl DesktopApp {
                             );
                         }
                         deferred = true;
-                        (decoded, Some(clip.stretch))
+                        (audio, stand_in)
                     }
                 }
             };
@@ -12062,20 +12137,18 @@ impl DesktopApp {
                 let Some(decoded) = self.track_cache.get(&path) else {
                     continue;
                 };
-                // A stretch render still pending is drawn from the same
-                // stand-in the reload draws it from - for a clip with no
-                // warp. Not yet true of a warped one: this road never asks
-                // `warp_plan`, so a quantized clip is redrawn here from the
-                // unwarped file unless it is stretched and its stretch of
-                // the warp has already landed.
-                let (decoded, stand_in) = match stretch_key(clip, &path) {
-                    None => (decoded, None),
-                    Some((key, _)) => match self.stretch_cache.get(&key) {
-                        Some(made) => (made, None),
-                        None => (decoded, Some(clip.stretch)),
-                    },
-                };
-                clip_infos.push(clip_picture(clip, decoded, rate, Some(wave_view), stand_in));
+                // What the clip plays, resolved exactly as the reload
+                // resolves it - its warp, then its stretch, and the same
+                // stand-ins while either is owed - so a view move redraws a
+                // quantized take as it plays. See `clip_audio`.
+                let resolved = clip_audio(clip, &path, decoded, &self.stretch_cache);
+                clip_infos.push(clip_picture(
+                    clip,
+                    &resolved.audio,
+                    rate,
+                    Some(wave_view),
+                    resolved.stand_in,
+                ));
             }
         }
         self.app.set_clip_infos(clip_infos);
@@ -22946,6 +23019,107 @@ mod tests {
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
     }
 
+    /// **A view refresh draws the warp the reload drew.** The picture road
+    /// (`refresh_pictures`, run on a zoom or scroll while any clip lacks a
+    /// pyramid) resolved a clip's stretch and never its warp, so a quantized,
+    /// unstretched take was redrawn from the UNWARPED file - its hits back
+    /// off the grid on screen while it played on it, until the next reload -
+    /// and a pending warp was drawn at the file's length instead of the
+    /// render's. Both roads now ask one resolver, `clip_audio`. A source scan
+    /// for the wiring, because `DesktopApp` cannot be built in a test; the
+    /// resolver itself is driven in the test after this one.
+    #[test]
+    fn a_view_refresh_draws_the_warp_the_reload_drew() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |sig: &str| {
+            let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        for (road, sig) in [
+            ("refresh_pictures", "fn refresh_pictures(&mut self) -> bool {"),
+            ("reload_clips", "fn reload_clips(&mut self, decode: Decode, ctx: &egui::Context) -> bool {"),
+        ] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("clip_audio(clip, &path, "),
+                "{road} resolves what a clip plays on its own, so the two \
+                 roads can draw a quantized take two different ways"
+            );
+            assert!(
+                !body.contains("stretch_key(clip, &path)") && !body.contains("warp_plan(clip, &path)"),
+                "{road} still keys a render itself instead of asking the one resolver"
+            );
+        }
+    }
+
+    /// **What a clip plays is its warp, then the stretch of that** - each
+    /// the cached render once it is in, and a stand-in at the render's
+    /// length while it is owed, with the stretch held back for as long as
+    /// the warp is out. The one resolver both drawing roads ask (see the
+    /// test above), driven through every state the cache can be in.
+    #[test]
+    fn a_clips_playing_audio_is_its_warp_then_its_stretch() {
+        let rate = 8_000u32;
+        let file = Decoded::of(tangent_record::decode::Clip {
+            samples: vec![0.0; rate as usize * 2 * 2],
+            rate,
+            source: std::path::PathBuf::from("a.wav"),
+        });
+        let path = std::path::Path::new("a.wav");
+        let mut cache: std::collections::HashMap<StretchKey, Decoded> =
+            std::collections::HashMap::new();
+        // A quantize that carries the second second a quarter later.
+        let warped = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "a.wav".to_owned(),
+            warp: vec![(0, 0), (8_000, 10_000)],
+            ..Default::default()
+        };
+        let (key, anchors, mode, fit) = warp_plan(&warped, path).expect("a warped clip has a plan");
+        let ratio = crate::warp::projected_frames(file.clip.frames(), &anchors) as f64
+            / file.clip.frames() as f64;
+
+        // Owed: the file stands in at the render's length, and the render is asked for.
+        let owed = clip_audio(&warped, path, &file, &cache);
+        assert!(Arc::ptr_eq(&owed.audio.clip, &file.clip), "an owed warp did not stand in with the file");
+        assert_eq!(owed.stand_in, Some(ratio), "an owed warp is not drawn at the render's length");
+        assert_eq!(owed.warp_key.as_ref(), Some(&key));
+        assert!(owed.warp_owed.is_some(), "an owed warp was not asked for");
+
+        // Landed: the render plays and draws, with no stand-in.
+        let render = Decoded::of(crate::warp::warp(&file.clip, &anchors, mode, fit));
+        cache.insert(key.clone(), render.clone());
+        let landed = clip_audio(&warped, path, &file, &cache);
+        assert!(Arc::ptr_eq(&landed.audio.clip, &render.clip), "the clip does not play its warp render");
+        assert_eq!(landed.stand_in, None);
+        assert!(landed.warp_owed.is_none() && landed.stretch.is_none());
+
+        // Warped and stretched, with the warp still out: the stretch is held
+        // back and the file stands in at the warp's length.
+        let both = tangent_ui::arrangement::ArrClip { stretch: 2.0, ..warped.clone() };
+        cache.clear();
+        let held = clip_audio(&both, path, &file, &cache);
+        assert!(held.stretch.is_none(), "a stretch was asked for while its warp was still out");
+        assert_eq!(held.stand_in, Some(ratio));
+
+        // The warp in, the stretch owed: the warp render stands in at the stretch.
+        cache.insert(key, render.clone());
+        let half = clip_audio(&both, path, &file, &cache);
+        assert!(Arc::ptr_eq(&half.audio.clip, &render.clip), "the stretch is not made from the warp");
+        assert_eq!(half.stand_in, Some(2.0));
+        assert!(half.stretch.is_some() && half.stretch_owed);
+
+        // Both in: the stretch of the warp is what plays.
+        let (skey, _) = stretch_key(&both, path).expect("a stretched clip has a key");
+        let stretched = Decoded::of(crate::stretch::stretch(&render.clip, 2.0, crate::stretch::Mode::Tape));
+        cache.insert(skey, stretched.clone());
+        let done = clip_audio(&both, path, &file, &cache);
+        assert!(Arc::ptr_eq(&done.audio.clip, &stretched.clip), "the clip does not play its stretch of the warp");
+        assert_eq!(done.stand_in, None);
+        assert!(!done.stretch_owed);
+    }
+
     /// **The lengths a reload measured go over in ONE call, and an empty
     /// list makes no call at all.**
     ///
@@ -23025,25 +23199,26 @@ mod tests {
         // And the two roads that BUILD that picture take the render, not the
         // file. Neither can be driven headless — `DesktopApp` cannot be
         // built in a test — so the pairing is pinned where it is written:
-        // the value handed over with no stand-in comes out of
-        // `stretch_cache`, never out of `track_cache`.
+        // both ask `clip_audio`, whose settled stretch is the value the
+        // cache handed back, with no stand-in - out of `stretch_cache`,
+        // never out of `track_cache`. (`a_clips_playing_audio_is_its_warp_
+        // then_its_stretch` drives the resolver itself.)
         let src = include_str!("desktop.rs");
         let body = &src[..src.find("mod tests {").expect("the test module")];
-        for (road, settled) in [
-            (
-                "reload_clips",
-                "if let Some(made) = self.stretch_cache.get(&key) {\n                        (made.clone(), None)",
-            ),
-            (
-                "refresh_pictures",
-                "match self.stretch_cache.get(&key) {\n                        Some(made) => (made, None),",
-            ),
-        ] {
+        let resolver = &body[body.find("fn clip_audio(").expect("the resolver")..];
+        let resolver = &resolver[..resolver.find("\n}\n").expect("its end")];
+        assert!(
+            resolver.contains("Some((key, _)) => match cache.get(key) {\n            Some(made) => (made.clone(), None, false),"),
+            "the resolver no longer draws a settled stretch from the render's \
+             own decode; a source pyramid with no stand-in is a waveform that \
+             lies by the ratio"
+        );
+        for road in ["fn reload_clips(", "fn refresh_pictures("] {
+            let at = body.find(road).expect("the road");
+            let end = at + body[at..].find("\n    }\n").expect("its end");
             assert!(
-                body.contains(settled),
-                "{road} no longer draws a settled stretch from the render's \
-                 own decode; a source pyramid with no stand-in is a waveform \
-                 that lies by the ratio"
+                body[at..end].contains("clip_audio(clip, &path, "),
+                "{road} no longer resolves its clips through `clip_audio`"
             );
         }
     }
@@ -25252,7 +25427,7 @@ mod tests {
             "the inline live-path warp is back"
         );
         assert!(
-            scan.contains("stretch_key(clip, &path)\n                .filter(|_| warp_stand_in.is_none())"),
+            scan.contains("let stretch = stretch_key(clip, path).filter(|_| warp_stand_in.is_none());"),
             "a stretch can be submitted while its clip's warp is still out"
         );
     }
