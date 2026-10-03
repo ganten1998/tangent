@@ -17627,6 +17627,16 @@ impl Engine {
         permute_rows(&mut self.inserts_loaded, order);
         permute_rows(&mut self.insert_keyable, order);
         permute_rows(&mut self.insert_editors, order);
+        // **And the controller each window is opened FROM**, beside the
+        // window it opens. Left at the old seat, opening a carried plugin's
+        // window opened the previous tenant's editor, titled as the new one,
+        // its knobs moving a plugin on another track - and a seat that had
+        // been empty answered "nothing is loaded".
+        permute_rows(&mut self.insert_editor_handles, order);
+        // An LV2 bay's port ledger IS its state (`save_insert_state` reads it
+        // first) and its window's values, so it rides with the box too.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        permute_rows(&mut self.insert_lv2, order);
         permute_rows(&mut self.insert_builtin, order);
         permute_rows(&mut self.insert_state_handles, order);
         permute_rows(&mut self.insert_latency_handles, order);
@@ -27861,6 +27871,33 @@ mod tests {
         let same: Vec<usize> = (0..CHANNELS).collect();
         assert!(e.permute_channel_inserts(&same).is_empty());
         assert_eq!(e.seat_latency_for_test(3, 0), 128, "identity disturbed a seat");
+    }
+
+    /// **A carried plugin takes every per-seat record with it** - the
+    /// controller its window is opened from, and (Linux/FreeBSD) the LV2
+    /// port ledger its state is read from.
+    ///
+    /// Left behind, a reorder opened the PREVIOUS tenant's editor from the
+    /// bay that now holds another plugin, titled as the new one, its knobs
+    /// moving a plugin on another track. A source scan: both records are
+    /// filled only by loading a hosted VST3 or LV2 plugin, which a test
+    /// engine of built-in units never does, so the test above cannot see
+    /// them.
+    #[test]
+    fn a_permutation_carries_every_per_seat_record_with_the_box() {
+        let whole = include_str!("instrument.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("pub fn permute_channel_inserts(").expect("the carry");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        // Both records are read before anything panics, so one run names
+        // each one left behind.
+        let mut left: Vec<String> = Vec::new();
+        for field in ["insert_editor_handles", "insert_lv2"] {
+            if !body.contains(&format!("permute_rows(&mut self.{field},")) {
+                left.push(format!("the carry leaves `{field}` at the seat the plugin left"));
+            }
+        }
+        assert!(left.is_empty(), "{}", left.join("; "));
     }
 
     #[test]
