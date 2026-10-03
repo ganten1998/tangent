@@ -249,6 +249,13 @@ struct Recorder {
     /// — and the reprobe keeps watching for the interface so the chosen
     /// system comes back the moment it does. See `start_engine`.
     fallback: Option<String>,
+    /// **The OUTPUT the setting names while the engine plays the system's
+    /// own instead**, on a system with no fallback of its own - every one but
+    /// ASIO - when the named device is missing or will not open. Kept so the
+    /// stand-in is said once rather than at every rebuild, and so an open
+    /// that finds the output again can say so. The setting is never
+    /// rewritten. See `start_engine`.
+    output_stand_in: Option<String>,
     /// The ReaStream sender, alive while the engine is and streaming while the
     /// setting is on. Dropped when the engine restarts so the next one hands it
     /// a fresh tap; see `reconcile_reastream`.
@@ -13735,6 +13742,9 @@ impl DesktopApp {
             self.app.buffer_frames(),
             rate,
         );
+        // Whether the engine below is the system's own standing in for a
+        // chosen output that would not open (see the arm that sets it).
+        let mut stood_in = false;
         // **The fallback, for this session only.** ASIO chosen and no
         // working output through it — the interface unplugged, or a driver
         // registered for hardware that never came — used to be silence plus
@@ -13837,6 +13847,44 @@ impl DesktopApp {
                     // interface is met on the road that was asked for.
                     Err(_) => tangent_record::audio::set_system(chosen.as_deref()),
                 }
+            } else if let Some(name) = want_out.as_deref() {
+                // **A chosen OUTPUT that will not open plays through the
+                // system's own instead, for this session.** Every system but
+                // ASIO has a default that plays, and this used to stay
+                // silent, retry five times, give up, and let the reprobe call
+                // the default's health a return: another WARN and six more
+                // opens every five seconds or so, each one closing and
+                // reopening the input, until somebody found "the system's
+                // own" in Setup. The setting is left exactly as it was, like
+                // the ASIO fallback's. Not yet watched for: the output is
+                // asked for again whenever the engine is rebuilt (the band
+                // reopened, a path setting changed), not the moment it is
+                // plugged back in.
+                log::warn!(
+                    "the chosen audio output {name:?} would not open ({e}) - opening the \
+                     system's own output for this session instead; the setting still names it"
+                );
+                let already_standing_in = self.recorder.output_stand_in.as_deref() == Some(name);
+                started = crate::instrument::Engine::start_sized(
+                    None,
+                    self.recorder.session.timebase(),
+                    self.app.buffer_frames(),
+                    rate,
+                );
+                if let Ok(e) = &started {
+                    stood_in = true;
+                    self.recorder.output_stand_in = Some(name.to_owned());
+                    if !already_standing_in {
+                        self.app.notify(
+                            Kind::Error,
+                            format!(
+                                "{name} is not available - using {} through the system's own \
+                                 audio for this session. Close and reopen the band once it is back.",
+                                e.output().device
+                            ),
+                        );
+                    }
+                }
             }
         }
         match started {
@@ -13852,6 +13900,16 @@ impl DesktopApp {
                             Kind::Success,
                             format!("Back on {was} - {}", e.output().device),
                         );
+                    }
+                }
+                // **And the chosen OUTPUT back**, the same way - unless the
+                // setting has moved on from it, which is not a return.
+                if !stood_in {
+                    if let Some(was) = self.recorder.output_stand_in.take() {
+                        if want_out.as_deref() == Some(was.as_str()) {
+                            log::info!("audio: back on {was}");
+                            self.app.notify(Kind::Success, format!("Back on {was}"));
+                        }
                     }
                 }
                 // **What was asked for, and what the device actually gave**,
@@ -18503,6 +18561,7 @@ impl DesktopApp {
                 stall_recovery: crate::instrument::StallRecovery::new(),
                 reprobe: None,
                 fallback: None,
+                output_stand_in: None,
                 reastream: None,
                 pads_retry: false,
                 sampler_retry: false,
@@ -24859,6 +24918,42 @@ mod tests {
             "the set-aside open asks the platform default for an ASIO name: `{decl}`"
         );
     }
+
+    /// **A chosen output that will not open plays through the system's own,
+    /// on every system with no fallback of its own.** A named output missing
+    /// under CoreAudio, WASAPI or ALSA - External Headphones with nothing
+    /// plugged in, a USB box unplugged - left the session silent: five
+    /// retries, then a reprobe that called the default output's health a
+    /// return, then six more opens and another WARN every five seconds or
+    /// so, each closing and reopening the input. A source scan, for the
+    /// reason the ASIO fallback's tests above are: the road opens real
+    /// devices, and `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_chosen_output_that_will_not_open_plays_through_the_systems_own() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let engine = {
+            let a = src.find("fn start_engine(").expect("`start_engine` is gone");
+            &src[a..a + src[a..].find("\n    fn ").expect("its end")]
+        };
+        let arm = {
+            let a = engine
+                .find("} else if let Some(name) = want_out.as_deref() {")
+                .expect("a chosen output that will not open has no road of its own off ASIO");
+            &engine[a..a + engine[a..].find("\n        match started {").expect("its end")]
+        };
+        assert!(
+            arm.contains("Engine::start_sized(\n                    None,"),
+            "the stand-in asks for the missing output again instead of the system's own"
+        );
+        assert!(
+            arm.contains("self.recorder.output_stand_in = Some(name.to_owned());")
+                && arm.contains("if !already_standing_in {"),
+            "the stand-in is not said once: every rebuild would raise the same toast"
+        );
+        assert!(
+            engine.contains("if let Some(was) = self.recorder.output_stand_in.take() {"),
+            "nothing clears the stand-in when the output opens again"
         );
     }
 
