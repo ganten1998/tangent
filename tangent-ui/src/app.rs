@@ -9490,6 +9490,7 @@ impl TangentApp {
         self.arrangement = arr;
         self.clips_dirty = true;
         self.load_drumpad_doc();
+        self.reset_automation_session();
         // **Seed the undo baseline HERE too.** Every road into a document
         // ends at `undo_reset` — open, save-as, fresh — and this one forgot,
         // which left `history` empty until the FIRST edit committed its own
@@ -12941,6 +12942,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // first pad edit writes the template's kit over that project's.
         // `adopt_template` loads the template's kit once it has repointed.
         self.load_drumpad_doc();
+        self.reset_automation_session();
         self.reconcile_auto_bases();
         // **One settings write per open, here, after everything an open
         // touches has landed** — the path, the desk, whatever the reconcile
@@ -13030,6 +13032,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             },
         }
+    }
+
+    /// **The automation session lets go of the last document.**
+    ///
+    /// Which rows are open, armed and bypassed, the lanes' modes and
+    /// latches, the chosen nodes and row, and the aims a paste falls back
+    /// to are session state keyed by `(lane, param)`, and a lane in the next
+    /// document is somebody else's track. A row armed in the last project
+    /// wrote an invisible curve into this one the first time a fader moved
+    /// during playback, and a bypass silenced this one's curve. Every road
+    /// that replaces the document calls this. The copied nodes themselves
+    /// stay: a copy made in one project pastes into another.
+    fn reset_automation_session(&mut self) {
+        self.arr_auto_open.clear();
+        self.arr_auto_armed.clear();
+        self.arr_auto_bypassed.clear();
+        self.arr_auto_modes.clear();
+        self.arr_auto_latched.clear();
+        self.arr_auto_last.clear();
+        self.arr_auto_nodes.clear();
+        self.arr_auto_sel = None;
+        self.arr_auto_hot = None;
+        self.arr_auto_focus = None;
+        self.arr_auto_drag_from = None;
+        self.auto_clipboard_from = None;
     }
 
     /// **On open, a lone base node and its control are made to agree.**
@@ -57401,6 +57428,30 @@ mod tests {
         let _ = ctx.run(delete(false), |ctx| app.frame(ctx));
         key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
         assert!(!app.channel_used(0), "a fresh Delete with nothing chosen no longer takes the selected track");
+    }
+
+    /// **A new project lets the automation session go.** Which rows are
+    /// open, armed and bypassed, and which nodes are chosen, are session
+    /// state keyed by `(lane, param)`, and a lane in the next document is
+    /// somebody else's track: a row armed in the last project wrote into
+    /// this one the first time a fader moved during playback, and a bypass
+    /// silenced this one's curve.
+    #[test]
+    fn a_new_project_lets_the_automation_session_go() {
+        use crate::automation::AutoParam;
+        let (_ctx, mut app) = auto_bench("autosession");
+        let root = project_scratch("autosessionnew");
+        app.set_project_dir(root.join("Projects"));
+        app.arr_auto_armed.insert((0, AutoParam::Gain));
+        app.arr_auto_bypassed.insert((0, AutoParam::Gain));
+        app.arr_auto_nodes = vec![(0, 0, 1)];
+        assert!(app.arr_auto_open.contains(&(0, AutoParam::Gain)), "fixture: the row is not open");
+        app.new_project();
+        assert!(app.arr_auto_armed.is_empty(), "a row armed in the last project writes into this one");
+        assert!(app.arr_auto_bypassed.is_empty(), "a bypass from the last project silences this one's curve");
+        assert!(app.arr_auto_nodes.is_empty(), "a node choice names this project's nodes");
+        assert!(app.arr_auto_open.is_empty(), "the last project's rows stand open over this one's tracks");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A node DROPPED on its neighbour's time makes a step**; one CARRIED
