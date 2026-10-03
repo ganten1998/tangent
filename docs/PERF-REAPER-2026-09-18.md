@@ -1058,7 +1058,8 @@ That shape is a modulation source sampled once per block from
 `transport.beat` rather than accumulated per sample. Worth noting beside
 it: the beat handed to a rack comes from `Shared::transport_pos`, which
 `run_transport` stores AFTER advancing, so it is the block's END and not
-its start.
+its start. (Fixed since: the beat is published for the block's first frame,
+`Shared::transport_anchor`, and a lane's beat is walked from there.)
 
 Until that is fixed a lane holding a voice stays on the callback's own
 block, where every buffer size gives what it gives today. It is written
