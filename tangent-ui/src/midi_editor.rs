@@ -162,7 +162,14 @@ pub struct MidiEditView<'a> {
     /// the shuffle everybody means by "swing". Only read while `swing`.
     pub swing_pct: f64,
     pub triplet: bool,
-    pub bpm: f64,
+    /// **The song's tempo and meter maps**, which every line, the ruler and
+    /// every snap here are asked of (`view_grid`) - the maps the arrangement
+    /// draws its lines from, so the roll's bars and beats are the song's
+    /// through a tempo or a meter change.
+    pub tempo: crate::tempo::TempoMap,
+    pub meter: crate::tempo::MeterMap,
+    /// The signature the gridbox SPELLS its rung in (`grid_word`), and
+    /// nothing else: where the lines are is the meter map's.
     pub sig_top: u32,
     pub sig_bottom: u32,
     /// **The playhead as the ROLL draws it**: in a looping clip, the song's
@@ -543,45 +550,35 @@ pub fn nav_window(l: &Layout, view: &MidiEditView<'_>) -> Rect {
 
 // ── the grid ───────────────────────────────────────────────────────────────
 
-fn bar_s(view: &MidiEditView<'_>) -> f64 {
-    let bpm = view.bpm.clamp(20.0, 400.0);
-    let top = view.sig_top.clamp(1, 32) as f64;
-    let bottom = view.sig_bottom.clamp(1, 32) as f64;
-    top * (60.0 / bpm) * (4.0 / bottom)
-}
-
-/// One grid step in seconds. Triplet divides the next size UP into three —
-/// an eighth-triplet is a third of a quarter — which is the 2/3 here.
+/// One grid step in seconds, where the roll's playhead stands: the rung of
+/// that bar's signature at the song's tempo there. Triplet divides the next
+/// size UP into three — an eighth-triplet is a third of a quarter — which
+/// is the 2/3 in it; a swung grid's step is its straight one. What a
+/// duplicate, a nudge and a resize move by, and how long a note drawn with
+/// the magnet off is.
 pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
     // **A NOTE VALUE, not a fraction of the bar.**
     //
-    // This was `bar_s * 2^exp`, which is a quarter note in 4/4 by coincidence
-    // — a 4/4 bar happens to be four quarters — and a DOTTED EIGHTH in 6/8,
-    // whose bar is three. Six beats cannot be divided by four, so every line
-    // and every snap in a compound meter landed between the notes. The bar
-    // length is still meter-aware and still right; it is simply not what a
-    // grid step is measured in.
-    let bpm = view.bpm.clamp(20.0, 400.0);
-    let g = crate::arrangement_panel::grid_quarters(
-        view.grid_exp,
-        view.sig_top.clamp(1, 32) as u8,
-        view.sig_bottom.clamp(1, 32) as u8,
-    ) * (60.0 / bpm);
-    if view.triplet {
-        g * 2.0 / 3.0
-    } else {
-        g
-    }
+    // This was the bar times `2^exp`, which is a quarter note in 4/4 by
+    // coincidence — a 4/4 bar happens to be four quarters — and a DOTTED
+    // EIGHTH in 6/8, whose bar is three. Six beats cannot be divided by four,
+    // so every line and every snap in a compound meter landed between the
+    // notes. The bar length is still meter-aware and still right; it is
+    // simply not what a grid step is measured in.
+    //
+    // **And the song's step, not the tempo dial's**: after a tempo change
+    // the dial's step is a length the song does not have there.
+    view_grid(view).map_or(0.0, |g| g.step_at(view.playhead_s))
 }
 
 /// `t`, magnetised to the grid's own lines — straight, triplet or swung.
 ///
 /// Delegates to [`Grid::nearest`](crate::quantize::Grid::nearest) through
 /// [`view_grid`], the one authority on where a line is, so a quantize on the
-/// same grid lands where the magnet does by construction. `snap_floor_t`,
-/// `snap_next_t` and `grid_lines` still spell the swung pair themselves; only
-/// `the_grid_snaps_straight_triplet_and_swung` (one point per shape) checks
-/// that what snaps is a line the grid draws.
+/// same grid lands where the magnet does by construction. [`snap_floor_t`],
+/// [`snap_next_t`] and [`grid_lines`] ask the same grid, so what snaps, what
+/// a walk steps to and what is drawn are one set of lines - the song's, on
+/// its tempo and meter maps.
 pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     if !view.snap_on {
         return t.max(0.0);
@@ -605,12 +602,22 @@ pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
 ///
 /// The bridge between the editor's loose terms - a bool for swing, a
 /// percentage beside it - and the value the rest of the app quantizes
-/// against. Triplet beats swing here because they are mutually exclusive in
-/// this app and the editor has always resolved them that way.
+/// against, laid on the song's maps the view carries. Triplet beats swing
+/// here because they are mutually exclusive in this app and the editor has
+/// always resolved them that way.
 pub fn view_grid(view: &MidiEditView<'_>) -> Option<crate::quantize::Grid> {
+    grid_of(view, view.swing && !view.triplet)
+}
+
+/// The view's grid, swung only when `swung`: with the magnet off a walk
+/// forward steps the straight grid under the swing.
+fn grid_of(view: &MidiEditView<'_>, swung: bool) -> Option<crate::quantize::Grid> {
     crate::quantize::Grid::new(
-        grid_step_s(view),
-        (view.swing && !view.triplet).then(|| view.swing_pct.clamp(0.5, 0.95)),
+        view.tempo.clone(),
+        view.meter.clone(),
+        view.grid_exp,
+        view.triplet,
+        swung.then(|| view.swing_pct.clamp(0.5, 0.95)),
     )
 }
 
@@ -639,85 +646,45 @@ pub fn snap_floor_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     if !view.snap_on {
         return t.max(0.0);
     }
-    let step = grid_step_s(view);
-    if step <= 0.0 {
+    let Some(grid) = view_grid(view) else {
         return t.max(0.0);
-    }
-    if view.swing && !view.triplet {
-        let pair = step * 2.0;
-        let base = (t / pair).floor() * pair;
-        let mut best = base;
-        for c in [base, base + pair * view.swing_pct.clamp(0.5, 0.95), base + pair] {
-            if c <= t + SNAP_EPS_S && c > best {
-                best = c;
-            }
-        }
-        best.max(0.0)
-    } else {
-        (((t + SNAP_EPS_S) / step).floor() * step).max(0.0)
-    }
+    };
+    grid.floor(t + SNAP_EPS_S).max(0.0)
 }
 
 /// The first grid line STRICTLY after `t` — shape-aware, so a note drawn
 /// on the on-beat of a swung pair runs long to the off-beat line and one
 /// drawn on the off-beat runs short to the next pair. Durations and
 /// nudges walk the same lines the magnet lands on. A line within
-/// [`SNAP_EPS_S`] of `t` is the one `t` stands on, never the next.
+/// [`SNAP_EPS_S`] of `t` is the one `t` stands on, never the next. With the
+/// magnet off it walks the straight grid under the swing.
 pub fn snap_next_t(view: &MidiEditView<'_>, t: f64) -> f64 {
-    let step = grid_step_s(view);
-    if step <= 0.0 {
+    let Some(grid) = grid_of(view, view.snap_on && view.swing && !view.triplet) else {
         return t;
-    }
-    if view.snap_on && view.swing && !view.triplet {
-        let pair = step * 2.0;
-        let base = (t / pair).floor() * pair;
-        for c in [
-            base + pair * view.swing_pct.clamp(0.5, 0.95),
-            base + pair,
-            base + pair + pair * view.swing_pct.clamp(0.5, 0.95),
-        ] {
-            if c > t + SNAP_EPS_S {
-                return c;
-            }
-        }
-        base + pair * 2.0
-    } else {
-        (((t + SNAP_EPS_S) / step).floor() + 1.0) * step
-    }
+    };
+    grid.next(t + SNAP_EPS_S)
 }
 
-/// Every grid line in `[from, to]`: `f(t, is_bar)`. Bounded, so a zoomed-out
-/// window cannot ask for ten thousand lines.
+/// Every grid line from the one at or before `from` to `to`: `f(t,
+/// is_bar)`. Bounded, so a zoomed-out window cannot ask for ten thousand
+/// lines: past two thousand it draws the bars alone.
 pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut(f64, bool)) {
-    let bar = bar_s(view);
-    let step = grid_step_s(view);
-    if bar <= 0.0 || step <= 0.0 || to <= from {
+    if to <= from {
         return;
     }
-    if (to - from) / step > 2000.0 {
-        // Too fine to see anyway: bars only.
-        let mut n = (from / bar).floor().max(0.0);
-        while n * bar <= to && n < 100_000.0 {
-            f(n * bar, true);
-            n += 1.0;
-        }
-        return;
-    }
-    if view.swing && !view.triplet {
-        let pair = step * 2.0;
-        let mut n = (from / pair).floor().max(0.0);
-        while n * pair <= to {
-            let base = n * pair;
-            f(base, (base / bar).round() * bar == base || base.rem_euclid(bar) < 1.0e-9);
-            f(base + pair * view.swing_pct.clamp(0.5, 0.95), false);
-            n += 1.0;
-        }
-    } else {
-        let mut n = (from / step).floor().max(0.0);
-        while n * step <= to {
-            let t = n * step;
-            f(t, t.rem_euclid(bar) < 1.0e-6 || bar - t.rem_euclid(bar) < 1.0e-6);
-            n += 1.0;
+    match view_grid(view) {
+        Some(grid) if (to - from) / grid.step_at(from).max(1.0e-9) <= 2000.0 => grid.lines(from, to, f),
+        _ => {
+            // Too fine to see anyway: bars only, the song's.
+            let mut n = view.meter.bar_beat_at_quarter(view.tempo.beat_at_seconds(from)).0;
+            for _ in 0..100_000 {
+                let t = view.tempo.seconds_at_beat(view.meter.quarter_at_bar(n));
+                if t > to {
+                    break;
+                }
+                f(t, true);
+                n = n.saturating_add(1);
+            }
         }
     }
 }
@@ -1416,21 +1383,28 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // ── the ruler: bars numbered, beats ticked, one press a locate ──────
     if l.ruler.is_positive() {
         painter.rect_filled(l.ruler, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
-        let bar = {
-            let bpm = view.bpm.clamp(20.0, 400.0);
-            f64::from(view.sig_top.clamp(1, 32)) * (60.0 / bpm)
-                * (4.0 / f64::from(view.sig_bottom.clamp(1, 32)))
-        };
+        // **The song's bars, on its maps**, as the lines under them are: a
+        // bar's length and its beats are its own signature's at the tempo
+        // there, so after a tempo or a meter change the numbers still stand
+        // on the bar lines. It was the tempo dial's one bar from 0:00.
+        let end = view.view_start_s + view.view_len_s;
+        let bar_at = |n: u32| view.tempo.seconds_at_beat(view.meter.quarter_at_bar(n));
+        let bar_of = |t: f64| view.meter.bar_beat_at_quarter(view.tempo.beat_at_seconds(t)).0;
+        let (first, last) = (bar_of(view.view_start_s), bar_of(end));
+        // The window's bars on average: with a tempo change in view they are
+        // not all one width.
+        let bar = (bar_at(last.saturating_add(1)) - bar_at(first))
+            / f64::from(last.saturating_sub(first).saturating_add(1));
         if bar > 0.0 {
             let px_per_s = f64::from(l.roll.width()) / view.view_len_s.max(1.0e-9);
-            let mut step = 1u64;
-            while bar * step as f64 * px_per_s < 44.0 && step < 1 << 16 {
+            let mut step = 1u32;
+            while bar * f64::from(step) * px_per_s < 44.0 && step < 1 << 16 {
                 step *= 2;
             }
-            let mut n = (view.view_start_s / (bar * step as f64)).floor().max(0.0) as u64;
-            loop {
-                let t = n as f64 * bar * step as f64;
-                if t > view.view_start_s + view.view_len_s {
+            let mut n = first / step * step;
+            for _ in 0..4_096 {
+                let t = bar_at(n);
+                if t > end {
                     break;
                 }
                 let x = x_of(&l, view, t);
@@ -1442,7 +1416,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                     painter.text(
                         Pos2::new(x + 3.0, l.ruler.top() + 1.0),
                         Align2::LEFT_TOP,
-                        format!("{}", n * step + 1),
+                        format!("{}", n + 1),
                         font(9.0),
                         ink.gamma_multiply(0.55),
                     );
@@ -1451,12 +1425,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 // smaller: 16.2, 16.3, 16.4, until 17 — whenever a beat has
                 // the room. Only at step 1: a decimated ruler has no beats.
                 if step == 1 {
-                    let beats = u64::from(view.sig_top.clamp(1, 32));
-                    let beat_px = bar * px_per_s / beats as f64;
+                    let sig = view.meter.sig_at_bar(n);
+                    let beats = u32::from(sig.beats.max(1));
+                    let beat_px = (bar_at(n.saturating_add(1)) - t) * px_per_s / f64::from(beats);
                     if beat_px >= 26.0 {
+                        let q0 = view.meter.quarter_at_bar(n);
+                        let beat_q = 4.0 / f64::from(sig.unit.max(1));
                         for b in 1..beats {
-                            let tb = t + bar * b as f64 / beats as f64;
-                            if tb > view.view_start_s + view.view_len_s {
+                            let tb = view.tempo.seconds_at_beat(q0 + f64::from(b) * beat_q);
+                            if tb > end {
                                 break;
                             }
                             let xb = x_of(&l, view, tb);
@@ -1480,7 +1457,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                         }
                     }
                 }
-                n += 1;
+                n = n.saturating_add(step);
             }
         }
     }
@@ -2352,7 +2329,7 @@ mod tests {
                 triplet,
                 swing,
                 swing_pct: 0.62,
-                bpm: 120.0,
+                tempo: crate::tempo::TempoMap::constant(120.0),
                 ..view(&notes)
             };
             // **Built from the VIEW'S OWN FIELDS, not from `view_grid`.**
@@ -2363,12 +2340,11 @@ mod tests {
             // passed. Verified by doing exactly that. Deriving the expected
             // grid independently here is what gives the comparison teeth -
             // if `view_grid` stops carrying swing, or triplet, or the
-            // meter, the magnet moves and this does not.
-            let grid = crate::quantize::Grid::from_document(
+            // song's maps, the magnet moves and this does not.
+            let grid = crate::quantize::Grid::new(
+                v.tempo.clone(),
+                v.meter.clone(),
                 v.grid_exp,
-                v.sig_top as u8,
-                v.sig_bottom as u8,
-                v.bpm,
                 v.triplet,
                 (v.swing && !v.triplet).then_some(v.swing_pct),
             )
@@ -2431,7 +2407,8 @@ mod tests {
             swing: false,
             swing_pct: 0.58,
             triplet: false,
-            bpm: 120.0,
+            tempo: crate::tempo::TempoMap::constant(120.0),
+            meter: crate::tempo::MeterMap::constant(crate::recorder::TimeSignature { beats: 4, unit: 4 }),
             sig_top: 4,
             sig_bottom: 4,
             playhead_s: 10.0,

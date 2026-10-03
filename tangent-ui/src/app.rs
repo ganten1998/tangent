@@ -13857,7 +13857,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **Below a bar, the note values `draw` steps.** Each bar is walked in
     /// `grid_quarters` steps from its own line, exactly as the ruler draws
     /// it. Dividing the bar by `2^-exp` agreed in 4/4 alone: in 3/4, 6/8 and
-    /// 7/8 the magnet landed between the lines drawn.
+    /// 7/8 the magnet landed between the lines drawn. A multi-bar grid is
+    /// the nearest of the two bar lines this position sits between, both
+    /// asked of the map, because "every four bars" is four bars of whatever
+    /// length they are.
+    ///
+    /// **The quantize grid's own walk** (`quantize::nearest_quarter`), so
+    /// the arrangement's magnet, the MIDI editor's and a quantize are one
+    /// arithmetic, not three kept in step.
     ///
     /// A pure function of the map, the position and the gridbox, so the test
     /// can drive it without an app.
@@ -13865,39 +13872,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !q.is_finite() || q <= 0.0 {
             return 0.0;
         }
-        // The rung as the ruler is handed it: `grid_quarters` clamps it.
-        let rung = exp;
-        let exp = i32::from(exp.clamp(-6, 6));
-        let bar = meter.bar_beat_at_quarter(q).0;
-        if exp >= 0 {
-            // A multi-bar grid: the nearest of the two bar lines this
-            // position sits between. Both are asked of the map, because
-            // "every four bars" is four bars of whatever length they are.
-            let every = 1u32 << exp.min(20);
-            let lo_bar = (bar / every) * every;
-            let hi_bar = lo_bar.saturating_add(every);
-            let lo = meter.quarter_at_bar(lo_bar);
-            let hi = meter.quarter_at_bar(hi_bar);
-            // **A tie goes UP**, which is what `f64::round` does and what
-            // every other snap in this app therefore does. Landing a
-            // dead-centre drop on the earlier line instead is a half-bar
-            // jump backwards that only shows on exact midpoints — the
-            // hardest kind of inconsistency to notice and the most annoying
-            // to work with.
-            if (q - lo).abs() < (hi - q).abs() { lo } else { hi }
-        } else {
-            // A sub-bar grid: THIS bar, in the note values the ruler draws
-            // it in. Every rung divides the bar exactly, so the last step is
-            // the next bar's downbeat, which is right and is why the clamp
-            // allows it.
-            let sig = meter.sig_at_bar(bar);
-            let q0 = meter.quarter_at_bar(bar);
-            let qn = meter.quarters_in_bar(bar).max(1.0e-9);
-            let step = crate::arrangement_panel::grid_quarters(rung, sig.beats, sig.unit).max(1.0e-9);
-            let n = (qn / step).round().max(1.0);
-            let k = ((q - q0) / step).round().clamp(0.0, n);
-            q0 + k * step
-        }
+        crate::quantize::nearest_quarter(meter, q, exp)
     }
 
     /// **One lane's height in points**, as every consumer of the lane stack
@@ -17267,25 +17242,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
     }
 
-    /// **The quantize window's grid**, from what it is showing.
-    ///
-    /// `None` when the numbers do not describe a grid, which is the same
-    /// answer `Grid::new` gives and for the same reason: a caller that
-    /// computed nonsense has a bug, and handing it a working grid hides it.
-    fn quantize_window_grid(&self) -> Option<crate::quantize::Grid> {
-        let sig = self.settings.time_signature();
-        crate::quantize::Grid::from_document(
-            self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
-            sig.beats,
-            sig.unit,
-            f64::from(self.tempo_bpm()),
-            self.settings.quantize_triplet,
-            // 50 IS straight, so it is `None` rather than a swing of a half.
-            (self.settings.quantize_swing_pct > 50.5)
-                .then(|| self.settings.quantize_swing_pct / 100.0),
-        )
-    }
-
     /// **What the window would act on**, in words, or `None`.
     ///
     /// The window asks so it can SAY, rather than leaving somebody to press
@@ -17337,8 +17293,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (`DialogAction::ApplyQuantize`), so this is the Apply's question. The
     /// preview asks the window's working copies instead; both go through
     /// [`Self::quantize_ask_of`], so the two cannot mean different things.
-    /// (The MIDI Apply takes only the strength and the window from here: it
-    /// still builds its grid a second way, in `quantize_window_grid`.)
+    /// The MIDI Apply takes its grid from here too, so notes and takes are
+    /// aimed at one set of lines.
     fn quantize_ask(&self) -> Option<crate::ports::QuantizeAsk> {
         self.quantize_ask_of(
             self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
@@ -17363,6 +17319,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the other in `Dialog::Quantize`'s working copies, and a struct for the
     /// hand-off would be an eighth place for a knob to be forgotten. The
     /// allow is for plain `cargo clippy`; the gate does not enable this lint.
+    ///
+    /// **The grid is laid on the song's maps**, the ones the arrangement
+    /// draws its lines from and the click plays to, so a quantize aims at
+    /// lines somebody can see. It was the tempo dial and the dial's
+    /// signature, counted from 0:00: right only while the song never
+    /// changed tempo or meter.
     #[allow(clippy::too_many_arguments)]
     fn quantize_ask_of(
         &self,
@@ -17374,20 +17336,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         sensitivity: f64,
         fit: &str,
     ) -> Option<crate::ports::QuantizeAsk> {
-        let sig = self.settings.time_signature();
-        let grid = crate::quantize::Grid::from_document(
+        let grid = crate::quantize::Grid::new(
+            self.live_tempo_map(),
+            self.live_meter_map(),
             grid_exp.clamp(-7, 3),
-            sig.beats,
-            sig.unit,
-            f64::from(self.tempo_bpm()),
             triplet,
             // 50 IS straight, so it is `None` rather than a swing of a half.
             (swing_pct > 50.5).then(|| swing_pct.clamp(50.0, 95.0) / 100.0),
         )?;
         Some(crate::ports::QuantizeAsk {
             ids: self.arr_quantize_ids(),
-            step_s: grid.step(),
-            swing: grid.swing(),
+            grid,
             strength: strength_pct.clamp(0.0, 100.0) / 100.0,
             window: (window_ms > 0.0).then(|| window_ms.clamp(0.0, 500.0) / 1000.0),
             sensitivity: sensitivity.clamp(0.0, 1.0),
@@ -17446,11 +17405,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         if self.midi_edit.is_some() {
-            let Some(grid) = self.quantize_window_grid() else {
-                return;
-            };
             self.me_quantize_with(crate::quantize::Quantize {
-                grid,
+                grid: ask.grid,
                 strength: ask.strength,
                 window: ask.window,
             });
@@ -20886,7 +20842,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             swing: self.settings.midi_swing,
             swing_pct: self.settings.midi_swing_pct.clamp(50.0, 95.0) / 100.0,
             triplet: self.settings.midi_triplet,
-            bpm: f64::from(self.tempo_bpm()),
+            // The song's maps, which the arrangement draws its lines from:
+            // the dial's one tempo counted from 0:00 put the roll's lines
+            // after a tempo change where the song has no beat.
+            tempo: self.live_tempo_map(),
+            meter: self.live_meter_map(),
             sig_top: u32::from(sig.beats),
             sig_bottom: u32::from(sig.unit),
             // **Folded into the pass the roll shows.** The roll draws a
@@ -41806,8 +41766,7 @@ mod tests {
             Some(crate::ports::ProjectRequest::QuantizeClips(
                 crate::ports::QuantizeAsk {
                     ids,
-                    step_s,
-                    swing,
+                    grid,
                     strength,
                     window,
                     sensitivity,
@@ -41815,8 +41774,9 @@ mod tests {
                 },
             )) => {
                 assert_eq!(ids.len(), 2, "Apply did not act on the whole selection");
+                let step_s = grid.step_at(0.0);
                 assert!((step_s - 0.25).abs() < 1e-9, "Apply used {step_s} s, not the window's eighth");
-                assert_eq!(swing, None, "50% is straight and must travel as None");
+                assert_eq!(grid.swing(), None, "50% is straight and must travel as None");
                 assert!((strength - 0.8).abs() < 1e-9, "the strength did not travel");
                 // **The three that used to be dropped on this step.** The
                 // Apply wrote them into settings and the request carried
@@ -41837,10 +41797,10 @@ mod tests {
     /// **The chip CALLED "1/16" applies a sixteenth**, whatever the song's
     /// meter. The window labelled its GRID chips in 4/4
     /// (`grid_label_text(e, 4, 4)`) while the grid it applies is built in
-    /// the song's meter (`Grid::from_document(.., sig.beats, sig.unit, ..)`),
-    /// so in 3/4 the chip "1/16" quantized to a 32nd and the default "1/8" to
-    /// a sixteenth. Read off the painted chips, so it holds whichever side
-    /// is made to agree with the other.
+    /// the song's meter (each bar's own signature, on the meter map), so in
+    /// 3/4 the chip "1/16" quantized to a 32nd and the default "1/8" to a
+    /// sixteenth. Read off the painted chips, so it holds whichever side is
+    /// made to agree with the other.
     #[test]
     fn the_quantize_chip_called_a_sixteenth_applies_a_sixteenth_in_three_four() {
         fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
@@ -41885,7 +41845,7 @@ mod tests {
         let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16");
         let e = -i8::try_from(rung).expect("eight chips");
         let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
-        let quarters = ask.step_s * app.tempo_bpm() / 60.0;
+        let quarters = ask.grid.step_at(0.0) * app.tempo_bpm() / 60.0;
         assert!(
             (quarters - 0.25).abs() < 1.0e-9,
             "in 3/4 the chip called 1/16 (rung {e}) quantizes to {quarters} quarter notes; a sixteenth is 0.25: {chips:?}"
@@ -41899,7 +41859,7 @@ mod tests {
         let e = -i8::try_from(rung).expect("eight chips");
         let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
         assert!(
-            (ask.step_s * app.tempo_bpm() / 60.0 - 0.25).abs() < 1.0e-9,
+            (ask.grid.step_at(0.0) * app.tempo_bpm() / 60.0 - 0.25).abs() < 1.0e-9,
             "the chips kept the meter the window opened in after it changed: {chips:?}"
         );
     }
@@ -42870,7 +42830,7 @@ mod tests {
         app.open_quantize_window();
         let ask = app.quantize_preview().expect("an open window asks");
         assert_eq!(ask.ids, vec![a], "the preview did not name the selection");
-        assert!((ask.step_s - 0.25).abs() < 1e-9, "an eighth at 120 is a quarter second");
+        assert!((ask.grid.step_at(0.0) - 0.25).abs() < 1e-9, "an eighth at 120 is a quarter second");
         assert!((ask.sensitivity - 0.72).abs() < 1e-9, "the dial did not reach the question");
         assert_eq!(ask.window, Some(0.025), "the window did not reach the question");
         assert!((ask.strength - 0.6).abs() < 1e-9, "the strength did not reach the question");
@@ -42899,9 +42859,9 @@ mod tests {
         );
         assert_eq!(moved.fit, "stretch", "the window's fit did not reach the question");
         assert!(
-            (moved.step_s - 0.125).abs() < 1e-9,
+            (moved.grid.step_at(0.0) - 0.125).abs() < 1e-9,
             "the window's grid did not reach the question: {} s",
-            moved.step_s
+            moved.grid.step_at(0.0)
         );
         assert_ne!(moved, ask, "the dial moved and the question did not");
         // **And the SETTINGS are untouched by turning it**, which is what
@@ -43042,11 +43002,11 @@ mod tests {
     /// The UI cannot reach the samples, so all this does is name the clips
     /// and the grid - which means the thing worth testing is that it names
     /// them correctly. Checked: MIDI in the selection is skipped rather than
-    /// sent, and the grid travels as SECONDS worked out from the window's
-    /// own exponent and the song's tempo, not as an exponent the host would
-    /// have to interpret for itself. (The fixture puts the arrangement's
-    /// grid on the same rung, so it cannot yet tell the two exponents
-    /// apart.)
+    /// sent, and the grid travels whole - the window's own exponent laid on
+    /// the song's maps, which the host asks where a line is - not as an
+    /// exponent the host would have to interpret for itself. (The fixture
+    /// puts the arrangement's grid on the same rung, so it cannot yet tell
+    /// the two exponents apart.)
     #[test]
     fn quantizing_the_arrangement_asks_the_host_for_the_audio_clips_only() {
         let root = project_scratch("arr-quantize");
@@ -43081,13 +43041,14 @@ mod tests {
         });
         match app.take_project_request() {
             Some(crate::ports::ProjectRequest::QuantizeClips(
-                crate::ports::QuantizeAsk { ids, step_s, swing, strength, window, .. },
+                crate::ports::QuantizeAsk { ids, grid, strength, window, .. },
             )) => {
                 assert_eq!(ids, vec![audio], "the MIDI clip was sent to an audio quantize");
                 assert_eq!(window, None, "a window of zero is OFF, not a window of zero");
                 // A quarter at 120 bpm in 4/4 is half a second.
+                let step_s = grid.step_at(0.0);
                 assert!((step_s - 0.5).abs() < 1e-9, "the grid went over as {step_s} s");
-                assert_eq!(swing, None, "the arrangement grid is straight");
+                assert_eq!(grid.swing(), None, "the arrangement grid is straight");
                 assert!((strength - 1.0).abs() < 1e-9, "the default strength is not full");
             }
             other => panic!("Q asked for {:?}", other.map(|r| std::mem::discriminant(&r))),
@@ -43109,6 +43070,71 @@ mod tests {
             app.take_project_request().is_none(),
             "a MIDI-only selection still asked the host to quantize audio"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The audio quantize aims at the lines the arrangement snaps to**,
+    /// through a tempo change and through a meter change. The ask carried
+    /// one step in seconds, worked out from the tempo dial and the dial's
+    /// signature and counted from 0:00, while the arrangement's lines and
+    /// its magnet follow the song's maps: with 120 bpm changing to 90 at
+    /// beat 16, beat 17 (8.667 s, a drawn line) was pulled to 8.5 s, and
+    /// after a 3/4 bar every half-note line of the song was a beat out. The
+    /// host builds the warp and the window's ticks from the ask, so this is
+    /// the grid both of them aim at.
+    #[test]
+    fn the_audio_quantize_aims_at_the_lines_the_arrangement_snaps_to() {
+        use crate::tempo::{MeterMap, MeterPoint, TempoMap, TempoPoint};
+        let root = project_scratch("q-maps");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.arr_snap = true;
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            start_s: 4.0,
+            len_s: 8.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(a);
+        // The named times are drawn lines, the quantize leaves them there,
+        // and everywhere else it aims where the arrangement's magnet does.
+        let agree = |app: &mut TangentApp, exp: i8, lines: &[f64]| {
+            app.settings.arr_grid_exp = i64::from(exp);
+            app.settings.quantize_grid_exp = i64::from(exp);
+            app.open_quantize_window();
+            let ask = app.quantize_preview().expect("an open window asks");
+            let grid = ask.grid;
+            for &t in lines {
+                assert!((app.arr_snap_t(t) - t).abs() < 1e-9, "fixture: {t} is not a drawn line");
+                assert!((grid.nearest(t) - t).abs() < 1e-9, "the quantize pulls the drawn line {t} to {}", grid.nearest(t));
+            }
+            for i in 0..400 {
+                let t = f64::from(i) * 0.037;
+                let (aim, snap) = (grid.nearest(t), app.arr_snap_t(t));
+                assert!((aim - snap).abs() < 1e-9, "at {t} the quantize aims at {aim} and the magnet at {snap}");
+            }
+        };
+        // 120 for four bars, then 90: beat 17 is at 8 + 2/3 s.
+        app.arrangement.tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            TempoPoint { at_beat: 16.0, bpm: 90.0, ramp: false },
+        ]);
+        let beat_17 = app.live_tempo_map().seconds_at_beat(17.0);
+        agree(&mut app, -2, &[beat_17]);
+        // Back to 120 throughout, and two bars of 4/4, one of 3/4, then 4/4:
+        // on a half-note grid the bar after the 3/4 one begins at 5.5 s, and
+        // its next line is at 6.5 s.
+        app.arrangement.tempo = TempoMap::constant(120.0);
+        let sig = |beats: u8| recorder::TimeSignature { beats, unit: 4 };
+        app.arrangement.meter = MeterMap::sanitised(vec![
+            MeterPoint { at_bar: 0, sig: sig(4) },
+            MeterPoint { at_bar: 2, sig: sig(3) },
+            MeterPoint { at_bar: 3, sig: sig(4) },
+        ]);
+        agree(&mut app, -1, &[5.5, 6.5]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -43294,6 +43320,40 @@ mod tests {
         app.apply_dialog_action(DialogAction::ApplyQuantize { grid_exp: -2, triplet: false, swing_pct: 50.0,
             strength_pct: 100.0, window_ms: 0.0, sensitivity: 0.5, fit: String::new() });
         assert_eq!(at_s(&app), before, "a loop trimmed by more than a pass was stacked on its head");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A quantize leaves a note on a beat of the tempo map where it is.**
+    /// The grid was the tempo dial's, counted from 0:00, while the
+    /// arrangement's lines, its magnet and the click follow the song's tempo
+    /// map: with 120 bpm changing to 90 at beat 16, beat 17 stands at
+    /// 8.667 s, and a quantize pulled a note played on it to 8.5 s, a
+    /// 120-bpm line nobody can see.
+    #[test]
+    fn a_quantize_leaves_a_note_on_a_beat_of_the_tempo_map_where_it_is() {
+        let root = project_scratch("q-tempo-map");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        // 120 for four bars (16 quarters = 8 s), then 90: beat 17 is at 8 + 2/3 s.
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 90.0, ramp: false },
+        ]);
+        let beat_17 = app.live_tempo_map().seconds_at_beat(17.0);
+        assert!((beat_17 - (8.0 + 60.0 / 90.0)).abs() < 1e-9, "fixture: beat 17 is at {beat_17}");
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote { at_s: beat_17 - 8.0, dur_s: 0.2, key: 60, vel: 100, muted: false }],
+            lane: 1, start_s: 8.0, len_s: 4.0, loop_s: 4.0, name: "MIDI".to_owned(), ..Default::default()
+        });
+        app.open_midi_editor(id);
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2, triplet: false, swing_pct: 50.0, strength_pct: 100.0,
+            window_ms: 0.0, sensitivity: 0.5, fit: String::new(),
+        });
+        let at = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").notes[0].at_s;
+        assert!((at - (beat_17 - 8.0)).abs() < 1e-9, "a note on beat 17 was pulled to {} s", 8.0 + at);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -47351,6 +47411,88 @@ mod tests {
         app.me_nudge(-1.0, 0);
         let at = app.arrangement.clips[0].notes[0].at_s;
         assert!(at < 0.9, "a swung nudge left left the note on its line, at {at}");
+    }
+
+    /// **The editor's lines, its magnet, its walks and a quantize follow a
+    /// tempo change in the part.** The editor drew and snapped to the tempo
+    /// dial's grid counted from 0:00, so with 120 bpm changing to 90 inside
+    /// a part its lines after the change stood where the song has no beat,
+    /// and a quantize that follows the song would land between them.
+    #[test]
+    fn the_editors_lines_magnet_and_quantize_follow_a_tempo_change_in_the_part() {
+        let root = project_scratch("me-tempo-map");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.arr_snap = true;
+        app.settings.arr_grid_exp = -3;
+        app.settings.midi_snap = true;
+        app.settings.midi_swing = false;
+        app.settings.midi_triplet = false;
+        app.settings.midi_grid_exp = -3;
+        // 120 for four bars, then 90: eighths of 0.25 s, then of 1/3 s.
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 90.0, ramp: false },
+        ]);
+        // A part from 6 s to 12 s, across the change, played around the lines.
+        let played = [6.27, 7.9, 8.3, 8.7, 10.02, 11.64];
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: played
+                .iter()
+                .map(|t| crate::arrangement::ArrNote { at_s: t - 6.0, dur_s: 0.1, key: 60, vel: 100, muted: false })
+                .collect(),
+            lane: 1, start_s: 6.0, len_s: 6.0, loop_s: 6.0, name: "MIDI".to_owned(), ..Default::default()
+        });
+        app.open_midi_editor(id);
+        let (lines, magnet, walk) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let v = app.midi_edit_view(st, clip);
+            let mut lines = Vec::new();
+            crate::midi_editor::grid_lines(&v, 6.0, 12.0, |t, _| lines.push(t));
+            let magnet: Vec<f64> = played.iter().map(|&t| crate::midi_editor::snap_t(&v, t)).collect();
+            // What Enter and the arrows step through, from the part's head.
+            let mut walk = vec![6.0];
+            while walk.len() < 64 {
+                let t = crate::midi_editor::snap_next_t(&v, walk[walk.len() - 1]);
+                if t > 12.0 + 1e-9 {
+                    break;
+                }
+                walk.push(t);
+            }
+            (lines, magnet, walk)
+        };
+        let drawn = |t: f64| lines.iter().any(|l| (l - t).abs() < 1e-6);
+        // The song's lines: beat 17 (8 + 2/3 s) is one, and every line drawn
+        // in the part is one the arrangement's magnet lands on.
+        let beat_17 = app.live_tempo_map().seconds_at_beat(17.0);
+        assert!(drawn(beat_17), "the editor draws no line on beat 17 ({beat_17} s): {lines:?}");
+        let inside: Vec<f64> = lines.iter().copied().filter(|l| (6.0 - 1e-9..=12.0 + 1e-9).contains(l)).collect();
+        for &l in &inside {
+            assert!((app.arr_snap_t(l) - l).abs() < 1e-9, "the editor draws a line at {l}, where the song has none");
+        }
+        assert_eq!(walk.len(), inside.len(), "the walk {walk:?} is not the lines drawn {inside:?}");
+        for (w, l) in walk.iter().zip(&inside) {
+            assert!((w - l).abs() < 1e-9, "the walk stepped to {w}, the line drawn is at {l}");
+        }
+        for (t, m) in played.iter().zip(&magnet) {
+            assert!(drawn(*m), "the magnet put {t} on {m}, where no line is drawn");
+        }
+        // A full-strength quantize on the same rung lands each note where the
+        // magnet does.
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -3, triplet: false, swing_pct: 50.0, strength_pct: 100.0,
+            window_ms: 0.0, sensitivity: 0.5, fit: String::new(),
+        });
+        let mut at: Vec<f64> = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip")
+            .notes.iter().map(|n| 6.0 + n.at_s).collect();
+        at.sort_by(f64::total_cmp);
+        for (got, want) in at.iter().zip(&magnet) {
+            assert!((got - want).abs() < 1e-9, "the quantize put a note at {got}, the magnet at {want}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The loop bar stands where the loop turns over**, on a part trimmed
