@@ -4162,6 +4162,17 @@ impl DesktopApp {
                 // and without it the set-aside would be permanent, which is
                 // the fault `DeadOnArrival` exists to avoid rather than cause.
                 self.recorder.doa.hardware_changed();
+                // **The stand-in goes first**, by the teardown `path_changed`
+                // does. On the fallback the engine is ALIVE, so the reopen
+                // below hit `start_engine`'s early return: the chosen system
+                // was restored under the stand-in's engine, the input reopened
+                // with the stand-in's render device as its ASIO duplex
+                // partner and failed, and nothing said "Back on".
+                if self.recorder.fallback.is_some() {
+                    self.recorder.engine = None;
+                    self.recorder.inserts_loaded =
+                        vec![None; tangent_ui::recorder::INSERT_SPACE];
+                }
                 self.open_audio_path(ctx);
             }
         } else if self.recorder.reprobe.is_some() {
@@ -27897,6 +27908,29 @@ mod tests {").expect("the tests module")];
         assert!(
             engine.contains("if let Some(was) = self.recorder.fallback.take()"),
             "nothing clears the marker when the chosen system comes back"
+        );
+    }
+
+    /// **The replug drops the stand-in before it reopens.** On the ASIO
+    /// fallback the engine is alive - the platform default standing in - so
+    /// the probe's reopen reached `start_engine`'s early return: SYSTEM went
+    /// back to ASIO under the stand-in's engine, the input opened with the
+    /// stand-in's render endpoint as its duplex device and failed, and the
+    /// interface never came back. A source scan, for the reason the test
+    /// above is one.
+    #[test]
+    fn the_probe_drops_the_stand_in_before_it_reopens() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let arm = {
+            let a = src.find(".is_some_and(Reprobe::device_back)").expect("the probe arm is gone");
+            let b = src[a..].find("self.open_audio_path(ctx);").expect("the probe no longer reopens");
+            &src[a..a + b]
+        };
+        assert!(
+            arm.contains("self.recorder.engine = None"),
+            "the replug reopens while the stand-in lives: `start_engine` returns at once, SYSTEM \
+             flips to ASIO under a WASAPI engine and the input opens on its render endpoint"
         );
     }
 
