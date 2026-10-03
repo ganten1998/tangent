@@ -511,10 +511,14 @@ cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
 # meaningful against the exact binary that faulted.
 cp target/x86_64-pc-windows-msvc/release/tangent.pdb "dist/tangent-${VERSION}-windows-x86_64.pdb" 2>/dev/null || true
 scripts/sign-windows.sh "$WINSTAGE/tangent.exe"
-# Steinberg's required notice, when the ASIO backend rode in.
-if [ -n "${CPAL_ASIO_DIR:-}" ]; then
-  printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt"
-fi
+# Steinberg's required notice, when the ASIO backend rode in: keyed on the
+# features this build was compiled with, not on CPAL_ASIO_DIR. That is cpal's
+# own variable and a shell can export it, so a WASAPI-only build made with it
+# set used to carry the notice, which the artifact checks took for proof of
+# ASIO. (They read the host off tangent.exe now as well.)
+case ",$WIN_FEATURES," in
+  *,asio,*) printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt" ;;
+esac
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in tangent.exe.

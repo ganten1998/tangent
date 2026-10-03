@@ -191,17 +191,15 @@ for a in "$@"; do
       printf '%s\n' "$list" | grep -Eq '^tangent\.exe$'        || note "$a: no tangent.exe"
       # **ASIO, or the release does not go out.**
       #
-      # `build-cross.sh` writes this notice ONLY when `CPAL_ASIO_DIR` was set,
-      # which is only when `vendor/asiosdk_*` was present - the SDK's licence
-      # forbids committing it, so a fresh checkout silently produces a
-      # WASAPI-only Windows build and says so in one line of build output
-      # nobody re-reads. Steinberg require the notice anyway, which is what
-      # makes it an honest fingerprint rather than a flag we set ourselves.
+      # `build-cross.sh` writes this notice when the build's features include
+      # `asio`, which it allows only with `vendor/asiosdk_*` present - the
+      # SDK's licence forbids committing it, so a fresh checkout does not have
+      # it. Steinberg require the notice whenever ASIO rides in.
       #
       # ASIO is the standard on Windows and the testers have interfaces: a
       # build without it is not the product, and the way that failure
       # presented was a user asking why the ASIO option FL Studio gives him
-      # is missing here. Loud, like the glibc floor.
+      # is missing here.
       printf '%s\n' "$list" | grep -Eq '(^|/)ASIO-NOTICE\.txt$' \
         || note "$a: NO ASIO (vendor/asiosdk_* was missing at build time)"
       # The portable build meets Smart App Control exactly as the installed
@@ -214,6 +212,16 @@ for a in "$@"; do
           note "$a: could not extract $pe to check its signature"
         fi
       done
+      # **And the host itself, read off the program.** A text file is a
+      # notice, not proof: the notice used to be keyed on CPAL_ASIO_DIR,
+      # cpal's own variable, which any shell can export, so a WASAPI-only
+      # build could carry it and pass. The SDK's driver list (asiolist.cpp)
+      # compiles the registry key it enumerates, `software\asio`, into the
+      # program; nothing of Tangent's own spells it in lower case, and a
+      # build without the host has no such bytes.
+      if [ -f "$inner/tangent.exe" ] && ! LC_ALL=C grep -a -q -F 'software\asio' "$inner/tangent.exe"; then
+        note "$a: tangent.exe has no ASIO host in it (a WASAPI-only build)"
+      fi
       rm -rf "$inner"
       ;;
     *-freebsd-*)
