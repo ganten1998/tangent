@@ -2715,7 +2715,7 @@ impl Hit {
             Hit::Capture => "Capture the session — video, audio, MIDI — apart from the arrangement",
             Hit::ProjectMenu => "Project — new, open, save, save as, template",
             Hit::Pause => "Pause — hold the playhead here; Stop goes home",
-            Hit::OpenSetup => "Take settings",
+            Hit::OpenSetup => "Settings - audio and media",
             Hit::CloseSetup => "Done",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
@@ -3239,7 +3239,11 @@ fn name_for(
             Hit::Pause => Node::button(id("pause"), r, "Pause"),
             Hit::Capture => Node::button(id("capture"), r, "Record a take"),
             Hit::ProjectMenu => Node::button(id("project"), r, "Project menu"),
-            Hit::OpenSetup => Node::button(id("setup"), r, "Take settings"),
+            // **SETTINGS, not the take's.** The take tier moved under the
+            // cassette; the cog opens AUDIO and MEDIA, and a screen reader
+            // announcing "Take settings" sent people to the one panel with no
+            // take rows in it.
+            Hit::OpenSetup => Node::button(id("setup"), r, "Settings - audio and media"),
             // Disabled while the tempo is held - see `RecorderState::tempo_held`.
             Hit::TapTempo => Node::button(id("tap"), r, "Tap tempo").enabled(!view.tempo_held),
             Hit::Export => Node::button(id("export"), r, "Export"),
@@ -9082,6 +9086,30 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len(), "two controls in the band share an id");
+    }
+
+    /// **The cog says what it opens.** It opens SETTINGS - the audio and
+    /// media tiers - since the take's own rows moved under the cassette, and
+    /// a screen reader still announced it as "Take settings": a name that
+    /// sends somebody to the one panel that has no take rows in it.
+    #[test]
+    fn the_cog_is_named_for_the_panel_it_opens() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0)));
+        let nodes = a11y_nodes(rect, &furnished());
+        let cog = nodes
+            .iter()
+            .find(|n| n.id == egui::Id::new(("band", "setup")))
+            .expect("the cog has no node");
+        assert!(
+            cog.label.starts_with("Settings") && !cog.label.to_lowercase().contains("take"),
+            "the cog is announced as {:?}",
+            cog.label
+        );
+        assert!(
+            !Hit::OpenSetup.label().to_lowercase().contains("take"),
+            "the cog's own label still says {:?}",
+            Hit::OpenSetup.label()
+        );
     }
 
     /// The names survive every state the band has, and every size.
