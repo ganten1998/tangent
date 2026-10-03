@@ -991,7 +991,8 @@ pub struct DesktopApp {
     /// **What each file SOUNDS like**, before a sensitivity is chosen. See
     /// `attacks_of`: the quantize window's marks are redrawn while a dial
     /// is being dragged, and this is the half of the detection that the
-    /// dial does not change.
+    /// dial does not change. In the frames of the decodes in `track_cache`,
+    /// so it is emptied and swept wherever that is.
     #[cfg(feature = "recorder")]
     attack_cache:
         std::collections::HashMap<std::path::PathBuf, Arc<crate::transient::Analysis>>,
@@ -3564,6 +3565,25 @@ fn heard_ratio(clip: &tangent_ui::arrangement::ArrClip) -> f64 {
         return 1.0;
     }
     clip.stretch.clamp(crate::stretch::RATIO.0, crate::stretch::RATIO.1)
+}
+
+/// **Room in a cache of per-file analyses, made from what the current ask
+/// does not name.** At the cap, every entry for a file the ask does not name
+/// goes and every one it does stays, so an ask over more files than the cap
+/// grows the cache to the ask instead of evicting what it is about to read.
+/// The attack cache emptied itself WHOLE at its cap, and an ask over nine
+/// takes - a folder row's - re-analysed all nine on every step of the
+/// detect dial. Bounded by the larger of the cap and the ask, and by the
+/// document: the reload's sweep drops a file no clip names.
+#[cfg(feature = "recorder")]
+fn make_room<V>(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, V>,
+    cap: usize,
+    asked: &[std::path::PathBuf],
+) {
+    if cache.len() >= cap {
+        cache.retain(|path, _| asked.contains(path));
+    }
 }
 
 /// **What a warp render would be asked for**, or `None` when this clip has
@@ -10999,6 +11019,9 @@ impl DesktopApp {
                 self.force_insert_reload();
                 let _ = self.app.take_desk_reload();
                 self.track_cache.clear();
+                // In the frames of the decodes just dropped, and the next
+                // take here may reuse a path: see `attack_cache`.
+                self.attack_cache.clear();
                 self.warm_refused.clear();
                 self.refused_why.clear();
                 self.stretch_cache.clear();
@@ -12036,6 +12059,8 @@ impl DesktopApp {
         if doc_path.is_some() {
             let referenced = |path: &std::path::PathBuf| live_files.contains(path);
             self.track_cache.retain(|path, _| referenced(path));
+            // A file's attacks go with its decode. See `attack_cache`.
+            self.attack_cache.retain(|path, _| referenced(path));
             // **The refusal set holds PADS as well as clips, so this sweep
             // has to ask both.**
             //
@@ -12502,9 +12527,9 @@ impl DesktopApp {
     /// Called with the bundle that is ABOUT to own the file; a sidecar
     /// already tagged with it is not being displaced by anything.
     ///
-    /// **Bounded by clearing**, the same cap-and-drop the attack cache
-    /// uses: a sampler's blob is large, and the only thing that ever wants
-    /// an old entry is an undo across the gesture that made it.
+    /// **Bounded by clearing**, a cap and a drop of the lot: a sampler's
+    /// blob is large, and the only thing that ever wants an old entry is an
+    /// undo across the gesture that made it.
     fn shelve_displaced_state(&mut self, strip: usize, bay: usize, incoming: &str) {
         let Some((owner, blob)) = sidecar_owner_and_state(strip, bay) else {
             return;
@@ -12519,12 +12544,14 @@ impl DesktopApp {
         self.displaced_states.insert((strip, bay, owner), blob);
     }
 
-    /// **This file's attacks at this sensitivity.**
+    /// **This file's attacks at this sensitivity.** `asked` is every file
+    /// the current ask names, which room in the cache is never made from.
     fn attacks_of(
         &mut self,
         path: &std::path::Path,
         decoded: &tangent_record::decode::Clip,
         sensitivity: f64,
+        asked: &[std::path::PathBuf],
     ) -> Vec<crate::transient::Transient> {
         // **The FILE is what is cached, not the answer.** `analyse` is the
         // whole cost - the envelope over every sample and the local median
@@ -12533,18 +12560,17 @@ impl DesktopApp {
         // analysis. So a hand on the detect slider re-picks and never
         // re-analyses, and there is one entry per file rather than one per
         // file per dial position.
+        //
+        // **And only for the decode it was made from**: one at another rate,
+        // or of another file under the same name, is analysed afresh. See
+        // `Analysis::fits`.
         const CAP: usize = 8;
-        if !self.attack_cache.contains_key(path) {
+        if !self.attack_cache.get(path).is_some_and(|a| a.fits(decoded)) {
             let Some(a) = crate::transient::analyse(decoded) else {
+                self.attack_cache.remove(path);
                 return Vec::new();
             };
-            // A few takes' analyses are a few hundred kilobytes; the
-            // cheap answer to "how many" is to drop the lot once it is
-            // silly, since the only thing that wants an old one is a
-            // selection being made again.
-            if self.attack_cache.len() >= CAP {
-                self.attack_cache.clear();
-            }
+            make_room(&mut self.attack_cache, CAP, asked);
             self.attack_cache.insert(path.to_path_buf(), Arc::new(a));
         }
         self.attack_cache
@@ -12706,6 +12732,7 @@ impl DesktopApp {
                 })
                 .collect()
         };
+        let files = self.asked_files(ask);
         let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(asked.len());
         for a in &asked {
             let path = a.path.clone();
@@ -12715,7 +12742,7 @@ impl DesktopApp {
             let rate = f64::from(decoded.rate.max(1));
             // Heard seconds per second of the warp's render. See `heard_ratio`.
             let r = heard_ratio(&a.clip);
-            let found = self.attacks_of(&path, &decoded, ask.sensitivity);
+            let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
             let map = quantize_map(&found, decoded.rate, decoded.seconds(), &a.clip, &q);
             let anchors = &a.anchors;
             let frames = decoded.frames();
@@ -12734,6 +12761,20 @@ impl DesktopApp {
             ));
         }
         out
+    }
+
+    /// **Every file one quantize ask names**, resolved: what the attack
+    /// cache keeps while that ask is answered. See `make_room`.
+    fn asked_files(&self, ask: &tangent_ui::ports::QuantizeAsk) -> Vec<std::path::PathBuf> {
+        let Some(doc_path) = self.app.project_doc() else {
+            return Vec::new();
+        };
+        let doc = self.app.arrangement();
+        ask.ids
+            .iter()
+            .filter_map(|id| doc.clips.iter().find(|c| c.id == *id))
+            .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+            .collect()
     }
 
     /// **Quantize one audio clip: find the attacks, decide where each
@@ -12778,7 +12819,8 @@ impl DesktopApp {
         let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
             return (0, 0);
         };
-        let found = self.attacks_of(&path, &decoded, ask.sensitivity);
+        let files = self.asked_files(ask);
+        let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
         let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
         if map.len() < 2 {
             return (0, found.len());
@@ -14080,6 +14122,9 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.stretch_cache.clear();
+                // The attacks were found in frames of those decodes, at the
+                // rate of the device that has just gone.
+                self.attack_cache.clear();
                 // **And every refusal, because a refusal belongs to the
                 // world it was made in.**
                 //
@@ -25284,6 +25329,94 @@ mod tests {
         assert_eq!(key(-1.0), 0, "below the floor did not clamp");
         assert_eq!(key(9.0), 1000, "above the ceiling did not clamp");
         assert_ne!(key(0.0), key(1.0));
+    }
+
+    /// **The attack analyses go wherever the decodes they came from go.** An
+    /// `Analysis` is in the frames of ITS decode and `attack_cache` is keyed
+    /// by path alone, so a device that reopened at another rate - or a
+    /// scratch whose next take reused `rec-1-1.wav` - handed `pick`
+    /// positions from the old decode: every anchor 8.8% of its time from its
+    /// hit after a 48 to 44.1 kHz change, or another file's attacks. A source
+    /// scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_attack_analyses_are_emptied_with_the_decodes_they_came_from() {
+        let src = include_str!("desktop.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let (mut sites, mut from) = (0usize, 0usize);
+        while let Some(at) = prod[from..].find("self.track_cache.clear();") {
+            let at = from + at;
+            // To the end of the function this clear stands in.
+            let end = prod[at..].find("\n    fn ").map_or(prod.len(), |e| at + e);
+            assert!(
+                prod[at..end].contains("self.attack_cache.clear();"),
+                "the decode cache is emptied (byte {at}) and the attack analyses \
+                 made from it are left standing"
+            );
+            sites += 1;
+            from = at + 1;
+        }
+        assert!(sites >= 2, "expected the New and the device-rebuild clears, found {sites}");
+        // And swept with the decodes, so a file no clip names any more takes
+        // its analysis with it.
+        assert!(
+            prod.contains("self.track_cache.retain(|path, _| referenced(path));")
+                && prod.contains("self.attack_cache.retain(|path, _| referenced(path));"),
+            "the reload sweeps the decodes and leaves their analyses standing"
+        );
+    }
+
+    /// **The attack cache never throws away the files it is being asked
+    /// for.** At its cap it emptied itself WHOLE, so an ask over more files
+    /// than the cap - a folder row's takes - evicted what it was about to
+    /// read and re-analysed every file on every step of the detect dial, a
+    /// dozen milliseconds a three-minute take, on the UI thread. A source
+    /// scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_attack_cache_never_throws_away_the_files_it_is_being_asked_for() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn attacks_of(").expect("the cache");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("self.attack_cache.clear();"),
+            "the cap empties the WHOLE cache when it fills, so an ask over more \
+             files than the cap evicts what it is about to read and re-analyses \
+             every file on every step of the detect dial"
+        );
+        assert!(
+            body.contains("make_room(&mut self.attack_cache, CAP, asked);"),
+            "the cache no longer makes its room from what the ask does not name"
+        );
+    }
+
+    /// **Room is made from what the ask does not name, never from what it
+    /// does.** Nine takes asked for under a cap of eight are analysed once
+    /// each however often the dial moves, and the next ask makes its room
+    /// from the files it does not name.
+    #[test]
+    fn the_attack_cache_makes_room_from_what_the_ask_does_not_name() {
+        let p = |n: usize| std::path::PathBuf::from(format!("take-{n}.wav"));
+        let asked: Vec<std::path::PathBuf> = (0..9).map(p).collect();
+        let mut cache: std::collections::HashMap<std::path::PathBuf, usize> =
+            std::collections::HashMap::new();
+        // One ask over nine takes, read twice - a detect dial moved once.
+        let mut analysed = 0;
+        for _ in 0..2 {
+            for f in &asked {
+                if !cache.contains_key(f) {
+                    make_room(&mut cache, 8, &asked);
+                    cache.insert(f.clone(), 0);
+                    analysed += 1;
+                }
+            }
+        }
+        assert_eq!(analysed, 9, "an ask over more files than the cap re-analysed what it was reading");
+        // A new ask: its room comes from the files it does not name.
+        let next = vec![p(0), p(20)];
+        make_room(&mut cache, 8, &next);
+        cache.insert(p(20), 0);
+        assert!(cache.contains_key(&p(0)), "a file the new ask names was thrown away");
+        assert!(cache.len() <= 8, "the cache kept files no ask names past its cap: {}", cache.len());
     }
 
     /// **The LIVE path warps too, and carries a picture of what it warped.**
