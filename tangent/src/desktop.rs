@@ -3687,6 +3687,13 @@ fn warped_clip_audio(
 /// the file's own seconds, a stretched take that was ON the grid came off
 /// it, by up to a quarter of a second. Two attacks that land on one line
 /// keep only the first, and the second is carried inside the segment.
+///
+/// **Fewer than two pairs is nothing to quantize**, and the answer is an
+/// empty map. The Apply refused such a map on its own, keeping the clip's
+/// old one, while the preview drew the lone hit moving: a move on screen
+/// that the button would not make. Refused here, the ticks and the Apply
+/// cannot disagree about it, and "nothing to quantize" keeps whatever map
+/// the clip already has.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
@@ -3725,6 +3732,9 @@ fn quantize_map(
         if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
             map.push((f, to));
         }
+    }
+    if map.len() < 2 {
+        map.clear();
     }
     map
 }
@@ -13201,7 +13211,9 @@ impl DesktopApp {
         let files = self.asked_files(ask);
         let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
         let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
-        if map.len() < 2 {
+        // Nothing to quantize - fewer than two pairs, which `quantize_map`
+        // answers with no map at all - keeps the map the clip already has.
+        if map.is_empty() {
             return (0, found.len());
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
@@ -26512,6 +26524,39 @@ mod tests {
                 "a hit that was on the grid is heard at {heard} s after the quantize: {map:?}"
             );
         }
+    }
+
+    /// **One attack is nothing to quantize, for the ticks as for the
+    /// Apply.** The Apply refused a map of fewer than two pairs and kept the
+    /// clip's old one, but that rule lived in `quantize_clip`, outside the
+    /// map both roads share - so the preview drew the lone hit moving. Lower
+    /// the detect slider on a take until one attack is left, and the ticks
+    /// showed a move that Apply then declined with "quantized 0 of 1".
+    #[test]
+    fn one_attack_is_nothing_to_quantize_for_the_ticks_or_the_apply() {
+        use crate::transient::Transient;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::from_document(-2, 4, 4, 120.0, false, None)
+                .expect("a quarter grid at 120 bpm"),
+        );
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            ..Default::default()
+        };
+        // A hit 30 ms after the 0.5 s line: a move, had it been allowed.
+        let one = [Transient { at: 25_440, strength: 10.0 }];
+        assert_eq!(
+            quantize_map(&one, 48_000, 2.0, &clip, &q),
+            Vec::<(u64, u64)>::new(),
+            "one attack drew a move the Apply will not write"
+        );
+        // A second one makes a map of both.
+        let two = [one[0], Transient { at: 72_960, strength: 10.0 }];
+        assert_eq!(
+            quantize_map(&two, 48_000, 2.0, &clip, &q),
+            vec![(25_440, 24_000), (72_960, 72_000)],
+            "two attacks were not quantized"
+        );
     }
 
     /// **A file's attacks are detected once per dial position.**
