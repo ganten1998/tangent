@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Build + package the Tangent Linux release NATIVELY (run this ON a Linux host).
 #
-# Cross-compiling from macOS fails because midir links ALSA and alsa-sys can't
-# find an ALSA sysroot (see docs/RELEASE.md). Building on Linux sidesteps that
-# entirely — this is the recommended Linux path.
+# A release's Linux tarballs are cross-built on macOS by `build-cross.sh`,
+# against a Debian bullseye ALSA sysroot it fetches itself
+# (`ensure_alsa_sysroot`; docs/RELEASE.md, "Cross-building"). This is the
+# native path: `release.sh` runs it on a Linux host, and
+# `build-linux-remote.sh` runs it on one from the Mac, for when a native build
+# is wanted (a toolchain regression, a glibc question, the suite on Linux).
 #
 #   scripts/build-linux-native.sh          # -> dist/tangent-<v>-linux-<arch>.tar.gz
 #

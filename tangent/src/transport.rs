@@ -132,8 +132,8 @@ impl Transport {
     /// way down the return-to-cursor locate is stored BEFORE the level falls,
     /// so a callback landing between the two stores - or reading the Relaxed
     /// level stale after Acquiring the new generation - rolls one block at
-    /// the cursor. Publishing `set_rolling(false)` first closes the falling
-    /// half.
+    /// the cursor. **Not yet right**: publishing `set_rolling(false)` first
+    /// would close the falling half, and this still publishes it last.
     ///
     /// No session in the signature any more: see `playing` for why a take has
     /// no say in whether the transport rolls.

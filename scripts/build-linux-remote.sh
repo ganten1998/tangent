@@ -5,11 +5,15 @@
 #   scripts/build-linux-remote.sh void ~/build/tangent # explicit remote dir
 #   DEPS=1 scripts/build-linux-remote.sh void          # install build deps first
 #
-# WHY THIS EXISTS. Linux cannot be cross-built from macOS: midir links ALSA and
-# alsa-sys needs a real sysroot to find libasound (docs/RELEASE.md, "Cross-build
-# blocker"). The sanctioned path has always been "run build-linux-native.sh on a
-# Linux host", which in practice meant a dozen manual steps and a scp, so it
-# never got run and Linux never shipped. This is those steps.
+# WHY THIS EXISTS. It was written when Linux could not be cross-built from
+# macOS (midir links ALSA, and alsa-sys found no libasound for a Linux
+# target), so the one path was "run build-linux-native.sh on a Linux host":
+# a dozen manual steps and a scp, which never got run, so Linux never
+# shipped. This is those steps. Since the bullseye sysroot, `build-cross.sh`
+# cross-builds both Linux tarballs on this Mac (`ensure_alsa_sysroot`;
+# docs/RELEASE.md, "Cross-building"), so this is for building NATIVELY when
+# that is wanted: a toolchain regression, a glibc question, the suite on
+# Linux.
 #
 # It copies the working tree (not a clone), so what builds is exactly what you
 # have here — including uncommitted changes. `target/` and `dist/` are excluded,

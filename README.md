@@ -89,8 +89,8 @@ including the Linux aarch64 tarball and checksums, are on the
   clips, and a pad-based drum machine with its own kits. The kit is the one
   thing that still saves itself, because a kit is hours of sample assignment
   and the one thing a session must never lose to a missed save. Answering
-  Don't Save on a session you never saved can discard its kit along with
-  it. A kit can
+  Don't Save on a session you never saved keeps a kit built in it, in that
+  session's folder. A kit can
   also be saved out as a single file that carries the samples inside it
   alongside the layout, so kits can be shared with people who do not have
   your sample folders.
@@ -213,10 +213,15 @@ builds natively on a Linux machine, and `build-freebsd.sh` on FreeBSD. See
 - **macOS.** Release builds are signed with a Developer ID certificate and
   notarized by Apple, with the ticket stapled to the bundle, so the app opens
   on a double-click with no Gatekeeper prompt and no need to be online.
-- **Windows.** The installer is unsigned, so SmartScreen shows "Windows
-  protected your PC" on first run. Click **More info**, then **Run anyway**.
-  Code-signing certificates for individual developers cost a few hundred a
-  year, and this app is free, so that is on hold for now.
+- **Windows.** From the first release after 5.0.0, every program in the
+  Windows download (the installer, the app, its video encoder and the
+  uninstaller) is signed under the author's name, and a release cannot be
+  cut with any of them unsigned. Windows 11's Smart App Control, where it
+  is switched on, runs a program it does not know only if it is signed, so
+  it refuses the unsigned 5.0.0. SmartScreen goes on reputation, which a
+  new signature has to earn, so the first signed releases may still show
+  "Windows protected your PC" on first run, as 5.0.0 does: click
+  **More info**, then **Run anyway**.
 - **Linux.** The tarball's `install.sh` installs to your home directory with
   no root. Two system libraries need to be present. MIDI and audio go through
   ALSA, so `libasound.so.2` is required (`libasound2` on Debian and Ubuntu,
