@@ -2862,6 +2862,10 @@ pub fn inside_template_shelf(path: &std::path::Path, project_root: &std::path::P
 /// clone and a differing one is work. Comparing against the disk template
 /// rather than a shipped constant means a template somebody customised
 /// protects its own clones correctly.
+///
+/// **Nor is a folder holding anything Tangent did not write**
+/// ([`holds_only_scratch`]): New and launch clear the folder they reclaim
+/// whole, so a project filed inside one would go with it.
 pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
     let template_kit = root
         .join("Templates")
@@ -2877,7 +2881,9 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
             LoadOutcome::Damaged => true,
             LoadOutcome::Missing | LoadOutcome::Empty => false,
         };
-        held || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
+        held
+            || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
+            || !holds_only_scratch(dir)
     };
     let first = root.join("Untitled");
     if !first.exists() || !keeps(&first) {
@@ -2890,6 +2896,67 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         }
     }
     first
+}
+
+/// **Whether a folder's name is one a scratch is given**: `Untitled`, or
+/// `Untitled ` and a number - what `fresh_project_dir` and the host's
+/// `next_untitled` mint, and nothing else. The test used to be "starts with
+/// `Untitled `", which also matched a folder somebody made and named
+/// themselves (GNOME Files calls a new one "Untitled Folder"), and the launch
+/// sweep and Don't Save both delete what they match.
+pub fn is_scratch_name(name: &str) -> bool {
+    name == "Untitled"
+        || name
+            .strip_prefix("Untitled ")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// **Whether everything in `dir` is something Tangent writes into a
+/// scratch**, so that clearing the folder can only ever clear Tangent's own
+/// files: the document (`project.tan`, or the legacy name), the kit sidecar
+/// and its write-then-rename temp, the plugin-state shelf `state/`, the
+/// export staging `export/`, `media/` holding files only, and dotfiles
+/// (Finder's `.DS_Store`). Anything else says no: a subfolder, a project
+/// filed inside, somebody's own file, a document quarantined as `.damaged`,
+/// a document's own write temp (the newest copy of a song whose rename
+/// failed).
+///
+/// The launch sweep, New's reclaim and Don't Save all remove a scratch
+/// WHOLE, and each judged it by its document, its kit and its `media/`
+/// alone: a saved project moved into a folder named `Untitled …`, or a first
+/// save typed into a scratch's own folder, went with it. A folder that
+/// cannot be listed is not judged harmless either.
+pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|e| {
+        let Ok(e) = e else {
+            return false;
+        };
+        let Ok(kind) = e.file_type() else {
+            return false;
+        };
+        let name = e.file_name();
+        match name.to_string_lossy().as_ref() {
+            // `DrumpadDoc::save_beside` writes `drumpad.json.tmp` and renames.
+            crate::arrangement::DOC_NAME
+            | crate::arrangement::DOC_NAME_LEGACY
+            | crate::drumpad::FILE_NAME
+            | "drumpad.json.tmp" => kind.is_file(),
+            "state" | "export" => kind.is_dir(),
+            // One level of files, which is how every writer fills it.
+            "media" => {
+                kind.is_dir()
+                    && std::fs::read_dir(e.path()).is_ok_and(|files| {
+                        files
+                            .into_iter()
+                            .all(|f| f.is_ok_and(|f| f.file_type().is_ok_and(|t| t.is_file())))
+                    })
+            }
+            other => other.starts_with('.') && kind.is_file(),
+        }
+    })
 }
 
 /// Move an unreadable document out of every writer's reach:
@@ -12788,9 +12855,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// miss**: an unnamed document with no clips, no takes beside it (the
     /// caller counts those), and a kit identical to the template's is the
     /// litter the launch sweep may clear - the owner's "i hate seeing
-    /// untitled 1 2 3 build up between sessions".
+    /// untitled 1 2 3 build up between sessions". And nothing in the folder
+    /// but what Tangent writes into a scratch ([`holds_only_scratch`]): the
+    /// sweep removes it whole, so a project somebody filed inside it, or
+    /// any file of their own, keeps it.
     pub fn scratch_is_disposable(dir: &std::path::Path, template_dir: &std::path::Path) -> bool {
         use crate::arrangement::{Arrangement, LoadOutcome};
+        if !holds_only_scratch(dir) {
+            return false;
+        }
         let template_kit = template_dir.join(crate::drumpad::FILE_NAME);
         if kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit) {
             return false;
@@ -58829,6 +58902,43 @@ mod tests {
         // sidecar on purpose, and that must not strand the folder.
         std::fs::remove_file(scratch.join(crate::drumpad::FILE_NAME)).unwrap();
         assert_eq!(fresh_project_dir(&root), scratch);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A scratch holding anything Tangent did not write is not a
+    /// scratch.** New and launch clear the folder they reclaim WHOLE, and the
+    /// reclaim judged it by its document and its kit alone: a saved project
+    /// filed inside an `Untitled` (a first save typed into the scratch's own
+    /// folder lands there) was handed back as fresh and deleted with it.
+    #[test]
+    fn a_new_session_steps_past_an_untitled_holding_anything_else() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-fresh-foreign-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scratch = root.join("Untitled");
+        // Everything Tangent writes into a scratch: still reclaimed.
+        std::fs::create_dir_all(scratch.join("media")).unwrap();
+        std::fs::create_dir_all(scratch.join("state")).unwrap();
+        std::fs::create_dir_all(scratch.join("export")).unwrap();
+        crate::arrangement::Arrangement::default().save_to(&crate::arrangement::doc_in(&scratch));
+        std::fs::write(scratch.join("media").join(".DS_Store"), b"finder").unwrap();
+        assert_eq!(fresh_project_dir(&root), scratch, "a scratch of Tangent's own files was stepped past");
+        // A saved project inside it: the folder is somebody's now.
+        let mut song = crate::arrangement::Arrangement::default();
+        song.named = true;
+        song.save_to(&crate::arrangement::doc_in(&scratch.join("Song")));
+        assert_eq!(
+            fresh_project_dir(&root),
+            root.join("Untitled 2"),
+            "New reclaimed an Untitled with a saved project inside it"
+        );
+        // So is a folder inside its media/, which Tangent never makes.
+        std::fs::remove_dir_all(scratch.join("Song")).unwrap();
+        std::fs::create_dir_all(scratch.join("media").join("Takes")).unwrap();
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"), "a folder inside media/ was reclaimed");
         let _ = std::fs::remove_dir_all(&root);
     }
 
