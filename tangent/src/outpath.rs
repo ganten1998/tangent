@@ -133,6 +133,11 @@ pub(crate) fn device_id(_device: Option<&str>) -> Option<u32> {
     None
 }
 
+/// See `mac::output_names`. Read only by the reprobe, which only the recorder
+/// has; off macOS the reprobe names outputs through cpal.
+#[cfg(all(target_os = "macos", feature = "recorder"))]
+pub(crate) use mac::output_names;
+
 #[cfg(target_os = "macos")]
 mod mac {
     use super::OutputPath;
@@ -374,6 +379,28 @@ mod mac {
             has_output(id)
                 && get_string(id, &PropertyAddress::global(NAME)).as_deref() == Some(wanted)
         })
+    }
+
+    /// **Every device with something to play OUT of, by name, from property
+    /// reads alone.**
+    ///
+    /// cpal lists outputs by asking each device for its configs, and on
+    /// macOS that builds an AUHAL per device to read a buffer range it then
+    /// throws away: about 21 ms a device, measured, the cost `nominal_rate`
+    /// exists to keep off a timer. The reprobe asks for this list every two
+    /// seconds for as long as the system's own stands in for a chosen output
+    /// (`desktop::OutputReturn`), so it asks the HAL instead: the device
+    /// list, whether each has output streams, and its
+    /// `kAudioObjectPropertyName`, which is cpal's name for it and so the
+    /// name the open matches. The reads `resolve` makes for the rate poll
+    /// once a second.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn output_names() -> Vec<String> {
+        all_devices()
+            .into_iter()
+            .filter(|&id| has_output(id))
+            .filter_map(|id| get_string(id, &PropertyAddress::global(NAME)))
+            .collect()
     }
 
     /// The transport in a word the panel can print.

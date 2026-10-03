@@ -238,8 +238,9 @@ struct Recorder {
     /// rebuilding it for ever.
     doa: crate::instrument::DeadOnArrival,
     /// The auto recheck — the owner's ask after the yank test. Alive while
-    /// the engine is down, and while it runs on the fallback below; see
-    /// `Reprobe`.
+    /// the engine is down, while it runs on the fallback below, and while
+    /// the system's own stands in for a chosen output (`output_stand_in`);
+    /// see `Reprobe`.
     reprobe: Option<Reprobe>,
     /// **The system the SETTING names while the engine runs on the platform
     /// default instead** — `Some("ASIO")` for the session in which the
@@ -253,8 +254,9 @@ struct Recorder {
     /// **The OUTPUT the setting names while the engine plays the system's
     /// own instead**, on a system with no fallback of its own - every one but
     /// ASIO - when the named device is missing or will not open. Kept so the
-    /// stand-in is said once rather than at every rebuild, and so an open
-    /// that finds the output again can say so. The setting is never
+    /// stand-in is said once rather than at every rebuild, so an open that
+    /// finds the output again can say so, and so the reprobe knows which
+    /// output to wait for (see `OutputReturn`). The setting is never
     /// rewritten. See `start_engine`.
     output_stand_in: Option<String>,
     /// The ReaStream sender, alive while the engine is and streaming while the
@@ -3115,10 +3117,30 @@ impl RateWatch {
 /// One-shot: sets `live` and exits. The UI thread never joins it — `Drop`
 /// signals `stop` and detaches, so a probe wedged inside a dying driver can
 /// never wedge the app with it.
+///
+/// **It also waits for a chosen OUTPUT the system's own is standing in
+/// for**, with the engine up: for that one name to be plugged in, and for
+/// nothing else. See [`OutputReturn`].
 #[cfg(feature = "recorder")]
 struct Reprobe {
     stop: Arc<std::sync::atomic::AtomicBool>,
     live: Arc<std::sync::atomic::AtomicBool>,
+    /// **The chosen output this probe waits to see plugged in**, when it
+    /// was spawned for a stand-in (see [`OutputReturn`]); `None` for the two
+    /// older watches. Kept so a probe spawned for another state is known for
+    /// one: see `fill_recorder_state`.
+    output: Option<String>,
+}
+
+/// **Which chosen systems fall back to the platform default when they have
+/// no working output**: ASIO, and only ASIO. Its device list is a registry
+/// of drivers, not of hardware, so "chosen and absent" is an everyday state
+/// there — an interface unplugged — and not a misconfiguration. JACK with no
+/// server is already answered a level down (`build_host`), and the platform
+/// default has nothing to fall back to.
+#[cfg(feature = "recorder")]
+fn fallback_wanted(chosen: Option<&str>) -> bool {
+    chosen == Some("ASIO")
 }
 
 /// **Whether the hardware the engine is waiting for is back**, as a pure
@@ -3138,23 +3160,102 @@ struct Reprobe {
 /// while somebody waits. Reasoned from the code and the tester's log, not
 /// measured on the Windows machine; the tester's next unplugged launch is
 /// the measurement.
-/// **Which chosen systems fall back to the platform default when they have
-/// no working output**: ASIO, and only ASIO. Its device list is a registry
-/// of drivers, not of hardware, so "chosen and absent" is an everyday state
-/// there — an interface unplugged — and not a misconfiguration. JACK with no
-/// server is already answered a level down (`build_host`), and the platform
-/// default has nothing to fall back to.
-#[cfg(feature = "recorder")]
-fn fallback_wanted(chosen: Option<&str>) -> bool {
-    chosen == Some("ASIO")
-}
-
 #[cfg(feature = "recorder")]
 fn hardware_back(asio: bool, baseline: &[String], outputs: &[String], default_alive: bool) -> bool {
     if asio {
         outputs != baseline
     } else {
         default_alive
+    }
+}
+
+/// **Where a chosen output's return is watched for while the system's own
+/// stands in for it: macOS and Windows.**
+///
+/// The watch names the outputs every two seconds, from the reprobe thread,
+/// beside a playing engine (see [`listed_outputs`]): property reads on
+/// CoreAudio, and on WASAPI the list the ASIO fallback's plug watch already
+/// takes at that rate. cpal's ALSA host (Linux, and FreeBSD through its shim)
+/// names a device only by OPENING it, for playback and for capture:
+/// `default`, `pipewire`, `pulse`, `jack`, `oss` and every card, a dozen
+/// opens every two seconds beside the engine, which is not a load to add
+/// without measuring it there. **Not yet watched on Linux and FreeBSD**: the
+/// output is asked for again when the engine is rebuilt (the band reopened,
+/// a path setting changed), and the stand-in's toast says so.
+#[cfg(feature = "recorder")]
+const OUTPUT_RETURN_WATCHED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// **A chosen output the system's own is standing in for is tried again
+/// when it is PLUGGED IN, and at no other moment.**
+///
+/// The edge, not the level, because the level is a storm. "The output is
+/// listed" holds on every probe for a device that is listed and will not open
+/// (held by another app, refusing the rate, half gone): the reopen fails,
+/// the system's own stands in again, the next probe finds the name listed
+/// again, and the path reopens every two seconds, the input with it. So this
+/// fires only when the name goes from ABSENT to LISTED, which is what a plug
+/// looks like from the list. One try per plug: a try that fails lands back
+/// on the stand-in, whose next watch starts from a list that already names
+/// the device, so the try after it needs the next plug. A device that never
+/// leaves the list is never tried from here (an engine rebuild still asks).
+///
+/// "Listed" by the open's own rule, `instrument::match_output_name` (the
+/// name exactly, then as a case-blind substring), so this and the open agree
+/// about which device a setting names.
+#[cfg(feature = "recorder")]
+struct OutputReturn {
+    /// The output the setting names.
+    want: String,
+    /// Whether the last look found it listed.
+    listed: bool,
+}
+
+#[cfg(feature = "recorder")]
+impl OutputReturn {
+    /// The watch, from the outputs listed when it began.
+    fn new(want: String, baseline: &[String]) -> Self {
+        let listed = crate::instrument::match_output_name(baseline, &want).is_some();
+        Self { want, listed }
+    }
+
+    /// One look at the list: `true` exactly when the output has just gone
+    /// from absent to listed.
+    fn note(&mut self, outputs: &[String]) -> bool {
+        let listed = crate::instrument::match_output_name(outputs, &self.want).is_some();
+        let plugged = listed && !self.listed;
+        self.listed = listed;
+        plugged
+    }
+}
+
+/// **The outputs [`OutputReturn`] looks among**, asked every two seconds
+/// for as long as a stand-in lasts.
+///
+/// **macOS: from the HAL's properties, not from cpal.** cpal asks each
+/// device for its configs, and on macOS that builds an AUHAL per device,
+/// about 21 ms each, measured: the cost `nominal_rate` exists to keep off a
+/// timer. `outpath::output_names` reads the same names directly.
+///
+/// **Windows: cpal's list**, the one the ASIO fallback's plug watch already
+/// takes from this thread at this rate. It activates an audio client per
+/// endpoint to ask its formats, and a walk of the endpoints' names alone
+/// would be cheaper, but cpal initializes COM on a thread inside that very
+/// format query, so the cheap walk is a road no thread here has taken, and
+/// there is no Windows machine to take it on. Only macOS and Windows ever
+/// ask (see `OUTPUT_RETURN_WATCHED`).
+#[cfg(feature = "recorder")]
+fn listed_outputs() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::outpath::output_names()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host()
+            .output_devices()
+            .map(|ds| ds.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -3166,12 +3267,22 @@ impl Reprobe {
     /// being waited for is ASIO's. Decided once, here: the system the
     /// engine is waiting on cannot change without `path_changed` reopening
     /// the path, which drops this probe with the engine it makes.
-    fn spawn(asio: bool) -> Self {
+    ///
+    /// `output`: the chosen output the system's own is standing in for, when
+    /// that is what is waited for. The probe then answers its plug and
+    /// nothing else (see [`OutputReturn`]), and wakes `ctx` when it does
+    /// rather than being polled: a stand-in can last all day, and a poll
+    /// would hold the UI at two frames a second for all of it. Never with
+    /// `asio`: the ASIO fallback does not carry the output, so it has none
+    /// standing in.
+    fn spawn(asio: bool, output: Option<String>, ctx: &egui::Context) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         let live = Arc::new(AtomicBool::new(false));
         let stop_t = Arc::clone(&stop);
         let live_t = Arc::clone(&live);
+        let watched = output.clone();
+        let wake = ctx.clone();
         let spawned = std::thread::Builder::new()
             .name("audio-reprobe".to_owned())
             .spawn(move || {
@@ -3193,6 +3304,16 @@ impl Reprobe {
                          is not used while ASIO is chosen)"
                     );
                 }
+                // A stand-in's output: its plug, the edge and never the level,
+                // looked for in `listed_outputs`.
+                let mut back = watched.map(|want| OutputReturn::new(want, &listed_outputs()));
+                if let Some(back) = &back {
+                    log::info!(
+                        "audio: the system's own output is standing in for {:?}; it is \
+                         tried again when it is plugged in",
+                        back.want
+                    );
+                }
                 loop {
                     // 2 s between probes, checked in slices so a stop signal
                     // lands within a tenth of a second. Before the first probe
@@ -3203,6 +3324,14 @@ impl Reprobe {
                             return;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if let Some(back) = back.as_mut() {
+                        if back.note(&listed_outputs()) {
+                            live_t.store(true, Ordering::Relaxed);
+                            wake.request_repaint();
+                            return;
+                        }
+                        continue;
                     }
                     let default_alive = !asio
                         && cpal::default_host()
@@ -3216,13 +3345,15 @@ impl Reprobe {
                     }
                 }
             });
-        if spawned.is_err() {
+        if spawned.is_err() && output.is_none() {
             // A machine that cannot spawn a thread: mark live so the UI
             // falls back to trying the open directly rather than waiting
-            // for a watcher that does not exist.
+            // for a watcher that does not exist. Not for a stand-in's
+            // output: the stand-in plays, and a fake answer would retry the
+            // output every frame a new probe failed to spawn.
             live.store(true, Ordering::Relaxed);
         }
-        Self { stop, live }
+        Self { stop, live, output }
     }
 
     fn device_back(&self) -> bool {
@@ -4302,8 +4433,25 @@ impl DesktopApp {
         // than trusting the next paint to somebody moving the mouse.
         // **On the fallback the probe stays alive with the engine**: the
         // engine is up, on the platform default, and the interface it is
-        // standing in for is exactly what the probe is watching for.
-        if self.recorder.engine.is_some() && self.recorder.fallback.is_none() {
+        // standing in for is exactly what the probe is watching for. **And
+        // while the system's own stands in for a chosen OUTPUT**, where the
+        // probe waits for that output to be plugged in (see `OutputReturn`).
+        let stand_in_for = if OUTPUT_RETURN_WATCHED && self.recorder.engine.is_some() {
+            self.recorder.output_stand_in.clone()
+        } else {
+            None
+        };
+        // **A probe made for another state is not this one's.** Its watch is
+        // chosen when it is spawned, and the state can move under it without
+        // passing the arms below: a stand-in's engine dying wants the old
+        // watch back, and an engine born as a stand-in while a probe waited
+        // for the default wants its output's.
+        if self.recorder.reprobe.as_ref().is_some_and(|p| p.output != stand_in_for) {
+            self.recorder.reprobe = None;
+        }
+        if self.recorder.engine.is_some() && self.recorder.fallback.is_none()
+            && stand_in_for.is_none()
+        {
             self.recorder.reprobe = None;
         } else if self
             .recorder
@@ -4319,7 +4467,22 @@ impl DesktopApp {
             // the band-close edge makes. The close edge also drops the probe
             // now; this guard covers the one frame where the close and the
             // replug land together.
-            if self.app.recorder_band_open() {
+            //
+            // **And never by retiring an engine a record runs on.** The
+            // reopen retires the stand-in before it opens, and a take, an
+            // arrangement record and the count-in before either all run on
+            // that engine, while the open itself is refused until a take is
+            // over: headphones plugged in once a take had started ended its
+            // monitor and its instrument for the rest of it. The probe has
+            // stopped and its answer stays set, so the reopen comes on the
+            // first frame after the record. With no engine alive there is
+            // nothing to keep, and the open's own refusal rules, as before.
+            let recording = self.recorder.engine.is_some()
+                && (self.recorder.session.is_recording()
+                    || self.recorder.arr_rec.is_some()
+                    || self.recorder.arr_rec_wait
+                    || self.recorder.take_count_pending);
+            if self.app.recorder_band_open() && !recording {
                 self.recorder.reprobe = None;
                 // **The hardware list changed, so a system set aside for
                 // serving nothing gets another turn.** This is the event that
@@ -4336,16 +4499,27 @@ impl DesktopApp {
                 // partner and failed, and nothing said "Back on". Through
                 // `retire_engine` like every teardown, so a plugin dialled in
                 // on the stand-in comes back on the interface as it was left.
-                if self.recorder.fallback.is_some() {
+                // **Either stand-in**: the ASIO fallback's platform default,
+                // or the system's own playing in place of a chosen output. An
+                // engine is alive here only as one of those two, since on the
+                // chosen output the arm above drops the probe.
+                if self.recorder.engine.is_some() {
                     self.retire_engine();
                 }
                 self.open_audio_path(ctx);
             }
         } else if self.recorder.reprobe.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            // **An output's watch is not polled**: it wakes the UI itself
+            // when it fires (see `Reprobe::spawn`), because a stand-in can
+            // last all day and this would hold the UI at two frames a second
+            // for all of it. The older watches are polled.
+            if stand_in_for.is_none() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         } else if self.app.recorder_band_open()
             && ((self.recorder.engine_error.is_some() && self.recorder.engine_retry.is_none())
-                || self.recorder.fallback.is_some())
+                || self.recorder.fallback.is_some()
+                || stand_in_for.is_some())
             // **Not while a reopen is already owed.** The replug above asks
             // for the open through `announce`, which runs it a frame later;
             // on that one frame the engine is still down and this arm spawned
@@ -4358,7 +4532,7 @@ impl DesktopApp {
             // the global says "platform default" while the interface being
             // waited for is ASIO's.
             let watch_plug = fallback_wanted(self.app.audio_system().as_deref());
-            self.recorder.reprobe = Some(Reprobe::spawn(watch_plug));
+            self.recorder.reprobe = Some(Reprobe::spawn(watch_plug, stand_in_for, ctx));
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
@@ -13659,9 +13833,10 @@ impl DesktopApp {
     /// change, a new output, the output dying or the band closing brought
     /// every plugin dialled in since the last save back at that save's
     /// settings, or at factory if it had never been saved. The five
-    /// teardowns (those four and the ASIO replug dropping its stand-in)
-    /// come through here, so none of them can drop the plugins before they
-    /// are asked.
+    /// teardowns (those four and the replug dropping a stand-in, the ASIO
+    /// fallback's or the system's own playing for a chosen output) come
+    /// through here, so none of them can drop the plugins before they are
+    /// asked.
     ///
     /// Written by what is LOADED, not by what the desk asks for: a bay the
     /// reconcile has not reached yet still holds its outgoing tenant. The
@@ -14169,20 +14344,23 @@ impl DesktopApp {
                 }
             } else if let Some(name) = want_out.as_deref() {
                 // **A chosen OUTPUT that will not open plays through the
-                // system's own instead, for this session.** Every system but
-                // ASIO has a default that plays, and this used to stay
-                // silent, retry five times, give up, and let the reprobe call
-                // the default's health a return: another WARN and six more
-                // opens every five seconds or so, each one closing and
+                // system's own instead, until it is plugged back in.** Every
+                // system but ASIO has a default that plays, and this used to
+                // stay silent, retry five times, give up, and let the reprobe
+                // call the default's health a return: another WARN and six
+                // more opens every five seconds or so, each one closing and
                 // reopening the input, until somebody found "the system's
                 // own" in Setup. The setting is left exactly as it was, like
-                // the ASIO fallback's. Not yet watched for: the output is
-                // asked for again whenever the engine is rebuilt (the band
-                // reopened, a path setting changed), not the moment it is
-                // plugged back in.
+                // the ASIO fallback's. The reprobe then waits for the output
+                // to be PLUGGED IN and tries it once per plug (see
+                // `OutputReturn`); a try that fails lands here again, and
+                // quietly, since this stand-in has been said. Every engine
+                // rebuild asks for it too (the band reopened, a path setting
+                // changed), and on Linux and FreeBSD only a rebuild does: see
+                // `OUTPUT_RETURN_WATCHED`.
                 log::warn!(
                     "the chosen audio output {name:?} would not open ({e}) - opening the \
-                     system's own output for this session instead; the setting still names it"
+                     system's own output in its place; the setting still names it"
                 );
                 let already_standing_in = self.recorder.output_stand_in.as_deref() == Some(name);
                 started = crate::instrument::Engine::start_sized(
@@ -14195,11 +14373,17 @@ impl DesktopApp {
                     stood_in = true;
                     self.recorder.output_stand_in = Some(name.to_owned());
                     if !already_standing_in {
+                        // What brings it back, said where it is true.
+                        let way_back = if OUTPUT_RETURN_WATCHED {
+                            "Plug it back in and it is tried again."
+                        } else {
+                            "Close and reopen the band once it is back."
+                        };
                         self.app.notify(
                             Kind::Error,
                             format!(
                                 "{name} is not available - using {} through the system's own \
-                                 audio for this session. Close and reopen the band once it is back.",
+                                 audio. {way_back}",
                                 e.output().device
                             ),
                         );
@@ -28748,7 +28932,8 @@ mod tests {").expect("the tests module")];
             .expect("`retire_engine` no longer drops the engine");
         assert!(save < gone, "`retire_engine` drops the plugins before it asks them for their settings");
         // The five teardowns: the output dying, the path changing and the
-        // replug dropping the ASIO stand-in, the device moving its own rate,
+        // replug dropping a stand-in (the ASIO fallback's, or the system's
+        // own playing for a chosen output), the device moving its own rate,
         // and the band closing.
         let calls = |name: &str| body(name).matches("self.retire_engine();").count();
         assert_eq!(calls("fn fill_recorder_state(&mut self"), 3, "a fill_recorder_state teardown skips the save");
@@ -29561,6 +29746,146 @@ mod tests {").expect("the tests module")];
         );
         assert!(hardware_back(true, &laptop, &plugged, true), "the interface arriving was missed");
         assert!(hardware_back(true, &plugged, &laptop, false), "an unplug is a change too");
+    }
+
+    /// **A chosen output the system's own stands in for is tried again when
+    /// it is plugged in, once per plug, and never for merely being listed.**
+    /// The stand-in used to wait for an engine rebuild, and the rule first
+    /// asked for in its place ("the named output is listed") reopens every two
+    /// seconds on a device that is listed and will not open, the input with
+    /// it. A plug is the name going from absent to listed.
+    ///
+    /// Revert-check performed: make `note` answer `listed` (the level) and
+    /// the second block names the storm.
+    #[test]
+    fn a_stand_in_output_is_tried_again_only_when_it_is_plugged_in() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let laptop = names(&["MacBook Pro Speakers"]);
+        let plugged = names(&["MacBook Pro Speakers", "External Headphones"]);
+        let watch = |want: &str, baseline: &[String]| OutputReturn::new(want.to_owned(), baseline);
+        // Absent, then listed: the plug.
+        let mut w = watch("External Headphones", &laptop);
+        assert!(!w.note(&laptop), "nothing was plugged in");
+        assert!(w.note(&plugged), "the headphones arriving were missed");
+        // Listed and staying listed: a device that will not open is not
+        // reopened on every probe.
+        let mut w = watch("External Headphones", &plugged);
+        for _ in 0..5 {
+            assert!(
+                !w.note(&plugged),
+                "a listed output that will not open is reopened every two seconds"
+            );
+        }
+        // Listed, unplugged, plugged back: exactly one more try.
+        let mut w = watch("External Headphones", &plugged);
+        assert!(!w.note(&laptop), "an unplug is not a way back");
+        assert!(w.note(&plugged), "the replug was missed");
+        assert!(!w.note(&plugged), "one plug made two tries");
+        // A list that never names it: never.
+        let mut w = watch("Komplete Audio 6", &laptop);
+        for list in [&laptop, &plugged, &laptop, &plugged] {
+            assert!(!w.note(list), "an output that never appeared was tried");
+        }
+        // Listed by the open's own rule, so a setting the open would find
+        // loosely is watched for the same way.
+        let mut w = watch("headphones", &laptop);
+        assert!(w.note(&plugged), "the open would find it, but its plug was missed");
+    }
+
+    /// **While the system's own stands in for a chosen output, the probe
+    /// waits for that output's plug, and the plug reopens on it.** The probe
+    /// was dropped whenever an engine was up off the ASIO fallback, so only a
+    /// rebuild asked for the output again, and the replug arm retired an
+    /// engine only on that fallback: a reopen with the output's stand-in
+    /// alive reaches `start_engine`'s early return and changes nothing. A
+    /// plug during a take waits for it, since the reopen retires the engine
+    /// the take captures through and the open is refused until it is over.
+    /// And because a stand-in can last all day, the watch wakes the UI instead
+    /// of being polled, and on macOS it names outputs from the HAL's
+    /// properties instead of cpal's list, which builds an AUHAL per device. A
+    /// source scan, for the reason the replug's own test above is one; the
+    /// rule is driven in `a_stand_in_output_is_tried_again_only_when_it_is_plugged_in`.
+    #[test]
+    fn the_probe_waits_for_a_stand_in_output_and_its_plug_reopens_on_it() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let probe = {
+            let a = src
+                .find("let stand_in_for = if OUTPUT_RETURN_WATCHED")
+                .expect("the probe no longer asks which output a stand-in plays for");
+            let b = src[a..]
+                .find("self.recorder.reprobe = Some(Reprobe::spawn(watch_plug, stand_in_for, ctx));")
+                .expect("no probe is spawned with the output a stand-in plays for");
+            &src[a..a + b]
+        };
+        let replug = probe.find(".is_some_and(Reprobe::device_back)").expect("the replug arm is gone");
+        let kept = probe
+            .find("&& stand_in_for.is_none()")
+            .expect("the probe is dropped while a stand-in plays, so nothing waits for its output");
+        assert!(kept < replug, "the probe is kept for a stand-in somewhere other than the drop arm");
+        assert!(
+            probe.contains("is_some_and(|p| p.output != stand_in_for)"),
+            "a probe spawned for another state outlives it: a stand-in's watch outlives its \
+             engine, or the default's watch reopens a stand-in when the default is alive"
+        );
+        assert!(
+            probe[replug..].contains("|| stand_in_for.is_some())"),
+            "no probe is spawned while the system's own stands in for a chosen output"
+        );
+        // Woken, not polled: a stand-in can last all day.
+        assert!(
+            probe[replug..]
+                .contains("if stand_in_for.is_none() {\n                ctx.request_repaint_after("),
+            "the output's watch is polled, holding the UI at two frames a second for as long as \
+             the stand-in lasts"
+        );
+        let spawn = {
+            let a = src
+                .find("fn spawn(asio: bool, output: Option<String>, ctx: &egui::Context)")
+                .expect("`Reprobe::spawn` is gone");
+            &src[a..a + src[a..].find("\n    fn ").expect("its end")]
+        };
+        assert!(
+            spawn.contains("wake.request_repaint();"),
+            "the output's watch never wakes the UI, so its plug is seen only when something else paints"
+        );
+        // And on macOS it looks in the HAL's own list: cpal's builds an AUHAL
+        // per device, every two seconds for as long as the stand-in lasts.
+        assert!(
+            spawn.contains("back.note(&listed_outputs())"),
+            "the output's watch looks somewhere other than `listed_outputs`"
+        );
+        let listed = {
+            let a = src
+                .find("fn listed_outputs() -> Vec<String> {")
+                .expect("`listed_outputs` is gone");
+            &src[a..a + src[a..].find("\n}\n").expect("its end")]
+        };
+        assert!(
+            listed.contains(
+                "#[cfg(target_os = \"macos\")]\n    {\n        crate::outpath::output_names()\n    }"
+            ),
+            "on macOS the output's watch builds an AUHAL per device every two seconds"
+        );
+        let arm = &probe[replug..];
+        let recording = {
+            let a = arm
+                .find("let recording = self.recorder.engine.is_some()")
+                .expect("the replug no longer asks whether a record runs on the engine it retires");
+            &arm[a..a + arm[a..].find(';').expect("its end")]
+        };
+        assert!(
+            recording.contains("self.recorder.session.is_recording()")
+                && recording.contains("self.recorder.arr_rec.is_some()"),
+            "a plug during a take or an arrangement record retires the engine it captures through"
+        );
+        let guard = arm
+            .find("if self.app.recorder_band_open() && !recording {")
+            .expect("the replug reopens under a running record");
+        let retire = arm
+            .find("if self.recorder.engine.is_some() {\n                    self.retire_engine();")
+            .expect("the plug reopens with an output's stand-in alive, so `start_engine` returns at once");
+        assert!(guard < retire, "the record is asked about after the engine has gone");
     }
 
     /// **The rate poll's thread never asks the chosen host under ASIO**, and
