@@ -3617,6 +3617,47 @@ fn stretched_clip_audio(
     }
 }
 
+/// **The loudest sample a clip PLAYS**: its file warped and then stretched,
+/// as [`stretched_clip_audio`] resolves it for the export and glue, over
+/// the span its passes read ([`audio_clip_passes`], the schedule playback
+/// is built from), before its own gain and fades. Normalize's measure.
+///
+/// The decode is not what a clip plays. A stretched clip's trim and length
+/// are seconds of the STRETCHED audio, so read off the decode they measured
+/// other material, as far as a whole trim away; a warp moves material
+/// across the trim, and the stretcher's output can peak where the file did
+/// not; and a looped clip plays one pass of its loop over and over, not its
+/// whole length of the file. Indexed at the audio's own rate. The renders
+/// playback has made are reused through `renders`, and one it has not is
+/// made, as the export makes it. Fades only lower a peak, so leaving them
+/// out never sets a gain that clips.
+#[cfg(feature = "recorder")]
+fn played_peak(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: Arc<tangent_record::decode::Clip>,
+    path: &std::path::Path,
+    renders: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
+) -> f32 {
+    let audio = stretched_clip_audio(clip, decoded, path, renders);
+    // Every pass reads from the same trim, the first for longest: one span.
+    let passes = audio_clip_passes(clip, &audio, f64::from(audio.rate.max(1)), 1.0);
+    let Some(from) = passes.first().map(|p| p.offset) else {
+        return 0.0;
+    };
+    let len = passes.iter().map(|p| p.len).max().unwrap_or(0);
+    let at = |f: u64| usize::try_from(f).unwrap_or(usize::MAX).min(audio.frames());
+    let mut peak = 0.0f32;
+    for f in at(from)..at(from.saturating_add(len)) {
+        for ch in 0..2 {
+            let v = audio.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+            if v.is_finite() {
+                peak = peak.max(v.abs());
+            }
+        }
+    }
+    peak
+}
+
 
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
@@ -3687,6 +3728,13 @@ fn warped_clip_audio(
 /// the file's own seconds, a stretched take that was ON the grid came off
 /// it, by up to a quarter of a second. Two attacks that land on one line
 /// keep only the first, and the second is carried inside the segment.
+///
+/// **Fewer than two pairs is nothing to quantize**, and the answer is an
+/// empty map. The Apply refused such a map on its own, keeping the clip's
+/// old one, while the preview drew the lone hit moving: a move on screen
+/// that the button would not make. Refused here, the ticks and the Apply
+/// cannot disagree about it, and "nothing to quantize" keeps whatever map
+/// the clip already has.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
@@ -3726,6 +3774,9 @@ fn quantize_map(
             map.push((f, to));
         }
     }
+    if map.len() < 2 {
+        map.clear();
+    }
     map
 }
 
@@ -3760,6 +3811,25 @@ fn make_room<V>(
     if cache.len() >= cap {
         cache.retain(|path, _| asked.contains(path));
     }
+}
+
+/// **Whether a quantize over these files is as good as done already**:
+/// every one that is decoded has an analysis made from that decode, so
+/// what is left is a `pick` and a map per clip - milliseconds, the work the
+/// marks redo on every turn of a dial. A file with no decode is skipped by
+/// the quantize and costs nothing. `take_project_request` runs such a
+/// quantize at once instead of behind a cover.
+#[cfg(feature = "recorder")]
+fn attacks_known(
+    asked: &[std::path::PathBuf],
+    decodes: &std::collections::HashMap<std::path::PathBuf, Decoded>,
+    analyses: &std::collections::HashMap<std::path::PathBuf, Arc<crate::transient::Analysis>>,
+) -> bool {
+    asked.iter().all(|path| {
+        decodes
+            .get(path)
+            .is_none_or(|d| analyses.get(path).is_some_and(|a| a.fits(&d.clip)))
+    })
 }
 
 /// **A clip's warp map in the frames of a decode at `rate`**: the anchors
@@ -10934,9 +11004,9 @@ impl DesktopApp {
             Q::Template(name) => ("Saving template", Some(name.clone())),
             Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
             Q::ResetTemplate => ("Resetting the template", None),
-            // Announced like the rest: a detection pass per selected clip (a
-            // whole-file analysis for a file not cached yet, ~12 ms per three
-            // minutes) and a map each, behind the busy cover.
+            // Announced only when a file has to be analysed first (~12 ms per
+            // three minutes of audio, each); see below for the quantize that
+            // runs at once.
             Q::QuantizeClips(_) => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
@@ -10960,6 +11030,20 @@ impl DesktopApp {
         if matches!(req, Q::Save) && !self.has_plugin_state() {
             self.run_project_request(ctx, req);
             return;
+        }
+        // **A quantize whose attacks are already known is the same case.**
+        // The window is open while it is used, so its marks have analysed
+        // every file the Apply names, and what is left is a pick and a map
+        // per clip; the render goes to the crew. Under the cover every Apply
+        // stood for its 400 ms minimum and swallowed the clicks on the desk
+        // meanwhile, in a window whose whole shape is "select a clip, Apply,
+        // listen, select another". A file that still has to be analysed is
+        // a real wait, and keeps the cover.
+        if let Q::QuantizeClips(ask) = &req {
+            if attacks_known(&self.asked_files(ask), &self.track_cache, &self.attack_cache) {
+                self.run_project_request(ctx, req);
+                return;
+            }
         }
         self.announce(ctx, label, detail, Chore::Project(req));
     }
@@ -13001,6 +13085,10 @@ impl DesktopApp {
         // lets it be asked again - so the marks for that clip would arrive
         // never rather than late. Nothing about the ask changes when a
         // decode lands, so the ask is the only thing that can remember.
+        // A file the decoder REFUSED never lands, so it answers at once with
+        // no marks (see `quantize_marks_for`), and its refusal is in the
+        // signature, so a file asked again after a project switch or an
+        // engine rebuild reopens the ask.
         if marks.len() == want {
             self.quantize_marked = ask.map(|a| (a, sig));
         }
@@ -13022,8 +13110,9 @@ impl DesktopApp {
     ///
     /// Everything `quantize_marks_for` reads that the ask does not carry:
     /// the file, the placement, the trim, the loop, the warp map and its
-    /// rate, and the stretch. A clip that moves changes this and the ticks
-    /// are rebuilt.
+    /// rate, the stretch, and whether the decoder refused the file. A clip
+    /// that moves changes this and the ticks are rebuilt; so does a refusal
+    /// that is lifted, so the file is asked again.
     ///
     /// **Not the document's own fingerprint**, which is the obvious
     /// one-liner and is wrong: it includes the desk, so a fader moved with
@@ -13035,6 +13124,7 @@ impl DesktopApp {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let doc = self.app.arrangement();
+        let doc_path = self.app.clip_doc();
         for id in &ask.ids {
             if let Some(c) = doc.clips.iter().find(|c| c.id == *id) {
                 c.path.hash(&mut h);
@@ -13045,6 +13135,11 @@ impl DesktopApp {
                 c.warp.hash(&mut h);
                 c.warp_rate.hash(&mut h);
                 c.stretch.to_bits().hash(&mut h);
+                let refused = doc_path.as_ref().is_some_and(|doc_path| {
+                    self.warm_refused
+                        .contains(&tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+                });
+                refused.hash(&mut h);
             }
         }
         h.finish()
@@ -13107,6 +13202,14 @@ impl DesktopApp {
         for a in &asked {
             let path = a.path.clone();
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
+                // **A file the decoder refused answers now, with no marks.**
+                // It never reaches `track_cache`; skipped like a decode still
+                // on its way, it kept the ask from ever latching, and while
+                // the window was up every frame rebuilt every mark and asked
+                // for another frame. A decode on its way is skipped: it lands.
+                if self.warm_refused.contains(&path) {
+                    out.push((a.id, Vec::new()));
+                }
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
@@ -13201,7 +13304,9 @@ impl DesktopApp {
         let files = self.asked_files(ask);
         let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
         let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
-        if map.len() < 2 {
+        // Nothing to quantize - fewer than two pairs, which `quantize_map`
+        // answers with no map at all - keeps the map the clip already has.
+        if map.is_empty() {
             return (0, found.len());
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
@@ -13220,7 +13325,8 @@ impl DesktopApp {
     /// should come up by what that half needs; measuring the whole file
     /// would normalise to a peak the clip does not play, which is the
     /// difference between "this take is level with the others" and "nothing
-    /// happened".
+    /// happened". And the played AUDIO, warped and stretched, not the
+    /// decode under it: see `played_peak`.
     ///
     /// **And nothing is written to disk.** The gain is a number on the clip:
     /// undoable, reversible, and the same file still under it.
@@ -13229,12 +13335,14 @@ impl DesktopApp {
         let Some(doc_path) = self.app.clip_doc() else {
             return;
         };
-        let rate = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or(48_000, |e| e.output().sample_rate);
         let doc = self.app.arrangement().clone();
+        // The warp and stretch renders playback already made, reused as glue
+        // reuses them: the live cache holds each beside its picture.
+        let mut renders: std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>> = self
+            .stretch_cache
+            .iter()
+            .map(|(k, d)| (k.clone(), Arc::clone(&d.clip)))
+            .collect();
         let mut done = 0usize;
         let mut silent = 0usize;
         for clip in doc.clips.iter().filter(|c| ids.contains(&c.id)) {
@@ -13245,19 +13353,7 @@ impl DesktopApp {
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
-            let frames = |s: f64| frames_at(f64::from(rate), s) as usize;
-            let from = frames(clip.offset_s);
-            let len = frames(clip.play_len_s(decoded.seconds()));
-            let end = (from + len).min(decoded.frames());
-            let mut peak = 0.0f32;
-            for f in from.min(end)..end {
-                for ch in 0..2 {
-                    let v = decoded.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
-                    if v.is_finite() {
-                        peak = peak.max(v.abs());
-                    }
-                }
-            }
+            let peak = played_peak(clip, decoded, &path, &mut renders);
             // **Silence has no peak to normalise to.** Dividing by it is an
             // infinite gain on a clip that would still be silent, and the
             // honest answer is to say so rather than to multiply nothing by
@@ -25821,6 +25917,67 @@ mod tests {
         }
     }
 
+    /// **Normalize measures the audio a clip PLAYS, not its file.** It read
+    /// the decode from the clip's trim for the clip's length. A looped clip
+    /// plays one pass of its loop over and over; a stretched clip's trim and
+    /// length are seconds of the STRETCHED audio; a warp carries material
+    /// across the trim. So each was measured over material it never plays:
+    /// a loud hit there kept the take from coming up at all, and a hit the
+    /// warp pulled in went unmeasured, so the gain could lift it past the
+    /// -1 dBFS normalize promises.
+    #[test]
+    fn normalize_measures_the_audio_the_clip_plays() {
+        let rate = 8_000u32;
+        let path = std::path::PathBuf::from("take.wav");
+        // Four seconds of a quiet tone, and one loud burst at `hit_s`.
+        let file = |hit_s: f64| {
+            let mut s: Vec<f32> = (0..4 * rate as usize)
+                .flat_map(|f| {
+                    let v = 0.1 * (f as f32 * 220.0 * std::f32::consts::TAU / rate as f32).sin();
+                    [v, v]
+                })
+                .collect();
+            let at = (hit_s * f64::from(rate)) as usize;
+            for f in at..at + 80 {
+                s[f * 2] = 0.9;
+                s[f * 2 + 1] = 0.9;
+            }
+            Arc::new(tangent_record::decode::Clip { samples: s, rate, source: path.clone() })
+        };
+        let peak = |clip: &tangent_ui::arrangement::ArrClip, hit_s: f64| {
+            played_peak(clip, file(hit_s), &path, &mut std::collections::HashMap::new())
+        };
+        let take = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "take.wav".to_owned(),
+            offset_s: 1.0,
+            ..Default::default()
+        };
+        // The control: a hit inside what a plain clip plays is its peak.
+        let plain = tangent_ui::arrangement::ArrClip { len_s: 2.0, ..take.clone() };
+        assert!(peak(&plain, 2.5) > 0.8, "a hit the clip plays was not measured");
+        // LOOPED, it plays 1..2 s of the file four times and never reaches 2.5.
+        let looped = tangent_ui::arrangement::ArrClip { len_s: 4.0, loop_s: 1.0, ..take.clone() };
+        let p = peak(&looped, 2.5);
+        assert!(p < 0.2, "a looped clip was measured past its loop, at {p}");
+        // STRETCHED to 2, it plays 1..4 s of the stretched audio: 0.5..2 s of
+        // the file, and the hit at 3 s is nowhere in it.
+        let stretched = tangent_ui::arrangement::ArrClip { stretch: 2.0, len_s: 3.0, ..take.clone() };
+        let p = peak(&stretched, 3.0);
+        assert!(p < 0.3, "a stretched clip was measured on the unstretched file, at {p}");
+        // WARPED, the hit at 0.9 s - in the trim - is carried to 1.1 s, which
+        // the clip plays.
+        let at = |s: f64| (s * f64::from(rate)) as u64;
+        let warped = tangent_ui::arrangement::ArrClip {
+            len_s: 1.0,
+            warp: vec![(at(0.9), at(1.1)), (at(1.9), at(1.9))],
+            warp_fit: "slice".to_owned(),
+            ..take.clone()
+        };
+        let p = peak(&warped, 0.9);
+        assert!(p > 0.8, "a hit the warp carries into the clip was not measured, at {p}");
+    }
+
     /// **The marks are rebuilt when the CLIPS move, not only when a knob
     /// does.**
     ///
@@ -25874,6 +26031,34 @@ mod tests {
         assert!(
             scan.contains("let sig = ask.as_ref().map_or(0, |a| self.quantize_clip_sig(a));"),
             "the pusher no longer asks where the clips are"
+        );
+    }
+
+    /// **A file the decoder refused lets the marks rest.** It never reaches
+    /// `track_cache`, so `quantize_marks_for` skipped it like a decode still
+    /// on its way; the ask latches only once every clip has answered, so it
+    /// never latched, and with the window up every frame rebuilt every mark
+    /// and asked for another frame - one missing take kept the app from
+    /// resting. It answers at once with no marks now, and its refusal is in
+    /// the signature, so a file that is asked again reopens the ask. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_refused_file_answers_the_marks_with_none() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |f: &str| {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        let marks = body("fn quantize_marks_for(");
+        assert!(
+            marks.contains("if self.warm_refused.contains(&path) {")
+                && marks.contains("out.push((a.id, Vec::new()));"),
+            "a refused file is skipped like a decode on its way, so the ask never latches"
+        );
+        assert!(
+            body("fn quantize_clip_sig(").contains("refused.hash(&mut h);"),
+            "the signature ignores a refusal, so one lifted leaves the clip unmarked"
         );
     }
 
@@ -26514,6 +26699,39 @@ mod tests {
         }
     }
 
+    /// **One attack is nothing to quantize, for the ticks as for the
+    /// Apply.** The Apply refused a map of fewer than two pairs and kept the
+    /// clip's old one, but that rule lived in `quantize_clip`, outside the
+    /// map both roads share - so the preview drew the lone hit moving. Lower
+    /// the detect slider on a take until one attack is left, and the ticks
+    /// showed a move that Apply then declined with "quantized 0 of 1".
+    #[test]
+    fn one_attack_is_nothing_to_quantize_for_the_ticks_or_the_apply() {
+        use crate::transient::Transient;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::from_document(-2, 4, 4, 120.0, false, None)
+                .expect("a quarter grid at 120 bpm"),
+        );
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            ..Default::default()
+        };
+        // A hit 30 ms after the 0.5 s line: a move, had it been allowed.
+        let one = [Transient { at: 25_440, strength: 10.0 }];
+        assert_eq!(
+            quantize_map(&one, 48_000, 2.0, &clip, &q),
+            Vec::<(u64, u64)>::new(),
+            "one attack drew a move the Apply will not write"
+        );
+        // A second one makes a map of both.
+        let two = [one[0], Transient { at: 72_960, strength: 10.0 }];
+        assert_eq!(
+            quantize_map(&two, 48_000, 2.0, &clip, &q),
+            vec![(25_440, 24_000), (72_960, 72_000)],
+            "two attacks were not quantized"
+        );
+    }
+
     /// **A file's attacks are detected once per dial position.**
     ///
     /// The marks are redrawn while somebody is dragging the sensitivity
@@ -26620,6 +26838,52 @@ mod tests {
         cache.insert(p(20), 0);
         assert!(cache.contains_key(&p(0)), "a file the new ask names was thrown away");
         assert!(cache.len() <= 8, "the cache kept files no ask names past its cap: {}", cache.len());
+    }
+
+    /// **A quantize waits behind the busy cover only for a file it has to
+    /// analyse.** Every Apply was announced, and the cover stands for at
+    /// least 400 ms and swallows the desk's clicks meanwhile - for what,
+    /// with the window's marks up, is a pick and a map per clip. The cover
+    /// is for a real wait: a decoded file with no analysis yet, or only one
+    /// made from another decode of it. The rule is a function of the caches;
+    /// the road through it is `take_project_request`, scanned below because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_quantize_waits_behind_the_cover_only_for_a_file_it_must_analyse() {
+        let take = |rate: u32| {
+            Decoded::of(tangent_record::decode::Clip {
+                samples: (0..rate as usize * 2).map(|i| if i % 4000 < 40 { 0.8 } else { 0.0 }).collect(),
+                rate,
+                source: std::path::PathBuf::from("take.wav"),
+            })
+        };
+        let analysis = |d: &Decoded| Arc::new(crate::transient::analyse(&d.clip).expect("an analysis"));
+        let (a, b) = (std::path::PathBuf::from("a.wav"), std::path::PathBuf::from("b.wav"));
+        let mut decodes = std::collections::HashMap::new();
+        decodes.insert(a.clone(), take(8_000));
+        decodes.insert(b.clone(), take(8_000));
+        let mut analyses = std::collections::HashMap::new();
+        analyses.insert(a.clone(), analysis(&decodes[&a]));
+        let both = [a.clone(), b.clone()];
+        assert!(!attacks_known(&both, &decodes, &analyses), "a file still to analyse ran uncovered");
+        analyses.insert(b.clone(), analysis(&decodes[&b]));
+        assert!(attacks_known(&both, &decodes, &analyses), "a quantize with nothing to analyse was covered");
+        // A file with no decode is skipped by the quantize and costs nothing.
+        let gone = [a.clone(), std::path::PathBuf::from("gone.wav")];
+        assert!(attacks_known(&gone, &decodes, &analyses), "a file with no decode held the quantize back");
+        // An analysis of another decode of the file is not this decode's.
+        decodes.insert(b.clone(), take(16_000));
+        assert!(!attacks_known(&both, &decodes, &analyses), "another decode's analysis was taken as known");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn take_project_request(&mut self").expect("the request road");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let quick = body
+            .find("attacks_known(&self.asked_files(ask), &self.track_cache, &self.attack_cache)")
+            .expect("a quantize no longer asks whether its attacks are known");
+        let covered = body.find("self.announce(ctx, label, detail").expect("the cover");
+        assert!(quick < covered, "the quantize is announced before it is asked whether it must be");
     }
 
     /// **The LIVE path warps too, and carries a picture of what it warped.**
