@@ -10504,6 +10504,19 @@ impl DesktopApp {
             // `Settings::default`, and the session adopts it, so the desk on
             // screen is the one a fresh install would show.
             tangent_ui::ports::ProjectRequest::ResetTemplate => {
+                // **The outgoing session first, left as New leaves it.** The
+                // app asked about unsaved work before raising this; the
+                // plugins' knobs, which never dirty the document, go into its
+                // project unless the answer was Don't Save - the mirror off
+                // the template below CLEARS the live shelf - and a scratch
+                // this session made and discarded is cleared.
+                let discarded = self.app.take_outgoing_discarded();
+                self.save_plugin_states();
+                if discarded {
+                    self.discard_outgoing_scratch();
+                } else {
+                    self.copy_states_to_project();
+                }
                 let template = self.templates_dir().join("default");
                 let _ = std::fs::remove_file(tangent_ui::arrangement::doc_in(&template));
                 let _ = std::fs::remove_dir_all(template.join("state"));
@@ -26091,6 +26104,31 @@ mod tests {
             "Reset Template goes through the launch road, which now reopens \
              the remembered project — so a reset rebuilds the template and \
              then puts the user's last song on screen instead of it"
+        );
+    }
+
+    /// **Reset Template lets the outgoing session go as New does.** The app
+    /// asks about unsaved work first now (`AfterSave::ResetTemplate`), and
+    /// the host carries the answer out: the plugins' knobs, which never
+    /// dirty the document, are shelved into the outgoing project unless the
+    /// answer was Don't Save - the adopt mirrors the template's shelf, which
+    /// CLEARS the live one - and a discarded scratch this session made is
+    /// cleared. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn reset_template_lets_the_outgoing_session_go_as_new_does() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("ProjectRequest::ResetTemplate => {").expect("the Reset Template arm");
+        let arm = &src[at..at + src[at..].find("ProjectRequest::Save =>").expect("the arm after it")];
+        let adopt = arm.find("self.adopt_fresh_from_template(").expect("the adopt");
+        let answer = arm.find("let discarded = self.app.take_outgoing_discarded();");
+        let shelved = arm.find("self.copy_states_to_project();");
+        let cleared = arm.find("self.discard_outgoing_scratch();");
+        assert!(
+            answer.is_some_and(|a| shelved.is_some_and(|s| cleared.is_some_and(|c| a < s && a < c && s < adopt && c < adopt))),
+            "Reset Template replaces the session without carrying out the save \
+             prompt's answer: knobs turned since the last save are lost, or a \
+             discarded scratch is left behind"
         );
     }
 

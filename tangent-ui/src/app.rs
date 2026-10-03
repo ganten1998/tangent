@@ -2361,6 +2361,9 @@ enum AfterSave {
     Open,
     /// The window is closing.
     Quit,
+    /// Settings > Reset > The Default Template: the session is replaced by
+    /// a fresh one from the rebuilt template, as New replaces it.
+    ResetTemplate,
 }
 
 /// **One moment on the undo timeline.**
@@ -16017,6 +16020,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 AfterSave::New => "starting a new project",
                 AfterSave::Open => "opening another project",
                 AfterSave::Quit => "quitting",
+                AfterSave::ResetTemplate => "resetting the default template",
             }
             .to_owned(),
             name: self.project_name(),
@@ -16054,6 +16058,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             AfterSave::Quit => {
                 self.quit_now = true;
                 self.quit_allowed = true;
+            }
+            AfterSave::ResetTemplate => {
+                self.project_request = Some(crate::ports::ProjectRequest::ResetTemplate);
             }
         }
     }
@@ -33966,7 +33973,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // road below — no backup, no font reload, no window resize. It is a
         // file on disk in the user's Projects folder and only the host can
         // reach it. See `ports::ProjectRequest::ResetTemplate`.
+        //
+        // **But it replaces the open session**, with a fresh one from the
+        // rebuilt template, so it asks about unsaved work as New does. It
+        // went straight to the host from its own confirmation, and the
+        // edits were simply gone.
         if scope == crate::settings::ResetScope::Template {
+            if self.ask_before(AfterSave::ResetTemplate) {
+                return;
+            }
             self.project_request = Some(crate::ports::ProjectRequest::ResetTemplate);
             return;
         }
@@ -63793,6 +63808,50 @@ mod tests {").expect("the tests module")];
         assert!(
             !matches!(request, Some(crate::ports::ProjectRequest::NewDiscarding)),
             "Reset Everything reclaims a leftover Untitled, recordings and all, without the scratch warning"
+        );
+    }
+
+    /// **Resetting the default template asks before it replaces unsaved
+    /// work.** The reset rebuilds the template and then stands the session on
+    /// a fresh copy of it - a session switch like New - but it went straight
+    /// from its own confirmation to the host, with no save prompt: unsaved
+    /// edits were gone, under a confirmation that says it changes nothing but
+    /// the template's desk. It asks as New does now, and Discard's answer
+    /// travels with the reset to the host.
+    #[test]
+    fn resetting_the_template_asks_before_it_replaces_unsaved_work() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        assert!(app.project_dirty_exact(), "the fixture has nothing unsaved");
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Template));
+        run_frame(&ctx, &mut app);
+        let replaced = matches!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate)
+        );
+        let asked = matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. }));
+        assert!(
+            asked || !replaced,
+            "Reset > The Default Template replaced an unsaved session without the save prompt"
+        );
+        // Discard: the reset goes ahead, and the host is told.
+        app.apply_dialog_action(DialogAction::SaveChangesDiscard);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "the answer did not carry on with the reset"
+        );
+        assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
+        // A clean session has nothing to ask about.
+        app.undo_reset();
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Template));
+        run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "a clean session was asked about nothing"
         );
     }
 

@@ -86,13 +86,16 @@ Related invariants that keep this working:
   kit `kit_is_custom` calls a kit work only when it holds a sample or
   cannot be parsed.
 - **New, Open and Quit ask, and "Don't Save" sticks.** The menu's and the
-  Project window's New and Open go through `ask_before`, as Quit does
-  (Settings > Reset does not: The Default Template replaces the session
-  without asking, and Everything opens a fresh one through New with the
-  session DISCARDED - `reset_settings` commits the reset as a moment, then
+  Project window's New and Open go through `ask_before`, as Quit does, and
+  so does Settings > Reset > The Default Template, which replaces the
+  session with a fresh one from the rebuilt template
+  (`AfterSave::ResetTemplate`; the host's arm then shelves or discards the
+  outgoing session as New does). Everything does not ask: it opens a fresh
+  session through New with the session DISCARDED - `reset_settings`
+  commits the reset as a moment, then
   gives Discard's answer, so the emptied desk is never written into the
   open project's document - and keeping, so a leftover Untitled with takes
-  is never reclaimed unasked). The
+  is never reclaimed unasked. The
   prompt's Discard reaches the host as `take_outgoing_discarded` and gates
   the document save-back AND the project plugin-state mirror in
   `switch_project`, the New arm and `on_exit`, and it survives New's detour
