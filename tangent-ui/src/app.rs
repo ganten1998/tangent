@@ -17312,11 +17312,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_multi = ids;
     }
 
-    /// **Open the quantize window**, filled from what was last used.
+    /// **Open the quantize window**, filled from what was last used - or,
+    /// when it is already open, re-aim it and leave its dials alone.
     pub fn open_quantize_window(&mut self) {
         // Before the window is filled, so its target line and its marks are
         // built from the selection this just made.
         self.adopt_track_clips_for_quantize();
+        // **Q on a window already up is a re-aim, not a reopen.** Q is the
+        // one road that adopts a picked track's audio, so it is how a
+        // standing window is pointed somewhere else, and the window keeps
+        // working copies of its dials that reach the settings only on
+        // Apply. Rebuilt from the settings, a strength of 40 and a grid of
+        // 1/16 turned and not yet applied snapped back to the last Apply's,
+        // the ticks with them, and the Apply after used the old numbers.
+        if matches!(self.dialog, Some(Dialog::Quantize { .. })) {
+            let now = self.quantize_target();
+            if let Some(Dialog::Quantize { target, .. }) = self.dialog.as_mut() {
+                *target = now;
+            }
+            return;
+        }
         self.dialog = Some(Dialog::Quantize {
             grid_exp: self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
             triplet: self.settings.quantize_triplet,
@@ -43034,6 +43049,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Q with the window up re-aims it and keeps its dials.**
+    ///
+    /// Q is the one road that aims a standing window at another track - the
+    /// per-frame refresh only follows the selection, it never adopts - and
+    /// it rebuilt the whole window from the settings, which the window
+    /// writes only on Apply. So turning the strength to 40 and the grid to
+    /// 1/16, clicking another track's header and pressing Q snapped both
+    /// dials back to what was last applied, the ticks with them, and the
+    /// Apply that followed used the old numbers.
+    #[test]
+    fn q_with_the_window_up_keeps_its_unapplied_dials() {
+        let root = project_scratch("q-keeps-dials");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let clip = |lane| crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane,
+            len_s: 2.0,
+            ..Default::default()
+        };
+        let a = app.arrangement.add_clip(clip(0));
+        let b = app.arrangement.add_clip(clip(1));
+        app.arr_selected = Some(a);
+        app.select_track(0, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        if let Some(Dialog::Quantize { strength_pct, grid_exp, .. }) = app.dialog.as_mut() {
+            *strength_pct = 40.0;
+            *grid_exp = -4;
+        }
+        app.select_track(1, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        match app.dialog.as_ref() {
+            Some(Dialog::Quantize { strength_pct, grid_exp, target, .. }) => {
+                assert_eq!(
+                    (*strength_pct, *grid_exp),
+                    (40.0, -4),
+                    "Q threw away the dials nobody had applied"
+                );
+                assert_eq!(target.as_deref(), Some("1 audio clip"), "the line did not follow");
+            }
+            _ => panic!("Q closed the quantize window"),
+        }
+        assert_eq!(app.arr_quantize_ids(), vec![b], "Q did not re-aim at the picked track");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The window asks for marks while it is open, and for nothing when
     /// it is not.**
     ///
@@ -43347,6 +43409,9 @@ mod tests {
         let agree = |app: &mut TangentApp, exp: i8, lines: &[f64]| {
             app.settings.arr_grid_exp = i64::from(exp);
             app.settings.quantize_grid_exp = i64::from(exp);
+            // Shut first: Q on a window already up re-aims it and keeps its
+            // dials, and this wants one opened on the setting just written.
+            app.dialog = None;
             app.open_quantize_window();
             let ask = app.quantize_preview().expect("an open window asks");
             let grid = ask.grid;
