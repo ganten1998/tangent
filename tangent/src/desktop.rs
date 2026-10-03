@@ -24961,21 +24961,37 @@ mod tests {
     #[test]
     fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
         // `insert_state_path` is per-install, and `(CHANNELS + 3, 2)` is
-        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf
-        // beside the real settings file. Not yet redirected: this reads and
-        // rewrites that file, unlocked against the tests that move
-        // `IVORY_SETTINGS_PATH`, and only puts it back at the end.
-        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
-        let path = insert_state_path(strip, bay);
-        let had = std::fs::read(&path).ok();
-        let restore = || match &had {
-            Some(raw) => {
-                let _ = std::fs::write(&path, raw);
+        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf -
+        // so this runs under `SIDECAR_ENV` with `IVORY_SETTINGS_PATH`
+        // pointed at a scratch folder, and puts the variable back after.
+        let _lock = super::sidecar_walk_probe::SIDECAR_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shelf = std::env::temp_dir().join(format!(
+            "tangent-displaced-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&shelf);
+        std::fs::create_dir_all(&shelf).expect("a scratch shelf");
+        let was = std::env::var_os("IVORY_SETTINGS_PATH");
+        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        let restore = || {
+            // SAFETY: still under `SIDECAR_ENV`.
+            unsafe {
+                match &was {
+                    Some(v) => std::env::set_var("IVORY_SETTINGS_PATH", v),
+                    None => std::env::remove_var("IVORY_SETTINGS_PATH"),
+                }
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+            let _ = std::fs::remove_dir_all(&shelf);
         };
+        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
+        assert!(
+            insert_state_path(strip, bay).starts_with(&shelf),
+            "the sidecar is still on the live shelf"
+        );
 
         // A plugin with settings somebody dialled in.
         write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as tweaked");
@@ -25021,6 +25037,34 @@ mod tests {
             Some(&b"the delay"[..])
         );
         restore();
+    }
+
+    /// **The displaced-state test stays off the live shelf.** It read and
+    /// rewrote `insert-state-35-2.bin` - the master's sixth slot - beside
+    /// the owner's own settings, with no redirect and no lock against the
+    /// tests that move `IVORY_SETTINGS_PATH`, and put the file back only at
+    /// the end: a failed assert left a foreign-tagged sidecar, and a live
+    /// save in between was overwritten. A source scan of that test, whose
+    /// redirect must stand before the first sidecar path is worked out.
+    #[test]
+    fn the_displaced_state_test_stays_off_the_live_shelf() {
+        let whole = include_str!("desktop.rs");
+        // Built at run time so this test's own source cannot match.
+        let name = format!("fn {}() {{", "a_displaced_plugin_state_survives_the_write_that_buried_it");
+        let at = whole.find(&name).expect("the test");
+        let body = &whole[at..at + whole[at..].find("\n    }\n").expect("its end")];
+        // Whitespace out, so a line break inside a call cannot hide it.
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let lock = body.find("SIDECAR_ENV.lock()");
+        // To the scratch shelf - not the restore's own `set_var` at the end.
+        let redirect = body.find("std::env::set_var(\"IVORY_SETTINGS_PATH\",shelf");
+        let first = body.find("insert_state_path(").expect("the test reads a sidecar path");
+        assert!(
+            lock.is_some_and(|l| redirect.is_some_and(|r| l < r && r < first)),
+            "it reads and rewrites insert-state-35-2.bin - the master's sixth slot - \
+             on the live shelf beside the owner's settings.json, unlocked against \
+             the tests that move IVORY_SETTINGS_PATH"
+        );
     }
 
     /// **And the two roads that bury a sidecar both shelve first.**
@@ -30736,8 +30780,10 @@ mod sidecar_walk_probe {
     /// and tests are not.** Same reason and same shape as `SETTINGS_PATH_ENV`
     /// in `settings.rs`: cargo runs these on parallel threads in ONE process,
     /// so a count read here would otherwise include another test's walk, and a
-    /// settings path set here would be taken away under it.
-    static SIDECAR_ENV: Mutex<()> = Mutex::new(());
+    /// settings path set here would be taken away under it. Shared with
+    /// `tests::a_displaced_plugin_state_survives_the_write_that_buried_it`,
+    /// which moves the settings path too.
+    pub(super) static SIDECAR_ENV: Mutex<()> = Mutex::new(());
 
     /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
     /// question is about — the shelf that matters is a PROJECT folder, and a

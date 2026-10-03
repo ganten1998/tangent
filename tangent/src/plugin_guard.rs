@@ -32,8 +32,25 @@
 use std::path::{Path, PathBuf};
 
 /// Where the breadcrumb sits: beside the settings it protects.
+///
+/// **Never the live one under test.** The guard's own test arms, disarms
+/// and consumes it, and in the real file that ate a real crash's blame, or
+/// left a false one for the next launch when the test process died
+/// mid-test. A file per test THREAD, so a test that loads a plugin cannot
+/// arm the crumb another test is reading either.
 fn crumb() -> PathBuf {
-    tangent_core::config::file("loading-plugin.txt")
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!(
+            "tangent-loading-plugin-{}-{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        tangent_core::config::file("loading-plugin.txt")
+    }
 }
 
 /// **About to hand control to `bundle`.** Write it down first.
@@ -97,6 +114,29 @@ pub fn take_blame() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The guard's own test never touches the live breadcrumb.** `crumb()`
+    /// had no test redirect, so the test below disarmed, armed and consumed
+    /// the running app's `~/.config/tangent/loading-plugin.txt`: it could eat
+    /// a real crash's blame, or leave "Rhodes Anthology" blamed for the next
+    /// launch if the test process died mid-test. A source scan, because the
+    /// hazard is the very file a behavioural test would have to touch.
+    #[test]
+    fn the_guards_own_test_never_touches_the_live_breadcrumb() {
+        let src = include_str!("plugin_guard.rs");
+        let at = src.find("fn crumb() -> PathBuf {").expect("crumb");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("crumb's end")];
+        assert!(
+            body.contains("#[cfg(test)]") && body.contains("std::env::temp_dir()"),
+            "crumb() has no test redirect: the guard's own test arms, disarms and \
+             consumes the live app's ~/.config/tangent/loading-plugin.txt"
+        );
+        assert!(
+            crumb().starts_with(std::env::temp_dir()),
+            "under test the breadcrumb is {}",
+            crumb().display()
+        );
+    }
 
     /// The three states, in the order a launch meets them.
     ///
