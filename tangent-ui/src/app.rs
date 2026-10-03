@@ -3211,6 +3211,10 @@ const GLUE_NEEDS: &str = "Glue needs two or more clips on one track, or one that
      repeats - pull a clip's edge past its first pass and glue welds the \
      repeats into it.";
 
+/// **Why glue said no to a frozen track**, for both roads through it: the
+/// lane plays its render, and its clips are what thawing has to find.
+const GLUE_FROZEN: &str = "That track is frozen - unfreeze it to glue its clips.";
+
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
 ///
 /// Counted rather than timestamped: "Untitled 3" is a name a person can say
@@ -17002,11 +17006,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// this answered it - with a request to the host, or with a refusal that
     /// says why. `false` leaves the selection to the MIDI road.
     ///
-    /// The count, track and kind rules are MIDI glue's, so on those the two
-    /// cannot come to different opinions: two or more clips, or one that
-    /// shows more than one pass; one track; one kind. Audio also refuses a
-    /// frozen track, whose clips are not what it plays; the MIDI road has no
-    /// such refusal yet.
+    /// The rules are MIDI glue's, so the two cannot come to different
+    /// opinions: two or more clips, or one that shows more than one pass;
+    /// one track; one kind; and not a frozen track, whose clips are not what
+    /// it plays.
     fn arr_glue_audio(&mut self, ids: &[u64]) -> bool {
         let picked: Vec<&crate::arrangement::ArrClip> =
             self.arrangement.clips.iter().filter(|c| ids.contains(&c.id)).collect();
@@ -17036,10 +17039,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return true;
         }
         if self.lane_frozen(lane).is_some() {
-            self.notify(
-                crate::notify::Kind::Info,
-                "That track is frozen - unfreeze it to glue its clips.",
-            );
+            self.notify(crate::notify::Kind::Info, GLUE_FROZEN);
             return true;
         }
         let ids: Vec<u64> = audio.iter().map(|c| c.id).collect();
@@ -17129,11 +17129,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and quietly gluing the ones that happen to share a lane would be a
     /// command that does something other than what was asked.
     ///
-    /// **Audio glues too**, by the same rules plus one (audio refuses a
-    /// frozen track, which this MIDI road does not yet) - the owner: "Audio
-    /// clips don't glue". Welding audio means RENDERING, so it is the host's
-    /// to do (see `RecorderRequest::GlueAudio`); this side decides whether
-    /// the selection can be glued at all and says why not in the same words.
+    /// **Audio glues too**, by the same rules, a frozen track refused on
+    /// both roads - the owner: "Audio clips don't glue". Welding audio means
+    /// RENDERING, so it is the host's to do (see `RecorderRequest::GlueAudio`);
+    /// this side decides whether the selection can be glued at all and says
+    /// why not in the same words.
     fn arr_glue_selection(&mut self) {
         let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
         if let Some(one) = self.arr_selected {
@@ -17186,6 +17186,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 crate::notify::Kind::Info,
                 "Glue works on one track at a time.",
             );
+            return;
+        }
+        // **Nor on a frozen track**, the audio road's rule: the lane plays
+        // its render, and its clips are what thawing has to find - the
+        // reason Delete leaves them too.
+        if self.lane_frozen(lane).is_some() {
+            self.notify(crate::notify::Kind::Info, GLUE_FROZEN);
             return;
         }
         picked.sort_by(|a, b| {
@@ -58370,6 +58377,30 @@ mod tests {
                 len_s: 8.0,
             });
         }));
+    }
+
+    /// **MIDI glue refuses a frozen track, as audio glue does.** A frozen
+    /// lane plays its render, and its clips are what thawing has to find -
+    /// Delete leaves them for that reason - but the MIDI road welded them
+    /// all the same, while its doc and the audio road's said the two roads
+    /// kept one set of rules. Refused in the audio road's own words.
+    #[test]
+    fn midi_glue_refuses_a_frozen_track_as_audio_glue_does() {
+        use crate::arrangement::ClipKind;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let a = glue_part(&mut app, ClipKind::Midi, 3, 0.0, 2.0, 2.0);
+        let b = glue_part(&mut app, ClipKind::Midi, 3, 4.0, 2.0, 2.0);
+        app.arr_multi.extend([a, b]);
+        app.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
+            lane: 3,
+            path: "media/frozen-04.wav".into(),
+            len_s: 8.0,
+        });
+        let before = app.arrangement.clips.clone();
+        let said = app.messages.len();
+        app.arr_glue_selection();
+        assert_eq!(app.arrangement.clips, before, "MIDI glue welded clips on a frozen track");
+        assert!(app.messages.len() > said, "the refusal did not say why");
     }
 
     /// **The host's weld lands as one plain loop in its sources' place**, and
