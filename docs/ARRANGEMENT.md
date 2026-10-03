@@ -67,12 +67,11 @@ button's count joins it from where it began, the red button pressed during
 a take's count joins that one, and Play during either starts the song on
 the downbeat. The realtime EXPORT is the one take that owns the transport
 and the lane order; those refusals key on `exporting` (the host's
-`bounce`), not on the take state. Not yet on every road to the lane order:
-only the lane drags refuse (`move_channel`, `move_selection`,
-`snap_into_folder`, each on `exporting || arr_recording`), while Insert
-Track, Paste Track Below, Cmd/Ctrl+F grouping and a drag home that ejects a
-track from its folder still reorder lanes under an export or an
-arrangement record.
+`bounce`), not on the take state. Every road to the lane order refuses
+under an export or an arrangement record, which both bind lane indices at
+their press: the lane drags (a move, a snap into a folder, a drag home that
+ejects a track), Insert Track, Paste Track Below and Cmd/Ctrl+F grouping
+each ask `lane_order_held` before they change anything, and it says why.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 
