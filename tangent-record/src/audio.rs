@@ -1345,10 +1345,18 @@ thread_local! {
     /// One instance per thread ends it, verified against asio-sys 0.2.6:
     /// through a SHARED instance, `load_driver` returns the already-loaded
     /// driver for the same name and `Err(DriverAlreadyExists)` for any other —
-    /// it never touches the SDK loader while a driver is live. Enumeration
-    /// while a stream runs then lists exactly the live driver, and the input
-    /// opens on the same duplex device the output owns, which is the only
-    /// correct answer a single-client ASIO driver has.
+    /// it never touches the SDK loader while a driver is live. (The vendored
+    /// asio-sys has since made that guard a process-wide `static`, so every
+    /// instance shares it; see `vendor/README.md`.) Enumeration while a stream
+    /// runs then lists exactly the live driver, and the input opens on the
+    /// same duplex device the output owns, which is the only correct answer a
+    /// single-client ASIO driver has.
+    ///
+    /// **It is the wrong answer for the Setup panel's OUTPUT row**, which
+    /// offered "the system's own" plus the running driver and nothing else,
+    /// so an interface registered beside ASIO4ALL could never be picked. That
+    /// row does not enumerate devices under ASIO: it reads the registry's
+    /// driver names, which loads nothing. See [`output_device_names`].
     ///
     /// Thread-local rather than global because `cpal::Host` is not guaranteed
     /// `Send`/`Sync` across every backend — and every real open in this app
@@ -2879,24 +2887,41 @@ impl LevelTracker {
 
 /// **Every audio OUTPUT this system offers, by name.**
 ///
-/// Names and nothing else, and that restriction is the whole of why this is
-/// its own function rather than a `map` over `output_devices()`.
+/// Names and nothing else: what the Setup panel's OUTPUT row offers, and what
+/// `instrument::resolve_output` is later asked to find. Every system but ASIO
+/// lists its devices here, dropping each as it goes, the care
+/// `resolve_output` takes too and explains at greater length.
 ///
-/// Under ASIO a `cpal::Device` holds its driver LOADED, and the shared host's
-/// guard refuses to load any other while one is held - so collecting devices
-/// would yield the first loadable driver and nothing after it, and the list
-/// would be one row long on a machine with four interfaces. Iterating and
-/// dropping each in turn is the only enumeration a single-client driver world
-/// permits. `instrument::resolve_output` takes the same care for the same
-/// reason and says so at greater length.
+/// **Under ASIO it is the registry's list of drivers, and no driver is
+/// loaded.** cpal lists ASIO devices by LOADING each driver in turn, and the
+/// guard refuses a second while one is held: with a stream running, every
+/// other `load_driver` answered `DriverAlreadyExists`, cpal's iterator
+/// skipped it (see `HOST_CACHE`), and the row offered "the system's own" plus
+/// the running driver - so a user with ASIO4ALL or FL Studio ASIO registered
+/// beside his interface could never pick the interface. With nothing held it
+/// loaded and unloaded every driver on the calling thread, which takes
+/// seconds and can hang on a dead one.
 ///
-/// **Under ASIO, while a stream holds a driver, this returns that driver
-/// alone**: every other `load_driver` answers `DriverAlreadyExists` and cpal's
-/// iterator skips it (see `HOST_CACHE`). With nothing held it loads and
-/// unloads every registered driver in turn on the calling thread, which takes
-/// seconds and can hang on a dead driver. A complete ASIO list needs the
-/// registry's names, not devices.
+/// The registry is the very list those loads walked: cpal's ASIO `Devices`
+/// is built from `Asio::driver_names`, names each device by the string it
+/// loaded it with, and `resolve_output` matches that string exactly. So a
+/// name picked here is spelled the way the open finds it. The price is that a
+/// driver with no hardware behind it is offered too; picking it fails at the
+/// open, which falls back to the platform default and says so, as it does
+/// for an interface unplugged after it was picked. See [`asio_output_rows`].
 pub fn output_device_names() -> Result<Vec<String>, AudioError> {
+    // **No `Asio` state, no driver touched.** The value is empty (the
+    // vendored crate keeps its guard in a process-wide static), and
+    // `driver_names` reads `HKLM\SOFTWARE\ASIO` through a throwaway SDK
+    // `AsioDrivers` that never opens a driver and leaves the loaded one, held
+    // in the SDK's own globals, alone. It is the first step of cpal's own
+    // enumeration, without the loads that follow it.
+    #[cfg(all(windows, feature = "asio"))]
+    {
+        if system_is_asio() {
+            return Ok(asio_output_rows(asio_sys::Asio::new().driver_names()));
+        }
+    }
     with_host(|host| {
         Ok(host
             .output_devices()
@@ -2904,6 +2929,32 @@ pub fn output_device_names() -> Result<Vec<String>, AudioError> {
             .map(|d| d.name().unwrap_or_else(|_| UNNAMED_DEVICE.to_string()))
             .collect())
     })
+}
+
+/// **The registry's ASIO driver names as OUTPUT rows**: in the registry's
+/// order, each name once, and no blank one.
+///
+/// - **The registry's order**, because it is the order cpal's ASIO host tries
+///   drivers in: the first row that can play is the driver "the system's
+///   own" opens.
+/// - **A name the registry repeats is offered once.** The SDK loads a driver
+///   by name and takes the FIRST entry spelled that way, so a later entry can
+///   never be opened by its name, and two chips would be one driver.
+/// - **A blank name is not offered.** A blank output setting reads as "the
+///   system's own" (tangent-ui's `audio_output_device`), so a chip with no
+///   name would open the first driver while it was lit as a choice.
+///
+/// Every name kept is spelled exactly as it came: the open matches it
+/// exactly first, and a tidied name would match loosely or not at all.
+#[cfg(any(test, all(windows, feature = "asio")))]
+fn asio_output_rows(registered: Vec<String>) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::with_capacity(registered.len());
+    for name in registered {
+        if !name.trim().is_empty() && !rows.contains(&name) {
+            rows.push(name);
+        }
+    }
+    rows
 }
 
 /// Every input the host can see, in enumeration order.
@@ -3739,6 +3790,58 @@ C   77      0      0    ---     ---   ---   ---     0                  alsa_play
             "the default host must pass the guard unenumerated, or build_host \
              could reject the very host it falls back to"
         );
+    }
+
+    /// **Under ASIO the OUTPUT row is every registered driver, once, in the
+    /// registry's order.** The row was built by loading drivers, and while a
+    /// stream held one every other load was refused and skipped: "the
+    /// system's own" plus the running driver, so an interface registered
+    /// beside ASIO4ALL could never be picked. The names come from the
+    /// registry now, which loads nothing. What they become as rows is pure,
+    /// so it is pinned here, where no ASIO exists: the registry's order (the
+    /// order "the system's own" is chosen in), a repeated entry once (the SDK
+    /// opens the first of a name), no blank chip (a blank output reads as the
+    /// system's own), and every kept name spelled as it came (the open
+    /// matches exactly first).
+    #[test]
+    fn the_asio_output_rows_are_every_registered_driver_once_in_registry_order() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let registered = names(&[
+            "ASIO4ALL v2",
+            "FL Studio ASIO",
+            "Komplete Audio 6 MK2",
+            "FL Studio ASIO",
+            "",
+            "   ",
+            "Focusrite USB ASIO ",
+        ]);
+        assert_eq!(
+            asio_output_rows(registered),
+            names(&["ASIO4ALL v2", "FL Studio ASIO", "Komplete Audio 6 MK2", "Focusrite USB ASIO "]),
+            "the rows are not the registry's drivers, once each, in its order and its spelling"
+        );
+        assert!(asio_output_rows(Vec::new()).is_empty(), "no driver registered, no row");
+    }
+
+    /// **The OUTPUT list under ASIO is the same whether or not a driver is
+    /// held.** The verifier's proof of the bug, for the only machine that can
+    /// run it: with a stream holding one driver, cpal's enumeration skipped
+    /// every other, so the list taken while a driver was held was that driver
+    /// alone. It fails on the old enumeration wherever two drivers load, and
+    /// passes on the registry's names, which load nothing.
+    #[test]
+    #[cfg(all(windows, feature = "asio"))]
+    #[ignore = "needs two registered ASIO drivers with hardware behind them"]
+    fn the_output_list_is_complete_while_a_driver_is_held() {
+        let was = system();
+        set_system(Some("ASIO"));
+        let all = output_device_names().expect("names");
+        assert!(all.len() >= 2, "the test needs two live ASIO outputs: {all:?}");
+        let held = with_host(|h| h.default_output_device()).expect("a driver");
+        let during = output_device_names().expect("names");
+        drop(held);
+        set_system(was.as_deref());
+        assert_eq!(during, all, "a held driver hid every other driver from the OUTPUT row");
     }
 
     fn stats() -> Arc<CaptureStats> {

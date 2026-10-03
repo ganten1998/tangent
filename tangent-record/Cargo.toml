@@ -333,6 +333,23 @@ linuxvideo = { path = "vendor/linuxvideo" }
 # fallback one.
 zune-jpeg = "0.5"
 
+# ── ASIO's driver names, Windows only ──────────────────────────────────────
+#
+# **The crate cpal's ASIO host is built on, named here for ONE call.** cpal
+# keeps its `asio_sys::Asio` private, and the only list of drivers it offers
+# is its device iterator, which LOADS each driver in turn: while a stream
+# holds one, every other load is refused and skipped, so the Setup panel's
+# OUTPUT row offered the running driver alone. `Asio::driver_names` reads the
+# registry and loads nothing; see `audio::output_device_names`.
+#
+# Not a second copy of anything. The root `[patch.crates-io]` sends every
+# `asio-sys` to `vendor/asio-sys`, so this and cpal's resolve to ONE package
+# with one process-wide driver guard between them, and the same version
+# requirement as cpal's keeps it that way. Optional and pulled in only by the
+# `asio` feature below, so a build without the SDK never compiles it.
+[target.'cfg(target_os = "windows")'.dependencies]
+asio-sys = { version = "0.2", optional = true }
+
 [lints]
 workspace = true
 
@@ -340,4 +357,6 @@ workspace = true
 # The Steinberg ASIO backend, Windows only in practice. Off by default:
 # building it needs the ASIO SDK on disk (CPAL_ASIO_DIR) and the SDK's
 # licence accepted — see docs/RELEASE.md.
-asio = ["cpal/asio"]
+# `asio-sys` is the OUTPUT row's driver list (see the Windows dependency
+# above).
+asio = ["cpal/asio", "dep:asio-sys"]
