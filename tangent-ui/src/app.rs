@@ -11848,30 +11848,16 @@ impl TangentApp {
             self.arrangement.automation =
                 crate::automation::Automation::from_curves(moved);
         }
-        // **And which rows are OPEN, armed or bypassed**, for the same
-        // reason: they are `(lane, param)` and the lane just changed.
-        let remap = |set: &HashSet<(usize, crate::automation::AutoParam)>,
-                     inv: &[usize; CHANNELS]| {
-            set.iter()
-                .map(|(l, p)| (if *l < CHANNELS { inv[*l] } else { *l }, *p))
-                .collect::<HashSet<_>>()
-        };
-        self.arr_auto_open = remap(&self.arr_auto_open, &inv);
-        self.arr_auto_armed = remap(&self.arr_auto_armed, &inv);
-        self.arr_auto_bypassed = remap(&self.arr_auto_bypassed, &inv);
+        // **And which rows are OPEN, armed or bypassed, and the paste's
+        // aims**, for the same reason: they are `(lane, param)` and the lane
+        // just changed. One function, because an undo or redo across this
+        // reorder has to carry them too - see `carry_automation_rows`.
+        self.carry_automation_rows(&inv);
         // The node selection names rows that have just moved. Cleared rather
         // than remapped: it is a hand's selection, and a reorder is the hand
         // doing something else.
         self.arr_auto_nodes.clear();
         self.arr_auto_sel = None;
-        // **The paste's aims are rows too** — `(lane, param)` — and a paste
-        // with nothing chosen lands on one: carried with the lane they name,
-        // or it would replace a span on whatever track moved into that row.
-        let carry = |aim: Option<(usize, crate::automation::AutoParam)>| {
-            aim.map(|(l, p)| (if l < CHANNELS { inv[l] } else { l }, p))
-        };
-        self.arr_auto_focus = carry(self.arr_auto_focus);
-        self.auto_clipboard_from = carry(self.auto_clipboard_from);
 
         // **The sidechain key edges, both ends.** They name channels the
         // same way the kits and the curves do, and an edge left behind is
@@ -11906,6 +11892,35 @@ impl TangentApp {
         });
         self.save_settings();
         self.arr_save_edits();
+    }
+
+    /// **The automation rows the session holds, carried to the lanes they
+    /// now name.** Which rows are open, armed or bypassed, and the paste's
+    /// two aims, are `(lane, param)` pairs kept beside the document rather
+    /// than in it, so nothing else moves them. A reorder calls this, and so
+    /// does an undo or redo that crosses one: the words put each curve back
+    /// on its old lane, and a bypass left where the reorder had taken it
+    /// let that curve play and silenced whichever curve took its row.
+    ///
+    /// **The paste's aims are rows too**, and a paste with nothing chosen
+    /// lands on one: carried with the lane they name, or it would replace a
+    /// span on whatever track moved into that row. `inv[old] = new`; a lane
+    /// past the channels holds still.
+    fn carry_automation_rows(&mut self, inv: &[usize]) {
+        use crate::automation::AutoParam;
+        use crate::recorder::CHANNELS;
+        let to = |l: usize| match inv.get(l) {
+            Some(&n) if l < CHANNELS && n < CHANNELS => n,
+            _ => l,
+        };
+        let remap = |set: &HashSet<(usize, AutoParam)>| {
+            set.iter().map(|&(l, p)| (to(l), p)).collect::<HashSet<_>>()
+        };
+        self.arr_auto_open = remap(&self.arr_auto_open);
+        self.arr_auto_armed = remap(&self.arr_auto_armed);
+        self.arr_auto_bypassed = remap(&self.arr_auto_bypassed);
+        self.arr_auto_focus = self.arr_auto_focus.map(|(l, p)| (to(l), p));
+        self.auto_clipboard_from = self.auto_clipboard_from.map(|(l, p)| (to(l), p));
     }
 
     /// **Open an empty lane directly below `n`**, the rows under it shifting
@@ -16385,6 +16400,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let carry = steps.into_iter().reduce(|first, then| compose_orders(&first, &then));
         if let Some(order) = carry {
             self.send_desk_perm(&order);
+            // And the automation rows the session keeps beside the words,
+            // which the words cannot put back - see `carry_automation_rows`.
+            self.carry_automation_rows(&invert_order(&order));
         }
         // The document moves, so an earlier "Don't Save" no longer covers it.
         self.outgoing_discarded = false;
@@ -67722,6 +67740,52 @@ mod folder_tests {
         assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
         // Which the engine agrees with.
         assert_eq!(a.folder_parents().len(), recorder::CHANNELS);
+    }
+
+    /// **Undoing a reorder takes a bypassed row back with its curve.** The
+    /// words put the curve back on its old lane, and nothing carried the
+    /// bypass, which the session keeps beside them: it stayed on the lane
+    /// the reorder had moved it to, so the bypassed curve played after the
+    /// undo and whichever curve came back into the moved row was silenced.
+    /// Redo carries it forward again.
+    #[test]
+    fn undoing_a_reorder_takes_a_bypassed_row_back_with_its_curve() {
+        use crate::automation::AutoParam;
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_auto_bypassed.insert((3, AutoParam::Gain));
+        // Move 3 up to 1: order[new] = old.
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+        assert!(
+            a.engine_automation().get(1, AutoParam::Gain).is_none(),
+            "the reorder lost the bypass"
+        );
+
+        a.undo();
+        assert!(
+            a.arrangement.automation.get(3, AutoParam::Gain).is_some(),
+            "the undo did not bring the curve back"
+        );
+        assert!(
+            a.engine_automation().get(3, AutoParam::Gain).is_none(),
+            "the bypassed curve plays after the undo"
+        );
+        assert!(
+            a.arr_auto_is_open(3, AutoParam::Gain),
+            "the open row stayed on the lane the track left"
+        );
+
+        a.redo();
+        assert!(
+            a.engine_automation().get(1, AutoParam::Gain).is_none(),
+            "the bypassed curve plays after the redo"
+        );
     }
 
     /// **A removed track takes its automation with it.** The curves are
