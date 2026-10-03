@@ -1261,14 +1261,17 @@ pub struct TangentApp {
     drag_pointer: Option<Pos2>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
-    /// The arrangement's grid and window, and the editor's feel, as they
-    /// stood at the last moment, so a frame that did not move them costs one
-    /// compare. See `commit_view_change`.
-    view_committed: Option<(crate::arrangement::View, Option<crate::arrangement::Feel>)>,
+    /// The arrangement's grid and window, the editor's feel and the view on
+    /// show, as they stood at the last moment, so a frame that did not move
+    /// them costs one compare. See `commit_view_change`.
+    view_committed: Option<(crate::arrangement::View, Option<crate::arrangement::Feel>, u8)>,
     /// **How many batches are holding their moment back.** See
     /// [`TangentApp::begin_one_moment`]: a gesture that reaches several
     /// committing writers is still one thing somebody did.
     undo_hold: u32,
+    /// **A held transpose key's steps owe one moment**, taken when the key
+    /// comes up rather than per step: the key repeats. See `transpose_by`.
+    transpose_owed: bool,
     /// The MIDI item being drawn by cmd-drag: lane, from, to (ordered).
     arr_pending: Option<(usize, f64, f64)>,
     /// Where the arrangement was last drawn, for hit tests.
@@ -4285,6 +4288,7 @@ impl TangentApp {
             arr_gesture_dirty: false,
             view_committed: None,
             undo_hold: 0,
+            transpose_owed: false,
             arr_pending: None,
             arrangement_rect: None,
             clip_infos: HashMap::new(),
@@ -7571,12 +7575,23 @@ impl TangentApp {
             .then_some(self.settings.transpose as i32)
     }
 
+    /// **The chord strip's arrows: a step, and its moment.** A press commits
+    /// where it is pressed. The arrow KEYS take theirs when the key comes up
+    /// instead (`transpose_owed`), because a held key repeats.
+    fn transpose_step(&mut self, step: i64) {
+        self.transpose_by(step);
+        self.undo_commit();
+    }
+
     /// Move the transpose by `step` semitones, if every note can come along.
     ///
     /// **All or nothing.** A chord whose top note would leave MIDI's range is
     /// not transposed at all, rather than transposed with that note dropped —
     /// dropping one note of a voicing silently changes the chord, and the whole
     /// point of this control is to ask what the chord becomes.
+    ///
+    /// **Commits nothing**, though the transpose is hashed: its two roads
+    /// take their moments differently - see `transpose_step`.
     fn transpose_by(&mut self, step: i64) {
         let want = (self.settings.transpose + step)
             .clamp(-crate::settings::TRANSPOSE_MAX, crate::settings::TRANSPOSE_MAX);
@@ -8600,11 +8615,11 @@ impl TangentApp {
                     if let Some(cr) = chord_rect {
                         let (up, down) = chord_strip::transpose_rects(cr);
                         if up.contains(pos) {
-                            self.transpose_by(1);
+                            self.transpose_step(1);
                             return;
                         }
                         if down.contains(pos) {
-                            self.transpose_by(-1);
+                            self.transpose_step(-1);
                             return;
                         }
                     }
@@ -8635,6 +8650,8 @@ impl TangentApp {
                         self.settings.capo_style =
                             self.settings.capo_style().next().key().to_owned();
                         self.save_settings();
+                        // A press, and the capo's style is hashed.
+                        self.undo_commit();
                         return;
                     }
                 }
@@ -33914,8 +33931,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             }
-            K::TransposeUp => self.transpose_by(1),
-            K::TransposeDown => self.transpose_by(-1),
+            // The key repeats, so its steps owe ONE moment, paid when it
+            // comes up (beside `audition_tick` in `paint`).
+            K::TransposeUp => {
+                self.transpose_by(1);
+                self.transpose_owed = true;
+            }
+            K::TransposeDown => {
+                self.transpose_by(-1);
+                self.transpose_owed = true;
+            }
             // **Per-view, the owner's rule**: the editor's flag when the
             // editor is up, the arrange field's on that view, the theory
             // surfaces' everywhere else — three stored values, one key.
@@ -34193,6 +34218,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .set_note_preference(self.settings.prefer_flats);
                 self.save_settings();
                 self.detection_tick(true); // refresh display immediately
+                // A row, so a moment: flats are hashed (`Notation`), and so
+                // are the staff's key, the tuning and the capo below.
+                self.undo_commit();
             }
             MenuAction::ToggleChordDetection => {
                 self.settings.chord_detection_enabled = !self.settings.chord_detection_enabled;
@@ -34309,6 +34337,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.show_the_staff();
                 self.save_settings();
                 self.request_natural_size();
+                self.undo_commit();
             }
             MenuAction::ToggleNoteNames => {
                 self.settings.staff_note_names = !self.settings.staff_note_names;
@@ -34358,11 +34387,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.fretboard_tuning = name.to_owned();
                 self.save_settings();
                 self.rebuild_voicing();
+                self.undo_commit();
             }
             MenuAction::SetCapo(fret) => {
                 self.settings.fretboard_capo = fret as i64;
                 self.save_settings();
                 self.rebuild_voicing();
+                self.undo_commit();
             }
             MenuAction::SetWood(key) => {
                 self.settings.fretboard_wood = key.to_owned();
@@ -35826,6 +35857,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // folder agree from this moment on.
                         self.settings.theme_name = name;
                         self.save_settings();
+                        // And it is a moment, as picking a theme is: the
+                        // name worn is hashed (`Look::theme`).
+                        self.undo_commit();
                         log::info!("theme saved to {}", path.display());
                         self.dialog = None;
                     }
@@ -36262,6 +36296,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Settings::CUSTOM_TUNING.to_owned();
                 self.dialog = None;
                 self.save_settings();
+                // The dialog's OK, so a moment: the tuning is hashed.
+                self.undo_commit();
                 self.rebuild_voicing();
                 // A different string count changes the fretboard band's height,
                 // so the window has to be re-measured. `SetTuning` never needed
@@ -37309,9 +37345,18 @@ impl TangentApp {
     /// folded into the next note drawn. The grid's drag is one moment at
     /// its release because the editor's drag is in the guard below.
     ///
-    /// **Nothing else.** `Notation` and `Look` are hashed too and nothing
-    /// watches them here: a gesture that writes one of those owes its own
-    /// commit.
+    /// **And the view on show** (`Look::view`, through `open_view`), for the
+    /// reason `frame` keeps that field once a frame: the flags it is read
+    /// from move in seven places. It is synced again here, because the
+    /// frame's own sync runs at its top, before the keys and clicks that
+    /// move the flags, and a switch then reached the document a frame late.
+    /// So Tab is a step back of its own, as the timeline's width and lane
+    /// count are; before, Tab and then a clip moved were one Ctrl+Z for
+    /// both, and the view flipped back with the clip.
+    ///
+    /// **Nothing else.** `Notation` and the rest of `Look` are hashed too
+    /// and nothing watches them here: a gesture that writes one of those
+    /// owes its own commit.
     ///
     /// **The guard sees every drag that writes the document as it goes**,
     /// not only the arrangement's (`arr_drag`, `arr_gesture_dirty`): a band
@@ -37328,6 +37373,14 @@ impl TangentApp {
     /// committed here at the end of its frame, and the host's warp commits
     /// a second moment when it lands, frames later. One press, two moments.
     fn commit_view_change(&mut self) {
+        self.settings.open_view = if self.arrangement_open {
+            2
+        } else if self.mixer_open {
+            1
+        } else {
+            0
+        };
+        let shown = self.settings.open_view;
         let desk = Self::desk_view(&self.settings);
         let (now, feel) = (desk.view, desk.feel);
         let carrying = self.arr_drag.is_some()
@@ -37344,7 +37397,7 @@ impl TangentApp {
             // find nothing changed and commit nothing.
             return;
         }
-        let now = now.map(|v| (v.to_view(), feel));
+        let now = now.map(|v| (v.to_view(), feel, shown));
         if self.view_committed == now {
             return;
         }
@@ -38191,6 +38244,15 @@ impl TangentApp {
         // accepted — a dialog opening mid-chord must stop the chord, not
         // abandon it.
         self.audition_tick(&ctx);
+        // **A held transpose key is one moment, paid when it comes up**, on
+        // the same every-frame terms: the key repeats, and a moment per
+        // repeat would be thirty a second into a hundred-moment history.
+        if self.transpose_owed
+            && ctx.input(|i| !i.key_down(egui::Key::ArrowUp) && !i.key_down(egui::Key::ArrowDown))
+        {
+            self.transpose_owed = false;
+            self.undo_commit();
+        }
         // And everything a gesture wants sounding, for the same reason: every
         // path that can change that set has run by now, and this is the one
         // place that has to notice.
@@ -42861,6 +42923,102 @@ mod tests {
             "one step back also undid the cartridge chosen three gestures ago"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The notation, the view on show and a saved theme's name are each
+    /// their own step back.**
+    ///
+    /// The capo, the staff's key, flats and the tuning (`Notation`), and the
+    /// theme worn and the view the session shows (`Look`), are all desk
+    /// fields and all hashed, and these roads committed nothing: the menu
+    /// rows, a custom tuning, a theme saved under a new name, and Tab, whose
+    /// view the frame writes into `open_view`. So each folded into the next
+    /// gesture's step back - Tab to the timeline, move a clip, Ctrl+Z, and
+    /// the clip came back and the view flipped with it. (Picking a theme,
+    /// cycling one and the palette already committed.)
+    #[test]
+    fn the_notation_the_open_view_and_a_saved_themes_name_are_their_own_moments() {
+        let root = project_scratch("notationmoments");
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+        for (what, action) in [
+            ("the capo", MenuAction::SetCapo(2)),
+            ("the staff's key", MenuAction::SetStaffKey(3)),
+            ("flats", MenuAction::ToggleNotePreference),
+            ("a tuning", MenuAction::SetTuning("Drop D".to_owned())),
+        ] {
+            let before = app.hist_at;
+            app.apply_menu_action(&ctx, action);
+            app.commit_view_change();
+            assert_eq!(app.hist_at, before + 1, "{what} left no moment of its own");
+        }
+        for (what, action) in [
+            (
+                "a custom tuning",
+                DialogAction::SetCustomTuning(tangent_core::fretboard::Tuning::standard()),
+            ),
+            ("a theme saved under a name", DialogAction::SaveThemeNamed("Undo Moments".to_owned())),
+        ] {
+            let before = app.hist_at;
+            app.apply_dialog_action(action);
+            app.commit_view_change();
+            assert_eq!(app.hist_at, before + 1, "{what} left no moment of its own");
+        }
+        // Tab, and the end of its frame.
+        let was = (app.mixer_open, app.arrangement_open);
+        let before = app.hist_at;
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
+        app.commit_view_change();
+        assert_ne!((app.mixer_open, app.arrangement_open), was, "Tab did not change the view");
+        assert_eq!(app.hist_at, before + 1, "Tab left {} moments", app.hist_at - before);
+        // One step back puts the view back, and leaves the theme's name.
+        app.undo();
+        assert_eq!((app.mixer_open, app.arrangement_open), was, "one Ctrl+Z did not undo Tab");
+        assert_eq!(app.settings.theme_name, "Undo Moments", "one Ctrl+Z also undid the theme's name");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A transpose is one step back: one press of an arrow, or one hold
+    /// of the key however long it repeats.**
+    ///
+    /// The transpose is a desk field and hashed, and `transpose_by`
+    /// committed nothing on either road, so it rode the next gesture's
+    /// step back. And the key REPEATS - `key_pressed` counts every repeat -
+    /// so a commit per step would put a moment per repeat into a
+    /// hundred-moment history, thirty a second. The key's steps are one
+    /// moment, taken when the key comes up.
+    #[test]
+    fn a_transpose_is_one_moment_per_press_or_hold() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        // The chord strip's arrows: a press, so a moment.
+        let before = app.hist_at;
+        app.transpose_step(1);
+        assert_eq!(app.settings.transpose, 1, "the arrow did not transpose");
+        assert_eq!(app.hist_at, before + 1, "the arrow left {} moments", app.hist_at - before);
+        // Up held: a press and two repeats, then the key comes up.
+        let key = |pressed: bool, repeat: bool| egui::Event::Key {
+            key: egui::Key::ArrowUp,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let before = app.hist_at;
+        for repeat in [false, true, true] {
+            pointer_frame(&ctx, &mut app, vec![key(true, repeat)]);
+        }
+        assert_eq!(app.settings.transpose, 4, "the held key did not walk three steps");
+        assert_eq!(app.hist_at, before, "the held key pushed {} moments", app.hist_at - before);
+        pointer_frame(&ctx, &mut app, vec![key(false, false)]);
+        assert_eq!(app.hist_at, before + 1, "the hold left {} moments", app.hist_at - before);
+        // One step back takes the whole hold off, and leaves the arrow's.
+        app.undo();
+        assert_eq!(app.settings.transpose, 1, "one Ctrl+Z did not take the whole hold back");
     }
 
     /// **Pasting a track is one step back, whatever is on it.**
