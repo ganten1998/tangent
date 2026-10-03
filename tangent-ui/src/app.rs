@@ -31796,7 +31796,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // - the band's dial, TAP, the TEMPO word, a typed commit, the
         // metronome panel's row, the double-click reset. Before a tap is
         // recorded, so a refused tap leaves nothing in `tap_times`. See
-        // `RecorderState::tempo_held`: a take's count-in, or an export.
+        // `RecorderState::tempo_held`: a take's count-in, or an export. The
+        // Export dialog's tempo arrives by its own road and is held there
+        // (`hold_dialog_tempo`).
         if self.recorder.tempo_held()
             && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
         {
@@ -32875,6 +32877,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             spec.composite.display = true;
         }
         spec
+    }
+
+    /// **A held tempo stays where it is through the Export dialog too.**
+    /// `apply_recorder_hit` refuses every tempo control while the tempo is
+    /// held - see `RecorderState::tempo_held` - and the dialog's OK never went
+    /// through it: during the arrangement's count-in it moved the engine's
+    /// count while the knob, TAP and the metronome panel were refused. The
+    /// rest of the dialog still lands; only the tempo is kept, and the OK
+    /// says so.
+    fn hold_dialog_tempo(&mut self, spec: &mut recorder::ExportSpec) {
+        if self.recorder.tempo_held() && spec.tempo_bpm != self.tempo_bpm() {
+            spec.tempo_bpm = self.tempo_bpm();
+            self.notify(
+                crate::notify::Kind::Info,
+                "The tempo holds through a count-in and an export - the rest of the export settings were kept.",
+            );
+        }
     }
 
     /// **Where the window is right now**, for the window capture: its content
@@ -36101,8 +36120,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             // This session only. Deliberately NOT written to settings: the
             // tick is what makes a choice outlive the session.
-            DialogAction::SetExport(spec) => self.export_override = Some(spec),
-            DialogAction::SetExportAndRemember(spec) => {
+            DialogAction::SetExport(mut spec) => {
+                self.hold_dialog_tempo(&mut spec);
+                self.export_override = Some(spec);
+            }
+            DialogAction::SetExportAndRemember(mut spec) => {
+                self.hold_dialog_tempo(&mut spec);
                 // The override is cleared as well as the setting written, or
                 // the session copy would keep shadowing the thing the user just
                 // asked to be permanent.
@@ -61078,6 +61101,41 @@ mod tests {
             forever,
             "the session copy must not go on shadowing it"
         );
+    }
+
+    /// **The Export dialog cannot move a held tempo.** `apply_recorder_hit`
+    /// refuses the knob, TAP, the typed TEMPO and the metronome panel while
+    /// the tempo is held, and the dialog's OK never went through it: during
+    /// the arrangement's count-in it moved the engine's count while every
+    /// other tempo control was refused. The rest of the dialog still lands;
+    /// only the tempo stays, and the OK says so.
+    #[test]
+    fn the_export_dialog_cannot_move_a_held_tempo() {
+        for remember in [false, true] {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.settings.record_export.tempo_bpm = 120.0;
+            app.recorder.take_counting = true;
+            assert!(app.recorder.tempo_held(), "the fixture holds no tempo");
+            app.messages.clear();
+            let mut spec = app.export_spec();
+            spec.tempo_bpm = 90.0;
+            spec.midi = !spec.midi;
+            let midi = spec.midi;
+            app.apply_dialog_action(if remember {
+                DialogAction::SetExportAndRemember(spec)
+            } else {
+                DialogAction::SetExport(spec)
+            });
+            assert_eq!(app.tempo_bpm(), 120.0, "the Export dialog moved a held tempo (remember: {remember})");
+            assert_eq!(app.export_spec().midi, midi, "the rest of the dialog went with the tempo");
+            assert!(!app.said().notes().is_empty(), "the held tempo was kept without a word");
+            // Nothing holding it, the dialog's tempo lands as before.
+            app.recorder.take_counting = false;
+            let mut spec = app.export_spec();
+            spec.tempo_bpm = 90.0;
+            app.apply_dialog_action(DialogAction::SetExport(spec));
+            assert_eq!(app.tempo_bpm(), 90.0, "the dialog's tempo is refused with nothing holding it");
+        }
     }
 
     /// Transposing moves the notes and the chord name with them.
