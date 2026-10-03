@@ -519,6 +519,10 @@ struct Recorder {
     /// When the ARRANGEMENT's count-in started, and how many beats it runs -
     /// so a take started during it can count in from the same instant and
     /// begin on the same downbeat, rather than at the press.
+    ///
+    /// **Only when the red button STARTED the count.** When it joined a
+    /// take's count this stays `None`, so a take pressed later in that count
+    /// cannot find its start - see `R::Toggle`'s join arm.
     arr_count_from: Option<(std::time::Instant, u32)>,
     /// **Play was pressed while a count-in was running**: the song starts on
     /// the downbeat instead of under the count. Pressing TAKE and then Play
@@ -625,8 +629,10 @@ struct Bounce {
 const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One press of the red button: what has been collected since, and where it
-/// lands. `finish_arr_record` is the only way out, and it always hands the
-/// document its clips.
+/// lands. `finish_arr_record` is the only way out that keeps it, and it hands
+/// the clips to whatever document is open WHEN it runs: closing the window
+/// drops a running record unwritten, and a New or an Open made mid-record
+/// lands it in the next session.
 #[cfg(feature = "recorder")]
 struct ArrRec {
     /// The playhead second the record began at.
@@ -874,10 +880,14 @@ pub struct DesktopApp {
     #[cfg(feature = "recorder")]
     insert_outstanding: usize,
     /// **The racks are being REBUILT, not added to**: an engine was born
-    /// with every seat empty, or a session switch marked the whole desk for
-    /// reload. Only then may the room hold an armed input shut - see
-    /// `armed_racks_pending`. Cleared the frame the reconcile finds nothing
-    /// outstanding.
+    /// with every seat empty, or `force_insert_reload` marked every occupied
+    /// bay for reload (launch, Open, New, a template). Only then may the room
+    /// hold an armed input shut - see `armed_racks_pending`. Raised only by
+    /// `start_engine` (after its ledger wipe) and `force_insert_reload`.
+    /// Cleared the frame the reconcile finds nothing outstanding ANYWHERE -
+    /// every seat, not only the armed chains - or finds no engine. A failed
+    /// load counts as landed (the reconcile writes the wanted path into the
+    /// ledger before `load_insert`), so a missing plugin cannot hold it.
     #[cfg(feature = "recorder")]
     racks_restoring: bool,
     /// The MIDI port to open once the window is up: `Some(Some(name))` from
@@ -972,7 +982,8 @@ pub struct DesktopApp {
     frame_log: FrameLog,
     /// Bumped every time `start_engine` seats a new engine, so every cache
     /// that stands for "what THIS engine was told" can notice it is talking
-    /// to a different one. See `push_desk_if_changed`.
+    /// to a different one. See the `desk_unchanged` gate in
+    /// `push_monitor_settings`, and `comp_rows_epoch`.
     #[cfg(feature = "recorder")]
     engine_epoch: u64,
     #[cfg(feature = "recorder")]
@@ -995,10 +1006,20 @@ pub struct DesktopApp {
     /// tenant's only copy - and the bay itself is undoable, so Ctrl+Z asks
     /// for a plugin whose settings are no longer anywhere.
     ///
-    /// **In memory and cleared with the session**, never on disk: the
-    /// sidecar naming round-trips strictly, so a second file would be
-    /// invisible to the shelf sweep and would leak another project's knobs
-    /// into this one's bays.
+    /// **In memory**, never on disk: the sidecar naming round-trips
+    /// strictly, so a second file would be invisible to the shelf sweep and
+    /// would leak another project's knobs into this one's bays.
+    ///
+    /// **What is shelved is the FILE as it last stood, not what the plugin
+    /// was playing.** A sidecar is written by a save, a plugin's own window
+    /// closing, a session switch, New's stash and quit (and by a copy, move,
+    /// paste or swap for the tenant it brings in) - never by a knob, and a
+    /// built-in unit has no window to close. So an undo brings the displaced
+    /// plugin back at its last-written settings, or at factory if it never
+    /// had a file. Only the paste and the swap shelve: a copy or a move into
+    /// a bay that still holds a removed tenant's file, and the Paste Track
+    /// state copy, write over it unshelved. Cleared by `switch_project`
+    /// only - New and Reset Template keep it.
     #[cfg(feature = "recorder")]
     displaced_states: std::collections::HashMap<(usize, usize, String), Vec<u8>>,
     /// The ReaStream config the sender was last handed. See
@@ -1076,7 +1097,6 @@ pub struct DesktopApp {
     /// `picker_needs_windowed`.
     #[cfg(feature = "recorder")]
     refullscreen: bool,
-    /// A picker deferred by one frame for that reason.
     #[cfg(feature = "recorder")]
     /// A request held back for one frame so the dialogs above it can stand
     /// down first. See `TangentApp::native_panel_up`.
@@ -1132,8 +1152,8 @@ pub struct DesktopApp {
     /// wherever the set is.
     #[cfg(feature = "recorder")]
     refused_why: std::collections::HashMap<std::path::PathBuf, String>,
-    /// Clips that have been time-stretched, by `(file, ratio in millionths,
-    /// mode)`.
+    /// Warp and stretch renders, by [`StretchKey`] - see there for the two
+    /// shapes.
     ///
     /// **Rendered once and played statelessly**, which is the whole design —
     /// see `crate::stretch`. The key rounds the ratio to a millionth so a
@@ -2673,14 +2693,6 @@ const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis
 #[cfg(feature = "recorder")]
 const ENGINE_TRIES: u8 = 5;
 
-/// **How often the open device is asked what rate it is ACTUALLY running at**,
-/// and how many polls in a row have to say "moved" before the path reopens.
-///
-/// A second between asks and three of them, so an interface has three seconds
-/// of "Syncing" to settle in before Tangent believes it. The Scarlett spends
-/// about two of those re-locking its clock, and during them it will report a
-/// rate that is neither the old one nor the new one — reopening on the first
-/// disagreement would catch it mid-stride and reopen again a moment later.
 #[cfg(feature = "recorder")]
 /// **How long the engine may go without notes somebody has drawn.**
 ///
@@ -2708,6 +2720,14 @@ const ENGINE_TRIES: u8 = 5;
 /// clips continuously still answers four times a second rather than sixty.
 const CLIPS_OWED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// **How often the open device is asked what rate it is ACTUALLY running at**,
+/// and how many polls in a row have to say "moved" before the path reopens.
+///
+/// A second between asks and three of them, so an interface has three seconds
+/// of "Syncing" to settle in before Tangent believes it. The Scarlett spends
+/// about two of those re-locking its clock, and during them it will report a
+/// rate that is neither the old one nor the new one — reopening on the first
+/// disagreement would catch it mid-stride and reopen again a moment later.
 const RATE_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// **Take the old AUHAL road back**, for an A/B on a machine that crackles.
@@ -3331,11 +3351,12 @@ fn stretched_clip_audio(
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
 ///
-/// Shares the stretch cache and keys into it by the map's own extent and
-/// length, which is enough: two different maps over one file that agreed on
-/// their first anchor, their last, and how many they had would have to be
-/// the same map to matter, and the render is rebuilt whenever the document
-/// changes the list anyway.
+/// Shares the stretch cache and keys into it as [`warp_plan`] does: the
+/// anchor count and [`warp_sig`], which name the map's ends and its fit and
+/// not its middle anchors or the stretch mode. The cache is the caller's -
+/// fresh per export, seeded from the live one by glue - and wherever it
+/// outlives a re-quantize that keeps the ends and the count, the old render
+/// is what comes back.
 #[cfg(feature = "recorder")]
 fn warped_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3373,15 +3394,9 @@ fn warped_clip_audio(
     made
 }
 
-/// The stretch cache's key for a clip and the mode it names; `None` for a
-/// clip that is not stretched. **The one spelling.** The cache is filled
-/// by two roads and swept by a third, and three copies of "ratio in
-/// millionths, mode's key" is how a sweep quietly stops matching what was
-/// inserted — the doc on the live path used to warn the sweep to keep up
-/// with it by hand.
 #[cfg(feature = "recorder")]
-/// **The warp map one quantize would write**, and how many attacks were
-/// found on the way to it.
+/// **The warp map one quantize would write**, and only the map: a caller
+/// that reports how many attacks it found counts its own `found`.
 ///
 /// Its own function because TWO callers need it and they must not disagree:
 /// the Apply, which writes it onto the clip, and the PREVIEW, which turns
@@ -3392,6 +3407,15 @@ fn warped_clip_audio(
 /// Anchors are in SOURCE frames, trim included - `warp` reads the whole
 /// file - and ascending in both fields, which `warp` demands and the
 /// document's reader enforces again on the way back in.
+///
+/// **Units.** `found` and each pair's `from` are frames of the decode the
+/// analysis was made from, at `rate`; each `to` is a frame of the warped
+/// render, at the same rate. `start_s` is where the clip stands and
+/// `offset_s` its trim, read here as SOURCE seconds - which a stretched
+/// clip's trim is not (it is in the stretched file's seconds). Two attacks
+/// that land on one line keep only the first, and the second is carried
+/// inside the segment; an attack whose target falls before frame zero is
+/// left out.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
@@ -3425,12 +3449,12 @@ fn quantize_map(
 ///
 /// `stretch_key`'s twin, and it keys into the SAME cache: a warp render and
 /// a stretch render are both "this file, treated this way", and the third
-/// field is where the treatments are told apart. The map's own extent and
-/// length are enough to name it - two different maps over one file that
-/// agreed on their first anchor, their last, and how many they had would
-/// have to be the same map to matter - and the fit is in there because
-/// switching a clip from stretch to slice must not hand back the render
-/// made the other way.
+/// field is where the treatments are told apart. Named by the anchor count
+/// and [`warp_sig`] - the first and last pairs and the fit, which is in
+/// there because switching a clip from stretch to slice must not hand back
+/// the render made the other way. That is not every input of the render: a
+/// re-quantize that keeps the ends and the count is served the old render,
+/// and a stretch-mode change the old mode's - see [`warp_sig`].
 #[cfg(feature = "recorder")]
 fn warp_plan(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3458,6 +3482,12 @@ fn warp_plan(
     ))
 }
 
+/// The stretch cache's key for a clip and the mode it names; `None` for a
+/// clip that is not stretched. **The one spelling.** The cache is filled
+/// by two roads and swept by a third, and three copies of "ratio in
+/// millionths, mode's key" is how a sweep quietly stops matching what was
+/// inserted — the doc on the live path used to warn the sweep to keep up
+/// with it by hand.
 fn stretch_key(
     clip: &tangent_ui::arrangement::ArrClip,
     path: &std::path::Path,
@@ -3486,12 +3516,20 @@ fn stretch_key(
 }
 
 /// **A warp map's identity, as the caches key it**, or `None` for a clip
-/// that is not warped. The map's extent and length plus the FIT, which is
-/// enough: two maps over one file agreeing on their first anchor, their last
-/// and how many they had would have to be the same map to matter, and the
-/// fit is in because switching a clip from stretch to slice must not hand
-/// back the render made the other way. One spelling, for the warp's own
-/// entry and for the stretch made from it.
+/// that is not warped: the FIT and the map's first and last pairs, nothing
+/// more. The fit is in because switching a clip from stretch to slice must
+/// not hand back the render made the other way. One spelling, for the
+/// warp's own entry (which adds the anchor count) and for the stretch made
+/// from it (which does not).
+///
+/// **Not the whole render.** `warp::warp` reads every anchor and the clip's
+/// stretch mode, and this names neither the middle anchors nor the mode. A
+/// re-quantize that leaves the outermost hits where they were - another
+/// swing, window or grid - keeps the same warp key when it keeps the count,
+/// and the same stretch-of-warp key even when it does not; nothing evicts
+/// an entry a clip still names, so playback and glue are then served the
+/// previous render. A stretch-mode change likewise keeps the old mode's
+/// warp.
 fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
     if clip.warp.len() < 2 {
         return None;
@@ -3507,6 +3545,15 @@ fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
 // features, the fallback for a platform that cannot carry the rest — stopped
 // compiling with five hundred errors. `scripts/check-firewall.sh` is what
 // says so, and nothing else in the repo ever builds this configuration.
+//
+// **And it is not only the impl.** A free item inserted between a doc block
+// and the item it documents takes the doc AND the `#[cfg]` with it, and the
+// item below loses its gate without a word - for anything that names a
+// recorder-only type, that is the Minimal build failing to compile. It has
+// happened in this file to `insert_state_path`, `arm_stem_tap`,
+// `shift_insert_states_for_v19`, `RATE_ASK_EVERY`, `insert_walk` and
+// `stretch_key`. Insert new items ABOVE a doc block, never between a doc and
+// its item.
 #[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
@@ -5137,14 +5184,14 @@ impl DesktopApp {
         if self.app.take_plugin_rescan() {
             self.announce(ctx, "Scanning plugins", None, Chore::RescanPlugins);
         }
-        // **The user's effect, across the effects bus.**
-        //
-        // Reconciled here with the plugin rack and for the same reasons:
-        // `Module::open` runs somebody else's initialiser and `Instance::create`
-        // can take seconds, so it happens after a frame and never inside one.
-        // Once per change, because `bus_effect_loaded` remembers what was asked
-        // for whether or not it worked — a plugin that will not load must not
-        // be retried sixty times a second.
+        // **The user's effect, across the effects bus**, was reconciled here
+        // once, beside the plugin rack, with its own memory of what had been
+        // asked for (`bus_effect_loaded`, gone since the bus became an
+        // ordinary insert seat). Its plugin now loads through the insert
+        // reconcile below, for the same reasons: `Module::open` runs somebody
+        // else's initialiser and `Instance::create` can take seconds, so it
+        // happens after a frame and never inside one, and a plugin that will
+        // not load must not be retried sixty times a second.
         // **ONE per call, like the instrument rack**, and for the same reason:
         // loading blocks for seconds, and thirty-nine slots reconciled in one
         // frame would be a window that stopped for a minute. Each is
@@ -5723,8 +5770,9 @@ impl DesktopApp {
         while let Some(request) = self.app.take_recorder_request() {
             match request {
                 // The transport's own two. Handled here rather than queued
-                // deeper: `Transport` is plain state, and the reconcile in
-                // `push_transport` is what carries it to the engine.
+                // deeper: `Transport` is plain state, and its once-a-frame
+                // reconcile, `Transport::push`, is what carries it to the
+                // engine.
                 R::Play => {
                     // PLAY only — pausing is the pause button's job now.
                     // The arrangement's record owns the transport while it
@@ -8809,18 +8857,6 @@ impl DesktopApp {
         (out, String::new())
     }
 
-    /// The document's clips, decoded and handed to the engine.
-    ///
-    /// **Decoded once per file, here, and held as one `Arc` each.** The
-    /// renderer must never allocate, and the decoded audio is the largest
-    /// thing this app ever holds — so it is built on this thread, cached by
-    /// path so an edit does not re-decode a hundred megabytes, and pushed
-    /// behind pointers. The cache is cleared when the engine restarts: a new
-    /// device may run at a new rate, and the cache is keyed to exactly one.
-    ///
-    /// The band's picture is synthesized here too: the first clip's wave and
-    /// name, the SPAN as the length — with one clip, exactly the backing
-    /// track's old face; the lanes come with the arrangement view's phase.
     #[cfg(feature = "recorder")]
     /// The red button going DOWN: snapshot what is armed, open the capture
     /// tee, roll the transport. Refusals go to the band's status line — a
@@ -10349,7 +10385,8 @@ impl DesktopApp {
             .set_plugin_list(crate::plugin_catalog_from(report.found));
     }
 
-    /// The template shelf: `<record_root>/Projects/Templates`.
+    /// The template shelf: `<project_root>/Templates`, the folder the app
+    /// names `tangent_ui::app::TEMPLATE_SHELF`.
     fn templates_dir(&self) -> std::path::PathBuf {
         self.app.project_root().join("Templates")
     }
@@ -10388,9 +10425,9 @@ impl DesktopApp {
             Q::Template(name) => ("Saving template", Some(name.clone())),
             Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
             Q::ResetTemplate => ("Resetting the template", None),
-            // **No overlay for this one.** It is a detection pass over one
-            // clip that is already decoded and in memory - measured in
-            // milliseconds - and an overlay that flashes is worse than none.
+            // Announced like the rest: a detection pass per selected clip (a
+            // whole-file analysis for a file not cached yet, ~12 ms per three
+            // minutes) and a map each, behind the busy cover.
             Q::QuantizeClips(_) => ("Quantizing", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
@@ -10606,10 +10643,11 @@ impl DesktopApp {
                 self.app.commit_undo_moment();
                 // **And the ticks are stale now.** The window stays open
                 // after Apply on purpose, and nothing in the ask moved -
-                // same clips, same knobs - so the comparison in
-                // `push_quantize_marks` would never rebuild them. What DID
-                // move is the audio under them: the clips have a warp map
-                // the marks have to be projected through.
+                // same clips, same knobs. What DID move is the audio under
+                // them: the clips have a warp map the marks have to be
+                // projected through. `quantize_clip_sig` hashes that map, so
+                // `push_quantize_marks` would rebuild them on its own;
+                // dropping the latch here makes it certain.
                 self.quantize_marked = None;
                 // **One message for the gesture, not one per clip.** Eight
                 // takes quantized at once is one thing somebody did.
@@ -10954,9 +10992,16 @@ impl DesktopApp {
         mirror_sidecars(dir, &global_state_dir());
     }
 
-    /// **Clear the Untitled litter** - every stray scratch that provably
-    /// holds no work: no takes in media/, a stock kit, and a document that
-    /// is unnamed and clipless (or missing). Anything with a doubt stays.
+    /// **Clear the Untitled litter.** Every folder directly under the
+    /// project root named `Untitled` or `Untitled …` is removed WHOLE when
+    /// all three hold: `count_media` counts nothing in its `media/` (a
+    /// recording, an import or a glued file counts; dotfiles, `frozen-*`
+    /// renders and byte-copies of the template's own media do not), its kit
+    /// is not custom against the template's, and its document is missing,
+    /// empty, or unnamed and clipless (`TangentApp::scratch_is_disposable`).
+    /// Nothing else in the folder is looked at - a subfolder, a nested
+    /// project or anybody's own files go with it - so a scratch must never
+    /// hold anything Tangent did not write there.
     fn sweep_disposable_untitleds(root: &std::path::Path, template: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(root) else {
             return;
@@ -11349,10 +11394,12 @@ impl DesktopApp {
                     clips = true;
                 }
                 (Warm::Stretch(key), Err(why)) => {
-                    // The renderer failed on this file. It plays UNSTRETCHED
-                    // from here — cached under the key so it is not asked
-                    // again every tick — and the failure is said out loud
-                    // rather than heard as a clip that went quiet.
+                    // The renderer failed on this file. It plays without the
+                    // render from here - UNSTRETCHED, or for a warp job
+                    // UNWARPED, though the message still says "unstretched" -
+                    // cached under the key so it is not asked again every
+                    // tick, and the failure is said out loud rather than
+                    // heard as a clip that went quiet.
                     let name = key.0.file_name().map(|n| n.to_string_lossy().into_owned());
                     notes.push(format!(
                         "could not stretch {}: {why} - it plays unstretched",
@@ -11716,9 +11763,10 @@ impl DesktopApp {
                 }
             };
             // **A pending warp holds the stretch back.** The stretch key
-            // names the file, the ratio and the mode and says nothing about
-            // the map, so a render submitted now would go into the cache
-            // under that key having been made from UNWARPED audio - and the
+            // already names the warp it is MEANT to be made from
+            // (`warp_sig`), but while the warp is out `decoded` is still the
+            // unwarped file - so a render submitted now would be made from
+            // unwarped audio and cached under the warped key, and the
             // quantize would be lost for as long as the entry lived.
             let (decoded, stand_in) = match stretch_key(clip, &path)
                 .filter(|_| warp_stand_in.is_none())
@@ -11974,8 +12022,12 @@ impl DesktopApp {
                 let Some(decoded) = self.track_cache.get(&path) else {
                     continue;
                 };
-                // A render still pending is drawn from the same stand-in
-                // the reload draws it from.
+                // A stretch render still pending is drawn from the same
+                // stand-in the reload draws it from - for a clip with no
+                // warp. Not yet true of a warped one: this road never asks
+                // `warp_plan`, so a quantized clip is redrawn here from the
+                // unwarped file unless it is stretched and its stretch of
+                // the warp has already landed.
                 let (decoded, stand_in) = match stretch_key(clip, &path) {
                     None => (decoded, None),
                     Some((key, _)) => match self.stretch_cache.get(&key) {
@@ -12324,34 +12376,6 @@ impl DesktopApp {
         }
     }
 
-    /// Write every loaded bay's plugin state beside the settings.
-    ///
-    /// Called on quit and whenever an editor closes — the second matters more
-    /// than the first, because closing the editor is the moment right after
-    /// somebody chose a preset, and it is also the moment they are most likely
-    /// to then force-quit or unplug something.
-    /// Bring each clip up so its loudest point sits just under full scale.
-    ///
-    /// **The PLAYED span, not the file.** A clip trimmed to its quiet half
-    /// should come up by what that half needs; measuring the whole file
-    /// would normalise to a peak the clip does not play, which is the
-    /// difference between "this take is level with the others" and "nothing
-    /// happened".
-    ///
-    /// **And nothing is written to disk.** The gain is a number on the clip:
-    /// **Quantize one audio clip: find the attacks, decide where each
-    /// belongs, and write the warp map that puts them there.**
-    ///
-    /// The host does this because the UI cannot reach the samples. Nothing
-    /// is rendered here - the map is the edit, and `warped_clip_audio`
-    /// builds the audio from it on the next pass - so this is undoable and
-    /// survives the document exactly as a stretch ratio does.
-    ///
-    /// **Anchored in SOURCE frames, including the trim.** A clip's `offset_s`
-    /// means the file is entered part-way through, so a transient found at
-    /// file frame N is heard at timeline `start_s + (N - offset)`. Quantizing
-    /// against the raw file position would put every hit of a trimmed clip
-    /// out by the trim.
     #[cfg(feature = "recorder")]
     /// **Shelve the settings a write is about to destroy.**
     ///
@@ -12593,6 +12617,21 @@ impl DesktopApp {
         out
     }
 
+    /// **Quantize one audio clip: find the attacks, decide where each
+    /// belongs, and write the warp map that puts them there.**
+    ///
+    /// The host does this because the UI cannot reach the samples. Nothing
+    /// is rendered here - the map is the edit, and the crew renders it
+    /// (`Work::Warp`, keyed by `warp_plan`) and an export through
+    /// `warped_clip_audio` - so this is undoable and survives the document
+    /// exactly as a stretch ratio does.
+    ///
+    /// **Anchored in SOURCE frames, including the trim.** A clip's `offset_s`
+    /// means the file is entered part-way through, so a transient found at
+    /// file frame N is heard at timeline `start_s + (N - offset)`. Quantizing
+    /// against the raw file position would put every hit of a trimmed clip
+    /// out by the trim.
+    ///
     /// **Everything one quantize was asked for**, so the per-clip worker
     /// takes one argument instead of six and a knob added to the window
     /// cannot be forgotten at one of the two call sites.
@@ -12632,6 +12671,15 @@ impl DesktopApp {
         (moved, found.len())
     }
 
+    /// Bring each clip up so its loudest point sits just under full scale.
+    ///
+    /// **The PLAYED span, not the file.** A clip trimmed to its quiet half
+    /// should come up by what that half needs; measuring the whole file
+    /// would normalise to a peak the clip does not play, which is the
+    /// difference between "this take is level with the others" and "nothing
+    /// happened".
+    ///
+    /// **And nothing is written to disk.** The gain is a number on the clip:
     /// undoable, reversible, and the same file still under it.
     #[cfg(feature = "recorder")]
     fn normalize_clips(&mut self, ids: &[u64]) {
@@ -12729,6 +12777,18 @@ impl DesktopApp {
     /// the clips did. Written into the project's `media/` beside the takes,
     /// through `materialize_project_dir`, the one door that makes a scratch
     /// real with its kit.
+    ///
+    /// **What "exactly as playback does" covers, and what it relies on.** The
+    /// clip layer only: decode, warp, stretch, passes, trim, fades and clip
+    /// gain, summed pre-rack - no fader, pan, automation, track mute or rack,
+    /// and the app refuses a frozen track before asking. The caches it reuses
+    /// (`track_cache`, `stretch_cache`) hold audio at the rate of the engine
+    /// that filled them: `start_engine` clears them, but an engine that dies
+    /// or a band that closes leaves them standing. **Not yet guarded:** with
+    /// no engine running the weld is written at 48 kHz while those caches may
+    /// still hold another engine's rate, and then it plays at the wrong
+    /// speed. The weld is one undo moment, taken in `finish_audio_glue`; the
+    /// sources' files stay on disk so that moment can be undone.
     #[cfg(feature = "recorder")]
     fn glue_audio_clips(&mut self, ids: &[u64]) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
@@ -13164,6 +13224,12 @@ impl DesktopApp {
         }
     }
 
+    /// Write every loaded bay's plugin state beside the settings.
+    ///
+    /// Called on quit and whenever an editor closes — the second matters more
+    /// than the first, because closing the editor is the moment right after
+    /// somebody chose a preset, and it is also the moment they are most likely
+    /// to then force-quit or unplug something.
     fn save_plugin_states(&mut self) {
         // EVERY seat. The old STRIPS+1+DRUM_PADS bound predates the
         // master's second rack and the folder-extra seats, so a plugin
@@ -13308,8 +13374,11 @@ impl DesktopApp {
         //
         // Nothing is lost by refusing. `open_input` declines during a take
         // too, so the only line that would have run is the one that
-        // deadlocks — and a take cannot outlive its engine anyway, since the
-        // capture rings live in it.
+        // deadlocks. A take CAN outlive its engine - the fault path drops a
+        // dead engine mid-take - and from that moment an input-driven take
+        // writes the desk's silence while an instrument-only take's file
+        // stops growing; the reopen this refusal defers is what brings the
+        // engine back, after the take.
         if self.recorder.session.state().is_active() {
             self.recorder.audio_path_deferred = true;
             return;
@@ -14098,7 +14167,9 @@ impl DesktopApp {
                 mask(&desk.soloed),
             );
         }
-        // **Whether every bay this desk asks for is actually in place.**
+        // **Whether an armed input is still waiting on a bay it is heard
+        // through, while the racks are being rebuilt** - see
+        // `armed_racks_pending`.
         //
         // Read before the engine borrow, and `&self` either way. A project
         // opens with its racks EMPTY and fills them one bay a frame, so for
@@ -14808,13 +14879,7 @@ impl DesktopApp {
     }
 }
 
-/// Where one insert bay's plugin state lives. See [`state_path`] for why a
-/// sidecar; keyed by CHANNEL AND BAY because that is what an insert is keyed
-/// by, and validated by bundle path on the way back for the same reason the
-/// slot files are — the wrong plugin's state is not a preset, it is arbitrary
-/// bytes to a `setState` that will believe them.
 #[cfg(feature = "recorder")]
-/// Copy a directory tree, best effort — the project system's clone.
 /// How many files are sitting in a project's `media/`.
 ///
 /// **The one folder in a scratch project that holds work.** The document,
@@ -14996,15 +15061,24 @@ pub(crate) fn os_reader_attached() -> bool {
 
 /// **Which discarded scratch "Don't Save" may clear, and the clearing.**
 ///
-/// Only a folder THIS session made real (`made_here`), so nothing that was on
-/// disk before the session - an old scratch reopened, a project kept by an
-/// earlier save - is ever touched; named `Untitled` or `Untitled N`; off the
-/// template shelf; whose document ON DISK is not a kept one (unnamed, no
-/// clips - the in-memory flag can be undone past a first save); and holding
-/// no recording (`rec-*`, the arrangement take's name), which is the one thing
-/// that cannot be made again and which New asks about on its own. What is
-/// left is the session's own litter - its kit, the samples and imports it
-/// copied in, its plugin shelf - and the user has just said not to keep it.
+/// All of these, everything after the first read ON DISK at the moment of
+/// removal:
+/// - `made_here`: `materialize_project_dir` turned nothing into this folder
+///   since the session was opened or adopted (`made_real_here`, in memory);
+/// - the folder is named `Untitled` or starts with `Untitled `, and is not on
+///   the template shelf (`inside_template_shelf`);
+/// - its document is missing, empty, or unnamed with no clips - a damaged,
+///   named or clip-holding one spares it (the in-memory flag can be undone
+///   past a first save);
+/// - nothing in `media/` is named `rec-*`, the arrangement take's name.
+///
+/// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar - a kit
+/// built in this scratch included - the samples and imports it copied in,
+/// freeze renders, glued files, `state/` and the export staging in `export/`.
+/// Nothing but the document and the names in `media/` is looked at. Open and
+/// Quit stop here; New calls this too, but when it spares a recording New's
+/// own reclaim then removes the scratch it stands on regardless - see the
+/// New arm.
 fn discard_scratch_made_here(
     made_here: bool,
     dir: Option<&std::path::Path>,
@@ -15059,6 +15133,7 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// Copy a directory tree, best effort — the project system's clone.
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -15208,6 +15283,11 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
     }
 }
 
+/// Where one insert bay's plugin state lives: a sidecar beside the settings,
+/// keyed by CHANNEL AND BAY because that is what an insert is keyed by, and
+/// validated by bundle path on the way back, as the instrument slots' files
+/// were before the slots went - the wrong plugin's state is not a preset, it
+/// is arbitrary bytes to a `setState` that will believe them.
 fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
     global_state_dir().join(sidecar_name(strip, bay))
 }
@@ -16047,6 +16127,12 @@ fn furnish_mirror_bay(
         .map(|_| ())
 }
 
+#[cfg(feature = "recorder")]
+/// The frozen lanes as the engine's mask - see `Shared::frozen`.
+fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
+    frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
+}
+
 /// **Arm a pass's stem tap from the two bools the Export dialog filled in.**
 ///
 /// One function because there are two export roads and they spelled the same
@@ -16067,12 +16153,6 @@ fn furnish_mirror_bay(
 /// a third time on its own side, once a block, because five writers of the dry
 /// buffer have to agree and one place to agree in is cheaper than five — see
 /// `Shared::stems_dry`.
-#[cfg(feature = "recorder")]
-/// The frozen lanes as the engine's mask - see `Shared::frozen`.
-fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
-    frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
-}
-
 fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
     e.set_stems(stems);
     e.set_stems_dry(stems && dry);
@@ -18639,12 +18719,6 @@ fn shift_insert_states_for_v18() {
     }
 }
 
-/// v18 -> v19: the channel count grew 8 -> 16, so every seat at or above the
-/// old channel block stepped up by 8 — the drum bus 8 -> 16, the click 9 ->
-/// 17, the fx return 10 -> 18, the master 11 -> 19, and the 128 pad seats
-/// 12.. -> 20... Highest first, or the move eats itself; numbers frozen as
-/// literals per the historical-migration rule. The upper bound covers the
-/// old master (11) and all 128 pads (12..139).
 #[cfg(feature = "recorder")]
 /// 16 -> today's channels: every seat at or above the old channel block —
 /// drums, click, fx, master, master-extra and all the pad blocks — steps
@@ -18665,6 +18739,12 @@ fn shift_insert_states_for_v20() {
     }
 }
 
+/// v18 -> v19: the channel count grew 8 -> 16, so every seat at or above the
+/// old channel block stepped up by 8 — the drum bus 8 -> 16, the click 9 ->
+/// 17, the fx return 10 -> 18, the master 11 -> 19, and the 128 pad seats
+/// 12.. -> 20... Highest first, or the move eats itself; numbers frozen as
+/// literals per the historical-migration rule. The upper bound covers the
+/// old master (11) and all 128 pads (12..139).
 fn shift_insert_states_for_v19() {
     for bay in 0..3 {
         for old in (8..(12 + 128)).rev() {
@@ -19914,6 +19994,17 @@ impl DesktopApp {
     /// folder above it and every channel it is routed to - see
     /// `armed_rack_pending`. The mask stops at 32 because `armed_mask` is a
     /// `u32` and there are 32 channels; there is no thirty-third to miss.
+    ///
+    /// **Silent only over EMPTY bays.** The hold is the subtraction
+    /// `room = mix - input_dry`, which is exact only while the held chains'
+    /// folder and route-destination bays hold nothing in the engine. At
+    /// engine birth that is true until the first such bay lands; from then on
+    /// every chain bay still pending holds the room over a plugin that is
+    /// already processing. After `force_insert_reload` (Open, New, a
+    /// template) it is false from the start: that marks the LEDGER only, and
+    /// every marked bay keeps its OLD instance playing until the reconcile
+    /// reaches it. For as long as this returns true, a nonlinear folder or
+    /// route bay in a held chain plays its residue.
     #[cfg(feature = "recorder")]
     fn armed_racks_pending(&self) -> bool {
         if !self.racks_restoring || self.recorder.engine.is_none() {
@@ -20265,8 +20356,12 @@ impl Decoded {
     }
 }
 
-/// The stretch cache's key: `(file, ratio in millionths, mode)`. See
-/// [`stretch_key`], the one place it is spelled.
+/// The render cache's key, shared by two treatments: a STRETCH is
+/// `(file, ratio in millionths, mode key [+ "|" + warp_sig])` - see
+/// [`stretch_key`] - and a WARP is `(file, anchor count, warp_sig)` - see
+/// [`warp_plan`], whose third field starts `warp:` and so can never equal a
+/// mode key. `warped_clip_audio` spells the warp key a second time and must
+/// agree with `warp_plan`.
 #[cfg(feature = "recorder")]
 type StretchKey = (std::path::PathBuf, i64, String);
 
@@ -20714,26 +20809,6 @@ impl Counted {
     }
 }
 
-/// One frame of the insert loader's walk: which bay to load next, and how
-/// many bays are still outstanding.
-///
-/// **A closure rather than the table itself.** The real tables are thirteen
-/// thousand entries long and live on two different objects — what the desk
-/// wants is the app's, what the engine has is the host's — so handing them
-/// over would mean building a copy every frame of the most repeated loop in
-/// the app. The rule under test is which INDEX comes back and what the meter
-/// reads, and that rule is the same whatever answers the question.
-///
-/// **One predicate, so the two answers are on one clock.** This used to ask
-/// twice: `next` was the first MISMATCHED bay and the count was of the
-/// mismatched bays that held a PLUGIN, on the reasoning that "3 of 13167" is
-/// no use to somebody waiting for eight plugins. The goal was right and the
-/// arithmetic was not — a reload marked the whole seat space, so the loader
-/// spent thousands of frames flushing empty bays while the count sat at zero,
-/// and the reading only moved when the walk happened to reach one of the
-/// eight. The fix belongs upstream, in what gets MARKED: `force_insert_reload`
-/// no longer marks a bay that is empty on both sides, so every bay this walk
-/// finds is a bay with work in it and the count is the number of frames left.
 #[cfg(feature = "recorder")]
 /// **Whether an armed input is still waiting on a bay** - the decision
 /// behind [`DesktopApp::armed_racks_pending`], as a function of its inputs so
@@ -20790,6 +20865,26 @@ fn armed_rack_pending(
         .any(|seat| (0..INSERTS).any(|bay| mismatched(seat, bay)))
 }
 
+/// One frame of the insert loader's walk: which bay to load next, and how
+/// many bays are still outstanding.
+///
+/// **A closure rather than the table itself.** The real tables are thirteen
+/// thousand entries long and live on two different objects — what the desk
+/// wants is the app's, what the engine has is the host's — so handing them
+/// over would mean building a copy every frame of the most repeated loop in
+/// the app. The rule under test is which INDEX comes back and what the meter
+/// reads, and that rule is the same whatever answers the question.
+///
+/// **One predicate, so the two answers are on one clock.** This used to ask
+/// twice: `next` was the first MISMATCHED bay and the count was of the
+/// mismatched bays that held a PLUGIN, on the reasoning that "3 of 13167" is
+/// no use to somebody waiting for eight plugins. The goal was right and the
+/// arithmetic was not — a reload marked the whole seat space, so the loader
+/// spent thousands of frames flushing empty bays while the count sat at zero,
+/// and the reading only moved when the walk happened to reach one of the
+/// eight. The fix belongs upstream, in what gets MARKED: `force_insert_reload`
+/// no longer marks a bay that is empty on both sides, so every bay this walk
+/// finds is a bay with work in it and the count is the number of frames left.
 fn insert_walk(len: usize, mismatch: impl Fn(usize) -> bool) -> (Option<usize>, usize) {
     let mut next: Option<usize> = None;
     let mut outstanding = 0usize;
@@ -24612,8 +24707,11 @@ mod tests {
     /// plugin's blob back.
     #[test]
     fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
-        // `insert_state_path` is per-install, so this uses a seat far out
-        // of anybody's way and puts it back.
+        // `insert_state_path` is per-install, and `(CHANNELS + 3, 2)` is
+        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf
+        // beside the real settings file. Not yet redirected: this reads and
+        // rewrites that file, unlocked against the tests that move
+        // `IVORY_SETTINGS_PATH`, and only puts it back at the end.
         let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
         let path = insert_state_path(strip, bay);
         let had = std::fs::read(&path).ok();
@@ -24905,11 +25003,11 @@ mod tests {
     /// `DesktopApp` cannot be built in a test; the precedent is
     /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
     ///
-    /// The second half is the trap in doing it at all: a stretch key names
-    /// the file, the ratio and the mode and says NOTHING about the map, so a
-    /// stretch submitted while the warp is still out would be rendered from
-    /// unwarped audio and cached under a key that would go on being handed
-    /// back.
+    /// The second half is the trap in doing it at all: while the warp is
+    /// out, the clip's audio is still the UNWARPED file standing in for it,
+    /// and the stretch key already names the warp (`warp_sig`) - so a stretch
+    /// submitted now would be rendered from unwarped audio and cached under
+    /// the warped key, which would go on being handed back.
     #[test]
     fn a_warp_is_handed_to_the_crew_and_holds_the_stretch_until_it_lands() {
         let src = include_str!("desktop.rs");

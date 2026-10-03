@@ -2877,11 +2877,6 @@ impl LevelTracker {
 // cpal: enumeration and opening a stream
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Every input the host can see, in enumeration order.
-///
-/// Not cached. An interface plugged in while the Recorder band is open must
-/// appear without a restart, and cpal has no change notification to hang a cache
-/// invalidation on.
 /// **Every audio OUTPUT this system offers, by name.**
 ///
 /// Names and nothing else, and that restriction is the whole of why this is
@@ -2895,9 +2890,12 @@ impl LevelTracker {
 /// permits. `instrument::resolve_output` takes the same care for the same
 /// reason and says so at greater length.
 ///
-/// Asked when the Setup panel OPENS, never per frame: under ASIO this loads
-/// and unloads every registered driver in turn, which is seconds of work and
-/// exactly the "Not Responding" the reprobe exists to keep off the UI thread.
+/// **Under ASIO, while a stream holds a driver, this returns that driver
+/// alone**: every other `load_driver` answers `DriverAlreadyExists` and cpal's
+/// iterator skips it (see `HOST_CACHE`). With nothing held it loads and
+/// unloads every registered driver in turn on the calling thread, which takes
+/// seconds and can hang on a dead driver. A complete ASIO list needs the
+/// registry's names, not devices.
 pub fn output_device_names() -> Result<Vec<String>, AudioError> {
     with_host(|host| {
         Ok(host
@@ -2908,6 +2906,11 @@ pub fn output_device_names() -> Result<Vec<String>, AudioError> {
     })
 }
 
+/// Every input the host can see, in enumeration order.
+///
+/// Not cached. An interface plugged in while the Recorder band is open must
+/// appear without a restart, and cpal has no change notification to hang a cache
+/// invalidation on.
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
     with_host(input_devices_on)
 }
@@ -3502,11 +3505,14 @@ mod tests {
     /// under ASIO is a fresh driver-guard, and a fresh guard is a license to
     /// ask the SDK's process-global loader to unload the driver a running
     /// stream is playing through. The cache is what makes that impossible, so
-    /// the cache is what this test pins. Thread-local state, and the whole
-    /// test on one thread, so parallel tests cannot race the counter.
+    /// the cache is what this test pins. The CACHE is thread-local; the
+    /// counter is not. Any test that builds a host on its own thread
+    /// (`the_active_system_is_the_one_the_host_was_built_as` does) can move it
+    /// mid-test.
     #[test]
     fn the_host_is_cached_until_the_system_choice_changes() {
-        // Serialize against any other test that touches SYSTEM.
+        // Nothing serializes this against other tests: SYSTEM and HOSTS_BUILT
+        // are both process-wide.
         let baseline_system = system();
         with_host(|_| ()); // whatever key is current: cached from here on
         let start = HOSTS_BUILT.load(Ordering::Relaxed);

@@ -1594,32 +1594,6 @@ pub fn ir_parent(dir: &str) -> String {
         .unwrap_or_else(|| dir.to_owned())
 }
 
-/// **Whether a path is the IRs folder or somewhere inside it.**
-///
-/// The line the row menu's two writing verbs are drawn on, and the whole of
-/// this panel's answer to "the browser can walk anywhere, so these verbs can
-/// be aimed at a file outside the IRs folder".
-///
-/// **Read anywhere, write only at home.** The browser walks the whole disk
-/// on purpose — "you load any irs there" — so at any moment it may be
-/// standing in a library somebody bought, unzipped and has one copy of. Copy
-/// is fine there: remembering where a file is changes nothing. Delete and
-/// Paste are not, and the reason is not that they are risky in general but
-/// that they would be this app doing them: a DAW that can erase a file it
-/// did not create, out of a folder it was never given, is a DAW nobody can
-/// leave pointed at their sample drive. The confirmation in front of Delete
-/// guards against a mis-aimed click; it does not grant a mandate.
-///
-/// The IRs folder is where the Wizard writes and where the panel opens, so
-/// it is the one place the app already owns files in — and the road from a
-/// foreign library into it is exactly the pair of verbs left live
-/// everywhere: copy there, walk home, paste. Nothing a person can reasonably
-/// want to do is out of reach; it just goes through their own folder.
-///
-/// String work, so it stays on this side of the push with the rest of the
-/// path arithmetic. `Path::starts_with` compares COMPONENTS, which is what
-/// makes `IRs-old` not a child of `IRs`; a `str::starts_with` here would
-/// have quietly said it was.
 /// **Two paths naming the same place, whatever they are spelled with.**
 ///
 /// The sibling of [`ir_under_root`] and for the same reason: a plain `==` on
@@ -1669,6 +1643,32 @@ pub fn ir_same(a: &str, b: &str) -> bool {
     std::path::Path::new(a) == std::path::Path::new(b)
 }
 
+/// **Whether a path is the IRs folder or somewhere inside it.**
+///
+/// The line the row menu's two writing verbs are drawn on, and the whole of
+/// this panel's answer to "the browser can walk anywhere, so these verbs can
+/// be aimed at a file outside the IRs folder".
+///
+/// **Read anywhere, write only at home.** The browser walks the whole disk
+/// on purpose — "you load any irs there" — so at any moment it may be
+/// standing in a library somebody bought, unzipped and has one copy of. Copy
+/// is fine there: remembering where a file is changes nothing. Delete and
+/// Paste are not, and the reason is not that they are risky in general but
+/// that they would be this app doing them: a DAW that can erase a file it
+/// did not create, out of a folder it was never given, is a DAW nobody can
+/// leave pointed at their sample drive. The confirmation in front of Delete
+/// guards against a mis-aimed click; it does not grant a mandate.
+///
+/// The IRs folder is where the Wizard writes and where the panel opens, so
+/// it is the one place the app already owns files in — and the road from a
+/// foreign library into it is exactly the pair of verbs left live
+/// everywhere: copy there, walk home, paste. Nothing a person can reasonably
+/// want to do is out of reach; it just goes through their own folder.
+///
+/// String work, so it stays on this side of the push with the rest of the
+/// path arithmetic. `Path::starts_with` compares COMPONENTS, which is what
+/// makes `IRs-old` not a child of `IRs`; a `str::starts_with` here would
+/// have quietly said it was.
 pub fn ir_under_root(path: &str, root: &str) -> bool {
     if path.is_empty() || root.is_empty() {
         // Before the app has said where home is, nothing is home. A default

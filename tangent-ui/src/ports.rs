@@ -122,18 +122,18 @@ pub struct ProjectExportSpec {
     /// Read only when `stems` is on, and the dialog cannot set it without
     /// `stems` (see `set_export_source`, which clears it whenever it clears
     /// `stems`) — so the fourth combination of the two bools is unreachable
-    /// rather than merely unused, and `an_export_cannot_ask_for_processed_
+    /// rather than merely unused, and `an_export_cannot_ask_for_dry_
     /// stems_with_stems_off` holds that end.
     ///
-    /// **False is PROCESSED, and that is the deliberate default.** Two
-    /// reasons. It is what the tap has always produced for an instrument,
-    /// an input, a drum lane and a group — the old single "Stems" option
-    /// was never dry for any of those — and it is what it now produces for
-    /// an audio track as well, since a clip finally reaches its lane's
-    /// rack. And it is the mode somebody asking for stems in order to hand
-    /// a mix on almost always wants: the files sum to the record. Dry is
-    /// the specialist's answer, for a re-mix somewhere else, and it is the
-    /// one you have to ask for.
+    /// **False is PROCESSED; the dialog arrives on DRY.** Moving SOURCE to
+    /// stems sets this (`set_export_source`, the owner's ruling), and a spec
+    /// carries dry only with stems on, so false is the default only of a
+    /// spec with stems off. Processed is what the tap has always produced for
+    /// an instrument, an input, a drum lane and a group - the old single
+    /// "Stems" option was never dry for any of those - and what it now
+    /// produces for an audio track as well, since a clip finally reaches its
+    /// lane's rack: the files sum to the record. Dry is for a re-mix
+    /// somewhere else.
     ///
     /// Appended last because the struct is append-only and because, if this
     /// spec is ever written to settings, a missing field must read back
@@ -304,12 +304,14 @@ pub trait AudioSetup: Send {
     /// WASAPI nor ASIO lit.
     fn active_system(&self) -> Option<String>;
 
-    /// **Every audio OUTPUT the chosen system offers**, in the backend's own
-    /// order, or empty when they cannot be reached.
-    ///
-    /// Asked when the panel OPENS, like [`Self::systems`] and [`Self::rates`]
-    /// and never per frame: under ASIO this loads and unloads every
-    /// registered driver in turn.
+    /// **Every audio OUTPUT the host the streams open through offers**, in
+    /// the backend's own order, or empty when they cannot be reached. That
+    /// host follows the process-wide system (`tangent_record::audio::system`),
+    /// not the setting, so during an ASIO fallback it is the stand-in's.
+    /// Under ASIO, while a stream holds a driver, only that driver; with none
+    /// held, every registered driver, loaded and unloaded in turn on the
+    /// calling thread. Asked when the panel OPENS, like [`Self::systems`] and
+    /// [`Self::rates`], and never per frame.
     ///
     /// **This exists because ASIO has no default.** cpal's ASIO host
     /// implements `default_output_device` as, verbatim, "ASIO has no concept
@@ -873,8 +875,23 @@ pub enum ProjectRequest {
     /// through `TangentApp::note_frozen`. The host does the render because
     /// the host owns the engines; the app owns the fact.
     Freeze(usize),
+    /// **Quantize the audio clips `ask.ids` names onto the grid** - one
+    /// gesture, however many clips.
+    ///
+    /// The host does the work because the UI cannot reach the samples: it
+    /// detects the attacks, asks where each should land, and writes the
+    /// result into each clip's `warp` map, one undo moment for the batch. The
+    /// audio is re-rendered from that map, so the edit is undoable and
+    /// survives the document like any other. (Not yet one moment for the
+    /// whole Apply: knobs the Apply moved are committed at the end of the
+    /// frame that asked, before this lands.)
+    ///
+    /// Carries the whole question - grid, strength, window, detection
+    /// sensitivity and fit - because the grid a quantize aims at is the one
+    /// the window showed when Apply was pressed; see [`QuantizeAsk`].
+    QuantizeClips(QuantizeAsk),
     /// **Put the default template's DESK back to the one Tangent ships
-    /// with.** Appended at the END, this enum's law.
+    /// with.**
     ///
     /// The template lives in the user's Projects folder, not in the app, so
     /// a template that has been written over survives every reinstall. The
@@ -882,20 +899,6 @@ pub enum ProjectRequest {
     /// any whole project that has been copied inside it — and lets
     /// `seed_template` write a fresh one. The kit and its samples stay: a
     /// person's default drum kit is theirs and is not what went wrong.
-    /// **Quantize one audio clip onto the grid**, by its id.
-    ///
-    /// The host does the work because the UI cannot reach the samples: it
-    /// detects the attacks, asks where each should land, and writes the
-    /// result into the clip's `warp` map. The audio is re-rendered from that
-    /// map, so the edit is undoable and survives the document like any other.
-    ///
-    /// Carries the grid rather than reading one, because the grid a quantize
-    /// aims at is the one that was on screen when somebody asked - a host
-    /// that looked it up again could answer a different question than the
-    /// one put to it. Seconds per step, and the swung off-beat's fraction.
-    /// **Ids, not one id**, because `project_request` carries one request a
-    /// frame and a marquee over eight takes is one gesture.
-    QuantizeClips(QuantizeAsk),
     ResetTemplate,
 }
 

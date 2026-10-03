@@ -87,8 +87,9 @@ impl Transport {
 
     /// The green button. Starts the audition from the playhead; pressed while
     /// auditioning, PAUSES — the playhead stays put, and the next press picks
-    /// up from there. Going home to 0:00 is the stop button's job, which is
-    /// what makes the pair a tape transport rather than two spellings of stop.
+    /// up from there. Going back to the edit cursor is the stop button's job,
+    /// which is what makes the pair a tape transport rather than two spellings
+    /// of stop.
     pub fn toggle_play(&mut self) {
         self.playing = !self.playing;
     }
@@ -124,11 +125,15 @@ impl Transport {
 
     /// Reconcile once a frame.
     ///
-    /// The order inside matters and is the safe one twice over: the locate is
-    /// published BEFORE the level rises (a callback that sees the level up is
-    /// guaranteed a position that is not stale), and the level falls BEFORE
-    /// the return-to-cursor locate (so no block rolls at the cursor on the way
-    /// down).
+    /// The locate is published BEFORE the level rises, which ORDERS the two
+    /// without making them one fact: `run_transport` loads the generation
+    /// before the level, so a callback can still read the old generation with
+    /// the level already up and roll one block from the old position. On the
+    /// way down the return-to-cursor locate is stored BEFORE the level falls,
+    /// so a callback landing between the two stores - or reading the Relaxed
+    /// level stale after Acquiring the new generation - rolls one block at
+    /// the cursor. Publishing `set_rolling(false)` first closes the falling
+    /// half.
     ///
     /// No session in the signature any more: see `playing` for why a take has
     /// no say in whether the transport rolls.

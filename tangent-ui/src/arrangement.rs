@@ -672,8 +672,13 @@ pub struct ArrClip {
     /// segment gets its own ratio, so a take that rushed one bar and dragged
     /// the next is fixed in both directions at once.
     ///
-    /// Frames rather than seconds because the anchors address SAMPLES of a
-    /// particular file, and a tempo change must not move them.
+    /// Frames rather than seconds because a tempo change must not move them -
+    /// but frames of the file AS DECODED at the engine rate the quantize ran at
+    /// (every decode is resampled to the rate it is asked for), not samples on
+    /// disk. The map does not record that rate, so it is right only against a
+    /// decode at the same rate: an export at another rate, or the session
+    /// reopened on a device running another, applies every anchor to the wrong
+    /// audio.
     pub warp: Vec<(u64, u64)>,
     /// **How each warped segment gets to where it belongs** - the binary's
     /// `warp::Fit` by its key. Empty reads as auto, which asks the material.
@@ -836,9 +841,13 @@ pub struct GluedAudio {
 /// a clip's notes once, in the pass that starts at this origin, so its loop
 /// bar and its folded playhead count from here too: the bar marks the turn at
 /// the end of the pass the roll draws. That is the arrangement's first seam
-/// (`clip_head_s`) whenever the trim is shorter than a loop; trimmed by a
-/// loop or more, the drawn pass - notes, bar and playhead alike - stands
-/// before the clip's head, as the notes always have.
+/// (`clip_head_s`) whenever the trim is shorter than a loop. The drawn pass
+/// itself begins at this origin, so on such a part its first `offset_s`
+/// seconds lie BEFORE the clip's head, in the roll's veil: the first pass
+/// never plays them (the trim cut them), every later pass does, and the
+/// folded playhead stands there for that long at the top of every pass after
+/// the first. Trimmed by a loop or more, the whole drawn pass - notes, bar and
+/// playhead alike - stands before the head, as the notes always have.
 pub fn midi_loop_origin_s(start_s: f64, offset_s: f64) -> f64 {
     // `max` yields the other side of a NaN, so an unwritten offset reads as
     // no trim rather than poisoning every position computed from it.
@@ -2054,6 +2063,15 @@ impl DeskRef<'_> {
         // fingerprint is a walk in declaration order, so a term inserted
         // among the others moves every existing document's hash and reads as
         // "everything changed" the first time an old session is opened.
+        //
+        // **And a term here is an UNDOABLE field.** This walk is what an
+        // undo moment is compared by (`TangentApp::walk`), so adding one is
+        // three jobs, not one: append it here; give every gesture that
+        // writes it exactly one commit (or make it part of `View`, which
+        // `commit_view_change` commits once a frame); and make
+        // `apply_desk_snapshot` restore every value it can hold, sentinels
+        // included - a value the apply declines leaves undo re-applying
+        // that moment on every press.
         opt(f, self.look.is_some());
         if let Some(l) = self.look {
             f.str(l.theme);
@@ -2810,11 +2828,16 @@ impl DeskSnap {
                         .unwrap_or(false),
                 }
             }),
-            // **Every field falls back to what the app already has**, which
-            // is why the reader takes a default from nowhere: a document
-            // written before one of these keys existed must not pull the
-            // arrangement to a zero it never chose. The caller applies this
-            // over its live settings and only the keys present move.
+            // **A key the block does not carry falls back to the SHIPPED
+            // default, not to the live value**, and `apply_desk_snapshot`
+            // writes it like any other field (the one exception: a zero
+            // `header_w` or `visible`, which it skips). That is safe only
+            // because no build has written a partial block - all fourteen
+            // keys arrived together, and the writer emits every one (`q_fit`
+            // only when it is not auto, and absent IS auto) - so the defaults
+            // are reached by a hand-edited file alone. An ABSENT block is what
+            // leaves the live values standing. Zero for `header_w` and
+            // `visible` is AUTO, the shipped default, not "unset".
             view: m.get("view").and_then(Value::as_object).map(|vm| View {
                 snap: vm.get("snap").and_then(Value::as_bool).unwrap_or(true),
                 grid_exp: vm.get("grid_exp").and_then(Value::as_i64).unwrap_or(-2).clamp(-7, 3),
@@ -4188,6 +4211,9 @@ impl Arrangement {
 
     /// `hash_into` over a desk that is only borrowed — the app's live desk,
     /// read straight out of the settings once a frame. See [`DeskRef`].
+    ///
+    /// **A term in this walk is an undoable field** - see `DeskRef::hash_into`
+    /// for what adding one costs.
     pub fn hash_into_ref(&self, desk: Option<DeskRef<'_>>, f: &mut Fingerprint) {
         f.u64(self.version);
         // The NORMALISED counter, the same expression the writer emits —

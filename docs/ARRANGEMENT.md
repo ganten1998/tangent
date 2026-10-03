@@ -56,6 +56,24 @@ header (the header's arm dot and the strip's R are one state).
    over a playing or even recording arrangement is legal and changes
    nothing about it.
 
+**2026-09-22, the ruling that keeps them apart.** A take is capture only.
+The cassette starts and ends it and nothing else does: it rolls no
+transport, Stop and Space do not end it, and the band's transport, the
+loop, the chord audition, undo/redo (once its count-in is over) and track
+moves all work while it runs (the owner: "the main buttons need to be
+intact while recording takes"). The two machines share ONE count-in in the
+engine, which is the one place they touch: a take pressed during the red
+button's count joins it from where it began, the red button pressed during
+a take's count joins that one, and Play during either starts the song on
+the downbeat. The realtime EXPORT is the one take that owns the transport
+and the lane order; those refusals key on `exporting` (the host's
+`bounce`), not on the take state. Not yet on every road to the lane order:
+only the lane drags refuse (`move_channel`, `move_selection`,
+`snap_into_folder`, each on `exporting || arr_recording`), while Insert
+Track, Paste Track Below, Cmd/Ctrl+F grouping and a drag home that ejects a
+track from its folder still reorder lanes under an export or an
+arrangement record.
+
 **Clip operations, v1, with their gestures (all owner-specified):**
 
 - **Move** — mouse-drag the clip body along its lane.
@@ -101,7 +119,15 @@ where it was dropped. That is the one way in; no picker, no menu row.
   "make it so every launch opens the default session, and doesn't open the
   previously open session." The remembered `project_path` is not reopened
   at launch any more; the last session is a File > Open away, and a
-  materialised Untitled (takes or edits in it) stays on disk for that panel.
+  materialised Untitled stays on disk for that panel, unless the session
+  that made it real discards it with Don't Save while it is unnamed and
+  clipless on disk and holds no recording (`rec-*`): then it was that
+  session's litter and is removed (`discard_scratch_made_here`,
+  2026-09-22; see docs/FOLDERS-AND-SESSIONS.md). Not yet for New, which
+  removes the scratch it stands on, recording and all, when that scratch
+  has no document on disk and still has the template's kit (the New arm of
+  `run_project_request`). The launch sweep (`sweep_disposable_untitleds`)
+  also clears an Untitled that holds nothing it counts as work.
   Third answer to this question — the history, including the "moscow"
   scare that reversed the second one, is on `open_project_at_launch`.
 - New / Open / Save As / Recent live under a PROJECT subject in the menu
@@ -304,7 +330,8 @@ channels play back their clips and nothing else. "Ready to play" and
     zooms around centre and counts duration from zero). The overview
     scrubber retired. Transport: Rec → Play → Stop → Pause (its own
     button), and Space stops ANY recording — take, arrangement record,
-    or rolling transport.
+    or rolling transport. (Superseded 2026-09-22: a take is capture only.
+    Space never reaches one, and only the cassette starts or ends it.)
   - **Recording over material is DESTRUCTIVE** (`arr_carve`): the new
     clip punches out whatever it overlaps — remove, trim either edge, or
     split with the tail's offset advanced — so behind the playhead is
@@ -1264,6 +1291,36 @@ channels play back their clips and nothing else. "Ready to play" and
   sets the pass length, clamped to the clip and never growing it, and
   it edge-scrolls horizontally like every other drag on the roll —
   horizontally only, because a loop length is a time and has no pitch.
+
+  QUANTIZE, AUDIO GLUE, AUTOMATION NODES, 2026-09-21..24. `Q` opens the
+  quantize window on both surfaces (`open_quantize_window`; Shift+Q
+  unbound). It is NOT modal, states its own grid (the `quantize_*`
+  settings, carried per session by `DeskSnap::view`), and moves NOTES while
+  the MIDI editor is open (`me_quantize_with`: the selection, or the whole
+  clip) and AUDIO otherwise (`ProjectRequest::QuantizeClips`: the selection
+  or, with none on a picked track, that track's audio clips, through
+  `adopt_track_clips_for_quantize`). Audio is WARPED, never split:
+  `transient` finds the attacks; `warp` renders the clip with each attack
+  copied as recorded and only the sustain stretched (`Fit::Stretch`), moves
+  segments untouched (`Fit::Slice`), or asks `stretch::percussiveness` once
+  per clip (`Fit::Auto`). The map lives on the clip (`warp`, `warp_fit`), is
+  in the undo fingerprint, renders on the decode crew (`Work::Warp`) BEFORE
+  any stretch, and the drawn wave is the warped render's. While the window
+  is open, `quantize_preview` asks the host for marks: amber where an
+  attack was found, a fainter tick in the clip's ink where the grid pulls
+  it. GLUE welds audio too (`RecorderRequest::GlueAudio`): the host lays
+  each clip out as playback does, mixes with `pull_lane_clips`, writes a
+  Float32 WAV into `media/`, and hands back one plain clip looping over its
+  own length, by MIDI glue's rules. AUTOMATION: two nodes may share an
+  instant (a step: arrive at the first, leave from the second; `value_at`
+  is right-continuous and the engine reads the same function); a plain
+  drag on a row's empty room is a box that chooses nodes
+  (`ArrDrag::AutoMarquee`), and a still press still locates, at the
+  release; a drag carries every chosen node from an anchor; Delete, copy
+  and paste reach chosen nodes before clips and tracks; Cmd/Ctrl+A opens
+  the selected track's automation menu (what its wrench opens). The MIDI
+  editor's playhead folds into the pass the roll draws inside a looping
+  clip (origin = start - offset).
 
 ## Order of work
 

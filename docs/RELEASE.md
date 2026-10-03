@@ -106,6 +106,17 @@ with `= 0` so a failed signing fails the build - without it makensis ignores
 the exit code and ships the uninstaller unsigned, which was tested); and
 `build-cross.sh` signs `setup.exe` after makensis writes it.
 
+**The timestamp is RFC 3161, and that is not optional.**
+`timestamp.acs.microsoft.com` speaks only RFC 3161; jsign's default is the
+legacy Authenticode protocol, and it fails AFTER Azure has signed, as
+"Malformed content" / "Unable to complete the timestamping" (the first real
+signing, 2026-09-24). `sign-windows.sh` passes `--tsmode RFC3161`; any
+other route to the same account (signtool with `/tr <url> /td sha256`, a CI
+action) must ask for RFC 3161 too. The certificate lives three days and the
+timestamp is what keeps a signature valid after it expires, so an
+untimestamped signature stops validating within days: on a Smart App
+Control machine, a Tangent that stops starting.
+
 Two Windows gates, and they judge different files. SmartScreen judges the
 OUTER installer when it is first opened. **Smart App Control** (Windows 11)
 checks EVERY program each time it starts and has no per-app override, not
@@ -149,7 +160,9 @@ Built into `dist/`; the version is read from the root `Cargo.toml`
 | macOS installer | `Tangent-<v>-macos.pkg` | `build-installer.sh macos` |
 | macOS app zip (primary) | `Tangent-<v>-macos-universal.zip` | `build-macos.sh` |
 | macOS DMG (best-effort) | `Tangent-<v>-macos-universal.dmg` | `build-macos.sh` |
+| macOS app zip/DMG, host arch only | `Tangent-<v>-macos-<arch>.{zip,dmg}` (arm64 on Apple silicon) | `ARCH=host build-macos.sh` (quick checks, not a release artifact) |
 | Windows installer | `Tangent-<v>-windows-setup.exe` | `build-cross.sh` (needs `makensis`) |
+| Windows portable | `tangent-<v>-windows-x86_64.zip` | `build-cross.sh` |
 | Linux x86_64 | `tangent-<v>-linux-x86_64.tar.gz` | `build-cross.sh` |
 | Linux aarch64 | `tangent-<v>-linux-aarch64.tar.gz` | `build-cross.sh` |
 | Checksums | `SHA256SUMS` | `release.sh` |
@@ -157,18 +170,21 @@ Built into `dist/`; the version is read from the root `Cargo.toml`
 Notes on the set:
 
 - **macOS is universal by default** (`ARCH=host` for a quick local build).
-- **The Windows portable zip is a transient installer input, not a
-  deliverable.** `build-cross.sh` builds it, `build-installer.sh` unzips
-  exactly it into the NSIS payload, and then it is deleted. The owner ships
-  Windows as the setup.exe alone. If `makensis` is missing the zip is kept
-  rather than shipping nothing, with a loud warning that the deliverable was
-  not produced.
+- **The Windows portable zip is a deliverable AND the installer's input.**
+  `build-cross.sh` builds it and keeps it; `build-installer.sh` unzips
+  exactly it into the NSIS payload, so one build's installed files and
+  portable files are the same bytes. It must ship: its version-less alias
+  `tangent-windows-x86_64.zip` is the store content's Windows archive
+  (`docs/STORE-CONTENT.md`), the legacy `ivory-windows-x86_64.zip` is in
+  supporter emails sent before the installers took over at 3.0.0, and
+  `publish-github.sh` can only upload an alias for a file that exists in
+  `dist/`. If `makensis` is missing, only the zip is built and the run warns
+  loudly that no setup.exe was produced. The
+  `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
+  function name; it is not a deliverable and `publish-github.sh` does not
+  upload it.
 - **The VST3 plugin is retired** (2026-08-24, the owner's ruling). No
   installer may carry a `Tangent.vst3`; `release.sh` fails any that does.
-- **The pkg is not yet in `release.sh`'s build path.** Run
-  `scripts/build-installer.sh macos` yourself after `build-macos.sh`, before
-  checksums. The supporter email hands out the pkg permalink, so a release
-  published without a fresh pkg breaks that link.
 - **FreeBSD ships.** `scripts/release.sh` on a FreeBSD host runs
   `scripts/build-freebsd.sh`, checks the `.pkg` and both offline bundles, and
   `publish-github.sh` uploads them. Two things to know: pkg spells a
@@ -202,8 +218,14 @@ Details that matter and are easy to lose:
   target. Nothing is lost: MP3 delivery goes through the bundled ffmpeg
   sidecar on both platforms.
 - **ASIO rides into the Windows build** when the Steinberg SDK is present
-  under `vendor/asiosdk_*` (its licence forbids committing it); without it
-  the build is WASAPI-only and says so.
+  under `vendor/asiosdk_*` (its licence forbids committing it, so a fresh
+  checkout does not have it). Without it `build-cross.sh` still produces a
+  WASAPI-only build and says so in one line, and `release.sh` then fails
+  the release on the missing `ASIO-NOTICE.txt`. Unpack the SDK into
+  `vendor/` before any Windows build meant for a tester or a release. (The
+  notice is written whenever `CPAL_ASIO_DIR` is set, and that is cpal's own
+  variable: one exported in the shell writes it over a WASAPI-only build
+  too, and that build then passes.)
 - **`scripts/build-cross.sh check-linux`** type-checks the Linux target from
   macOS with a stub `alsa.pc`, so Linux-only code is checked before pushing
   rather than discovered broken on the Linux box.
@@ -226,13 +248,21 @@ Per artifact, it verifies and refuses to bless a release on failure:
 
 - **pkg**: expands it and requires the app component, NO retired VST3
   component, a standalone install choice, `relocatable="false"` (so a stray
-  copy elsewhere on the disk cannot swallow the update), and an Installer
-  signature.
-- **setup.exe** (needs `7zz`): requires `tangent.exe`, NO VST3 payload, and
-  `Uninstall.exe`.
+  copy elsewhere on the disk cannot swallow the update), an Installer
+  signature, and a stapled notarization ticket (`stapler validate`).
+- **setup.exe** (needs `7zz`; without it the run FAILS rather than
+  skipping): requires `tangent.exe`, NO VST3 payload and `Uninstall.exe`;
+  an Authenticode signature on setup.exe itself and on `tangent.exe`,
+  `tangent-ffmpeg.exe` and `Uninstall.exe` as extracted from it.
+  `scripts/pe-signed.py` checks PRESENCE (a non-empty certificate table),
+  not chain validity, which only a first launch on Windows proves.
 - **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.
 - **macOS zip**: the `Tangent.app` executable present, no `__MACOSX` junk.
-- **Windows zip** (only exists when makensis was missing): `tangent.exe`.
+- **Windows zip**: `tangent.exe` at the top level; `ASIO-NOTICE.txt`, the
+  fingerprint of an ASIO build, so a WASAPI-only Windows build fails the
+  release (unless an exported `CPAL_ASIO_DIR` wrote the notice anyway: see
+  the ASIO bullet above); and signatures on `tangent.exe` and
+  `tangent-ffmpeg.exe`.
 - **Linux tarballs**: the `tangent` binary (the pre-2.1.0 empty-tarball bug),
   `install.sh` (the README's first instruction; 4.92.0 shipped without it),
   and `tangent-ffmpeg` (video on a clean machine; also shipped missing once).
@@ -260,10 +290,10 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 3. **Test**: all three commands from gate 1.
 4. **Tag locally**: `git tag -a v<v> -m 'Tangent <v>'`. The tag must exist
    before the build; pushing it happens in step 8.
-5. **Build**: `scripts/release.sh` on the Mac builds macOS, Windows and both
-   Linux tarballs in one pass, then run `scripts/build-installer.sh macos`
-   for the pkg (see the gap above) and `scripts/release.sh --sums-only` to
-   fold it into the checksums. On the FreeBSD box, `scripts/release.sh` (as
+5. **Build**: `scripts/release.sh` on the Mac builds macOS (app, zip, dmg
+   and the signed, notarized pkg), Windows (zip and signed setup.exe) and
+   both Linux tarballs in one pass, and writes the checksums. On the
+   FreeBSD box, `scripts/release.sh` (as
    root or with `doas`, for the bundles) builds and checks the FreeBSD set;
    copy its three files into the Mac's `dist/` before `--sums-only`.
 6. **Smoke-test.** `open dist/Tangent.app`. For Linux,
@@ -297,6 +327,27 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 10. **Verify as a stranger**: download each artifact on a clean machine or VM
     (quarantine attribute present) and confirm the documented first-launch
     paths work. Then put `main` back on the next `X.Y.Z-dev`.
+
+## Builds for testers: `scripts/publish-dropbox.sh`
+
+Between releases every build is `X.Y.Z-dev`, and `release.sh` refuses to
+touch one, so NONE of its artifact checks (signatures, the ASIO notice, the
+payload lists) run on what testers receive. `publish-dropbox.sh
+[windows|macos|linux …]` copies the current version's artifacts from
+`dist/` to `<Dropbox>/Tangent Development/builds/<HEAD>[-dirty]/`, installer
+first, and writes `SHA256SUMS.txt` there. What it does not know:
+
+- **Which commit built the files.** The folder is named after the commit
+  checked out, and `-dirty` after the tracked files, WHEN YOU PUBLISH;
+  every `-dev` build has the same file names. Rebuild immediately before
+  publishing.
+- **What is left over.** Everything in `dist/` with this version's name
+  goes: an `ARCH=host` `macos-arm64` pair survives a later universal build,
+  a failed Linux leg leaves the previous run's tarballs, and nothing
+  removes an old setup.exe before `makensis` runs again.
+- **A platform with nothing in `dist/`.** With no arguments it publishes
+  all three, and under macOS's bash 3.2 it stops with `pats[@]: unbound
+  variable` if any has no artifacts: name the platforms you built.
 
 ## Store links: check them, then act in order
 

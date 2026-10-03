@@ -22,7 +22,9 @@
 #
 # Run it on each OS (and each Linux arch), copy the artifacts into one dist/,
 # then `scripts/release.sh --sums-only` there so SHA256SUMS covers everything.
-# It builds and checks only — tagging, signing for distribution and uploading
+# It builds and checks only. Tagging comes FIRST (refusal 2); signing is not
+# manual: build-macos.sh and build-installer.sh sign and notarize, and
+# build-cross.sh signs every Windows PE; pushing, publishing and verifying
 # (docs/RELEASE.md steps 8-10) stay deliberately manual.
 set -euo pipefail
 
@@ -216,7 +218,8 @@ esac
 
 # 5. THIRD-PARTY-LICENSES must match Cargo.lock. The build scripts only test
 #    that the file EXISTS, so a stale one is bundled forever, and regenerating
-#    it was a documented gate that lived in memory (docs/RELEASE.md gate 4) —
+#    it was a documented gate that lived in memory (then docs/RELEASE.md gate
+#    4; gate 2 now) —
 #    which is how 5.0 shipped a licence file 400+ commits stale, with the LV2,
 #    ASIO and accessibility dependency work entirely unlisted. Regenerate into
 #    a temp file and byte-diff; the generator is deterministic given the same
@@ -237,7 +240,7 @@ fi
 rm -f "$TPL_TMP"
 
 # 6. The gate must be green before the build spends the version. The commands
-#    are docs/RELEASE.md gate 3 plus the Cargo.toml lint policy under the
+#    are docs/RELEASE.md gate 1 plus the Cargo.toml lint policy under the
 #    clippy driver, all in scripts/check.sh — one script, so CI can someday
 #    call the same thing instead of restating it in YAML (docs/RELEASE.md's
 #    one hard rule for when CI returns). Skipped on --sums-only, which

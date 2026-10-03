@@ -41,52 +41,84 @@ a third flag (`strip_folder_shut`). Consequences, all deliberate:
 
 Nothing is written at launch or New. The template is adopted IN MEMORY
 (`adopt_template`), aimed at a prospective folder that does not exist.
-The folder MATERIALISES (`materialize_project_dir`) at the first thing
-worth keeping: a Save, a kit edit, a recorded take (whose writer creates
-`media/` itself). Renaming before that repoints alone, so the folder is
-born under the chosen name; "Untitled" reaches disk only if the user
-saves while keeping it. The launch sweep
-(`sweep_disposable_untitleds`) clears strays that provably hold no work —
-unnamed, clipless, stock kit, no takes; any doubt spares the folder.
+The folder MATERIALISES at the first thing worth keeping, always through
+`materialize_project_dir` (the one door, below): a Save (the first save
+moves it to the chosen name), a kit edit or pad load, an import, an
+arrangement take with audio, a freeze, a glue, or a realtime export pass
+(its staging copy lands in the project's `export/`); a MIDI-only take
+makes no folder. Renaming before that repoints alone, so the folder is
+born under the chosen name; any of those writers makes `Untitled` real
+without a save. The launch sweep (`sweep_disposable_untitleds`) removes,
+WHOLE, every folder directly under the project root named `Untitled` or
+`Untitled …` whose `media/` holds nothing `count_media` counts, whose kit
+is not custom and whose document is missing, empty, or unnamed and
+clipless. It looks nowhere else in the folder: a subfolder or a nested
+project goes with it.
 
 Related invariants that keep this working:
 
-- The document writes ONLY on Save (autosave is gone by the owner's word);
-  `switch_project` gates the doc save on `project_dirty()` but always
-  shelves plugin states — and `copy_states_to_project` stands down while
-  the folder is unmaterialised.
-- **Save As Template is not a save of the session** (2026-09-22). A
-  scratch's template is written from memory (`write_template_into`) into
-  a staging folder and swapped onto the shelf; only a REAL folder is saved
-  and copied. The old road saved the scratch into `Projects/Untitled` first,
-  which was the pile's main source. Every template carries a
-  `drumpad.json`, because `kit_is_custom` compares against it.
-- **Every door out asks, and "Don't Save" sticks.** The Project window's New
-  and Open go through `ask_before` like the menu's; a "Don't Save" answer
-  reaches the host as `take_outgoing_discarded` and gates the document
-  save-back AND the plugin-state shelving in `switch_project`, the New arm
-  and `on_exit`, and it survives New's detour through the scratch warning
-  (`rearm_outgoing_discarded`). A scratch THIS session made real
-  (`made_real_this_session`), named Untitled, unnamed and clipless ON DISK,
-  off the shelf and holding no recording (`rec-*`) is removed when discarded
-  (`discard_scratch_made_here`) - its kit, imports and shelf were the
-  session's own litter.
+- The session's document is written by a save the hand asked for: Save,
+  the prompt's Save, the first save (`save_project_first`, which MOVES a
+  materialised scratch to the chosen name) and Save As (a copy the session
+  then stands on). Two side roads write it too: Save As Template from a
+  REAL folder (`save_project_and_states`, before the copy), and the
+  save-back on New and Open (`switch_project`, the New arm), which writes
+  only when `project_dirty_exact()` and the prompt was not answered Don't
+  Save. `on_exit` never writes it. Plugin states always go to the global
+  shelf first (`save_plugin_states`); `copy_states_to_project` mirrors them
+  into the project's `state/` only when the answer was not Don't Save, and
+  stands down while the folder is unmaterialised.
+- **Save As Template never makes a scratch real** (2026-09-22). A session
+  whose folder does not exist yet is not written: its template is built
+  from memory (`write_template_into`) into a staging folder and swapped
+  onto the shelf (`swap_in_template`), and the scratch is marked as needing
+  no save (`mark_template_saved`). A REAL folder (a saved project, or a
+  scratch something already materialised) is still saved first
+  (`save_project_and_states`) and copied whole, as it always was. The old
+  road saved the scratch into `Projects/Untitled` first, which was the
+  pile's main source. Every template Save As Template writes carries a
+  `drumpad.json`, an empty kit included, because `kit_is_custom` compares
+  against it; one seeded by a fresh install has none, and with no template
+  kit `kit_is_custom` calls a kit work only when it holds a sample or
+  cannot be parsed.
+- **New, Open and Quit ask, and "Don't Save" sticks.** The menu's and the
+  Project window's New and Open go through `ask_before`, as Quit does
+  (Settings > Reset does not: The Default Template replaces the session
+  without asking, and Everything opens a fresh one through New). The
+  prompt's Discard reaches the host as `take_outgoing_discarded` and gates
+  the document save-back AND the project plugin-state mirror in
+  `switch_project`, the New arm and `on_exit`, and it survives New's detour
+  through the scratch warning (`rearm_outgoing_discarded`). Then a scratch
+  THIS session made real (`made_real_this_session`), named Untitled,
+  unnamed and clipless ON DISK, off the shelf and holding no recording
+  (`rec-*`) is removed WHOLE (`discard_scratch_made_here`): its kit (a kit
+  built there included), the samples and imports it copied in, freeze
+  renders, glued files, `state/` and the export staging. Open and Quit
+  leave a scratch holding a recording on disk; New's reclaim of the
+  scratch it stands on removes it, recordings and all, unless its kit
+  differs from the template's (New then steps past it to `Untitled 2`).
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
   every lane's kit samples and writes the kit sidecar. Imports, pad loads,
-  arrangement takes with audio, freezes and exports go through it first; a
+  arrangement takes with audio, freezes, glues and realtime exports go
+  through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
   only into a folder that is already real).
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
-  from the Open panel is read without being inhabited, so it keeps the
-  session's own kit, where every kit write goes.
+  from the Open panel is READ, not inhabited, and that road is not yet
+  safe: `project_doc`, the kit and the plugin-state shelf all stay the
+  previous session's, so the template's unnamed document stands in that
+  project's folder. The next Save MOVES that folder to the name typed and
+  writes the template over its document, and the next Open or Quit mirrors
+  the template desk's plugin states into that project's `state/`.
 - **No test resolves the owner's media folder**: `Settings::media_root`
   honours `TANGENT_MEDIA_ROOT` in every build and is a per-thread temp root
   under `tangent-ui`'s tests. One test wrote a blank document over the real
   `Projects/Untitled` on every `cargo test` until 2026-09-22.
 - **The sweep counts takes, not litter**: `count_media` skips dotfiles
   (Finder's `.DS_Store`), freeze renders and byte-copies of the template's own
-  media (length-checked first, so no take is read). A kit is compared by its
+  media (a file is read whole only when the template holds one of the same
+  name and length). A kit is compared by its
   parsed kits, not its bytes; with no template kit, only a kit holding a
   sample, or bytes nobody can parse, is work.
 - The canonical document name is `project.tan`; `project.tangent` reads

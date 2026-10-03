@@ -3,20 +3,13 @@
 ; Built from macOS with `makensis` (brew install makensis); scripts/build-installer.sh
 ; passes SRCDIR, OUTFILE and VERSION on the command line.
 ;
-; Two components, either or both:
+; One component, the application:
 ;   Standalone -> $PROGRAMFILES64\Tangent
-;   VST3       -> $COMMONFILES64\VST3\Tangent.vst3
 ;
-; $COMMONFILES64 is "C:\Program Files\Common Files", so that resolves to
-; C:\Program Files\Common Files\VST3 — the location in the VST3 specification
-; and the one every host scans without being configured. Writing anywhere else
-; is the difference between a plugin that appears and one the user has to go
-; looking for.
-;
-; The VST3 is a BUNDLE DIRECTORY, not a loose DLL:
-;   Tangent.vst3\Contents\x86_64-win\Tangent.vst3
-; That nesting is correct and is what the spec describes. Hosts do accept a
-; bare DLL, but only the bundle can carry the licence files alongside it.
+; The VST3 plugin was retired on 2026-08-24. Installers before that also
+; wrote $COMMONFILES64\VST3\Tangent.vst3 (C:\Program Files\Common Files\VST3,
+; where every host scans without being configured); this installer and its
+; uninstaller only remove that bundle, so no host keeps finding a stale build.
 
 Unicode true
 !include "MUI2.nsh"
@@ -46,7 +39,7 @@ Name "Tangent ${VERSION}"
 OutFile "${OUTFILE}"
 InstallDir "$PROGRAMFILES64\Tangent"
 InstallDirRegKey HKLM "Software\Tangent" "InstallDir"
-; Both destinations are under Program Files, so this needs admin. Asking up
+; The destination is under Program Files, so this needs admin. Asking up
 ; front is better than failing halfway through with a file-copy error.
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
@@ -75,9 +68,10 @@ VIAddVersionKey "LegalCopyright" "MIT"
 
 ; **The installer and uninstaller wear the app's own logo**, not NSIS's
 ; default. The caller passes the icon (`-DICON=…/assets/tangent.ico`); the
-; same `ivory.ico` build.rs embeds into `tangent.exe`, so the setup, the app
-; and the Add/Remove entry are one mark. Falls back to the app icon staged
-; beside the binary if the caller says nothing.
+; same `assets/tangent.ico` build.rs embeds into `tangent.exe`, so the setup,
+; the app and the Add/Remove entry are one mark. The fallback below names a
+; file the staged payload does not carry (it holds no `.ico` at all), so a
+; build without `-DICON` cannot find its icon.
 !ifndef ICON
   !define ICON "${SRCDIR}/app/ivory.ico"
 !endif
@@ -85,7 +79,7 @@ VIAddVersionKey "LegalCopyright" "MIT"
 !define MUI_UNICON "${ICON}"
 
 !define MUI_ABORTWARNING
-!define MUI_COMPONENTS_TEXT_TOP "Tangent comes in two pieces. Install either, or both."
+!define MUI_COMPONENTS_TEXT_TOP "Tangent installs as one application."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\tangent.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open Tangent now"
 !define MUI_FINISHPAGE_TEXT "Hold H in Tangent to see every keyboard shortcut."
@@ -141,8 +135,8 @@ Section "Tangent application" SEC_APP
 SectionEnd
 
 Section -Uninstaller
-  ; Always written, even when only the plugin was chosen, so there is always a
-  ; way back out. $INSTDIR exists either way because SetOutPath created it.
+  ; Always written, so there is always a way back out. $INSTDIR exists
+  ; either way because SetOutPath created it.
   SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -187,7 +181,7 @@ SectionEnd
 
 !insertmacro MUI_UNFUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_APP} \
-    "The program, its plug-in and its shortcuts. Always removed."
+    "The program and its shortcuts (and any VST3 plug-in an older installer left behind). Always removed."
   !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_SETTINGS} \
     "Everything under %USERPROFILE%\.config\tangent: settings, taught chord names, the supporter key, logs. Leave this off to keep them for the next install."
 !insertmacro MUI_UNFUNCTION_DESCRIPTION_END

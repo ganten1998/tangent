@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# The release gate: every command docs/RELEASE.md gate 3 names, plus the lint
+# The release gate: every command docs/RELEASE.md gate 1 names, plus the lint
 # policy under the clippy driver, stopping at the first failure so release.sh
 # can refuse on a single exit code.
 #
 # Three test suites, not one, because `cargo test --workspace` alone misses two
-# things (docs/RELEASE.md gate 3):
+# things (docs/RELEASE.md gate 1):
 #   - the full 13,133-row differential sweep is #[ignore]d, so --workspace only
 #     ever runs the 1,500-row fast subset;
 #   - --workspace unifies features, so tangent-core is always compiled WITH

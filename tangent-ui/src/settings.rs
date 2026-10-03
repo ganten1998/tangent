@@ -1208,9 +1208,11 @@ pub struct Settings {
     ///
     /// **Zero is off and a NEGATIVE is auto**, which is the setting to
     /// reach for: the engine works the grain out per callback as eight
-    /// buffers' worth capped at 10.7 ms, which measured best at every
-    /// buffer size on a quiet machine. See `instrument::GRAIN_AUTO_BLOCKS`
-    /// for the table that decided the eight.
+    /// buffers' worth, capped at `MAX_BLOCK` - 512 frames: 10.7 ms at 48 kHz,
+    /// 11.6 ms at 44.1 kHz, 5.3 ms at 96 kHz - which measured best at every
+    /// buffer size on a quiet machine. A fixed value is capped at the same 512
+    /// frames (`set_grain_ms`), so the 10.7 chip is 5.3 ms at 96 kHz. See
+    /// `instrument::GRAIN_AUTO_BLOCKS` for the table that decided the eight.
     ///
     /// Measured on 96 hosted reverbs, forked: at a 64-frame buffer the
     /// worst block goes from 83% of the deadline and 140 late blocks in
@@ -1618,7 +1620,9 @@ pub struct Settings {
     /// Where the swung off-beat sits, percent of its pair: 66.7 is the
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
-    /// **How hard the editor's quantize pulls**, as a percentage.
+    /// **How hard a quantize pulls**, as a percentage: the quantize window's
+    /// STRENGTH, for notes and audio alike (the name dates from the editor's
+    /// own quantize, which the window replaced).
     ///
     /// 100 puts a note on the line; 50 moves it half way and keeps half of
     /// whatever the hand did. A setting rather than a constant because full
@@ -1626,14 +1630,12 @@ pub struct Settings {
     /// the figure somebody wants is a taste, not a default worth arguing
     /// about.
     pub midi_quantize_pct: f64,
-    /// **The quantize window's own grid**, which is deliberately NOT the
-    /// grid the editor or the arrangement is drawing.
-    ///
-    /// `Q` quantizes to what you can see, which is the fast road and the
-    /// right default. The window is the other one: somebody trying a 1/16
-    /// quantize on a take while the arrangement shows bars should not have
-    /// to move the arrangement's grid to do it, and should not accidentally
-    /// move it either.
+    /// **The quantize window's own grid**, which is deliberately NOT the grid
+    /// the editor or the arrangement is drawing: somebody trying a 1/16
+    /// quantize on a take while the arrangement shows bars should not have to
+    /// move the arrangement's grid to do it, and should not accidentally move
+    /// it either. `Q` opens that window from both surfaces; nothing quantizes
+    /// to the grid on screen any more.
     pub quantize_grid_exp: i64,
     /// Three in the space of the next size up, for the window's grid.
     pub quantize_triplet: bool,
@@ -1686,10 +1688,11 @@ pub struct Settings {
     pub midi_pedal_lane: bool,
     /// **The MASTER's row on the timeline**, shown by default.
     ///
-    /// `Cmd`/`Ctrl+M` hides it. It cannot be REMOVED — a session always has
-    /// an output, and a row you can delete and not get back is a row people
-    /// delete once and then look for — so hiding is the only thing the
-    /// keystroke does.
+    /// `Cmd`/`Ctrl+Shift+M` hides it and brings it back (plain
+    /// `Cmd`/`Ctrl+M` is the metronome panel, which took the chord from it).
+    /// It cannot be REMOVED - a session always has an output, and a row you
+    /// can delete and not get back is a row people delete once and then look
+    /// for - so hiding is all the keystroke does.
     pub arr_master_row: bool,
     /// **Supporters only:** the heart drifts through the active palette's
     /// sixteen colours instead of sitting on one.
@@ -3246,7 +3249,8 @@ impl Settings {
         // `record_sources` is NOT read, and is left in `extra` to be written
         // back untouched — the same treatment `record_audio_source` got when it
         // was retired before it. A take is the desk now and there is nothing
-        // left for the key to say; see `record::TakeSource`. Reading it would
+        // left for the key to say (the `record::TakeSource` choice it fed is
+        // gone). Reading it would
         // mean honouring `input`, which is a microphone with none of the
         // effects that were audible while it was played.
         // Whether the FILE carried a bars key. A local rather than a field on
@@ -5683,9 +5687,9 @@ impl Settings {
     /// **Not one of [`Self::media_roots`], and not made at launch.** Both
     /// panels that open on it go through the host's `panel_start` as one of
     /// OUR folders, which makes it on the way in — the same lazy moment the
-    /// per-unit preset drawers have. A sixth root would be made under the
-    /// real `Documents` by the roots test, which overrides the other five
-    /// into a scratch folder and has no override for this one.
+    /// per-unit preset drawers have. It sits under `media_root` like the five,
+    /// so `TANGENT_MEDIA_ROOT` and this crate's per-thread test root cover it
+    /// too; it is left off the list only so that launch does not make it.
     pub fn sysex_root(&self) -> PathBuf {
         self.media_root().join("SYSEX")
     }
@@ -5769,17 +5773,6 @@ impl Settings {
             .join("Tangent")
     }
 
-    /// **An install with takes already in the old place keeps them.**
-    ///
-    /// Changing a default silently relocates everybody who never chose: the
-    /// next launch would open on an empty Takes folder and a project list
-    /// with nothing in it, with the old work still on disk and no sign of
-    /// where. So the move applies to people who have nothing to move, and
-    /// anybody else is PINNED to where their work already is — which they
-    /// can then change from the Project section of the settings panel, on
-    /// purpose, knowing what is where.
-    ///
-    /// Runs once; `media_root_v20` is the marker.
     /// **Throw away a `screen_reader_mode` that the app guessed at.**
     ///
     /// The detection asked egui whether it was building an accesskit tree,
@@ -5817,6 +5810,17 @@ impl Settings {
         true
     }
 
+    /// **An install with takes already in the old place keeps them.**
+    ///
+    /// Changing a default silently relocates everybody who never chose: the
+    /// next launch would open on an empty Takes folder and a project list
+    /// with nothing in it, with the old work still on disk and no sign of
+    /// where. So the move applies to people who have nothing to move, and
+    /// anybody else is PINNED to where their work already is — which they
+    /// can then change from the Project section of the settings panel, on
+    /// purpose, knowing what is where.
+    ///
+    /// Runs once; `media_root_v20` is the marker.
     pub fn pin_legacy_media_root(&mut self) -> bool {
         if self.media_root_v20 {
             return false;
@@ -5891,9 +5895,10 @@ impl Settings {
     /// was written twice and the two copies disagreed.
     ///
     /// A NEGATIVE is AUTO and must survive: the engine reads it as "work the
-    /// grain out from the buffer" (`GRAIN_AUTO`). Anything below -1 folds
-    /// onto -1 so no file can invent a second spelling of the same mode, and
-    /// anything positive is clamped to the range the panel offers.
+    /// grain out from the buffer" (`GRAIN_AUTO`). Any negative folds onto -1
+    /// so no file can invent a second spelling of the same mode (`-0.0` is not
+    /// negative and reads as OFF), and anything else is clamped to the range
+    /// the panel offers.
     ///
     /// The loader had this right from the day Auto shipped. The DIALOG did
     /// not: it clamped to `0.0..=50.0`, which turned the Auto the panel had

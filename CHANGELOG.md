@@ -13,8 +13,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 ### Added
 
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
-  small one.** A new row in the audio setup panel, beside the buffer size
-  and off by default.
+  small one.** A new row in the audio setup panel, beside the buffer size,
+  set to Auto by default. A settings file written by a development build
+  from before Auto was the default keeps Off until the row is changed.
 
   A track's effects are normally run once per audio callback, and most of
   what a plugin costs is paid per call rather than per sample: ninety-six
@@ -23,12 +24,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   stretches staggered across tracks so each callback refills a share of the
   desk rather than all of it.
 
-  **Nothing is delayed.** A stretch is rendered earlier in wall clock for
-  the same positions in the song, so the sound comes out when it always
-  did. What does arrive later is the desk's answer to a CHANGE: a plugin
-  knob, an automation edit or a clip edit lands on a rendered-ahead track up
-  to the chosen number of milliseconds late. Faders, sends, mute and solo
-  are applied at the moment the audio is played and are unaffected.
+  **The audio is not delayed.** A stretch is rendered earlier in wall
+  clock for the same positions in the song, so the sound comes out when it
+  always did. What does arrive later is the desk's answer to a CHANGE: an
+  automation edit or a clip edit lands on a rendered-ahead track up to the
+  chosen number of milliseconds late. And a plugin parameter's own
+  automation is read once per stretch, so on a rendered-ahead track it
+  plays up to twice that late. Faders, sends, mute and solo, and their
+  automation, are applied at the moment the audio is played and are
+  unaffected.
 
   Measured here on thirty-two tracks carrying three FabFilter Pro-R 2
   reverbs each - ninety-six of them - with other work running on the
@@ -119,6 +123,146 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Tangent does not use.
 
   Log out and back in for a new group to take effect.
+
+- **Quantize, for audio takes as well as MIDI.** Q opens the quantize
+  window, in the arrangement and in the MIDI editor alike. With the editor
+  open it moves notes: the selected ones, or every note in the clip when
+  none is selected, each keeping its length and staying inside its clip.
+  Otherwise it moves the attacks in the selected audio clips, and any MIDI
+  clips in that selection are left alone. In the MIDI editor Q used to snap
+  the selected notes straight onto the editor's grid; it opens the window
+  there too now.
+
+  It is a window you leave open, not a question to answer: select a clip,
+  press Apply, listen, select another. Apply does not close it. Its top
+  line says what Apply would act on ("2 audio clips", "all 47 notes in this
+  clip") and follows the selection as it changes, and Space still plays and
+  stops the song while it is up.
+
+  It has a grid of its own rather than borrowing the view's (a grid size,
+  triplet, and a swing amount where 50% is straight), so trying a sixteenth
+  quantize does not change what the arrangement draws. STRENGTH is how far
+  each note or hit travels: 100% puts it on the line, and less keeps some
+  of what was played. WINDOW leaves alone anything further than that from
+  a line, which is what stops a grace note, a flam or the second half of a
+  roll being collapsed onto the beat it decorates; at 0 it is off and
+  everything moves. The window opens on the settings you last applied, and
+  they are saved with the session.
+
+  **Audio is quantized inside the clip, not by cutting it up.** The take's
+  attacks are found and moved onto the grid, and each attack plays back
+  exactly as it was recorded while only the sustain after it is stretched.
+  On a test recording of clicks, stretching through the attacks put every
+  hit 6.5 ms late; keeping them puts each within half a millisecond of the
+  line. The *detect* slider sets how readily something counts as an
+  attack. The fit decides how a moved piece of audio gets where it
+  belongs: *stretch* fills the distance, and *slice* moves it untouched, so
+  a hit moved later leaves a gap in front of it and one moved earlier cuts
+  short the sound before it, as a split would. The *auto* fit, the default,
+  listens to the material: percussive takes are sliced and sustained ones
+  stretched, decided once for the whole clip. The quantize is an edit on
+  the clip, so it undoes, it saves, and the waveform moves with it. It is
+  rendered in the background the way a stretch is, and the clip is silent
+  until the render lands.
+
+  **While the window is open, the waveform shows its answer.** Every attack
+  it finds in the clips it would act on gets an amber tick, with a fainter
+  one where the grid will pull it, and both follow the dials as they turn,
+  so a detection setting is something you can see before you commit to it.
+  A take that is already quantized wears its ticks on its hits, and a
+  looped clip is marked in every pass.
+
+  **Q aims at a track.** Click a track's header and press Q, and that
+  track's audio clips are selected for it (a folder stands for the tracks
+  inside it), unless the clips already selected are all on tracks you
+  picked.
+
+  **Not yet right everywhere.** On a clip trimmed from its front, as the
+  second half of a split is, what the trim hides (a take's audio, a part's
+  notes) is pulled onto the clip's start and heard there. A time-stretched
+  audio clip is quantized and marked as if it were not stretched, and the
+  marks on a looped clip are not limited to the attacks its loop plays. In
+  a song whose tempo or meter changes, the grid is one tempo and one meter
+  counted from 0:00, so after the first change it misses the lines the
+  arrangement draws. And an audio quantize is tied to the sample rate it
+  was made at: exported at another rate, or opened on a device running at
+  another, it is applied to the wrong audio.
+
+- **Audio clips glue.** Cmd/Ctrl+G welds audio clips the way it has always
+  welded MIDI ones: two or more on one track, or one that repeats, become
+  one clip. They are rendered exactly as they play (trim, loops, fades,
+  gain, a quantize and a stretch included) into a new 32-bit float WAV in
+  the project's media folder, and replaced by one plain clip that loops
+  over its own length and plays the same samples they did. Like a MIDI
+  glue it takes one track and one kind of clip at a time, and it is
+  refused on a frozen track. Not yet safe with no audio engine running, as
+  when the recorder band is closed: the weld is then written as 48 kHz
+  audio whatever rate the clips were decoded at, so where the device ran
+  at another rate it plays at the wrong speed (undo brings the clips back).
+
+- **Automation nodes make steps, and move as a set.** Two nodes may now
+  share an instant, which is a step: the curve arrives at the first and
+  leaves from the second. A node could not sit on a neighbour's time
+  before, and a drag that passed over one destroyed it. The very start of
+  the song is the one place a step cannot be heard, so a node put down on
+  the first node there gives it its value instead.
+
+  Drag across an automation row's empty room and a box chooses every node
+  inside it; a press that does not move is still the click that places the
+  playhead. Dragging a chosen node carries all of them by the distance the
+  hand travels, and a click alone moves nothing. A group dragged against
+  the start of the song or the top or bottom of the row stops there as a
+  shape instead of piling onto one spot. Shift-click on a node still adds
+  it to the choice or takes it back out. Delete or Backspace removes the
+  chosen nodes, all but a node at the very start of the song, which holds
+  the row's level; it used to remove the selected track, and held down it
+  still does once the nodes are gone. Copy, cut and paste work on them: a
+  paste lands at the playhead, snapped when the magnet is on, on the row
+  you chose, pressed or copied from, replaces the nodes in the span it
+  covers, and arrives chosen. The clip menu's Delete and Copy act on the
+  clip even while nodes are chosen, and undo, or opening or closing a row,
+  lets the choice go rather than leave it on the wrong nodes.
+
+- **Cmd/Ctrl+A opens the selected track's automation menu**, the same as
+  the wrench on its header. In the MIDI editor it still selects every note.
+
+- **A built-in effect's window follows its automation.** The knobs,
+  readings and EQ curve of an open Tangent effect show the automation's
+  value at the playhead, and move with it as the song plays. It is display
+  only: saving, or storing a preset, keeps the setting you made by hand. A
+  knob with automation on it follows its curve rather than the mouse, so a
+  drag never writes the curve's passing value into your setting (moving an
+  EQ band whose frequency is automated changes only its gain); a value
+  typed into its reading still sets it.
+
+- **Mute and solo take the record arm's alt and shift.** A plain click
+  toggles and carries the selected strips with it. Alt-click makes that
+  strip the only one muted or soloed, and alt-click on the strip that is
+  already alone clears them all. Shift-click toggles that one strip and
+  leaves the selection out of it. Exclusive solo is the one most worth
+  having: with several tracks soloed, hearing just one used to mean
+  clicking each of the others off.
+
+- **Audio Setup chooses the output.** A new OUTPUT row beside SYSTEM lists
+  the outputs the system offers, with "the system's own" first. It matters
+  most under ASIO, which has no default device: Tangent opened whichever
+  ASIO driver came first in Windows' list, so a machine with FL Studio
+  ASIO or ASIO4ALL installed beside a real interface opened the wrapper,
+  and nothing in the app could say otherwise. The output belongs to the
+  computer, not the song, so projects do not carry it; changing the audio
+  system forgets it, since a device name from one system means nothing to
+  another, and so does resetting Devices and Folders.
+
+  **Not yet right in two places.** Under ASIO, while a driver is running,
+  the row lists only that driver, so the interface still cannot be picked
+  from it, and "the system's own" there is still the first driver in the
+  list. And on macOS or under WASAPI, an output chosen by name that runs at
+  a different rate from the system's default output makes Tangent rebuild
+  its audio every three seconds or so (setting SAMPLE RATE to the default
+  output's rate avoids it).
+
+- **A count-in being recorded into the take shows its beat in red** on the
+  band's display.
 
 ### Fixed
 
@@ -216,6 +360,172 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   single block. The measured level a rack is handed went from -40 dBFS to
   -180, and loading each bay got faster, not slower, because the drain
   finishes at once instead of waiting out eight blocks of decay.
+
+- **A take made after the audio engine restarted was silent.** Changing the
+  buffer size or the sample rate, or the automatic recovery after the
+  output goes quiet, rebuilds the audio engine, and from then on every take
+  recorded digital silence: the new engine's connection to the take
+  recorder was lost in the handover. It is kept now. A take that starts
+  with no working connection still records silence, but it now ends with
+  an error that says why. Measured on the Linux machine that found it: a
+  take after the engine was rebuilt peaks at -17.5 dB, the same as the
+  output.
+
+- **A dry stem now carries the instrument that plays it.** A MIDI track
+  played by an instrument in its bays (the Analog, the sampler, any hosted
+  instrument) rendered its dry stem silent, and so was left out of a dry
+  export altogether: the dry copy was taken before the bays ran, and such
+  an instrument makes its sound inside them. An instrument in one of the
+  track's first three bays writes the dry stem too now; one in bays 4 to 6
+  is still left out.
+
+- **The count-in's last click sounded twice.** The count-in and the
+  metronome both played the downbeat where one hands over to the other, a
+  sample apart. The metronome lets the count-in's click stand now. Not yet
+  right with the playhead parked between two beats: there the song's first
+  click after the count-in is lost.
+
+- **The Analog's arpeggiator follows the song's tempo.** With the transport
+  stopped it ran at 120 bpm whatever the song said, until play had been
+  pressed once: on a 90 bpm song a held chord at 1/8 gave four notes a
+  second instead of three. It also worked its beat out from the tempo knob
+  alone, so on a song with a tempo ramp it drifted further from the click
+  every bar; it follows the tempo map now. And the ARP switch acts on a
+  chord you are already holding: switching it on starts the pattern,
+  switching it off hands the chord back to the keys, and moving the switch
+  between its on positions keeps the pattern's place.
+
+- **An armed input is no longer heard bare while its plugins load.** A rack
+  fills one plugin at a time, so for a second or two after a session
+  opened, a guitar meant to go through an amp reached the speakers as the
+  bare DI, the loudest thing in the room. While the racks are being
+  rebuilt (a session opening or a new one starting, or the audio engine
+  restarting, as it does for a new buffer size or sample rate), monitoring
+  now waits until every plugin an armed audio input is heard through has
+  loaded: its own, its folders' and those of any track it is routed to. A
+  plugin you add by hand does not touch monitoring. And a denoiser that
+  has just loaded applies its full reduction from its first moment instead
+  of fading in from none.
+
+- **"Untitled" folders stopped piling up.** Save As Template on a session
+  you had never saved wrote that session into Projects/Untitled before
+  copying it, every time. The template is written straight from memory
+  now, always with its drum kit, and no Untitled folder is left behind;
+  the template it replaces is kept until the new one is complete, and the
+  session then counts as saved, since the template holds it. "Don't Save"
+  means it: answering it on New, Open or Quit no longer writes the
+  session, or its plugin settings, back into the project anyway, and the
+  Project window's New and Open now ask before leaving an unsaved session
+  at all. An Untitled folder this session created is removed when you
+  answer Don't Save, provided it holds no saved clips and no recording,
+  instead of pushing the next session to "Untitled 2", and a drum kit
+  built in it goes with it. Open and Quit keep one that holds a recording;
+  New does not yet, and unless its kit was changed it removes the Untitled
+  it stands on, recording and all. The launch clean-up no longer mistakes
+  Finder's .DS_Store files, freeze renders or copies of the template's own
+  samples for work. And a new session takes the template's drum kit
+  rather than the last project's.
+
+- **The band's controls no longer vanish in a smaller window.** At 900
+  points wide (the window at 100% on a 1440-point screen) the transport
+  icons shrank until the settings cog was too small to draw while its
+  button stayed live, and between 794 and 889 points the send knobs, the
+  master, the pitch dial and the tempo knob dropped out together. Icons
+  keep a floor size now, a knob's caption gives way before the knob does,
+  and every control is drawn at every width from 560 to 2600 points.
+
+- **Reset Everything resizes the window straight away.** It put the
+  window's size back to 100% in the settings and left the window as it was
+  until the next launch. It resizes it at once now, and undoing the reset
+  puts the window back.
+
+- **In the plugin, Reset Everything no longer turns on a recorder band.**
+  The plugin has no recorder to fill one, and nothing in its menus could
+  turn the band off again.
+
+- **The settings panel behaves.** DONE no longer also places the playhead
+  in the song under it, a signature typed into SIG is kept when you click
+  away, and Escape backs out one layer at a time. On Linux, AUDIO SETUP
+  and the strips name a USB interface by its maker and model rather than
+  by its PipeWire node. And a short name given to an input you chose stays
+  with that interface: with it unplugged, the default input standing in
+  for it is no longer shown under its name.
+
+- **Audio Setup shows the audio system that is actually running.** It
+  marked a system only once the setting named one, and the setting is
+  empty until you choose, so a fresh install playing through WASAPI lit
+  neither of the row's choices. During an ASIO fallback it marks the
+  system standing in.
+
+- **An ASIO driver's refusal says why.** A buffer size the driver would
+  not take, or buffers it could not create, reached the log as a device
+  that was not available, which was the one thing that was not true, and
+  the real reason went to a console a Windows app does not have. The
+  driver's own reason is in the log now.
+
+- **One gesture, one undo.** After normalising and then quantizing a take,
+  one Ctrl+Z undid both, because the normalise had no undo step of its
+  own. The same fault folded these into whatever you did next: adding a
+  track; dragging the arrangement header's knobs; the mute, solo, arm,
+  polarity and theory switches, in the mixer and the arrangement alike;
+  dragging the band's master fader, send knobs and varispeed, and a
+  double-click that resets a knob; the metronome panel's division,
+  count-in and click-sound rows, and the switches that record the click
+  and the count-in into a take; choosing a DX7 cartridge, a DX7 patch, the
+  default bank or a Keys sound; and collapsing a folder. The opposite fault
+  took several presses to undo one thing. With the magnet off, a
+  two-second marker drag pushed 120 steps into a history that holds 100.
+  Carrying a time-signature change along the ruler left two steps for
+  every bar it crossed, the first of each pair a song with that change
+  missing. Dragging a plugin to another bay left a step with the plugin in
+  both. A multi-file import left one step per file, and deleting a track
+  left one for each plugin on it plus one for its clips. Grouping tracks
+  into a folder, inserting a track or pasting one left a step with every
+  track shifted down and nothing in the gap. Each is one step now. Undoing
+  a grouping, an inserted track or a pasted one does not yet put back the
+  settings of the plugins on the tracks that moved: each comes back at its
+  factory settings, or at a neighbour's where both carry the same plugin.
+
+- **Undoing a Paste FX or a bay swap restores the replaced plugin's
+  settings as they were last written to disk**, at a save or when its own
+  window was closed. A plugin dialled in since then (any built-in unit)
+  still comes back at those settings, or at its factory values if it was
+  never saved.
+
+- **The Stream to OBS window keeps what you typed however it closes.**
+  Escape or the window's close button threw away a typed identifier and
+  host, and a stream that was switched on went on sending to the old ones.
+  And the MIDI Inputs window follows devices being plugged in and out while
+  it is open, keeping the boxes you had ticked.
+
+- **The MIDI editor's playhead loops with the clip.** Inside a looping clip
+  the line kept going past the pass the roll draws, while the sound looped
+  correctly. It wraps with the loop now, and inserting, pasting, splitting,
+  Backspace, the arrows and the zoom all act where the line is drawn; the
+  navigator strip, which shows the whole clip, still shows where the song
+  is. The loop bar counts from where the loop does, so on a clip trimmed
+  from its front it stands where the loop turns over, and with the magnet
+  on, dragging it keeps the loop a whole number of grid steps long. Not
+  yet on a looping part trimmed from its front: in the first moments of
+  each later pass, which the roll draws before the clip's head, inserting,
+  pasting and Backspace act at the head instead, and the song can jump
+  forward.
+
+- **The edge of the track headers waits before it resizes.** It took the
+  slightest movement as a resize, so a click meant to send the playhead
+  home moved the edge. It waits for 8 points of travel now, and a click
+  that stays inside them always sends the playhead home.
+
+- **Render ahead's Auto could be chosen and never stuck.** The panel stored
+  it as Off; it is kept now.
+
+- **File names made from clip and export names are safer on Windows.**
+  `< > : " | ? *` and control characters become `-`, and trailing dots are
+  trimmed: Windows refuses the first in a file name and drops the second.
+
+- **Two small ones on the band:** the cassette's hubs keep an edge at the
+  band's smallest size, and the Sandstone and Celadon hearts have a dark
+  border.
 
 ### Changed
 
@@ -523,6 +833,86 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   renders any WAV through the unit from a bay's saved print, and reproduces
   the plugin's own output to within 3e-3, so the next change is measured on
   a real take too.
+
+- **A take records and nothing else; the transport stays yours.** Pressing
+  the cassette used to roll the song, refuse Play and Pause, leave Space
+  doing nothing, ignore the loop and make Stop end the take: the opposite
+  of what a take is for when you are filming a walkthrough of a project.
+  Now a take is started and ended by the cassette, never by the transport,
+  and it no longer starts the song: the song plays when you play it, as it
+  does with no take running. Record, play, stop, pause and the cassette
+  stay where they are on the band, and Stop, Space, auditioning a chord,
+  undo and redo and moving tracks all work while a take is recording. A
+  realtime export is the one exception: it owns the transport while it
+  runs.
+
+  A take and the red button share one count-in: a take started during the
+  red button's count joins it, the red button pressed during a take's
+  count joins that one, and Play during either starts the song on the
+  downbeat. A take's `take.json` records whether the song was rolling when
+  it began (`timeline_rolling`), which says whether
+  `timeline_start_seconds` places its first frame.
+
+- **The take's settings are on the cassette.** Right-click it for the TAKE
+  panel: the take's name and folder, count-in, signature and export, and
+  the take's switches. Right-click the red button, when no take is
+  running, for a RECORDING panel with just the count-in and the signature.
+  The cog keeps the machine (Audio Setup, hearing the input, the project
+  and plugin doors, where things are kept) with the count-in and signature
+  as well. A row is the same size in all three.
+
+- **In the arrangement, Cmd/Ctrl+M opens the metronome panel; showing and
+  hiding the master row moved to Cmd/Ctrl+Shift+M.** The panel opens in the
+  middle of the arrangement, and a second press closes it. It carries the
+  count-in now, counted in bars ("off", "1 bar", "2 bars"), and IN TAKE
+  chooses whether the count stops before the take begins or carries on
+  into it, recorded at the head of the file. Not yet right at a click
+  division other than one a beat: the count runs that many clicks instead
+  of beats, so it is shorter or longer than it says, and with a faster
+  click a take whose count stops before it begins loses its opening.
+
+- **During a count-in or an export the tempo is held.** In a count-in the
+  tempo knob dims and TAP refuses; while an export renders, both leave the
+  band's row. The metronome panel's tempo row and the tempo lane refuse a
+  change until the count is over or the export has finished, and a screen
+  reader hears the held controls as unavailable. Undo and redo wait as
+  well, since a step back can change the tempo.
+
+- **A session carries the arrangement's own grid and window.** The magnet,
+  the grid, whether the tempo lane and the master row are showing, the
+  width of the track headers, how many lanes fit the window and the
+  quantize window's settings are saved in the project now, beside the
+  metronome, tempo and signature that already were. Opening a project
+  saved this way no longer leaves the timeline wearing the last session's
+  choices; one saved before this opens with the timeline as it was last
+  left, and records its own at the next save. Like the theme, changing one
+  is an edit to the song: it undoes, and it marks the project unsaved. The
+  lane count travels with the height of the window it was chosen in, so on
+  a display of another size it gives about the same lane height rather
+  than the same number of lanes. Not yet for the header width and the lane
+  count while they are on Auto, as on a fresh install: a project saved on
+  Auto opens on whatever the window already had, and undoing the first
+  change away from Auto leaves it standing, after which undo can go no
+  further back and the redo is lost.
+
+- **A clip's waveform shows its gain.** Normalising a take changed how it
+  sounded and not how it looked. The waveform is drawn at the clip's level
+  now, held inside its lane when the clip is lifted past full scale.
+
+- **On Windows, every program Tangent installs is signed.** Windows 11's
+  Smart App Control checks each program every time it starts and blocks an
+  unsigned one it does not know, with no override, not even for an
+  administrator: a tester's installed Tangent stopped opening the day Smart
+  App Control switched itself on. The app, its bundled video encoder, the
+  installer and the uninstaller are all signed now, under the author's own
+  name, and a Windows release cannot be cut with any of them unsigned.
+  SmartScreen may still say "Windows protected your PC" on the first signed
+  releases, because that warning goes on reputation, which a new signature
+  has to earn.
+
+- **The Windows download's video encoder is FFmpeg 8.1.3** (it was 8.1.2).
+
+- **The supporter's heart moves at half the speed.**
 
 ### Fixed
 
@@ -1069,9 +1459,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the roll with a grip tab on the ruler above it: drag it left to shorten the
   loop and right to lengthen it. Shortening turns one pass into several without
   touching the clip's place on the timeline, which is how a four-bar part
-  becomes four repeats of one bar; lengthening past the clip's own end grows
-  the clip with it, because the schedule drops everything past the clip's end
-  and a loop whose tail is silent is a control that lies. It follows the SNAP
+  becomes four repeats of one bar; lengthening stops at the clip's own end,
+  because the clip's length belongs to the timeline (see "The loop bar
+  stops at the clip instead of stretching it"). It follows the SNAP
   chip like everything else in the editor, so a loop lands on the grid the
   notes in it landed on, and it will not be pulled shorter than one grid line.
   A note that ends on the turn keeps its own edge — notes win on the roll, and
@@ -1151,10 +1541,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   unless somebody is deliberately testing it.
 
 - **Stems export asks which stems: dry, or processed.** The export dialog's
-  SOURCE row is joined by a STEMS row with two chips. *Processed* writes each
-  lane through its own insert rack — the mix's own sound, one file per lane,
-  and the default. *Dry* writes each lane before its own inserts, for a remix
-  somewhere else. The rule is the same at every strip: a dry stem is that
+  SOURCE row is joined by a STEMS row with two chips. *Dry* writes each lane
+  before its own inserts, for a remix somewhere else, and is what the STEMS
+  row comes up on when SOURCE moves to stems; pick *Processed* and it stays
+  picked while stems stay on. *Processed* writes each lane through its own
+  insert rack: the mix's own sound, one file per lane. The rule is the same
+  at every strip: a dry stem is that
   strip's own bays taken out and nothing else's, so a group's dry stem is the
   group before its bus compressor with its children exactly as they reach the
   mix. The two write to different folders — `stems/` and `stems-dry/` — so a
@@ -1202,7 +1594,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Every launch opens the default session.** Tangent no longer reopens the
   project that was on screen when it quit; it stands on a fresh copy of the
   default template every time, and the last session is a File > Open away.
-  A scratch with takes or edits in it stays on disk for that panel. The
+  A scratch stays on disk for that panel if it holds an audio recording or
+  was saved with clips in it; one this session created that holds neither
+  is deleted, with its kit, imported copies and plugin settings, when you
+  answer Don't Save on New, Open or Quit. New does not keep a recording
+  yet: unless the scratch's kit was changed, it removes the scratch it
+  stands on, recording and all. The
   owner: "make it so every launch opens the default session, and doesn't
   open the previously open session."
 
@@ -1341,10 +1738,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   key everywhere else on this desk and therefore meant the opposite of what the
   rest of the app teaches. Alt takes it over, and it ignores the strip selection
   the way no other control does — spreading it would arm the very tracks the
-  gesture exists to stand down. Shift now ADDS rather than toggles, so sweeping
-  it across four lanes leaves four armed instead of turning back off whichever
-  were already on. A plain click still toggles one lane, which is the only
-  gesture here that can disarm without disarming everything. Both views, since
+  gesture exists to stand down. Shift touches only the lane under it, leaving
+  the strip selection out of it, and flips it (see "Both arm modifiers can
+  undo themselves"); a plain click toggles the lane and carries the selected
+  strips with it. Both views, since
   the arrangement's header and the mixer's strip have always shared one road.
 
 ### Changed
@@ -1503,10 +1900,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 - **Enter no longer starts a take.** It began one from any surface, on the
   argument that the key which starts a performance must not be the one that
-  ends it. Cmd+R does both, and a bare, enormous, centre-of-the-keyboard key
-  that rolls tape is a take started by a stray press — and the MIDI editor
-  now wants Enter for writing a note. The owner: "Remove enter for record --
-  we already have command r."
+  ends it. But a bare, enormous, centre-of-the-keyboard key that rolls tape
+  is a take started by a stray press, and the MIDI editor now wants Enter
+  for writing a note. No key starts or ends a take now: the cassette's own
+  button does both. Cmd/Ctrl+R is the arrangement's red button: it counts
+  in and records the armed tracks, cancels a count-in, or stops a running
+  record, and it works while a take is running. The owner: "Remove enter
+  for record -- we already have command r."
 
 - **The Humanize menu opens under the pointer, and is bigger.** It opened
   centred on the roll and wore the swing menu's rows, which are a list to pick

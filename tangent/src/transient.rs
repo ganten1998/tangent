@@ -46,12 +46,14 @@ use tangent_record::decode::Clip;
 /// One detected attack: where it is, and how strongly it announced itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transient {
-    /// Frames from the start of the clip. The FOOT of the rise - see the
-    /// module header.
+    /// Frames from the start of the clip - the decoded FILE, at the rate it
+    /// was decoded at. The FOOT of the rise - see the module header.
     pub at: usize,
-    /// How far above the local floor this peak stood, as a multiple of it.
-    /// A caller ranking or thinning detections reads this; the detector
-    /// itself only uses it to order equals.
+    /// The detection function at this peak: how far, in dB, the hop rose
+    /// over the loudest hop of the last [`LOOKBACK_S`] (not a multiple of the
+    /// local floor, which only decides whether it counts). A caller ranking
+    /// or thinning detections reads this; the detector itself only uses it to
+    /// order equals.
     pub strength: f32,
 }
 
@@ -78,35 +80,16 @@ const LOOKBACK_S: f64 = 0.026;
 /// ~130 ms each side, so the floor tracks a phrase rather than a bar.
 const FLOOR_HALF: usize = 100;
 
-/// **Find the attacks.**
+/// **What a file sounds like, before anybody has said how readily to call
+/// a rise an attack** - the sensitivity-free half of the detector, made by
+/// [`analyse`] and read by [`pick`].
 ///
-/// `sensitivity` runs 0 to 1: 0 reports only what stands far above its
-/// surroundings, 1 reports nearly every rise. 0.5 is the default and is
-/// tuned so a click track gives one detection per click and a held chord
-/// gives none after its own start.
-///
-/// Returns positions in ascending order, each the foot of its rise.
-///
-/// **In two halves, and every caller uses both.** [`analyse`] is the whole
-/// cost and reads no sensitivity; [`pick`] is what a hand on a dial
-/// re-runs. There is no one-shot door, because the only caller there has
-/// ever been wants to turn the dial - see `DesktopApp::attacks_of`.
-///
-/// **What a file sounds like, before anybody has said how readily to call a
-/// rise an attack.**
-///
-/// Everything in [`detect`] up to the threshold: the envelope of the
-/// differenced signal, one pass over every sample, and the flux against the
-/// recent peak, one pass over the hops. Neither reads `sensitivity`.
-///
-/// It is split out because the quantize window's marks are redrawn while
-/// somebody is dragging the detect slider, and this half is the whole cost:
-/// a three-minute take is eight million samples through the envelope and
-/// nothing about turning the dial changes any of it. The host analyses a
-/// file once and [`pick`]s from it per dial position - see
-/// `DesktopApp::attacks_of`.
-///
-/// `None` for a clip too short to have hops to compare.
+/// It is in the frames of the decode it was made from (`rate`, `frames`).
+/// Positions picked from it mean nothing against a decode at another rate
+/// or of another file, so a cache of these has to be emptied wherever the
+/// decode cache it was filled from is. Not yet true of the host's
+/// (`DesktopApp::attacks_of`): it is keyed by path alone and emptied only
+/// when it reaches its cap.
 pub struct Analysis {
     env: Vec<f32>,
     /// Every hop the flux PEAKS on, with the local median it stands over.
@@ -134,6 +117,14 @@ struct Cand {
     median: f32,
 }
 
+/// **Every rise in `clip` that turned over, with the floor it stands on.**
+///
+/// The whole cost of a detection - the envelope of the differenced signal
+/// (one pass over every sample), the flux against the recent peak, and the
+/// local median at every positive flux peak - and none of it reads the
+/// sensitivity. The host analyses a file once and [`pick`]s from it per
+/// dial position - see `DesktopApp::attacks_of`. `None` for a clip under
+/// eight hops (~10 ms).
 #[must_use]
 pub fn analyse(clip: &Clip) -> Option<Analysis> {
     let hop = ((f64::from(clip.rate.max(1)) * HOP_S) as usize).max(1);
@@ -253,11 +244,15 @@ pub fn analyse(clip: &Clip) -> Option<Analysis> {
 }
 
 /// **Which of an [`Analysis`]'s rises count as attacks at this
-/// sensitivity.** The cheap half: one walk of the flux, and a local median
-/// taken only at the hops that are actually peaks.
+/// sensitivity.** The cheap half: one walk of the candidates [`analyse`]
+/// found, each already carrying its local median.
 ///
-/// `sensitivity` runs 0 to 1 and is the MARGIN over that median - see
-/// [`detect`], whose doc this half answers.
+/// `sensitivity` runs 0 to 1 and sets the MARGIN over that median: 0 reports
+/// only what stands far above its surroundings, 1 reports nearly every rise.
+/// 0.5 is the default and is tuned so a click track gives one detection per
+/// click and a held chord gives none after its own start.
+///
+/// Returns positions in ascending order, each the foot of its rise.
 #[must_use]
 pub fn pick(a: &Analysis, sensitivity: f32) -> Vec<Transient> {
     let Analysis { env, cand, hop, rate, frames } = a;
@@ -292,8 +287,11 @@ pub fn pick(a: &Analysis, sensitivity: f32) -> Vec<Transient> {
         out.push(Transient { at: foot(env, k, max_back) * hop, strength: flux });
         last = Some(k);
     }
-    // The foot walk can land two detections on one frame when a hit rises
-    // over more hops than the refractory period covers.
+    // A guard, not a case that happens today: the foot walk reaches back at
+    // most `max_back` hops (~6 ms) and two kept detections are at least
+    // `min_gap` hops (~30 ms) apart, so at any real sample rate no two land
+    // on one frame. It keeps the list strictly ascending if either constant
+    // moves.
     out.dedup_by_key(|t| t.at);
     out.retain(|t| t.at < frames);
     out
@@ -500,8 +498,6 @@ mod tests {
         }
     }
 
-    /// **Sensitivity moves the count in the direction it says**, which is
-    /// the only promise the dial makes.
     /// **The dial is free to turn.**
     ///
     /// `analyse` is the whole cost of a detection and `pick` is what a hand
@@ -547,6 +543,8 @@ mod tests {
         );
     }
 
+    /// **Sensitivity moves the count in the direction it says**, which is
+    /// the only promise the dial makes.
     #[test]
     fn a_lower_sensitivity_never_finds_more() {
         let c = clicks(4.0, 0.25);

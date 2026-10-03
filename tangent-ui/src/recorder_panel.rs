@@ -973,13 +973,18 @@ struct Layout {
     preview: Rect,
 
     // ── transport ──
-    /// The green button. Idle and audition only — during a take the slot is
-    /// EMPTY, because record owns the transport and a dead control is worse
-    /// than no control.
+    /// The green button: play from the playhead. Play only - a press while
+    /// the song rolls does nothing, and Pause is its own button. Seated in
+    /// BOTH layouts, in the same place - a take is capture only - and
+    /// `NOTHING` only under a realtime export, which owns the transport
+    /// (`fill_rolling`).
     play: Rect,
+    /// The arrangement's red button: seated under a take as at rest,
+    /// `NOTHING` under a realtime export.
     record: Rect,
-    /// The steady red dot, which takes the record button's place while rolling.
-    /// An indicator and not a control, so it is not a hit.
+    /// Stop: the transport and the arrangement's record, never a take (the
+    /// cassette ends that). Seated in every layout, an export included - it
+    /// is how an export is cut short.
     stop: Rect,
     meter: Rect,
     /// The take's readout - the count-in digit, the take's clock, FINISHING -
@@ -1348,12 +1353,6 @@ impl Layout {
         self.fill_faders(body, gap, false);
     }
 
-    /// The transport column: the round record button, a stop beside it, the
-    /// meter under both, and the clock under that.
-    ///
-    /// The clock now takes the whole width of the column. That is what deleting
-    /// the `CLOCK` toggle bought — the timecode used to share its row with a
-    /// small mystery box, and the box is what was making the number small.
     /// The middle group's rectangle AT REST, whatever the state.
     ///
     /// The faders are placed from this in both layouts, so the two controls
@@ -2205,10 +2204,10 @@ impl Layout {
         );
     }
 
-    /// Rolling: readable from the bench. The preview collapses to a strip that
-    /// is enough to see somebody has walked in front of the camera and no more,
-    /// the two things worth reading from two metres away take most of the rest,
-    /// and the monitor column stays exactly where it was.
+    /// Rolling: the at-rest layout, readable from the bench. The preview keeps
+    /// its size and the transport row its places (a realtime export takes
+    /// record, play, pause and the tempo away), and the take's readout - the
+    /// count-in beat, the clock - goes onto the LCD's scope glass.
     fn fill_rolling(&mut self, body: Rect, gap: f32, view: &RecorderView<'_>) {
         // **The same preview, at the same size**, placed in `new` for both
         // layouts. It used to collapse to a strip when a take started, back
@@ -2546,7 +2545,10 @@ pub enum Hit {
     NameField,
     PickCamera,
     PickAudio,
-    /// Cycle 0 / 4 / 8 beats. See [`next_count_in`].
+    /// Step the count-in through `COUNT_IN_CHOICES` - off, 1, 2, 4 BARS - and
+    /// back round to off. A length off that list (the metronome panel's 3 or
+    /// 5-8 bars) starts the cycle over at off. Stepped in
+    /// `TangentApp::apply_recorder_hit`; see also [`next_count_in`].
     CycleCountIn,
     Export,
     /// Whether the click is also recorded into the file. Lives in the
@@ -3486,11 +3488,14 @@ pub fn timeline_fraction(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Opti
     Some(((pos.x - l.timeline.left()) / l.timeline.width()).clamp(0.0, 1.0))
 }
 
-/// The next count-in length in the cycle, in beats.
+/// The next count-in length in the cycle, in BARS (`COUNT_IN_CHOICES`).
 ///
-/// Here rather than in the app so that the control's label and the effect of
-/// clicking it cannot disagree. An unknown value — a hand-edited settings file
-/// — lands on the first choice rather than sticking.
+/// Meant as the one place the chip's cycle is decided, so that the control's
+/// label and the effect of clicking it cannot disagree - but only a test
+/// calls it today: the chip's own arm in `TangentApp::apply_recorder_hit`
+/// repeats the same walk. An unknown value (a hand-edited file, or a length
+/// the metronome panel set off this list) lands on the first choice rather
+/// than sticking.
 pub fn next_count_in(current: u32) -> u32 {
     let i = COUNT_IN_CHOICES
         .iter()
@@ -3551,8 +3556,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     // border round one band does not mean "recording"; and this function is
     // the same one the compositor calls, so the border was burned into every
     // take. It rings the window now, from `TangentApp::paint`, which the
-    // compositor never calls — see the comment there. The steady dot in
-    // `draw_capture` stays: it is the transport's own light.
+    // compositor never calls — see the comment there. A running take reads
+    // from the lit cassette (`draw_capture`).
 }
 
 /// A control's chrome: a filled box with a hairline, so a thing you can click
@@ -5505,9 +5510,12 @@ fn readout_state(view: &RecorderView<'_>) -> RecordState {
     }
 }
 
-/// **Sized on the WIDEST text the state can show**, never on the text itself:
-/// a clock sized on its own digits would jump a size at 9:59 -> 10:00, and a
-/// count-in at 9 -> 10 beats.
+/// **Sized on the widest text of the readout's current FORMAT, never on its
+/// digits**: the take's clock holds one size from 0:00 to 59:59 and can step
+/// down once, at the hour, when `timecode` grows a field (on a glass too
+/// narrow for the longer text); a count-in is sized on two digits whatever
+/// beat it is on. A clock sized on its own digits would jump at 9:59 ->
+/// 10:00, and a count-in at 9 -> 10 beats.
 fn readout_size(r: Rect, state: RecordState, text: &str) -> f32 {
     let (widest, share) = match state {
         RecordState::CountIn { .. } => ("00", 0.80),
@@ -6522,6 +6530,12 @@ const TRANSPORT_SIDE: f32 = 0.82;
 /// half a point over twice [`COG_MIN_R`], so rounding at the threshold cannot
 /// drop the cog, and it stays under the knob's diameter (11.1 at 900), so the
 /// row keeps its rule of buttons smaller than the dial beside them.
+///
+/// The floor is `side`'s. Where the row cannot also afford `MIN_GAP` between
+/// its nine items, `fill_faders` scales every width - icons included - below
+/// it rather than let the row overlap; the cog is then held by its own floor
+/// (`cog_fits`), which `every_control_is_drawn_at_every_width_the_window_allows`
+/// checks at every width the window allows.
 const TRANSPORT_MIN_SIDE: f32 = 10.5;
 
 /// The smallest cog worth drawing, as a radius. Below it the teeth merge into
@@ -7720,9 +7734,6 @@ mod tests {
         assert!(at_3440 <= 0.72, "the scope crowded the digits out: {at_3440}");
     }
 
-    /// **The metronome panel answers every control it draws.**
-    ///
-    /// It was an egui dialog and read as a foreign object — the owner's "it's
     /// **A panel summoned at a point lands CENTRED on it, both ways.**
     ///
     /// `Cmd+M` hands the middle of the surface as a one-point anchor, and
@@ -7770,6 +7781,9 @@ mod tests {
         }
     }
 
+    /// **The metronome panel answers every control it draws.**
+    ///
+    /// It was an egui dialog and read as a foreign object — the owner's "it's
     /// cut off or looks wonky". Painted like the dials' own panels it is
     /// themed by construction, but a painted panel has to hit-test itself, so
     /// this walks every cell it draws and asks what is under it.
@@ -8556,14 +8570,6 @@ mod tests {
         }
     }
 
-    /// **The PLUGINS row still reads after the resync button took its right
-    /// end**, at every window size the card is drawn at.
-    ///
-    /// `label_text` shrinks its words to fit and DRAWS NOTHING at all below
-    /// `MIN_TEXT`, so taking eight percent of a row's width is not a free
-    /// change: it moves the size at which the row stops existing. The row
-    /// carries the longest caption-plus-value pair on the card, which makes
-    /// it the one that hits the floor first.
     const LONG_NODE: &str =
         "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
 
@@ -8666,6 +8672,14 @@ mod tests {
         }
     }
 
+    /// **The PLUGINS row still reads after the resync button took its right
+    /// end**, at every window size the card is drawn at.
+    ///
+    /// `label_text` shrinks its words to fit and DRAWS NOTHING at all below
+    /// `MIN_TEXT`, so taking eight percent of a row's width is not a free
+    /// change: it moves the size at which the row stops existing. The row
+    /// carries the longest caption-plus-value pair on the card, which makes
+    /// it the one that hits the floor first.
     #[test]
     fn the_plugins_row_still_has_room_for_its_words() {
         for w in [900.0_f32, 1280.0, 1920.0, 2560.0] {
@@ -8693,14 +8707,14 @@ mod tests {
         }
     }
 
-    /// **AUDIO then MEDIA in the cog, TAKE on its own** — the owner's order,
-    /// now split across two shapes: each tier's rows sit under its own
+    /// **AUDIO then MEDIA in the cog, TAKE on its own** - the owner's order,
+    /// now split across shapes: in the cog each tier's rows sit under its own
     /// heading, and no tier's rows reach into the next one.
     ///
     /// The TAKE tier used to be the third band of this panel and is the
-    /// capture button's whole panel since the owner asked for it there. So
-    /// the ordering claim is made per SHAPE: the cog reads audio then media,
-    /// and the take panel reads its heading then its rows.
+    /// capture button's whole panel since the owner asked for it there; that
+    /// panel, like the red button's, wears its tier's name as its TITLE and
+    /// has no heading band, so its rows start right under the title.
     #[test]
     fn the_settings_tiers_read_audio_then_media_then_take() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
@@ -10464,8 +10478,9 @@ mod tests {
             let at_rest = Layout::new(r, &furnished());
             let live = Layout::new(r, &furnished_rolling());
             // The timeline holds still: the playhead somebody is watching at
-            // 0:47 is drawn in the same box it was drawn in at 0:00, even
-            // though a click on it goes dead while the take runs.
+            // 0:47 is drawn in the same box it was drawn in at 0:00, and a
+            // take no longer stops a click on it locating. (Dormant for now:
+            // the LCD owns its box, and both layouts leave it `NOTHING`.)
             assert_eq!(at_rest.timeline, live.timeline, "the timeline moved");
             // So do the master and the effect knobs, which are the levels a
             // hand reaches for mid-take.
@@ -10478,12 +10493,8 @@ mod tests {
         }
     }
 
-    /// The timeline is one rectangle wearing two hits: empty it is the
-    /// import button, loaded it is a locate whose fraction is the fraction
-    /// into the file (a take no longer stands in its way: it films the
-    /// window and does not own the transport).
-    /// **The heart's corner is nobody else's.** It floats at the band's
-    /// very top right and must not sit on the master ladder's numbers or
+    /// **The heart's corner is nobody else's.** It holds the band's
+    /// bottom-right corner and must not sit on the master ladder's numbers or
     /// bars.
     #[test]
     fn the_heart_keeps_out_of_the_masters_scale() {
@@ -11991,24 +12002,16 @@ mod tests {
 // old 290-430 card "too small and a pain to use", and the fix is ROOM —
 // every row's text sizes itself to its rectangle, so width IS legibility.
 const SETUP_W: (f32, f32, f32) = (0.34, 380.0, 580.0);
-/// Its height over its width. Grew with the section headers: the same
-/// seven rows of controls, plus the two bands that name their tiers.
+/// The height over the width of a panel of [`SETUP_ROWS`] rows - the
+/// proportion the one-panel design was tuned at. Read only through `ref_h` in
+/// `SetupLayout::new`, which scales it to the [`SETUP_REF_ROWS`] reference
+/// panel; no shape is drawn at this aspect.
 const SETUP_ASPECT: f32 = 1.16;
-/// Rows of controls under the title.
-///
-/// **Seven: six about the take, and Setup.** The camera and the audio input
-/// left this panel because a device belongs to the control it feeds — the
-/// microphone's own icon opens the audio picker and the camera preview opens
-/// the camera's (see `input_icon` and `preview_rect`).
-///
-/// The audio PATH did not, and should not have. It went out with them in
-/// 4.19.0 and landed nowhere: `Hit::ShowAudioStatus` was left with no target in
-/// any layout, so the panel that says what rate the two streams are running at
-/// — the one that exists because a silent 44.1-against-48 mismatch makes takes
-/// drift — became unreachable from anywhere in the app. It is back, as the last
-/// row, and it is the one row here that is not about a take.
-/// (Kept as the unit the row pitch is derived from; the three section
-/// headers take about half a row each on top of these.)
+/// **Not a row count any more.** No shape shows eleven rows; the number
+/// survives as the denominator that turns [`SETUP_ASPECT`] into the reference
+/// panel's height (`ref_h = w * SETUP_ASPECT * SETUP_REF_ROWS / SETUP_ROWS`),
+/// so changing it changes every shape's row pitch. What each shape actually
+/// shows is `SETUP_MACHINE_ROWS`, `SETUP_TAKE_ROWS` and `SETUP_ROLLING_ROWS`.
 const SETUP_ROWS: usize = 11;
 
 /// **The panel every proportion here was tuned on**: eight rows under two
@@ -12029,24 +12032,33 @@ const SETUP_REF_ROWS: usize = 8;
 /// control - the owner's "undesirable margin/empty space from the bottom".
 const SETUP_MACHINE_ROWS: usize = 7;
 const SETUP_TAKE_ROWS: usize = 6;
-/// The red button's shape: one row of two controls, under one heading.
+/// The red button's shape: one row of two controls - the AUDIO tier's
+/// count-in and signature - under the panel's own title, with no heading band.
 const SETUP_ROLLING_ROWS: usize = 1;
 
 /// **Which tiers of the setup panel a caller wants.**
 ///
-/// One panel, two shapes, rather than two panels. The owner's call - "move
-/// the entire take section of the settings menu to summon when you right
-/// click the capture take button" - and the cheap way to honour it is not to
-/// build a second panel with its own copies of eleven controls. Copies
+/// One panel, three shapes, rather than three panels. The owner's call -
+/// "move the entire take section of the settings menu to summon when you
+/// right click the capture take button" - and the cheap way to honour it is
+/// not to build more panels with their own copies of the controls. Copies
 /// drift: one of them gains a clamp, the other does not, and a year later
 /// two places disagree about what a count-in may be.
 ///
-/// So the tier is a SHAPE of the same layout, drawn by the same code and
-/// hit-tested by the same table. The tier a shape leaves out is laid out
-/// far below the panel, where the clip cannot show it and
-/// [`setup_hit_test`]'s own "is it even in the panel" guard cannot reach it
-/// - which is why neither the draw nor the hit test needed a single guard
-/// of its own.
+/// So a tier is a SHAPE of the same layout, drawn by the same code and
+/// hit-tested by the same table. The bands a shape leaves out are laid out
+/// far below the panel, where the clip cannot show them and
+/// [`setup_hit_test`]'s own "is it even in the panel" guard cannot reach
+/// them.
+///
+/// **Each shape hangs off the control that opened it**
+/// (`TangentApp::setup_anchor`): `Machine` off the cog, or the cassette when
+/// the layout has unseated the cog (mid-take, or a band too small to draw
+/// it); `Take` off the cassette; `Rolling` off the red button. An unseated
+/// control's rect is `Rect::NOTHING`, and a panel hung off it is NaN - not
+/// drawn, still open, and eating the next press - so a shape whose control
+/// can be unseated has to fall back to a seated one or close. (`Rolling` does
+/// not yet: the red button is unseated under a realtime export.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SetupShape {
     /// The cog's panel: the machine and where things are kept.
@@ -12068,14 +12080,13 @@ pub enum SetupShape {
 }
 
 impl SetupShape {
-    /// **The word over the tier this shape shows.** On the shape rather than
-    /// in the painter because it is the thing that tells somebody which
-    /// panel they opened: the red button's two rows sat under a heading that
-    /// said TAKE, and the owner read the panel as the wrong one before
-    /// reading a single control in it.
-    ///
-    /// `Machine` has two tiers of its own and names them where they are
-    /// drawn; this is the one heading the other shapes carry.
+    /// **The word for the one tier a single-tier shape shows** - TAKE or
+    /// RECORDING - worn as that panel's TITLE (see
+    /// [`SetupShape::title_word`]): those two shapes carry no heading band,
+    /// because a panel headed TAKE over a heading reading TAKE wore its own
+    /// name twice. `Machine` names its AUDIO and MEDIA tiers where they are
+    /// drawn, so its answer here is never shown. (`draw_setup` still pairs
+    /// this word with `take_head`, which no shape lays out on the panel.)
     pub fn tier_word(self) -> &'static str {
         match self {
             SetupShape::Rolling => "RECORDING",
@@ -12135,8 +12146,12 @@ struct SetupLayout {
     hear_input: Rect,
     /// The way to Setup: the audio system, the devices, the rate, the buffer.
     audio: Rect,
-    /// The two tier headings: AUDIO above, TAKE below — the owner's order.
+    /// The cog's AUDIO heading. (MEDIA's is `project_head`.)
     audio_head: Rect,
+    /// **Laid out OFF the panel in every shape now**: the cog shows no take
+    /// tier, and the take and red-button panels wear their tier's name as the
+    /// TITLE (`SetupShape::title_names_its_tier`). Kept so a shape can grow a
+    /// heading back without re-deriving the band order.
     take_head: Rect,
     /// The AUDIO tier's own count-in and signature — the same settings as
     /// the take's copies, standing where the ARRANGEMENT's rules read as
@@ -12151,7 +12166,8 @@ struct SetupLayout {
     /// The STREAM door, on the count-in row's free half — the ReaStream send
     /// settings, moved here from the Project menu by the owner's word.
     stream_row: Rect,
-    /// The third tier's heading, and its three folder rows.
+    /// The MEDIA tier's heading - the cog's second tier - and its four folder
+    /// rows: projects, exports, presets and impulse responses.
     project_head: Rect,
     proj_dest: Rect,
     proj_reveal: Rect,
@@ -12201,7 +12217,8 @@ impl SetupLayout {
         stream_row: Rect::NOTHING,
     };
 
-    /// Hung off `anchor` — the cog — and pulled back onto `screen`.
+    /// Hung off `anchor` - the control that opened this shape (see
+    /// [`SetupShape`]) - and pulled back onto `screen`.
     ///
     /// Below and left-aligned with the cog when there is room, which is where a
     /// popup belongs relative to the thing that opened it. The clamp is not a
@@ -12256,9 +12273,10 @@ impl SetupLayout {
             };
         }
         // The title keeps a band of its own at the top, with the way out at the
-        // right of it. Everything else is seven rows of equal height, because a
-        // dialog whose rows are all different sizes reads as a form somebody
-        // assembled rather than as a panel.
+        // right of it. Everything else is rows of one pitch - a heading band
+        // takes a little over half of one - because a dialog whose rows are all
+        // different sizes reads as a form somebody assembled rather than as a
+        // panel.
         // The reference title where there is room for it, and never more than
         // a third of a short panel - the clamp only bites when the screen has
         // squeezed the panel below the height solved for above.
@@ -12275,14 +12293,16 @@ impl SetupLayout {
             Vec2::new(close_w, title.height() * 0.62),
         );
         let rows = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
-        // **Three tiers: AUDIO, then MEDIA, then TAKE** — the owner's order. The
-        // same seven rows of controls, walked by a cursor now, with a
-        // half-height heading band opening each tier. A real gap between
+        // **AUDIO, then MEDIA, under the cog** - the owner's order - with the
+        // TAKE tier on its own under the cassette and the red button's one
+        // row on its own under it. Walked by a cursor, with a half-height
+        // heading band opening each of the cog's two tiers. A real gap between
         // rows: `Rect::contains` is inclusive at both edges, so two rows that
         // merely touch share a line of pixels and every overlap test in this
         // file fails there.
-        // Two headings for `Machine` - AUDIO and MEDIA - and one for each of
-        // the other two. Counted above, where the height was solved.
+        // Two headings for `Machine` - AUDIO and MEDIA - and none for the
+        // other two, whose tier word is the panel's title. Hidden bands go to
+        // `gone()` and take no units.
         let units = units_of(heads, rows_shown);
         // Read back from the rectangle rather than used as solved, so a panel
         // the screen squeezed still lays out. Unsqueezed it IS `ref_pitch`.
@@ -12348,15 +12368,18 @@ impl SetupLayout {
         let rp2 = band(1.0, machine);
         let rp3 = band(1.0, machine);
         let rp4 = band(1.0, machine);
-        // **`Rolling` shows the heading and `r3` alone** - the row that
-        // carries COUNT-IN and SIG. Everything else in the tier is laid out
-        // where nothing can see or reach it, exactly as the other shape's
+        // **`Rolling` shows `rolling_row` alone** - the AUDIO tier's own
+        // COUNT-IN and SIG on a row of their own - and no heading: the panel's
+        // title already says RECORDING. Everything in the take tier is laid
+        // out where nothing can see or reach it, exactly as the other shape's
         // rows are, so the red button's panel is two controls without being
         // a second copy of them.
         // **AUDIO and MEDIA are the cog's headings; the other two shapes
         // wear their tier's name as the panel's TITLE instead.** So this
         // band is laid out where nothing can see it for them - see
         // `SetupShape::title_word` - and the rows move up into the space.
+        // The cog shows no take tier either, so the condition below is false
+        // for every shape.
         let take_head = band(HEAD, (take || rolling) && !shape.title_names_its_tier());
         let r0 = band(1.0, take);
         let r1 = band(1.0, take);
@@ -13446,7 +13469,7 @@ pub fn draw_met(
         }
     }
 
-    // ── IN TAKE: does the count keep clicking once it is rolling ──
+    // ── IN TAKE: is the count-in recorded at the head of the take ──
     let row = l.rows[6];
     if row.is_positive() {
         label(row, "IN TAKE");
@@ -13711,7 +13734,8 @@ pub fn fx_value_at(screen: Rect, anchor: Rect, fx: Fx, key: &str, pos: Pos2) -> 
     track.is_positive().then(|| along(track, pos))
 }
 
-/// Where the take-settings popup goes, given the window and the cog.
+/// Where the setup panel goes, given the window, the control it hangs off and
+/// the shape.
 ///
 /// [`Rect::NOTHING`] when there is no room for it. The app needs this to know
 /// whether a press landed inside the popup or outside it, which is the whole of
@@ -13759,7 +13783,6 @@ pub fn setup_hit_test(
         })
 }
 
-/// Draw the take-settings popup over `screen`, hung off the cog at `anchor`.
 /// Draw an effect's panel over `screen`, hung off the knob at `anchor`.
 ///
 /// `values` answers what each key is set to, and `division` is the delay's
@@ -13926,6 +13949,8 @@ pub fn draw_fx(
     }
 }
 
+/// Draw the setup panel in `shape` over `screen`, hung off the control at
+/// `anchor` (see [`SetupShape`]).
 pub fn draw_setup(
     painter: &Painter,
     screen: Rect,
@@ -13968,7 +13993,9 @@ pub fn draw_setup(
         }
     }
     // The tier headings: a word and a hairline running out to the right,
-    // so AUDIO and TAKE read as sections rather than as two more rows.
+    // so AUDIO and MEDIA read as sections rather than as two more rows.
+    // (`take_head` is laid out off the panel in every shape, so its word is
+    // never seen.)
     for (band, word) in [
         (l.audio_head, "AUDIO"),
         (l.project_head, "MEDIA"),
@@ -14199,9 +14226,11 @@ pub fn draw_setup(
     }
 
     // **Setup**, showing the input it is about. The caption is a question the
-    // device name answers, so the row is a readout as well as a way in: an
-    // interface that has gone missing says so here, in the panel you would open
-    // to find out why nothing is being recorded.
+    // device name answers, so the row is a readout as well as a way in - but
+    // **not yet one that says when the interface has gone missing**:
+    // `DeviceLabel::text` is the bare name for an open interface and a missing
+    // one alike, and both are painted in the same ink, so the panel you would
+    // open to find out why nothing is being recorded reads the same either way.
     //
     // Not `labelled`: a device name is as long as its driver makes it, and a
     // long one drew nothing at all there. See `DEVICE_FLOOR`.

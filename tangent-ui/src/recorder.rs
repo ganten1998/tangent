@@ -1780,7 +1780,8 @@ impl Desk {
 
     /// Whether a strip is heard — which is now also whether it is RECORDED.
     ///
-    /// The take is the desk (see `record::TakeSource`), so this one rule
+    /// The take is the desk (the `record::TakeSource` choice that used to
+    /// stand between them is gone), so this one rule
     /// answers "is it in the file" as well as "is it in the room". The audio
     /// thread's `strip_is_heard` is the same rule over the bit masks this same
     /// `Desk` was pushed as; two answers to that question is the shape of the
@@ -1936,6 +1937,11 @@ pub struct RecorderState {
     /// press, so its own CountIn digit never shows; the engine's click is the
     /// only thing that knows the beat, and the glass shows this instead of
     /// the take's clock until the count is over. The host's fact.
+    ///
+    /// The host shows it for ANY count running over a writing take - the
+    /// take's own in-file count, or the arrangement's count started over it or
+    /// joined by it - and folds the engine's CLICK count by the signature's
+    /// beats.
     pub count_beat: Option<u32>,
 }
 
@@ -2409,8 +2415,11 @@ impl Default for Knobs {
 // and seconds are `f64`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecorderRequest {
-    /// The one button. Start a pre-roll, start a take, or stop one — the
-    /// session decides which, because only it knows what state it is in.
+    /// The arrangement's red button: start a record (counted in from settings
+    /// over a stopped song, or joining a take's count already running),
+    /// cancel its count, or finish it - the host decides which, because only
+    /// it knows what state it is in. Refused while a realtime export runs.
+    /// Never a take: that is `Capture`.
     Toggle,
     /// The cassette beside the cog: start or stop a CAPTURE — the whole-take
     /// machinery (window video, all audio, the `.mid`), completely separate
@@ -2468,6 +2477,13 @@ pub enum RecorderRequest {
     /// trim, loop passes, fades, gain, warp and stretch - mixes them with the
     /// engine's own mixer, writes the result into the project's `media/`,
     /// and hands the one clip back through `TangentApp::finish_audio_glue`.
+    ///
+    /// The app decides whether the selection can be welded (one kind, one
+    /// track, two or more clips or one that repeats, not on a frozen track)
+    /// and sends nothing otherwise; the host keeps only the audio clips among
+    /// the ids and re-checks the track. Where `caps.capture_devices` is false
+    /// (a plugin, the Minimal build) `request_recorder` drops it, and nothing
+    /// is said unless the app says it.
     GlueAudio(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///

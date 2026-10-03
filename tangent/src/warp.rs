@@ -20,14 +20,20 @@
 //! material between two attacks is stretched to fit the distance between
 //! their new homes. Its cost is the stretcher's own artefacts, and
 //! [`crate::stretch`] already chooses the right algorithm by listening to
-//! the material.
+//! the material. (Not yet for a multi-mic kit: the host detects and warps
+//! each take on its own, so one hit moves by a different amount in each
+//! mic and the bleed flams against itself after all.)
 //!
-//! **The attacks themselves are never stretched**, which is the whole
-//! argument for anchoring on transients rather than on bar lines. A segment
-//! runs from one attack to the next, so a splice - the place any
-//! time-domain stretcher shows its seam - always lands where a new hit is
-//! about to mask it. Stretching THROUGH an attack is what makes a warped
-//! drum take sound soft, and nothing here does it.
+//! **An anchored attack is not stretched**, which is the whole argument for
+//! anchoring on transients rather than on bar lines. A segment runs from
+//! one anchor to the next and a stretched segment's first few milliseconds
+//! are the source's own (`keep_the_attack`), so a splice - the place any
+//! time-domain stretcher shows its seam - lands where a new hit is about to
+//! mask it. Stretching THROUGH an attack is what makes a warped drum take
+//! sound soft, and it still happens to what is not an anchor: a hit the
+//! detector missed, the later of two hits the quantize sent to one grid
+//! line (dropped as an anchor and carried inside the segment), and whatever
+//! of a long attack outlasts the copied head.
 //!
 //! # Offline, like every other edit
 //!
@@ -62,11 +68,13 @@ pub enum Fit {
     /// split, as a mode rather than as a different feature.
     ///
     /// Nothing is processed at all, so the hit comes out bit for bit as it
-    /// was played. A segment that has to move later leaves silence behind
-    /// it; one that moves earlier is cut off by the hit in front. On
-    /// isolated percussion with small corrections that is the best sound
-    /// available, and on anything sustained it is a disaster - which is why
-    /// [`Fit::pick`] asks the material rather than offering a coin toss.
+    /// was played. A segment that has to move later leaves a gap behind it,
+    /// which the segment before fills by holding its last frame (a split
+    /// would leave silence there); one that moves earlier is cut off by the
+    /// hit in front. On isolated percussion with small corrections that is
+    /// the best sound available, and on anything sustained it is a
+    /// disaster - which is why [`Fit::pick`] asks the material rather than
+    /// offering a coin toss.
     Slice,
 }
 
@@ -124,8 +132,9 @@ const SLICE_AT: f32 = 0.55;
 /// Below this a segment is a handful of samples and the ratio it implies is
 /// noise: two attacks detected four milliseconds apart are one attack, and
 /// stretching the scrap between them by 3x makes an audible chirp out of
-/// nothing. Such a segment is COPIED, and the error it would have absorbed
-/// is carried by its neighbour.
+/// nothing. Such a segment is COPIED, then trimmed or padded to its own slot
+/// like every other (the pad holds its last frame); its neighbours are
+/// untouched.
 const MIN_SEGMENT: usize = 256;
 
 /// How much of each segment's head is played back exactly as recorded, in
@@ -139,16 +148,6 @@ const ATTACK_KEEP: usize = 240;
 const ATTACK_FADE: usize = 240;
 
 
-/// **Warp `clip` so every anchor's `from` lands on its `to`.**
-///
-/// Anchors are taken in the order given and must ascend in both fields;
-/// anything that does not is dropped rather than reordered, because an
-/// anchor list that goes backwards is a caller bug and guessing at what it
-/// meant would hide it.
-///
-/// Material before the first anchor and after the last is carried at the
-/// ratio of the segment beside it, so a clip does not change character at
-/// its edges.
 #[must_use]
 /// **The anchors this map can actually be rendered from**: ascending in both
 /// fields, inside the clip, and no two on one frame.
@@ -249,6 +248,32 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
     last.to + ((at - last.from) as f64 * ratio).round() as usize
 }
 
+/// **Warp `clip` so every anchor's `from` lands on its `to`.**
+///
+/// The anchors pass through [`usable`] first - ascending in both fields,
+/// inside the clip, none on one frame - and anything else is dropped rather
+/// than reordered: a list that goes backwards is a caller bug.
+///
+/// **What a caller may rely on** (and [`projected_frames`], [`project_frame`]
+/// and the host's stand-in all lean on):
+/// - The result is EXACTLY [`projected_frames`]`(clip.frames(), anchors)`
+///   frames long under every [`Fit`]: each segment is trimmed or padded to
+///   the length the anchor list demands, so nothing accumulates.
+/// - Every surviving anchor's `from` comes out at its `to`, to the frame.
+/// - On a STRETCHED segment the first [`ATTACK_KEEP`] frames (a quarter of
+///   the segment, when that is shorter) are the source's own, crossfaded
+///   over [`ATTACK_FADE`] into the stretcher's output. A segment whose source
+///   or slot is under [`MIN_SEGMENT`], and every segment under
+///   [`Fit::Slice`], is copied, then trimmed or padded with a hold of its
+///   last frame.
+/// - The fit is resolved once for the whole clip; the stretch ALGORITHM is
+///   resolved per segment by [`stretch::Mode::pick`], so under `Mode::Auto`
+///   a segment within 2% of its slot is resampled and its pitch moves.
+/// - The head is mapped from `0..first.from` onto `0..first.to`; a first
+///   anchor at frame zero that moves later gets silence in front of it. The
+///   tail keeps the ratio of the last segment.
+/// - The anchors and `clip` are in the SAME frame rate. A map is frames at
+///   the rate it was made at, and nothing here rescales it.
 pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     let frames = clip.frames();
     if frames == 0 || anchors.is_empty() {
@@ -325,9 +350,9 @@ pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
         } else if fit == Fit::Slice {
             // **Moved, not fitted.** The segment is played as recorded and
             // the trim or the pad below does the rest: short of its slot it
-            // leaves the silence a split would leave, long for it it is cut
-            // off by the hit in front, and either way nothing has been
-            // through an algorithm. See `Fit::Slice`.
+            // is held on its last frame where a split would leave silence,
+            // long for it it is cut off by the hit in front, and either way
+            // nothing has been through an algorithm. See `Fit::Slice`.
             seg
         } else {
             keep_the_attack(&seg, stretch::stretch(&seg, want as f64 / src_len as f64, mode))

@@ -1281,6 +1281,12 @@ pub struct Manifest {
     /// `timeline_start_seconds` without this lands that many bars late — a
     /// bar-scale error, not a millisecond one — and the setting it derives
     /// from can be flipped tomorrow, so it cannot be reconstructed.
+    ///
+    /// With `timeline_rolling` false (every take whose count is in the file -
+    /// a count only runs over a stopped song) this is still the offset of the
+    /// music from frame 0; whether the song was STARTED from
+    /// `timeline_start_seconds` at that offset (Play during the count) is a
+    /// separate fact the manifest does not yet carry.
     pub head_seconds: f64,
     /// The desk's mute and solo masks as the take began, by desk index.
     ///

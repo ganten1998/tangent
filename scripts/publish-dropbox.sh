@@ -6,7 +6,7 @@
 #   scripts/publish-dropbox.sh windows         # one platform
 #   scripts/publish-dropbox.sh windows macos
 #
-# **Why this exists at all.** `dist` is a SYMLINK out of the repo:
+# **Why this exists at all.** `dist` is meant to be a SYMLINK out of the repo:
 #
 #     dist -> ~/Library/Caches/tangent-dist
 #

@@ -613,8 +613,12 @@ pub struct TangentApp {
     ///
     /// Distinct from `arr_auto_sel`, which chooses a whole ROW: one of them
     /// answers Delete by closing the lane and the other by removing points,
-    /// and a single field could not mean both. Picking either clears the
-    /// other, so there is never a question of which Delete meant.
+    /// and a single field could not mean both. Choosing a row clears this
+    /// (`arr_select_auto_row`), and only the two presses on a node
+    /// (`arr_select_auto_node`, and `arr_toggle_auto_node` with Shift) clear
+    /// the row and the clip selection. Not yet the other roads that fill
+    /// this: the box, the shift-click that adds a node and a paste leave the
+    /// row and the clips chosen, so a Delete or a copy can find two subjects.
     ///
     /// Indices, not identities — a `Curve`'s points have no ids. Anything
     /// that reorders a curve therefore has to REMAP or clear this: a drag
@@ -1137,11 +1141,14 @@ pub struct TangentApp {
     /// **Where the metronome panel was summoned**, when it was summoned by
     /// the keyboard rather than by pressing its icon.
     ///
-    /// `None` means the icon, and the panel hangs off it as it always has.
-    /// `Some` is Cmd+M's "wherever the pointer is", which is the whole
-    /// difference between a shortcut and a second way to click the same
-    /// chip: a panel that opened across the window from the hand would be
-    /// slower than reaching for the icon.
+    /// `None` means the icon, and the panel hangs off it. `Some` is Cmd+M's
+    /// point: the CENTRE of the surface the panel is drawn on (`met_stage`,
+    /// the timeline, since the chord is the arrangement's), never the
+    /// pointer. The owner's call after living with "wherever the hand is":
+    /// a panel that opens somewhere different every time has to be found.
+    /// `met_anchor` makes it a one-point anchor, which `MetLayout` centres
+    /// the panel on both ways. Cleared on every close, or the next press on
+    /// the icon would open at a stale point.
     met_at: Option<Pos2>,
     /// A drag along the panel's tempo track, once one has begun.
     met_drag: bool,
@@ -2083,9 +2090,6 @@ enum FlagMenuAction {
     DeleteSig(u32),
 }
 
-/// A gesture in flight on the arrangement. What the press grabbed, and the
-/// figures the drag needs to stay relative — the band's own rule: a press
-/// never makes the thing jump to the pointer.
 /// **How far the header seam must be carried before it resizes**, in points.
 /// Less than this and the press is still the seam's CLICK, which sends the
 /// playhead home — see `ArrDrag::HeaderGrip`.
@@ -2102,6 +2106,15 @@ const HEADER_GRIP_DEAD: f32 = 8.0;
 /// anchor, a node passing over another takes nothing with it; and one
 /// DROPPED on another's time sits beside it as a step, the two in the order
 /// they had before (see `Curve::set_points`).
+///
+/// **Dropped on an instant that already holds a step**, the node makes a
+/// third point there and `sanitised` keeps a run's first and last in the
+/// order the anchor held them: a node that came from the LEFT becomes the
+/// step's arrival and the old arrival is gone; one from the RIGHT becomes the
+/// departure and the old departure is gone. Gone from the release on: a node
+/// only carried past is rebuilt from this anchor next frame and takes nothing
+/// with it. At zero a run keeps only its last point, so a node dropped on the
+/// base replaces it.
 #[derive(Debug, Clone)]
 struct AutoDragFrom {
     /// The node under the hand, `(lane, param, index)` into the anchor, and
@@ -2138,20 +2151,26 @@ struct AutoDragFrom {
     produced: Vec<Vec<crate::automation::Point>>,
 }
 
+/// A gesture in flight on the arrangement. What the press grabbed, and the
+/// figures the drag needs to stay relative — the band's own rule: a press
+/// never makes the thing jump to the pointer.
 #[derive(Debug, Clone, Copy)]
 enum ArrDrag {
-    /// An automation point being carried. `(lane, index)` — the index is
-    /// re-derived after every move, because moving a point past its
-    /// neighbour re-sorts the curve and the old index would then name
-    /// somebody else's point.
-    /// `(lane, row, point)` — which lane, which of its open rows, and which
-    /// point on that row's curve.
+    /// An automation point being carried: `(lane, row, point)`, which lane,
+    /// which of its open rows, and which point on that row's curve. The
+    /// point's index is re-derived after every move, because moving a point
+    /// past its neighbour re-sorts the curve and the old index would then
+    /// name somebody else's point.
     AutoPoint(usize, usize, usize),
     /// **A box drawn over an automation row's empty room**, choosing every
     /// node inside it. `from` and `to` are `(song seconds, normalised
     /// value)` at the press and under the hand now; `press` is where the
     /// press was on screen. A press that never travels is a CLICK, and
-    /// locates at the release — what a press on the row's room always did.
+    /// locates at the release (a press on the row's room used to locate on
+    /// the press itself). Not yet when a tap's press and release arrive in
+    /// ONE frame: the press arm returns before the release block runs, so
+    /// that tap does not locate, and the box stays armed until a later
+    /// gesture replaces or releases it.
     AutoMarquee {
         lane: usize,
         slot: usize,
@@ -6213,13 +6232,6 @@ impl TangentApp {
                     // key as every multi-select on this desk and therefore
                     // meant the opposite of what the rest of the app teaches.
                     //
-                    // SHIFT ADDS. "shift click is for holding and
-                    // multiselecting different arms" — so it sets the bit
-                    // rather than flipping it, and sweeping shift across four
-                    // lanes leaves four armed instead of leaving whichever
-                    // were already on turned back off. Taking one out again
-                    // is the plain press, which is the only gesture here that
-                    // can disarm without disarming everything.
                     // **Both modifiers can UNDO themselves**, which is the
                     // owner's follow-up: "shift multi works but should also
                     // be able to turn them off as well ... the same should go
@@ -6376,19 +6388,12 @@ impl TangentApp {
         self.auto_set_base(lane, param, v);
     }
 
-    /// Put one general channel back to an empty slot.
-    ///
-    /// **Everything the channel accumulated goes with it** — kind, name,
-    /// colour, mute, solo, all three bays, and its levels back to shipped.
-    /// Leaving any of it behind would make the next thing added here inherit
-    /// a stranger's settings, which is worse than either keeping the channel
-    /// or losing it.
     /// Remove `n`, and every other selected track with it.
     ///
-    /// **Highest index first**, because removing a channel shuffles the ones
-    /// below it up — taking them in ascending order would make every index
-    /// after the first one point at the wrong track. The selection is emptied
-    /// afterwards: half of what it named is gone.
+    /// **Highest index first.** It was needed when removing a channel
+    /// shuffled the ones below it up; `remove_channel_inner` now empties the
+    /// slot in place, so no index moves under the loop. The selection is
+    /// emptied afterwards: the tracks it named are gone.
     fn remove_selected_channels(&mut self, n: usize) {
         let mut all = self.selection_partners(n);
         all.push(n);
@@ -6407,6 +6412,20 @@ impl TangentApp {
         self.sel_anchor = None;
     }
 
+    /// Put one general channel back to an empty slot.
+    ///
+    /// **What the channel accumulated goes with it**: kind and input, name,
+    /// colour, mute, solo and arm, its fader and send back to shipped, its
+    /// clips, its sidechain key edges, and all six bays (its own three and
+    /// its folder seat's) with their bypass flags. Leaving any of it behind
+    /// would make the next thing added here inherit a stranger's settings,
+    /// which is worse than either keeping the channel or losing it. The
+    /// pedal seats keep their plugins and flags on purpose (see the note at
+    /// the end).
+    ///
+    /// **Not yet all of it**: its pan, polarity and icon, its drum kit, and
+    /// its automation (the curves, and the open, armed and bypassed rows)
+    /// stay on the slot, and the next track made there inherits them.
     fn remove_channel(&mut self, n: usize) {
         // **ONE moment for the whole removal.** A track is clips, six bays,
         // a sidechain table and a bypass table, and `arr_save_edits` and
@@ -7537,15 +7556,6 @@ impl TangentApp {
         self.monitor_rect = rect;
     }
 
-    /// Colour of the supporter heart, or None when it should not be drawn.
-    /// Derived every frame from the licence — never a cached flag.
-    /// The heart's colour IF the chord strip is the one drawing it.
-    ///
-    /// `None` whenever the recorder band is in the window, because that is
-    /// where the heart lives now — the strip is the fallback for the windows
-    /// that have no band, which is a recorder turned off and a recorder torn
-    /// off into its own window alike. The condition is `recorder_h > 0.0`'s,
-    /// and it is written out rather than derived so the two cannot drift.
     /// **The heart's outline, by theme.** Measured against the fill
     /// everywhere — see `recorder_panel::heart_border` — except on
     /// Centennial, where the owner asked for "a dark either gray or black or
@@ -7572,12 +7582,21 @@ impl TangentApp {
         }
     }
 
+    /// The heart's colour IF the chord strip is the one drawing it.
+    ///
+    /// `None` whenever the recorder band is in the window, because that is
+    /// where the heart lives now — the strip is the fallback for the windows
+    /// that have no band, which is a recorder turned off and a recorder torn
+    /// off into its own window alike. The condition is `recorder_h > 0.0`'s,
+    /// and it is written out rather than derived so the two cannot drift.
     fn strip_heart_color(&self) -> Option<egui::Color32> {
         let band_in_window = self.settings.show_recorder && !self.settings.recorder_detached;
         (!band_in_window).then(|| self.heart_color(0.0)).flatten()
     }
 
-    /// How long the supporter heart's wave takes to walk all sixteen colours.
+    /// How long the supporter heart's wave takes to walk the whole palette:
+    /// one colour per channel, `recorder::CHANNELS` of them (thirty-two since
+    /// the desk grew), so one twelve-second lap is thirty-two bands.
     ///
     /// **Fast enough to read as a wave.** The first pass took twenty-four
     /// seconds on the reasoning that a thing in the corner of a window
@@ -7607,16 +7626,18 @@ impl TangentApp {
     /// the one no test ever saw.
     ///
     /// The wave is STEPPED (see `heart_wave`) and advances one band every
-    /// `HEART_CYCLE_S / 16` — 750 ms since the cycle was slowed to twelve
-    /// seconds; the cheater's swirl turns once in ten. A hundred
-    /// milliseconds still draws every pixel either can change, and the tick
-    /// is deliberately NOT derived from the cycle: it is the rate at which
-    /// asking is cheap, not the rate at which the picture moves.
+    /// `HEART_CYCLE_S / recorder::CHANNELS`: 375 ms at the twelve-second
+    /// cycle, measured the same way in
+    /// `the_wave_moves_and_it_moves_the_other_way`; the cheater's swirl
+    /// turns once in ten. A hundred milliseconds still draws every pixel
+    /// either can change, and the tick is deliberately NOT derived from the
+    /// cycle: it is the rate at which asking is cheap, not the rate at which
+    /// the picture moves.
     /// And an unfocused or minimised window asks for nothing at all: a heart
     /// nobody is looking at still moves, at the idle poll, for free.
     const HEART_TICK: Duration = Duration::from_millis(100);
 
-    /// How many of the sixteen are on the heart at once.
+    /// How many of the palette's colours are on the heart at once.
     ///
     /// The sprite is eleven diagonal steps corner to corner, so four colours
     /// across it makes bands about three pixels wide — wide enough to be a
@@ -7644,7 +7665,8 @@ impl TangentApp {
         self.heart_palette_slot(at.rem_euclid(n as f64) as usize % n)
     }
 
-    /// One of the active palette's sixteen, as a bright shade for the heart.
+    /// One of the active palette's `recorder::CHANNELS` colours, as a bright
+    /// shade for the heart.
     fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
         let idx = self.palette().slot(i % recorder::CHANNELS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
@@ -7663,6 +7685,8 @@ impl TangentApp {
         }
     }
 
+    /// Colour of the supporter heart, or None when it should not be drawn.
+    /// Derived every frame from the licence — never a cached flag.
     fn heart_color(&self, t: f64) -> Option<egui::Color32> {
         if !self.settings.show_heart {
             return None;
@@ -7689,21 +7713,6 @@ impl TangentApp {
         Some(self.heart_palette_slot(0))
     }
 
-    /// **The heart has two sets of sixteen, and two gestures.**
-    ///
-    /// LEFT click walks the current set. RIGHT click swaps which set you are
-    /// walking. `heart_slot` is the position in whichever one is live, so one
-    /// index serves both and switching sets keeps your place:
-    ///
-    /// * ANIMATED — the travelling wave, drawn through one of the sixteen
-    ///   auto-palettes. The slot chooses the palette.
-    /// * BASE — one flat colour, the slot chooses which of the live palette's
-    ///   sixteen.
-    ///
-    /// This replaces a single seventeen-stop ring on the right button, which
-    /// was the fix for it being a one-way door and was still one gesture doing
-    /// two jobs: you could not reach a particular animated palette without
-    /// walking past every flat colour to get there.
     /// A press on the heart. `true` when it was the heart's, and the caller
     /// must not go on to open a menu or sound a note.
     ///
@@ -7897,21 +7906,6 @@ impl TangentApp {
                         self.apply_recorder_hit(recorder_panel::Hit::ResetLufs);
                         return;
                     }
-                    // **The two take buttons carry the take's settings.**
-                    //
-                    // The owner's call, and the shape of it is the point: the
-                    // CAPTURE button opens the whole take tier, because that
-                    // is the button that makes a take and everything in that
-                    // tier is about the one it is about to make. The RECORD
-                    // button opens the same panel, because a count-in and a
-                    // signature are what somebody reaches for at the red
-                    // button and reaching twice for the same two settings is
-                    // the thing this is meant to stop.
-                    //
-                    // One panel for both rather than a smaller second one:
-                    // "only a copy of the Countin and Sig options" is what a
-                    // second panel would be FOR, and a copy is what drifts.
-                    // The take tier already leads with those two.
                     // **The two buttons open two SHAPES of one panel.**
                     // Capture makes a take, so it opens everything about the
                     // take; the red button is pressed in the moment, so it
@@ -10582,16 +10576,28 @@ impl TangentApp {
         // **The arrangement's grid and window**, the timeline's half of what
         // `feel` is for the editor. Clamped on the way in exactly as the
         // settings reader clamps them, or a document could hand the app a
-        // number its own file could never hold.
+        // number its own file could never hold. (Not yet for the grid: this
+        // clamps it to -7, where the settings reader and every gesture stop
+        // at -6.)
         if let Some(v) = d.view.as_ref() {
             self.settings.arr_snap = v.snap;
             self.settings.arr_grid_exp = v.grid_exp.clamp(-7, 3);
             self.settings.arr_tempo_lane = v.tempo_lane;
             self.settings.arr_master_row = v.master_row;
-            // **Zero means "say nothing"**, for the two the app derives from
-            // the window when it has no opinion. A document written before
-            // these keys carries zero, and taking it literally would give
-            // every old session a track header of no width.
+            // **Zero is AUTO** for these two: the app derives the width and
+            // the count from the window. On an OPEN or a template adopt the
+            // live value stands: the shipped template is seeded on AUTO
+            // (`template_desk`), and taking it literally would put a column
+            // somebody sized back on AUTO at every launch and New. (A
+            // document from before these keys has no `view` block at all;
+            // `from_value` answers `None` and none of this runs.)
+            //
+            // **Not yet right for an undo.** A moment is the live desk, so
+            // its zero IS the auto value; but `undo_apply` comes through
+            // here too and skips it, so a Ctrl+Z past a first resize leaves
+            // the dragged width (or the wheeled count) standing, and the next
+            // Ctrl+Z commits that desk, cuts the redo tail and lands on the
+            // same moment again. See `TangentApp::undo_commit`.
             if v.header_w > 0.0 && v.header_w.is_finite() {
                 self.settings.arr_header_w = v.header_w;
             }
@@ -11386,8 +11392,6 @@ impl TangentApp {
             || (self.settings.tracks_added >> n) & 1 == 1
     }
 
-    /// Add a BARE track on channel `n`: it exists, armed with its send up,
-    /// and says NO INPUT until the chip binds one — the owner's flow.
     /// The host's cue that a reorder moved the channels: `order[new] = old`.
     /// The host saves live plugin states, renames the sidecars to follow,
     /// and reloads the racks.
@@ -11897,6 +11901,8 @@ impl TangentApp {
         }
     }
 
+    /// Add a BARE track on channel `n`: it exists, dry (its send at zero),
+    /// and says NO INPUT until the chip binds one: the owner's flow.
     fn add_bare_track(&mut self, n: usize) {
         if n >= recorder::CHANNELS {
             return;
@@ -11916,7 +11922,7 @@ impl TangentApp {
         // keyboard's `HdrAdd` all end here and nowhere else, so without
         // this a new track had no moment of its own and was folded into
         // whatever the user did next. Inside a batch - the multi-file
-        // import makes a track per file - `one_moment` holds it.
+        // import makes a track per file - `begin_one_moment` holds it.
         self.undo_commit();
     }
 
@@ -12196,19 +12202,6 @@ impl TangentApp {
         self.open_midi_inputs_dialog(ch);
     }
 
-    /// **The MIDI Inputs dialog, from ONE place.**
-    ///
-    /// Three doors reach it — the input chip's MIDI row on the arrangement
-    /// header and on the mixer strip, and the global menu — and
-    /// `open_track_dialog`'s law applies for the same reason: a field added
-    /// to the dialog must not have to be added three times or one door
-    /// silently offers less than the others.
-    ///
-    /// The list is **ports first, then the devices this track remembers and
-    /// cannot see.** A remembered device is never dropped — unplugging a
-    /// keyboard must not cost somebody the setup — and it is never silently
-    /// mixed in with the live ones either: `present` is what the row says out
-    /// loud.
     /// **The device rows for one lane, from the ports that are here NOW.**
     ///
     /// `held` is the rows an already-open window is showing, if there is
@@ -12282,6 +12275,19 @@ impl TangentApp {
         }
     }
 
+    /// **The MIDI Inputs dialog, from ONE place.**
+    ///
+    /// Three doors reach it — the input chip's MIDI row on the arrangement
+    /// header and on the mixer strip, and the global menu — and
+    /// `open_track_dialog`'s law applies for the same reason: a field added
+    /// to the dialog must not have to be added three times or one door
+    /// silently offers less than the others.
+    ///
+    /// The list is **ports first, then the devices this track remembers and
+    /// cannot see.** A remembered device is never dropped — unplugging a
+    /// keyboard must not cost somebody the setup — and it is never silently
+    /// mixed in with the live ones either: `present` is what the row says out
+    /// loud.
     fn open_midi_inputs_dialog(&mut self, lane: usize) {
         let sel = self.channel_midi_sel(lane);
         let devices = self.midi_device_rows(lane, None);
@@ -13222,8 +13228,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.clips.iter().any(|c| c.lane == n)
     }
 
-    /// The pictures the host made of each clip after decoding: the played
-    /// span's wave, and the file's length in seconds.
     /// **The marks the quantize window asked for**, whole - a clip missing
     /// from the list has none. Replaced rather than merged, because the set
     /// is the answer to one question and a leftover from the last one would
@@ -13241,6 +13245,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         !self.clip_marks.is_empty()
     }
 
+    /// The pictures the host made of each clip after decoding: the played
+    /// span's wave, and the file's length in seconds.
     pub fn set_clip_infos(&mut self, infos: Vec<crate::ports::ClipInfo>) {
         self.clip_infos = infos.into_iter().map(|i| (i.id, i)).collect();
     }
@@ -13471,17 +13477,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_bar_s() * 2.0f64.powi(exp)
     }
 
-    /// `t`, magnetised: to the nearest grid line while the magnet is on.
-    ///
-    /// **Snapped in QUARTERS and not in seconds.** With one tempo the two are
-    /// the same statement and a modulo was enough. With a tempo map the grid
-    /// lines are not evenly spaced in seconds at all — that is what a tempo
-    /// map IS — so rounding a second to the nearest multiple of a bar's
-    /// length would magnetise to a grid the ruler does not draw, and would do
-    /// it worse the further from the last tempo change you edited.
-    ///
-    /// The constant-tempo answer is unchanged, because the conversion is a
-    /// multiply in that case and this reduces to the modulo it replaces.
     /// **The playhead walks the grid on the arrow keys**, in the arrange
     /// view: a grid step per press, a bar per press with Shift, and onto the
     /// grid when snap is on so a head parked between lines lands on one.
@@ -13496,6 +13491,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.locate(to);
     }
 
+    /// `t`, magnetised: to the nearest grid line while the magnet is on.
+    ///
+    /// **Snapped in QUARTERS and not in seconds.** With one tempo the two are
+    /// the same statement and a modulo was enough. With a tempo map the grid
+    /// lines are not evenly spaced in seconds at all — that is what a tempo
+    /// map IS — so rounding a second to the nearest multiple of a bar's
+    /// length would magnetise to a grid the ruler does not draw, and would do
+    /// it worse the further from the last tempo change you edited.
+    ///
+    /// The constant-tempo answer is unchanged, because the conversion is a
+    /// multiply in that case and this reduces to the modulo it replaces.
     fn arr_snap_t(&self, t: f64) -> f64 {
         if !self.settings.arr_snap {
             return t.max(0.0);
@@ -13517,6 +13523,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// zero is a beat out for the rest of the song; and a multi-bar grid
     /// stepped in seconds walks away from the bars entirely once a tempo
     /// change is in front of it.
+    ///
+    /// **Not yet the same below a bar, outside 4/4.** `draw` steps
+    /// `grid_quarters` note values through each bar, and this divides the
+    /// bar by `2^-exp`: in 3/4, 6/8 and 7/8 the two disagree, and the magnet
+    /// lands between the lines drawn. `arr_grid_s` has the same
+    /// `bar * 2^exp`.
     ///
     /// A pure function of the map, the position and the gridbox, so the test
     /// can drive it without an app.
@@ -16062,6 +16074,54 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// A moment worth keeping: pushed unless it IS the standing moment.
     /// Anything ahead of NOW (the redo tail) dies — the timeline forked.
     ///
+    /// # The rule: one gesture leaves exactly one moment
+    ///
+    /// A moment is compared by `walk`'s words (the document through
+    /// `Arrangement::hash_into_ref`, the live desk through `desk_view`, and
+    /// the drum kits), so the day a field joins that walk it is undoable,
+    /// and every gesture that writes it owes the timeline exactly one
+    /// commit. Three ways to break that, and this codebase has shipped all
+    /// three:
+    ///
+    /// * ZERO: the writer only saves the settings and the gesture commits
+    ///   nothing, so the edit folds into the NEXT gesture's moment and one
+    ///   Ctrl+Z undoes two things.
+    /// * N: a loop whose every write commits; hold it with
+    ///   `begin_one_moment`.
+    /// * per FRAME: a drag that commits on every tick (a two-second marker
+    ///   carry was 120 moments in a 100-moment history).
+    ///
+    /// Not every gesture keeps the rule yet: the metronome panel's tempo
+    /// track commits on every frame it moves the tempo, and some presses and
+    /// knobs still commit nothing. A writer found breaking it is a bug to
+    /// fix, not a precedent to follow.
+    ///
+    /// How each shape must commit:
+    ///
+    /// * a PRESS (a button, a switch, a menu row, a typed Enter) commits
+    ///   where it is pressed;
+    /// * a DRAG marks `arr_gesture_dirty` (or its own surface's grab) and
+    ///   commits once at its release, so a release an early return can
+    ///   swallow must still end the gesture;
+    /// * a BATCH of committing writers is held with `begin_one_moment` and
+    ///   released with `commit_undo_moment` in the same function and the
+    ///   same frame, on every exit;
+    /// * a function with several exits takes its commit at the CALLER;
+    /// * a host-side edit commits once, through `commit_undo_moment`, after
+    ///   every write of the gesture has landed.
+    ///
+    /// Two frame-level rules stand in for gestures: `commit_view_change`
+    /// commits the timeline's `View` once a frame, and the end of a
+    /// playback pass commits the automation it wrote (in `frame`).
+    ///
+    /// The other half lives in `apply_desk_snapshot`: applying a moment
+    /// must reproduce its words exactly. A value the apply declines to
+    /// restore leaves the live walk different from the moment it stands on,
+    /// so the next `undo` pushes the live desk, cuts the redo tail and
+    /// re-applies the same moment, on every press. (Not yet true of the
+    /// header width and the lane count: the apply skips their zero, which
+    /// is AUTO, so a Ctrl+Z past a first resize wedges there.)
+    ///
     /// # Why this does NOT take the fingerprint
     ///
     /// The cheap answer's failure mode lands on the wrong side of
@@ -16393,10 +16453,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// this answered it - with a request to the host, or with a refusal that
     /// says why. `false` leaves the selection to the MIDI road.
     ///
-    /// The rules are MIDI glue's, so the two cannot come to different
-    /// opinions: two or more clips, or one that shows more than one pass; one
-    /// track; one kind. And not on a frozen track, whose clips are not what
-    /// it plays.
+    /// The count, track and kind rules are MIDI glue's, so on those the two
+    /// cannot come to different opinions: two or more clips, or one that
+    /// shows more than one pass; one track; one kind. Audio also refuses a
+    /// frozen track, whose clips are not what it plays; the MIDI road has no
+    /// such refusal yet.
     fn arr_glue_audio(&mut self, ids: &[u64]) -> bool {
         let picked: Vec<&crate::arrangement::ArrClip> =
             self.arrangement.clips.iter().filter(|c| ids.contains(&c.id)).collect();
@@ -16492,8 +16553,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
-    /// Ask the host to normalise whatever audio is selected.
-    ///
     /// **Glue the selected clips on ONE track into a single clip.**
     ///
     /// Several parts, written and welded into one. Cmd+G on macOS, Ctrl+G
@@ -16520,10 +16579,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and quietly gluing the ones that happen to share a lane would be a
     /// command that does something other than what was asked.
     ///
-    /// **Audio glues too**, by the same rules - the owner: "Audio clips don't
-    /// glue". Welding audio means RENDERING, so it is the host's to do (see
-    /// `RecorderRequest::GlueAudio`); this side decides whether the selection
-    /// can be glued at all and says why not in the same words.
+    /// **Audio glues too**, by the same rules plus one (audio refuses a
+    /// frozen track, which this MIDI road does not yet) - the owner: "Audio
+    /// clips don't glue". Welding audio means RENDERING, so it is the host's
+    /// to do (see `RecorderRequest::GlueAudio`); this side decides whether
+    /// the selection can be glued at all and says why not in the same words.
     fn arr_glue_selection(&mut self) {
         let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
         if let Some(one) = self.arr_selected {
@@ -16768,8 +16828,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             })
             .map(|c| c.id)
             .collect();
-        // Nothing to adopt: leave whatever was selected, so the window says
-        // "nothing to quantize" rather than quietly emptying a selection.
+        // Nothing to adopt: leave whatever was selected. With nothing
+        // selected the window says so ("nothing selected"). Not yet right
+        // with a clip selected on ANOTHER track: it stays the target, so the
+        // window names it and Apply quantizes it, although the tracks picked
+        // last hold no audio.
         if ids.is_empty() {
             return;
         }
@@ -16865,13 +16928,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         ids
     }
 
-    /// **What the window is currently asking for**, over the audio it would
-    /// act on, or `None` when the numbers do not describe a grid.
+    /// **What the window last APPLIED**, over the audio it would act on, or
+    /// `None` when the numbers do not describe a grid.
     ///
-    /// The one place the seven knobs become a question, so the REQUEST and
-    /// the PREVIEW cannot ask different ones - see
-    /// [`crate::ports::QuantizeAsk`]. Read from the settings, which the
-    /// window writes as it is turned.
+    /// Read from the settings, which the window writes only on Apply
+    /// (`DialogAction::ApplyQuantize`), so this is the Apply's question. The
+    /// preview asks the window's working copies instead; both go through
+    /// [`Self::quantize_ask_of`], so the two cannot mean different things.
+    /// (The MIDI Apply takes only the strength and the window from here: it
+    /// still builds its grid a second way, in `quantize_window_grid`.)
     fn quantize_ask(&self) -> Option<crate::ports::QuantizeAsk> {
         self.quantize_ask_of(
             self.settings.quantize_grid_exp.clamp(-7, 3) as i8,
@@ -16891,6 +16956,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// working copies while a hand is still on them. One derivation, so the
     /// ticks drawn while a dial is turning and the warp written when it is
     /// let go cannot mean different things.
+    ///
+    /// Seven loose knobs on purpose: one caller holds them in `Settings`,
+    /// the other in `Dialog::Quantize`'s working copies, and a struct for the
+    /// hand-off would be an eighth place for a knob to be forgotten. The
+    /// allow is for plain `cargo clippy`; the gate does not enable this lint.
     #[allow(clippy::too_many_arguments)]
     fn quantize_ask_of(
         &self,
@@ -16994,6 +17064,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips(ask));
     }
 
+    /// Ask the host to normalise whatever audio is selected.
+    ///
     /// **The set, or the one.** The same rule every clip action here follows:
     /// a marquee over eight takes means all eight.
     fn arr_normalize_selection(&mut self) {
@@ -17031,11 +17103,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// **Write a clip's warp map**, which is the whole of an audio quantize.
-    ///
-    /// The host computes it - only the host can reach the samples - and the
-    /// rendered audio is derived from it, so this one assignment is the
-    /// edit, the undo point and the thing the document saves.
+    /// **Write a clip's warp map**, keeping the fit it already has: the whole
+    /// of an audio quantize's edit, and the thing the document saves.
+    /// **Commits nothing**, like [`Self::set_clip_warp_with_fit`]: the caller
+    /// ends the gesture (`clear_clip_warp` does, with `commit_undo_moment`).
     pub fn set_clip_warp(&mut self, id: u64, warp: Vec<(u64, u64)>) {
         let fit = self
             .arrangement
@@ -17068,6 +17139,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `undo_commit` opens to the other side of the firewall: the app owns
     /// the timeline, the host owns the samples, and a host-side edit still
     /// has to land as one undoable step.
+    ///
+    /// **Two jobs, one name**: it RELEASES a `begin_one_moment` hold, and it
+    /// is also the plain commit for a gesture that held nothing (the host's,
+    /// `clear_clip_warp`'s and `reset_clip_gain`'s). So a count of calls says
+    /// nothing about balance: a release is only a release in the same
+    /// function as its hold. Never call it as a standalone commit from inside
+    /// somebody else's held batch: the saturating decrement would end THEIR
+    /// batch early, and their own release would then commit a second moment.
     pub fn commit_undo_moment(&mut self) {
         // Ends a batch if one was begun. Saturating, so the ordinary
         // caller - a host gesture that never held anything - just commits.
@@ -17088,12 +17167,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Nests, so a batch inside a batch is still one moment. **Every call
     /// must be answered by a `commit_undo_moment`** - see
     /// `every_held_moment_is_released`, which is what says so.
+    ///
+    /// **A hold never outlives the function, or the frame, that took it.**
+    /// `undo_reset` does not lower `undo_hold`, so one unreleased hold stops
+    /// the timeline recording for the rest of the session, across New and
+    /// Open too, and the next Ctrl+Z throws away everything done since, with
+    /// no redo to bring it back. Release on EVERY exit: an early `return`, a
+    /// `?`, an `else` branch. Never hold across a host request: the frames
+    /// in between would fold unrelated gestures into the batch.
     pub fn begin_one_moment(&mut self) {
         self.undo_hold = self.undo_hold.saturating_add(1);
     }
 
     /// **Take a clip back to how it was played.** The map is the edit, so
     /// dropping it is the undo that does not need the stack.
+    ///
+    /// **Nothing calls this yet**: no menu row, key or host road reaches
+    /// it. It ends its own moment through `commit_undo_moment`, so whatever
+    /// is wired to it must not call it inside a `begin_one_moment` batch:
+    /// that release would end the batch early.
     pub fn clear_clip_warp(&mut self, id: u64) {
         self.set_clip_warp(id, Vec::new());
         // Its own gesture, so its own moment - the write no longer commits.
@@ -17101,6 +17193,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Put a clip's level back to unity.
+    /// Only a test calls this today; it ends its own moment, with
+    /// `clear_clip_warp`'s caution about batches.
     pub fn reset_clip_gain(&mut self, id: u64) {
         self.set_clip_gain(id, 1.0);
         // Its own gesture, so its own moment - `set_clip_gain` commits
@@ -17567,7 +17661,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         );
     }
 
-    /// The metronome tool's rect, which the panel hangs off.
     /// **What the metronome panel hangs off**, on whichever surface is up.
     ///
     /// The toolbar's own cell in the arrangement, and the click strip's sound
@@ -17575,10 +17668,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// as its own button". One panel, two doors, and the anchor decides where
     /// it opens rather than each caller deciding.
     fn met_anchor(&self, rect: Rect) -> Rect {
-        // **Summoned at the pointer beats hanging off a chip somewhere
-        // else.** A one-point rect is enough: `MetLayout` only reads the
-        // anchor to decide which side to fall on and gets clamped to the
-        // surface either way.
+        // **A summoned panel beats hanging off a chip.** `met_at` is Cmd+M's
+        // point, and a one-point rect is what tells `MetLayout` to centre the
+        // panel ON it, both ways, rather than hang it below.
         if let Some(p) = self.met_at {
             return Rect::from_center_size(p, Vec2::splat(1.0));
         }
@@ -17610,13 +17702,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
 
-    /// **Where the setup panel hangs, asked once.**
-    ///
-    /// The draw took this from the capture button for the take shape while
-    /// the PRESS path still took it from the cog, so the take panel was
-    /// painted in one place and hit-tested in another: every press landed on
-    /// whatever the cog's geometry said was there, which is why its Done
-    /// button did nothing at all. One function now, and both roads call it.
     /// **Close the setup panel, and take its fields with it.**
     ///
     /// The take's NAME is typed only in this panel, and the signature only
@@ -17639,6 +17724,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **Where the setup panel hangs, asked once.**
+    ///
+    /// The draw took this from the capture button for the take shape while
+    /// the PRESS path still took it from the cog, so the take panel was
+    /// painted in one place and hit-tested in another: every press landed on
+    /// whatever the cog's geometry said was there, which is why its Done
+    /// button did nothing at all. One function now, and both roads call it.
+    /// Each shape answers its own control, and `Machine` falls back to the
+    /// cassette when the cog is unseated. `Rolling` has no fallback, and the
+    /// red button is unseated under a realtime export (see `SetupShape`).
     fn setup_anchor(
         &self,
         band: Rect,
@@ -17787,6 +17882,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // counts into the take and what it plays are all desk
                 // fields and all hashed - and none of them committed, so
                 // choosing one folded into whatever the user did next.
+                // Not yet the signature's two rows above, which end in
+                // `set_time_signature` and commit nothing, nor the tempo
+                // track, a drag (`met_drag`) that `retime_arrangement`
+                // commits on every frame it moves the bpm, and never on an
+                // empty song.
                 self.undo_commit();
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
@@ -17992,8 +18092,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn arr_copy(&mut self) {
         // **Chosen NODES are the most specific thing on this timeline**, so
-        // they answer first — ahead of clips and ahead of the track. Nothing
-        // else can be selected at the same time.
+        // they answer first — ahead of clips and ahead of the track. (Not
+        // yet the only thing chosen: a box, a shift-click add or a paste
+        // leaves a clip selection standing beside them.)
         if self.arr_copy_auto_nodes() {
             return;
         }
@@ -18116,13 +18217,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.frozen_refuses(lane);
             return;
         }
-        // **A chosen automation row goes first.** It is the only thing
-        // selected when it is selected — see `arr_select_auto_row` — so this
-        // can never take a clip somebody meant to keep.
-        // **Nodes before the row.** Both cannot be chosen at once — picking
-        // either clears the other — but the order is written down anyway,
-        // because Delete closing a lane somebody meant to thin out would
-        // take the work with it.
+        // **Chosen nodes first, then a chosen row, then the clips.** Nodes
+        // before the row, because Delete closing a lane somebody meant to
+        // thin out would take the work with it. The subjects are not yet
+        // exclusive: choosing a row lets the nodes and clips go
+        // (`arr_select_auto_row`) and pressing a node lets the row and clips
+        // go, but the box, a shift-click add and a paste leave the clips
+        // chosen, and a chosen clip on a frozen lane then refuses this Delete
+        // before the nodes are reached.
         if !self.arr_auto_nodes.is_empty() {
             self.arr_delete_auto_nodes();
             return;
@@ -18337,8 +18439,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::midi_editor::snap_t(&self.midi_edit_view(st, clip), t)
     }
 
-    /// The CREATE snap: the grid line at or before the click — a note
-    /// lands in the cell under the hand, never the next one.
     /// The first grid line AT or AFTER `t`.
     ///
     /// **What a paste anchors to.** Flooring put the notes on the line
@@ -18360,6 +18460,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::midi_editor::snap_next_t(&view, floor).max(t)
     }
 
+    /// The CREATE snap: the grid line at or before the click — a note
+    /// lands in the cell under the hand, never the next one.
     fn me_snap_floor(&self, t: f64) -> f64 {
         let Some(st) = self.midi_edit.as_ref() else {
             return t.max(0.0);
@@ -18392,16 +18494,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// notes and not the bar around them would make a bar-long loop a matter
     /// of luck.
     ///
-    /// **And the clip grows to hold its own pass.** `len_s` is how long the
-    /// clip stands on the timeline and `loop_s` is how long one pass of it
-    /// is, and the schedule DROPS every note past `len_s` — so a loop
-    /// lengthened past the clip's end would go on saying it was two bars long
-    /// while the second bar of it was silent. A control that can be dragged
-    /// into a state where its own tail does not sound is a control that lies.
-    /// The clip is therefore pushed out to the loop, never pulled in: a clip
-    /// longer than its loop is a stack of passes and stays exactly as it was,
-    /// and trimming a loop SHORT does not shorten the clip, it lays down more
-    /// passes — which is the whole point of the gesture.
+    /// **The loop is clamped to the clip; the clip never moves.** `len_s` is
+    /// the timeline's, and this handle has no licence over it (the owner:
+    /// "clamp the loop to the clip"). The bar's wall is the clip's END, so
+    /// the longest loop is the clip plus the trim in front of it, counted
+    /// from `midi_loop_origin_s`. What snaps is the LENGTH, laid from the
+    /// clip's head: on a straight grid a part whose head is on the grid gets
+    /// a loop of whole grid steps, and under swing the end lands on the
+    /// swung lines, so only a whole number of PAIRS keeps the feel.
     fn me_set_loop_end(&mut self, t: f64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -18539,8 +18639,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// [`me_quantize`](Self::me_quantize), told exactly what to do rather
-    /// than working it out from the view.
+    /// **The MIDI half of the quantize window's Apply**: the selected notes,
+    /// or the whole clip when nothing is selected, onto `q`'s grid, strength
+    /// and window, with every knob stated. [`Self::apply_quantize_window`] is
+    /// the only caller.
+    ///
+    /// Each start is clamped into `start_s .. start_s + len_s - dur`, the
+    /// clamp a drag uses. Not yet quantized where it is HEARD: a note is
+    /// placed at its first-pass position and then clamped, so one the trim
+    /// hides is moved onto the clip's head, and one that rings past the
+    /// clip's end is pulled in to end there, even when it sat on a line.
     fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -18608,6 +18716,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// MOVE the whole selection by the grabbed note's delta: every note
+    /// keeps its distance from the hand, and the CLIP's edges clamp the set
+    /// as one, so a chord cannot shear against its own notes.
     fn me_move_selection(
         &mut self,
         grabbed: usize,
@@ -19240,10 +19351,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// silence — 1 is the floor, because a note at velocity 0 is a note-off
     /// wearing a note's clothes.
     ///
-    /// **The selection only**, as `me_quantise` does, and for the same
-    /// reason: these are the two keys that rewrite notes in place, and one of
-    /// them taking the whole clip while the other took the selection is the
-    /// kind of difference nobody remembers in time.
+    /// **The selection only.** The quantize window takes the whole clip when
+    /// nothing is selected and this does not, so with an empty selection one
+    /// of the two commands that rewrite notes in place does nothing: the
+    /// kind of difference nobody remembers in time, and one rule should
+    /// replace it.
     ///
     /// Notes are kept inside their clip, exactly as the quantiser keeps them.
     fn me_humanize(&mut self, timing_pct: u8, vel_pct: u8, seed: u64) {
@@ -19579,6 +19691,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// time round. And anything that then MOVES the playhead adds the shift
     /// back, so the song stays in the pass it was in rather than jumping to
     /// the first. See `arrangement::fold_into_midi_pass`.
+    ///
+    /// **Scoped to actions that act AT the playhead.** A press on the ruler
+    /// or the roll, and a press or scrub on the navigator, SET the transport
+    /// to the second under the hand: snapped, never folded, no shift added.
+    /// The roll's axis is the song's own, so a press inside the drawn pass
+    /// lands in the first pass and a press past the loop bar lands in the
+    /// later pass that stands there; the line is then drawn folded, back in
+    /// the pass the roll shows.
     fn me_playhead(&self) -> (f64, f64) {
         let raw = self.playhead_s();
         let folded = self
@@ -20060,8 +20180,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
-    /// DELETE the whole selection, highest index first so nothing slides
-    /// under the knife.
     /// **Backspace takes a note back and puts the playhead where it was.**
     ///
     /// Enter writes a note and walks the playhead past it; Backspace is its
@@ -20127,6 +20245,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// DELETE the whole selection, highest index first so nothing slides
+    /// under the knife.
     fn me_delete_selected(&mut self) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -22407,7 +22527,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// All of the editor's input: wheel grammar, presses, drags, keys.
     /// Whether one of the band's INLINE popups — the setup panel or an
     /// effect's parameters — is up. They eat their presses inside
     /// `handle_main_interaction`, but the mixer and the view passes run
@@ -22556,6 +22675,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// All of the editor's input: wheel grammar, presses, drags, keys.
     fn midi_editor_input(&mut self, ctx: &egui::Context) {
         if self.midi_edit.is_none() {
             return;
@@ -25018,11 +25138,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .unwrap_or(0.0);
                         self.arr_drag = Some(ArrDrag::Flag { index: i, grab_dt: dt });
                     }
-                    // **A press on empty room makes a point only with ALT
-                    // held**; a plain press moves the playhead, like every
-                    // other empty surface on this timeline. The owner's
-                    // gesture: alt-click adds a node, and the drag that
-                    // follows places it.
+                    // **A press on an automation row's empty room** adds a
+                    // node with SHIFT held, and the drag that follows places
+                    // it; a plain press is a box or a click (see below, and
+                    // `ArrDrag::AutoMarquee`).
                     Some(A::AutoLane(n, row, t, v)) => {
                         let Some(param) = self.arr_auto_param_at(n, row) else {
                             return;
@@ -25168,7 +25287,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         });
                     }
                     // Through the desk, so a multiple selection carries — see
-                    // the arm of the same name in `apply_arrange_hit`.
+                    // the arm of the same name in `apply_arrange_key`.
                     Some(A::ToTheory(n)) => {
                         self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0);
                     }
@@ -26229,8 +26348,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if paste_ev {
                 self.arr_paste();
             }
-            // **Cmd/Ctrl+A: the selected track's automation lanes** — what
-            // the A on its header opens. The owner asked for a key for it.
+            // **Cmd/Ctrl+A: the selected track's automation menu**, the one
+            // the wrench on its header opens. The owner asked for a key for it.
             // Not select-all here: the MIDI editor keeps that chord for its
             // notes, and this block stands down while the editor is open.
             if ctx.input(|i| {
@@ -26324,8 +26443,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.arr_normalize_selection();
         }
-        // **Ctrl/Cmd+G: GLUE the selected MIDI clips on one track.** The way
-        // out of a loop: write the passes, then weld them into one.
+        // **Ctrl/Cmd+G: GLUE the selected clips on one track**: MIDI welded
+        // here, audio rendered into one file by the host
+        // (`RecorderRequest::GlueAudio`). The way out of a loop: write the
+        // passes, then weld them into one.
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
@@ -26346,10 +26467,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.add_track_first_free();
         }
-        // **Ctrl/Cmd+M: the metronome panel, at the pointer.** The owner's
-        // call: the click's own settings - tempo, signature, count-in -
-        // should be one chord away from wherever the hand already is,
-        // rather than a reach for a chip in the corner.
+        // **Ctrl/Cmd+M: the metronome panel, in the middle of the
+        // timeline.** The owner's call: the click's own settings (tempo,
+        // signature, count-in) one chord away rather than a reach for a chip
+        // in the corner; why the middle and not the pointer is below.
         //
         // It DISPLACED the master row, which had this chord and now has
         // shift with it. Said out loud because a shortcut that quietly
@@ -27503,23 +27624,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .to_owned()
     }
 
-    /// **Where a control is standing right now**, normalised — the level an
-    /// untouched automation lane draws.
-    ///
-    /// The same normalisation the curve stores, so a lane with no points and
-    /// a lane whose first point was just dropped on that line agree about
-    /// where the line is. A plugin parameter answers with the plugin's own
-    /// default, which is where the knob rests until somebody moves it; there
-    /// is no way to read a live parameter back from here, and guessing a
-    /// middle would draw a line the plugin is not on.
     /// **A lane's base level: its first node, or the control if it has none.**
     ///
     /// The row's dial shows and sets this. The first node is what the curve
     /// holds before anything else happens — `value_at` is flat back to the
     /// left edge — so it IS the lane's resting level, and a dial that showed
     /// the live control instead would disagree with the lane it sits on the
-    /// moment the curve moved. See `Curve::remove_near`, which refuses to
-    /// delete it for the same reason.
+    /// moment the curve moved. See `arr_take_auto_node`, which refuses to
+    /// delete a first node standing at the very start, for the same reason.
     fn auto_base(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
         self.arrangement
             .automation
@@ -27548,6 +27660,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         );
     }
 
+    /// **Where a control is standing right now**, normalised — the level an
+    /// untouched automation lane draws.
+    ///
+    /// The same normalisation the curve stores, so a lane with no points and
+    /// a lane whose first point was just dropped on that line agree about
+    /// where the line is. A plugin parameter answers with the plugin's own
+    /// default, which is where the knob rests until somebody moves it; there
+    /// is no way to read a live parameter back from here, and guessing a
+    /// middle would draw a line the plugin is not on.
     fn auto_resting(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
         use crate::automation::AutoParam;
         // **The master reads its own controls**, not `channel_gains[16]`,
@@ -28669,8 +28790,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.save_settings_soon();
-        // A BUTTON, so a gesture, so a moment - unlike the knob above it,
-        // which is dragged and takes one when the hand lets go.
+        // A BUTTON, so a gesture, so a moment. The knob above it
+        // (`set_keys_param_of`) is a drag and takes NO moment yet: the
+        // slider reports every frame it moves and nothing reports its
+        // release, so a turned knob rides the next gesture's moment.
         self.undo_commit();
     }
 
@@ -30394,10 +30517,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// sixty times a second is the mistake `CaptureDevices::current_name`
     /// already exists to avoid.
     fn open_audio_setup(&mut self) {
-        // **Asked at OPEN and never per frame.** Under ASIO `outputs()`
-        // loads and unloads every registered driver in turn - seconds of
-        // work, and exactly the "Not Responding" the reprobe exists to keep
-        // off this thread.
+        // **Asked at OPEN and never per frame.** Under ASIO, `outputs()`
+        // names only the running driver while a stream holds one, which is
+        // the usual state here (the band Setup opens from starts the
+        // engine), so the row cannot offer another driver then. With no
+        // stream held it loads and unloads every registered driver in turn,
+        // on this thread: seconds of work, and exactly the "Not Responding"
+        // the reprobe exists to keep off it.
         let (systems, rates, outputs) = match self.audio_setup.as_ref() {
             Some(s) => (s.systems(), s.rates(), s.outputs()),
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -30686,12 +30812,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             || self.pad_name_typing.is_some()
     }
 
-    /// One click in the band.
-    ///
-    /// Everything that changes a SETTING happens here and now; everything that
-    /// touches a device or the filesystem becomes a request for the host. That
-    /// split is the same one `Caps` draws, and it is why a plugin could paint
-    /// this band harmlessly if it ever had reason to.
     // ── Keyboard reach (a11y) ──────────────────────────────────────────────
 
     /// A note, spelled so a screen reader can pronounce it.
@@ -31059,6 +31179,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// One click in the band.
+    ///
+    /// Everything that changes a SETTING happens here and now; everything that
+    /// touches a device or the filesystem becomes a request for the host. That
+    /// split is the same one `Caps` draws, and it is why a plugin could paint
+    /// this band harmlessly if it ever had reason to.
     fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
         use recorder_panel::Hit;
         use recorder::RecorderRequest as R;
@@ -31076,9 +31202,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Hit::Record => self.request_recorder(R::Toggle),
             Hit::Capture => self.request_recorder(R::Capture),
             Hit::Pause => self.request_recorder(R::Pause),
-            // The audition. The host ignores it while a take is writing;
-            // pressed mid-audition it stops and the playhead goes home to
-            // 0:00, which is `Transport::toggle_play`'s half of the rule.
+            // **Play, and only play.** The host rolls the song from the
+            // playhead; a press while it already rolls does nothing (Pause
+            // is its own button), and so does one under a realtime export or
+            // the arrangement's record, which own the transport. During a
+            // count it rolls on the downbeat, and a running take does not
+            // refuse it.
             Hit::Play => self.request_recorder(R::Play),
             // The × in the timeline's corner: empty the timeline. The
             // document is the app's own now — the edit happens here — and
@@ -32637,11 +32766,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// Set the count-in, in bars, from wherever asked.
-    ///
-    /// One place, because there are two — the band's cell and the menu — and
-    /// they disagreed: the band cycled the legacy BEATS key while the display
-    /// read bars, so clicking it changed a number nothing showed.
     /// Set the time signature from wherever asked, keeping the count-in's
     /// beat count in step: a count-in is a number of BARS, so changing the
     /// signature changes how many beats that is.
@@ -32652,6 +32776,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.save_settings();
     }
 
+    /// **Set the count-in, in bars, and keep the legacy beats key in step**,
+    /// as one moment: `CountIn::bars` and `CountIn::beats` are both hashed.
+    /// The setup panel's COUNT-IN chip comes through here; the metronome
+    /// panel's COUNT row still writes the bars on its own and leaves the
+    /// beats behind.
+    ///
+    /// **Meant to be the one place**, because two roads once disagreed: the
+    /// band cycled the legacy BEATS key while the display read bars, so
+    /// clicking it changed a number nothing showed.
     fn set_count_in_bars(&mut self, bars: u32) {
         self.settings.record_count_in_bars = i64::from(bars);
         // The legacy key is kept in step so a downgrade to a build that reads
@@ -32659,8 +32792,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
-        // Both callers are single presses - the band's count-in chip and
-        // the typed number - so one moment each. `CountIn::bars` is hashed.
+        // Both callers are single presses (the setup panel's count-in chip,
+        // and the menu's `SetCountIn` arm, which no menu row builds today),
+        // so one moment each. `CountIn::bars` is hashed.
         self.undo_commit();
     }
 
@@ -32668,7 +32802,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Refused rather than queued where the host cannot honour it. A plugin
         // never drains, so an ungated request would sit here forever and the
         // first thing a Toggle did after somebody added draining would be to
-        // start a take nobody asked for.
+        // start an arrangement record nobody asked for.
         if !self.caps.capture_devices {
             return;
         }
@@ -32978,10 +33112,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.apply_menu_action(ctx, MenuAction::ToggleTheoryView(v));
                 }
             }
-            // Space. Not routed through a `MenuAction`, because there is no
-            // menu row for it: pressing Record is what the BAND is for, and a
-            // menu row that starts a take would be reachable from a right-click
-            // over the piano with the recorder hidden.
             // Toggle, not "start": a press during the arrangement's count-in
             // cancels it, which is what anybody who has just realised they
             // came in wrong will try — and `Toggle` is where that lives.
@@ -32993,7 +33123,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // ruling: "The take record should be bound to nothing but the
             // click button." So no key starts, ends or cancels a take now —
             // the cassette's own button is the whole interface to it — and
-            // Enter means what its card has always said it means.
+            // no key reaches this arm today: Enter belongs to the MIDI
+            // editor, and Cmd/Ctrl+R sends the same `Toggle` straight from
+            // `fn paint`.
             K::StartRecording => {
                 if !self.recorder.state.is_writing() {
                     self.request_recorder(recorder::RecorderRequest::Toggle);
@@ -34310,7 +34442,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 //
                 // - the band has to be SHOWN, which is the consent the
                 //   keymap gates Space on - somebody who has never opened
-                //   the recorder must not start a take with the widest key
+                //   the recorder must not roll the song with the widest key
                 //   on the keyboard;
                 // - Space is PLAY only on the desk's surfaces. On the piano
                 //   view it is the chord audition, and a plugin face opened
@@ -36398,16 +36530,19 @@ impl TangentApp {
 
     /// **A change to the arrangement's grid or window is a moment.**
     ///
-    /// Those nine settings became part of the document when the session
-    /// started carrying them (`arrangement::View`), which put them in the
-    /// undo fingerprint - and the fingerprint is what a moment is compared
-    /// by. But every gesture that changes one of them only saves the
-    /// settings file: the magnet button and its keyboard twin, the tempo
-    /// lane's, `Cmd+Shift+M`, the grid drag, the grid's arrow keys, the
-    /// lane-count wheel, the header's width drag. So each of them had NO
-    /// moment of its own and was folded into whatever the user did next -
-    /// one Ctrl+Z undoing two things, which is the fault the owner reported
-    /// against normalize and which this is the commoner trigger for.
+    /// The fourteen fields of `arrangement::View` (the timeline's magnet,
+    /// grid, tempo lane, master row, header width, lane count and the pane
+    /// height that count was chosen at, and the quantize window's seven
+    /// knobs) became part of the document when the session started carrying
+    /// them, which put them in the undo fingerprint - and the fingerprint is
+    /// what a moment is compared by. But every gesture that changes one of
+    /// them only saves the settings file: the magnet button and its keyboard
+    /// twin, the tempo lane's, `Cmd+Shift+M`, the grid drag, the grid's
+    /// arrow keys, the lane-count wheel, the header's width drag. So each of
+    /// them had NO moment of its own and was folded into whatever the user
+    /// did next - one Ctrl+Z undoing two things, which is the fault the
+    /// owner reported against normalize and which this is the commoner
+    /// trigger for.
     ///
     /// **Once a frame, not at each of the nine.** A tenth will be written,
     /// and a rule that has to be remembered at a call site is one that gets
@@ -36420,6 +36555,21 @@ impl TangentApp {
     /// drag change their field on every frame of themselves and are one
     /// moment at the end, exactly as a clip drag is; committing per frame
     /// is how a marker drag used to drain the whole hundred-moment history.
+    ///
+    /// **`View` and nothing else.** The editor's `Feel`, `Notation` and
+    /// `Look` are hashed too and nothing watches them here: a gesture that
+    /// writes one of those owes its own commit.
+    ///
+    /// **The guard sees the arrangement's gestures only**: `arr_drag` and
+    /// `arr_gesture_dirty`. A band (`grabbed`), mixer (`mixer_grab`),
+    /// metronome (`met_drag`) or editor (`MidiEdit::drag`) drag in flight
+    /// is invisible to it, so a `View` change made during one commits that
+    /// drag's half-way state as a moment of its own.
+    ///
+    /// **Nor can it see a host request raised in the same frame**: an
+    /// audio Apply in the quantize window that moves a knob has the knobs
+    /// committed here at the end of its frame, and the host's warp commits
+    /// a second moment when it lands, frames later. One press, two moments.
     fn commit_view_change(&mut self) {
         let now = Self::desk_view(&self.settings).view;
         if self.arr_drag.is_some() || self.arr_gesture_dirty {
@@ -41028,8 +41178,9 @@ mod tests {
     /// Two things worth holding. The window is NOT modal, so the selection
     /// moves under it and the target line has to follow - a window saying
     /// "1 audio clip" while three are selected is lying about what the
-    /// button does. And Apply uses the WINDOW'S grid, not the view's, which
-    /// is the whole reason the window exists beside the bare `Q`.
+    /// button does. And Apply uses the WINDOW'S grid, not the view's: `Q`
+    /// opens this window, and its grid is its own, so trying a 1/16 quantize
+    /// never moves the view's grid.
     #[test]
     fn the_quantize_window_follows_the_selection_and_applies_its_own_grid() {
         use crate::dialogs::{Dialog, DialogAction};
@@ -41189,12 +41340,13 @@ mod tests {
 
     /// **Changing the timeline's grid or window is its own step back.**
     ///
-    /// Those nine settings joined the document when the session started
-    /// carrying them, which put them in the undo fingerprint - and every
-    /// gesture that changes one only saves the settings file. So each had
-    /// NO moment of its own and was folded into whatever the user did
-    /// next: one Ctrl+Z undoing two things, which is the fault the owner
-    /// reported against normalize and this is the commoner trigger for.
+    /// The fields of `arrangement::View` joined the document when the
+    /// session started carrying them, which put them in the undo
+    /// fingerprint - and every gesture that changes one only saves the
+    /// settings file. So each had NO moment of its own and was folded into
+    /// whatever the user did next: one Ctrl+Z undoing two things, which is
+    /// the fault the owner reported against normalize and this is the
+    /// commoner trigger for.
     ///
     /// `commit_view_change` is one rule once a frame rather than a call at
     /// each of the nine places, because a tenth will be written.
@@ -41614,6 +41766,11 @@ mod tests {
     /// the session - every edit after it folding into one moment that never
     /// gets pushed. A source scan, because the imbalance is a property of
     /// the TEXT rather than of any one run.
+    ///
+    /// **Not yet per function.** What it compares is two whole-file counts,
+    /// and plain `commit_undo_moment` commits and early-exit releases count
+    /// as releases too, so it stays green with an early-exit release
+    /// deleted (`insert_track_below`'s, for one).
     #[test]
     fn every_held_moment_is_released() {
         for (what, src) in [
@@ -42113,14 +42270,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Q in the arrangement asks the host to quantize the selected AUDIO.**
+    /// **The quantize window's Apply, in the arrangement, asks the host to
+    /// quantize the selected AUDIO.**
     ///
     /// The UI cannot reach the samples, so all this does is name the clips
     /// and the grid - which means the thing worth testing is that it names
     /// them correctly. Checked: MIDI in the selection is skipped rather than
-    /// sent, and the grid travels as SECONDS worked out from the
-    /// arrangement's own exponent and the song's tempo, not as an exponent
-    /// the host would have to interpret for itself.
+    /// sent, and the grid travels as SECONDS worked out from the window's
+    /// own exponent and the song's tempo, not as an exponent the host would
+    /// have to interpret for itself. (The fixture puts the arrangement's
+    /// grid on the same rung, so it cannot yet tell the two exponents
+    /// apart.)
     #[test]
     fn quantizing_the_arrangement_asks_the_host_for_the_audio_clips_only() {
         let root = project_scratch("arr-quantize");
@@ -42186,15 +42346,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-
-     /// **Quantize puts what was played on the grid the editor is showing.**
+    /// **Quantize puts what was played on the quantize window's grid.**
     ///
     /// Tangent had no quantize of any kind; this is the first one. Driven
-    /// through `me_quantize` on a clip whose notes are deliberately OFF the
+    /// through the window's Apply (`DialogAction::ApplyQuantize` →
+    /// `me_quantize_with`) on a clip whose notes are deliberately OFF the
     /// grid, and checked against hand-computed positions rather than against
     /// the quantizer's own arithmetic - a test that asked `Quantize` where a
     /// note should go and then checked it went there would pass on any
-    /// implementation, correct or not.
+    /// implementation, correct or not. (The editor's own grid is on the same
+    /// rung here, so this does not yet tell the two grids apart.)
     ///
     /// **The clip starts OFF the grid, deliberately.** At 8.25 s with a
     /// quarter-note grid of half a second, the clip's own zero is not on a
@@ -42287,8 +42448,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **The editor works on SETS now.** Select-all takes every note;
-    /// quantise puts their starts on the grid; duplicate lays the copies
     /// **A cursor step is held, and the step after it takes over cleanly.**
     ///
     /// Two things that have to be true together. The note has to OUTLAST the
@@ -42863,6 +43022,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The editor works on SETS now.** Select-all takes every note;
+    /// quantise puts their starts on the grid; duplicate lays the copies
     /// one step later and hands them the selection; a nudge moves the set
     /// together inside the clip's walls; delete takes them all at once.
     #[test]
@@ -48885,10 +49046,11 @@ mod tests {
             "insert_keys",
             "insert_bypass",
             "instruments",
-            // The arrangement's grid and window, added later still. Zero is
-            // a real value for two of its fields — a header of no width and
-            // no lanes visible — so an absent block that read as zeroes
-            // would give every old session an unusable timeline.
+            // The arrangement's grid and window, added later still. An ABSENT
+            // block must leave the live values alone; read as the shipped
+            // defaults it would reset the grid, the magnet and the quantize
+            // window of every old session, and put the header width and the
+            // lane count back on AUTO (zero is AUTO for those two).
             "view",
         ] {
             assert!(desk.remove(k).is_some(), "{k} was never written");
@@ -58259,7 +58421,7 @@ mod tests {
 
     /// A plugin drains nothing, so a request it can never honour must not be
     /// recorded at all — otherwise the first thing draining would do, whenever
-    /// somebody added it, is start a take nobody asked for.
+    /// somebody added it, is start an arrangement record nobody asked for.
     #[test]
     fn a_plugin_records_no_recorder_requests() {
         let (_ctx, mut app) = headless(Caps::PLUGIN);
@@ -61755,7 +61917,7 @@ mod tests {").expect("the tests module")];
     /// answers "is it allowed", and all of it lives here:
     /// - the recorder band has to be SHOWN, which is the consent the keymap
     ///   gates Space on - somebody who has never opened the recorder must
-    ///   not start a take with the widest key on the keyboard;
+    ///   not roll the song with the widest key on the keyboard;
     /// - Space is PLAY only on the desk's surfaces. On the piano view it is
     ///   the chord audition, and a plugin face opened from there must not
     ///   quietly turn it into a transport.
@@ -63500,8 +63662,9 @@ mod tests {").expect("the tests module")];
     /// transport, Stop from a rolling one - and Stop cannot end a take, the
     /// host's `R::Stop` leaves the session alone.
     ///
-    /// Revert-check performed: give `K::StartRecording` its `Capture` arm
-    /// back and this goes red naming Enter.
+    /// Enter is bound to nothing now, so a `Capture` arm restored on
+    /// `K::StartRecording` no longer turns this red; the Cmd+R and Space
+    /// rows are what bite.
     #[test]
     fn no_key_touches_a_take() {
         let press_on = |key: egui::Key,
@@ -65279,49 +65442,6 @@ mod folder_tests {
         }
     }
 
-    /// **A lane opens with exactly one node, and alt-click makes it two.**
-    ///
-    /// Both halves of the owner's rule, which took two goes to get right in
-    /// both directions. First there was an `ensure_zero` on every mutator, so
-    /// the first alt-click on an empty lane made TWO nodes — the seed and the
-    /// one under the hand. Removing it fixed that and broke the other half:
-    /// the lane then opened with nothing on it. One node, seeded once, when
-    /// the lane is opened.
-    /// **The drumpad opens on C2, whatever page it was left on.**
-    ///
-    /// The selection and the page are two pieces of state that have to agree,
-    /// and only one of them was persisted — so paging away once and reopening
-    /// put the highlight on the last pad of the wrong page, because
-    /// `sel - base` was clamped into range rather than being out of it.
-    /// **A copied drum track is a full instance, not a follower.**
-    ///
-    /// Copying the bays put `DRUMPAD_PATH` in bay 0 of the new lane, which is
-    /// the whole of what makes the engine treat a lane as drums — so it took
-    /// MIDI, drew its pads striking, and made no sound, because a lane's
-    /// samples live in its KIT and the new lane's was empty. The owner: "the
-    /// second is seen as an instance of the 1st that follows but does not
-    /// produce sound."
-    /// **A pad edit is on the undo timeline like everything else.**
-    ///
-    /// The kits live in a sidecar of their own, and the undo history stored
-    /// the arrangement document alone — so loading a kit, clearing a pad or
-    /// retuning one could not be undone, and an undo taken after one of them
-    /// put the clips back while the pads stayed exactly as they were. The
-    /// owner: "the whole pad logic should be compat with standard copy paste
-    /// and cut undo / redo behavior."
-    /// **Undo actually moves, and redo survives it.**
-    ///
-    /// It did neither, and the cause was one character of arithmetic three
-    /// files away: `Arrangement::to_json` wrote `next_clip_id` raw while
-    /// `from_json` raised it to `max(highest id + 1, 1)`, so a document that
-    /// said 0 read back as 1. Undo compares the live document against the
-    /// moment it stands on, saw that phantom difference, decided something
-    /// had changed, pushed a duplicate moment, TRUNCATED THE REDO TAIL to
-    /// make room for it, and stepped back to precisely where it started.
-    ///
-    /// Nothing failed. Undo simply did nothing, and redo was gone. This
-    /// asserts the movement rather than the arithmetic, because the
-    /// arithmetic is not the point and could be fixed a second way.
     /// **Automation nodes obey select, delete, copy, cut and paste.**
     ///
     /// A curve was drawable and draggable and nothing else: no way to choose
@@ -65396,6 +65516,19 @@ mod folder_tests {
         assert_eq!(count(&app), 6, "undo did not bring the deleted nodes back");
     }
 
+    /// **Undo actually moves, and redo survives it.**
+    ///
+    /// It did neither, and the cause was one character of arithmetic three
+    /// files away: `Arrangement::to_json` wrote `next_clip_id` raw while
+    /// `from_json` raised it to `max(highest id + 1, 1)`, so a document that
+    /// said 0 read back as 1. Undo compares the live document against the
+    /// moment it stands on, saw that phantom difference, decided something
+    /// had changed, pushed a duplicate moment, TRUNCATED THE REDO TAIL to
+    /// make room for it, and stepped back to precisely where it started.
+    ///
+    /// Nothing failed. Undo simply did nothing, and redo was gone. This
+    /// asserts the movement rather than the arithmetic, because the
+    /// arithmetic is not the point and could be fixed a second way.
     #[test]
     fn undo_steps_back_and_leaves_a_redo_to_come_forward_to() {
         let mut app = app();
@@ -66191,6 +66324,14 @@ mod folder_tests {
         }
     }
 
+    /// **A pad edit is on the undo timeline like everything else.**
+    ///
+    /// The kits live in a sidecar of their own, and the undo history stored
+    /// the arrangement document alone — so loading a kit, clearing a pad or
+    /// retuning one could not be undone, and an undo taken after one of them
+    /// put the clips back while the pads stayed exactly as they were. The
+    /// owner: "the whole pad logic should be compat with standard copy paste
+    /// and cut undo / redo behavior."
     #[test]
     fn a_pad_edit_can_be_undone_and_redone() {
         let mut app = app();
@@ -66285,6 +66426,14 @@ mod folder_tests {
         }
     }
 
+    /// **A copied drum track is a full instance, not a follower.**
+    ///
+    /// Copying the bays put `DRUMPAD_PATH` in bay 0 of the new lane, which is
+    /// the whole of what makes the engine treat a lane as drums — so it took
+    /// MIDI, drew its pads striking, and made no sound, because a lane's
+    /// samples live in its KIT and the new lane's was empty. The owner: "the
+    /// second is seen as an instance of the 1st that follows but does not
+    /// produce sound."
     #[test]
     fn copying_a_drum_track_copies_the_kit_that_makes_the_sound() {
         let mut app = app();
@@ -67984,6 +68133,12 @@ mod folder_tests {
         assert!(app.desk_owns_the_arrows(), "the mixer still transposed");
     }
 
+    /// **The drumpad opens on C2, whatever page it was left on.**
+    ///
+    /// The selection and the page are two pieces of state that have to agree,
+    /// and only one of them was persisted — so paging away once and reopening
+    /// put the highlight on the last pad of the wrong page, because
+    /// `sel - base` was clamped into range rather than being out of it.
     #[test]
     fn the_drumpad_opens_on_c2_however_it_was_left() {
         let mut app = app();
@@ -68008,6 +68163,15 @@ mod folder_tests {
         );
     }
 
+    /// **A lane opens with exactly one node, and the first node drawn makes
+    /// it two.**
+    ///
+    /// Both halves of the owner's rule, which took two goes to get right in
+    /// both directions. First there was an `ensure_zero` on every mutator, so
+    /// the first alt-click on an empty lane made TWO nodes — the seed and the
+    /// one under the hand. Removing it fixed that and broke the other half:
+    /// the lane then opened with nothing on it. One node, seeded once, when
+    /// the lane is opened.
     #[test]
     fn opening_a_lane_lays_one_node_at_the_start_and_the_next_click_makes_two() {
         use crate::automation::{AutoParam, Point, Shape};
@@ -69268,15 +69432,6 @@ mod aspect_snap_tests {
         ..Caps::DESKTOP
     };
 
-    /// The owner's desk as it ships, on the display he reported.
-    ///
-    /// `first_launch`, because that is the set of bands a person actually has
-    /// up — `Settings::default` has no recorder and no neck, which is a
-    /// 147-point window and a question nobody is asking. `tracks_added` full,
-    /// so the paywall's sixteen is never what a count is measuring: the
-    /// licence on the machine running these tests is whatever it is, and a
-    /// document that already carries work on every lane opens the whole desk
-    /// for everybody (see `active_channels`).
     /// **The window a laptop opens at shows the whole band.**
     ///
     /// The owner, on a 2013 MacBook Air running Linux at 1440x900: "at 100%
@@ -69318,6 +69473,15 @@ mod aspect_snap_tests {
         }
     }
 
+    /// The owner's desk as it ships, on the display he reported.
+    ///
+    /// `first_launch`, because that is the set of bands a person actually has
+    /// up — `Settings::default` has no recorder and no neck, which is a
+    /// 147-point window and a question nobody is asking. `tracks_added` full,
+    /// so the paywall's sixteen is never what a count is measuring: the
+    /// licence on the machine running these tests is whatever it is, and a
+    /// document that already carries work on every lane opens the whole desk
+    /// for everybody (see `active_channels`).
     fn desk_on(w: i64, usable_h: i64, percent: i64) -> Settings {
         let mut s = Settings::first_launch();
         s.show_welcome = false;

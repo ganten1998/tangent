@@ -10,7 +10,7 @@ Canada signs under their own legal name (step 3).
 
 ## Why this route and not a certificate on a USB stick
 
-Three different things get called "reliable" in code signing, and it pays
+Four different things get called "reliable" in code signing, and it pays
 to keep them apart:
 
 1. **A valid signature.** Every option gives you this. It proves the file
@@ -86,8 +86,8 @@ Verification Root CA 2020. Each certificate lives three days; the RFC 3161
 timestamp is what keeps signatures valid after that. It took one fix:
 jsign's default timestamp protocol is the legacy Authenticode one, which
 Microsoft's server does not speak, so `sign-windows.sh` passes
-`--tsmode RFC3161`. What remains is step 6's three variables on whichever
-machine builds.
+`--tsmode RFC3161`. Signing is live: any machine that builds needs step 6's
+three variables and an `az login`.
 
 1. **Azure account.** https://portal.azure.com - sign in or create the
    account (Microsoft account, credit card for the subscription; the
@@ -98,7 +98,8 @@ machine builds.
    (may still appear as "Trusted Signing accounts") - Create. Pick:
    - Resource group: new, e.g. `tangent-signing`
    - Account name: e.g. `tangent` (globally unique; whatever it accepts)
-   - Region: **East US** (matches the endpoint the scripts default to)
+   - Region: **East US** (matches the endpoint in step 6's example; the
+     scripts have no default and require all three variables)
    - Pricing: **Basic**
 
 3. **Identity validation, as an Individual.** Open the account (the
@@ -150,11 +151,17 @@ machine builds.
    export TRUSTED_SIGNING_PROFILE=tangent      # your profile name from step 4
    ```
 
-7. **Prove it.** Sign any PE once and check it:
+   It needs a jsign that knows `--storetype TRUSTEDSIGNING` (Homebrew's 7.5
+   does).
+
+7. **Prove it.** Sign a scratch COPY, never a file in `dist/`: re-signing a
+   signed file nests a second signature and changes its bytes after
+   `release.sh` wrote SHA256SUMS.
 
    ```sh
-   scripts/sign-windows.sh dist/Tangent-*-windows-setup.exe
-   python3 scripts/pe-signed.py dist/Tangent-*-windows-setup.exe
+   cp "$(ls dist/Tangent-*-windows-setup.exe | head -1)" /tmp/probe.exe
+   scripts/sign-windows.sh /tmp/probe.exe
+   python3 scripts/pe-signed.py /tmp/probe.exe
    ```
 
 From then on `build-cross.sh` signs `tangent.exe`, `tangent-ffmpeg.exe`,

@@ -87,7 +87,14 @@ mod varispeed;
 /// at all.
 #[cfg(feature = "recorder")]
 mod stretch;
+/// Where a clip's attacks are, for audio quantize. It reads a
+/// `tangent_record::decode::Clip` just as `stretch` does, but is not yet
+/// gated on `recorder` the way `stretch` is, so a Minimal build fails to
+/// compile it.
 mod transient;
+/// Warping a clip's attacks onto the grid: the audio half of quantize. Not
+/// yet gated on `recorder` either, though it renders through `stretch` and
+/// reads a `tangent_record::decode::Clip`.
 mod warp;
 /// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
 /// instrument and the metronome. Absent from a Minimal build for the same
