@@ -2776,6 +2776,10 @@ fn legacy_rate_poll() -> bool {
 #[cfg(feature = "recorder")]
 struct RatePoll {
     seen: Arc<std::sync::atomic::AtomicU32>,
+    /// **The output to ask: the one the engine OPENED**, by the name it
+    /// opened with (`OutputInfo::device`), or `None` before any engine has.
+    /// See [`RatePoll::follow`].
+    device: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[cfg(feature = "recorder")]
@@ -2783,11 +2787,20 @@ impl RatePoll {
     fn start() -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         let seen = Arc::new(AtomicU32::new(0));
+        let device: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
         let weak = Arc::downgrade(&seen);
+        let followed = Arc::clone(&device);
         let _ = std::thread::Builder::new()
             .name("tangent-rate-watch".to_owned())
             .spawn(move || loop {
                 let Some(cell) = weak.upgrade() else { return };
+                // **The output the engine opened, never the default by
+                // default.** A session may run a CHOSEN output, and the
+                // system default beside it can sit at another rate for good:
+                // asked about the default, this read that difference as the
+                // device moving on its own, and the follower reopened the
+                // audio path every three seconds for the rest of the session.
+                let name = followed.lock().map(|n| n.clone()).unwrap_or(None);
                 // **Never the chosen host under ASIO.** `default_output_rate`
                 // goes through `with_host`, which is per THREAD — so on this
                 // thread it built a second ASIO host, whose empty driver guard
@@ -2825,14 +2838,16 @@ impl RatePoll {
                     #[cfg(target_os = "macos")]
                     {
                         if legacy_rate_poll() {
-                            crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                            crate::instrument::Engine::default_output_rate(name.as_deref())
+                                .unwrap_or(0)
                         } else {
-                            crate::outpath::nominal_rate(None).unwrap_or(0)
+                            crate::outpath::nominal_rate(name.as_deref()).unwrap_or(0)
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
                     {
-                        crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                        crate::instrument::Engine::default_output_rate(name.as_deref())
+                            .unwrap_or(0)
                     }
                 };
                 cell.store(hz, Ordering::Relaxed);
@@ -2842,7 +2857,20 @@ impl RatePoll {
                 drop(cell);
                 std::thread::sleep(RATE_ASK_EVERY);
             });
-        Self { seen }
+        Self { seen, device }
+    }
+
+    /// **Ask about this output from now on**: the name the engine just
+    /// opened with. What was heard about the last one is forgotten, so the
+    /// follower reads "nothing known yet" until the new output has answered
+    /// rather than comparing a new engine with an old device. An ask already
+    /// in flight can still land one old answer; `RateWatch` wants
+    /// [`RATE_DRIFT_POLLS`] in a row, so one cannot reopen anything.
+    fn follow(&self, device: Option<&str>) {
+        if let Ok(mut name) = self.device.lock() {
+            *name = device.map(str::to_owned);
+        }
+        self.seen.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// What the device last said, or `None` while nothing has been asked yet.
@@ -13897,6 +13925,11 @@ impl DesktopApp {
                     .map(|e| e.output().device.clone());
                 self.recorder.overload =
                     crate::outpath::OverloadWatch::watch(opened_on.as_deref());
+                // **And the rate follower asks the same device**, for the
+                // same reason: an engine on a chosen output compared with the
+                // system default's rate reopened the path every three seconds
+                // whenever the two ran at different rates. See `RatePoll`.
+                self.recorder.rate_poll.follow(opened_on.as_deref());
                 // `xruns_seen` is deliberately NOT reset with it. On Linux
                 // `graph_dropouts` is a cumulative process-wide count that
                 // survives an engine rebuild, so zeroing the high-water mark
@@ -27829,7 +27862,9 @@ mod tests {").expect("the tests module")];
             &src[a..a + b]
         };
         let guard = thread.find("system_is_asio()").expect("the poll thread no longer asks which system it is on");
-        let ask = thread.find("default_output_rate(None)").expect("the poll thread no longer asks the rate");
+        let ask = thread
+            .find("default_output_rate(name.as_deref())")
+            .expect("the poll thread no longer asks the rate");
         assert!(guard < ask, "the ASIO check comes after the ask, so the driver is loaded first");
         let follower = {
             let a = src.find("rate_poll.rate()").expect("the follower no longer reads the poll");
@@ -27839,6 +27874,40 @@ mod tests {").expect("the tests module")];
             follower.contains("system_is_asio()") && follower.contains("device_rate_now()"),
             "under ASIO the follower no longer asks the engine's own device on the UI thread"
         );
+    }
+
+    /// **The rate poll asks the output the engine OPENED.** It asked the
+    /// system DEFAULT output while an engine opened on a chosen output was
+    /// playing another device, so a chosen output running at another rate
+    /// than the default read as a device that had moved on its own, and the
+    /// audio path reopened every three seconds for the whole session - every
+    /// plugin reloaded, every clip decoded again. A source scan: the poll
+    /// asks real hardware from a thread of its own, and the engine it follows
+    /// lives on a `DesktopApp`, which cannot be built in a test.
+    #[test]
+    fn the_rate_poll_asks_the_output_the_engine_opened() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let poll = {
+            let a = src.find("impl RatePoll {").expect("`RatePoll` is gone");
+            let b = src[a..].find("\n}\n").expect("the end of `impl RatePoll`");
+            &src[a..a + b]
+        };
+        assert!(
+            !poll.contains("default_output_rate(None)") && !poll.contains("nominal_rate(None)"),
+            "RatePoll asks the system DEFAULT output's rate while an engine opened on a chosen \
+             output plays another device; a rate mismatch between them reopens the path every 3 s"
+        );
+        // And it is told which output that is where the engine is born,
+        // after the engine is seated: the overload watch's rule, and for its
+        // reason.
+        let start = src.find("fn start_engine(").expect("`start_engine` is gone");
+        let body = &src[start..start + src[start..].find("\n    fn ").expect("its end")];
+        let seated = body.find("self.recorder.engine = Some(e);").expect("the engine is seated");
+        let told = body
+            .find("self.recorder.rate_poll.follow(opened_on.as_deref());")
+            .expect("`start_engine` never tells the rate poll which output it opened");
+        assert!(seated < told, "the rate poll is told before the engine is seated");
     }
 
     /// The macOS save panel's refusal rule is chosen the same way its start
