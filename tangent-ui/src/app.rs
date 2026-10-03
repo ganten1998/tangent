@@ -18380,40 +18380,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if !repeats {
                 c.pedal.retain(|e| e.at_s < cut);
             }
-            tails.push(crate::arrangement::ArrClip {
-                pedal: tail_pedal,
-                kind: c.kind,
-                notes: tail_notes,
-                lane: c.lane,
-                path: c.path.clone(),
-                start_s: t,
-                offset_s: c.offset_s + head,
-                len_s: len - head,
-                // **A blade makes a clip, so the clip it makes is a loop** —
-                // over its own new length, like everything else born here.
-                //
-                // The HEAD is left holding whatever loop it already had, and
-                // that is not an oversight: a four-bar clip repeating one bar,
-                // cut at two and a half, still repeats that bar for two and a
-                // half bars. Re-cutting the head's loop to its new length
-                // would throw the pass away and weld the repeats it had into
-                // one, which is glue's verb and not the blade's.
-                // A repeating clip's tail keeps the repeat; any other tail is
-                // a new clip and takes a loop over its own length.
-                loop_s: if repeats { c.loop_s } else { len - head },
-                fade_in_s: 0.0,
-                fade_out_s: tail_fade,
-                name: c.name.clone(),
-                id: 0,
-                extra: Default::default(),
-                anchor: Default::default(),
-                follow_tempo: false,
-                stretch: 1.0,
-                stretch_mode: String::new(),
-                gain: 1.0,
-                warp: Vec::new(),
-                warp_fit: String::new(),
-            });
+            // **The tail is the same take, cut: a clone with only what the
+            // blade changes written over it.** Everything else an audio clip
+            // carries belongs to the whole take - the quantize (warp map and
+            // fit), the normalise (gain), the stretch (ratio and algorithm),
+            // how it keeps its bar, and any key this build cannot read. The
+            // tail was built field by field with all of that reset, so the
+            // right half of a quantized, normalised take played unquantized
+            // at unity gain, and a stretched take's tail read the raw file.
+            // `offset_s + head` is right for every one of them: the trim is
+            // on the axis of the audio the clip PLAYS (warped, then
+            // stretched), which is the axis `head` is measured on. Cloning
+            // the head is safe because every field the head changed above is
+            // written again here.
+            let mut tail = c.clone();
+            tail.id = 0;
+            tail.pedal = tail_pedal;
+            tail.notes = tail_notes;
+            tail.start_s = t;
+            tail.offset_s = c.offset_s + head;
+            tail.len_s = len - head;
+            // **A blade makes a clip, so the clip it makes is a loop** —
+            // over its own new length, like everything else born here.
+            //
+            // The HEAD is left holding whatever loop it already had, and
+            // that is not an oversight: a four-bar clip repeating one bar,
+            // cut at two and a half, still repeats that bar for two and a
+            // half bars. Re-cutting the head's loop to its new length
+            // would throw the pass away and weld the repeats it had into
+            // one, which is glue's verb and not the blade's.
+            // A repeating clip's tail keeps the repeat; any other tail is
+            // a new clip and takes a loop over its own length.
+            tail.loop_s = if repeats { c.loop_s } else { len - head };
+            tail.fade_in_s = 0.0;
+            tail.fade_out_s = tail_fade;
+            tails.push(tail);
         }
         if tails.is_empty() {
             return;
@@ -68533,6 +68534,67 @@ mod folder_tests {
             "a non-repeating clip's tail is a new clip with a loop over its own length, not {}",
             tail.loop_s
         );
+    }
+
+    /// **A blade divides a clip in time and in nothing else.** Everything an
+    /// audio clip carries besides its window - the quantize (warp map and
+    /// fit), the normalise (gain), the stretch (ratio and algorithm), how it
+    /// follows the tempo - belongs to the whole take. The tail was built
+    /// field by field with all of it reset: the right half of a quantized,
+    /// normalised take played unquantized at unity gain, and a stretched
+    /// take's tail read the raw file at an offset on the stretched axis.
+    #[test]
+    fn a_split_audio_clip_keeps_its_warp_gain_and_stretch_on_both_sides() {
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.settings.arr_snap = false;
+        let map: Vec<(u64, u64)> = vec![(0, 0), (96_000, 97_200), (192_000, 192_000)];
+        a.arrangement.clips.push(crate::arrangement::ArrClip {
+            id: 3,
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/take.wav".to_owned(),
+            name: "take".to_owned(),
+            start_s: 0.0,
+            offset_s: 0.5,
+            len_s: 8.0,
+            loop_s: 8.0,
+            warp: map.clone(),
+            warp_fit: "slice".to_owned(),
+            stretch: 1.25,
+            stretch_mode: "rhythmic".to_owned(),
+            gain: 0.5,
+            anchor: crate::arrangement::Anchor::Beat,
+            follow_tempo: true,
+            ..Default::default()
+        });
+        a.arr_selected = Some(3);
+        a.recorder.position_s = 5.0;
+        a.arr_split_at_playhead();
+
+        let head = a.arrangement.clips.iter().find(|c| c.id == 3).expect("the head").clone();
+        let tail = a.arrangement.clips.iter().find(|c| c.id != 3).expect("the tail landed").clone();
+        // What the blade changes.
+        assert!((head.len_s - 5.0).abs() < 1.0e-9, "the head is {} long", head.len_s);
+        assert!((tail.start_s - 5.0).abs() < 1.0e-9, "the tail starts at {}", tail.start_s);
+        assert!((tail.len_s - 3.0).abs() < 1.0e-9, "the tail is {} long", tail.len_s);
+        assert!(
+            (tail.offset_s - 5.5).abs() < 1.0e-9,
+            "the tail enters the played audio at {}, not at the head's trim plus the cut",
+            tail.offset_s
+        );
+        // What it must not: both halves are still one take.
+        assert_eq!(tail.warp, map, "the split threw the tail's quantize away");
+        assert_eq!(head.warp, map, "the split moved the head's quantize");
+        assert_eq!(tail.warp_fit, "slice", "the tail lost the quantize's fit");
+        assert!((tail.gain - 0.5).abs() < 1.0e-12, "the tail lost its gain: {}", tail.gain);
+        assert!(
+            (tail.stretch - 1.25).abs() < 1.0e-12,
+            "the tail lost its stretch: {} - it reads the raw file at a stretched offset",
+            tail.stretch
+        );
+        assert_eq!(tail.stretch_mode, "rhythmic", "the tail lost its stretch algorithm");
+        assert_eq!(tail.anchor, head.anchor, "the tail stopped keeping its bar");
+        assert_eq!(tail.follow_tempo, head.follow_tempo, "the tail stopped following the tempo");
     }
 
     /// **A dragged block lands where it was dropped, head first.**
