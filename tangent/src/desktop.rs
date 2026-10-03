@@ -11079,7 +11079,9 @@ impl DesktopApp {
     /// does mean the engine's slot is empty and there is nothing to unload.
     fn force_insert_reload(&mut self) {
         // A whole-desk change - a session switch or a template - is a
-        // rebuild, and the room may hold an armed input through it.
+        // rebuild, and the room may hold an armed input through it: over the
+        // bays the engine has nothing in, never over one still playing its
+        // old instance (see `chain_bay_pending`).
         self.racks_restoring = true;
         let bays = tangent_ui::recorder::INSERTS;
         for i in 0..self.recorder.inserts_loaded.len() {
@@ -20043,14 +20045,16 @@ impl DesktopApp {
     ///
     /// **Silent only over EMPTY bays.** The hold is the subtraction
     /// `room = mix - input_dry`, which is exact only while the held chains'
-    /// folder and route-destination bays hold nothing in the engine. At
-    /// engine birth that is true until the first such bay lands; from then on
-    /// every chain bay still pending holds the room over a plugin that is
-    /// already processing. After `force_insert_reload` (Open, New, a
-    /// template) it is false from the start: that marks the LEDGER only, and
-    /// every marked bay keeps its OLD instance playing until the reconcile
-    /// reaches it. For as long as this returns true, a nonlinear folder or
-    /// route bay in a held chain plays its residue.
+    /// folder and route-destination bays hold nothing in the engine, so only
+    /// a bay the engine has NOTHING in holds the room (`chain_bay_pending`).
+    /// After `force_insert_reload` (Open, New, a template) a bay still playing
+    /// its OLD instance until the reconcile reaches it is let through, as a
+    /// plugin picked by hand is. Not yet exact everywhere: at engine birth,
+    /// once the first folder or route bay of a held chain lands, every chain
+    /// bay still empty goes on holding the room over a plugin that is already
+    /// processing, and a nonlinear one plays its residue for that long - as
+    /// it does on Open or New when an empty bay is held beside an occupied
+    /// one.
     #[cfg(feature = "recorder")]
     fn armed_racks_pending(&self) -> bool {
         if !self.racks_restoring || self.recorder.engine.is_none() {
@@ -20069,10 +20073,16 @@ impl DesktopApp {
                 })
             },
             |seat, bay| {
-                self.recorder
-                    .inserts_loaded
-                    .get(seat * inserts + bay)
-                    .is_some_and(|got| self.app.insert(seat, bay) != got.as_deref())
+                self.recorder.inserts_loaded.get(seat * inserts + bay).is_some_and(|got| {
+                    chain_bay_pending(
+                        self.app.insert(seat, bay),
+                        got.as_deref(),
+                        self.recorder
+                            .engine
+                            .as_ref()
+                            .is_some_and(|e| e.insert(seat, bay).is_some()),
+                    )
+                })
             },
         )
     }
@@ -20855,6 +20865,29 @@ impl Counted {
     }
 }
 
+/// **Whether one bay of an armed input's chain holds the room shut**:
+/// something is wanted there, it has not arrived (`wanted` is not what the
+/// reconcile's ledger says the bay holds), and the ENGINE has nothing in the
+/// slot.
+///
+/// The last clause is the narrowing, and it is about what the hold IS: the
+/// room is held by subtraction (`room = mix - input_dry`), which is exact only
+/// over bays that process nothing. At engine birth every bay is empty, so the
+/// rule is the old one there. After `force_insert_reload` (Open, New, a
+/// template) a bay the old desk occupied wears the reload sentinel while its
+/// OLD instance goes on playing until the reconcile reaches it, and holding
+/// the room over a folder denoiser that is still running played the noise it
+/// removes, inverted, at full level - the residue d6547f6 took away from a
+/// plugin picked by hand, back on every Open. Such a bay is let through for
+/// the reason a picked plugin is: the chain it is in goes on playing, and its
+/// swap is one block. `engine_holds` is asked of the engine
+/// (`Engine::insert`), because the sentinel cannot say it: it is also written
+/// on a bay the old desk left empty and the new one wants.
+#[cfg(feature = "recorder")]
+fn chain_bay_pending(wanted: Option<&str>, ledger: Option<&str>, engine_holds: bool) -> bool {
+    wanted.is_some() && wanted != ledger && !engine_holds
+}
+
 /// **Whether an armed input is still waiting on a bay** - the decision
 /// behind [`DesktopApp::armed_racks_pending`], as a function of its inputs so
 /// that it can be driven by a test. `DesktopApp` cannot be built in one.
@@ -20869,9 +20902,9 @@ impl Counted {
 ///
 /// `parents` is the engine's folder table (`folder_parents`, -1 for none);
 /// `routed_to` answers the channels one channel is routed to, as a mask.
-/// `mismatched` answers "is this seat's bay holding something other than what
-/// the desk asks for", which is the reconcile's own word for a bay that has
-/// not arrived - the same predicate `insert_walk` counts.
+/// `mismatched` answers "is this seat's bay still waiting on what the desk
+/// asks for" - in the host, [`chain_bay_pending`]: a bay that has not arrived
+/// (the predicate `insert_walk` counts) and that the engine holds nothing in.
 #[cfg(feature = "recorder")]
 fn armed_rack_pending(
     armed: u32,
@@ -24378,6 +24411,49 @@ mod tests {
             "the rebuild never ends, so every later pick would hold the room"
         );
         assert_eq!(src.matches("self.racks_restoring = true;").count(), 2, "a third road raises the flag");
+    }
+
+    /// **On Open and New the room is held only over a bay the ENGINE has
+    /// nothing in.** `force_insert_reload` marks every occupied bay with the
+    /// reload sentinel while its OLD instance goes on playing until the
+    /// reconcile reaches it, and the room is held by subtraction: held over a
+    /// folder denoiser that is still running, it played the noise the denoiser
+    /// removes, inverted and at full level, until the last bay of the mic's
+    /// chain had reloaded. Engine birth is unchanged: every slot is empty
+    /// there, so every bay that has not arrived still holds.
+    #[test]
+    fn the_room_is_held_only_over_a_bay_the_engine_has_nothing_in() {
+        const RELOAD: &str = "\u{1f}reload";
+        let denoise = Some("@tangent-denoise");
+        // Engine birth: nothing in the slot and nothing arrived - held.
+        assert!(chain_bay_pending(denoise, None, false), "engine birth no longer holds the room");
+        // Open or New over a desk that had it: the OLD instance plays on.
+        assert!(
+            !chain_bay_pending(denoise, Some(RELOAD), true),
+            "the room is held over a denoiser that is still playing, so the noise it removes plays"
+        );
+        // Open or New onto a bay the old desk left empty: nothing there yet.
+        assert!(
+            chain_bay_pending(denoise, Some(RELOAD), false),
+            "an empty bay no longer holds the room on Open"
+        );
+        // Arrived - or failed, which the reconcile counts as arrived.
+        assert!(!chain_bay_pending(denoise, denoise, true));
+        assert!(!chain_bay_pending(denoise, denoise, false), "a failed load holds the room");
+        // Nothing wanted: an old instance on its way out is not waited for.
+        assert!(!chain_bay_pending(None, Some(RELOAD), true));
+        assert!(!chain_bay_pending(None, None, false));
+        // And it is what the gate asks, with the engine's own record of the
+        // slot: `DesktopApp` cannot be built in a test.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn armed_racks_pending(").expect("`armed_racks_pending` is gone");
+        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            body.contains("chain_bay_pending(")
+                && body.contains(".is_some_and(|e| e.insert(seat, bay).is_some())"),
+            "the room's gate no longer asks the engine whether the bay holds anything"
+        );
     }
 
     /// **And the room is actually wired to it.** `push_monitor_settings` is
