@@ -121,11 +121,12 @@ where it was dropped. That is the one way in; no picker, no menu row.
   at launch any more; the last session is a File > Open away, and a
   materialised Untitled stays on disk for that panel, unless the session
   that made it real discards it with Don't Save while it is unnamed and
-  clipless on disk and holds no recording (`rec-*`): then it was that
+  clipless on disk and holds no recording (`rec-*`) and no kit of its own:
+  then it was that
   session's litter and is removed (`discard_scratch_made_here`,
-  2026-09-22; see docs/FOLDERS-AND-SESSIONS.md). Not yet for New, which
-  removes the scratch it stands on, recording and all, when that scratch
-  has no document on disk and still has the template's kit (the New arm of
+  2026-09-22; see docs/FOLDERS-AND-SESSIONS.md). New keeps one too: it
+  starts beside a scratch the discard refuses, and asks about a clean
+  session's scratch with takes in it before reclaiming it (the New arm of
   `run_project_request`). The launch sweep (`sweep_disposable_untitleds`)
   also clears an Untitled that holds nothing it counts as work.
   Third answer to this question — the history, including the "moscow"

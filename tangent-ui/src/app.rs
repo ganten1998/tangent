@@ -2374,6 +2374,9 @@ enum AfterSave {
     Open,
     /// The window is closing.
     Quit,
+    /// Settings > Reset > The Default Template: the session is replaced by
+    /// a fresh one from the rebuilt template, as New replaces it.
+    ResetTemplate,
 }
 
 /// **One moment on the undo timeline.**
@@ -2922,6 +2925,10 @@ pub fn inside_template_shelf(path: &std::path::Path, project_root: &std::path::P
 /// clone and a differing one is work. Comparing against the disk template
 /// rather than a shipped constant means a template somebody customised
 /// protects its own clones correctly.
+///
+/// **Nor is a folder holding anything Tangent did not write**
+/// ([`holds_only_scratch`]): New and launch clear the folder they reclaim
+/// whole, so a project filed inside one would go with it.
 pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
     let template_kit = root
         .join("Templates")
@@ -2930,14 +2937,21 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
     let keeps = |dir: &std::path::Path| {
         use crate::arrangement::LoadOutcome;
         let held = match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(dir)) {
-            LoadOutcome::Loaded(a) => a.named,
+            // A document with clips is work, named or not, as the sweep and
+            // Don't Save have always read it (`scratch_is_disposable`).
+            // Open's save-back writes a scratch's document unnamed, clips and
+            // all - an arrangement take finished on the way out included -
+            // and New reclaimed that folder whole.
+            LoadOutcome::Loaded(a) => a.named || !a.clips.is_empty(),
             // Unreadable bytes are somebody's song until proven otherwise —
             // reclaiming a folder on the strength of a failed parse is how
             // a corrupt SAVED project would be deleted outright.
             LoadOutcome::Damaged => true,
             LoadOutcome::Missing | LoadOutcome::Empty => false,
         };
-        held || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
+        held
+            || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
+            || !holds_only_scratch(dir)
     };
     let first = root.join("Untitled");
     if !first.exists() || !keeps(&first) {
@@ -2950,6 +2964,67 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         }
     }
     first
+}
+
+/// **Whether a folder's name is one a scratch is given**: `Untitled`, or
+/// `Untitled ` and a number - what `fresh_project_dir` and the host's
+/// `next_untitled` mint, and nothing else. The test used to be "starts with
+/// `Untitled `", which also matched a folder somebody made and named
+/// themselves (GNOME Files calls a new one "Untitled Folder"), and the launch
+/// sweep and Don't Save both delete what they match.
+pub fn is_scratch_name(name: &str) -> bool {
+    name == "Untitled"
+        || name
+            .strip_prefix("Untitled ")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// **Whether everything in `dir` is something Tangent writes into a
+/// scratch**, so that clearing the folder can only ever clear Tangent's own
+/// files: the document (`project.tan`, or the legacy name), the kit sidecar
+/// and its write-then-rename temp, the plugin-state shelf `state/`, the
+/// export staging `export/`, `media/` holding files only, and dotfiles
+/// (Finder's `.DS_Store`). Anything else says no: a subfolder, a project
+/// filed inside, somebody's own file, a document quarantined as `.damaged`,
+/// a document's own write temp (the newest copy of a song whose rename
+/// failed).
+///
+/// The launch sweep, New's reclaim and Don't Save all remove a scratch
+/// WHOLE, and each judged it by its document, its kit and its `media/`
+/// alone: a saved project moved into a folder named `Untitled …`, or a first
+/// save typed into a scratch's own folder, went with it. A folder that
+/// cannot be listed is not judged harmless either.
+pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|e| {
+        let Ok(e) = e else {
+            return false;
+        };
+        let Ok(kind) = e.file_type() else {
+            return false;
+        };
+        let name = e.file_name();
+        match name.to_string_lossy().as_ref() {
+            // `DrumpadDoc::save_beside` writes `drumpad.json.tmp` and renames.
+            crate::arrangement::DOC_NAME
+            | crate::arrangement::DOC_NAME_LEGACY
+            | crate::drumpad::FILE_NAME
+            | "drumpad.json.tmp" => kind.is_file(),
+            "state" | "export" => kind.is_dir(),
+            // One level of files, which is how every writer fills it.
+            "media" => {
+                kind.is_dir()
+                    && std::fs::read_dir(e.path()).is_ok_and(|files| {
+                        files
+                            .into_iter()
+                            .all(|f| f.is_ok_and(|f| f.file_type().is_ok_and(|t| t.is_file())))
+                    })
+            }
+            other => other.starts_with('.') && kind.is_file(),
+        }
+    })
 }
 
 /// Move an unreadable document out of every writer's reach:
@@ -3045,19 +3120,49 @@ fn copy_kit_samples(
     dst: &std::path::Path,
 ) {
     for slot in kits.iter().flat_map(|k| k.pads.iter()) {
-        let rel = std::path::Path::new(&slot.path);
-        if slot.path.is_empty() || rel.is_absolute() {
-            continue;
-        }
-        let (from, to) = (src.join(rel), dst.join(rel));
-        if to.exists() || !from.is_file() {
-            continue;
-        }
-        if let Some(parent) = to.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&from, &to);
+        copy_named_file(&slot.path, src, dst);
     }
+}
+
+/// **The files the DOCUMENT stands on**, by the kit samples' rules: every
+/// clip's `path` and every frozen lane's render. A template Save As Template
+/// copied whole from a real project carries them, and a scratch adopted
+/// from it reads them out of the template until it is real - so they came
+/// across neither when it was made real nor when it was saved back as the
+/// template, and the swap that replaced the old template then deleted them
+/// while the new document still named them.
+fn copy_doc_media(
+    clips: &[crate::arrangement::ArrClip],
+    frozen: &[crate::arrangement::FrozenLane],
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) {
+    let named = clips.iter().map(|c| c.path.as_str()).chain(frozen.iter().map(|f| f.path.as_str()));
+    for path in named {
+        copy_named_file(path, src, dst);
+    }
+}
+
+/// One RELATIVE file a kit or a document names, from `src` into `dst`: only
+/// a file that exists there and is missing here, never over one already in
+/// `dst`. An absolute path is somebody's own file elsewhere and not ours to
+/// duplicate, and one that climbs out with `..` would land outside `dst`.
+fn copy_named_file(path: &str, src: &std::path::Path, dst: &std::path::Path) {
+    let rel = std::path::Path::new(path);
+    let inside = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+    if path.is_empty() || !inside {
+        return;
+    }
+    let (from, to) = (src.join(rel), dst.join(rel));
+    if to.exists() || !from.is_file() {
+        return;
+    }
+    if let Some(parent) = to.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&from, &to);
 }
 
 /// **Why glue said no**, in one place, for both roads through it.
@@ -12867,6 +12972,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if let Some(src) = self.media_source.as_ref() {
             copy_kit_samples(&self.drumpad_kits, src, dir);
+            // And what the document's own clips and frozen lanes stand on,
+            // out of the same template - see `copy_doc_media`.
+            copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, src, dir);
         }
         // **And the kit itself**, when there is one and the folder has none.
         // The samples alone left a real project whose kit lived only in
@@ -12884,9 +12992,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **The session as a TEMPLATE, written straight into `dir`** - the
-    /// document with the live desk and `named` off, the kit sidecar, and
-    /// the samples the kit names. Nothing else is touched: not the
-    /// session's own folder, not its path, not its saved mark.
+    /// document with the live desk and `named` off, the kit sidecar, the
+    /// samples the kit names, and the files the document's own clips and
+    /// frozen lanes stand on. Nothing else is touched: not the session's own
+    /// folder, not its path, not its saved mark.
     ///
     /// Save As Template used to save the session into its own folder first
     /// and copy that folder, so a scratch that had never been saved was
@@ -12910,9 +13019,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.write_kit_into(dir);
         // The samples from wherever the kit reads them NOW: the project when
-        // it is real, the template it was adopted from when it is not.
+        // it is real, the template it was adopted from when it is not - and
+        // the files the document's own clips and frozen lanes stand on, from
+        // the same place (`copy_doc_media`).
         if let Some(src) = self.kit_doc().as_deref().and_then(std::path::Path::parent) {
             copy_kit_samples(&self.drumpad_kits, src, dir);
+            copy_doc_media(&arr.clips, &self.settings.frozen_lanes, src, dir);
         }
         Ok(())
     }
@@ -12938,9 +13050,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// miss**: an unnamed document with no clips, no takes beside it (the
     /// caller counts those), and a kit identical to the template's is the
     /// litter the launch sweep may clear - the owner's "i hate seeing
-    /// untitled 1 2 3 build up between sessions".
+    /// untitled 1 2 3 build up between sessions". And nothing in the folder
+    /// but what Tangent writes into a scratch ([`holds_only_scratch`]): the
+    /// sweep removes it whole, so a project somebody filed inside it, or
+    /// any file of their own, keeps it.
     pub fn scratch_is_disposable(dir: &std::path::Path, template_dir: &std::path::Path) -> bool {
         use crate::arrangement::{Arrangement, LoadOutcome};
+        if !holds_only_scratch(dir) {
+            return false;
+        }
         let template_kit = template_dir.join(crate::drumpad::FILE_NAME);
         if kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit) {
             return false;
@@ -12953,6 +13071,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn open_project(&mut self, doc: &std::path::Path) {
+        // **A template opened from the Open panel is ADOPTED, as New adopts
+        // one**: read into a fresh scratch that does not exist yet. It used
+        // to be read and not inhabited, which left the session standing in
+        // the PREVIOUS project's folder with the template's unnamed document
+        // on screen - and the next Save asked for a name, moved that
+        // project's folder to it and wrote the template over its document.
+        // The first FREE name, never an Untitled already on disk: this road
+        // has no reclaim question to ask about what is in one.
+        let root = self.project_root();
+        if inside_template_shelf(doc, &root) {
+            if let Some(template) = doc.parent() {
+                let template = template.to_path_buf();
+                self.adopt_template(&template, &unique_dir(&root, "Untitled"));
+                return;
+            }
+        }
         self.open_project_keeping(doc, KeepPath::Write);
     }
 
@@ -12995,8 +13129,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         //
         // So an adopting open is the only kind the shelf gets: the document
         // is read and the session is left pointing wherever the caller aimed
-        // it, which for every road but `adopt_template` is where it already
-        // was. Refusing outright would be worse — somebody who opens a
+        // it. `open_project` hands a shelf document to `adopt_template`,
+        // which repoints at a fresh scratch on its next line, so that read is
+        // the one that lands here; this guard is the last line for any other
+        // road. Refusing outright would be worse - somebody who opens a
         // template wants to SEE it, and now they can, they just cannot save
         // over it by accident.
         let on_shelf = inside_template_shelf(doc, &self.project_root());
@@ -13028,10 +13164,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The kit rides the project: whatever drumpad this directory
         // carries replaces the one in memory. Beside `project_doc`, which is
-        // where every kit write goes: a stencil opened from the dialog keeps
-        // the session's home, so its kit must stay the session's too, or the
-        // first pad edit writes the template's kit over that project's.
-        // `adopt_template` loads the template's kit once it has repointed.
+        // where every kit write goes: a stencil read here keeps the session's
+        // home, so its kit must stay the session's too, or the first pad edit
+        // writes the template's kit over that project's. `adopt_template`
+        // loads the template's kit once it has repointed.
         self.load_drumpad_doc();
         self.reset_automation_session();
         self.reconcile_auto_bases();
@@ -13044,10 +13180,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // in, which is what a relaunch after a crash depends on.
         //
         // A `Leave` open writes nothing: `adopt_template` repoints and
-        // writes on its next line, and a stencil opened from the dialog
-        // keeps the previous session's path and leaves the mirror of its
-        // desk to the next settings write — of which there is one for
-        // every control touched.
+        // writes on its next line.
         if keep == KeepPath::Write {
             self.save_settings();
         }
@@ -13300,9 +13433,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(parent) = dir.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let moved = src.as_ref().is_some_and(|s| {
-            s.is_dir() && *s != dir && !dir.exists() && std::fs::rename(s, &dir).is_ok()
+        // **Never a KEPT project's folder.** One whose document on disk is
+        // named (or unreadable: somebody's song until proven otherwise) is a
+        // project, and the session standing in it is not its document any
+        // more - an undo past the first save puts `named` back off. Moving
+        // it took the project's name off its folder. It is copied from, as
+        // Save As copies, and stays where it is.
+        let kept = src.as_deref().is_some_and(|s| {
+            use crate::arrangement::LoadOutcome;
+            match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(s)) {
+                LoadOutcome::Loaded(a) => a.named,
+                LoadOutcome::Damaged => true,
+                LoadOutcome::Missing | LoadOutcome::Empty => false,
+            }
         });
+        let moved = !kept
+            && src.as_ref().is_some_and(|s| {
+                s.is_dir() && *s != dir && !dir.exists() && std::fs::rename(s, &dir).is_ok()
+            });
         let doc = crate::arrangement::doc_in(&dir);
         self.project_doc = doc.clone();
         self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -16094,6 +16242,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 AfterSave::New => "starting a new project",
                 AfterSave::Open => "opening another project",
                 AfterSave::Quit => "quitting",
+                AfterSave::ResetTemplate => "resetting the default template",
             }
             .to_owned(),
             name: self.project_name(),
@@ -16132,6 +16281,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.quit_now = true;
                 self.quit_allowed = true;
             }
+            AfterSave::ResetTemplate => {
+                self.project_request = Some(crate::ports::ProjectRequest::ResetTemplate);
+            }
         }
     }
 
@@ -16167,6 +16319,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // an on-exit flush in the host finds nothing owed.
         self.flush_settings_now();
         false
+    }
+
+    /// **Ask New's question again, for unsaved work that arrived after it
+    /// was asked** - the host's call once a New has finished a running
+    /// arrangement record: the take is in the document only from that
+    /// moment, so the question asked when New was pressed (none at all, on a
+    /// clean session) never covered it. `true` when the prompt is up and the
+    /// New must wait; its Save or Discard raises New again, as the menu's
+    /// does.
+    pub fn ask_before_new(&mut self) -> bool {
+        self.ask_before(AfterSave::New)
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -34196,7 +34359,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // road below — no backup, no font reload, no window resize. It is a
         // file on disk in the user's Projects folder and only the host can
         // reach it. See `ports::ProjectRequest::ResetTemplate`.
+        //
+        // **But it replaces the open session**, with a fresh one from the
+        // rebuilt template, so it asks about unsaved work as New does. It
+        // went straight to the host from its own confirmation, and the
+        // edits were simply gone.
         if scope == crate::settings::ResetScope::Template {
+            if self.ask_before(AfterSave::ResetTemplate) {
+                return;
+            }
             self.project_request = Some(crate::ports::ProjectRequest::ResetTemplate);
             return;
         }
@@ -34262,13 +34433,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // open 'new'." A reset that leaves you looking at the thing you
             // were resetting is a reset you have to finish by hand.
             //
-            // `NewDiscarding` rather than `New`, because `New` is allowed to
-            // stop and ask about a scratch with takes in it — and this road
+            // `NewKeeping` rather than `New`, because `New` is allowed to
+            // stop and ask about a scratch with takes in it - and this road
             // has already asked. `ask_before_resetting` is the only way in
             // and its confirmation now says a fresh session is part of the
             // deal, so a second question here would be the same question
-            // twice.
-            self.project_request = Some(crate::ports::ProjectRequest::NewDiscarding);
+            // twice. Not `NewDiscarding`, the scratch warning's "Discard
+            // it": that reclaimed a leftover Untitled, recordings and all,
+            // with no warning ever shown and under a confirmation that says
+            // nothing recorded is deleted. Keeping leaves it standing.
+            //
+            // **And the reset IS the discard.** New's save-back writes the
+            // outgoing document when it is dirty and nobody said Don't Save,
+            // and by then the desk is the reset one: every instrument,
+            // plugin, name, fader and route went out of the open project's
+            // own document. The answer is given at the end of this function,
+            // as the prompt's Don't Save gives it.
+            self.project_request = Some(crate::ports::ProjectRequest::NewKeeping);
             // **And the Konami walk, quietly.**
             //
             // The owner: "Have 'reset everything' quietly reset the konami
@@ -34357,6 +34538,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
         }
         self.save_settings();
+        // **The reset is one moment, then the discard** - see the
+        // `NewKeeping` above. A press commits where it is pressed, and here,
+        // after everything the reset touches, because a NEW moment is what
+        // clears a Don't Save (`undo_commit_moment`): left to the frame's own
+        // commit (`commit_view_change` sees the reset grid), the answer was
+        // gone before New could read it.
+        if scope == R::Everything {
+            self.undo_commit();
+            self.outgoing_discarded = true;
+        }
         self.report_the_reset(scope, undoable);
     }
 
@@ -46320,7 +46511,7 @@ mod tests {
     ///
     /// Revert-checks, both performed: drop the `inside_template_shelf` early
     /// return in `save_project_as` and the second half goes red; drop the
-    /// `on_shelf` guard in `open_project_keeping` and the first does.
+    /// shelf branch in `open_project` and the first does.
     #[test]
     fn a_template_is_read_but_never_saved_over_or_moved_into() {
         let root = std::env::temp_dir().join(format!(
@@ -46352,13 +46543,16 @@ mod tests {
             "the ordinary open did not take"
         );
 
-        // (1) OPENING a template shows it without moving in.
+        // (1) OPENING a template shows it without moving in: it is adopted
+        // into a fresh scratch, as New adopts it - neither the shelf nor the
+        // folder the session stood in before.
         app.open_project(&crate::arrangement::doc_in(&template));
         assert!(
-            app.project_doc().is_some_and(|d| d.starts_with(&mine)),
+            app.project_doc().is_some_and(|d| !d.starts_with(&shelf) && !d.starts_with(&mine)),
             "opening a template moved the session onto the shelf, so every \
-             save from here writes the thing every New is made from — it went \
-             to {:?}",
+             save from here writes the thing every New is made from, or left \
+             it in the last project's folder, which the next save then moves - \
+             it went to {:?}",
             app.project_doc()
         );
         assert!(
@@ -59940,6 +60134,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A scratch holding anything Tangent did not write is not a
+    /// scratch.** New and launch clear the folder they reclaim WHOLE, and the
+    /// reclaim judged it by its document and its kit alone: a saved project
+    /// filed inside an `Untitled` (a first save typed into the scratch's own
+    /// folder lands there) was handed back as fresh and deleted with it.
+    #[test]
+    fn a_new_session_steps_past_an_untitled_holding_anything_else() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-fresh-foreign-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scratch = root.join("Untitled");
+        // Everything Tangent writes into a scratch: still reclaimed.
+        std::fs::create_dir_all(scratch.join("media")).unwrap();
+        std::fs::create_dir_all(scratch.join("state")).unwrap();
+        std::fs::create_dir_all(scratch.join("export")).unwrap();
+        crate::arrangement::Arrangement::default().save_to(&crate::arrangement::doc_in(&scratch));
+        std::fs::write(scratch.join("media").join(".DS_Store"), b"finder").unwrap();
+        assert_eq!(fresh_project_dir(&root), scratch, "a scratch of Tangent's own files was stepped past");
+        // A saved project inside it: the folder is somebody's now.
+        let mut song = crate::arrangement::Arrangement::default();
+        song.named = true;
+        song.save_to(&crate::arrangement::doc_in(&scratch.join("Song")));
+        assert_eq!(
+            fresh_project_dir(&root),
+            root.join("Untitled 2"),
+            "New reclaimed an Untitled with a saved project inside it"
+        );
+        // So is a folder inside its media/, which Tangent never makes.
+        std::fs::remove_dir_all(scratch.join("Song")).unwrap();
+        std::fs::create_dir_all(scratch.join("media").join("Takes")).unwrap();
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"), "a folder inside media/ was reclaimed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A scratch whose document holds clips is not a scratch either.**
+    /// Open writes the outgoing session's document back when it is dirty and
+    /// was not discarded - a scratch's unnamed, clips and all, an
+    /// arrangement take finished on the way out included - and the next New
+    /// reclaimed that folder whole, because only `named` held it. A MIDI
+    /// take lives in the document alone, so nothing in `media/` spoke for it.
+    #[test]
+    fn a_new_session_steps_past_an_untitled_whose_document_holds_clips() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-fresh-clips-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scratch = root.join("Untitled");
+        let mut doc = crate::arrangement::Arrangement::default();
+        doc.save_to(&crate::arrangement::doc_in(&scratch));
+        assert_eq!(fresh_project_dir(&root), scratch, "an empty unnamed scratch is no longer reclaimed");
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&scratch));
+        assert_eq!(
+            fresh_project_dir(&root),
+            root.join("Untitled 2"),
+            "New reclaimed an unnamed scratch whose document holds clips"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A fresh install lands in the same place, which is the whole point of
     /// `first_launch` being what a reset resets to.
     #[test]
@@ -64654,6 +64917,89 @@ mod tests {").expect("the tests module")];
         assert_eq!(plugin.pending_window_size, None);
     }
 
+    /// **Reset Everything never hands New a session to write back.** The
+    /// reset empties the desk and then opens a fresh session through New,
+    /// and New's save-back writes the outgoing document when it is dirty and
+    /// was not discarded. Nobody had said Don't Save, so the emptied desk -
+    /// every instrument, plugin, name, fader and route gone - was written
+    /// over the open project's document. The reset IS the discard, and New
+    /// is told so. Nor may it reclaim a leftover Untitled without the
+    /// scratch warning, recordings and all (`NewDiscarding`): the reset's
+    /// own confirmation says nothing recorded is deleted.
+    #[test]
+    fn reset_everything_never_hands_new_a_session_to_write_back() {
+        // No settings file and no backup written: `Settings::path()` is one
+        // shared file whenever `IVORY_SETTINGS_PATH` is set, and the backup
+        // beside it is what `a_confirmed_reset_does_its_scope_and_offers_undo`
+        // undoes from.
+        let (ctx, mut app) = headless(Caps { persist_global_settings: false, ..Caps::DESKTOP });
+        app.settings.master_gain = 0.3; // the open project's own desk...
+        app.undo_reset(); // ...as it was last saved
+        assert!(!app.project_dirty_exact());
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Everything));
+        run_frame(&ctx, &mut app);
+        let request = app.take_project_request();
+        let raised = request.is_some();
+        let asked = matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. }));
+        let discarded = app.take_outgoing_discarded();
+        let dirty = app.project_dirty_exact();
+        // The host's New arm writes the outgoing document when it was not
+        // discarded and is dirty - with the desk as it stands: the reset one.
+        assert!(
+            !raised || asked || discarded || !dirty,
+            "Reset Everything hands New a dirty session it was never told to discard: \
+             the host writes the emptied desk over the open project's document"
+        );
+        assert!(
+            !matches!(request, Some(crate::ports::ProjectRequest::NewDiscarding)),
+            "Reset Everything reclaims a leftover Untitled, recordings and all, without the scratch warning"
+        );
+    }
+
+    /// **Resetting the default template asks before it replaces unsaved
+    /// work.** The reset rebuilds the template and then stands the session on
+    /// a fresh copy of it - a session switch like New - but it went straight
+    /// from its own confirmation to the host, with no save prompt: unsaved
+    /// edits were gone, under a confirmation that says it changes nothing but
+    /// the template's desk. It asks as New does now, and Discard's answer
+    /// travels with the reset to the host.
+    #[test]
+    fn resetting_the_template_asks_before_it_replaces_unsaved_work() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        assert!(app.project_dirty_exact(), "the fixture has nothing unsaved");
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Template));
+        run_frame(&ctx, &mut app);
+        let replaced = matches!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate)
+        );
+        let asked = matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. }));
+        assert!(
+            asked || !replaced,
+            "Reset > The Default Template replaced an unsaved session without the save prompt"
+        );
+        // Discard: the reset goes ahead, and the host is told.
+        app.apply_dialog_action(DialogAction::SaveChangesDiscard);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "the answer did not carry on with the reset"
+        );
+        assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
+        // A clean session has nothing to ask about.
+        app.undo_reset();
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Template));
+        run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "a clean session was asked about nothing"
+        );
+    }
+
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
     ///
     /// The chord the owner asked for — "Ctrl/CMD + S to save should summon a
@@ -68844,6 +69190,84 @@ mod folder_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A template re-saved from a scratch keeps the audio its own clips
+    /// stand on.** Save As Template from a real project copies the whole
+    /// folder, so a template can carry a clip's `media/Loop.wav` and a
+    /// frozen lane's render. A scratch adopted from it, saved back as the
+    /// template, staged the KIT's samples alone, and the swap then removed
+    /// the old template: the files were gone while the new document still
+    /// named them.
+    #[test]
+    fn a_template_resaved_from_a_scratch_keeps_the_audio_its_clips_stand_on() {
+        let root = temp_root("tpl-audio");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFloopWAVE").expect("loop");
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        app.adopt_template(&template, &projects.join("Untitled"));
+        let stage = projects.join(TEMPLATE_SHELF).join(".default.writing");
+        app.write_template_into(&stage).expect("the template is written");
+        let kept = stage.join("media").join("Loop.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(kept, "a template re-saved from a scratch dropped the file its own clip plays");
+    }
+
+    /// **A scratch made real brings the audio its template's clips stand
+    /// on**, as it brings the kit's samples: a clip's file and a frozen
+    /// lane's render. Until the folder is real they are read out of the
+    /// template; from then on the project's own `media/` answers, and a
+    /// first save is born with only what the materialise carried.
+    #[test]
+    fn a_scratch_made_real_brings_the_audio_its_template_clips_stand_on() {
+        let root = temp_root("tpl-clips-real");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        for f in ["Loop.wav", "frozen-02-1.wav"] {
+            std::fs::write(template.join("media").join(f), b"RIFFxxxxWAVE").expect("template audio");
+        }
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        let mut desk = TangentApp::template_desk();
+        desk.frozen = Some(vec![crate::arrangement::FrozenLane {
+            lane: 2,
+            path: "media/frozen-02-1.wav".to_owned(),
+            len_s: 1.0,
+        }]);
+        doc.desk = Some(desk);
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        app.materialize_project_dir();
+        let brought = ["Loop.wav", "frozen-02-1.wav"].map(|f| scratch.join("media").join(f).is_file());
+        // And the first save of a scratch never made real.
+        let _ = std::fs::remove_dir_all(&scratch);
+        app.adopt_template(&template, &scratch);
+        let song = projects.join("Song");
+        assert!(app.save_project_first(&song), "the first save");
+        let saved = ["Loop.wav", "frozen-02-1.wav"].map(|f| song.join("media").join(f).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(brought, [true, true], "a scratch made real left its clip's or its freeze's audio in the template");
+        assert_eq!(saved, [true, true], "a first save left its clip's or its freeze's audio in the template");
+    }
+
     /// **New hands over the TEMPLATE's kit, never the last project's.** A
     /// template on the shelf is read and not inhabited, so `project_doc`
     /// still named the outgoing project when the kit was loaded - New
@@ -68948,10 +69372,11 @@ mod folder_tests {
         }
     }
 
-    /// **A template opened from the Open panel leaves the session's kit
-    /// alone.** The stencil is read, not inhabited, so the session keeps its
-    /// home and every kit write still goes there: loading the template's kit
-    /// here made the first pad edit write it over that project's own.
+    /// **A template opened from the Open panel leaves the last project's kit
+    /// alone.** It is adopted into a fresh scratch with its own kit, so a pad
+    /// edit writes there. While the session stayed in the previous project's
+    /// folder, loading the template's kit made the first pad edit write it
+    /// over that project's own.
     #[test]
     fn a_template_opened_from_the_dialog_leaves_the_projects_kit_alone() {
         let root = temp_root("tpl-open");
@@ -68971,12 +69396,13 @@ mod folder_tests {
         app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
         app.open_project(&crate::arrangement::doc_in(&song));
         app.open_project(&crate::arrangement::doc_in(&template));
+        let scratch = projects.join("Untitled");
         assert_eq!(
             app.project_doc(),
-            Some(crate::arrangement::doc_in(&song).as_path()),
-            "a stencil was inhabited"
+            Some(crate::arrangement::doc_in(&scratch).as_path()),
+            "a template opened from the panel was not adopted into a fresh scratch"
         );
-        // A pad edit writes the kit where the session lives.
+        // A pad edit writes the kit where the session lives: the scratch.
         app.drumpad_sel = 36;
         app.drumpad_edited();
         let written = std::fs::read_to_string(song.join(crate::drumpad::FILE_NAME)).expect("the song's kit");
@@ -68984,7 +69410,86 @@ mod folder_tests {
             written.contains("Snare.wav") && !written.contains("Kick.wav"),
             "the template's kit was written over the song's: {written}"
         );
+        let adopted = std::fs::read_to_string(scratch.join(crate::drumpad::FILE_NAME)).expect("the scratch's kit");
+        assert!(adopted.contains("Kick.wav"), "the scratch did not take the template's kit: {adopted}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Saving after opening a template never moves or overwrites the last
+    /// project.** A template opened from the Open panel was read and not
+    /// inhabited: the session stayed in the previous song's folder with the
+    /// template's unnamed document on screen, so the next Save asked for a
+    /// name, MOVED the song's folder to it, takes and all, and wrote the
+    /// template over the song's document. The panel adopts a template now,
+    /// the way New does.
+    #[test]
+    fn saving_after_opening_a_template_never_moves_or_overwrites_the_last_project() {
+        let root = temp_root("tpl-open-save");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        let song = projects.join("song");
+        std::fs::create_dir_all(song.join("media")).expect("song media");
+        std::fs::write(song.join("media").join("rec-1-1.wav"), b"a take").expect("take");
+        let mut named = crate::arrangement::Arrangement::default();
+        named.named = true;
+        named.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/rec-1-1.wav".to_owned(),
+            len_s: 2.0,
+            ..Default::default()
+        });
+        named.save_to(&crate::arrangement::doc_in(&song));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        app.open_project(&crate::arrangement::doc_in(&song));
+        // File > Open, pointed into the shelf.
+        app.open_project(&crate::arrangement::doc_in(&template));
+        // Cmd+S on the unnamed document it shows: the panel answers a name.
+        let _ = app.save_project_first(&projects.join("Template edit"));
+
+        let take_stayed = song.join("media").join("rec-1-1.wav").is_file();
+        let back = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&song));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(take_stayed, "the first save MOVED the previous project's folder");
+        assert!(back.named && back.clips.len() == 1, "the template was written over the previous project's document");
+    }
+
+    /// **A first save never moves a kept project's folder.** The first save
+    /// of an unnamed session renames the folder it stands on to the name
+    /// typed - right for a scratch, wrong for a folder whose document on
+    /// disk is NAMED, because the session standing in it is not that
+    /// document any more: an undo past the first save puts the session's
+    /// `named` back off, and the next Cmd+S took the project's own name off
+    /// its folder. It is copied now, as Save As copies, and stays put.
+    #[test]
+    fn a_first_save_never_moves_a_kept_projects_folder() {
+        let root = temp_root("first-save-kept");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        app.adopt_template(&template, &projects.join("Untitled"));
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        let song = projects.join("Song");
+        assert!(app.save_project_first(&song), "the first save");
+        std::fs::write(song.join("media").join("rec-1-1.wav"), b"a take").expect("take");
+        app.undo();
+        assert!(!app.arrangement.named, "the fixture: an undo past the first save leaves the session unnamed");
+        // Cmd+S on that unnamed session: the panel answers another name.
+        assert!(app.save_project_first(&projects.join("Elsewhere")), "the second first save");
+
+        let stayed = song.join("media").join("rec-1-1.wav").is_file();
+        let back = crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(&song));
+        let copied = projects.join("Elsewhere").join("media").join("rec-1-1.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(stayed, "a first save MOVED a kept project's folder to the name typed");
+        assert!(
+            matches!(back, crate::arrangement::LoadOutcome::Loaded(a) if a.named),
+            "the kept project's own document went with the move"
+        );
+        assert!(copied, "the session's media did not come with it to its new home");
     }
 
     /// **An undo never makes a scratch real.** Undoing a track move swaps

@@ -899,6 +899,10 @@ pub enum ProjectRequest {
     /// any whole project that has been copied inside it — and lets
     /// `seed_template` write a fresh one. The kit and its samples stay: a
     /// person's default drum kit is theirs and is not what went wrong.
+    ///
+    /// The session on screen is then replaced by a fresh one from it, as New
+    /// replaces it, so the app asks about unsaved work before raising this
+    /// and the host carries the answer out (`take_outgoing_discarded`).
     ResetTemplate,
 }
 
