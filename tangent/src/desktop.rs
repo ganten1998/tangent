@@ -3617,6 +3617,47 @@ fn stretched_clip_audio(
     }
 }
 
+/// **The loudest sample a clip PLAYS**: its file warped and then stretched,
+/// as [`stretched_clip_audio`] resolves it for the export and glue, over
+/// the span its passes read ([`audio_clip_passes`], the schedule playback
+/// is built from), before its own gain and fades. Normalize's measure.
+///
+/// The decode is not what a clip plays. A stretched clip's trim and length
+/// are seconds of the STRETCHED audio, so read off the decode they measured
+/// other material, as far as a whole trim away; a warp moves material
+/// across the trim, and the stretcher's output can peak where the file did
+/// not; and a looped clip plays one pass of its loop over and over, not its
+/// whole length of the file. Indexed at the audio's own rate. The renders
+/// playback has made are reused through `renders`, and one it has not is
+/// made, as the export makes it. Fades only lower a peak, so leaving them
+/// out never sets a gain that clips.
+#[cfg(feature = "recorder")]
+fn played_peak(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: Arc<tangent_record::decode::Clip>,
+    path: &std::path::Path,
+    renders: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
+) -> f32 {
+    let audio = stretched_clip_audio(clip, decoded, path, renders);
+    // Every pass reads from the same trim, the first for longest: one span.
+    let passes = audio_clip_passes(clip, &audio, f64::from(audio.rate.max(1)), 1.0);
+    let Some(from) = passes.first().map(|p| p.offset) else {
+        return 0.0;
+    };
+    let len = passes.iter().map(|p| p.len).max().unwrap_or(0);
+    let at = |f: u64| usize::try_from(f).unwrap_or(usize::MAX).min(audio.frames());
+    let mut peak = 0.0f32;
+    for f in at(from)..at(from.saturating_add(len)) {
+        for ch in 0..2 {
+            let v = audio.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+            if v.is_finite() {
+                peak = peak.max(v.abs());
+            }
+        }
+    }
+    peak
+}
+
 
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
@@ -13284,7 +13325,8 @@ impl DesktopApp {
     /// should come up by what that half needs; measuring the whole file
     /// would normalise to a peak the clip does not play, which is the
     /// difference between "this take is level with the others" and "nothing
-    /// happened".
+    /// happened". And the played AUDIO, warped and stretched, not the
+    /// decode under it: see `played_peak`.
     ///
     /// **And nothing is written to disk.** The gain is a number on the clip:
     /// undoable, reversible, and the same file still under it.
@@ -13293,12 +13335,14 @@ impl DesktopApp {
         let Some(doc_path) = self.app.clip_doc() else {
             return;
         };
-        let rate = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or(48_000, |e| e.output().sample_rate);
         let doc = self.app.arrangement().clone();
+        // The warp and stretch renders playback already made, reused as glue
+        // reuses them: the live cache holds each beside its picture.
+        let mut renders: std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>> = self
+            .stretch_cache
+            .iter()
+            .map(|(k, d)| (k.clone(), Arc::clone(&d.clip)))
+            .collect();
         let mut done = 0usize;
         let mut silent = 0usize;
         for clip in doc.clips.iter().filter(|c| ids.contains(&c.id)) {
@@ -13309,19 +13353,7 @@ impl DesktopApp {
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
-            let frames = |s: f64| frames_at(f64::from(rate), s) as usize;
-            let from = frames(clip.offset_s);
-            let len = frames(clip.play_len_s(decoded.seconds()));
-            let end = (from + len).min(decoded.frames());
-            let mut peak = 0.0f32;
-            for f in from.min(end)..end {
-                for ch in 0..2 {
-                    let v = decoded.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
-                    if v.is_finite() {
-                        peak = peak.max(v.abs());
-                    }
-                }
-            }
+            let peak = played_peak(clip, decoded, &path, &mut renders);
             // **Silence has no peak to normalise to.** Dividing by it is an
             // infinite gain on a clip that would still be silent, and the
             // honest answer is to say so rather than to multiply nothing by
@@ -25883,6 +25915,67 @@ mod tests {
                 "{what} commits a moment of its own again, so a batch leaves one per clip"
             );
         }
+    }
+
+    /// **Normalize measures the audio a clip PLAYS, not its file.** It read
+    /// the decode from the clip's trim for the clip's length. A looped clip
+    /// plays one pass of its loop over and over; a stretched clip's trim and
+    /// length are seconds of the STRETCHED audio; a warp carries material
+    /// across the trim. So each was measured over material it never plays:
+    /// a loud hit there kept the take from coming up at all, and a hit the
+    /// warp pulled in went unmeasured, so the gain could lift it past the
+    /// -1 dBFS normalize promises.
+    #[test]
+    fn normalize_measures_the_audio_the_clip_plays() {
+        let rate = 8_000u32;
+        let path = std::path::PathBuf::from("take.wav");
+        // Four seconds of a quiet tone, and one loud burst at `hit_s`.
+        let file = |hit_s: f64| {
+            let mut s: Vec<f32> = (0..4 * rate as usize)
+                .flat_map(|f| {
+                    let v = 0.1 * (f as f32 * 220.0 * std::f32::consts::TAU / rate as f32).sin();
+                    [v, v]
+                })
+                .collect();
+            let at = (hit_s * f64::from(rate)) as usize;
+            for f in at..at + 80 {
+                s[f * 2] = 0.9;
+                s[f * 2 + 1] = 0.9;
+            }
+            Arc::new(tangent_record::decode::Clip { samples: s, rate, source: path.clone() })
+        };
+        let peak = |clip: &tangent_ui::arrangement::ArrClip, hit_s: f64| {
+            played_peak(clip, file(hit_s), &path, &mut std::collections::HashMap::new())
+        };
+        let take = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "take.wav".to_owned(),
+            offset_s: 1.0,
+            ..Default::default()
+        };
+        // The control: a hit inside what a plain clip plays is its peak.
+        let plain = tangent_ui::arrangement::ArrClip { len_s: 2.0, ..take.clone() };
+        assert!(peak(&plain, 2.5) > 0.8, "a hit the clip plays was not measured");
+        // LOOPED, it plays 1..2 s of the file four times and never reaches 2.5.
+        let looped = tangent_ui::arrangement::ArrClip { len_s: 4.0, loop_s: 1.0, ..take.clone() };
+        let p = peak(&looped, 2.5);
+        assert!(p < 0.2, "a looped clip was measured past its loop, at {p}");
+        // STRETCHED to 2, it plays 1..4 s of the stretched audio: 0.5..2 s of
+        // the file, and the hit at 3 s is nowhere in it.
+        let stretched = tangent_ui::arrangement::ArrClip { stretch: 2.0, len_s: 3.0, ..take.clone() };
+        let p = peak(&stretched, 3.0);
+        assert!(p < 0.3, "a stretched clip was measured on the unstretched file, at {p}");
+        // WARPED, the hit at 0.9 s - in the trim - is carried to 1.1 s, which
+        // the clip plays.
+        let at = |s: f64| (s * f64::from(rate)) as u64;
+        let warped = tangent_ui::arrangement::ArrClip {
+            len_s: 1.0,
+            warp: vec![(at(0.9), at(1.1)), (at(1.9), at(1.9))],
+            warp_fit: "slice".to_owned(),
+            ..take.clone()
+        };
+        let p = peak(&warped, 0.9);
+        assert!(p > 0.8, "a hit the warp carries into the clip was not measured, at {p}");
     }
 
     /// **The marks are rebuilt when the CLIPS move, not only when a knob
