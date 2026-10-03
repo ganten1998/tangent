@@ -1261,10 +1261,10 @@ pub struct TangentApp {
     drag_pointer: Option<Pos2>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
-    /// The arrangement's grid and window as they stood at the last moment,
-    /// so a frame that did not move them costs one compare. See
-    /// `commit_view_change`.
-    view_committed: Option<crate::arrangement::View>,
+    /// The arrangement's grid and window, and the editor's feel, as they
+    /// stood at the last moment, so a frame that did not move them costs one
+    /// compare. See `commit_view_change`.
+    view_committed: Option<(crate::arrangement::View, Option<crate::arrangement::Feel>)>,
     /// **How many batches are holding their moment back.** See
     /// [`TangentApp::begin_one_moment`]: a gesture that reaches several
     /// committing writers is still one thing somebody did.
@@ -37272,7 +37272,8 @@ impl TangentApp {
         self.commit_view_change();
     }
 
-    /// **A change to the arrangement's grid or window is a moment.**
+    /// **A change to the arrangement's grid or window, or to the editor's
+    /// feel, is a moment.**
     ///
     /// The fourteen fields of `arrangement::View` (the timeline's magnet,
     /// grid, tempo lane, master row, header width, lane count and the pane
@@ -37300,9 +37301,17 @@ impl TangentApp {
     /// moment at the end, exactly as a clip drag is; committing per frame
     /// is how a marker drag used to drain the whole hundred-moment history.
     ///
-    /// **`View` and nothing else.** The editor's `Feel`, `Notation` and
-    /// `Look` are hashed too and nothing watches them here: a gesture that
-    /// writes one of those owes its own commit.
+    /// **And the editor's `Feel`, on the same terms.** It is the MIDI
+    /// editor's half of `View` (its magnet, grid, triplet, swing and
+    /// humanize), written from as many places: the tool buttons, their G
+    /// and P twins, O, the SWG and HUMANIZE menus, and the grid's drag,
+    /// click, right-click and wheel. Every one of them only saved, so each
+    /// folded into the next note drawn. The grid's drag is one moment at
+    /// its release because the editor's drag is in the guard below.
+    ///
+    /// **Nothing else.** `Notation` and `Look` are hashed too and nothing
+    /// watches them here: a gesture that writes one of those owes its own
+    /// commit.
     ///
     /// **The guard sees every drag that writes the document as it goes**,
     /// not only the arrangement's (`arr_drag`, `arr_gesture_dirty`): a band
@@ -37319,7 +37328,8 @@ impl TangentApp {
     /// committed here at the end of its frame, and the host's warp commits
     /// a second moment when it lands, frames later. One press, two moments.
     fn commit_view_change(&mut self) {
-        let now = Self::desk_view(&self.settings).view;
+        let desk = Self::desk_view(&self.settings);
+        let (now, feel) = (desk.view, desk.feel);
         let carrying = self.arr_drag.is_some()
             || self.arr_gesture_dirty
             || self.grabbed.is_some()
@@ -37334,7 +37344,7 @@ impl TangentApp {
             // find nothing changed and commit nothing.
             return;
         }
-        let now = now.map(|v| v.to_view());
+        let now = now.map(|v| (v.to_view(), feel));
         if self.view_committed == now {
             return;
         }
@@ -42395,6 +42405,54 @@ mod tests {
         app.commit_view_change();
         assert_eq!(app.hist_at, at + 1, "the release left the drag uncommitted");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The MIDI editor's magnet, grid, triplet and swing are each their
+    /// own step back.**
+    ///
+    /// They are the editor's `Feel`, the editor's half of the timeline's
+    /// `View`, hashed and restored by undo, and none of their roads
+    /// committed: the tool buttons, their G and P twins, O, the SWG and
+    /// HUMANIZE menus and the grid's drag, click, right-click and wheel only
+    /// saved the settings. So pressing the editor's magnet and then drawing
+    /// a note was one Ctrl+Z for both, where the timeline's own magnet has a
+    /// step of its own. Driven at the event level, through the buttons, the
+    /// key and the grid's drag.
+    #[test]
+    fn the_editors_magnet_grid_triplet_and_swing_are_their_own_moments() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = midi_editor_zoomed_in(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let _ = run_frame(&ctx, &mut app);
+        let l = crate::midi_editor::Layout::new(rect);
+        for (what, at) in [("magnet", l.tool_snap.center()), ("triplet grid", l.tool_triplet.center())] {
+            let before = app.hist_at;
+            click_with(&ctx, &mut app, at, egui::Modifiers::NONE);
+            assert_eq!(app.hist_at, before + 1, "the editor's {what} left {} moments", app.hist_at - before);
+        }
+        // O, with the hand over the roll: swing on, which retires the
+        // triplet.
+        let before = app.hist_at;
+        key_with(&ctx, &mut app, egui::Key::O, egui::Modifiers::NONE);
+        assert!(app.settings.midi_swing, "O did not swing the grid");
+        assert_eq!(app.hist_at, before + 1, "O left {} moments", app.hist_at - before);
+        // The grid's DRAG: nothing while the hand is on it, one at the end.
+        let before = app.hist_at;
+        let exp = app.settings.midi_grid_exp;
+        let grid = l.tool_grid.center();
+        press(&ctx, &mut app, grid);
+        for dy in [14.0, 28.0, 42.0] {
+            move_to(&ctx, &mut app, grid + Vec2::new(0.0, dy));
+        }
+        assert_ne!(app.settings.midi_grid_exp, exp, "the drag did not move the grid");
+        assert_eq!(app.hist_at, before, "the grid drag pushed {} moments mid-drag", app.hist_at - before);
+        release(&ctx, &mut app, grid + Vec2::new(0.0, 42.0));
+        assert_eq!(app.hist_at, before + 1, "the grid drag left {} moments", app.hist_at - before);
+        // One step back takes the grid off and leaves the swing.
+        app.undo();
+        assert_eq!(app.settings.midi_grid_exp, exp, "one Ctrl+Z did not undo the grid drag");
+        assert!(app.settings.midi_swing, "one Ctrl+Z also undid the swing");
     }
 
     /// **Undo puts an AUTO width and lane count back, and never wedges.**
