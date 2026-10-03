@@ -3391,6 +3391,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
         gain: 1.0,
         warp: Vec::new(),
         warp_fit: String::new(),
+        warp_rate: 0,
     }
 }
 
@@ -6852,6 +6853,7 @@ impl TangentApp {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -6875,6 +6877,7 @@ impl TangentApp {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -6898,6 +6901,7 @@ impl TangentApp {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -6938,6 +6942,7 @@ impl TangentApp {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         self.arrangement = arr;
         // **A tempo map and a signature change, for the row to have
@@ -9918,6 +9923,7 @@ impl TangentApp {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let _ = doc;
         self.arr_save_edits();
@@ -10087,6 +10093,7 @@ impl TangentApp {
                 gain: 1.0,
                 warp: Vec::new(),
                 warp_fit: String::new(),
+                warp_rate: 0,
             });
             added = Some(id);
         }
@@ -16943,6 +16950,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             stretch_mode: String::new(),
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
             gain: 1.0,
             extra: Default::default(),
         });
@@ -17118,6 +17126,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         self.arr_multi.clear();
         self.arr_selected = None;
@@ -17509,6 +17518,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// of an audio quantize's edit, and the thing the document saves.
     /// **Commits nothing**, like [`Self::set_clip_warp_with_fit`]: the caller
     /// ends the gesture (`clear_clip_warp` does, with `commit_undo_moment`).
+    ///
+    /// A map written here is not told its rate, so it is stored as unknown
+    /// and read as it stands (see `ArrClip::warp_rate`); the quantize writes
+    /// through [`Self::set_clip_warp_with_fit`], which is told.
     pub fn set_clip_warp(&mut self, id: u64, warp: Vec<(u64, u64)>) {
         let fit = self
             .arrangement
@@ -17516,22 +17529,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .iter()
             .find(|c| c.id == id)
             .map_or_else(String::new, |c| c.warp_fit.clone());
-        self.set_clip_warp_with_fit(id, warp, fit);
+        self.set_clip_warp_with_fit(id, warp, fit, 0);
     }
 
-    /// The map and the FIT it was made under, which travel together: the
-    /// render is built from the pair, and the same anchors under `slice` and
-    /// under `stretch` are two different takes.
+    /// The map, the FIT it was made under and the RATE its frames are
+    /// counted at, which travel together: the render is built from all
+    /// three. The same anchors under `slice` and under `stretch` are two
+    /// different takes, and the same anchors at 44.1 and at 48 kHz move
+    /// different seconds. An empty map has no frames to count, so it keeps
+    /// no rate.
     ///
     /// **Commits nothing.** It used to end with `undo_commit`, which is one
     /// moment per CLIP - so a marquee over eight takes left eight of them
     /// and one Ctrl+Z undid a single take's quantize. The caller commits
     /// once for the gesture, through `commit_undo_moment`.
-    pub fn set_clip_warp_with_fit(&mut self, id: u64, warp: Vec<(u64, u64)>, fit: String) {
+    pub fn set_clip_warp_with_fit(&mut self, id: u64, warp: Vec<(u64, u64)>, fit: String, rate: u32) {
+        let rate = if warp.is_empty() { 0 } else { rate };
         if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
-            if c.warp != warp || c.warp_fit != fit {
+            if c.warp != warp || c.warp_fit != fit || c.warp_rate != rate {
                 c.warp = warp;
                 c.warp_fit = fit;
+                c.warp_rate = rate;
                 self.clips_dirty = true;
             }
         }
@@ -26658,6 +26676,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         gain: 1.0,
                         warp: Vec::new(),
                         warp_fit: String::new(),
+                        warp_rate: 0,
                     });
                     self.arr_save_edits();
                 }
@@ -42517,7 +42536,7 @@ mod tests {
         app.set_clip_gain(a, 0.5);
         app.commit_undo_moment();
         // The quantize, the same way.
-        app.set_clip_warp_with_fit(a, vec![(0, 100), (1000, 1100)], "slice".to_owned());
+        app.set_clip_warp_with_fit(a, vec![(0, 100), (1000, 1100)], "slice".to_owned(), 48_000);
         app.commit_undo_moment();
 
         let got = |app: &TangentApp| {
@@ -42961,9 +42980,9 @@ mod tests {
     /// The owner: "quantizing is not subject to the undo redo process at
     /// all". Two halves, and the second is the one that was really wrong.
     ///
-    /// The map IS the edit - the audio is rendered from it - so `warp` and
-    /// `warp_fit` are in the fingerprint walk and a moment carries them.
-    /// That half held.
+    /// The map IS the edit - the audio is rendered from it - so `warp`,
+    /// `warp_fit` and `warp_rate` are in the fingerprint walk and a moment
+    /// carries them. That half held.
     ///
     /// The half that did not: `set_clip_warp` committed a moment ITSELF, so
     /// a marquee over eight takes left eight moments and one Ctrl+Z undid a
@@ -42999,6 +43018,7 @@ mod tests {
                 id,
                 vec![(0, shift), (1000, 1000 + shift)],
                 "slice".to_owned(),
+                44_100,
             );
         }
         // **The engine is told by the WRITE.** A document that moved and a
@@ -43018,6 +43038,7 @@ mod tests {
             let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
             assert!(c.warp.is_empty(), "a clip kept its warp through the undo");
             assert!(c.warp_fit.is_empty(), "a clip kept its fit through the undo");
+            assert_eq!(c.warp_rate, 0, "a clip kept its map's rate through the undo");
         }
         assert!(app.clips_dirty, "the undo never reached the engine");
 
@@ -43032,6 +43053,7 @@ mod tests {
                 "the redo did not bring the map back"
             );
             assert_eq!(c.warp_fit, "slice", "the redo did not bring the fit back");
+            assert_eq!(c.warp_rate, 44_100, "the redo did not bring the map's rate back");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -43570,6 +43592,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         app.recorder.position_s = 0.0;
@@ -43798,6 +43821,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         let before: Vec<(f64, u8)> = app.arrangement.clips[0]
@@ -43913,6 +43937,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -44381,6 +44406,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             pedal: Vec::new(),
@@ -44446,6 +44472,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             pedal: Vec::new(),
@@ -44497,6 +44524,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -44891,6 +44919,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -44977,6 +45006,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         // Three notes at 1.0, 2.0 and 3.0 — DELIBERATELY unequal lengths, so
@@ -45086,6 +45116,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         app.note_clipboard = vec![crate::arrangement::ArrNote {
@@ -45173,6 +45204,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
 
         assert!(!app.track_on_clipboard());
@@ -45443,6 +45475,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.arr_selected = Some(id);
         app.arr_copy();
@@ -45485,6 +45518,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.open_midi_editor(id);
         // Two Cs with a GAP between them, and one E in the middle of it.
@@ -47014,6 +47048,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -47542,6 +47577,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.arr_save_edits();
@@ -51872,6 +51908,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -54658,6 +54695,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
@@ -54681,6 +54719,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -54808,6 +54847,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -56620,6 +56660,7 @@ mod tests {
                 gain: 1.0,
                 warp: Vec::new(),
                 warp_fit: String::new(),
+                warp_rate: 0,
             })
         };
         let audio = add(ClipKind::Audio);
@@ -58582,6 +58623,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         app.arr_auto_nodes.clear();
         app.arr_selected = Some(id);
@@ -58621,6 +58663,7 @@ mod tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         }
     }
 
@@ -63443,6 +63486,7 @@ mod tests {").expect("the tests module")];
                 gain: 1.0,
                 warp: Vec::new(),
                 warp_fit: String::new(),
+                warp_rate: 0,
             });
         }
         // Wound right in, so any fit at all shows up in the numbers.
@@ -63531,6 +63575,7 @@ mod tests {").expect("the tests module")];
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -64294,6 +64339,7 @@ mod tests {").expect("the tests module")];
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -64752,6 +64798,7 @@ mod tests {").expect("the tests module")];
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(ctx, app);
@@ -66790,6 +66837,7 @@ mod velocity_selection_tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -70370,6 +70418,7 @@ mod folder_tests {
             loop_s: 8.0,
             warp: map.clone(),
             warp_fit: "slice".to_owned(),
+            warp_rate: 48_000,
             stretch: 1.25,
             stretch_mode: "rhythmic".to_owned(),
             gain: 0.5,
@@ -70396,6 +70445,7 @@ mod folder_tests {
         assert_eq!(tail.warp, map, "the split threw the tail's quantize away");
         assert_eq!(head.warp, map, "the split moved the head's quantize");
         assert_eq!(tail.warp_fit, "slice", "the tail lost the quantize's fit");
+        assert_eq!(tail.warp_rate, 48_000, "the tail lost the rate its quantize was made at");
         assert!((tail.gain - 0.5).abs() < 1.0e-12, "the tail lost its gain: {}", tail.gain);
         assert!(
             (tail.stretch - 1.25).abs() < 1.0e-12,
@@ -72954,6 +73004,7 @@ mod arrange_peaks_tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         }
     }
 
@@ -73057,6 +73108,7 @@ mod sampler_road_tests {
             gain: 1.0,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         }
     }
 

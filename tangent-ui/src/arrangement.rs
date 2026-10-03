@@ -379,6 +379,7 @@ fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
         | "loop_s" => v.is_number(),
         "follow_tempo" => v.is_boolean(),
         "notes" | "pedal" => v.is_array(),
+        "warp_rate" => v.is_number(),
         // A name not in the list is not a key this build claims, so nothing
         // is about to consume it either way.
         _ => true,
@@ -425,7 +426,7 @@ pub fn stretch_mode_label(key: &str) -> &'static str {
 /// read and `tangent-ui` cannot name a constant that lives with the DSP.
 pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
 
-const CLIP_KEYS: [&str; 18] = [
+const CLIP_KEYS: [&str; 19] = [
     "kind",
     "lane",
     "path",
@@ -444,6 +445,7 @@ const CLIP_KEYS: [&str; 18] = [
     "stretch_mode",
     "gain",
     "loop_s",
+    "warp_rate",
 ];
 
 /// What a clip is made of.
@@ -675,14 +677,28 @@ pub struct ArrClip {
     /// Frames rather than seconds because a tempo change must not move them -
     /// but frames of the file AS DECODED at the engine rate the quantize ran at
     /// (every decode is resampled to the rate it is asked for), not samples on
-    /// disk. The map does not record that rate, so it is right only against a
-    /// decode at the same rate: an export at another rate, or the session
-    /// reopened on a device running another, applies every anchor to the wrong
-    /// audio.
+    /// disk. The map records that rate in `warp_rate`, and every reader
+    /// rescales it to the decode in its hands, so an export at another rate,
+    /// or the session reopened on a device running another, moves the same
+    /// seconds the quantize did.
     pub warp: Vec<(u64, u64)>,
     /// **How each warped segment gets to where it belongs** - the binary's
     /// `warp::Fit` by its key. Empty reads as auto, which asks the material.
     pub warp_fit: String,
+    /// **The sample rate `warp`'s frames are counted at**: the rate of the
+    /// decode the quantize measured its attacks in.
+    ///
+    /// The same file is a different number of frames in the live engine, in
+    /// an export at another rate, and on a device whose rate has changed
+    /// since, so a map applied to them raw pulled each anchor 8.8% of its
+    /// time off its hit between 48 and 44.1 kHz. Each reader rescales the
+    /// map from this rate to its own decode's (the binary's `warp_anchors`).
+    ///
+    /// **Zero means unknown, and the map is read as it stands.** That is
+    /// what a document from before this field says, and how every build
+    /// before it read the map: right at the rate it was made at. Reading it
+    /// as 48 kHz instead would move every quantize made at 44.1 kHz.
+    pub warp_rate: u32,
     /// The clip's own level, linear. 1.0 is untouched.
     ///
     /// **Where NORMALISE lives**, and why it is undoable: rewriting the file
@@ -748,6 +764,7 @@ impl Default for ArrClip {
             stretch_mode: String::new(),
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
             extra: Map::new(),
         }
     }
@@ -3623,6 +3640,16 @@ impl Arrangement {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    // **Absent is UNKNOWN, never 48 kHz**: a map from before
+                    // the field is read as it stands. So is a rate no decode
+                    // can have (the decoder clamps every one to 8-192 kHz),
+                    // because the rescale multiplies it into frame counts.
+                    warp_rate: c
+                        .get("warp_rate")
+                        .and_then(Value::as_u64)
+                        .and_then(|r| u32::try_from(r).ok())
+                        .filter(|r| (8_000..=192_000).contains(r))
+                        .unwrap_or(0),
                     stretch_mode: c
                         .get("stretch_mode")
                         .and_then(Value::as_str)
@@ -4049,6 +4076,11 @@ impl Arrangement {
                         if !c.warp_fit.is_empty() && c.warp_fit != "auto" {
                             m.insert("warp_fit".into(), Value::String(c.warp_fit.clone()));
                         }
+                        // Unknown writes nothing, so a map from before the
+                        // rate was kept stays the document it was.
+                        if c.warp_rate != 0 {
+                            m.insert("warp_rate".into(), Value::Number(c.warp_rate.into()));
+                        }
                         if !c.stretch_mode.is_empty() && c.stretch_mode != "auto" {
                             m.insert(
                                 "stretch_mode".into(),
@@ -4344,6 +4376,10 @@ impl Arrangement {
             }
             // `""` and `"auto"` write the same nothing, as `stretch_mode`.
             f.str(if c.warp_fit == "auto" { "" } else { &c.warp_fit });
+            // Appended for the same reason: the same pairs at another rate
+            // move other seconds, so a rate change is an edit undo can take
+            // back and the asterisk can see.
+            f.u64(u64::from(c.warp_rate));
         }
         // **A constant map is not written, so its VALUE is not in the
         // document.** One tempo all the way through lives on the desk
@@ -4578,6 +4614,7 @@ mod tests {
             extra: Map::new(),
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         }
     }
 
@@ -4659,8 +4696,8 @@ mod tests {
     /// quantized take could have been closed with nothing to say it was
     /// unsaved.
     ///
-    /// Asserted for BOTH fields, because `warp_fit` alone moves no anchor
-    /// and would have been the easy one to leave out.
+    /// Asserted for EVERY field, because `warp_fit` and `warp_rate` alone
+    /// move no pair and would have been the easy ones to leave out.
     #[test]
     fn a_warp_moves_the_words_that_undo_and_dirty_are_built_on() {
         let words = |a: &Arrangement| {
@@ -4688,6 +4725,11 @@ mod tests {
 
         a.clips[0].warp_fit = "slice".to_owned();
         assert_ne!(moved, words(&a), "the fit left the words unchanged");
+
+        // The same pairs at another rate are another quantize.
+        let fitted = words(&a);
+        a.clips[0].warp_rate = 44_100;
+        assert_ne!(fitted, words(&a), "the map's rate left the words unchanged");
 
         // And "auto" is the same nothing as "", exactly as `stretch_mode`:
         // a document that writes neither must not read as two documents.
@@ -4753,6 +4795,46 @@ mod tests {
                 {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0}]}"#,
         );
         assert!(!plain.to_json().contains("warp"), "an unwarped clip wrote a warp key");
+    }
+
+    /// **A warp map keeps the rate it was made at through save and load.**
+    ///
+    /// The map is frames of the decode the quantize measured, and its rate
+    /// is what lets a reader at another rate - an export, a device that has
+    /// changed rate since - find the same seconds in its own decode. Lost on
+    /// save, the reopened session would apply the frames raw again.
+    ///
+    /// Unknown stays unknown: a map from before the field writes no key, so
+    /// its document is the one it was, and a rate no decode can have (the
+    /// decoder clamps every one to 8-192 kHz) is not believed.
+    #[test]
+    fn a_warp_maps_rate_survives_the_document() {
+        let text = r#"{"arrangement_version": 9, "clips": [
+            {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+             "warp": [[0, 0], [24000, 22050]], "warp_rate": 44100}]}"#;
+        let a = Arrangement::from_json(text);
+        assert_eq!(a.clips[0].warp_rate, 44_100, "the map's rate did not survive the read");
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back, a, "the map's rate did not survive a round trip");
+        assert!(
+            !back.clips[0].extra.contains_key("warp_rate"),
+            "the rate came back twice, the second time as a newer build's key"
+        );
+
+        let old = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+                 "warp": [[0, 0], [24000, 22050]]}]}"#,
+        );
+        assert_eq!(old.clips[0].warp_rate, 0, "a map from before its rate was given one");
+        assert!(!old.to_json().contains("warp_rate"), "an unknown rate wrote a key");
+
+        let odd = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"kind": "audio", "path": "/x/a.wav", "lane": 0, "start_s": 0.0,
+                 "warp": [[0, 0], [24000, 22050]], "warp_rate": 3}]}"#,
+        );
+        assert_eq!(odd.clips[0].warp_rate, 0, "a rate no decode can have was believed");
     }
 
     /// The span is the furthest clip end, trims and the zero sentinel both
@@ -5078,6 +5160,7 @@ mod tests {
             extra: Map::new(),
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 48_000,
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {
             panic!("the document did not parse as an object");
@@ -5373,6 +5456,7 @@ mod tests {
             extra,
             warp: Vec::new(),
             warp_fit: String::new(),
+            warp_rate: 0,
         });
         a.add_clip(ArrClip {
             pedal: Vec::new(),
