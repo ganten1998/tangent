@@ -559,6 +559,13 @@ pub enum Dialog {
         /// window can say so rather than leaving somebody to press and
         /// find out. `None` when nothing is selected.
         target: Option<String>,
+        /// **The song's meter, `(beats, unit)`, that the GRID chips are
+        /// spelled in** - the meter the grid they apply is built in
+        /// (`Grid::from_document`), so the chip called "1/16" applies a
+        /// sixteenth. Spelled in 4/4, every chip in 3/4 or 6/8 quantized a
+        /// note value finer than it said. Refreshed by the app every frame,
+        /// because the window is not modal and the meter can change under it.
+        meter: (u8, u8),
     },
     /// Name the colours the app is wearing and write them to the user themes
     /// folder. Stays open on failure so the typed name is not lost.
@@ -12580,6 +12587,7 @@ fn show_on(
             sensitivity,
             fit,
             target,
+            meter,
         } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
@@ -12624,7 +12632,8 @@ fn show_on(
                             head(ui, "GRID");
                             ui.horizontal_wrapped(|ui| {
                                 for e in (-7_i8..=0).rev() {
-                                    let label = crate::arrangement_panel::grid_label_text(e, 4, 4);
+                                    let label =
+                                        crate::arrangement_panel::grid_label_text(e, meter.0, meter.1);
                                     if ui.selectable_label(*grid_exp == e, label).clicked() {
                                         *grid_exp = e;
                                     }

@@ -1000,7 +1000,8 @@ pub struct DesktopApp {
     /// **What each file SOUNDS like**, before a sensitivity is chosen. See
     /// `attacks_of`: the quantize window's marks are redrawn while a dial
     /// is being dragged, and this is the half of the detection that the
-    /// dial does not change.
+    /// dial does not change. In the frames of the decodes in `track_cache`,
+    /// so it is emptied and swept wherever that is.
     #[cfg(feature = "recorder")]
     attack_cache:
         std::collections::HashMap<std::path::PathBuf, Arc<crate::transient::Analysis>>,
@@ -1427,6 +1428,100 @@ fn clip_picture(
         wave_from_s,
         wave_span_s,
         peaks: stand_in.is_none().then(|| Arc::clone(&decoded.peaks)),
+    }
+}
+
+/// **What a clip PLAYS, as far as the render cache can say right now** -
+/// see [`clip_audio`].
+#[cfg(feature = "recorder")]
+struct ClipAudio {
+    /// What to play and draw: the last render in the chain the cache holds,
+    /// or, while one is owed, the audio that render will be made from.
+    audio: Decoded,
+    /// `Some(ratio)` while a render is owed: `audio` is then drawn at
+    /// `1/ratio` of the clip's time and measured `ratio` times as long (see
+    /// `clip_picture`). The warp's projected length over the file's while
+    /// the warp is out, the stretch while it is.
+    stand_in: Option<f64>,
+    /// The warp render the clip names, when it has a map.
+    warp_key: Option<StretchKey>,
+    /// What rendering that warp takes, when the cache does not hold it yet.
+    warp_owed: Option<(Vec<crate::warp::Anchor>, crate::stretch::Mode, crate::warp::Fit)>,
+    /// The stretch render the clip names next, with its algorithm - unless
+    /// a warp still owed holds it back.
+    stretch: Option<(StretchKey, crate::stretch::Mode)>,
+    /// Whether the cache lacks that stretch render.
+    stretch_owed: bool,
+}
+
+/// **What a clip plays, resolved ONCE for both roads that draw it**: its
+/// warp render, then the stretch of that, each the cached render when there
+/// is one and the audio standing in for it while it is owed. `reload_clips`
+/// asks this and then submits whatever is owed; `refresh_pictures` asks it
+/// and only draws. The picture road used to spell its own resolution, and
+/// spelled only the stretch: every zoom past the threshold redrew a
+/// quantized take from the unwarped file while it played warped, and a
+/// pending warp at the file's length instead of the render's.
+///
+/// **A warp still owed holds the stretch back.** The stretch key already
+/// names the warp it is MEANT to be made from (`warp_sig`), but while the
+/// warp is out `decoded` is still the unwarped file - so a stretch made now
+/// would be of unwarped audio, cached under the warped key, and the quantize
+/// would be lost for as long as the entry lived.
+#[cfg(feature = "recorder")]
+fn clip_audio(
+    clip: &tangent_ui::arrangement::ArrClip,
+    path: &std::path::Path,
+    decoded: &Decoded,
+    cache: &std::collections::HashMap<StretchKey, Decoded>,
+) -> ClipAudio {
+    let (mut warp_key, mut warp_owed) = (None, None);
+    let (audio, warp_stand_in) = match warp_plan(clip, path) {
+        None => (decoded.clone(), None),
+        Some((key, anchors, mode, fit)) => {
+            let made = cache.get(&key).cloned();
+            warp_key = Some(key);
+            match made {
+                Some(made) => (made, None),
+                None => {
+                    // **The length the render will be**, so the clip keeps
+                    // its seconds and its picture while it waits. See
+                    // `warp::projected_frames`.
+                    //
+                    // The stand-in picture is the unwarped pyramid read at
+                    // `1/ratio`, which for a warp is a uniform smear of a
+                    // thing that is not uniform - the LENGTH is exact and
+                    // the hits inside it are not. It stands for one render
+                    // and the right picture replaces it; a clip drawn at the
+                    // wrong length would move every trim under the hand.
+                    let src = decoded.clip.frames();
+                    let out = crate::warp::projected_frames(src, &anchors);
+                    let ratio = if src == 0 {
+                        1.0
+                    } else {
+                        out as f64 / src as f64
+                    };
+                    warp_owed = Some((anchors, mode, fit));
+                    (decoded.clone(), Some(ratio))
+                }
+            }
+        }
+    };
+    let stretch = stretch_key(clip, path).filter(|_| warp_stand_in.is_none());
+    let (audio, stand_in, stretch_owed) = match &stretch {
+        None => (audio, warp_stand_in, false),
+        Some((key, _)) => match cache.get(key) {
+            Some(made) => (made.clone(), None, false),
+            None => (audio, Some(clip.stretch), true),
+        },
+    };
+    ClipAudio {
+        audio,
+        stand_in,
+        warp_key,
+        warp_owed,
+        stretch,
+        stretch_owed,
     }
 }
 
@@ -3394,12 +3489,12 @@ fn stretched_clip_audio(
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
 ///
-/// Shares the stretch cache and keys into it as [`warp_plan`] does: the
-/// anchor count and [`warp_sig`], which name the map's ends and its fit and
-/// not its middle anchors or the stretch mode. The cache is the caller's -
-/// fresh per export, seeded from the live one by glue - and wherever it
-/// outlives a re-quantize that keeps the ends and the count, the old render
-/// is what comes back.
+/// Asks [`warp_plan`] for the render - its key, anchors, mode and fit - so
+/// the export, glue and the crew's live render share ONE spelling of the
+/// key, and that key names every input of the render (see [`warp_sig`]).
+/// The cache is the caller's: fresh per export, seeded from the live one by
+/// glue. An entry it holds under a key the clip still names IS the clip's
+/// render.
 #[cfg(feature = "recorder")]
 fn warped_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3407,31 +3502,16 @@ fn warped_clip_audio(
     path: &std::path::Path,
     cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
 ) -> Arc<tangent_record::decode::Clip> {
-    let Some(sig) = warp_sig(clip) else {
+    let Some((key, anchors, mode, fit)) = warp_plan(clip, path) else {
         return decoded;
     };
-    let key: StretchKey = (
-        path.to_path_buf(),
-        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        sig,
-    );
     if let Some(c) = cache.get(&key) {
         return Arc::clone(c);
     }
-    let anchors: Vec<crate::warp::Anchor> = clip
-        .warp
-        .iter()
-        .map(|&(from, to)| crate::warp::Anchor {
-            from: usize::try_from(from).unwrap_or(usize::MAX),
-            to: usize::try_from(to).unwrap_or(usize::MAX),
-        })
-        .collect();
     // The material decides both the algorithm and whether it is used at
     // all, exactly as a stretch's does. `Fit::Auto` asks
     // `stretch::percussiveness` and answers Slice only for material a slice
     // flatters - see `warp::Fit::pick`.
-    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
-    let fit = crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default();
     let made = Arc::new(crate::warp::warp(&decoded, &anchors, mode, fit));
     cache.insert(key, Arc::clone(&made));
     made
@@ -3446,44 +3526,106 @@ fn warped_clip_audio(
 /// turns a dial. A preview computed separately is a second implementation
 /// of the feature that looks like the first until it does not.
 ///
-/// Anchors are in SOURCE frames, trim included - `warp` reads the whole
-/// file - and ascending in both fields, which `warp` demands and the
+/// Anchors are in SOURCE frames - `warp` reads the whole file, trim
+/// included - and ascending in both fields, which `warp` demands and the
 /// document's reader enforces again on the way back in.
 ///
+/// **Only what the clip PLAYS is quantized.** A pair is kept only when both
+/// its ends lie inside the clip's played window: from its trim, for its
+/// length or one pass of its loop (every pass replays that same span). The
+/// attacks come from the whole FILE, and one in the trim or past the clip's
+/// end is not the clip's: anchored, it moves material the clip never played
+/// INTO it. Placed with `saturating_sub`, every hit in front of the trim was
+/// heard on the clip's first frame, the first of them became an anchor
+/// there, and the clip's own downbeat was dropped as a tie - the right half
+/// of a split take opened on the take's first hit. An attack the clip plays
+/// whose line falls outside the window is left unanchored too, rather than
+/// carried out of the clip.
+///
 /// **Units.** `found` and each pair's `from` are frames of the decode the
-/// analysis was made from, at `rate`; each `to` is a frame of the warped
-/// render, at the same rate. `start_s` is where the clip stands and
-/// `offset_s` its trim, read here as SOURCE seconds - which a stretched
-/// clip's trim is not (it is in the stretched file's seconds). Two attacks
-/// that land on one line keep only the first, and the second is carried
-/// inside the segment; an attack whose target falls before frame zero is
-/// left out.
+/// analysis was made from, at `rate`, and `file_s` is that decode's length;
+/// each `to` is a frame of the warped render, at the same rate. The clip's
+/// `start_s` is where it stands; its trim, length and loop are on the axis
+/// it is HEARD on, the stretched file's seconds. Warp first, stretch after,
+/// as the render runs: a frame of the warp's render is heard `stretch`
+/// times as far in (see [`heard_ratio`]), so an attack is placed on the grid
+/// in heard seconds and its target brought back by the same ratio. Placed in
+/// the file's own seconds, a stretched take that was ON the grid came off
+/// it, by up to a quarter of a second. Two attacks that land on one line
+/// keep only the first, and the second is carried inside the segment.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
     rate: u32,
-    start_s: f64,
-    offset_s: f64,
+    file_s: f64,
+    clip: &tangent_ui::arrangement::ArrClip,
     q: &tangent_ui::quantize::Quantize,
 ) -> Vec<(u64, u64)> {
-    let rate = rate.max(1);
-    let secs = |f: usize| f as f64 / f64::from(rate);
-    let offset = (offset_s * f64::from(rate)).max(0.0).round() as usize;
+    let rate = f64::from(rate.max(1));
+    let r = heard_ratio(clip);
+    let start_s = clip.start_s;
+    // The played window, in the frames `from` and `to` count.
+    let offset = (clip.offset_s * rate / r).max(0.0).round();
+    let len_s = clip.play_len_s(file_s * r);
+    let played_s = if clip.loop_s > 1.0e-6 {
+        clip.loop_s.min(len_s)
+    } else {
+        len_s
+    };
+    let end = offset + played_s.max(0.0) * rate / r;
+    let inside = |f: f64| f >= offset && f < end;
     let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
     for t in found {
-        // Where this attack is heard, and where it should be heard.
-        let heard = start_s + secs(t.at.saturating_sub(offset));
-        let want = q.place(heard);
-        let to = offset as f64 + (want - start_s) * f64::from(rate);
-        if to < 0.0 {
+        let from = t.at as f64;
+        if !inside(from) {
             continue;
         }
-        let (f, to) = (t.at as u64, to.round() as u64);
+        // Where this attack is heard, and where it should be heard.
+        let heard = start_s + (from - offset) * r / rate;
+        let want = q.place(heard);
+        let to = (offset + (want - start_s) * rate / r).round();
+        if !inside(to) {
+            continue;
+        }
+        let (f, to) = (t.at as u64, to as u64);
         if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
             map.push((f, to));
         }
     }
     map
+}
+
+/// **Heard seconds per second of the warp's render**: the clip's stretch as
+/// `stretch::stretch` applies it (clamped to its range), or 1.0 for a clip
+/// that is not stretched - `stretch_key`'s own test. The stretch runs AFTER
+/// the warp, so this is what carries a place in the warp's render onto the
+/// axis the clip's trim, length and loop are measured on, for the quantize
+/// and for the ticks that preview it.
+#[cfg(feature = "recorder")]
+fn heard_ratio(clip: &tangent_ui::arrangement::ArrClip) -> f64 {
+    if !clip.stretch.is_finite() || (clip.stretch - 1.0).abs() <= 1.0e-9 {
+        return 1.0;
+    }
+    clip.stretch.clamp(crate::stretch::RATIO.0, crate::stretch::RATIO.1)
+}
+
+/// **Room in a cache of per-file analyses, made from what the current ask
+/// does not name.** At the cap, every entry for a file the ask does not name
+/// goes and every one it does stays, so an ask over more files than the cap
+/// grows the cache to the ask instead of evicting what it is about to read.
+/// The attack cache emptied itself WHOLE at its cap, and an ask over nine
+/// takes - a folder row's - re-analysed all nine on every step of the
+/// detect dial. Bounded by the larger of the cap and the ask, and by the
+/// document: the reload's sweep drops a file no clip names.
+#[cfg(feature = "recorder")]
+fn make_room<V>(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, V>,
+    cap: usize,
+    asked: &[std::path::PathBuf],
+) {
+    if cache.len() >= cap {
+        cache.retain(|path, _| asked.contains(path));
+    }
 }
 
 /// **What a warp render would be asked for**, or `None` when this clip has
@@ -3492,11 +3634,13 @@ fn quantize_map(
 /// `stretch_key`'s twin, and it keys into the SAME cache: a warp render and
 /// a stretch render are both "this file, treated this way", and the third
 /// field is where the treatments are told apart. Named by the anchor count
-/// and [`warp_sig`] - the first and last pairs and the fit, which is in
-/// there because switching a clip from stretch to slice must not hand back
-/// the render made the other way. That is not every input of the render: a
-/// re-quantize that keeps the ends and the count is served the old render,
-/// and a stretch-mode change the old mode's - see [`warp_sig`].
+/// and [`warp_sig`], which between them name EVERY input of the render this
+/// clip supplies: the whole map, the fit (switching a clip from stretch to
+/// slice must not hand back the render made the other way) and the stretch
+/// mode its stretched segments are rendered in. A key that left one out
+/// would hand a re-quantize or a mode change the render it replaced, because
+/// nothing evicts an entry a clip still names. The one spelling of the key:
+/// [`warped_clip_audio`] asks here too.
 #[cfg(feature = "recorder")]
 fn warp_plan(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3558,29 +3702,39 @@ fn stretch_key(
     ))
 }
 
-/// **A warp map's identity, as the caches key it**, or `None` for a clip
-/// that is not warped: the FIT and the map's first and last pairs, nothing
-/// more. The fit is in because switching a clip from stretch to slice must
-/// not hand back the render made the other way. One spelling, for the
-/// warp's own entry (which adds the anchor count) and for the stretch made
-/// from it (which does not).
+/// **A warp render's identity, as the caches key it**, or `None` for a clip
+/// that is not warped: every input of `warp::warp` the clip supplies - the
+/// fit, the stretch mode every stretched segment is rendered in, the anchor
+/// count and a hash of every pair. One spelling, for the warp's own entry
+/// ([`warp_plan`]) and for the stretch made from it ([`stretch_key`]), so a
+/// stretch of a warp can never be keyed to another warp.
 ///
-/// **Not the whole render.** `warp::warp` reads every anchor and the clip's
-/// stretch mode, and this names neither the middle anchors nor the mode. A
-/// re-quantize that leaves the outermost hits where they were - another
-/// swing, window or grid - keeps the same warp key when it keeps the count,
-/// and the same stretch-of-warp key even when it does not; nothing evicts
-/// an entry a clip still names, so playback and glue are then served the
-/// previous render. A stretch-mode change likewise keeps the old mode's
-/// warp.
+/// **The whole render, because nothing evicts a key a clip still names.**
+/// This named the fit and the map's first and last pairs, so a re-quantize
+/// that left the outermost hits where they were - another swing, window or
+/// grid - kept its key and was served the previous render, live and in
+/// glue, while the export rendered the new map; and a stretch-mode change
+/// kept the old mode's warp. The pairs are hashed rather than spelled out
+/// because a take can carry thousands; a 64-bit collision is not one anybody
+/// will meet. The fit and the mode are the clip's own strings, quoted so no
+/// spelling can run into its neighbour, rather than what they resolve to:
+/// two spellings of one mode cost a second render of the same audio and
+/// never play the wrong one.
 #[cfg(feature = "recorder")]
 fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
+    use std::hash::{Hash, Hasher};
     if clip.warp.len() < 2 {
         return None;
     }
-    let (f0, t0) = clip.warp[0];
-    let (f1, t1) = clip.warp[clip.warp.len() - 1];
-    Some(format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    clip.warp.hash(&mut h);
+    Some(format!(
+        "warp:{:?}:{:?}:{}:{:016x}",
+        clip.warp_fit,
+        clip.stretch_mode,
+        clip.warp.len(),
+        h.finish()
+    ))
 }
 
 // **This attribute belongs to the IMPL, not to what is above it.** It was
@@ -10987,6 +11141,9 @@ impl DesktopApp {
                 // a whole desk is rebuilt.
                 self.displaced_states.clear();
                 self.track_cache.clear();
+                // In the frames of the decodes just dropped, and the next
+                // take here may reuse a path: see `attack_cache`.
+                self.attack_cache.clear();
                 self.warm_refused.clear();
                 self.refused_why.clear();
                 self.stretch_cache.clear();
@@ -11833,83 +11990,64 @@ impl DesktopApp {
             // warp map changes when somebody quantizes and never sixty times
             // a second the way a stretch drag does. There is nothing to wait
             // for a hand to settle on.
-            let (decoded, warp_stand_in) = match warp_plan(clip, &path) {
-                None => (decoded, None),
-                Some((key, anchors, mode, fit)) => {
-                    // Warm as long as a clip wants it, exactly like a
-                    // stretch render - the sweep below frees the rest.
-                    //
-                    // **And NOT into `stretched_ids`**, which is the retain
-                    // list for `stretch_seen` - the per-clip record of which
-                    // ratio was last seen, kept for `stretch_step`. A warp
-                    // does not go through that gate, so a warped clip with no
-                    // stretch has nothing to remember and keeping a row for
-                    // it would only outlive the clip.
-                    live_stretches.insert(key.clone());
-                    match self.stretch_cache.get(&key) {
-                        Some(made) => (made.clone(), None),
-                        None => {
-                            if !self.pool.holds_stretch(&key) {
-                                self.pool.submit(
-                                    Warm::Stretch(key),
-                                    Work::Warp {
-                                        source: Arc::clone(&decoded.clip),
-                                        anchors: anchors.clone(),
-                                        mode,
-                                        fit,
-                                    },
-                                    rate,
-                                    ctx,
-                                );
-                            }
-                            deferred = true;
-                            // **The length the render will be**, so the clip
-                            // keeps its seconds and its picture while it
-                            // waits. See `warp::projected_frames`.
-                            //
-                            // The stand-in picture is the unwarped pyramid
-                            // read at `1/ratio`, which for a warp is a
-                            // uniform smear of a thing that is not uniform -
-                            // the LENGTH is exact and the hits inside it are
-                            // not. It stands for one render and the right
-                            // picture replaces it; a clip drawn at the wrong
-                            // length would move every trim under the hand.
-                            let src = decoded.clip.frames();
-                            let out = crate::warp::projected_frames(src, &anchors);
-                            let ratio = if src == 0 {
-                                1.0
-                            } else {
-                                out as f64 / src as f64
-                            };
-                            (decoded, Some(ratio))
-                        }
+            //
+            // **One resolution for this road and the picture road**, so the
+            // two cannot draw a clip two ways - see `clip_audio`. What it
+            // says is owed is submitted here.
+            let ClipAudio {
+                audio,
+                stand_in,
+                warp_key,
+                warp_owed,
+                stretch,
+                stretch_owed,
+            } = clip_audio(clip, &path, &decoded, &self.stretch_cache);
+            if let Some(key) = warp_key {
+                // Warm as long as a clip wants it, exactly like a stretch
+                // render - the sweep below frees the rest.
+                //
+                // **And NOT into `stretched_ids`**, which is the retain list
+                // for `stretch_seen` - the per-clip record of which ratio was
+                // last seen, kept for `stretch_step`. A warp does not go
+                // through that gate, so a warped clip with no stretch has
+                // nothing to remember and keeping a row for it would only
+                // outlive the clip.
+                live_stretches.insert(key.clone());
+                if let Some((anchors, mode, fit)) = warp_owed {
+                    if !self.pool.holds_stretch(&key) {
+                        self.pool.submit(
+                            Warm::Stretch(key),
+                            Work::Warp {
+                                source: Arc::clone(&decoded.clip),
+                                anchors,
+                                mode,
+                                fit,
+                            },
+                            rate,
+                            ctx,
+                        );
                     }
+                    deferred = true;
                 }
-            };
-            // **A pending warp holds the stretch back.** The stretch key
-            // already names the warp it is MEANT to be made from
-            // (`warp_sig`), but while the warp is out `decoded` is still the
-            // unwarped file - so a render submitted now would be made from
-            // unwarped audio and cached under the warped key, and the
-            // quantize would be lost for as long as the entry lived.
-            let (decoded, stand_in) = match stretch_key(clip, &path)
-                .filter(|_| warp_stand_in.is_none())
-            {
-                None => (decoded, warp_stand_in),
+            }
+            // **A pending warp holds the stretch back**, which `clip_audio`
+            // has already done: `stretch` is `None` while the warp is out.
+            let (decoded, stand_in) = match stretch {
+                None => (audio, stand_in),
                 Some((key, mode)) => {
                     live_stretches.insert(key.clone());
                     stretched_ids.push(clip.id);
-                    if let Some(made) = self.stretch_cache.get(&key) {
-                        (made.clone(), None)
-                    } else if stretch_over_ceiling(decoded.clip.frames(), clip.stretch) {
+                    if !stretch_owed {
+                        (audio, stand_in)
+                    } else if stretch_over_ceiling(audio.clip.frames(), clip.stretch) {
                         notes.push(format!(
                             "{} stretched by {:.2} would be longer than the {}-minute ceiling - it plays unstretched",
                             clip.name,
                             clip.stretch,
                             tangent_record::decode::MAX_FRAMES / 60 / 48_000
                         ));
-                        self.stretch_cache.insert(key, decoded.clone());
-                        (decoded, None)
+                        self.stretch_cache.insert(key, audio.clone());
+                        (audio, None)
                     } else {
                         let in_flight = self.pool.holds_stretch(&key);
                         if stretch_step(&mut self.stretch_seen, clip.id, &key, in_flight)
@@ -11918,7 +12056,7 @@ impl DesktopApp {
                             self.pool.submit(
                                 Warm::Stretch(key),
                                 Work::Stretch {
-                                    source: Arc::clone(&decoded.clip),
+                                    source: Arc::clone(&audio.clip),
                                     ratio: clip.stretch,
                                     mode,
                                 },
@@ -11927,7 +12065,7 @@ impl DesktopApp {
                             );
                         }
                         deferred = true;
-                        (decoded, Some(clip.stretch))
+                        (audio, stand_in)
                     }
                 }
             };
@@ -12045,6 +12183,8 @@ impl DesktopApp {
         if doc_path.is_some() {
             let referenced = |path: &std::path::PathBuf| live_files.contains(path);
             self.track_cache.retain(|path, _| referenced(path));
+            // A file's attacks go with its decode. See `attack_cache`.
+            self.attack_cache.retain(|path, _| referenced(path));
             // **The refusal set holds PADS as well as clips, so this sweep
             // has to ask both.**
             //
@@ -12146,20 +12286,18 @@ impl DesktopApp {
                 let Some(decoded) = self.track_cache.get(&path) else {
                     continue;
                 };
-                // A stretch render still pending is drawn from the same
-                // stand-in the reload draws it from - for a clip with no
-                // warp. Not yet true of a warped one: this road never asks
-                // `warp_plan`, so a quantized clip is redrawn here from the
-                // unwarped file unless it is stretched and its stretch of
-                // the warp has already landed.
-                let (decoded, stand_in) = match stretch_key(clip, &path) {
-                    None => (decoded, None),
-                    Some((key, _)) => match self.stretch_cache.get(&key) {
-                        Some(made) => (made, None),
-                        None => (decoded, Some(clip.stretch)),
-                    },
-                };
-                clip_infos.push(clip_picture(clip, decoded, rate, Some(wave_view), stand_in));
+                // What the clip plays, resolved exactly as the reload
+                // resolves it - its warp, then its stretch, and the same
+                // stand-ins while either is owed - so a view move redraws a
+                // quantized take as it plays. See `clip_audio`.
+                let resolved = clip_audio(clip, &path, decoded, &self.stretch_cache);
+                clip_infos.push(clip_picture(
+                    clip,
+                    &resolved.audio,
+                    rate,
+                    Some(wave_view),
+                    resolved.stand_in,
+                ));
             }
         }
         self.app.set_clip_infos(clip_infos);
@@ -12500,12 +12638,14 @@ impl DesktopApp {
         }
     }
 
-    /// **This file's attacks at this sensitivity.**
+    /// **This file's attacks at this sensitivity.** `asked` is every file
+    /// the current ask names, which room in the cache is never made from.
     fn attacks_of(
         &mut self,
         path: &std::path::Path,
         decoded: &tangent_record::decode::Clip,
         sensitivity: f64,
+        asked: &[std::path::PathBuf],
     ) -> Vec<crate::transient::Transient> {
         // **The FILE is what is cached, not the answer.** `analyse` is the
         // whole cost - the envelope over every sample and the local median
@@ -12514,18 +12654,17 @@ impl DesktopApp {
         // analysis. So a hand on the detect slider re-picks and never
         // re-analyses, and there is one entry per file rather than one per
         // file per dial position.
+        //
+        // **And only for the decode it was made from**: one at another rate,
+        // or of another file under the same name, is analysed afresh. See
+        // `Analysis::fits`.
         const CAP: usize = 8;
-        if !self.attack_cache.contains_key(path) {
+        if !self.attack_cache.get(path).is_some_and(|a| a.fits(decoded)) {
             let Some(a) = crate::transient::analyse(decoded) else {
+                self.attack_cache.remove(path);
                 return Vec::new();
             };
-            // A few takes' analyses are a few hundred kilobytes; the
-            // cheap answer to "how many" is to drop the lot once it is
-            // silly, since the only thing that wants an old one is a
-            // selection being made again.
-            if self.attack_cache.len() >= CAP {
-                self.attack_cache.clear();
-            }
+            make_room(&mut self.attack_cache, CAP, asked);
             self.attack_cache.insert(path.to_path_buf(), Arc::new(a));
         }
         self.attack_cache
@@ -12589,8 +12728,8 @@ impl DesktopApp {
     /// **Where the asked clips are, as one number.**
     ///
     /// Everything `quantize_marks_for` reads that the ask does not carry:
-    /// the file, the placement, the trim, the loop and the warp map. A
-    /// clip that moves changes this and the ticks are rebuilt.
+    /// the file, the placement, the trim, the loop, the warp map and the
+    /// stretch. A clip that moves changes this and the ticks are rebuilt.
     ///
     /// **Not the document's own fingerprint**, which is the obvious
     /// one-liner and is wrong: it includes the desk, so a fader moved with
@@ -12610,13 +12749,17 @@ impl DesktopApp {
                 c.len_s.to_bits().hash(&mut h);
                 c.loop_s.to_bits().hash(&mut h);
                 c.warp.hash(&mut h);
+                c.stretch.to_bits().hash(&mut h);
             }
         }
         h.finish()
     }
 
     /// **The ticks one ask comes to**, per clip, in seconds from the start
-    /// of each FILE.
+    /// of the audio each clip PLAYS - its file warped and then stretched,
+    /// the axis its trim is on - so the painter lays them down by
+    /// subtracting the trim. In the file's own seconds a stretched clip wore
+    /// its ticks off its hits by the ratio.
     ///
     /// Split from the pusher so that one has a single exit and can hand
     /// `late_change` an ANSWER rather than a bare `true` - see
@@ -12641,14 +12784,15 @@ impl DesktopApp {
         //
         // This ran off a deep clone of the arrangement - every clip, every
         // note, every automation point - once per dial position, for the
-        // sake of four fields on the handful of clips named in the ask.
-        // The borrow is released at the end of the block, which is what the
-        // clone was buying: `attacks_of` below needs `&mut self`.
+        // sake of a few fields on the handful of clips named in the ask.
+        // Those clips are cloned on their own now, which for an audio clip
+        // is its strings and its map: it holds no notes. The borrow is
+        // released at the end of the block, which is what the clone was
+        // buying: `attacks_of` below needs `&mut self`.
         struct Asked {
             id: u64,
             path: std::path::PathBuf,
-            start_s: f64,
-            offset_s: f64,
+            clip: tangent_ui::arrangement::ArrClip,
             anchors: Vec<crate::warp::Anchor>,
         }
         let asked: Vec<Asked> = {
@@ -12660,8 +12804,7 @@ impl DesktopApp {
                     Some(Asked {
                         id: *id,
                         path: tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path),
-                        start_s: c.start_s,
-                        offset_s: c.offset_s,
+                        clip: c.clone(),
                         // **An attack is FOUND in the file and DRAWN over
                         // what the clip plays**, and those are two different
                         // timelines the moment a warp map exists. Projecting
@@ -12683,19 +12826,22 @@ impl DesktopApp {
                 })
                 .collect()
         };
+        let files = self.asked_files(ask);
         let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(asked.len());
-        for clip in &asked {
-            let path = clip.path.clone();
+        for a in &asked {
+            let path = a.path.clone();
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
-            let found = self.attacks_of(&path, &decoded, ask.sensitivity);
-            let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
-            let anchors = &clip.anchors;
+            // Heard seconds per second of the warp's render. See `heard_ratio`.
+            let r = heard_ratio(&a.clip);
+            let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
+            let map = quantize_map(&found, decoded.rate, decoded.seconds(), &a.clip, &q);
+            let anchors = &a.anchors;
             let frames = decoded.frames();
             out.push((
-                clip.id,
+                a.id,
                 map.iter()
                     .map(|&(f, t)| {
                         let at = crate::warp::project_frame(
@@ -12703,12 +12849,26 @@ impl DesktopApp {
                             anchors,
                             usize::try_from(f).unwrap_or(usize::MAX),
                         );
-                        ((at as f64 / rate) as f32, (t as f64 / rate) as f32)
+                        ((at as f64 * r / rate) as f32, (t as f64 * r / rate) as f32)
                     })
                     .collect(),
             ));
         }
         out
+    }
+
+    /// **Every file one quantize ask names**, resolved: what the attack
+    /// cache keeps while that ask is answered. See `make_room`.
+    fn asked_files(&self, ask: &tangent_ui::ports::QuantizeAsk) -> Vec<std::path::PathBuf> {
+        let Some(doc_path) = self.app.project_doc() else {
+            return Vec::new();
+        };
+        let doc = self.app.arrangement();
+        ask.ids
+            .iter()
+            .filter_map(|id| doc.clips.iter().find(|c| c.id == *id))
+            .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+            .collect()
     }
 
     /// **Quantize one audio clip: find the attacks, decide where each
@@ -12724,7 +12884,8 @@ impl DesktopApp {
     /// means the file is entered part-way through, so a transient found at
     /// file frame N is heard at timeline `start_s + (N - offset)`. Quantizing
     /// against the raw file position would put every hit of a trimmed clip
-    /// out by the trim.
+    /// out by the trim. Only the attacks the clip plays are moved, and only
+    /// to where it still plays them - see `quantize_map`.
     ///
     /// **Everything one quantize was asked for**, so the per-clip worker
     /// takes one argument instead of six and a knob added to the window
@@ -12753,8 +12914,9 @@ impl DesktopApp {
         let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
             return (0, 0);
         };
-        let found = self.attacks_of(&path, &decoded, ask.sensitivity);
-        let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
+        let files = self.asked_files(ask);
+        let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
+        let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
         if map.len() < 2 {
             return (0, found.len());
         }
@@ -14166,6 +14328,9 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.stretch_cache.clear();
+                // The attacks were found in frames of those decodes, at the
+                // rate of the device that has just gone.
+                self.attack_cache.clear();
                 // **And every refusal, because a refusal belongs to the
                 // world it was made in.**
                 //
@@ -20668,8 +20833,8 @@ impl Decoded {
 /// `(file, ratio in millionths, mode key [+ "|" + warp_sig])` - see
 /// [`stretch_key`] - and a WARP is `(file, anchor count, warp_sig)` - see
 /// [`warp_plan`], whose third field starts `warp:` and so can never equal a
-/// mode key. `warped_clip_audio` spells the warp key a second time and must
-/// agree with `warp_plan`.
+/// mode key. `warped_clip_audio` takes its key from `warp_plan`, so there is
+/// one spelling of it, and `warp_sig` names every input of the render.
 #[cfg(feature = "recorder")]
 type StretchKey = (std::path::PathBuf, i64, String);
 
@@ -23230,6 +23395,107 @@ mod tests {
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
     }
 
+    /// **A view refresh draws the warp the reload drew.** The picture road
+    /// (`refresh_pictures`, run on a zoom or scroll while any clip lacks a
+    /// pyramid) resolved a clip's stretch and never its warp, so a quantized,
+    /// unstretched take was redrawn from the UNWARPED file - its hits back
+    /// off the grid on screen while it played on it, until the next reload -
+    /// and a pending warp was drawn at the file's length instead of the
+    /// render's. Both roads now ask one resolver, `clip_audio`. A source scan
+    /// for the wiring, because `DesktopApp` cannot be built in a test; the
+    /// resolver itself is driven in the test after this one.
+    #[test]
+    fn a_view_refresh_draws_the_warp_the_reload_drew() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |sig: &str| {
+            let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        for (road, sig) in [
+            ("refresh_pictures", "fn refresh_pictures(&mut self) -> bool {"),
+            ("reload_clips", "fn reload_clips(&mut self, decode: Decode, ctx: &egui::Context) -> bool {"),
+        ] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("clip_audio(clip, &path, "),
+                "{road} resolves what a clip plays on its own, so the two \
+                 roads can draw a quantized take two different ways"
+            );
+            assert!(
+                !body.contains("stretch_key(clip, &path)") && !body.contains("warp_plan(clip, &path)"),
+                "{road} still keys a render itself instead of asking the one resolver"
+            );
+        }
+    }
+
+    /// **What a clip plays is its warp, then the stretch of that** - each
+    /// the cached render once it is in, and a stand-in at the render's
+    /// length while it is owed, with the stretch held back for as long as
+    /// the warp is out. The one resolver both drawing roads ask (see the
+    /// test above), driven through every state the cache can be in.
+    #[test]
+    fn a_clips_playing_audio_is_its_warp_then_its_stretch() {
+        let rate = 8_000u32;
+        let file = Decoded::of(tangent_record::decode::Clip {
+            samples: vec![0.0; rate as usize * 2 * 2],
+            rate,
+            source: std::path::PathBuf::from("a.wav"),
+        });
+        let path = std::path::Path::new("a.wav");
+        let mut cache: std::collections::HashMap<StretchKey, Decoded> =
+            std::collections::HashMap::new();
+        // A quantize that carries the second second a quarter later.
+        let warped = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "a.wav".to_owned(),
+            warp: vec![(0, 0), (8_000, 10_000)],
+            ..Default::default()
+        };
+        let (key, anchors, mode, fit) = warp_plan(&warped, path).expect("a warped clip has a plan");
+        let ratio = crate::warp::projected_frames(file.clip.frames(), &anchors) as f64
+            / file.clip.frames() as f64;
+
+        // Owed: the file stands in at the render's length, and the render is asked for.
+        let owed = clip_audio(&warped, path, &file, &cache);
+        assert!(Arc::ptr_eq(&owed.audio.clip, &file.clip), "an owed warp did not stand in with the file");
+        assert_eq!(owed.stand_in, Some(ratio), "an owed warp is not drawn at the render's length");
+        assert_eq!(owed.warp_key.as_ref(), Some(&key));
+        assert!(owed.warp_owed.is_some(), "an owed warp was not asked for");
+
+        // Landed: the render plays and draws, with no stand-in.
+        let render = Decoded::of(crate::warp::warp(&file.clip, &anchors, mode, fit));
+        cache.insert(key.clone(), render.clone());
+        let landed = clip_audio(&warped, path, &file, &cache);
+        assert!(Arc::ptr_eq(&landed.audio.clip, &render.clip), "the clip does not play its warp render");
+        assert_eq!(landed.stand_in, None);
+        assert!(landed.warp_owed.is_none() && landed.stretch.is_none());
+
+        // Warped and stretched, with the warp still out: the stretch is held
+        // back and the file stands in at the warp's length.
+        let both = tangent_ui::arrangement::ArrClip { stretch: 2.0, ..warped.clone() };
+        cache.clear();
+        let held = clip_audio(&both, path, &file, &cache);
+        assert!(held.stretch.is_none(), "a stretch was asked for while its warp was still out");
+        assert_eq!(held.stand_in, Some(ratio));
+
+        // The warp in, the stretch owed: the warp render stands in at the stretch.
+        cache.insert(key, render.clone());
+        let half = clip_audio(&both, path, &file, &cache);
+        assert!(Arc::ptr_eq(&half.audio.clip, &render.clip), "the stretch is not made from the warp");
+        assert_eq!(half.stand_in, Some(2.0));
+        assert!(half.stretch.is_some() && half.stretch_owed);
+
+        // Both in: the stretch of the warp is what plays.
+        let (skey, _) = stretch_key(&both, path).expect("a stretched clip has a key");
+        let stretched = Decoded::of(crate::stretch::stretch(&render.clip, 2.0, crate::stretch::Mode::Tape));
+        cache.insert(skey, stretched.clone());
+        let done = clip_audio(&both, path, &file, &cache);
+        assert!(Arc::ptr_eq(&done.audio.clip, &stretched.clip), "the clip does not play its stretch of the warp");
+        assert_eq!(done.stand_in, None);
+        assert!(!done.stretch_owed);
+    }
+
     /// **The lengths a reload measured go over in ONE call, and an empty
     /// list makes no call at all.**
     ///
@@ -23309,25 +23575,26 @@ mod tests {
         // And the two roads that BUILD that picture take the render, not the
         // file. Neither can be driven headless — `DesktopApp` cannot be
         // built in a test — so the pairing is pinned where it is written:
-        // the value handed over with no stand-in comes out of
-        // `stretch_cache`, never out of `track_cache`.
+        // both ask `clip_audio`, whose settled stretch is the value the
+        // cache handed back, with no stand-in - out of `stretch_cache`,
+        // never out of `track_cache`. (`a_clips_playing_audio_is_its_warp_
+        // then_its_stretch` drives the resolver itself.)
         let src = include_str!("desktop.rs");
         let body = &src[..src.find("mod tests {").expect("the test module")];
-        for (road, settled) in [
-            (
-                "reload_clips",
-                "if let Some(made) = self.stretch_cache.get(&key) {\n                        (made.clone(), None)",
-            ),
-            (
-                "refresh_pictures",
-                "match self.stretch_cache.get(&key) {\n                        Some(made) => (made, None),",
-            ),
-        ] {
+        let resolver = &body[body.find("fn clip_audio(").expect("the resolver")..];
+        let resolver = &resolver[..resolver.find("\n}\n").expect("its end")];
+        assert!(
+            resolver.contains("Some((key, _)) => match cache.get(key) {\n            Some(made) => (made.clone(), None, false),"),
+            "the resolver no longer draws a settled stretch from the render's \
+             own decode; a source pyramid with no stand-in is a waveform that \
+             lies by the ratio"
+        );
+        for road in ["fn reload_clips(", "fn refresh_pictures("] {
+            let at = body.find(road).expect("the road");
+            let end = at + body[at..].find("\n    }\n").expect("its end");
             assert!(
-                body.contains(settled),
-                "{road} no longer draws a settled stretch from the render's \
-                 own decode; a source pyramid with no stand-in is a waveform \
-                 that lies by the ratio"
+                body[at..end].contains("clip_audio(clip, &path, "),
+                "{road} no longer resolves its clips through `clip_audio`"
             );
         }
     }
@@ -24427,6 +24694,65 @@ mod tests {
         assert_eq!(stretch_key(&undone, path).unwrap().0, a);
     }
 
+    /// **A warp render is keyed by the WHOLE map, and by the stretch mode it
+    /// was rendered with.** `warp_sig` named only the map's first and last
+    /// pairs and the fit; the warp key added the count, the stretch-of-warp
+    /// key not even that. Nothing evicts a key a clip still names, so two
+    /// maps that share their ends - a re-quantize at another swing, window
+    /// or grid - were served one cached render live and in glue while the
+    /// export rendered the new map, and a stretch-mode change on a warped
+    /// clip kept the old mode's warp.
+    #[test]
+    fn a_warp_render_is_keyed_by_the_whole_map_and_the_mode() {
+        let path = std::path::Path::new("take.wav");
+        let straight = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            warp: vec![(0, 0), (12_000, 12_000), (24_000, 24_000), (36_000, 36_000)],
+            ..Default::default()
+        };
+        let swung = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, 0), (12_000, 14_000), (24_000, 24_000), (36_000, 36_000)],
+            ..straight.clone()
+        };
+        let fewer = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, 0), (24_000, 24_000), (36_000, 36_000)],
+            ..straight.clone()
+        };
+        let moded = |mode: &str| tangent_ui::arrangement::ArrClip {
+            stretch_mode: mode.to_owned(),
+            ..straight.clone()
+        };
+        let w = |c: &tangent_ui::arrangement::ArrClip| warp_plan(c, path).expect("a plan").0;
+        let s = |c: &tangent_ui::arrangement::ArrClip| {
+            stretch_key(&tangent_ui::arrangement::ArrClip { stretch: 1.5, ..c.clone() }, path)
+                .expect("a stretched clip has a stretch key")
+                .0
+        };
+        // Every facet is checked before anything panics, so one run names
+        // each collision.
+        let mut shared: Vec<String> = Vec::new();
+        if w(&straight) == w(&swung) {
+            shared.push(format!("two different maps share one cached render: {:?}", w(&straight)));
+        }
+        if s(&straight) == s(&swung) {
+            shared.push(format!("two stretches of two warps share one render: {:?}", s(&straight)));
+        }
+        if s(&straight) == s(&fewer) {
+            shared.push(format!("the stretch key cannot see the map's length: {:?}", s(&straight)));
+        }
+        if w(&moded("tape")) == w(&moded("tonal")) {
+            shared.push(format!(
+                "a stretch-mode change is served the old mode's warp: {:?}",
+                w(&moded("tape"))
+            ));
+        }
+        assert!(shared.is_empty(), "{}", shared.join("; "));
+        // And the same map under the same treatment is the same render, or
+        // the cache would never hit.
+        assert_eq!(w(&straight), w(&straight.clone()));
+        assert_eq!(s(&swung), s(&swung.clone()));
+    }
+
     /// **The glued file's name answers to nothing yet**: not a file on disk,
     /// and not a path some clip in the document still names - a clip whose
     /// file went missing would otherwise wake up playing the weld.
@@ -24985,6 +25311,7 @@ mod tests {
             "c.len_s.to_bits",
             "c.loop_s.to_bits",
             "c.warp.hash",
+            "c.stretch.to_bits",
         ] {
             assert!(
                 sig.contains(field),
@@ -25451,6 +25778,130 @@ mod tests {
         );
     }
 
+    /// **A hit the trim hides stays hidden when the clip is quantized.**
+    /// `quantize_map` sees every attack in the FILE and placed the ones in
+    /// front of a clip's trim with `t.at.saturating_sub(offset)`, so each was
+    /// "heard" on the clip's first frame: the first became an anchor ON that
+    /// frame, every later hit aimed at the same line was dropped (the clip's
+    /// own downbeat among them), and the render played the file's opening at
+    /// the head of the clip. A hit past the clip's end is the same stranger
+    /// from the other side, and is left out the same way.
+    #[test]
+    fn an_attack_the_trim_hides_is_not_pulled_onto_the_clip_start() {
+        use crate::transient::Transient;
+        let rate = 48_000u32;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::new(0.125, None).expect("a 1/16 grid at 120 bpm"),
+        );
+        // The right half of a 16 s take split at 8 s: it stands at 8 s and
+        // enters the file at 8 s, so the file's first eight seconds are trim.
+        // Its end is trimmed too, at 11.9 s of the file.
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            start_s: 8.0,
+            offset_s: 8.0,
+            len_s: 3.9,
+            loop_s: 3.9,
+            ..Default::default()
+        };
+        let (offset, end) = (384_000usize, 571_200u64);
+        // Two quiet hits inside the trim, and one past the end at 11.92 s -
+        // nearer the 11.875 s line inside the clip than any line past it.
+        // The clip's own two, loud: its downbeat 3 ms late and the next
+        // sixteenth 10 ms late.
+        let quiet = [480usize, 48_000, 572_160];
+        let loud = [384_144usize, 396_480];
+        let mut found: Vec<Transient> = quiet
+            .iter()
+            .chain(loud.iter())
+            .map(|&at| Transient { at, strength: 10.0 })
+            .collect();
+        // In the order `pick` reports them.
+        found.sort_by_key(|t| t.at);
+        let map = quantize_map(&found, rate, 16.0, &clip, &q);
+
+        // What the map PLAYS. Slice - what `Fit::Auto` picks for drums - so a
+        // click comes out exactly as it went in.
+        let frames = 16 * rate as usize;
+        let mut s = vec![0.0f32; frames * 2];
+        for (hits, level) in [(&quiet[..], 0.3f32), (&loud[..], 0.9f32)] {
+            for &at in hits {
+                for k in 0..64 {
+                    s[(at + k) * 2] = level;
+                    s[(at + k) * 2 + 1] = level;
+                }
+            }
+        }
+        let file = tangent_record::decode::Clip { samples: s, rate, source: "take.wav".into() };
+        let anchors: Vec<crate::warp::Anchor> = map
+            .iter()
+            .map(|&(from, to)| crate::warp::Anchor { from: from as usize, to: to as usize })
+            .collect();
+        let out = crate::warp::warp(
+            &file,
+            &anchors,
+            crate::stretch::Mode::Auto,
+            crate::warp::Fit::Slice,
+        );
+        let opening = out.samples[offset * 2..(offset + 480) * 2]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            opening > 0.8,
+            "the clip's first 10 ms peak at {opening}: it opens on a hit from its \
+             trim, not on its own downbeat - map {map:?}"
+        );
+        // And the map itself: nothing from the trim or past the end lands
+        // inside the clip, and the clip's own hits are the ones anchored.
+        for &(from, to) in &map {
+            assert!(
+                from >= offset as u64 || to < offset as u64,
+                "a hit the trim hides (file frame {from}) was sent to frame {to}: {map:?}"
+            );
+            assert!(
+                from < end || to >= end,
+                "a hit past the clip's end (file frame {from}) was sent to frame {to}: {map:?}"
+            );
+        }
+        assert!(map.contains(&(384_144, 384_000)), "the clip's own downbeat was dropped: {map:?}");
+        assert!(map.contains(&(396_480, 396_000)), "the clip's next hit was not quantized: {map:?}");
+    }
+
+    /// **A stretched take already on the grid is left on it.** Warp first,
+    /// stretch after: an attack at warped frame `f` is HEARD at
+    /// `f * stretch / rate`, and `quantize_map` placed it on the song's grid
+    /// in the file's own seconds instead - a take stretched to 1.25 whose
+    /// hits were heard exactly on the beat came out up to 250 ms off it.
+    #[test]
+    fn a_stretched_take_already_on_the_grid_is_left_on_it() {
+        use crate::transient::Transient;
+        // A take stretched to 1.25 whose hits fall every 0.4 s of FILE - every
+        // 0.5 s as played, the quarter grid at 120 bpm.
+        let r = 1.25;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::new(0.5, None).expect("a quarter grid at 120 bpm"),
+        );
+        let found: Vec<Transient> = (0..5)
+            .map(|i| Transient { at: (0.4 * f64::from(i) * 48_000.0) as usize, strength: 10.0 })
+            .collect();
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            stretch: r,
+            ..Default::default()
+        };
+        // Two seconds of file, two and a half as played.
+        let map = quantize_map(&found, 48_000, 2.0, &clip, &q);
+        assert_eq!(map.len(), found.len(), "a hit the stretched clip plays was left out: {map:?}");
+        for &(_, to) in &map {
+            // Warp first, stretch after: result frame `to` is heard at to*r/rate.
+            let heard = to as f64 * r / 48_000.0;
+            assert!(
+                (heard - (heard / 0.5).round() * 0.5).abs() < 0.002,
+                "a hit that was on the grid is heard at {heard} s after the quantize: {map:?}"
+            );
+        }
+    }
+
     /// **A file's attacks are detected once per dial position.**
     ///
     /// The marks are redrawn while somebody is dragging the sensitivity
@@ -25469,6 +25920,94 @@ mod tests {
         assert_eq!(key(-1.0), 0, "below the floor did not clamp");
         assert_eq!(key(9.0), 1000, "above the ceiling did not clamp");
         assert_ne!(key(0.0), key(1.0));
+    }
+
+    /// **The attack analyses go wherever the decodes they came from go.** An
+    /// `Analysis` is in the frames of ITS decode and `attack_cache` is keyed
+    /// by path alone, so a device that reopened at another rate - or a
+    /// scratch whose next take reused `rec-1-1.wav` - handed `pick`
+    /// positions from the old decode: every anchor 8.8% of its time from its
+    /// hit after a 48 to 44.1 kHz change, or another file's attacks. A source
+    /// scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_attack_analyses_are_emptied_with_the_decodes_they_came_from() {
+        let src = include_str!("desktop.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let (mut sites, mut from) = (0usize, 0usize);
+        while let Some(at) = prod[from..].find("self.track_cache.clear();") {
+            let at = from + at;
+            // To the end of the function this clear stands in.
+            let end = prod[at..].find("\n    fn ").map_or(prod.len(), |e| at + e);
+            assert!(
+                prod[at..end].contains("self.attack_cache.clear();"),
+                "the decode cache is emptied (byte {at}) and the attack analyses \
+                 made from it are left standing"
+            );
+            sites += 1;
+            from = at + 1;
+        }
+        assert!(sites >= 2, "expected the New and the device-rebuild clears, found {sites}");
+        // And swept with the decodes, so a file no clip names any more takes
+        // its analysis with it.
+        assert!(
+            prod.contains("self.track_cache.retain(|path, _| referenced(path));")
+                && prod.contains("self.attack_cache.retain(|path, _| referenced(path));"),
+            "the reload sweeps the decodes and leaves their analyses standing"
+        );
+    }
+
+    /// **The attack cache never throws away the files it is being asked
+    /// for.** At its cap it emptied itself WHOLE, so an ask over more files
+    /// than the cap - a folder row's takes - evicted what it was about to
+    /// read and re-analysed every file on every step of the detect dial, a
+    /// dozen milliseconds a three-minute take, on the UI thread. A source
+    /// scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_attack_cache_never_throws_away_the_files_it_is_being_asked_for() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn attacks_of(").expect("the cache");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("self.attack_cache.clear();"),
+            "the cap empties the WHOLE cache when it fills, so an ask over more \
+             files than the cap evicts what it is about to read and re-analyses \
+             every file on every step of the detect dial"
+        );
+        assert!(
+            body.contains("make_room(&mut self.attack_cache, CAP, asked);"),
+            "the cache no longer makes its room from what the ask does not name"
+        );
+    }
+
+    /// **Room is made from what the ask does not name, never from what it
+    /// does.** Nine takes asked for under a cap of eight are analysed once
+    /// each however often the dial moves, and the next ask makes its room
+    /// from the files it does not name.
+    #[test]
+    fn the_attack_cache_makes_room_from_what_the_ask_does_not_name() {
+        let p = |n: usize| std::path::PathBuf::from(format!("take-{n}.wav"));
+        let asked: Vec<std::path::PathBuf> = (0..9).map(p).collect();
+        let mut cache: std::collections::HashMap<std::path::PathBuf, usize> =
+            std::collections::HashMap::new();
+        // One ask over nine takes, read twice - a detect dial moved once.
+        let mut analysed = 0;
+        for _ in 0..2 {
+            for f in &asked {
+                if !cache.contains_key(f) {
+                    make_room(&mut cache, 8, &asked);
+                    cache.insert(f.clone(), 0);
+                    analysed += 1;
+                }
+            }
+        }
+        assert_eq!(analysed, 9, "an ask over more files than the cap re-analysed what it was reading");
+        // A new ask: its room comes from the files it does not name.
+        let next = vec![p(0), p(20)];
+        make_room(&mut cache, 8, &next);
+        cache.insert(p(20), 0);
+        assert!(cache.contains_key(&p(0)), "a file the new ask names was thrown away");
+        assert!(cache.len() <= 8, "the cache kept files no ask names past its cap: {}", cache.len());
     }
 
     /// **The LIVE path warps too, and carries a picture of what it warped.**
@@ -25612,7 +26151,7 @@ mod tests {
             "the inline live-path warp is back"
         );
         assert!(
-            scan.contains("stretch_key(clip, &path)\n                .filter(|_| warp_stand_in.is_none())"),
+            scan.contains("let stretch = stretch_key(clip, path).filter(|_| warp_stand_in.is_none());"),
             "a stretch can be submitted while its clip's warp is still out"
         );
     }

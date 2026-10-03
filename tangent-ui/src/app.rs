@@ -16964,6 +16964,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             sensitivity: self.settings.quantize_sensitivity.clamp(0.0, 1.0),
             fit: self.settings.quantize_fit.clone(),
             target: self.quantize_target(),
+            meter: {
+                let sig = self.settings.time_signature();
+                (sig.beats, sig.unit)
+            },
         });
     }
 
@@ -18482,40 +18486,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if !repeats {
                 c.pedal.retain(|e| e.at_s < cut);
             }
-            tails.push(crate::arrangement::ArrClip {
-                pedal: tail_pedal,
-                kind: c.kind,
-                notes: tail_notes,
-                lane: c.lane,
-                path: c.path.clone(),
-                start_s: t,
-                offset_s: c.offset_s + head,
-                len_s: len - head,
-                // **A blade makes a clip, so the clip it makes is a loop** —
-                // over its own new length, like everything else born here.
-                //
-                // The HEAD is left holding whatever loop it already had, and
-                // that is not an oversight: a four-bar clip repeating one bar,
-                // cut at two and a half, still repeats that bar for two and a
-                // half bars. Re-cutting the head's loop to its new length
-                // would throw the pass away and weld the repeats it had into
-                // one, which is glue's verb and not the blade's.
-                // A repeating clip's tail keeps the repeat; any other tail is
-                // a new clip and takes a loop over its own length.
-                loop_s: if repeats { c.loop_s } else { len - head },
-                fade_in_s: 0.0,
-                fade_out_s: tail_fade,
-                name: c.name.clone(),
-                id: 0,
-                extra: Default::default(),
-                anchor: Default::default(),
-                follow_tempo: false,
-                stretch: 1.0,
-                stretch_mode: String::new(),
-                gain: 1.0,
-                warp: Vec::new(),
-                warp_fit: String::new(),
-            });
+            // **The tail is the same take, cut: a clone with only what the
+            // blade changes written over it.** Everything else an audio clip
+            // carries belongs to the whole take - the quantize (warp map and
+            // fit), the normalise (gain), the stretch (ratio and algorithm),
+            // how it keeps its bar, and any key this build cannot read. The
+            // tail was built field by field with all of that reset, so the
+            // right half of a quantized, normalised take played unquantized
+            // at unity gain, and a stretched take's tail read the raw file.
+            // `offset_s + head` is right for every one of them: the trim is
+            // on the axis of the audio the clip PLAYS (warped, then
+            // stretched), which is the axis `head` is measured on. Cloning
+            // the head is safe because every field the head changed above is
+            // written again here.
+            let mut tail = c.clone();
+            tail.id = 0;
+            tail.pedal = tail_pedal;
+            tail.notes = tail_notes;
+            tail.start_s = t;
+            tail.offset_s = c.offset_s + head;
+            tail.len_s = len - head;
+            // **A blade makes a clip, so the clip it makes is a loop** —
+            // over its own new length, like everything else born here.
+            //
+            // The HEAD is left holding whatever loop it already had, and
+            // that is not an oversight: a four-bar clip repeating one bar,
+            // cut at two and a half, still repeats that bar for two and a
+            // half bars. Re-cutting the head's loop to its new length
+            // would throw the pass away and weld the repeats it had into
+            // one, which is glue's verb and not the blade's.
+            // A repeating clip's tail keeps the repeat; any other tail is
+            // a new clip and takes a loop over its own length.
+            tail.loop_s = if repeats { c.loop_s } else { len - head };
+            tail.fade_in_s = 0.0;
+            tail.fade_out_s = tail_fade;
+            tails.push(tail);
         }
         if tails.is_empty() {
             return;
@@ -18746,11 +18751,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and window, with every knob stated. [`Self::apply_quantize_window`] is
     /// the only caller.
     ///
-    /// Each start is clamped into `start_s .. start_s + len_s - dur`, the
-    /// clamp a drag uses. Not yet quantized where it is HEARD: a note is
-    /// placed at its first-pass position and then clamped, so one the trim
-    /// hides is moved onto the clip's head, and one that rings past the
-    /// clip's end is pulled in to end there, even when it sat on a line.
+    /// **Quantized where it is HEARD, and only if it is.** A note is placed
+    /// at the first pass that plays it ([`crate::arrangement::first_heard_shift_s`],
+    /// the schedule's own rule), moved there, and mapped back by the same
+    /// pass. One no pass plays - hidden by the trim on every pass, or only
+    /// ever past the clip's end - is left exactly where it is. It used to be
+    /// placed at its first-pass position and then clamped into the clip, so
+    /// a hidden note was dragged onto the clip's head, where it sounded; a
+    /// trimmed loop's downbeat, heard on every pass after the first, moved a
+    /// beat late in all of them; and with the trim a loop or more, the whole
+    /// loop stacked on one instant.
+    ///
+    /// Only the START is held inside the clip: pulled before the head it
+    /// stops at the head, and a note whose line is at or past the clip's end
+    /// stays put, since there it would sound nowhere. A note that rings past
+    /// the end may, as playback lets it.
     fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -18760,24 +18775,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
+        // Asked of every note before any moves: the answer reads the clip.
+        let heard: Vec<Option<f64>> = clip
+            .notes
+            .iter()
+            .map(|n| crate::arrangement::first_heard_shift_s(clip, n.at_s))
+            .collect();
         let mut moved = 0usize;
         for (i, n) in clip.notes.iter_mut().enumerate() {
             if !selected.is_empty() && selected.binary_search(&i).is_err() {
                 continue;
             }
-            // Clip-relative -> timeline, quantize, and back.
-            let abs = c0 + (n.at_s - offset);
-            let want = q.place(abs);
-            // **The clip's own edges still hold.** A note cannot be pushed
-            // out of the clip that owns it, and the tail has to fit: the set
-            // clamps the same way a drag does.
-            let dur = n.dur_s.max(0.05);
-            let want = want.clamp(c0, (c1 - dur).max(c0));
-            let at = offset + (want - c0);
-            if (n.at_s - at).abs() > 1.0e-9 {
-                n.at_s = at;
-                moved += 1;
+            let Some(shift) = heard[i] else {
+                continue;
+            };
+            // Clip-relative -> where this pass plays it, quantize, and back.
+            let abs = c0 + (n.at_s - offset) + shift;
+            let want = q.place(abs).max(c0);
+            if want >= c1 - 1.0e-9 || (want - abs).abs() <= 1.0e-9 {
+                continue;
             }
+            n.at_s = offset + (want - c0) - shift;
+            moved += 1;
         }
         if moved > 0 {
             // **Sorted by `at` is a contract of this list**, and a quantize
@@ -31557,11 +31576,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **The document FOLLOWS the tempo.** A MIDI clip is beats, and beats
     /// are what the player wrote — storing seconds is an encoding, not a
     /// meaning. So when the tempo moves, every MIDI clip's start, length,
-    /// trim and notes are rescaled by `old/new`, and every AUDIO clip keeps
-    /// its bar seat (start only — audio itself cannot stretch). Before this,
-    /// a clip written at 120 was, in the owner's words, "made unusable at
-    /// 180". Mid-drag the doc save waits for the knob's release (the release
-    /// path calls `arr_save_edits`); a typed or tapped tempo saves at once.
+    /// trim, loop, notes and pedal are rescaled by `old/new`, and every
+    /// AUDIO clip keeps its bar seat (start only — audio itself cannot
+    /// stretch). Before this, a clip written at 120 was, in the owner's
+    /// words, "made unusable at 180". The loop is in the same seconds as the
+    /// notes it repeats: left unscaled, slowing down restarted every pass
+    /// halfway through its notes. Mid-drag the doc save waits for the knob's
+    /// release (the release path calls `arr_save_edits`); a typed or tapped
+    /// tempo saves at once.
     fn retime_arrangement(&mut self, old_bpm: f64, new_bpm: f64) {
         if old_bpm <= 0.0 || new_bpm <= 0.0 {
             return;
@@ -31575,9 +31597,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if c.kind == crate::arrangement::ClipKind::Midi {
                 c.len_s *= r;
                 c.offset_s *= r;
+                c.loop_s *= r;
                 for n in &mut c.notes {
                     n.at_s *= r;
                     n.dur_s *= r;
+                }
+                for e in &mut c.pedal {
+                    e.at_s *= r;
                 }
             }
         }
@@ -31593,8 +31619,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// One arrange-stretch tick. The grabbed clip's ORIGINAL edge and the
     /// snapped hand give the factor; every MIDI clip in the press-time
     /// snapshot scales from its originals — starts and lengths around the
-    /// group's fixed end, trims, fades and every note with them. "Shrink
-    /// them to half size", exactly, when the edge lands a half-span in.
+    /// group's fixed end, trims, fades, loops, every note and the pedal with
+    /// them. "Shrink them to half size", exactly, when the edge lands a
+    /// half-span in.
     fn arr_stretch(&mut self, id: u64, from_left: bool, anchor: f64, t_raw: f64) {
         let t = self.arr_snap_t(t_raw);
         let Some(g0) = self.arr_stretch_orig.iter().find(|c| c.id == id) else {
@@ -31626,9 +31653,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             c.offset_s = o.offset_s * k;
             c.fade_in_s = o.fade_in_s * k;
             c.fade_out_s = o.fade_out_s * k;
+            // **The loop is a length on the same axis**: a MIDI part's in the
+            // seconds its notes speak, an audio clip's in the stretched
+            // file's. Left as it was, a part pulled to twice its length
+            // played its first half over its second.
+            c.loop_s = o.loop_s * k;
             for (n, n0) in c.notes.iter_mut().zip(o.notes.iter()) {
                 n.at_s = n0.at_s * k;
                 n.dur_s = (n0.dur_s * k).max(0.01);
+            }
+            for (e, e0) in c.pedal.iter_mut().zip(o.pedal.iter()) {
+                e.at_s = e0.at_s * k;
             }
             // **Audio carries the ratio; MIDI does not need to.**
             //
@@ -40310,6 +40345,13 @@ impl TangentApp {
                     self.settings.scope_draw_color.to_color32(),
                     self.settings.meter_bg_color.to_color32(),
                 );
+                // **The quantize window spells its GRID chips in the meter
+                // the grid is built in**, read on every frame it is drawn:
+                // it is not modal, so the meter can change while it is open.
+                if let Some(Dialog::Quantize { meter, .. }) = self.dialog.as_mut() {
+                    let sig = self.settings.time_signature();
+                    *meter = (sig.beats, sig.unit);
+                }
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
         {
@@ -41388,6 +41430,76 @@ mod tests {
         assert_eq!(app.settings.quantize_fit, "slice");
         assert!((app.settings.quantize_window_ms - 30.0).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The chip CALLED "1/16" applies a sixteenth**, whatever the song's
+    /// meter. The window labelled its GRID chips in 4/4
+    /// (`grid_label_text(e, 4, 4)`) while the grid it applies is built in
+    /// the song's meter (`Grid::from_document(.., sig.beats, sig.unit, ..)`),
+    /// so in 3/4 the chip "1/16" quantized to a 32nd and the default "1/8" to
+    /// a sixteenth. Read off the painted chips, so it holds whichever side
+    /// is made to agree with the other.
+    #[test]
+    fn the_quantize_chip_called_a_sixteenth_applies_a_sixteenth_in_three_four() {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let (ctx, mut app) = headless_with(Caps::PLUGIN, Settings::default());
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let frame = |app: &mut TangentApp| -> Vec<String> {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            let mut painted = Vec::new();
+            for c in &out.shapes {
+                walk(&c.shape, &mut painted);
+            }
+            painted
+        };
+        let chips_of = |painted: &[String]| -> Vec<String> {
+            let grid = painted.iter().position(|s| s == "GRID").expect("the quantize window painted no GRID row");
+            painted[grid + 1..].iter().take_while(|s| *s != "triplet").cloned().collect()
+        };
+        // Settle first, so nothing a first frame adopts can put the meter back.
+        frame(&mut app);
+        frame(&mut app);
+        app.settings.record_time_signature = "3/4".to_owned();
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.open_quantize_window();
+        // Inline in a plugin; three frames, because an Area's first is a sizing pass.
+        let painted = (0..3).map(|_| frame(&mut app)).last().expect("three frames");
+        assert_eq!(app.settings.time_signature().beats, 3, "a frame put the meter back - this test proves nothing");
+        let chips = chips_of(&painted);
+        assert_eq!(chips.len(), 8, "the GRID row is not rungs 0 down to -7: {chips:?}");
+        // Painted coarse to fine: rung 0 first.
+        let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16");
+        let e = -i8::try_from(rung).expect("eight chips");
+        let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
+        let quarters = ask.step_s * app.tempo_bpm() / 60.0;
+        assert!(
+            (quarters - 0.25).abs() < 1.0e-9,
+            "in 3/4 the chip called 1/16 (rung {e}) quantizes to {quarters} quarter notes; a sixteenth is 0.25: {chips:?}"
+        );
+        // **And the window is not modal**, so the meter can change while it
+        // is open: the chips follow on the next frame, not at the next open.
+        app.settings.record_time_signature = "4/4".to_owned();
+        let painted = (0..2).map(|_| frame(&mut app)).last().expect("two frames");
+        let chips = chips_of(&painted);
+        let rung = chips.iter().position(|c| c == "1/16").expect("no chip is called 1/16 in 4/4");
+        let e = -i8::try_from(rung).expect("eight chips");
+        let ask = app.quantize_ask_of(e, false, 50.0, 100.0, 0.0, 0.5, "").expect("every rung is a grid");
+        assert!(
+            (ask.step_s * app.tempo_bpm() / 60.0 - 0.25).abs() < 1.0e-9,
+            "the chips kept the meter the window opened in after it changed: {chips:?}"
+        );
     }
 
 
@@ -42642,6 +42754,89 @@ mod tests {
             (half - 0.27).abs() < 1e-9,
             "half strength moved the note to {half}, wanted 0.27 - half of the 40 ms"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A quantize leaves a trimmed loop's downbeat where every pass plays
+    /// it.** A note was placed at its FIRST-pass position and then clamped
+    /// into the clip, so on a loop trimmed from its front the downbeat - in
+    /// the trim on the first pass, heard on every later one - was dragged
+    /// onto the clip's head: a beat late in every pass, plus a new hit at the
+    /// head, from a quantize of notes that were all on the grid already.
+    #[test]
+    fn a_quantize_leaves_a_trimmed_loops_downbeat_where_every_pass_plays_it() {
+        let root = project_scratch("me-q-loop-trim");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key, vel: 100, muted: false };
+        // A two-bar loop (4 s at 120) drawn out to four passes, its head then
+        // trimmed by one beat: the source origin is 8.0 s, the clip starts at 8.5.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0, 36), n(2.0, 38)],
+            lane: 1, start_s: 8.5, offset_s: 0.5, len_s: 15.5, loop_s: 4.0,
+            name: "MIDI".to_owned(), ..Default::default()
+        });
+        let heard = |app: &TangentApp| -> Vec<f64> {
+            crate::arrangement::clip_notes_in_song_time(
+                app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"),
+            )
+            .iter().map(|n| n.at_s).collect()
+        };
+        let before = heard(&app);
+        assert_eq!(before, vec![10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0], "fixture: every heard note on a bar line");
+        app.open_midi_editor(id);
+        app.apply_dialog_action(DialogAction::ApplyQuantize {
+            grid_exp: -2, triplet: false, swing_pct: 50.0, strength_pct: 100.0,
+            window_ms: 0.0, sensitivity: 0.5, fit: String::new(),
+        });
+        assert_eq!(heard(&app), before, "a quantize of notes already on the grid moved what the loop plays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A note no pass plays is left exactly where it is.** One the trim
+    /// hides on every pass, and one that only ever falls past the clip's
+    /// end, were clamped INTO the clip by the quantize and began to sound:
+    /// three notes heard where one was, even with a 50 ms window.
+    #[test]
+    fn a_quantize_leaves_the_notes_a_trim_hid_where_they_are() {
+        let root = project_scratch("me-q-hidden");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.2, key, vel: 100, muted: false };
+        // One pass of a 4 s loop, trimmed by 0.5 at the front and to 2.5 s
+        // long: of the three notes only the one at 1.0 is ever heard.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62), n(3.5, 64)],
+            lane: 1, start_s: 8.0, offset_s: 0.5, len_s: 2.5, loop_s: 4.0, name: "MIDI".to_owned(), ..Default::default() });
+        let heard = |app: &TangentApp, id: u64| crate::arrangement::clip_notes_in_song_time(
+            app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"));
+        assert_eq!(heard(&app, id).len(), 1, "fixture: one heard note");
+        app.open_midi_editor(id);
+        app.apply_dialog_action(DialogAction::ApplyQuantize { grid_exp: -2, triplet: false, swing_pct: 50.0,
+            strength_pct: 100.0, window_ms: 50.0, sensitivity: 0.5, fit: String::new() });
+        let after = heard(&app, id);
+        assert_eq!(after.len(), 1, "the quantize made hidden notes audible: {after:?}");
+        let ats: Vec<f64> = app.arrangement.clips.iter().find(|c| c.id == id).unwrap().notes.iter().map(|n| n.at_s).collect();
+        assert_eq!(ats, vec![0.0, 1.0, 3.5], "notes the trim hid were moved: {ats:?}");
+
+        // **Trimmed by a loop or more**, every note stood before the head on
+        // its first pass and was clamped to it: the bar of quarters became
+        // one four-note chord per pass. Each is heard on a later pass, on a
+        // line, and stays there.
+        let deep = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![n(0.0, 60), n(0.5, 62), n(1.0, 64), n(1.5, 65)],
+            lane: 2, start_s: 3.0, offset_s: 3.0, len_s: 5.0, loop_s: 2.0, name: "MIDI".to_owned(), ..Default::default() });
+        let at_s = |app: &TangentApp| -> Vec<f64> { heard(app, deep).iter().map(|n| n.at_s).collect() };
+        let before = at_s(&app);
+        assert_eq!(before.len(), 10, "fixture: two and a half passes of four quarters: {before:?}");
+        app.open_midi_editor(deep);
+        app.apply_dialog_action(DialogAction::ApplyQuantize { grid_exp: -2, triplet: false, swing_pct: 50.0,
+            strength_pct: 100.0, window_ms: 0.0, sensitivity: 0.5, fit: String::new() });
+        assert_eq!(at_s(&app), before, "a loop trimmed by more than a pass was stacked on its head");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -53756,6 +53951,75 @@ mod tests {
         assert!((a.start_s - 8.0 * r).abs() < 1e-9, "audio lost its bar seat");
         assert!((a.len_s - 3.0).abs() < 1e-9, "audio length must NOT stretch");
         assert!((a.offset_s - 1.0).abs() < 1e-9, "audio trim must NOT stretch");
+    }
+
+    /// **A tempo change keeps a MIDI loop the length of its notes**, and its
+    /// pedal under them. The retime scaled a clip's start, length, trim and
+    /// notes and left `loop_s` in the old tempo's seconds, so slowing from
+    /// 120 to 60 restarted every pass halfway through its notes - the first
+    /// half of every MIDI clip layered over its second - and speeding up
+    /// left a gap in each. The pedal's edges, in the same source seconds as
+    /// the notes, stayed where they were too.
+    #[test]
+    fn a_tempo_change_keeps_a_midi_loop_the_length_of_its_notes() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.record_export.tempo_bpm = 120.0;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.25, key, vel: 100, muted: false };
+        let p = |at_s: f64, value: u8| crate::arrangement::ArrPedal { at_s, cc: 64, value };
+        // One bar at 120 (2 s), drawn out to two passes - every clip is born a loop.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62)],
+            pedal: vec![p(0.5, 127), p(1.5, 0)],
+            lane: 1, len_s: 4.0, loop_s: 2.0, name: "m".into(), ..Default::default() });
+        let heard = |app: &TangentApp| -> Vec<(f64, u8)> {
+            crate::arrangement::clip_notes_in_song_time(
+                app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip"))
+                .iter().map(|n| (n.at_s, n.key)).collect()
+        };
+        assert_eq!(heard(&app), vec![(0.0, 60), (1.0, 62), (2.0, 60), (3.0, 62)]);
+        app.apply_recorder_hit(recorder_panel::Hit::SetTempo(60.0));
+        assert_eq!(heard(&app), vec![(0.0, 60), (2.0, 62), (4.0, 60), (6.0, 62)],
+            "the loop kept its 120-bpm length while its notes were retimed to 60");
+        let pedal: Vec<f64> = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip")
+            .pedal.iter().map(|e| e.at_s).collect();
+        assert_eq!(pedal, vec![1.0, 3.0], "the pedal kept its 120-bpm seconds while its notes moved");
+    }
+
+    /// **An arrange-stretch carries each clip's loop with it.** The stretch
+    /// scaled a clip's length, trim, fades and notes (and an audio clip's
+    /// ratio) and left `loop_s` as it was, so a MIDI clip pulled to twice its
+    /// length played its first half over its second, and an audio clip -
+    /// whose loop is measured in the STRETCHED file's seconds - replayed half
+    /// of its stretched pass. A MIDI clip's pedal stayed behind its notes.
+    #[test]
+    fn an_arrange_stretch_carries_each_clips_loop_with_it() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        let n = |at_s: f64, key: u8| crate::arrangement::ArrNote { at_s, dur_s: 0.25, key, vel: 100, muted: false };
+        let p = |at_s: f64, value: u8| crate::arrangement::ArrPedal { at_s, cc: 64, value };
+        // Two passes of a two-second loop each: a MIDI part with a pedal,
+        // and an audio take beside it.
+        let m = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi, notes: vec![n(0.0, 60), n(1.0, 62)],
+            pedal: vec![p(0.5, 127), p(1.5, 0)],
+            lane: 1, len_s: 4.0, loop_s: 2.0, name: "m".into(), ..Default::default() });
+        let a = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio, path: "a.wav".into(),
+            lane: 2, len_s: 4.0, loop_s: 2.0, name: "a".into(), ..Default::default() });
+        app.arr_stretch_orig = app.arrangement.clips.clone();
+        // The right edge from 4 s to 8 s: both twice as long.
+        app.arr_stretch(m, false, 0.0, 8.0);
+        let of = |id: u64| app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").clone();
+        let (mc, ac) = (of(m), of(a));
+        assert!((mc.len_s - 8.0).abs() < 1e-9 && (ac.len_s - 8.0).abs() < 1e-9, "the stretch did not double them");
+        assert!((mc.loop_s - 4.0).abs() < 1e-9, "the MIDI loop is {} while its notes doubled", mc.loop_s);
+        let heard: Vec<(f64, u8)> = crate::arrangement::clip_notes_in_song_time(&mc)
+            .iter().map(|n| (n.at_s, n.key)).collect();
+        assert_eq!(heard, vec![(0.0, 60), (2.0, 62), (4.0, 60), (6.0, 62)]);
+        let pedal: Vec<f64> = mc.pedal.iter().map(|e| e.at_s).collect();
+        assert_eq!(pedal, vec![1.0, 3.0], "the pedal stayed behind the notes it holds");
+        assert!((ac.stretch - 2.0).abs() < 1e-9, "the audio did not take the ratio");
+        assert!((ac.loop_s - 4.0).abs() < 1e-9, "the audio loop is {} while its audio doubled", ac.loop_s);
     }
 
     /// **Seven notes into the space of four.** The editor's shift-drag
@@ -68768,6 +69032,67 @@ mod folder_tests {
             "a non-repeating clip's tail is a new clip with a loop over its own length, not {}",
             tail.loop_s
         );
+    }
+
+    /// **A blade divides a clip in time and in nothing else.** Everything an
+    /// audio clip carries besides its window - the quantize (warp map and
+    /// fit), the normalise (gain), the stretch (ratio and algorithm), how it
+    /// follows the tempo - belongs to the whole take. The tail was built
+    /// field by field with all of it reset: the right half of a quantized,
+    /// normalised take played unquantized at unity gain, and a stretched
+    /// take's tail read the raw file at an offset on the stretched axis.
+    #[test]
+    fn a_split_audio_clip_keeps_its_warp_gain_and_stretch_on_both_sides() {
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.settings.arr_snap = false;
+        let map: Vec<(u64, u64)> = vec![(0, 0), (96_000, 97_200), (192_000, 192_000)];
+        a.arrangement.clips.push(crate::arrangement::ArrClip {
+            id: 3,
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/take.wav".to_owned(),
+            name: "take".to_owned(),
+            start_s: 0.0,
+            offset_s: 0.5,
+            len_s: 8.0,
+            loop_s: 8.0,
+            warp: map.clone(),
+            warp_fit: "slice".to_owned(),
+            stretch: 1.25,
+            stretch_mode: "rhythmic".to_owned(),
+            gain: 0.5,
+            anchor: crate::arrangement::Anchor::Beat,
+            follow_tempo: true,
+            ..Default::default()
+        });
+        a.arr_selected = Some(3);
+        a.recorder.position_s = 5.0;
+        a.arr_split_at_playhead();
+
+        let head = a.arrangement.clips.iter().find(|c| c.id == 3).expect("the head").clone();
+        let tail = a.arrangement.clips.iter().find(|c| c.id != 3).expect("the tail landed").clone();
+        // What the blade changes.
+        assert!((head.len_s - 5.0).abs() < 1.0e-9, "the head is {} long", head.len_s);
+        assert!((tail.start_s - 5.0).abs() < 1.0e-9, "the tail starts at {}", tail.start_s);
+        assert!((tail.len_s - 3.0).abs() < 1.0e-9, "the tail is {} long", tail.len_s);
+        assert!(
+            (tail.offset_s - 5.5).abs() < 1.0e-9,
+            "the tail enters the played audio at {}, not at the head's trim plus the cut",
+            tail.offset_s
+        );
+        // What it must not: both halves are still one take.
+        assert_eq!(tail.warp, map, "the split threw the tail's quantize away");
+        assert_eq!(head.warp, map, "the split moved the head's quantize");
+        assert_eq!(tail.warp_fit, "slice", "the tail lost the quantize's fit");
+        assert!((tail.gain - 0.5).abs() < 1.0e-12, "the tail lost its gain: {}", tail.gain);
+        assert!(
+            (tail.stretch - 1.25).abs() < 1.0e-12,
+            "the tail lost its stretch: {} - it reads the raw file at a stretched offset",
+            tail.stretch
+        );
+        assert_eq!(tail.stretch_mode, "rhythmic", "the tail lost its stretch algorithm");
+        assert_eq!(tail.anchor, head.anchor, "the tail stopped keeping its bar");
+        assert_eq!(tail.follow_tempo, head.follow_tempo, "the tail stopped following the tempo");
     }
 
     /// **A dragged block lands where it was dropped, head first.**
