@@ -17220,8 +17220,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // **No track picked at all**: `lanes` is empty, nothing is on it,
         // and `all` over a selection answers false - which then meets the
-        // adopter's own empty-lanes guard and changes nothing. One guard,
-        // in the place that acts.
+        // adopter's own no-track guard and changes nothing. One guard, in
+        // the place that acts.
         let lanes = self.quantize_fallback_lanes();
         ids.iter().all(|id| {
             self.arrangement
@@ -17267,16 +17267,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   selection is not what it acts on;
     /// - the selected clips already lie on the picked tracks, which is the
     ///   "unless" in the ask;
-    /// - the tracks hold no audio, so there is nothing to adopt and the
-    ///   window should say "nothing to quantize" rather than lie.
+    /// - NO track is picked, so the clip selection is all there is.
+    ///
+    /// And one answer that adopts nothing: picked tracks that hold no audio
+    /// (an empty track, a MIDI one, a folder with nothing in it) let go of
+    /// any clip selected elsewhere, so the window says "nothing to quantize"
+    /// rather than naming a take on a track the hand has left.
     fn adopt_track_clips_for_quantize(&mut self) {
         if self.midi_edit.is_some() || self.clip_selection_is_on_a_picked_track() {
             return;
         }
-        let lanes = self.quantize_fallback_lanes();
-        if lanes.is_empty() {
+        if self.selected_tracks.is_empty() {
             return;
         }
+        let lanes = self.quantize_fallback_lanes();
         let ids: Vec<u64> = self
             .arrangement
             .clips
@@ -17286,12 +17290,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             })
             .map(|c| c.id)
             .collect();
-        // Nothing to adopt: leave whatever was selected. With nothing
-        // selected the window says so ("nothing selected"). Not yet right
-        // with a clip selected on ANOTHER track: it stays the target, so the
-        // window names it and Apply quantizes it, although the tracks picked
-        // last hold no audio.
+        // **Nothing to adopt.** With no clip selection the window says
+        // "nothing selected"; with a selection on ANOTHER track the tracks
+        // have won and hold nothing, so that selection is cleared too.
+        // Keeping it aimed the window at a track the hand had left: it named
+        // the take there and Apply quantized it.
         if ids.is_empty() {
+            self.arr_selected = None;
+            self.arr_multi.clear();
             return;
         }
         // The earliest is the primary, so the rim lands somewhere a hand
@@ -42969,6 +42975,62 @@ mod tests {
             "the editor's quantize adopted arrangement clips"
         );
         app.close_midi_editor();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Q on a track with no audio lets go of a take on another track.**
+    ///
+    /// The tracks win when the clip selection disagrees with them - a
+    /// header click is what makes the two disagree - but when the picked
+    /// track held nothing to adopt, the adopter gave up and left the old
+    /// selection standing. So: select a take on track 1, click the header of track 3
+    /// (empty, or MIDI only), press Q, and the window said "1 audio clip"
+    /// and Apply quantized the take on track 1, a track the hand had left.
+    /// An empty folder took the same road one step earlier.
+    #[test]
+    fn q_on_a_track_with_no_audio_lets_go_of_a_take_on_another_track() {
+        let root = project_scratch("qtrack-none");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let take = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 1,
+            len_s: 2.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(take);
+        app.select_track(1, egui::Modifiers::NONE); // what the clip click leaves
+        app.select_track(3, egui::Modifiers::NONE); // a header with no audio on it
+        app.open_quantize_window();
+        assert_eq!(
+            app.quantize_target(),
+            None,
+            "Q on an empty track aimed the window at a take on track 1"
+        );
+        assert_eq!(app.arr_selected, None, "the take on track 1 is still selected");
+
+        // **An empty FOLDER is a picked track with nothing in it**, not "no
+        // track picked".
+        app.set_is_folder(5, true);
+        app.arr_selected = Some(take);
+        app.arr_multi = vec![take];
+        app.select_track(1, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::NONE);
+        app.open_quantize_window();
+        assert_eq!(
+            app.arr_quantize_ids(),
+            Vec::<u64>::new(),
+            "Q on an empty folder aimed the window at a take on track 1"
+        );
+
+        // And with no track picked at all, the take is still all there is.
+        app.arr_selected = Some(take);
+        app.arr_multi.clear();
+        app.selected_tracks.clear();
+        app.selected_channel = None;
+        app.open_quantize_window();
+        assert_eq!(app.arr_quantize_ids(), vec![take], "a take with no track picked was let go");
         let _ = std::fs::remove_dir_all(&root);
     }
 
