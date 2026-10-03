@@ -12109,11 +12109,11 @@ const SETUP_ROLLING_ROWS: usize = 1;
 /// **Each shape hangs off the control that opened it**
 /// (`TangentApp::setup_anchor`): `Machine` off the cog, or the cassette when
 /// the layout has unseated the cog (mid-take, or a band too small to draw
-/// it); `Take` off the cassette; `Rolling` off the red button. An unseated
-/// control's rect is `Rect::NOTHING`, and a panel hung off it is NaN - not
-/// drawn, still open, and eating the next press - so a shape whose control
-/// can be unseated has to fall back to a seated one or close. (`Rolling` does
-/// not yet: the red button is unseated under a realtime export.)
+/// it); `Take` off the cassette; `Rolling` off the red button, or the
+/// cassette while a realtime export has unseated it. An unseated control's
+/// rect is `Rect::NOTHING`, and a panel hung off it is NaN - not drawn,
+/// still open, and eating the next press - so a shape whose control can be
+/// unseated has to fall back to a seated one or close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SetupShape {
     /// The cog's panel: the machine and where things are kept.

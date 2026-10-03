@@ -8090,6 +8090,13 @@ impl TangentApp {
 
         // Right-click (or ctrl-click on macOS, Qt default) opens the menu.
         if resp.secondary_clicked() || (resp.clicked() && ctrl_as_context) {
+            // **Not under the open setup panel**, which is modal: the left
+            // button's presses all go to it (below), and this branch ran
+            // first with no word about it, so a right-click under the scrim
+            // opened an effect's panel on top of it, or the band's menu.
+            if self.setup_open {
+                return;
+            }
             // **Not over the mixer, which is its own surface.**
             //
             // A right-click there means "paint this channel" and opens the
@@ -18323,9 +18330,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// painted in one place and hit-tested in another: every press landed on
     /// whatever the cog's geometry said was there, which is why its Done
     /// button did nothing at all. One function now, and both roads call it.
-    /// Each shape answers its own control, and `Machine` falls back to the
-    /// cassette when the cog is unseated. `Rolling` has no fallback, and the
-    /// red button is unseated under a realtime export (see `SetupShape`).
+    /// Every shape answers a SEATED control - see `SetupShape`: `Machine`
+    /// falls back to the cassette when the cog is unseated, and `Rolling`
+    /// when the red button is (a realtime export).
     fn setup_anchor(
         &self,
         band: Rect,
@@ -18345,7 +18352,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             recorder_panel::SetupShape::Take => recorder_panel::capture_rect(band, view),
-            recorder_panel::SetupShape::Rolling => recorder_panel::record_rect(band, view),
+            // **The cog's treatment, for the red button.** A realtime export
+            // unseats it (`fill_rolling`), and a RECORDING panel left open
+            // into one hung off `Rect::NOTHING`: NaN, undrawn, owning every
+            // surface under it and spending the next press - the band's
+            // Stop, as often as not - on closing itself.
+            recorder_panel::SetupShape::Rolling => {
+                let record = recorder_panel::record_rect(band, view);
+                if record.is_positive() {
+                    record
+                } else {
+                    recorder_panel::capture_rect(band, view)
+                }
+            }
         }
     }
 
@@ -31732,7 +31751,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         // A field being typed into owns every key; so does an open dialog.
-        if self.text_entry_active() || self.dialog_blocks_keys(ctx) {
+        //
+        // **And so does a band popup** - the setup panel, an effect's
+        // parameters, the pitch range - whose scrim says the window is
+        // waiting on it. The pointer obeyed that and the keyboard did not:
+        // in reader mode a Tab to the cassette and Enter started a take
+        // under the open panel, and the Project node led on to a realtime
+        // export. Every focused node is under the scrim, the desk's and the
+        // timeline's as much as the band's, so the guard is not the band's.
+        if self.text_entry_active() || self.dialog_blocks_keys(ctx) || self.band_popup_owns() {
             return;
         }
         let Some(gesture) = ctx.input(crate::a11y::Gesture::read) else {
@@ -68081,6 +68108,111 @@ mod tests {").expect("the tests module")];
         assert!(
             !open(recorder::RecordState::Rolling),
             "the red button's panel of refused rows opened under a take"
+        );
+    }
+
+    /// **An open RECORDING panel hangs off a control that is drawn, an
+    /// export included.** It hangs off the red button, and a realtime export
+    /// unseats the red button (`Rect::NOTHING`): a panel hung off nothing is
+    /// NaN - not drawn, still open, still owning every surface under it -
+    /// and the next press, typically the band's Stop meant to cut the export
+    /// short, was spent closing it. It falls back to the cassette, as the
+    /// cog's panel already did.
+    #[test]
+    fn an_open_recording_panel_always_hangs_somewhere_it_is_drawn() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Rolling;
+        // A realtime export has started with the panel up.
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.recorder.exporting = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band is not laid out");
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let panel = {
+            let view = app.recorder_layout_view();
+            recorder_panel::setup_popup_rect(screen, app.setup_anchor(band, &view), app.setup_shape)
+        };
+        assert!(
+            !app.setup_open || panel.is_positive(),
+            "the RECORDING panel is open and hung off nothing: {panel:?} - undrawn, and it eats the next press"
+        );
+    }
+
+    /// **The open setup panel is modal to the keyboard too.** Its scrim
+    /// says the window is waiting on it, and the pointer obeys; but the
+    /// band's keyboard nodes stayed live under it, so in reader mode a Tab
+    /// to the cassette and Enter started a take with the panel up - or
+    /// reached the Project dialog and from there a realtime export.
+    #[test]
+    fn a_focused_band_control_waits_behind_the_open_setup_panel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.screen_reader_mode = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        while app.take_recorder_request().is_some() {}
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Rolling;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("band", "capture"))));
+        // Enter, not Space: Enter is bound to nothing, so only the keyboard
+        // node's road can act on it.
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.setup_open, "the fixture's panel closed, so nothing here was behind it");
+        assert_eq!(
+            app.take_recorder_request(),
+            None,
+            "a focused band control fired under the open setup panel"
+        );
+    }
+
+    /// **And modal to the right button.** The right-click branch ran before
+    /// the panel's own press handling with no word about it, so a
+    /// right-click on a knob under the scrim opened that effect's panel on
+    /// top of the setup panel, and anywhere else the band's menu.
+    #[test]
+    fn a_right_click_reaches_nothing_behind_the_open_setup_panel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let at = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.5)).center();
+        let right_click = |ctx: &egui::Context, app: &mut TangentApp| {
+            pointer_frame(
+                ctx,
+                app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        };
+        right_click(&ctx, &mut app);
+        assert!(app.fx_open.is_some(), "the fixture's right-click opens no effect panel at all");
+        app.fx_open = None;
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Machine;
+        right_click(&ctx, &mut app);
+        assert!(
+            app.fx_open.is_none() && !app.vari_open && app.menu_state.is_none(),
+            "a right-click reached the band through the open setup panel"
         );
     }
 
