@@ -19736,7 +19736,10 @@ impl Engine {
     }
 
     /// True from the downbeat that ends the count-in until the next
-    /// [`Engine::start_count_in`].
+    /// [`Engine::start_count_in`] or [`Engine::cancel_count_in`] - and true
+    /// again from the first callback after a cancel, or after a count of zero
+    /// beats, with no downbeat at all. "A count reached its go" is
+    /// [`Engine::count_in_downbeat_ns`], not this latch.
     pub fn count_in_done(&self) -> bool {
         self.shared.count_in_done.load(Ordering::Relaxed)
     }
