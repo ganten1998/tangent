@@ -515,7 +515,8 @@ struct Recorder {
     /// The red button pressed, the COUNT-IN still clicking: the record
     /// begins on the downbeat.
     arr_rec_wait: bool,
-    /// **The cassette started the engine's count-in and it has not reached
+    /// **A take is counting on the engine's count-in - its own, or one it
+    /// joined, its count in the file or not - and the count has not reached
     /// its downbeat yet.**
     ///
     /// The engine has ONE count-in, and the take and the arrangement record
@@ -6441,9 +6442,17 @@ impl DesktopApp {
                     self.recorder
                         .session
                         .toggle(&root, name.as_deref(), wait, spec);
-                    // A joined count counts from when the ARRANGEMENT's began,
-                    // and the take now waits on that click like its own.
-                    if let Some((from, _)) = joined.filter(|_| !in_take) {
+                    // A joined count counts from when it began, and the take
+                    // now waits on that click like its own - with the count
+                    // in the file as well. Its head is measured against the
+                    // click's downbeat, and Stop and the red button leave a
+                    // count alone only when a take says it is counting on it:
+                    // left out, Stop meant for the arrangement record killed
+                    // the click under a take whose head then described a
+                    // downbeat that never sounded. (`count_in_began_at` acts
+                    // on a pre-roll only; a take with its count in the file
+                    // is already writing.)
+                    if let Some((from, _)) = joined {
                         self.recorder.session.count_in_began_at(from);
                         self.recorder.take_count_pending = true;
                     }
@@ -22668,6 +22677,26 @@ mod tests {
                 "let joined = if starting && self.recorder.arr_rec_wait { self.recorder.count_from }"
             ),
             "the cassette joins a count by something other than when that count began"
+        );
+    }
+
+    /// **A take that joins a count holds its click, with the count in the
+    /// file too.** `take_count_pending` is what Stop and the red button ask
+    /// before they cancel the click - unless a take is counting on it, which
+    /// only the cassette may cancel - and a joined take with its count in
+    /// the file never set it: Stop meant for the arrangement record killed
+    /// the click under a take whose `take.json` measured its head against a
+    /// downbeat that then never sounded. The take's own count in the file
+    /// always set it.
+    #[test]
+    fn a_take_that_joins_a_count_holds_its_click_with_the_count_in_the_file_too() {
+        let capture = cassette_arm();
+        let join = capture
+            .find("if let Some((from, _)) = joined {")
+            .expect("only a joined take whose count is NOT in the file holds the click");
+        assert!(
+            capture[join..].contains("self.recorder.take_count_pending = true;"),
+            "a joined take does not hold the click its head is measured against"
         );
     }
 
