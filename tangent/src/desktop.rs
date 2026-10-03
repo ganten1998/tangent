@@ -10177,7 +10177,9 @@ impl DesktopApp {
         }
         // ── the clips, decoded at the EXPORT rate with a cache of their
         // own, so the live engine's cache never learns a wrong-rate clip ──
-        if let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) {
+        // Read where `clip_doc` says they are: an export of a fresh session
+        // reads its template's clips out of the template.
+        if let Some(doc_path) = self.app.clip_doc() {
             let doc = self.app.arrangement().clone();
             let mut placed = Vec::new();
             let mut midi_placed = Vec::new();
@@ -11721,14 +11723,14 @@ impl DesktopApp {
         }
         let live_files: std::collections::HashSet<std::path::PathBuf> = self
             .app
-            .project_doc()
+            .clip_doc()
             .map(|doc_path| {
                 self.app
                     .arrangement()
                     .clips
                     .iter()
                     .filter(|c| c.kind != tangent_ui::arrangement::ClipKind::Midi)
-                    .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+                    .map(|c| tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path))
                     .collect()
             })
             .unwrap_or_default();
@@ -11812,7 +11814,7 @@ impl DesktopApp {
         let mut seen: std::collections::HashSet<std::path::PathBuf> =
             std::collections::HashSet::new();
         if self.clips_owed {
-            if let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) {
+            if let Some(doc_path) = self.app.clip_doc() {
                 for clip in &self.app.arrangement().clips {
                     // A MIDI item has no file: its notes are in the document.
                     if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
@@ -11905,7 +11907,14 @@ impl DesktopApp {
         //
         // An audio clip with no document to resolve against is skipped where
         // it is read instead, which is the honest place to give up on one.
-        let doc_path = self.app.project_doc().map(std::path::Path::to_path_buf);
+        //
+        // **`clip_doc`, not `project_doc`**, for the clips and the frozen
+        // lanes alike: a fresh session's template clips are still in the
+        // template until its folder is real. Resolved into the folder nobody
+        // had made yet they were refusals, and remembered ones, so they
+        // stayed silent after it was made. Every road that reads a clip's
+        // file asks the same - see `TangentApp::clip_doc`.
+        let doc_path = self.app.clip_doc();
         let rate = self
             .recorder
             .engine
@@ -12345,12 +12354,12 @@ impl DesktopApp {
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
         let mut clip_infos: Vec<tangent_ui::ports::ClipInfo> = Vec::new();
-        if let Some(doc_path) = self.app.project_doc() {
+        if let Some(doc_path) = self.app.clip_doc() {
             for clip in &self.app.arrangement().clips {
                 if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
                     continue;
                 }
-                let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
+                let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
                 let Some(decoded) = self.track_cache.get(&path) else {
                     continue;
                 };
@@ -12837,7 +12846,7 @@ impl DesktopApp {
         &mut self,
         ask: &tangent_ui::ports::QuantizeAsk,
     ) -> Vec<(u64, Vec<(f32, f32)>)> {
-        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+        let Some(doc_path) = self.app.clip_doc() else {
             return Vec::new();
         };
         let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
@@ -12928,14 +12937,14 @@ impl DesktopApp {
     /// **Every file one quantize ask names**, resolved: what the attack
     /// cache keeps while that ask is answered. See `make_room`.
     fn asked_files(&self, ask: &tangent_ui::ports::QuantizeAsk) -> Vec<std::path::PathBuf> {
-        let Some(doc_path) = self.app.project_doc() else {
+        let Some(doc_path) = self.app.clip_doc() else {
             return Vec::new();
         };
         let doc = self.app.arrangement();
         ask.ids
             .iter()
             .filter_map(|id| doc.clips.iter().find(|c| c.id == *id))
-            .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+            .map(|c| tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path))
             .collect()
     }
 
@@ -12960,7 +12969,7 @@ impl DesktopApp {
     /// cannot be forgotten at one of the two call sites.
     #[cfg(feature = "recorder")]
     fn quantize_clip(&mut self, id: u64, ask: &tangent_ui::ports::QuantizeAsk) -> (usize, usize) {
-        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+        let Some(doc_path) = self.app.clip_doc() else {
             return (0, 0);
         };
         let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
@@ -13008,7 +13017,7 @@ impl DesktopApp {
     /// undoable, reversible, and the same file still under it.
     #[cfg(feature = "recorder")]
     fn normalize_clips(&mut self, ids: &[u64]) {
-        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+        let Some(doc_path) = self.app.clip_doc() else {
             return;
         };
         let rate = self
@@ -13150,8 +13159,13 @@ impl DesktopApp {
             .map(|(k, d)| (k.clone(), Arc::clone(&d.clip)))
             .collect();
         let mut placed: Vec<crate::instrument::Placed> = Vec::new();
+        // **Read where the audio is, write where the project is.** The
+        // sources resolve against `clip_doc` - a fresh session's template
+        // clips are still in the template - and the weld goes into this
+        // project's own `media/`, below, once the door has made it real.
+        let clip_doc = self.app.clip_doc().unwrap_or_else(|| doc_path.clone());
         for clip in &picked {
-            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let path = tangent_ui::arrangement::Arrangement::resolve(&clip_doc, &clip.path);
             let decoded = match self.track_cache.get(&path) {
                 Some(d) => Arc::clone(&d.clip),
                 None => match tangent_record::decode::decode(&path, rate) {
@@ -27595,6 +27609,101 @@ mod tests {
             Some(door) < stems.find("let _ = std::fs::create_dir_all(&dir);"),
             "the stems road makes its folder before the door"
         );
+    }
+
+    /// **Every road that reads a clip's file finds it where `clip_doc` says
+    /// it is**, never against `project_doc`: the absence this pins.
+    ///
+    /// A launch and New adopt the template in memory and aim the session at
+    /// a scratch folder nobody has made, and a clip names its audio relative
+    /// to the document (`media/Loop.wav`). Every host road resolved that
+    /// against `project_doc`, so in every fresh session each template clip
+    /// with audio and each frozen lane was a decode refusal: silent on the
+    /// speakers and in an export, with no waveform, and still silent once the
+    /// folder was real, because the refusal was remembered.
+    /// `TangentApp::clip_doc` answers the template until the folder is real;
+    /// `an_adopted_clip_reads_from_the_template_until_the_project_is_real`
+    /// drives it. Where the session WRITES (a take, a render, a weld, the
+    /// document, `state/`) stays on `project_doc`.
+    ///
+    /// Each `Arrangement::resolve` in the host is followed back to where its
+    /// document came from, through rebindings like `doc_path.as_ref()`, and
+    /// has to arrive at `clip_doc()`. A road added later against
+    /// `project_doc`, or against a parameter, goes red here and has to be
+    /// routed. The warm-up, the landing, the reload and the export are named,
+    /// so the scan cannot pass by finding nothing.
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test.
+    ///
+    /// Revert-check: put any one road back on `project_doc()` and this goes
+    /// red naming it.
+    #[test]
+    fn every_road_that_reads_a_clips_file_resolves_it_through_clip_doc() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        // Whole-line comments out, so a sentence ABOUT a road is not read as
+        // the road.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let call = "Arrangement::resolve(";
+        let mut roads: Vec<String> = Vec::new();
+        for (at, _) in code.match_indices(call) {
+            let head = ["\n    fn ", "\n    pub fn ", "\nfn ", "\npub fn "]
+                .iter()
+                .filter_map(|h| code[..at].rfind(h))
+                .max()
+                .expect("a resolve outside every fn");
+            let road = code[head..].trim_start().split('(').next().unwrap_or_default().to_owned();
+            let body = &code[head..at];
+            let doc = code[at + call.len()..]
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_start_matches('&');
+            // Up the fn, binding by binding, to where `doc` came from.
+            let mut upto = body.len();
+            loop {
+                let bound = [format!("Some({doc})"), format!("let {doc} "), format!("|{doc}|")]
+                    .iter()
+                    .filter_map(|b| body[..upto].rfind(b.as_str()))
+                    .max()
+                    .unwrap_or_else(|| {
+                        panic!("`{road}` resolves a clip against `{doc}`, which is not bound from `clip_doc()` in it")
+                    });
+                let from = body[..bound].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+                let to = bound + body[bound..].find([';', '{']).unwrap_or(body.len() - bound);
+                let statement = &body[from..to];
+                assert!(
+                    !statement.contains("project_doc()"),
+                    "`{road}` resolves a clip's file against `project_doc`, so a fresh \
+                     session's template clips are refused: {}",
+                    statement.trim()
+                );
+                if statement.contains("clip_doc()") {
+                    break;
+                }
+                // A rebinding of the same name (`doc_path.as_ref()`): up again.
+                let rhs = &statement[statement.find('=').unwrap_or(statement.len())..];
+                assert!(
+                    rhs.contains(doc),
+                    "`{road}` resolves a clip against `{doc}`, bound from something other \
+                     than `clip_doc()`: {}",
+                    statement.trim()
+                );
+                upto = from;
+            }
+            roads.push(road);
+        }
+        for road in ["fn queue_warm", "fn land_decodes", "fn reload_clips", "fn start_offline_render"] {
+            assert!(
+                roads.iter().any(|r| r == road),
+                "`{road}` no longer resolves a clip's file, so this scan proves nothing about it"
+            );
+        }
     }
 
     /// **Every edge where frames may stop drains the settings debounce.**

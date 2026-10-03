@@ -134,11 +134,17 @@ Related invariants that keep this working:
   arrangement takes with audio, freezes, glues and realtime exports go
   through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
-  only into a folder that is already real). Not yet heard BEFORE it is
-  real: the host resolves a clip and a frozen lane against the unmade
-  folder, not the template the way the kit's `kit_doc` does, so a
-  template's own audio is silent in a scratch until something makes it
-  real.
+  only into a folder that is already real). BEFORE it is real the
+  scratch's media is read out of the template: the kit through `kit_doc`,
+  every clip and frozen lane through `clip_doc`, one rule (`media_doc`)
+  that answers the project's own folder from the moment it exists. Every
+  road that reads a clip's file asks `clip_doc`: the host's playback and
+  its warm-up, the pictures, export, freeze, glue, normalize and quantize,
+  and a clip dragged out as a sample. Everything a session writes still
+  goes beside `project_doc`. Clips used to resolve against the unmade
+  folder, so a template's own audio was silent in every fresh session, and
+  stayed silent after the folder was made because the refusal was
+  remembered.
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
   from the Open panel is ADOPTED the same way (`open_project`), into the
