@@ -2099,8 +2099,15 @@ struct Shared {
     /// renders this is its END, not its start - and in the chunk that wraps it
     /// is already back at `loop_a` plus the block's overshoot. The host reads it
     /// as the playhead (`Engine::transport_position`); audio-thread code that
-    /// wants the block being rendered uses the `at` that `run_transport` returns.
+    /// wants the block being rendered uses the `at` that `run_transport` returns,
+    /// which it publishes as `transport_anchor`.
     transport_pos: AtomicU64,
+    /// **The FIRST frame of the chunk being rendered** - the `at` of
+    /// `run_transport`, stored before the advance and the loop wrap, beside
+    /// the beat and tempo below. Not the playhead (`transport_pos` is): this
+    /// is the block a rack is rendering, so a rack with no span of its own is
+    /// handed the pair as it stands. See `rack_transport`.
+    transport_anchor: AtomicU64,
     /// **Where that frame is in the MUSIC, and how fast the music is going
     /// there** - the beat as the tempo map reckons it, and the map's
     /// instantaneous tempo, both as `f64` bits.
@@ -2116,19 +2123,21 @@ struct Shared {
     /// the wrong speed. New tempo points default to a RAMP, so that is the
     /// ordinary case and not an exotic one.
     ///
-    /// Published once a chunk by `run_transport` for the same frame as
-    /// `transport_pos` (the END of the chunk, after the wrap), from
+    /// Published once a chunk by `run_transport` for `transport_anchor`, the
+    /// first frame of the chunk being rendered, from
     /// `TempoMap::beat_at_seconds` - the map walk `BarClock::resync` uses - and
-    /// `TempoMap::bpm_at_beat`. The click places each beat exactly from the map;
-    /// the arp extrapolates from this pair (see `rack_transport`), so the two
-    /// agree to within the tempo change across that extrapolation. Single
-    /// writer: read only by the callback itself and by lane workers the
-    /// callback dispatches after the store (`LanePool::run` publishes jobs with
-    /// a Release the workers Acquire), so the three loads cannot tear.
+    /// `TempoMap::bpm_at_beat`. It was published for the END of the chunk, the
+    /// next one's start, after the wrap. The click places each beat exactly
+    /// from the map; the arp extrapolates from this pair across at most its own
+    /// grain (see `rack_transport`), so the two agree to within the tempo
+    /// change across that. Single writer: read only by the callback itself and
+    /// by lane workers the callback dispatches after the store (`LanePool::run`
+    /// publishes jobs with a Release the workers Acquire), so the loads cannot
+    /// tear.
     transport_beat: AtomicU64,
     transport_bpm: AtomicU64,
     /// **The engine's sample rate, for whoever on the audio thread needs
-    /// to turn `transport_pos` into beats.** A built-in voice's
+    /// to turn frames past `transport_anchor` into beats.** A built-in voice's
     /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
     /// has the board but not the renderer. Written once, at start, from
     /// the rate the device actually opened at; 48 kHz until then.
@@ -3183,6 +3192,7 @@ impl Shared {
             grain: AtomicU32::new(0),
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
+            transport_anchor: AtomicU64::new(0),
             transport_beat: AtomicU64::new(0.0f64.to_bits()),
             // The same seed `Arp::new` had, so a rack that runs before the
             // first `run_transport` is no worse off than it was.
@@ -5504,11 +5514,12 @@ fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
 /// * **The lane the insert TAP names**, whose mid-rack signal is pushed from
 ///   inside the render and would lead the audio.
 /// * **Not here: a built-in voice's arpeggiator.** It reads the song's beat
-///   through `rack_transport`, walked from the published anchor to the
-///   span's own frame. That is exact at a constant tempo and off by the
-///   tempo change across the walk otherwise; a lane carrying it renders
-///   ahead like any other, and pinning it would not help the loop wrap,
-///   where a pinned lane walks just as far.
+///   through `rack_transport`, walked from the chunk's first frame to the
+///   span's own: no walk at all for a lane on the chunk, and at most its own
+///   grain for a lane ahead of it, which is exact at a constant tempo and
+///   off by the tempo change inside that grain otherwise - the error the
+///   arp's own one-tempo walk across a span already has. A lane carrying it
+///   renders ahead like any other.
 ///
 /// The Fx bus and the two master seats are not channels and never reach this
 /// loop, so they are asserted rather than tested per lane.
@@ -6874,8 +6885,8 @@ fn run_extra_rack(
     // early by exactly that much. Every other caller - the room, the sends
     // pass, the folders, the pedalboards, the pads, the click, the Fx bus
     // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is the END of
-    // that block (see `rack_transport`).
+    // sentinel, and is handed the published anchor, which is that block's
+    // first frame (see `rack_transport`).
     pos: u64,
 ) -> Option<u32> {
     if is_folder {
@@ -6919,25 +6930,26 @@ fn run_extra_rack(
 /// difference it grew every bar. New tempo points default to a ramp, so that
 /// was the ordinary case rather than an exotic one.
 ///
-/// `run_transport` publishes ONE anchor per chunk: `transport_pos`, and the
+/// `run_transport` publishes ONE anchor per chunk: `transport_anchor`, the
+/// chunk's FIRST frame (taken before the advance and the loop wrap), and the
 /// tempo map's beat (`TempoMap::beat_at_seconds`) and instantaneous tempo
-/// (`TempoMap::bpm_at_beat`) at that frame. The anchor is the END of the
-/// chunk being rendered - stored after the advance and after the loop
-/// wrap - so in the chunk that wraps it is already back near the loop's
-/// head.
+/// (`TempoMap::bpm_at_beat`) at that frame.
 ///
 /// `pos` is the span's own first frame, or `u64::MAX` for a caller that has
-/// none. The sentinel is handed the anchor as it stands, one chunk AHEAD of
-/// the block its caller renders. A real `pos` is walked from the anchor in a
-/// straight line at the anchor's tempo, which is exact only while the tempo
-/// is constant between the two: across a ramp it is off by the ramp's
-/// curvature over the walk (a frame or less on an ordinary ramp), across a
-/// tempo step by the step times the part of the walk beyond it, and across a
-/// loop wrap - where the anchor has already jumped back to the head - by
-/// everything the map does between the head and `pos`. So the beat is NOT a
-/// pure function of the span's position on a tempo map, and `pinned_lanes`
-/// does not pin a lane for it. Three relaxed loads for the sentinel, five
-/// for a lane, read once so every bay in the rack sees one block.
+/// none. The sentinel is handed the anchor as it stands, which is exactly the
+/// block its caller renders. A real `pos` is walked from the anchor in a
+/// straight line at the anchor's tempo. Every lane span of a chunk starts at
+/// the anchor or up to a grain past it, on the same lap - a grain is cut at
+/// the loop's end and the rings are emptied at the wrap - so an ungrained
+/// lane is not walked at all, and a grained one only across its own grain:
+/// exact at a constant tempo, and otherwise off by the ramp's curvature over
+/// the grain (a frame or less) or a tempo step times the part of the grain
+/// beyond it, which is the error the arp's own one-tempo walk across a span
+/// already has. The anchor used to be the END of the chunk, after the wrap:
+/// the sentinel ran a chunk ahead, and in the chunk that wraps a lane at its
+/// own frame was walked back the whole loop from the head. Three relaxed
+/// loads for the sentinel, five for a lane, read once so every bay in the
+/// rack sees one block.
 fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
     let rolling = shared.rolling.load(Ordering::Relaxed);
     let beat = f64::from_bits(shared.transport_beat.load(Ordering::Relaxed));
@@ -6946,7 +6958,7 @@ fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
         beat
     } else {
         let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
-        let here = shared.transport_pos.load(Ordering::Relaxed) as f64;
+        let here = shared.transport_anchor.load(Ordering::Relaxed) as f64;
         beat + (pos as f64 - here) / rate * bpm / 60.0
     };
     crate::analog::arp::Transport { bpm, playing: rolling, beat }
@@ -7019,8 +7031,8 @@ fn run_rack(
     // early by exactly that much. Every other caller - the room, the sends
     // pass, the folders, the pedalboards, the pads, the click, the Fx bus
     // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is the END of
-    // that block (see `rack_transport`).
+    // sentinel, and is handed the published anchor, which is that block's
+    // first frame (see `rack_transport`).
     pos: u64,
 ) -> Option<u32> {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
@@ -11842,13 +11854,20 @@ impl Renderer {
             }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
-        // **And where that is in the MUSIC.** The map's beat at that frame
-        // (`beat_at_seconds`, the walk `BarClock::resync` makes too) and its
-        // instantaneous tempo there (`bpm_at_beat`), so the click and a
-        // built-in voice's arpeggiator read one tempo map rather than two
-        // different ideas of the tempo. Once a block, not once a frame: an
-        // arp step is tens of milliseconds and a block is under one.
-        let secs = self.pos as f64 / self.rate.max(1.0);
+        // **And where the block being rendered is in the MUSIC.** The map's
+        // beat at its first frame (`beat_at_seconds`, the walk
+        // `BarClock::resync` makes too) and its instantaneous tempo there
+        // (`bpm_at_beat`), so the click and a built-in voice's arpeggiator
+        // read one tempo map rather than two different ideas of the tempo.
+        // Once a block, not once a frame: an arp step is tens of milliseconds
+        // and a block is under one.
+        //
+        // **At `at`, from before the advance and the wrap.** It was taken at
+        // `self.pos`, the END of the block: a rack with no span of its own got
+        // the next block's beat, and in the block that wraps a loop a lane at
+        // its own frame was walked back the whole loop from the head.
+        self.shared.transport_anchor.store(at, Ordering::Relaxed);
+        let secs = at as f64 / self.rate.max(1.0);
         let beat = self.maps.tempo.beat_at_seconds(secs);
         self.shared
             .transport_beat
@@ -33848,7 +33867,7 @@ mod sampler_road {
         let shared = Shared::new();
         shared.rate.store(48_000, Ordering::Relaxed);
         shared.rolling.store(true, Ordering::Relaxed);
-        shared.transport_pos.store(48_000, Ordering::Relaxed);
+        shared.transport_anchor.store(48_000, Ordering::Relaxed);
         shared.transport_beat.store(4.0f64.to_bits(), Ordering::Relaxed);
         shared.transport_bpm.store(90.0f64.to_bits(), Ordering::Relaxed);
 
@@ -33866,10 +33885,10 @@ mod sampler_road {
             "a lane half a second ahead is at beat {}, not 4.75",
             t.beat
         );
-        // And half a second EARLIER, the side an ungrained lane is on - its
-        // span starts a chunk before the published frame, which is the END
-        // of the chunk (a grained one sits ahead of it): the offset has to
-        // carry its sign.
+        // And half a second EARLIER. No lane sits behind the anchor, which
+        // is its chunk's first frame (a grained lane sits ahead of it), but
+        // the walk is a straight line either way: the offset has to carry
+        // its sign.
         let t = rack_transport(&shared, 48_000 - 24_000);
         assert!(
             (t.beat - 3.25).abs() < 1.0e-9,
@@ -33927,7 +33946,7 @@ mod sampler_road {
         for _ in 0..40 {
             out.fill(0.0);
             e.render_offline(&mut out);
-            let pos = e.shared.transport_pos.load(Ordering::Relaxed);
+            let pos = e.shared.transport_anchor.load(Ordering::Relaxed);
             let beat = f64::from_bits(e.shared.transport_beat.load(Ordering::Relaxed));
             let bpm = f64::from_bits(e.shared.transport_bpm.load(Ordering::Relaxed));
             let secs = pos as f64 / f64::from(rate);
@@ -33950,6 +33969,93 @@ mod sampler_road {
             agreed > 10,
             "the fixture's map never diverged from the dial, so this proves nothing"
         );
+    }
+
+    /// **A lane rendering the chunk that straddles a loop's end is handed
+    /// that chunk's beat, not one walked back from the loop's head.** The
+    /// anchor a lane's beat is walked from used to be the END of the chunk,
+    /// stored after the wrap, so in the wrapping chunk it was already at the
+    /// head and a lane at the chunk's own frame was walked the whole loop
+    /// back in a straight line. On a map with a tempo change inside the loop
+    /// that lands most of a beat off, and an arp fires on any change of step,
+    /// backwards included.
+    #[test]
+    fn a_racks_beat_at_the_loop_end_is_not_walked_from_the_loop_head() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        let tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            TempoPoint { at_beat: 8.0, bpm: 130.0, ramp: false },
+        ]);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        // Beats 0..16: the loop's end is mid-chunk, and the step at beat 8
+        // falls on a chunk boundary, so nothing else is off.
+        let b = (tempo.seconds_at_beat(16.0) * f64::from(rate)) as u64;
+        e.set_loop(0, b);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        let mut worst = (0.0f64, 0u64);
+        for _ in 0..(b / 512 + 4) {
+            // Where the chunk about to render starts.
+            let at = e.transport_position();
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let got = rack_transport(&e.shared, at).beat;
+            let want = tempo.beat_at_seconds(at as f64 / f64::from(rate));
+            if (got - want).abs() > worst.0 {
+                worst = ((got - want).abs(), at);
+            }
+        }
+        assert!(
+            worst.0 < 0.01,
+            "the lane rendering the chunk at frame {} was handed a beat {:.3} off the map",
+            worst.1,
+            worst.0
+        );
+    }
+
+    /// **A rack with no span of its own is handed the beat of the block it
+    /// renders, not the next one.** The room, the sends pass, the folders,
+    /// the pads, the click and the buses pass the sentinel and take the
+    /// published pair as it stands, and that pair was published for the END
+    /// of the chunk: an arp in any of those racks ran a chunk early, and in
+    /// the chunk that wraps a loop it played the next lap's head. Over a
+    /// ramp, so the tempo half of the pair is held to its frame too.
+    #[test]
+    fn a_rack_with_no_span_of_its_own_is_handed_the_block_it_renders() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        let tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 90.0, ramp: true },
+            TempoPoint { at_beat: 6.0, bpm: 150.0, ramp: false },
+        ]);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        let b = (tempo.seconds_at_beat(8.0) * f64::from(rate)) as u64;
+        e.set_loop(0, b);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..(b / 512 + 4) {
+            let at = e.transport_position();
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let t = rack_transport(&e.shared, u64::MAX);
+            let want = tempo.beat_at_seconds(at as f64 / f64::from(rate));
+            assert!(
+                (t.beat - want).abs() < 1.0e-6,
+                "the chunk at frame {at} handed a rack with no span beat {:.4}, where the map says {want:.4}",
+                t.beat
+            );
+            assert!(
+                (t.bpm - tempo.bpm_at_beat(want)).abs() < 1.0e-6,
+                "the chunk at frame {at} handed a rack with no span {:.3} bpm, where the map says {:.3}",
+                t.bpm,
+                tempo.bpm_at_beat(want)
+            );
+        }
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures
