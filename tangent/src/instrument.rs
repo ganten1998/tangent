@@ -7838,19 +7838,21 @@ struct Renderer {
     /// already scaled by how much of it monitoring is currently withholding.
     ///
     /// Subtracted rather than separately summed. **The subtraction is exact
-    /// only for what `mix_monitor` itself applied**: the input's fader, pan,
-    /// pedalboard and own racks (the subtrahend is the same `src` that pass
-    /// added), and its folders' faders and pans (`folder_chain_gain`). It is
-    /// NOT exact for what PROCESSES the input further on: a folder ancestor's
-    /// rack or board (they work on the group's sum), and a route's whole path
-    /// (route gain, the destination's rack, the gain it folds at -
-    /// `lane_gain` - and its pan), none of which is in the subtrahend. While
-    /// an input is withheld (monitoring off, its strip muted or soloed out,
-    /// or the host's rebuild gate `DesktopApp::armed_racks_pending`), the
-    /// room therefore hears `path(src) - src` for those: a folder denoiser's
-    /// removed noise inverted, an amp bus's sound minus the DI, a turned-down
-    /// or muted bus's input inverted. One buffer, filled by the pass that
-    /// made the samples in the first place.
+    /// only through gains**: the input's fader, pan, pedalboard and own racks
+    /// (the subtrahend is the same `src` that pass added), its folders'
+    /// faders and pans (`folder_chain_gain`), and for a ROUTED input the
+    /// route's gain and each destination's fold gain - `lane_gain`, so its
+    /// fader, mute and solo - and pan along the way (`route_transfer`). It
+    /// is NOT exact for what PROCESSES the input further on: a folder
+    /// ancestor's rack or board (they work on the group's sum) and a route
+    /// destination's rack, which the subtrahend takes as unity. While an
+    /// input is withheld (monitoring off, its strip muted or soloed out, or
+    /// the host's rebuild gate `DesktopApp::armed_racks_pending`), the room
+    /// therefore hears `rack(x) - x` for those: a folder denoiser's removed
+    /// noise inverted, an amp bus's sound minus the DI it was handed. Exact
+    /// withholding through a processing bay would need that bay run twice,
+    /// which is two instances of the plugin. One buffer, filled by the pass
+    /// that made the samples in the first place.
     input_dry: Vec<f32>,
     /// Whether the room and the take differ this block — in CONTENT, because
     /// monitoring is withholding an input, or in TREATMENT, because a live
@@ -10070,10 +10072,11 @@ impl Renderer {
             // so the difference between the file's mix and the speakers' is
             // the input that monitoring is withholding, and `mix_monitor`
             // wrote that down frame by frame as it made it. Exactly so only
-            // where that input reaches the master through plain gains: a
-            // folder's rack and board, and a route's destination, PROCESS
-            // what reaches them, and the subtrahend knows nothing of either -
-            // see `input_dry` for what the room hears then.
+            // where that input reaches the master through plain gains, a
+            // route's included: a folder's rack and board, and a route
+            // destination's rack, PROCESS what reaches them, and the
+            // subtrahend takes them as unity - see `input_dry` for what the
+            // room hears then.
             //
             // After the insert it could not be done at all: a limiter is not
             // linear, and there is no arithmetic that takes one voice back out
@@ -10965,6 +10968,9 @@ impl Renderer {
         // which strip.
         let mut offset = 0usize;
         let capturing = self.shared.arr_capture.load(Ordering::Relaxed);
+        // What the routes make of a routed strip, walked once a chunk and
+        // only if one is open - see `route_transfer`.
+        let mut transfer: Option<[[f32; 2]; CHANNELS]> = None;
         for input in 0..INPUTS {
             let width = self.monitor_widths[input].min(ch_in.saturating_sub(offset));
             if width == 0 {
@@ -11126,10 +11132,11 @@ impl Renderer {
             // fader sits in the same place for both — ahead of the rack, which
             // is where this pass has always put it.
             //
-            // **And only while the transport rolls.** `mix_clips` returns
-            // after zeroing when it is not, and without that term the parked
-            // position is re-read every callback and the clips buzz one block
-            // of themselves under a readout that says nothing is moving.
+            // **And only while the transport rolls**, the gate the lane pass
+            // keeps too (`DeskRef::clips_rolling`): without that term the
+            // parked position is re-read every callback and the clips buzz
+            // one block of themselves under a readout that says nothing is
+            // moving.
             let merge_clip = takes_rack && clip_on_lane && monitoring && rolling;
             if merge_clip {
                 // Pulled for THIS block, into a scratch of its own: the read
@@ -11353,6 +11360,31 @@ impl Renderer {
             // See `folder_chain_gain`: the room's subtrahend for a grouped
             // strip is what its folders will make of it, not the raw input.
             let chain = self.folder_chain_gain(lane);
+            // **And for a ROUTED strip, what its routes make of it**, because
+            // that is where it reaches the mix instead (`route_transfer`).
+            // Routed away, nothing of it goes straight out, so its straight
+            // share is only what its folders fold, and none for a loose strip:
+            // the subtrahend was `chain` alone, as if it went direct, so a
+            // withheld input routed to a bus turned down or muted came out of
+            // the room inverted. A folder's own input keeps the old reckoning.
+            let held = if !is_folder
+                && (0..self.route_n).any(|i| {
+                    let (from, _, hardware, _, _) = self.route_cache[i];
+                    from == lane && !hardware
+                }) {
+                let t = transfer.get_or_insert_with(|| self.route_transfer());
+                let mut held = if self.folders[lane] >= 0 { chain } else { [0.0; 2] };
+                for i in 0..self.route_n {
+                    let (from, target, hardware, _, gain) = self.route_cache[i];
+                    if from == lane && !hardware && gain > 0.0 && target < CHANNELS {
+                        held[0] += gain * t[target][0];
+                        held[1] += gain * t[target][1];
+                    }
+                }
+                held
+            } else {
+                chain
+            };
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -11400,7 +11432,7 @@ impl Renderer {
                     // four inputs share one buffer and the last one to run
                     // would otherwise be the only one the speakers were spared.
                     if let Some(d) = self.input_dry.get_mut(at + c) {
-                        *d += src * keep_out * chain[c.min(1)];
+                        *d += src * keep_out * held[c.min(1)];
                     }
                     // Post-fader, like every other send here, and closed with
                     // the room: a channel nobody can hear must not arrive back
@@ -11926,12 +11958,6 @@ impl Renderer {
         }
         self.clip_lanes = lanes;
         self.clip_under = under;
-        // **Stopped means silent, exactly as it always has.** Without this the
-        // parked position is re-read every callback and the clips buzz one
-        // block of themselves under a readout that says nothing is moving.
-        if !rolling || self.clips.is_empty() {
-            return;
-        }
         // **The per-lane fader's own smoothing state, advanced here and read
         // by the SENDS pass.**
         //
@@ -11942,6 +11968,13 @@ impl Renderer {
         // writer it has ever had. Advancing it was interleaved with the clip
         // walk frame by frame; it never depended on the frame, so it is one
         // loop now and the arithmetic is unchanged.
+        //
+        // **Every chunk, rolling or not, clips or not.** It sat behind an
+        // early return for a stopped transport or an empty clip list, left
+        // from when this pass folded the clips itself, so with the song
+        // parked, or in a session of MIDI tracks, a bus kept the gain it last
+        // had and its fader, mute and solo never reached what was routed into
+        // it. The walk above is all this pass still does with the clips.
         let coeff = self.gain_coeff;
         let mut target = [0.0f32; CHANNELS];
         let mut punch = [u64::MAX; CHANNELS];
@@ -15080,6 +15113,61 @@ impl Renderer {
             hops += 1;
         }
         g
+    }
+
+    /// **What the routes make of what reaches each channel's ARRIVALS**, per
+    /// side: the room's subtrahend for a routed strip, as `folder_chain_gain`
+    /// is for a grouped one.
+    ///
+    /// One unit gathered into `dest` in the sends pass leaves it at
+    /// `lane_gain[dest]` and its pan, into the master where `route_direct`
+    /// lets it, and on along `dest`'s own routes at their gains - the sends
+    /// pass's own arithmetic, read from the same latched table and the gain
+    /// `mix_clips` advanced this chunk. **The destination's rack is taken as
+    /// unity**: it processes rather than scales, and no subtraction can
+    /// model that (see `input_dry`). A cycle's way back is a block late in
+    /// the sends pass, and is not in this sum.
+    ///
+    /// Each channel once, so a desk of routes costs one walk of the table
+    /// per channel at most, and nothing allocates.
+    fn route_transfer(&self) -> [[f32; 2]; CHANNELS] {
+        fn walk(
+            r: &Renderer,
+            d: usize,
+            path: u32,
+            t: &mut [[f32; 2]; CHANNELS],
+            done: &mut u32,
+        ) -> [f32; 2] {
+            let bit = 1u32 << d;
+            if *done & bit != 0 {
+                return t[d];
+            }
+            if path & bit != 0 {
+                return [0.0; 2];
+            }
+            let mut on = [0.0f32; 2];
+            for i in 0..r.route_n {
+                let (from, target, hardware, _, gain) = r.route_cache[i];
+                if from != d || hardware || gain <= 0.0 || target >= CHANNELS {
+                    continue;
+                }
+                let next = walk(r, target, path | bit, t, done);
+                on[0] += gain * next[0];
+                on[1] += gain * next[1];
+            }
+            let (pl, pr) = pan_gains(r.lane_pan(d));
+            let g = r.lane_gain[d];
+            let direct = r.route_direct[d];
+            t[d] = [g * pl * (direct + on[0]), g * pr * (direct + on[1])];
+            *done |= bit;
+            t[d]
+        }
+        let mut t = [[0.0f32; 2]; CHANNELS];
+        let mut done = 0u32;
+        for d in 0..CHANNELS {
+            walk(self, d, 0, &mut t, &mut done);
+        }
+        t
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -28979,6 +29067,69 @@ mod tests {
         );
     }
 
+    /// **A bus's fader and mute reach what is routed into it while the song
+    /// is stopped, and in a session with no audio clip.**
+    ///
+    /// The sends pass folds a destination's arrivals at `lane_gain[dest]`,
+    /// and the only writer of that gain sat after `mix_clips`' early return
+    /// for a stopped transport or an empty clip list. So with the song
+    /// parked, or in a session of MIDI tracks, the bus kept whatever gain it
+    /// last had - unity from engine birth - and pulling its fader down or
+    /// muting it changed nothing routed into it. The test above presets
+    /// `lane_gain` by hand, which is why it never saw this.
+    #[test]
+    fn a_muted_bus_silences_what_is_routed_into_it_while_the_song_is_stopped() {
+        fn heard(r: &mut Renderer, in_tx: &mut Producer<f32>) -> f32 {
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut peak = 0.0f32;
+            for b in 0..16u64 {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = b * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            peak
+        }
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+        r.monitor = Some(in_rx);
+        r.monitor_channels = 1;
+        r.monitor_widths = inputs_array([1]);
+        r.monitor_scratch = vec![0.0; 8192];
+        // A live input on channel 1, armed and heard, routed whole to
+        // channel 2 through an empty rack. The transport is parked and there
+        // is no clip anywhere.
+        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        shared.midi_off.store(1 << 1, Ordering::Relaxed);
+        shared.armed.store(1 << 1, Ordering::Relaxed);
+        shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        r.channel_gain[1] = 1.0;
+        shared.routes[0].store(pack_route(1, 2, false, false), Ordering::Relaxed);
+        shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.route_count.store(1, Ordering::Release);
+        shared.monitor_on.store(true, Ordering::Relaxed);
+        r.room_gain = 1.0;
+        // The control: the route carries the input to the speakers.
+        let open = heard(&mut r, &mut in_tx);
+        assert!(open > 0.4, "the routed input never reached the speakers (peak {open})");
+        // The bus's fader, halved.
+        shared.channel_gains[2].store(0.5f32.to_bits(), Ordering::Relaxed);
+        let half = heard(&mut r, &mut in_tx);
+        assert!(
+            (half - 0.25).abs() < 0.02,
+            "a bus pulled down to half passed what was routed into it at {half} while stopped"
+        );
+        // And MUTED.
+        shared.channel_gains[2].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.muted.store(1 << 2, Ordering::Relaxed);
+        let shut = heard(&mut r, &mut in_tx);
+        assert!(shut < 1.0e-3, "a muted bus passed what was routed into it while stopped (peak {shut})");
+    }
+
 
     /// **A CHAIN carries through in one block: A to B to C.**
     ///
@@ -31927,6 +32078,110 @@ mod tests {
             } else {
                 assert!(room < 1.0e-3, "{case}: the child reached the speakers (peak {room})");
             }
+        }
+    }
+
+    /// **A ROUTED strip's live input reaches the mix through the channel it
+    /// is routed to, so what the room keeps out is what that route
+    /// contributed.** The subtrahend was the input as if it went straight to
+    /// the master; routed away, it arrives at the route's gain and the bus's
+    /// fader, mute and pan instead. With monitoring off (the launch default)
+    /// a bus pulled down to half put the input into the speakers at minus
+    /// half, and a MUTED bus put it there whole and inverted - the folder
+    /// case above, through a route. Rolling over a clip, the one state in
+    /// which the bus's fold gain always followed the desk, and parked. The
+    /// take is the control: the route really does carry the input there.
+    #[test]
+    fn a_routed_armed_input_stays_out_of_the_room_with_monitoring_off() {
+        // A silent clip on lane 9, so a rolling transport has audio under it.
+        let silence = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 2 * 48_000 * 3],
+            rate: 48_000,
+            source: PathBuf::from("silence.wav"),
+        });
+        for (rolling, dest_muted, dest_gain) in [
+            (true, false, 0.5f32),
+            (true, true, 1.0),
+            (false, false, 0.5),
+            (false, true, 1.0),
+        ] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut to_audio, _back) = r.hijack_track_rings();
+            if rolling {
+                to_audio
+                    .push(vec![Placed {
+                        clip: Arc::clone(&silence),
+                        strip: 9,
+                        start: 0,
+                        offset: 0,
+                        len: 48_000 * 3,
+                        fade_in: 0,
+                        fade_out: 0,
+                        gain: 1.0,
+                    }])
+                    .expect("room");
+            }
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1 | 1 << 9, Ordering::Relaxed);
+            shared.armed.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.channel_gains[2].store(dest_gain.to_bits(), Ordering::Relaxed);
+            r.channel_gain[1] = 1.0;
+            r.channel_gain[2] = dest_gain;
+            if dest_muted {
+                shared.muted.store(1 << 2, Ordering::Relaxed);
+            }
+            // Channel 1 -> channel 2, whole, at unity, through an empty rack.
+            shared.routes[0].store(pack_route(1, 2, false, false), Ordering::Relaxed);
+            shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.route_count.store(1, Ordering::Release);
+            // Monitoring OFF: none of channel 1 belongs in the room.
+            shared.monitor_on.store(false, Ordering::Relaxed);
+            if rolling {
+                shared.transport_at.store(0, Ordering::Relaxed);
+                shared.transport_req.store(1, Ordering::Release);
+                shared.rolling.store(true, Ordering::Relaxed);
+            }
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            let (mut taped, mut room) = (0.0f32, 0.0f32);
+            for b in 0..(48_000 * 2 / 256) {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+                taped = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+                room = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            let case = format!("rolling={rolling} dest_muted={dest_muted} dest_gain={dest_gain}");
+            if dest_muted {
+                assert!(taped < 1.0e-3, "{case}: a muted bus put the input in the take (peak {taped})");
+            } else {
+                assert!(
+                    (taped - 0.5 * dest_gain).abs() < 0.02,
+                    "{case}: the take has the routed input at {taped}, not at the bus's level"
+                );
+            }
+            assert!(
+                room < 1.0e-3,
+                "{case}: a withheld routed input reached the speakers (peak {room})"
+            );
         }
     }
 
