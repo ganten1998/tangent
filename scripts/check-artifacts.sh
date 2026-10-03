@@ -140,14 +140,22 @@ for a in "$@"; do
       continue
       ;;
     *setup.exe)
+      wl=""
       if command -v 7zz >/dev/null 2>&1; then
-        wl="$(7zz l "$a" 2>/dev/null)"
-        printf '%s\n' "$wl" | grep -q 'tangent\.exe' \
-          || note "$a: no tangent.exe"
-        printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3' \
-          && note "$a: carries the RETIRED VST3 payload"
-        printf '%s\n' "$wl" | grep -q 'Uninstall\.exe' \
-          || note "$a: no uninstaller"
+        # `-slt`: one `Path = ` line per entry, which is what names every PE
+        # below. A listing that fails is a problem on the record, not an
+        # abort with nothing said.
+        if wl="$(7zz l -slt "$a" 2>/dev/null)"; then
+          printf '%s\n' "$wl" | grep -q 'tangent\.exe' \
+            || note "$a: no tangent.exe"
+          printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3' \
+            && note "$a: carries the RETIRED VST3 payload"
+          printf '%s\n' "$wl" | grep -q 'Uninstall\.exe' \
+            || note "$a: no uninstaller"
+        else
+          wl=""
+          note "$a: 7zz could not list it (damaged, or not an NSIS installer)"
+        fi
       else
         note "$a: not inspected (install 7-zip to check: brew install sevenzip)"
       fi
@@ -158,10 +166,24 @@ for a in "$@"; do
       # as it starts, with no way for the user to allow one: an unsigned
       # tangent.exe, encoder or uninstaller is blocked however signed the
       # setup was. Extracted, not listed, because a signature is in the bytes.
+      # **Every** PE, read off the listing, and not three named ones: NSIS
+      # unpacks its own plug-in DLLs into $PLUGINSDIR and loads them
+      # (System.dll in .onInit, nsDialogs.dll for the finish page), and Smart
+      # App Control judges DLLs too. A list of names missed exactly those
+      # two. The three Tangent ships stay on it, so a missing one is named.
       if command -v 7zz >/dev/null 2>&1; then
         inner="$(mktemp -d)"
-        for pe in tangent.exe tangent-ffmpeg.exe Uninstall.exe; do
-          if 7zz e -y -o"$inner" "$a" "$pe" >/dev/null 2>&1 && [ -f "$inner/$pe" ]; then
+        pe_names="$( { printf '%s\n' tangent.exe tangent-ffmpeg.exe Uninstall.exe
+                       printf '%s\n' "$wl" | awk '/^----------$/ { items = 1; next }
+                         items && sub(/^Path = /, "")' | grep -iE '\.(exe|dll)$' || true
+                     } | awk '!seen[$0]++' )"
+        pes=()
+        while IFS= read -r pe; do [ -n "$pe" ] && pes+=("$pe"); done <<< "$pe_names"
+        # One extraction for all of them: the payload is one solid LZMA
+        # stream, and every separate call decompresses it from the start.
+        7zz x -y -o"$inner" "$a" "${pes[@]}" >/dev/null 2>&1 || true
+        for pe in "${pes[@]}"; do
+          if [ -f "$inner/$pe" ]; then
             pe_sig "$a: $pe" "$inner/$pe"
           else
             note "$a: could not extract $pe to check its signature"

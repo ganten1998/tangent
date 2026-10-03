@@ -8,6 +8,8 @@
 #
 # One script for every PE we ship, deliberately. build-cross.sh signs the
 # inner tangent.exe and the bundled tangent-ffmpeg.exe as it stages them;
+# build-installer.sh signs copies of NSIS's System.dll and nsDialogs.dll,
+# which the installer unpacks and loads, before makensis packs them;
 # makensis runs this on the uninstaller while it builds the installer (the
 # .nsi's !uninstfinalize); build-cross.sh signs the NSIS setup.exe after
 # makensis writes it. Two Windows gates want signatures, on different files:

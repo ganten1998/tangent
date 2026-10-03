@@ -100,13 +100,17 @@ Installer** certificate; `release.sh` fails an unsigned pkg at check time.
 
 `scripts/sign-windows.sh` Authenticode-signs a PE via **jsign** against
 Azure Artifact Signing (signtool is Windows-only and this binary is
-cross-built from macOS). Four PEs ship, and all four take that one route:
+cross-built from macOS). Six PEs ship, and all six take that one route:
 `build-cross.sh` signs the inner `tangent.exe` and the bundled
-`tangent-ffmpeg.exe` as it stages them; makensis signs the uninstaller while
-it builds the installer (`!uninstfinalize` in `installer/windows/tangent.nsi`,
-with `= 0` so a failed signing fails the build - without it makensis ignores
-the exit code and ships the uninstaller unsigned, which was tested); and
-`build-cross.sh` signs `setup.exe` after makensis writes it.
+`tangent-ffmpeg.exe` as it stages them; `build-installer.sh` signs copies of
+the two NSIS plug-in DLLs the installer unpacks and loads (`System.dll`,
+which `.onInit` calls to ask whether Windows is 64-bit, and `nsDialogs.dll`)
+and hands makensis a private `NSISDIR` holding them; makensis signs the
+uninstaller while it builds the installer (`!uninstfinalize` in
+`installer/windows/tangent.nsi`, with `= 0` so a failed signing fails the
+build - without it makensis ignores the exit code and ships the uninstaller
+unsigned, which was tested); and `build-cross.sh` signs `setup.exe` after
+makensis writes it.
 
 **The timestamp is RFC 3161, and that is not optional.**
 `timestamp.acs.microsoft.com` speaks only RFC 3161; jsign's default is the
@@ -126,7 +130,8 @@ even for an administrator: an unknown, unsigned program is simply blocked.
 A tester hit exactly that on 2026-09-24, days after installing, when Smart
 App Control left its evaluation mode. It needs a valid signature, not
 reputation, so a signed build runs there from its first release - but only
-if the encoder and the uninstaller are signed as well as the app.
+if the encoder, the uninstaller and the installer's NSIS plug-ins are
+signed as well as the app.
 
 With none of `TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
 `TRUSTED_SIGNING_PROFILE` set, the PEs ship unsigned and the build says so
@@ -137,8 +142,9 @@ only, since an exported variable reaches every child of the build. Either
 way `sign-windows.sh` hands the token to jsign through jsign's environment
 (`--storepass env:…`), never on its command line, where any process on the
 machine could read it for as long as a signing runs. `release.sh` then checks the
-signature of `setup.exe`, of each PE inside it (extracted with 7-Zip:
-`tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe`) and of each PE in the
+signature of `setup.exe`, of every PE inside it (extracted with 7-Zip:
+`tangent.exe`, `tangent-ffmpeg.exe`, `Uninstall.exe` and the two NSIS
+plug-ins, and any other `.exe` or `.dll` it lists) and of each PE in the
 portable zip (`scripts/pe-signed.py`), and a Windows release runs RED until
 the Azure account exists, on purpose.
 
@@ -263,8 +269,9 @@ refuses to bless a release on failure:
   signature, and a stapled notarization ticket (`stapler validate`).
 - **setup.exe** (needs `7zz`; without it the run FAILS rather than
   skipping): requires `tangent.exe`, NO VST3 payload and `Uninstall.exe`;
-  an Authenticode signature on setup.exe itself and on `tangent.exe`,
-  `tangent-ffmpeg.exe` and `Uninstall.exe` as extracted from it.
+  an Authenticode signature on setup.exe itself and on every PE 7-Zip
+  lists inside it, as extracted: `tangent.exe`, `tangent-ffmpeg.exe`,
+  `Uninstall.exe`, and NSIS's own `System.dll` and `nsDialogs.dll`.
   `scripts/pe-signed.py` checks PRESENCE (a non-empty certificate table),
   not chain validity, which only a first launch on Windows proves.
 - **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.

@@ -146,6 +146,13 @@ SectionEnd
     "The standalone app. Opens its own window and connects to a MIDI keyboard by itself."
   !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
+; **${RunningX64} is a plug-in call.** x64.nsh spells it as System::Call, so
+; the installer unpacks NSIS's System.dll into $PLUGINSDIR and loads it, and
+; Smart App Control judges a DLL like any program: refused, it would make this
+; test fail on a 64-bit machine. build-installer.sh hands makensis signed
+; copies of System.dll and nsDialogs.dll (the finish page's). A call into any
+; other plug-in packs that one UNSIGNED, which check-artifacts.sh refuses: add
+; it to build-installer.sh's list.
 Function .onInit
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP "Tangent needs 64-bit Windows."

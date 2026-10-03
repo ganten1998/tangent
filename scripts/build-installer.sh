@@ -217,10 +217,35 @@ build_windows() {
   # exe; the setup, the app, and the Add/Remove entry are one mark.
   need "$ROOT/assets/tangent.ico" "the app icon is missing"
   local out="dist/$NAME-$VERSION-windows-setup.exe"
+
+  # **NSIS's own plug-ins are signed too.** The installer unpacks two of
+  # NSIS's stock plug-in DLLs into $PLUGINSDIR and loads them: System.dll in
+  # .onInit (x64.nsh's ${RunningX64} is four System::Calls) and nsDialogs.dll
+  # for the finish page. Smart App Control judges DLLs as well as programs,
+  # and a System.dll it refuses makes ${RunningX64} false: the signed
+  # installer would stop with "Tangent needs 64-bit Windows." on a 64-bit
+  # machine. makensis loads plug-ins from $NSISDIR/Plugins, and NSISDIR is
+  # its documented override for its data directory, so it gets a private
+  # copy of that directory whose two DLLs are signed (Homebrew's copy is
+  # never touched). A plug-in the .nsi starts calling later is NOT signed
+  # here, and check-artifacts.sh, which reads every PE inside the setup.exe,
+  # refuses it: add it to this list.
+  local nsis_data plugin
+  nsis_data="$(cd "${NSISDIR:-$(dirname "$(command -v makensis)")/../share/nsis}" 2>/dev/null && pwd -P || true)"
+  [ -n "$nsis_data" ] && [ -d "$nsis_data/Plugins/x86-unicode" ] || {
+    echo "cannot find NSIS's data directory (Plugins, Stubs, Include); set NSISDIR" >&2
+    exit 1
+  }
+  cp -R "$nsis_data" "$WORK/windows/nsis"
+  chmod -R u+w "$WORK/windows/nsis"
+  for plugin in System nsDialogs; do
+    scripts/sign-windows.sh "$WORK/windows/nsis/Plugins/x86-unicode/$plugin.dll" "NSIS $plugin.dll"
+  done
+
   # SIGNCMD signs the uninstaller while makensis builds it (the .nsi's
   # !uninstfinalize); the setup.exe itself is signed by build-cross.sh once
   # makensis has written it.
-  makensis -NOCD \
+  NSISDIR="$WORK/windows/nsis" makensis -NOCD \
     "-DVERSION=$VERSION" \
     "-DNUMVERSION=${VERSION%%-*}" \
     "-DSRCDIR=$WORK/windows" \
