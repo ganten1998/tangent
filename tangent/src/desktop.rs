@@ -3351,12 +3351,12 @@ fn stretched_clip_audio(
 /// **The clip as the warp map leaves it**, or the clip untouched when there
 /// is no map.
 ///
-/// Shares the stretch cache and keys into it as [`warp_plan`] does: the
-/// anchor count and [`warp_sig`], which name the map's ends and its fit and
-/// not its middle anchors or the stretch mode. The cache is the caller's -
-/// fresh per export, seeded from the live one by glue - and wherever it
-/// outlives a re-quantize that keeps the ends and the count, the old render
-/// is what comes back.
+/// Asks [`warp_plan`] for the render - its key, anchors, mode and fit - so
+/// the export, glue and the crew's live render share ONE spelling of the
+/// key, and that key names every input of the render (see [`warp_sig`]).
+/// The cache is the caller's: fresh per export, seeded from the live one by
+/// glue. An entry it holds under a key the clip still names IS the clip's
+/// render.
 #[cfg(feature = "recorder")]
 fn warped_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3364,31 +3364,16 @@ fn warped_clip_audio(
     path: &std::path::Path,
     cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
 ) -> Arc<tangent_record::decode::Clip> {
-    let Some(sig) = warp_sig(clip) else {
+    let Some((key, anchors, mode, fit)) = warp_plan(clip, path) else {
         return decoded;
     };
-    let key: StretchKey = (
-        path.to_path_buf(),
-        i64::try_from(clip.warp.len()).unwrap_or(i64::MAX),
-        sig,
-    );
     if let Some(c) = cache.get(&key) {
         return Arc::clone(c);
     }
-    let anchors: Vec<crate::warp::Anchor> = clip
-        .warp
-        .iter()
-        .map(|&(from, to)| crate::warp::Anchor {
-            from: usize::try_from(from).unwrap_or(usize::MAX),
-            to: usize::try_from(to).unwrap_or(usize::MAX),
-        })
-        .collect();
     // The material decides both the algorithm and whether it is used at
     // all, exactly as a stretch's does. `Fit::Auto` asks
     // `stretch::percussiveness` and answers Slice only for material a slice
     // flatters - see `warp::Fit::pick`.
-    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
-    let fit = crate::warp::Fit::from_key(&clip.warp_fit).unwrap_or_default();
     let made = Arc::new(crate::warp::warp(&decoded, &anchors, mode, fit));
     cache.insert(key, Arc::clone(&made));
     made
@@ -3474,11 +3459,13 @@ fn quantize_map(
 /// `stretch_key`'s twin, and it keys into the SAME cache: a warp render and
 /// a stretch render are both "this file, treated this way", and the third
 /// field is where the treatments are told apart. Named by the anchor count
-/// and [`warp_sig`] - the first and last pairs and the fit, which is in
-/// there because switching a clip from stretch to slice must not hand back
-/// the render made the other way. That is not every input of the render: a
-/// re-quantize that keeps the ends and the count is served the old render,
-/// and a stretch-mode change the old mode's - see [`warp_sig`].
+/// and [`warp_sig`], which between them name EVERY input of the render this
+/// clip supplies: the whole map, the fit (switching a clip from stretch to
+/// slice must not hand back the render made the other way) and the stretch
+/// mode its stretched segments are rendered in. A key that left one out
+/// would hand a re-quantize or a mode change the render it replaced, because
+/// nothing evicts an entry a clip still names. The one spelling of the key:
+/// [`warped_clip_audio`] asks here too.
 #[cfg(feature = "recorder")]
 fn warp_plan(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3539,28 +3526,38 @@ fn stretch_key(
     ))
 }
 
-/// **A warp map's identity, as the caches key it**, or `None` for a clip
-/// that is not warped: the FIT and the map's first and last pairs, nothing
-/// more. The fit is in because switching a clip from stretch to slice must
-/// not hand back the render made the other way. One spelling, for the
-/// warp's own entry (which adds the anchor count) and for the stretch made
-/// from it (which does not).
+/// **A warp render's identity, as the caches key it**, or `None` for a clip
+/// that is not warped: every input of `warp::warp` the clip supplies - the
+/// fit, the stretch mode every stretched segment is rendered in, the anchor
+/// count and a hash of every pair. One spelling, for the warp's own entry
+/// ([`warp_plan`]) and for the stretch made from it ([`stretch_key`]), so a
+/// stretch of a warp can never be keyed to another warp.
 ///
-/// **Not the whole render.** `warp::warp` reads every anchor and the clip's
-/// stretch mode, and this names neither the middle anchors nor the mode. A
-/// re-quantize that leaves the outermost hits where they were - another
-/// swing, window or grid - keeps the same warp key when it keeps the count,
-/// and the same stretch-of-warp key even when it does not; nothing evicts
-/// an entry a clip still names, so playback and glue are then served the
-/// previous render. A stretch-mode change likewise keeps the old mode's
-/// warp.
+/// **The whole render, because nothing evicts a key a clip still names.**
+/// This named the fit and the map's first and last pairs, so a re-quantize
+/// that left the outermost hits where they were - another swing, window or
+/// grid - kept its key and was served the previous render, live and in
+/// glue, while the export rendered the new map; and a stretch-mode change
+/// kept the old mode's warp. The pairs are hashed rather than spelled out
+/// because a take can carry thousands; a 64-bit collision is not one anybody
+/// will meet. The fit and the mode are the clip's own strings, quoted so no
+/// spelling can run into its neighbour, rather than what they resolve to:
+/// two spellings of one mode cost a second render of the same audio and
+/// never play the wrong one.
 fn warp_sig(clip: &tangent_ui::arrangement::ArrClip) -> Option<String> {
+    use std::hash::{Hash, Hasher};
     if clip.warp.len() < 2 {
         return None;
     }
-    let (f0, t0) = clip.warp[0];
-    let (f1, t1) = clip.warp[clip.warp.len() - 1];
-    Some(format!("warp:{}:{f0}:{t0}:{f1}:{t1}", clip.warp_fit))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    clip.warp.hash(&mut h);
+    Some(format!(
+        "warp:{:?}:{:?}:{}:{:016x}",
+        clip.warp_fit,
+        clip.stretch_mode,
+        clip.warp.len(),
+        h.finish()
+    ))
 }
 
 // **This attribute belongs to the IMPL, not to what is above it.** It was
@@ -20385,8 +20382,8 @@ impl Decoded {
 /// `(file, ratio in millionths, mode key [+ "|" + warp_sig])` - see
 /// [`stretch_key`] - and a WARP is `(file, anchor count, warp_sig)` - see
 /// [`warp_plan`], whose third field starts `warp:` and so can never equal a
-/// mode key. `warped_clip_audio` spells the warp key a second time and must
-/// agree with `warp_plan`.
+/// mode key. `warped_clip_audio` takes its key from `warp_plan`, so there is
+/// one spelling of it, and `warp_sig` names every input of the render.
 #[cfg(feature = "recorder")]
 type StretchKey = (std::path::PathBuf, i64, String);
 
@@ -24119,6 +24116,65 @@ mod tests {
         // Undoing the warp is back to the plain key exactly.
         let undone = tangent_ui::arrangement::ArrClip { warp: Vec::new(), ..warped };
         assert_eq!(stretch_key(&undone, path).unwrap().0, a);
+    }
+
+    /// **A warp render is keyed by the WHOLE map, and by the stretch mode it
+    /// was rendered with.** `warp_sig` named only the map's first and last
+    /// pairs and the fit; the warp key added the count, the stretch-of-warp
+    /// key not even that. Nothing evicts a key a clip still names, so two
+    /// maps that share their ends - a re-quantize at another swing, window
+    /// or grid - were served one cached render live and in glue while the
+    /// export rendered the new map, and a stretch-mode change on a warped
+    /// clip kept the old mode's warp.
+    #[test]
+    fn a_warp_render_is_keyed_by_the_whole_map_and_the_mode() {
+        let path = std::path::Path::new("take.wav");
+        let straight = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            warp: vec![(0, 0), (12_000, 12_000), (24_000, 24_000), (36_000, 36_000)],
+            ..Default::default()
+        };
+        let swung = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, 0), (12_000, 14_000), (24_000, 24_000), (36_000, 36_000)],
+            ..straight.clone()
+        };
+        let fewer = tangent_ui::arrangement::ArrClip {
+            warp: vec![(0, 0), (24_000, 24_000), (36_000, 36_000)],
+            ..straight.clone()
+        };
+        let moded = |mode: &str| tangent_ui::arrangement::ArrClip {
+            stretch_mode: mode.to_owned(),
+            ..straight.clone()
+        };
+        let w = |c: &tangent_ui::arrangement::ArrClip| warp_plan(c, path).expect("a plan").0;
+        let s = |c: &tangent_ui::arrangement::ArrClip| {
+            stretch_key(&tangent_ui::arrangement::ArrClip { stretch: 1.5, ..c.clone() }, path)
+                .expect("a stretched clip has a stretch key")
+                .0
+        };
+        // Every facet is checked before anything panics, so one run names
+        // each collision.
+        let mut shared: Vec<String> = Vec::new();
+        if w(&straight) == w(&swung) {
+            shared.push(format!("two different maps share one cached render: {:?}", w(&straight)));
+        }
+        if s(&straight) == s(&swung) {
+            shared.push(format!("two stretches of two warps share one render: {:?}", s(&straight)));
+        }
+        if s(&straight) == s(&fewer) {
+            shared.push(format!("the stretch key cannot see the map's length: {:?}", s(&straight)));
+        }
+        if w(&moded("tape")) == w(&moded("tonal")) {
+            shared.push(format!(
+                "a stretch-mode change is served the old mode's warp: {:?}",
+                w(&moded("tape"))
+            ));
+        }
+        assert!(shared.is_empty(), "{}", shared.join("; "));
+        // And the same map under the same treatment is the same render, or
+        // the cache would never hit.
+        assert_eq!(w(&straight), w(&straight.clone()));
+        assert_eq!(s(&swung), s(&swung.clone()));
     }
 
     /// **The glued file's name answers to nothing yet**: not a file on disk,
