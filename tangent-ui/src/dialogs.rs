@@ -425,7 +425,8 @@ pub enum Dialog {
         /// Rate for both streams, or `None` for the devices' own.
         rate: Option<u32>,
         /// **How far ahead a track's effects are rendered, in milliseconds;
-        /// zero is off.** Here because it is the same kind of decision as the
+        /// zero is OFF and any NEGATIVE is AUTO** (the panel sends `-1.0`).
+        /// Here because it is the same kind of decision as the
         /// buffer size two rows above it - what this machine can carry,
         /// traded against how quickly the desk answers - and because a
         /// setting with no switch is worse than no setting.
@@ -433,7 +434,9 @@ pub enum Dialog {
         ahead: f64,
         /// Every audio system this build can open.
         systems: Vec<String>,
-        /// The one in use, or `None` for the platform's default.
+        /// The system actually RUNNING (`AudioSetup::active_system`), or the
+        /// one the settings name when the host cannot say; `None` only when
+        /// neither can.
         system: Option<String>,
         /// Every output the chosen system offers. Snapshotted at open, like
         /// `systems` and `rates` - see `ports::AudioSetup::outputs`.
@@ -527,14 +530,11 @@ pub enum Dialog {
         /// at full and never turned down from the view the owner was in.
         existing: Vec<(usize, String, f32)>,
     },
-    /// Name the colours the app is wearing and write them to the user themes
-    /// folder. Stays open on failure so the typed name is not lost.
     /// **The quantize window**: every knob the feature has, in one place.
     ///
     /// Working copies, so a window somebody is fiddling with does not move
     /// anything until Apply. The grid here is the WINDOW'S own - see
-    /// `Settings::quantize_grid_exp` - because `Q` already quantizes to the
-    /// grid you can see and this is the other road.
+    /// `Settings::quantize_grid_exp` - and never the grid on screen.
     Quantize {
         grid_exp: i8,
         triplet: bool,
@@ -552,6 +552,8 @@ pub enum Dialog {
         /// find out. `None` when nothing is selected.
         target: Option<String>,
     },
+    /// Name the colours the app is wearing and write them to the user themes
+    /// folder. Stays open on failure so the typed name is not lost.
     SaveTheme {
         name: String,
         message: Option<String>,
@@ -1715,7 +1717,9 @@ pub enum DialogAction {
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
     SetBufferFrames(Option<u32>),
-    /// Milliseconds of render-ahead; zero is off. See
+    /// Milliseconds of render-ahead: zero is off, any negative is AUTO. Every
+    /// handler stores it through `Settings::sane_render_ahead`, never a bare
+    /// clamp - a clamp to `0..` is how Auto once turned into Off. See
     /// `Settings::render_ahead_ms`.
     SetRenderAhead(f64),
     /// **Quantize the current selection** with every knob stated.
@@ -9907,14 +9911,17 @@ fn show_on(
                             // **What these two rows mean under JACK.** The
                             // server runs one period and one rate for the whole
                             // graph and tells its clients what they are, so both
-                            // controls below are still worth SHOWING — they are
+                            // controls below are still worth SHOWING - they are
                             // what gets used the moment the system goes back to
-                            // ALSA — and are not worth pretending about while
-                            // JACK is selected. Said rather than greyed out
-                            // because this is the saved setting and the engine
-                            // falls back to ALSA when no server answered; the
-                            // Audio Status line reports the period actually
-                            // running either way, and it is the one to believe.
+                            // ALSA - and are not worth pretending about while
+                            // JACK is running. `system` is the RUNNING system
+                            // (`AudioSetup::active_system`; the saved one only
+                            // when nothing can say), so JACK chosen with no
+                            // server answering reads ALSA and the note stays
+                            // down - correctly, since ALSA's buffer is then the
+                            // one in force. The Audio Status line reports the
+                            // period actually running either way, and it is the
+                            // one to believe.
                             let jack_note = (system.as_deref() == Some("JACK")).then_some(
                                 "JACK sets this for the whole graph; change it in the server",
                             );
@@ -9992,7 +9999,10 @@ fn show_on(
                                     // what follows the OS when somebody
                                     // changes the default underneath, and a
                                     // user who picked a box by hand has to be
-                                    // able to get back to it.
+                                    // able to get back to it. Under ASIO it
+                                    // follows nothing: there is no system
+                                    // default, so it opens the first
+                                    // registered driver that answers.
                                     let on = output.is_none();
                                     if ui.selectable_label(on, "the system's own").clicked() && !on
                                     {
@@ -10093,9 +10103,14 @@ fn show_on(
                                 // **Auto is a negative**, resolved by the
                                 // engine against the buffer the device
                                 // hands over rather than fixed here: eight
-                                // callbacks, capped at 10.7 ms, which is
-                                // the setting that measured best at every
-                                // buffer size. See `GRAIN_AUTO_BLOCKS`.
+                                // buffers' worth, capped at `MAX_BLOCK` -
+                                // 512 frames: 10.7 ms at 48 kHz, 11.6 ms at
+                                // 44.1 kHz, 5.3 ms at 96 kHz - which is the
+                                // setting that measured best at every buffer
+                                // size. A fixed value is capped at the same
+                                // 512 frames (`set_grain_ms`), so the 10.7
+                                // chip is 5.3 ms at 96 kHz. See
+                                // `GRAIN_AUTO_BLOCKS`.
                                 pick(ui, "Auto", -1.0);
                                 for ms in [2.5_f64, 5.0, 10.7] {
                                     pick(ui, &format!("{ms:.1} ms"), ms);
@@ -15696,35 +15711,6 @@ at: None,
         );
     }
 
-    /// **The buffer chip and the readout above it cannot disagree about who
-    /// asked.**
-    ///
-    /// The owner's screen, in full:
-    ///
-    /// ```text
-    ///     OUTPUT  Scarlett 18i20 USB
-    ///             48000 Hz  20 ch  64 frames (1.3 ms)  - asked for 256, and
-    ///             the device gave this instead
-    ///     BUFFER SIZE   [Device]  64  128  256  512  1024  2048
-    /// ```
-    ///
-    /// "Device" is the SELECTED chip, and nobody typed 256. `pick_buffer`
-    /// resolves an unstated choice to `WANT_BUFFER_FRAMES`,
-    /// `StreamStats::buffer_frames` carries that number, and this readout
-    /// labelled it "asked for" — so the panel told him his interface had
-    /// refused a size he had never chosen, three rows above the chip saying he
-    /// had chosen nothing. His words: "Asked for doesn't equal got still ...
-    /// display is firm."
-    ///
-    /// Three numbers, and the panel used to name two. What the USER chose is
-    /// now read from `*buffer`, which is the same variable the chips are drawn
-    /// from — so the two are not merely kept in step, they are one value, and
-    /// this drives the real chip through a real `egui::Context` to say so:
-    /// read the sentence, PRESS 256, read it again.
-    ///
-    /// Revert-check: change the `(None, Some(a))` arm of `ask` back to a bare
-    /// `format!("asked for {a}")` and the first block goes red on the missing
-    /// attribution.
     /// **The OUTPUT row offers every device and answers a press.**
     ///
     /// ASIO has no default: cpal's ASIO host takes the first driver under
@@ -15829,6 +15815,35 @@ at: None,
         assert!(bare.says("none reported"), "an empty output list said nothing");
     }
 
+    /// **The buffer chip and the readout above it cannot disagree about who
+    /// asked.**
+    ///
+    /// The owner's screen, in full:
+    ///
+    /// ```text
+    ///     OUTPUT  Scarlett 18i20 USB
+    ///             48000 Hz  20 ch  64 frames (1.3 ms)  - asked for 256, and
+    ///             the device gave this instead
+    ///     BUFFER SIZE   [Device]  64  128  256  512  1024  2048
+    /// ```
+    ///
+    /// "Device" is the SELECTED chip, and nobody typed 256. `pick_buffer`
+    /// resolves an unstated choice to `WANT_BUFFER_FRAMES`,
+    /// `StreamStats::buffer_frames` carries that number, and this readout
+    /// labelled it "asked for" — so the panel told him his interface had
+    /// refused a size he had never chosen, three rows above the chip saying he
+    /// had chosen nothing. His words: "Asked for doesn't equal got still ...
+    /// display is firm."
+    ///
+    /// Three numbers, and the panel used to name two. What the USER chose is
+    /// now read from `*buffer`, which is the same variable the chips are drawn
+    /// from — so the two are not merely kept in step, they are one value, and
+    /// this drives the real chip through a real `egui::Context` to say so:
+    /// read the sentence, PRESS 256, read it again.
+    ///
+    /// Revert-check: change the `(None, Some(a))` arm of `ask` back to a bare
+    /// `format!("asked for {a}")` and the first block goes red on the missing
+    /// attribution.
     #[test]
     fn a_setup_panels_buffer_chip_and_its_readout_name_the_same_asker() {
         let out = crate::recorder::StreamStats {
@@ -16281,9 +16296,10 @@ at: None,
                 EXPORT_STEM_CHIPS[chip]
             );
         }
-        // And the default is PROCESSED — the mode that carries the mix's own
-        // sound, and the one the old single "Stems" option already produced
-        // for every source class that reached a rack at all.
+        // And the bare spec's default reads PROCESSED - but that is a spec
+        // with stems OFF, where this row is dead. Moving SOURCE to stems
+        // arrives on DRY (`set_export_source`), so this pins the field's
+        // default, not the mode an export arrives on.
         let spec = crate::ports::ProjectExportSpec::default();
         assert!(!spec.stems_dry);
         assert_eq!(EXPORT_STEM_CHIPS[export_stem_mode_chip(&spec)], "Processed");

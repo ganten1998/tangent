@@ -1327,12 +1327,17 @@ struct Spectral {
     /// attack and release move — a frame writes a TARGET and this follows
     /// it. Unity at rest.
     g_db: [f32; DENOISE_BANDS],
-    /// **No frame has been heard since the last reset**, so there is no
-    /// gain to follow FROM: the first frame takes its target outright. A
-    /// follower started at unity glided down at the RELEASE rate, and a bay
-    /// rebuilt under a live microphone reopened the room onto its noise at
-    /// full level for a quarter of a second. The target was right from the
-    /// first frame; only the follower lagged.
+    /// **No frame has been SUPPRESSED since the last reset**, so there is no
+    /// gain to follow FROM: the first frame `spectral_suppress` writes takes
+    /// its target outright. A frame that passes at unity first - a learn
+    /// pass, or a wire with nothing learned - returns before that and leaves
+    /// this standing. (The bank's own `Denoise::fresh` is spent on its first
+    /// tick, learning or not, so after a fresh unit's first learn this kernel
+    /// snaps onto the cut and the bank glides it in.) A follower started at
+    /// unity glided down at the RELEASE rate, and a bay rebuilt under a live
+    /// microphone reopened the room onto its noise at full level for a
+    /// quarter of a second. The target was right from the first frame; only
+    /// the follower lagged.
     fresh: bool,
     /// Each band's learned floor as energy, the print the opening rule
     /// measures a frame's band energy against. Laid down by `refloor`.
@@ -1774,7 +1779,10 @@ pub struct Denoise {
     tick_len: u32,
     phase: u32,
     /// **No tick has run since the bands were cleared**, so there is no cut
-    /// to smooth FROM: the first tick takes its target outright. The cut
+    /// to smooth FROM: the first tick takes its target outright. A LEARNING
+    /// tick is a tick too (its target is no cut), so a fresh unit made to
+    /// learn first still glides its first cut in; the spectral kernel's own
+    /// `fresh` waits for its first suppressing frame instead. The cut
     /// used to start at zero and climb at the RELEASE rate, and a bay rebuilt
     /// under a live microphone reopened the room onto its noise 13 dB over
     /// the settled level. One tick only: after it every move is smoothed

@@ -172,9 +172,15 @@ pub struct ClipView<'a> {
     /// visually see these things better".
     pub gain: f32,
     /// **Where the quantize window's detector finds attacks, and where it
-    /// would put them** - `(found, target)`, both in seconds from the start
-    /// of the FILE, so the same numbers work whatever the clip is trimmed
-    /// to. Empty unless that window is open over this clip.
+    /// would put them** - `(found, target)`, in seconds of the file AS THE
+    /// CLIP'S WARP MAP LEAVES IT, from the file's start: `found` is the attack
+    /// projected through the current map (`warp::project_frame`), so a take
+    /// quantized once wears its ticks on its hits, and the trim is subtracted
+    /// here, at the draw. Not through the clip's STRETCH: a stretched clip's
+    /// ticks stand in unstretched seconds. Every attack in the file arrives,
+    /// and a looped clip repeats ALL of them in every pass rather than only
+    /// those inside `offset_s .. offset_s + loop_s`, the span `wave_band`
+    /// folds each pass into. Empty unless that window is open over this clip.
     ///
     /// The owner asked for these: "the waveform should have transient marks
     /// shown as the different settings are tweaked in its menu". A
@@ -183,12 +189,6 @@ pub struct ClipView<'a> {
     pub marks: &'a [(f32, f32)],
 }
 
-/// One automation lane's contents, pushed in.
-///
-/// **Points in SCREEN-independent terms** — seconds and a normalised value —
-/// exactly as the document holds them. The panel turns them into pixels; it
-/// is handed nothing that has already been through a rect, so a resize
-/// cannot leave a stale coordinate behind.
 /// **A box being drawn over one automation row** to choose the nodes inside
 /// it: times in song seconds, values normalised, so the row draws it through
 /// the same two mappings its nodes use and the box and the nodes it lights
@@ -203,6 +203,12 @@ pub struct AutoMarquee {
     pub v1: f64,
 }
 
+/// One automation lane's contents, pushed in.
+///
+/// **Points in SCREEN-independent terms** — seconds and a normalised value —
+/// exactly as the document holds them. The panel turns them into pixels; it
+/// is handed nothing that has already been through a rect, so a resize
+/// cannot leave a stale coordinate behind.
 pub struct AutoView<'a> {
     pub param: crate::automation::AutoParam,
     /// **What to CALL it**, resolved by the app.
@@ -422,7 +428,8 @@ pub struct ArrangeView<'a> {
     /// **The theme's own accent**, `settings.white_key_active_color`: what
     /// an automation dial wears. See [`auto_dial_body`].
     pub accent: (u8, u8, u8),
-    /// Whether the master's row is drawn. `Cmd`/`Ctrl+M`; shown by default.
+    /// Whether the master's row is drawn. `Cmd`/`Ctrl+Shift+M` (plain
+    /// `Cmd`/`Ctrl+M` is the metronome panel); shown by default.
     pub show_master_row: bool,
     /// The master rack's six short names — empty for an empty bay.
     ///
@@ -836,8 +843,9 @@ pub enum RowKind {
     /// beside the master, and the owner's call was that the metronome is not
     /// a thing you arrange against; the desk is where its level lives.
     ///
-    /// `Cmd`/`Ctrl+M` hides it. Shown by default, because a control nobody
-    /// can find is a control nobody has.
+    /// `Cmd`/`Ctrl+Shift+M` hides it (plain `Cmd`/`Ctrl+M` is the metronome
+    /// panel). Shown by default, because a control nobody can find is a
+    /// control nobody has.
     Master,
 }
 
@@ -4495,19 +4503,25 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-/// What the grid box SAYS: bars as a power of two — "8", "1", "1/16".
-/// **The grid's step in QUARTER NOTES.**
+/// **The grid's step in QUARTER NOTES - the one authority on what a rung
+/// is.**
 ///
-/// A note value, not a fraction of the bar — which is what the box has always
-/// said and never meant. `exp = -2` is a quarter note, `-3` an eighth, `0` a
-/// whole note; the bar it lands in is irrelevant.
+/// A rung is not a fixed note value. `exp >= 0` is `2^exp` bars, so `0` is
+/// one bar whatever the meter. Below that the ladder halves the BAR while the
+/// half is still a whole number of beats, drops to the BEAT the first time a
+/// half would land between beats, and halves from there:
 ///
-/// The difference only shows in a meter whose bar is not a power of two of
-/// its own beat. In 4/4 a quarter of a bar IS a quarter note, so dividing the
-/// bar by four was right by accident for years. In 6/8 a bar is three
-/// quarters, so a quarter of it is a DOTTED EIGHTH — a line on nothing anyone
-/// plays, and a magnet that pulls notes to it. Six beats cannot be divided by
-/// four, and both this panel and the MIDI editor were trying.
+///   4/4  bar, 1/2, 1/4, 1/8 ...     3/4  bar, 1/4, 1/8 ...
+///   6/8  bar, dotted 1/4, 1/8 ...   7/8  bar, 1/8, 1/16 ...
+///
+/// Every rung divides the bar exactly. Every consumer of a grid exponent has
+/// to ask this, with the meter it is working in: the arrangement's lines
+/// (per bar), the gridbox (`grid_label_text`), the MIDI editor
+/// (`midi_editor::grid_step_s`) and the quantize `Grid` do. Two do not yet:
+/// the arrangement's magnet (`TangentApp::snap_quarter`, and `arr_grid_s`
+/// beside it) still divides the bar by `2^-exp`, which in 3/4, 6/8 and 7/8
+/// lands between these lines, and the quantize window spells its rungs in
+/// 4/4.
 pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     let beat = 4.0 / f64::from(unit.max(1));
     let per_bar = f64::from(beats.max(1));
@@ -5039,38 +5053,12 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     p.auto_ground[lane % 2]
 }
 
-/// **A clip's waveform from its pyramid, as one mesh.**
-///
-/// Two things at once, and the second is the larger.
-///
-/// The picture comes from `peaks` rather than from a host-drawn span: for
-/// every column the panel works out which seconds of the SOURCE stand under
-/// it — the clip's trim, and for a looped clip the fold back into its loop —
-/// and asks the pyramid for the lowest and highest sample there. So the
-/// wave is right at the zoom it is drawn at, on the frame the window moves,
-/// and the host is never asked to walk samples for a view change. The fold
-/// is the engine's own rule and the old host picture's: pass `k` plays
-/// `offset_s .. offset_s + loop_s` of the file again, and a column that
-/// straddles a seam reads on past the seam rather than wrapping, which is
-/// what `looped_span_envelope` did and what
-/// `a_looped_audio_clip_repeats_its_first_pass` holds.
-///
-/// And it is ONE shape. The column loop emitted a feathered `LineSegment`
-/// per pixel per clip — thirteen thousand shapes on a 1920-wide window with
-/// eight clips, each tessellated as a stroke with end caps (eight vertices,
-/// sixteen triangles), 0.63 ms a frame before a single pixel was painted.
-/// A min/max band is two vertices per column and two triangles between
-/// neighbours; the tessellator passes a mesh through. The look is kept:
-/// at each column the band spans exactly the rows the stroke did (held to
-/// a point by `the_band_from_the_pyramid_covers_the_rows_the_columns_did`),
-/// and between columns it joins them, which is the outline a waveform has
-/// always been. A silent column keeps a one-point floor so a flat stretch
-/// still reads as a line at every pixel density.
-///
-/// A column outside the clip's own seconds (a rounding hair at either end)
-/// breaks the band, and the next one starts a new run — never a triangle
-/// across a gap. The pyramid's answer is finite and clamped by contract, so
-/// no column can carry a NaN into the mesh.
+/// **The colour a detected attack is marked in.** Amber, and not the
+/// clip's own ink: these are an answer laid OVER the picture, and one drawn
+/// in the picture's colour reads as part of it. Named so a test can find
+/// them among everything else vertical on the surface.
+pub(crate) const MARK_INK: Color32 = Color32::from_rgb(0xFF, 0xC3, 0x4D);
+
 /// **The quantize window's marks over one clip's body.**
 ///
 /// `(found, target)` in seconds from the start of the FILE - the clip's own
@@ -5081,12 +5069,6 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
 ///
 /// **Tall, and full height.** These are answers to "where", and a mark that
 /// only reaches the middle of the wave reads as part of the wave.
-/// **The colour a detected attack is marked in.** Amber, and not the
-/// clip's own ink: these are an answer laid OVER the picture, and one drawn
-/// in the picture's colour reads as part of it. Named so a test can find
-/// them among everything else vertical on the surface.
-pub(crate) const MARK_INK: Color32 = Color32::from_rgb(0xFF, 0xC3, 0x4D);
-
 fn draw_clip_marks(
     painter: &Painter,
     r: Rect,
@@ -5144,6 +5126,38 @@ fn draw_clip_marks(
     }
 }
 
+/// **A clip's waveform from its pyramid, as one mesh.**
+///
+/// Two things at once, and the second is the larger.
+///
+/// The picture comes from `peaks` rather than from a host-drawn span: for
+/// every column the panel works out which seconds of the SOURCE stand under
+/// it — the clip's trim, and for a looped clip the fold back into its loop —
+/// and asks the pyramid for the lowest and highest sample there. So the
+/// wave is right at the zoom it is drawn at, on the frame the window moves,
+/// and the host is never asked to walk samples for a view change. The fold
+/// is the engine's own rule and the old host picture's: pass `k` plays
+/// `offset_s .. offset_s + loop_s` of the file again, and a column that
+/// straddles a seam reads on past the seam rather than wrapping, which is
+/// what `looped_span_envelope` did and what
+/// `a_looped_audio_clip_repeats_its_first_pass` holds.
+///
+/// And it is ONE shape. The column loop emitted a feathered `LineSegment`
+/// per pixel per clip — thirteen thousand shapes on a 1920-wide window with
+/// eight clips, each tessellated as a stroke with end caps (eight vertices,
+/// sixteen triangles), 0.63 ms a frame before a single pixel was painted.
+/// A min/max band is two vertices per column and two triangles between
+/// neighbours; the tessellator passes a mesh through. The look is kept:
+/// at each column the band spans exactly the rows the stroke did (held to
+/// a point by `the_band_from_the_pyramid_covers_the_rows_the_columns_did`),
+/// and between columns it joins them, which is the outline a waveform has
+/// always been. A silent column keeps a one-point floor so a flat stretch
+/// still reads as a line at every pixel density.
+///
+/// A column outside the clip's own seconds (a rounding hair at either end)
+/// breaks the band, and the next one starts a new run — never a triangle
+/// across a gap. The pyramid's answer is finite and clamped by contract, so
+/// no column can carry a NaN into the mesh.
 fn wave_band(
     painter: &Painter,
     r: Rect,
@@ -9196,7 +9210,7 @@ ArrangeView {
 
 
     /// **The MASTER heads the track list, at a full track's height, in the
-    /// mixer's own colours — and `Cmd`/`Ctrl+M` hides it.**
+    /// mixer's own colours — and `Cmd`/`Ctrl+Shift+M` hides it.**
     ///
     /// The desk draws a strip for it and the timeline drew none, so a
     /// session's output level was reachable from one view and not the other.

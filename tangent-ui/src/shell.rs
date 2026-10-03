@@ -645,11 +645,12 @@ pub struct SurfaceReport {
     /// [`Chrome`] surface ever says so: it is the one whose input the main
     /// window cannot see, so somebody has to carry the key back.
     pub cycle_theme: bool,
-    /// **The transport key, pressed in a plugin window.** Space, through the
-    /// one keymap. A non-modal window is one you are meant to leave open
-    /// while you work, and on the desktop it is a real child window - so
-    /// without this the main window is unfocused for as long as it is up and
-    /// nothing can be played. See `chrome_gesture`.
+    /// **The transport key, pressed in a window wearing the chrome bar** - a
+    /// plugin's, or the quantize window. Space, through the one keymap. A
+    /// non-modal window is one you are meant to leave open while you work,
+    /// and on the desktop it is a real child window - so without this the
+    /// main window is unfocused for as long as it is up and nothing can be
+    /// played. See `ChromeGesture`, which `draw_chrome_bar` fills.
     pub transport: bool,
 }
 

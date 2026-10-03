@@ -454,21 +454,28 @@ const LOOP_BAR_W: f32 = 3.0;
 ///
 /// Generous against the three points it is drawn at, because the thing being
 /// aimed at is a line — the same bargain `EDGE_SLOP` makes around a note's
-/// border. Symmetric, unlike a note's, because the bar sits at the clip's
-/// right END: half of the target a hand naturally aims at is on the empty side
-/// past the clip, where there is nothing else to hit.
+/// border. Symmetric, unlike a note's, because the bar often sits at the
+/// clip's right END (always, on a clip that shows one pass): half of the
+/// target a hand naturally aims at is on the empty side past the clip, where
+/// there is nothing else to hit.
 ///
 /// `pub` for the app's own drag test, which measures the grab it presses at
 /// rather than restating the number.
 pub const LOOP_BAR_GRAB: f32 = 5.0;
 
-/// **Where the loop's right end stands on the roll**, or nothing.
+/// **Where the loop turns over on the roll**, or nothing.
 ///
-/// `None` on a clip that does not loop — every audio clip, and every MIDI
-/// clip glued or written before looping existed — and `None` when that second
+/// `None` on a clip that does not loop (`loop_s` at or under a microsecond -
+/// a document written before looping existed), and `None` when that second
 /// is off the roll: a bar drawn where it cannot be seen is a bar a hand can
 /// never find, and one hit-tested off the roll would claim presses on the
 /// piano column or past the right edge.
+///
+/// It stands where the pass the roll draws turns over,
+/// `midi_loop_origin_s + loop_s`: the clip's end only while the clip shows
+/// exactly that one pass, inside the clip once it is pulled out to more
+/// passes, and `offset_s` sooner than `start_s + loop_s` on a part trimmed
+/// from its front.
 ///
 /// The one authority for the bar, like every other pair in this file: the
 /// painter and the hit test both come here, so what is drawn is what answers.
@@ -568,7 +575,13 @@ pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
 }
 
 /// `t`, magnetised to the grid's own lines — straight, triplet or swung.
-/// The ONE authority: the drawn lines call the same maths.
+///
+/// Delegates to [`Grid::nearest`](crate::quantize::Grid::nearest) through
+/// [`view_grid`], the one authority on where a line is, so a quantize on the
+/// same grid lands where the magnet does by construction. `snap_floor_t`,
+/// `snap_next_t` and `grid_lines` still spell the swung pair themselves; only
+/// `the_grid_snaps_straight_triplet_and_swung` (one point per shape) checks
+/// that what snaps is a line the grid draws.
 pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     if !view.snap_on {
         return t.max(0.0);
@@ -1673,9 +1686,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // ARE and this is where the part ends.
     //
     // The tab in the ruler is what says "pull me". A bare line through the
-    // roll reads as the clip's edge, which it also is, and an edge is not
-    // obviously a handle; a tab standing on the ruler is, and it puts a piece
-    // of the target in a band that no note can ever cover.
+    // roll reads as the clip's edge, which on a one-pass clip it also is,
+    // and an edge is not obviously a handle; a tab standing on the ruler is,
+    // and it puts a piece of the target in a band that no note can ever
+    // cover.
     if let Some(x) = loop_bar_x(&l, view) {
         let half = LOOP_BAR_W * 0.5;
         painter.rect_filled(
@@ -2295,8 +2309,11 @@ mod tests {
     /// delegates to `Grid::nearest`, and this is what notices if somebody
     /// gives the editor a local implementation again. The app has already
     /// paid once for a magnet that pointed somewhere the drawn lines did not
-    /// - the box said "1/2" and it snapped eighths - and a quantize that
-    /// disagreed with the magnet would be the same bug wearing a menu item.
+    /// - the box said "1/2" and it snapped eighths - and a quantize whose
+    /// arithmetic disagreed with the magnet's on the same grid would be the
+    /// same bug again. (The quantize window aims at a grid of its own by
+    /// design - `Settings::quantize_grid_exp` - so what is held here is the
+    /// arithmetic, not which grid.)
     ///
     /// Swept across straight, triplet and swung grids: two implementations
     /// agreeing on one number is luck, and agreeing across a sweep is a

@@ -344,10 +344,13 @@ fn adopt_queued_taps(
 
 /// What a take says when the desk it was given cannot reach it any more.
 ///
-/// A take through a dead tap is silence, and a silent take used to be only a
-/// WARNING on an otherwise ordinary "Recorded 0:15 of audio" line - true, and
-/// no help at all, because the file is empty for a reason that has nothing to
-/// do with what was played.
+/// A take through a dead tap is silence when an input writer carries it (it
+/// writes the desk's zeros at the input's pace) and an EMPTY file when the
+/// instrument writer does (no frames arrive, and the manifest leaves the file
+/// out of `files`), though this message says "silence" for both. A silent take
+/// used to be only a WARNING on an otherwise ordinary "Recorded 0:15 of audio"
+/// line - true, and no help at all, because the file is silent or empty for a
+/// reason that has nothing to do with what was played.
 const DEAD_TAP: &str = "nothing from the desk reached this take - the audio engine it \
      was listening to is no longer running, so the file is silence";
 
@@ -411,8 +414,9 @@ impl Writer {
                 };
                 // **The capture ring is popped and thrown away, every time.**
                 //
-                // The input reaches the file through the DESK — see
-                // `TakeSource` — where it has already been given its fader, its
+                // The input reaches the file through the DESK (`mix_plugin`,
+                // below; the `TakeSource` setting that once offered another
+                // road is gone), where it has already been given its fader, its
                 // send and the master's limiter. Adding these samples too would
                 // be the same microphone twice.
                 //
@@ -1336,31 +1340,6 @@ impl Session {
         self.last.as_ref()
     }
 
-    /// Put out every clip latch the band can show, because the user just said
-    /// they have seen it.
-    ///
-    /// **All of them, or the light does not go out.** The indicator is an OR
-    /// across latches that arrive by different paths — the live input tracker,
-    /// the instrument bus's own, and the take summary — and clearing all but
-    /// one is a dismiss button that appears not to work.
-    /// The engine's is cleared by the caller, which is the only one holding it.
-    ///
-    /// **Each of them is TWO latches, and that is the bug this comment used to
-    /// describe wrongly.** The `AudioMeters` behind these mutexes are a
-    /// published COPY. The original lives in the `LevelTracker` on the writer
-    /// thread, and `Writer::pump` copies it over the published one every cycle
-    /// — so clearing the copies alone was undone within about 4 ms, forever,
-    /// for as long as the stream stayed open. The symptom was precise and
-    /// bizarre: the lamp could be cleared only while NO input was selected,
-    /// because unselecting one destroys the thread that owns the latch.
-    ///
-    /// So the copies are cleared here — that is what makes the lamp go dark on
-    /// this frame rather than the next poll — and the command clears the
-    /// sources, so it stays dark.
-    /// Hand the live-monitor tap to whoever will play it, once.
-    ///
-    /// Taken rather than borrowed: the ring's read end belongs to exactly one
-    /// consumer, and that is the engine's render thread.
     /// Choose different inputs on the OPEN device.
     ///
     /// **The whole point of the device-wide rings**: this used to be a close
@@ -1401,6 +1380,10 @@ impl Session {
         self.picks
     }
 
+    /// Hand the live-monitor tap to whoever will play it, once.
+    ///
+    /// Taken rather than borrowed: the ring's read end belongs to exactly one
+    /// consumer, and that is the engine's render thread.
     pub fn take_monitor(
         &mut self,
     ) -> Option<(
@@ -1413,6 +1396,27 @@ impl Session {
         self.audio.as_mut().and_then(|a| a.monitor.take())
     }
 
+    /// Put out every clip latch the band can show, because the user just said
+    /// they have seen it.
+    ///
+    /// **All of them, or the light does not go out.** The indicator is an OR
+    /// across latches that arrive by different paths — the live input tracker,
+    /// the instrument bus's own, and the take summary — and clearing all but
+    /// one is a dismiss button that appears not to work.
+    /// The engine's is cleared by the caller, which is the only one holding it.
+    ///
+    /// **Each of them is TWO latches, and that is the bug this comment used to
+    /// describe wrongly.** The `AudioMeters` behind these mutexes are a
+    /// published COPY. The original lives in the `LevelTracker` on the writer
+    /// thread, and `Writer::pump` copies it over the published one every cycle
+    /// — so clearing the copies alone was undone within about 4 ms, forever,
+    /// for as long as the stream stayed open. The symptom was precise and
+    /// bizarre: the lamp could be cleared only while NO input was selected,
+    /// because unselecting one destroys the thread that owns the latch.
+    ///
+    /// So the copies are cleared here — that is what makes the lamp go dark on
+    /// this frame rather than the next poll — and the command clears the
+    /// sources, so it stays dark.
     pub fn clear_clip(&mut self) {
         self.clipped = false;
         for (m, cmds) in [
@@ -1679,11 +1683,6 @@ impl Session {
         self.audio.is_some() || self.plugin_audio.is_some()
     }
 
-    /// Which sources the next take is made of. Ignored mid-take: a take that
-    /// changed what it was recording halfway through would produce a file
-    /// matching neither answer.
-    /// The take's time signature. Ignored mid-take, like the source: a `.mid`
-    /// whose bar lines changed halfway through is a file nobody can edit.
     /// The next take's placement facts, pushed each frame so `begin` can
     /// latch them at the one moment they are true of anything: where the
     /// playhead is, whether the transport is rolling (a take no longer rolls
@@ -1718,6 +1717,11 @@ impl Session {
         }
     }
 
+    /// The take's time signature: how long a count-in beat lasts on the wall
+    /// clock, how the glass folds that count into bars, and the meter the
+    /// `.mid` is written with. Ignored while a take is active, count-in
+    /// included: a `.mid` whose bar lines changed halfway through is a file
+    /// nobody can edit.
     pub fn set_meter(&mut self, meter: tangent_ui::recorder::TimeSignature) {
         if !self.state.is_active() {
             self.meter = meter;
@@ -2116,10 +2120,16 @@ impl Session {
     ///
     /// **The beat number comes from the wall clock, not from the audio
     /// thread's sample count**, and the click the user hears comes from the
-    /// audio thread. They are two clocks, so in principle they can disagree —
-    /// in practice a count-in is at most eight beats, four seconds at 120, and
-    /// the two differ by well under a millisecond over that. Worth knowing
-    /// about; not worth a lock-free beat channel to fix.
+    /// audio thread. They are two clocks, and they agree only while the
+    /// engine counts one click per beat of the signature: the engine's count
+    /// is `beats` CLICKS at the click's division (`Shared::metronome_div`),
+    /// this one is `beats` beats of the signature, and the go the host arms
+    /// T0 (`arm_at`) and Play-on-go from is the ENGINE's. Even at one click a
+    /// beat the two land within about a buffer of each other - the engine
+    /// starts its count at its next callback and latches the go when it
+    /// renders it - so whichever a UI frame sees first decides whether T0 is
+    /// the heard downbeat or that frame's `now` (in one frame, the host's
+    /// handover runs first).
     pub fn tick(&mut self, root: &std::path::Path, name: Option<&str>) -> bool {
         let Some(from) = self.count_in_from else {
             return false;

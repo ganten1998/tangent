@@ -357,8 +357,12 @@ mod mac {
 
     fn resolve(device: Option<&str>) -> Option<AudioObjectID> {
         let Some(wanted) = device else {
-            // No name means the app took the system default, which is what
-            // `Engine::start(None)` does and what almost every session runs.
+            // No name means the system DEFAULT output device. A session may
+            // run a CHOSEN device instead (`Settings::audio_output_device`),
+            // so anything that watches the RUNNING output must pass the name
+            // the engine opened - `OutputInfo::device`, cpal's own name for
+            // it, which is the `kAudioObjectPropertyName` matched below - and
+            // never `None`. (`RatePoll`, in desktop.rs, still asks `None`.)
             let id: AudioObjectID = get(SYSTEM_OBJECT, &PropertyAddress::global(DEFAULT_OUTPUT))?;
             return (id != 0).then_some(id);
         };

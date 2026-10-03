@@ -9,13 +9,25 @@
 //!
 //! # Where the grid comes from
 //!
-//! Not from here. [`Grid::from_document`] takes the same terms the drawn
-//! lines take — the grid exponent, the meter, the tempo, triplet and swing —
-//! and [`arrangement_panel::grid_quarters`](crate::arrangement_panel::grid_quarters)
-//! stays the one authority on what a grid step IS. A quantize that aimed at
-//! its own idea of the grid would be a magnet pointing somewhere the eye
-//! cannot see, and this app has already paid for that once: the box said
-//! "1/2" while the magnet snapped eighths.
+//! Not from here. [`Grid::from_document`] takes a grid exponent, ONE meter,
+//! ONE tempo, triplet and swing, and asks
+//! [`arrangement_panel::grid_quarters`](crate::arrangement_panel::grid_quarters) -
+//! the one authority on what a grid step IS - how long a step is.
+//!
+//! **A `Grid` is uniform from 0:00**: its lines stand at `k * step`, and
+//! swung pairs and triplet runs are counted from 0:00 too. That is the grid
+//! the arrangement draws only while the song's tempo and meter are constant,
+//! and - for triplet and swing - only while a bar holds a whole number of
+//! steps (of pairs, when swung). Both callers (`quantize_ask_of` and
+//! `quantize_window_grid`) hand it the session's one `tempo_bpm()` and one
+//! `time_signature()`, so after a tempo or meter change a quantize aims at
+//! lines nobody can see.
+//!
+//! Whoever LABELS a grid has to spell it in the meter it quantizes in -
+//! `grid_label_text` with the same `(beats, unit)` - or it is a magnet
+//! pointing somewhere the eye cannot see, and this app has already paid for
+//! that once: the box said "1/2" while the magnet snapped eighths. (The
+//! quantize window's GRID chips do not yet: they are spelled in 4/4.)
 //!
 //! # The three knobs, and why each exists
 //!
@@ -79,7 +91,9 @@ impl Grid {
         })
     }
 
-    /// **The grid the document is drawing**, in the document's own terms.
+    /// **The grid the document is drawing**, in the document's own terms -
+    /// while its tempo and meter are constant: this takes one of each (see
+    /// the module header).
     ///
     /// `triplet` and `swing` are mutually exclusive in this app — a swung
     /// triplet grid is two answers to one question — and the editor already
@@ -119,9 +133,10 @@ impl Grid {
     ///
     /// The straight case is a round. The swung case walks the three
     /// candidates that can straddle `t` — the pair's head, its swung
-    /// off-beat, and the next pair's head — which is what the editor's
-    /// magnet does, line for line. `a_full_strength_quantize_lands_where_the_magnet_would`
-    /// holds the two together.
+    /// off-beat, and the next pair's head. The editor's magnet IS this
+    /// function - `midi_editor::snap_t` delegates through `view_grid` - and
+    /// `a_full_strength_quantize_lands_where_the_magnet_would` holds that
+    /// wiring.
     #[must_use]
     pub fn nearest(self, t: f64) -> f64 {
         if !t.is_finite() {
@@ -157,7 +172,8 @@ pub struct Quantize {
 
 impl Quantize {
     /// A full-strength quantize with no window: the plain "put it on the
-    /// grid" that a menu item means when it offers no knobs.
+    /// grid", with no knobs to turn. Only tests build one today: the
+    /// quantize window's Apply states every knob.
     #[must_use]
     pub fn full(grid: Grid) -> Self {
         Self { grid, strength: 1.0, window: None }
@@ -183,7 +199,9 @@ impl Quantize {
         t + (target - t) * strength
     }
 
-    /// [`place`](Self::place) in FRAMES, which is what both documents hold.
+    /// [`place`](Self::place) in FRAMES, for a caller that counts them.
+    /// Nothing outside this module's tests calls it: notes are held in
+    /// seconds, and the host's `quantize_map` places seconds too.
     ///
     /// The rate arrives here rather than living in the grid for the reason
     /// [`Grid`]'s own comment gives: the grid is musical and the rate is not.

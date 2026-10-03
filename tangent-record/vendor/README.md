@@ -82,12 +82,16 @@ directory, drop the `exclude` line from the root `Cargo.toml`, and put
 # Vendored `cpal`
 
 `cpal/` is [`cpal` 0.16.0](https://github.com/RustAudio/cpal) (Apache-2.0) with
-**one host added and three things the backends got wrong about their own
+**one host added and four things the backends got wrong about their own
 errors**. The host is behind `#[cfg(target_os = "freebsd")]`; of the other
-three, two are in the JACK backend — which compiles only where the `jack`
-feature is on — and one is in the ALSA host, which macOS and Windows never
-compile either. So those two platforms still build the code they built from
-crates.io and produce the same binary. That constraint is the whole discipline
+four, two are in the JACK backend, which compiles only where the `jack`
+feature is on, one is in the ALSA host, which macOS and Windows never
+compile, and one is in the ASIO host, which compiles only under
+`#[cfg(all(windows, feature = "asio"))]`. So macOS still builds the code it
+built from crates.io and produces the same binary; so does Windows WITHOUT
+`asio`, but every Windows build meant for a user has it (`release.sh` fails
+a Windows build that lacks the ASIO notice), so the Windows binary Tangent
+ships carries the sixth change below. That constraint is the whole discipline
 here: `[patch.crates-io]` is not target-conditional, so this copy is what
 *every* platform builds, and the moment it diverges where an unfeatured
 platform can see it, it stops being a patch and becomes a fork of everybody's
@@ -99,13 +103,14 @@ change" below. It is a lint attribute and emits no code, so "the same binary"
 above still holds exactly; it is called out here rather than buried because the
 rule it brushes against is the one rule this directory has.
 
-The three are one finding wearing three hats, and it is worth saying once
-here: **cpal's error callback is the only channel its backends have, and they
-each use it wrongly.** JACK sends a routine buffer-size NOTIFICATION down it,
+The four are one finding wearing four hats, and it is worth saying once
+here: **cpal's backends report their own errors wrongly, each in its own
+way.** JACK sends a routine buffer-size NOTIFICATION down the error callback,
 so a host that believes a stream error rebuilds forever. ALSA sends nothing at
-all for an underrun, so a host cannot see a glitch it is never told about. One
-backend cries wolf and the other stays silent, and a host cannot be correct
-against both without knowing this.
+all for an underrun, so a host cannot see a glitch it is never told about.
+ASIO printed a stream-build failure to a stdout a windowed binary does not
+have and reported `DeviceNotAvailable`. One backend cries wolf and the others
+stay silent, and a host cannot be correct against them without knowing this.
 
 ## Why
 
@@ -310,18 +315,23 @@ and now hand the sentence to the caller instead:
 .map_err(|e| BackendSpecificError { description: e.to_string() }.into())
 ```
 
-**The same finding as the other three, in a fourth hat.** A driver refusing a
-buffer size, a sample rate and an unsupported sample format are three different
-faults, and all three arrived at the host as `DeviceNotAvailable` — three words
-that say only "there is no device", which is the one thing that was not true.
-The sentence that named the real fault went to `stdout`, and a windowed Windows
-binary has no console attached: it was written to a handle nobody owns and lost.
+**The same finding as the other three, in a fourth hat.** A requested buffer
+size the driver cannot take, a failing `ASIOGetBufferSize`, a driver that
+cannot be stopped or have its buffers disposed, and a refused
+`ASIOCreateBuffers` are different faults, and all of them arrived at the host
+as `DeviceNotAvailable`: three words that say only "there is no device", which
+is the one thing that was not true. (A refused sample rate or an unsupported
+sample format never reached these two sites: `check_config` runs first and
+answers `StreamConfigNotSupported`, or a `build_stream_err` mapping, for
+those.) The sentence that named the real fault went to `stdout`, and a windowed
+Windows binary has no console attached: it was written to a handle nobody owns
+and lost.
 
 That is not a theoretical loss. It is how a user on a Komplete Audio 6 MK2 came
 to report only that "ASIO doesn't work" — nothing anywhere on his machine could
-have told him, or us, which of the three it was. `build_stream_err` twenty lines
-below already uses exactly this shape for every OTHER ASIO failure, so this is
-the file being made consistent with itself rather than a new idea.
+have told him, or us, which of them it was. `build_stream_err` at the bottom of
+the same file already uses exactly this shape for every OTHER ASIO failure, so
+this is the file being made consistent with itself rather than a new idea.
 
 **Inside the discipline this directory is built on.** The ASIO host compiles
 only under `#[cfg(all(windows, feature = "asio"))]`, so macOS, Linux and FreeBSD

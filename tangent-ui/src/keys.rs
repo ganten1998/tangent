@@ -41,17 +41,27 @@ pub enum KeyAction {
     ManageTaughtChords,
     ToggleChordLearning,
     ToggleNotePreference,
-    /// §5: START a take.
+    /// §5: record the ARRANGEMENT - the red button's request (`Toggle`): start
+    /// one (with the count-in from settings, or joining a take's count already
+    /// running), cancel its count, or finish it. Never the take: a take is
+    /// capture only, and the cassette is its whole interface.
     ///
-    /// Separate from stopping, which is the owner's call and the right one: one
-    /// key that does both means the key that begins a performance is the same
-    /// one that ends it, and the difference between the two is a state you
-    /// cannot see from the bench. Enter starts, Space stops.
+    /// **Bound to no key today**: Enter was, and went to the MIDI editor;
+    /// Cmd+R reaches the red button directly, beside undo in `paint`. Its arm
+    /// in `apply_key_action` still refuses while a take is writing, which
+    /// Cmd+R and the red button do not - a key pointed here should lose that
+    /// guard first.
     ///
-    /// The first binding here that is not always live — see [`Gates`].
+    /// Gated with Space - see [`Gates`].
     StartRecording,
-    /// §5: STOP a take. Space, because that is what every transport in every
-    /// DAW the user already owns is bound to.
+    /// Space: the TRANSPORT's key. It stops whatever is rolling - the song or
+    /// the arrangement's record - and the playhead goes back to the edit
+    /// cursor; idle on the desk or the timeline it plays from there. On the
+    /// piano view it is also the chord audition (a hold, see `audition_tick`):
+    /// idle it sounds the lit chord instead of playing, and over a rolling
+    /// song it both stops the song and sounds the chord. It never reaches a take
+    /// (`RecorderRequest::Stop` does not end one), and it is refused under a
+    /// realtime export, which the band's own Stop cuts short.
     StopRecording,
     /// Raise the recorder band, or put it away.
     ///
@@ -110,17 +120,16 @@ pub enum KeyAction {
 pub struct Gates {
     /// The Recorder band is showing.
     ///
-    /// Space toggles recording, and it is gated on the band being OPEN rather
-    /// than on the host merely being able to record: a user who has never
-    /// opened the recorder must not start a take by pressing the widest key on
-    /// the keyboard while reaching for something else. Opening the band is the
-    /// consent, and it is one right-click away.
+    /// Space is gated on the band being OPEN because the engine is: the host
+    /// opens the audio path when the band opens and drops it when the band
+    /// closes (`recorder_band_open`), so with the band hidden there is nothing
+    /// for Space to play, stop or audition through. It cannot start or end a
+    /// take - only the cassette does.
     ///
-    /// Note for whoever wires this up: the band owns a take-name text field. A
-    /// space typed into it must not also hit the transport, so `app.rs` has to
-    /// keep `pressed` away from a frame where a text field holds keyboard
-    /// focus — the same reasoning that already keeps it away from dialogs and
-    /// the open menu.
+    /// A field being typed into - the take name, a typed number - must not
+    /// also hit the transport; `app.rs` keeps every shortcut away from such a
+    /// frame through `text_entry_active`, in the same condition that keeps
+    /// them away from dialogs and the open menu.
     pub recorder_shown: bool,
     /// This host can record at all — `Caps::capture_devices`.
     ///
@@ -275,8 +284,10 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // cycle with no key the card was honest about. Its row wears its own
     // words rather than Tab's; see `card_rows`.
     (Key::F6, "F6", KeyAction::ToggleMixer, true),
-    // §5: one button, not arm-then-record, and Space because that is what every
-    // transport in every DAW the user already owns is bound to.
+    // Space is PLAY / STOP - what every transport in every DAW the user already
+    // owns is bound to - and it never starts, stops or cancels a take. (On the
+    // piano view it auditions the lit chord instead of playing; see
+    // `KeyAction::StopRecording`.)
     //
     // LAST of the listed rows on purpose. These are the only GATED ones, so
     // they are the only ones that can appear and disappear; at the end of the
@@ -285,17 +296,16 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // single letter, which is why the key column is measured rather than
     // assumed — see `key_col_w`.
     // **Enter is NOT bound here**, and the gap is the point. It was
-    // `StartRecording`, on the argument in the paragraph below that the key
-    // which begins a performance must not be the one that ends it. Cmd+R
-    // begins and ends it — one chord, a toggle, on the card as `C-R` — and a
-    // second binding on a bare, enormous, centre-of-the-keyboard key is a
-    // take started by every stray press. The owner, once the MIDI editor
-    // wanted Enter for writing a note: "Remove enter for record -- we already
-    // have command r."
+    // `StartRecording`, on the argument that the key which begins a
+    // performance must not be the one that ends it. Cmd+R toggles the
+    // arrangement's record - one chord, on the card as `C-R` - and a second
+    // binding on a bare, enormous, centre-of-the-keyboard key is a recording
+    // started by every stray press. The owner, once the MIDI editor wanted
+    // Enter for writing a note: "Remove enter for record -- we already have
+    // command r."
     //
-    // `StartRecording` keeps its variant, its gate and its words: nothing
-    // reaches it from this table today, and a future key can be pointed at it
-    // without rebuilding what it means.
+    // `StartRecording` keeps its variant, its gate and its arm; nothing
+    // reaches it from this table today.
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
@@ -556,7 +566,8 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Mixer => rows.extend([
             ("R-CLK", "channel: the track menu · loaded insert: delete / replace"),
             ("2-CLK", "rename a channel · reset a fader"),
-            ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
+            ("A-ARM", "alt-click R, M or S: that strip alone - again: none"),
+            ("S-ARM", "shift-click R, M or S: that strip only, not the selection"),
             ("A-CLK", "alt-click an insert: empty the bay"),
             ("S-CLK", "shift-click an insert: bypass it - the plugin stays"),
             ("DEL", "remove the selected channel"),
@@ -570,7 +581,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("S-2", "shift+2: the arrangement"),
         ]),
         HelpView::Arrange => rows.extend([
-            ("DRAG", "move a clip · edges trim · corners fade"),
+            ("DRAG", "move a clip · edges trim · corners fade · chosen nodes move as one"),
             // **Cmd, not shift.** The owner moved the creation gesture onto
             // the command key and unbound shift from it entirely; the card is
             // the only place in the app that says what the gesture IS, so a
@@ -589,13 +600,15 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // lane" and "a node" rather than naming the two surfaces. The
             // ramp toggle is the one thing a tempo point has that an
             // automation node does not, so it alone gets a row of its own.
-            ("S-CLK", "shift-click a lane: drop a node · a node: add it · an insert bay: bypass it"),
+            ("S-CLK", "shift-click a lane: drop a node · a node: choose or let go · a bay: bypass it"),
+            ("BOX", "drag an automation row's empty room: choose the nodes inside"),
             ("S-PT", "shift-click a tempo point: ramp or step"),
             ("DIAL", "an automation row's dial: the lane's base · 2-click resets"),
             ("2-CLK", "double-click a MIDI item: open its editor"),
-            ("DEL", "delete the selected clips · nodes · track"),
-            ("A-CLK", "alt-click: empty an insert bay · remove a node"),
+            ("DEL", "delete the selected clips · nodes · close a chosen row · else the track"),
+            ("A-CLK", "alt-click: empty an insert bay · remove a node (right-click too)"),
             ("R-CLK", "empty room: the app menu · header: the track menu · loaded insert: delete / replace"),
+            ("SEAM", "the header's edge: drag to size the headers · click: playhead home"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport"),
             ("A-DRG", "alt-drag empty room: move the viewport"),
@@ -604,7 +617,8 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("-/=", "zoom out / in, in steps, around the playhead"),
             ("L/R", "left / right: the playhead a grid step · shift: a bar"),
             ("W", "fit the biggest clip - empty: the shipped zoom"),
-            ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
+            ("A-ARM", "alt-click the arm dot, M or S: that track alone - again: none"),
+            ("S-ARM", "shift-click the arm dot, M or S: that track only, not the selection"),
             ("C-T", "ctrl+T: a new track"),
             ("C-C/V/X", "copy · paste · cut the selected clips - or nodes"),
             ("C-F", "group the selection into a folder"),
@@ -618,22 +632,24 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // the one nobody would guess from the word "glue", so it is the
             // half that has to be on the card.
             ("C-G", "glue the selected clips on a track - or one that repeats - into one"),
-            // **C-A opens the selected track's automation lanes** - the A on
-            // its header, from the keyboard. The editor keeps the same chord
-            // for selecting its notes; out here it was free.
-            ("C-A", "open the selected track's automation lanes"),
+            // **C-A opens the selected track's automation menu** - the menu
+            // its wrench opens, from the keyboard. The editor keeps the same
+            // chord for selecting its notes; out here it was free.
+            ("C-A", "the selected track's automation menu - what its wrench opens"),
             // C-S-N, not C-N: the handler requires shift, and only audio
             // comes up — a note's velocity is a performance, not a level.
             ("C-S-N", "normalise the selected audio clips"),
             // **The same letter as the editor's Q**, and the card says so
-            // on both sides: in here it moves audio onto the grid, in the
-            // editor it moves notes. Audio only, for the same reason
-            // normalise is — a note is moved where notes are edited.
+            // on both sides: Q opens the quantize window, which acts on notes
+            // while the editor is open and on the selected AUDIO otherwise -
+            // or, when a track header was the last thing picked, on that
+            // track's audio. MIDI out here is skipped, for the reason
+            // normalise skips it: a note is moved where notes are edited.
             ("Q", "the quantize window - grid, strength, window, feel"),
             // **C-M is the metronome now** and the master row took shift
             // with it - the owner's call, and the card is where a moved
             // shortcut has to be said or it is simply lost.
-            ("C-M", "the metronome panel, at the pointer"),
+            ("C-M", "the metronome panel, in the middle of the view"),
             ("C-S-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
@@ -645,7 +661,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // so the card is the only place the app can say it is there. Its
             // tab stands on the ruler, which is what the row names, because
             // that is the half of it no note can ever cover.
-            ("LOOP", "the tab on the ruler at the clip's end: drag to set the loop"),
+            ("LOOP", "the tab on the ruler where the loop turns over: drag to set the loop"),
             ("S-EDG", "shift-drag a note's edge: stretch the selection to the grid"),
             ("S-CLK", "shift-click: add to the selection"),
             ("C-DRG", "cmd-drag empty room: rubber-band select"),
@@ -1503,7 +1519,8 @@ mod tests {
         assert!(!has(&arrange, "P"), "P does nothing on the arrangement");
         // The automation and tempo lanes have rows now, and they must keep
         // saying what the one-hand rules say: shift drops a node, a tempo
-        // point's shift is the ramp, and glue is the MIDI-only truth.
+        // point's shift is the ramp, and glue takes audio and MIDI alike,
+        // and one clip that repeats.
         assert!(
             desc(&arrange, "S-CLK").contains("node"),
             "the arrange card lost the automation gestures: {:?}",
@@ -1732,14 +1749,13 @@ mod tests {
         );
     }
 
-    /// §5: a user who has never opened the Recorder must not start a take by
+    /// §5: a user who has never opened the Recorder must not roll the song by
     /// pressing the widest key on the keyboard.
     ///
     /// Space is the one binding that is not always live, and it is gated on the
     /// BAND being open rather than on the host being able to capture: opening
     /// the band is the consent, and it is one right-click away. Ungated, the
-    /// first thing a stray thumb does in a piano app is begin recording the
-    /// room.
+    /// first thing a stray thumb does in a piano app is start the song.
     #[test]
     fn space_does_nothing_until_the_recorder_band_is_open() {
         assert_eq!(
@@ -1753,8 +1769,9 @@ mod tests {
         );
         // **And Enter is bound to NOTHING**, gate open or shut. It began a
         // take once, on the argument that the key which starts a performance
-        // must not be the one that ends it; Cmd+R does both now, and Enter is
-        // the MIDI editor's key for writing a note. A bare Enter that could
+        // must not be the one that ends it; no key starts a take any more -
+        // Cmd+R is the arrangement's record - and Enter is the MIDI editor's
+        // key for writing a note. A bare Enter that could
         // still roll tape from any surface is a take started by a stray
         // press — which is what the owner met: "Remove enter for record -- we
         // already have command r."
@@ -1806,10 +1823,11 @@ mod tests {
         );
         // **ONE row now.** Starting and stopping were separate keys, on the
         // argument that the key which begins a performance must not be the
-        // one that ends it — and Enter was the start. Cmd+R does both, and a
-        // bare Enter that could still roll tape is a take begun by a stray
-        // press, so the start key is gone and only Space's stop is gated
-        // here. See `BINDINGS`, where the gap is written down.
+        // one that ends it — and Enter was the start. No key starts a take
+        // any more - Cmd+R is the arrangement's record - and a bare Enter
+        // that could still roll tape is a take begun by a stray press, so the
+        // start key is gone and only Space's stop is gated here. See
+        // `BINDINGS`, where the gap is written down.
         assert_eq!(
             shown.len(),
             hidden.len() + 1,

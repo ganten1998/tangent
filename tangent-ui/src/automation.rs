@@ -105,8 +105,6 @@ impl AutoParam {
 
     /// What a person calls it — the lane's label, and what a screen reader
     /// says.
-    /// What a person calls it — the lane's label, and what a screen reader
-    /// says.
     ///
     /// A plugin parameter has no name of its own here: the NAME lives with
     /// the plugin and reaches the app through `ports::FxParams`, so this
@@ -228,6 +226,13 @@ impl Shape {
 /// same timeline point -- this allows for instant movement of the value to
 /// another value". A curve arrives at the first point of a pair and leaves
 /// from the second, so the pair is a jump with no ramp between.
+///
+/// **One window, three readings.** `sanitised` folds points LESS than this
+/// apart, measured from a run's first point, so the instants it keeps are at
+/// least this far apart and hold at most two points each; `put` treats every
+/// point within it, inclusive, as the one to REPLACE (the last of them, moved
+/// to the new time); the app re-finds moved or pasted nodes within twice it
+/// (`arr_auto_find`). No road makes a third point at one instant.
 pub const SAME_INSTANT_S: f64 = 1e-9;
 
 /// One point on a curve.
@@ -301,18 +306,6 @@ impl Curve {
             kept.push(last);
             i = j;
         }
-        // **A curve always begins with a node at zero.**
-        //
-        // `value_at` is already flat before the first point, so this changes
-        // nothing anyone can HEAR — the value from zero up to that first
-        // point is the same either way. What it changes is what a person can
-        // see and grab: a lane whose curve started at bar 40 drew a flat
-        // stretch with no node on it, which reads as "nothing here yet"
-        // rather than "held at this value", and there was no handle to take
-        // hold of to say otherwise.
-        //
-        // Same shape as the point it copies, so the first segment leaves zero
-        // exactly as it leaves the point it was derived from.
         // **No seeded node at zero.** A curve begins with exactly the
         // points somebody drew.
         //
@@ -343,6 +336,19 @@ impl Curve {
     /// makes a curve safe to add to a song that is already playing: drawing
     /// one point at bar 40 does not ramp the whole song up to it from
     /// wherever it happened to start.
+    ///
+    /// **Right-continuous at a step - the contract every reader shares.** The
+    /// segment is the one that begins at the LAST point at or before `seconds`,
+    /// so at an instant holding two points (see [`SAME_INSTANT_S`]) the curve
+    /// ramps toward the first and plays the second from the instant itself on.
+    /// The engine plays exactly this - `fill_automation_params`,
+    /// `automation_now` and the master's three reads all call it - and so does
+    /// the host's face overlay (`desktop::live_face`). The arrangement's painter
+    /// draws the same shape from the points (flat before the first, a Hold's
+    /// level then a vertical jump, flat after the last), so a change to this
+    /// rule is a change to the painter too. Only sortedness is relied on: a
+    /// zero-length segment answers its second point and the fraction is
+    /// clamped. NaN or −∞ reads as before the first point, +∞ as after the last.
     pub fn value_at(&self, seconds: f64) -> Option<f64> {
         let first = self.points.first()?;
         // The segment `seconds` falls in, found as the LAST point at or
@@ -386,6 +392,11 @@ impl Curve {
     /// Answers the INDEX it landed at — which is the only way a caller can
     /// name it: at a step's instant the time names two points, and the one
     /// replaced is the second.
+    ///
+    /// **The value must be a number.** Unlike [`Curve::sanitised`] this drops
+    /// nothing: `f64::clamp` passes a NaN value through and it is stored as
+    /// given (a NaN time becomes 0.0 through `max`), and `value_at` then answers
+    /// NaN for that stretch of the curve.
     pub fn put(&mut self, point: Point) -> usize {
         let Point { at_s, value, shape } = point;
         let p = Point {
@@ -422,6 +433,9 @@ impl Curve {
     }
 
     /// Take the point nearest `seconds` out, if one is within `reach`.
+    ///
+    /// Only its tests call it: the app removes a node by index
+    /// ([`Curve::remove_at`]) and moves nodes with [`Curve::set_points`].
     pub fn remove_near(&mut self, seconds: f64, reach: f64) -> bool {
         let Some((i, _)) = self
             .points
@@ -434,11 +448,11 @@ impl Curve {
             return false;
         };
         // **No base-node rule here.** Protecting the first point is a
-        // decision about a GESTURE — an alt-click that means "delete this" —
-        // and this is the mechanism underneath it, which a DRAG also uses to
-        // move a point by taking it out and putting it back. Refusing here
-        // made the first point immovable and left a trail behind every drag.
-        // The guard lives in `TangentApp::arr_remove_auto_point`.
+        // decision about a GESTURE, and the app's own gestures do not come
+        // through here: a drag moves a node with `set_points`, and the guard
+        // on a deletion lives in `TangentApp::arr_take_auto_node`. Picked by
+        // TIME, so at a step this takes the arrival - which is why the app
+        // removes by index.
         self.points.remove(i);
         // **A lone node at the start USED to be swept away with the rest.**
         //
@@ -452,10 +466,10 @@ impl Curve {
         // resting at the level its dial is showing, which is exactly right
         // and is not "automated by a flat line nobody put there".
         //
-        // Clearing it here would also fight the refusal above: the base
-        // cannot be deleted directly, and deleting it as a side effect of
-        // removing the last drawn point would be the same deletion by
-        // another road.
+        // Clearing it here would also fight the refusal in
+        // `arr_take_auto_node`: the base cannot be deleted directly, and
+        // deleting it as a side effect of removing the last drawn point would
+        // be the same deletion by another road.
         true
     }
 }
@@ -496,6 +510,13 @@ impl Automation {
 
     /// The value of one control at a moment, or `None` when nothing
     /// automates it — which is what leaves the fader in charge.
+    ///
+    /// Exactly [`Curve::value_at`]: flat outside the points, right-continuous
+    /// at a step. The engine asks once per rendered chunk, at the chunk's
+    /// FIRST frame (`secs = at / rate` in `resolve_automation`), so on the
+    /// desk's own controls a step at `t` is heard from the first chunk that
+    /// starts at or after `t`. A plugin parameter on a lane rendered ahead is
+    /// read at the chunk's position too, not the grain's - see `grain_ok`.
     pub fn value_at(&self, lane: usize, param: AutoParam, seconds: f64) -> Option<f64> {
         self.get(lane, param)?.value_at(seconds)
     }

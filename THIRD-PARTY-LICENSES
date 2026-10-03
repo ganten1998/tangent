@@ -56,9 +56,12 @@ The fonts above are not relicensed by it and remain under their own terms.
 
 Bundled video encoder (Linux and Windows artifacts)
 ---------------------------------------------------
-The Linux and Windows artifacts ship an UNMODIFIED ffmpeg build as
+The Linux and Windows artifacts ship an unmodified ffmpeg build as
 `tangent-ffmpeg` (`tangent-ffmpeg.exe`), invoked by Tangent as a separate
-process to encode a take's video. ffmpeg is a trademark of Fabrice Bellard;
+process to encode a take's video. In the Windows release artifacts it
+carries Tangent's Authenticode signature, which appends a certificate table
+and updates the PE checksum and certificate-table entry; the program code is
+still BtbN's build byte for byte. ffmpeg is a trademark of Fabrice Bellard;
 these builds are GPL-licensed and their full licence text plus a provenance
 note (exact upstream URL and checksum) ship beside the binary in the
 ffmpeg-licenses/ folder of those artifacts. Source code for ffmpeg is

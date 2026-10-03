@@ -17,14 +17,17 @@ resolver = "2"
 # directly is the only way past it.
 #
 # THIS APPLIES TO EVERY PLATFORM, WHICH IS WHY THE PATCH IS SHAPED THE WAY IT IS.
-# `[patch.crates-io]` is not target-conditional, so macOS, Windows and Linux
-# builds compile this copy too. Everything added is behind
-# `#[cfg(target_os = "freebsd")]`, so those platforms compile byte-identical
-# code to upstream 0.16.0 and get an identical binary.
-# `tangent-record/vendor/README.md` carries the diff, the measurements and the
-# upstream issue; keep it that way, because the moment this copy diverges
-# anywhere outside a freebsd cfg it stops being a patch and starts being a fork
-# of everybody's audio.
+# `[patch.crates-io]` is not target-conditional, so every build compiles this
+# copy, and everything it changes (apart from one lint attribute that emits no
+# code) is behind a cfg: the OSS host behind `target_os = "freebsd"`; two JACK
+# fixes behind the `jack` feature, which Linux and FreeBSD turn on; one ALSA
+# fix in the ALSA host (Linux and FreeBSD); and one ASIO fix behind
+# `all(windows, feature = "asio")`, which every Windows build we ship has. So
+# macOS compiles byte-identical code to upstream 0.16.0 and gets an identical
+# binary; Linux, FreeBSD and the shipped Windows build carry the changes
+# `tangent-record/vendor/README.md` lists. Keep it that way: the moment this
+# copy diverges where no cfg opts in, it stops being a patch and starts being a
+# fork of everybody's audio.
 [patch.crates-io]
 cpal = { path = "tangent-record/vendor/cpal" }
 # **One ASIO driver guard for the whole process.** asio-sys 0.2.6 keeps its

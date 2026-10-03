@@ -145,9 +145,11 @@ by sha256, and the Linux tarballs and the Windows artifact ship them as
 * Windows: BtbN autobuild ffmpeg **n8.1.3** (`ffmpeg-n8.1.3-win64-gpl-8.1.zip`),
   from the dated tag `autobuild-2026-09-22-13-18` of `BtbN/FFmpeg-Builds`.
   BtbN prunes dated tags after a few weeks, so the pin says which build, not
-  where it can still be fetched. Windows builds 4.4.1 through 5.0.0-beta.13
-  bundled **n8.1.2-44-g7c533d0f86** from `autobuild-2026-08-17-13-05`
-  (already gone upstream).
+  where it can still be fetched. Every Windows build made from e5ae43b up
+  to d6547f6 (2026-08-18 to 2026-09-22), that is releases 4.4.1 through
+  5.0.0-beta.13 and the 5.0.0-dev builds handed to testers in that span,
+  the last of them 21567be, bundled **n8.1.2-44-g7c533d0f86** from
+  `autobuild-2026-08-17-13-05` (already gone upstream).
 * Once Windows signing is configured, the shipped `tangent-ffmpeg.exe`
   carries Tangent's Authenticode signature, because Smart App Control
   blocks unsigned programs. The program is still BtbN's build byte for
@@ -173,7 +175,8 @@ GitHub releases in the same repo the binaries are served from:
   his build readme. Fetch and hash these promptly; that server rotates old
   builds out.
 * Tag `third-party-src-ffmpeg-n8.1.2-btbn-2026-08-17`, for the Windows
-  builds already out (4.4.1 through 5.0.0-beta.13): the FFmpeg source
+  builds already out (every build from e5ae43b up to d6547f6: 4.4.1 through
+  5.0.0-beta.13 and the tester builds of that span): the FFmpeg source
   archive at commit `7c533d0f86`, a git archive of `BtbN/FFmpeg-Builds` at
   the COMMIT the tag `autobuild-2026-08-17-13-05` pointed to (the tag itself
   is gone upstream), and the source tarball of every bundled library that
@@ -199,7 +202,7 @@ fails the same gate that guards download links.
 
 **The uploads themselves are an owner action**: they need release
 credentials, and a standing decision that GitHub remains the hosting venue.
-Until both tags exist with their assets, distribution of the Linux and
+Until all three tags exist with their assets, distribution of the Linux and
 Windows artifacts is out of compliance on this point, and no documentation
 edit changes that.
 

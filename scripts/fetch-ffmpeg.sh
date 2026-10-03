@@ -73,8 +73,14 @@ ARM64_SHA="f4149bb2b0784e30e99bdda85471c9b5930d3402014e934a5098b41d0f7201b1"
 # weeks: the 8.1.2 pin this replaced (autobuild-2026-08-17-13-05) 404ed on
 # the TAG by 2026-09-22, and every clean Windows build died here after its
 # `cargo xwin build` had already succeeded. So the archive is also kept in
-# the durable cache below; when this URL goes the same way, the cache still
-# builds, and a fresh machine needs the deliberate URL+hash bump.
+# the durable cache below. **On the day you bump this pin**: change WIN_FILE,
+# WIN_URLS and WIN_SHA in one edit, run `scripts/fetch-ffmpeg.sh windows` once
+# (`keep` copies the verified zip into `vendor/ffmpeg/`), and archive
+# `BtbN/FFmpeg-Builds` at the tag for the source release (LICENSING.md, W31).
+# BtbN prunes dated tags within weeks; after that a copy of the verified
+# archive (`vendor/ffmpeg/` in this Dropbox-synced folder, or `dist/vendor/`)
+# is the only thing that builds Windows, and a fresh clone without one needs a
+# new pin, i.e. a different encoder build.
 WIN_FILE="ffmpeg-n8.1.3-win64-gpl-8.1.zip"
 WIN_URLS="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-22-13-18/$WIN_FILE"
 WIN_SHA="ed885833e406f0f7a1ea0304dd170779117799b2fba8096abc3e2e4dd679cc20"
@@ -97,11 +103,17 @@ sha_ok() { # sha_ok <file> <sha256>
     [ "$got" = "$2" ]
 }
 
-# **The durable cache: `vendor/ffmpeg/`, beside the ASIO SDK.** `dist/vendor`
-# was the only copy, and a clean build starts with `rm -rf dist` - which is
-# how the Windows leg lost its archive and then found its upstream gone.
+# **The durable cache: `vendor/ffmpeg/`, beside the ASIO SDK.** `dist` is
+# meant to be a symlink out of Dropbox, to `~/Library/Caches/tangent-dist` (see
+# `publish-dropbox.sh`). `rm -rf dist` deletes the LINK, not the cache behind
+# it, and the next `mkdir -p dist` makes an empty directory inside the
+# Dropbox-synced repo; `dist/vendor` then starts empty and every archive is
+# fetched again, which is the road on which the Windows leg met its pruned
+# upstream on 2026-09-22. Clean with `rm -rf dist/*`, never `rm -rf dist`.
 # `/vendor/` is gitignored (the ASIO licence forbids committing the SDK next
-# to it), so nothing is redistributed by keeping the archives here.
+# to it), so nothing is redistributed by keeping the archives here; it is
+# inside the Dropbox folder, so it is synced, and an archive Dropbox has made
+# online-only is read back over the network.
 CACHE="vendor/ffmpeg"
 
 fetch() { # fetch <file> <sha256> <url...>

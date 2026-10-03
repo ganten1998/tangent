@@ -36,14 +36,15 @@ Windows and Linux downloads carry their own encoder, so filming a take needs
 nothing installed. There is a native **Stream to OBS** sender too, for going
 live instead of to a file.
 
-**A DAW.** A sixteen-track desk with a mixer, an arrangement view, a MIDI
+**A DAW.** A thirty-two-track desk with a mixer, an arrangement view, a MIDI
 editor and a drum machine. Folders are real buses: a group sums its children
 in the engine and runs its own insert rack over the sum. Automation reaches
 track controls and plugin parameters alike, the tempo lane does ramps and
-steps, clips time-stretch from their edges, and delay compensation understands
-groups. It **hosts your plugins**: VST3 on every platform, LV2 on Linux and
-FreeBSD, editor windows included, and a built-in tine electric piano plays
-whenever no instrument is loaded, so the app makes a sound out of the box.
+steps, clips time-stretch from their edges, audio takes quantize as well as
+MIDI, and delay compensation understands groups. It **hosts your plugins**:
+VST3 on every platform, LV2 on Linux and FreeBSD, editor windows included,
+and a built-in tine electric piano plays whenever no instrument is loaded,
+so the app makes a sound out of the box.
 
 It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, and on
 Linux (glibc 2.30+, ALSA, Wayland or X11). It builds and runs on FreeBSD too.
@@ -70,7 +71,7 @@ including the Linux aarch64 tarball and checksums, are on the
   records what was captured, and a take that loses its video still keeps its
   audio and its MIDI. Software monitoring, a metronome, and input trims live
   on the recorder band.
-- **The mixer.** Sixteen channels plus a master, each with a fader, pan, a
+- **The mixer.** Thirty-two channels plus a master, each with a fader, pan, a
   send into the effects bus, an insert rack, and meters. Routing goes two
   ways: a **hardware output** sends a copy of a channel out of your
   interface's own jacks (a headphone amp, a stage monitor), and a **channel
@@ -79,12 +80,17 @@ including the Linux aarch64 tarball and checksums, are on the
   over the sum, so a compressor in a folder's bay is a bus compressor.
 - **The arrangement.** Audio and MIDI clips on a timeline, groups that drag
   their children with them, automation lanes for track controls and plugin
-  parameters, a tempo lane with ramps and steps, time-stretch from a clip's
-  edge (MIDI re-times, audio renders), and glue for MIDI clips.
+  parameters (nodes that box-select, copy, paste and make steps), a tempo
+  lane with ramps and steps, time-stretch from a clip's edge (MIDI re-times,
+  audio renders), **quantize** for audio takes as well as MIDI (`Q`: a
+  take's attacks are found and warped onto the grid, with the attack itself
+  left as it was played), and glue for audio and MIDI clips alike.
 - **The MIDI editor and the drum machine.** A piano-roll editor for MIDI
   clips, and a pad-based drum machine with its own kits. The kit is the one
   thing that still saves itself, because a kit is hours of sample assignment
-  and the one thing a session must never lose to a missed save. A kit can
+  and the one thing a session must never lose to a missed save. Answering
+  Don't Save on a session you never saved can discard its kit along with
+  it. A kit can
   also be saved out as a single file that carries the samples inside it
   alongside the layout, so kits can be shared with people who do not have
   your sample folders.
@@ -117,7 +123,7 @@ including the Linux aarch64 tarball and checksums, are on the
   voicing you are holding, in every key if you want. *Correct Chord Name…*
   teaches a general leaning instead, so similar voicings shift too. *Manage
   Taught Chords…* lists, deletes, and can forget everything learned.
-- **Sixteen themes.** `T` cycles them; every theme carries its own palette,
+- **Nineteen themes.** `T` cycles them; every theme carries its own palette,
   solved against contrast floors rather than picked by eye. Key and note
   colors are customizable on top.
 - **Keyboard shortcuts.** Hold **H** and every view's bindings appear. **N**

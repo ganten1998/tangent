@@ -79,7 +79,11 @@ pub fn rate_index(v: f32) -> usize {
 pub struct Transport {
     pub bpm: f64,
     pub playing: bool,
-    /// The playhead at the block's first sample, in beats.
+    /// The playhead at the block's first sample, in beats. Not exact
+    /// everywhere yet: the engine (`instrument::rack_transport`) hands a rack
+    /// with no span of its own the beat at the END of its block, and walks a
+    /// lane's from that anchor in a straight line, which a tempo change or a
+    /// loop wrap between the two throws off.
     pub beat: f64,
 }
 
@@ -495,10 +499,6 @@ mod tests {
         assert!(ev.iter().any(|(_, o)| matches!(o, ArpOut::Off { .. })));
     }
 
-    /// **The transport's grid is the grid.** Playing from beat 0.9 at
-    /// 100 bpm, the first boundary after the start lands where the
-    /// playhead crosses beat 1.0 — 0.1 beats in, 2880 frames — and not on
-    /// the block's own clock.
     /// **STOPPED, it runs at the song's tempo and not at 120.**
     ///
     /// Auditioning a patch is the one thing you do with the transport
@@ -574,6 +574,10 @@ mod tests {
         );
     }
 
+    /// **The transport's grid is the grid.** Playing from beat 0.9 at
+    /// 100 bpm, the first boundary after the start lands where the
+    /// playhead crosses beat 1.0 — 0.1 beats in, 2880 frames — and not on
+    /// the block's own clock.
     #[test]
     fn a_playing_transport_places_steps_on_its_own_grid() {
         let mut arp = Arp::new(SR);
