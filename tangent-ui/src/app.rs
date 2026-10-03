@@ -29465,9 +29465,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.save_settings_soon();
         // A BUTTON, so a gesture, so a moment. The knob above it
-        // (`set_keys_param_of`) is a drag and takes NO moment yet: the
-        // slider reports every frame it moves and nothing reports its
-        // release, so a turned knob rides the next gesture's moment.
+        // (`set_keys_param_of`) is a drag and takes its moment at the
+        // release, which the panel reports (`SetKeysParam::done`).
         self.undo_commit();
     }
 
@@ -35998,8 +35997,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             }
-            DialogAction::SetKeysParam { slot, knob, value } => {
+            DialogAction::SetKeysParam { slot, knob, value, done } => {
                 self.set_keys_param_of(slot, knob, value);
+                // **The knob's one moment, when the hand lets go.** It moves
+                // the sound on every frame of the drag, and the knobs are
+                // hashed (`keys_params`): it committed nothing, so a turned
+                // Hammer rode the next gesture's step back.
+                if done {
+                    self.undo_commit();
+                }
             }
             DialogAction::ResetKeysParams { slot } => {
                 self.reset_keys_params_of(slot);
@@ -42949,6 +42955,45 @@ mod tests {
         assert_eq!(
             app.settings.strip_dx7_cartridge[2], cart,
             "one step back also undid the cartridge chosen three gestures ago"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A turned Keys knob is one step back, taken when the hand lets go.**
+    ///
+    /// The knobs are hashed (`keys_params`), and the panel's drag reached
+    /// `set_keys_param_of` once a frame, which only saves - and nothing
+    /// reported the release, so the turn committed nothing at all and rode
+    /// the next gesture's step back (a comment beside it said otherwise).
+    /// The panel now says when the gesture ends (`SetKeysParam::done`; its
+    /// own test is in dialogs.rs), and the app commits there.
+    #[test]
+    fn a_turned_keys_knob_is_one_moment_at_its_release() {
+        let root = project_scratch("keysknob");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arr_save_edits();
+        app.commit_view_change();
+        let was = app.keys_param_of(3, 1);
+        let before = app.hist_at;
+        // Ten frames of a drag, then the release.
+        for f in 1..=10u8 {
+            app.apply_dialog_action(DialogAction::SetKeysParam {
+                slot: 3,
+                knob: 1,
+                value: f32::from(f) * 0.08,
+                done: false,
+            });
+        }
+        assert_eq!(app.hist_at, before, "the knob pushed {} moments mid-drag", app.hist_at - before);
+        app.apply_dialog_action(DialogAction::SetKeysParam { slot: 3, knob: 1, value: 0.8, done: true });
+        assert_eq!(app.hist_at, before + 1, "the knob's release left {} moments", app.hist_at - before);
+        // One step back puts the knob where the hand found it.
+        app.undo();
+        assert!(
+            (app.keys_param_of(3, 1) - was).abs() < 1.0e-6,
+            "one Ctrl+Z left the knob at {} rather than {was}",
+            app.keys_param_of(3, 1)
         );
         let _ = std::fs::remove_dir_all(&root);
     }
