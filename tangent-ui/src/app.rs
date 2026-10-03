@@ -57479,23 +57479,26 @@ mod tests {
     }
 
     /// **A lane dropped under an export or an arrangement record lands
-    /// nowhere, its folder included**, driven by real pointer events. The
-    /// ordinary drop decided membership from where the block landed and only
-    /// then asked `move_selection`, which refused: the child left its folder
-    /// while its row stayed where it was, a group changed under a pass that
-    /// writes it by row.
+    /// nowhere, its folder included**, in both views, driven by real pointer
+    /// events. The ordinary drop decided membership from where the block
+    /// landed and only then asked `move_selection`, which refused: the child
+    /// left its folder while its row stayed where it was, a group changed
+    /// under a pass that writes it by row.
     #[test]
     fn a_lane_dropped_under_an_export_or_a_record_keeps_its_folder() {
-        for (exporting, arr) in [(true, false), (false, true)] {
+        for ((exporting, arr), mixer) in [(true, false), (false, true)]
+            .into_iter()
+            .flat_map(|held| [(held, false), (held, true)])
+        {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-            app.arrangement_open = true;
+            app.arrangement_open = !mixer;
+            app.mixer_open = mixer;
             for n in 0..5 {
                 app.add_bare_track(n);
             }
             app.toggle_folder(1);
             app.set_in_folder(2, true);
             let _ = run_frame(&ctx, &mut app);
-            let rect = app.arrangement_rect.expect("arrange rect");
             let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
                 let _ = ctx.run(
                     egui::RawInput {
@@ -57512,22 +57515,35 @@ mod tests {
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             };
-            let (grab, drop) = {
+            // Out of the folder, onto the BODY of a row or strip outside it:
+            // an ordinary move, not a snap and not a drag home.
+            let (grab, drop) = if mixer {
+                let rect = app.mixer_rect.expect("mixer rect");
+                let view = app.mixer_view();
+                let l = crate::mixer_panel::Layout::new(rect, &view);
+                let body = l.strips[4].panel;
+                (
+                    l.strips[2].name.center(),
+                    Pos2::new(body.left() + body.width() * 0.3, body.center().y),
+                )
+            } else {
+                let rect = app.arrangement_rect.expect("arrange rect");
                 let clips = app.arr_clip_views();
                 let view = app.arrange_view(&clips);
                 let l = crate::arrangement_panel::Layout::new(rect, &view);
-                // Out of the folder, onto the BODY of a row outside it: an
-                // ordinary move, not a snap and not a drag home.
                 (l.header_rows[2].name.center(), l.header_rows[4].panel.center())
             };
             app.recorder.exporting = exporting;
             app.recorder.arr_recording = arr;
-            let held = format!("export={exporting} record={arr}");
+            let held = format!("export={exporting} record={arr} mixer={mixer}");
             frame(&mut app, vec![egui::Event::PointerMoved(grab), button(grab, true)]);
             assert!(
-                matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 2, .. })),
-                "the press did not arm the carry under {held}: {:?}",
-                app.arr_drag
+                if mixer {
+                    app.mixer_reorder.is_some()
+                } else {
+                    matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 2, .. }))
+                },
+                "the press did not arm the carry under {held}"
             );
             frame(&mut app, vec![egui::Event::PointerMoved(drop)]);
             frame(&mut app, vec![egui::Event::PointerMoved(drop), button(drop, false)]);
