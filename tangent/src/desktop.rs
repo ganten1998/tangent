@@ -26142,7 +26142,7 @@ mod tests {
     #[test]
     fn every_host_side_edit_commits_its_own_undo_moment() {
         let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let scan = &src[..src.find("\nmod tests {").expect("the tests module")];
         // The body of each batch, from its signature to the next `fn` at
         // the same depth, must contain the commit.
         for (f, what) in [
@@ -26173,6 +26173,32 @@ mod tests {
                 "{what} commits a moment of its own again, so a batch leaves one per clip"
             );
         }
+    }
+
+    /// **The probe module's name first appears AS the probe module.** Six
+    /// scans here used to cut their haystack at its first spelling, and once
+    /// a test's own literal came first every one of them read production
+    /// plus the head of `mod tests`: a needle an earlier test happened to
+    /// spell satisfied a scan with the production line deleted (the marks'
+    /// frame ask did), and moving one test moved every cut. They cut at the
+    /// tests module now; this keeps a scan copied from the old pattern from
+    /// bringing the trap back. The names are built with `concat!`, so this
+    /// test is never the first spelling itself.
+    #[test]
+    fn the_first_probe_anchor_in_this_file_is_the_probe_module() {
+        let src = include_str!("desktop.rs");
+        let anchor = concat!("mod ", "sidecar_walk_probe");
+        let module = src
+            .find(concat!("\nmod ", "sidecar_walk_probe {"))
+            .expect("the probe module")
+            + 1;
+        let first = src.find(anchor).expect("the anchor");
+        let line = src[..first].matches('\n').count() + 1;
+        assert_eq!(
+            first, module,
+            "the first `{anchor}` is a literal on line {line}, not the module: a scan \
+             that cuts there reads the head of `mod tests`, so cut at the tests module"
+        );
     }
 
     /// **Normalize measures the audio a clip PLAYS, not its file.** It read
@@ -26253,7 +26279,7 @@ mod tests {
     #[test]
     fn the_marks_are_rebuilt_when_the_clips_move() {
         let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let scan = &src[..src.find("\nmod tests {").expect("the tests module")];
         let sig = {
             let at = scan.find("fn quantize_clip_sig(").expect("the signature");
             &scan[at..at + scan[at..].find("\n    }\n").expect("its end")]
@@ -26339,7 +26365,7 @@ mod tests {
     #[test]
     fn the_chosen_audio_output_is_the_one_that_opens() {
         let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let scan = &src[..src.find("\nmod tests {").expect("the tests module")];
 
         // READ: the first open asks for it by name.
         assert!(
@@ -26786,7 +26812,7 @@ mod tests {
     #[test]
     fn the_preview_and_the_apply_read_one_map() {
         let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let scan = &src[..src.find("\nmod tests {").expect("the tests module")];
         let calls = scan.matches("quantize_map(&found,").count();
         assert_eq!(
             calls, 2,
@@ -27374,7 +27400,7 @@ mod tests {
     #[test]
     fn a_warp_is_handed_to_the_crew_and_holds_the_stretch_until_it_lands() {
         let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
+        let scan = &src[..src.find("\nmod tests {").expect("the tests module")];
         assert!(
             scan.contains("Work::Warp {"),
             "the warp is no longer a job the crew can be handed"
@@ -33877,9 +33903,9 @@ mod sidecar_walk_probe {
     #[test]
     fn every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag() {
         let whole = include_str!("desktop.rs");
-        // Everything above this module, because the table below spells the
-        // call sites out and would otherwise find itself.
-        let src = &whole[..whole.find("mod sidecar_walk_probe").expect("this module")];
+        // Production only - everything above `mod tests` - because the table
+        // below spells the call sites out and would otherwise find itself.
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         for (call, gate) in [
             ("shift_insert_states_for_v13();", "take_desk_state_shift()"),
             ("shift_insert_states_for_v14();", "take_desk_state_shift_v14()"),
