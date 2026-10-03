@@ -1341,6 +1341,24 @@ pub fn folder_extra_of(seat: usize) -> Option<usize> {
 /// of these.
 pub const AMP_PEDALS: usize = 7;
 
+/// **The default pedalboard**, in chain order: dynamics first, then the
+/// filters and drive, modulation, time, and the room last - the order a
+/// player wires a real board, seeded so the amp arrives dressed rather
+/// than as seven pluses.
+///
+/// **Dressed and switched OFF.** Every one of these lands BYPASSED - see
+/// the app's `seed_amp_board`, which is the other half of this table and
+/// the only place that writes it.
+pub const AMP_DEFAULT_BOARD: [&str; AMP_PEDALS] = [
+    "@tangent-comp",
+    "@tangent-wah",
+    "@tangent-drive",
+    "@tangent-chorus",
+    "@tangent-trem",
+    "@tangent-echo",
+    "@tangent-plate",
+];
+
 /// **Where the amp-pedal seats begin** - seven appended seats per channel,
 /// the pedalboard the amp wears when it sits in a channel bay. Appended
 /// after the folder-extra block, for the reason `MASTER_EXTRA_SEAT`
@@ -1385,7 +1403,7 @@ pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
 ///
 /// **Why one function rather than the test each caller was making.** Three
 /// places asked `seat < CHANNELS` and meant "does this seat get a board" —
-/// the amp face's chip row, the picker the chips open, and the host's
+/// the amp face's chip row, the picker the chips open, and the
 /// default-board seeding — and the engine asked a fourth version of it by
 /// running the board only in the lane pass, which a folder never reaches.
 /// All four agreed, and all four were wrong the same way: an amp dropped
