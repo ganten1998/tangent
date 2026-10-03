@@ -5197,10 +5197,6 @@ impl DesktopApp {
         // frame would be a window that stopped for a minute. Each is
         // remembered whether or not it worked, so a plugin that will not load
         // is not retried sixty times a second.
-        // **A track reorder moves the plugin-state sidecars with it** —
-        // BEFORE the reconcile below, or the racks reload against the old
-        // rows' knobs. Live states written down first, so what moves is
-        // what was sounding.
         // **The master's mono fold**, pushed like every other desk setting:
         // the app owns the choice, the engine owns the buffer. Cheap enough
         // to send unconditionally — one relaxed store against a branch and a
@@ -5209,28 +5205,40 @@ impl DesktopApp {
             e.set_master_mono(self.app.master_mono());
             e.set_master_mute(self.app.master_muted());
         }
+        // **A track reorder moves the plugin-state sidecars with it** —
+        // BEFORE the reconcile below, or the racks reload against the old
+        // rows' knobs. Live states written down first, so what moves is
+        // what was sounding.
+        //
+        // **And so do its undo and its redo**, which hand over the inverse
+        // and the order again (`TangentApp::undo_apply`). A moment names
+        // each bay's bundle and nothing about the plugin in it, so an undo
+        // that sent nothing put every name back and the reconcile rebuilt
+        // each moved bay from a file written for another row: factory
+        // settings, or a neighbour's where both rows held the same plugin.
         if let Some(order) = self.app.take_desk_state_perm() {
-            // **Only the rows this permutation touches.** See
-            // `save_plugin_states_as_loaded_for`.
-            let mut moved = vec![false; tangent_ui::recorder::TOTAL_SEATS];
-            for (new, old) in order.iter().enumerate() {
-                if new != *old {
-                    // The channel row, and its folder-extra seat - the
-                    // second rack travels with the track, so its state
-                    // must be written down before the move like the
-                    // first one's.
-                    for seat in [
-                        new,
-                        *old,
-                        tangent_ui::recorder::folder_extra_seat(new),
-                        tangent_ui::recorder::folder_extra_seat(*old),
-                    ] {
-                        if let Some(m) = moved.get_mut(seat) {
-                            *m = true;
-                        }
-                    }
-                }
-            }
+            // The channel order lifted onto the whole seat space, so each
+            // folder-extra seat and each pedal seat follows its channel
+            // through every copy of the per-seat state - see
+            // `recorder::seat_order`.
+            let full = tangent_ui::recorder::seat_order(&order);
+            // **Only the seats this permutation touches.** See
+            // `save_plugin_states_as_loaded_for`. Read off the lifted order,
+            // so a channel's row, its folder-extra seat and its seven pedal
+            // seats are all here: the list this replaced was kept by hand,
+            // named the first two, and left the pedals' settings out of the
+            // save while `seat_order` moved their files.
+            let moved: Vec<bool> = full.iter().enumerate().map(|(new, old)| new != *old).collect();
+            // **Written down in the layout the files are still in.** The
+            // engine, `inserts_loaded` and the sidecars all describe the OLD
+            // rows until the moves below, so each seat's live state lands in
+            // its own file under its own tenant's name, and then the three
+            // move together. Saving after the carry wrote every carried
+            // state at its NEW seat, and the file move then carried it a
+            // second time: the shelf ended in the old layout, and the next
+            // rebuild of a moved bay - a redo, a buffer-size change - read
+            // another row's file.
+            self.save_plugin_states_as_loaded_for(Some(&moved));
             // **Carry the plugins across instead of rebuilding them.**
             //
             // A track that moves takes its plugins with it, and the instance
@@ -5248,12 +5256,7 @@ impl DesktopApp {
             // The host's own copy of what sits in each seat travels too, or
             // the reconcile below compares the new seat against the old
             // seat's plugin and reloads everything it just carried.
-            // The channel order lifted onto the whole seat space, so each
-            // folder-extra seat follows its channel through every copy of
-            // the per-seat state - see `recorder::seat_order`.
-            let full = tangent_ui::recorder::seat_order(&order);
             permute_loaded_rows(&mut self.recorder.inserts_loaded, &full);
-            self.save_plugin_states_as_loaded_for(Some(&moved));
             permute_insert_states_in(
                 insert_state_path(0, 0)
                     .parent()
@@ -25303,6 +25306,107 @@ mod tests {
         // And never past the rows the permutation names — the drum pads
         // above the channels are not part of a channel reorder.
         assert!(hit.iter().all(|i| i / bays < 16));
+    }
+
+    /// **A reorder writes the live states down in the layout the files are
+    /// in when it writes them.**
+    ///
+    /// The arm used to carry the plugins and permute `inserts_loaded` first,
+    /// then save - which wrote each carried state at its NEW seat - and then
+    /// moved the files a second time. The live shelf ended in the pre-move
+    /// layout, so the next rebuild of a moved bay (a redo, a buffer-size
+    /// change) seated it from another row's file. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_reorder_writes_the_live_states_in_the_layout_the_files_are_in() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("if let Some(order) = self.app.take_desk_state_perm() {").expect("the reorder arm");
+        let arm = &src[at..at + src[at..].find("// **A pasted track's plugin STATE").expect("the arm's end")];
+        let pos = |w: &str| arm.find(w).unwrap_or_else(|| panic!("the reorder arm lost `{w}`"));
+        let save = pos("self.save_plugin_states_as_loaded_for(");
+        let carry = pos("permute_channel_inserts(&order)");
+        let rows = pos("permute_loaded_rows(&mut self.recorder.inserts_loaded");
+        let files = pos("insert_state_path(0, 0)");
+        let old_then_move = save < carry && save < rows && save < files;
+        let move_then_new = save > carry && save > rows && save > files;
+        assert!(old_then_move || move_then_new,
+            "the live states are written after the carry and before the live shelf moves, so the \
+             shelf ends in the pre-move layout");
+    }
+
+    /// **A reorder's sidecars follow it there, and its undo's inverse brings
+    /// them back** - the channel row, its folder-extra rack and its pedals.
+    ///
+    /// Driven through the two free functions the reorder arm moves the
+    /// host's per-seat state with, over a scratch folder: the files written
+    /// in the OLD layout, the way the arm now writes them, then moved by the
+    /// lifted order. Insert Track is the case that matters, because it is a
+    /// CYCLE - three rows shift and the free lane comes up into the gap - so
+    /// moving the files twice, or by the order instead of its inverse on the
+    /// way back, lands every one of them on the wrong row. At every seat the
+    /// file's owner must agree with what `inserts_loaded` says is seated
+    /// there, or the next rebuild of that bay reads another plugin's state.
+    #[test]
+    fn a_reorders_sidecars_follow_it_and_its_undo_brings_them_back() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, seat_order, CHANNELS};
+        let dir = std::env::temp_dir()
+            .join(format!("tangent-reorder-sidecars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch folder");
+        let bays = tangent_ui::recorder::INSERTS;
+        let mut loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        // Rows 2, 3 and 4 hold A, B and C - each with a plugin in its
+        // folder-extra rack and on its third pedal - and row 5 is free.
+        let seats = |row: usize, name: &str| {
+            [
+                (row, 0, name.to_owned()),
+                (folder_extra_seat(row), 1, format!("{name}-extra")),
+                (amp_pedal_seat(row, 2), 0, format!("{name}-pedal")),
+            ]
+        };
+        for (row, name) in [(2, "A"), (3, "B"), (4, "C")] {
+            for (seat, bay, owner) in seats(row, name) {
+                let mut out = owner.as_bytes().to_vec();
+                out.push(0);
+                out.extend_from_slice(b"as dialled");
+                std::fs::write(dir.join(sidecar_name(seat, bay)), out).expect("a sidecar");
+                loaded[seat * bays + bay] = Some(owner);
+            }
+        }
+        let owner = |seat: usize, bay: usize| -> Option<String> {
+            let raw = std::fs::read(dir.join(sidecar_name(seat, bay))).ok()?;
+            let split = raw.iter().position(|b| *b == 0)?;
+            Some(String::from_utf8_lossy(&raw[..split]).into_owned())
+        };
+        let agree = |loaded: &[Option<String>], rows: &[(usize, &str)], when: &str| {
+            for &(row, name) in rows {
+                for (seat, bay, want) in seats(row, name) {
+                    assert_eq!(owner(seat, bay).as_deref(), Some(want.as_str()), "{when}: seat {seat} bay {bay}'s file");
+                    assert_eq!(loaded[seat * bays + bay].as_deref(), Some(want.as_str()), "{when}: seat {seat} bay {bay}'s ledger");
+                }
+            }
+        };
+        // Insert Track under row 1: the free lane comes up to row 2 and the
+        // three rows under it shift down one - `open_lane_below`'s order.
+        let mut order: Vec<usize> = (0..CHANNELS).filter(|c| *c != 5).collect();
+        order.insert(2, 5);
+        let full = seat_order(&order);
+        permute_loaded_rows(&mut loaded, &full);
+        permute_insert_states_in(Some(dir.clone()), &full);
+        agree(&loaded, &[(3, "A"), (4, "B"), (5, "C")], "after the insert");
+        assert_eq!(owner(2, 0), None, "the opened row kept a sidecar");
+        // The undo: what `undo_apply` hands the host is the inverse.
+        let mut back = vec![0usize; CHANNELS];
+        for (new, &old) in order.iter().enumerate() {
+            back[old] = new;
+        }
+        let full = seat_order(&back);
+        permute_loaded_rows(&mut loaded, &full);
+        permute_insert_states_in(Some(dir.clone()), &full);
+        agree(&loaded, &[(2, "A"), (3, "B"), (4, "C")], "after its undo");
+        assert_eq!(owner(5, 0), None, "the free lane kept a sidecar after the undo");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     use super::*;
 
