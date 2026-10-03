@@ -337,7 +337,9 @@ touch one, so NONE of its artifact checks (signatures, the ASIO notice, the
 payload lists) run on what testers receive. `publish-dropbox.sh
 [windows|macos|linux …]` copies the current version's artifacts from
 `dist/` to `<Dropbox>/Tangent Development/builds/<HEAD>[-dirty]/`, installer
-first, and writes `SHA256SUMS.txt` there. What it does not know:
+first, and writes `SHA256SUMS.txt` there. A platform with nothing in `dist/`
+is skipped with a line that names it, so the default run (all three)
+publishes whatever was built. What it does not know:
 
 - **Which commit built the files.** The folder is named after the commit
   checked out, and `-dirty` after the tracked files, WHEN YOU PUBLISH;
@@ -347,9 +349,6 @@ first, and writes `SHA256SUMS.txt` there. What it does not know:
   goes: an `ARCH=host` `macos-arm64` pair survives a later universal build,
   a failed Linux leg leaves the previous run's tarballs, and nothing
   removes an old setup.exe before `makensis` runs again.
-- **A platform with nothing in `dist/`.** With no arguments it publishes
-  all three, and under macOS's bash 3.2 it stops with `pats[@]: unbound
-  variable` if any has no artifacts: name the platforms you built.
 
 ## Store links: check them, then act in order
 
