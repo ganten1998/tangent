@@ -13135,9 +13135,9 @@ impl DesktopApp {
                 c.warp.hash(&mut h);
                 c.warp_rate.hash(&mut h);
                 c.stretch.to_bits().hash(&mut h);
-                let refused = doc_path.as_ref().is_some_and(|d| {
+                let refused = doc_path.as_ref().is_some_and(|doc_path| {
                     self.warm_refused
-                        .contains(&tangent_ui::arrangement::Arrangement::resolve(d, &c.path))
+                        .contains(&tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
                 });
                 refused.hash(&mut h);
             }
