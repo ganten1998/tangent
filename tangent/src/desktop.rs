@@ -526,14 +526,19 @@ struct Recorder {
     /// after the count - so the host keeps one flag per owner, and a count is
     /// running while either is set.
     take_count_pending: bool,
-    /// When the ARRANGEMENT's count-in started, and how many beats it runs -
-    /// so a take started during it can count in from the same instant and
-    /// begin on the same downbeat, rather than at the press.
+    /// **When the engine's count-in began, and how many beats it runs -
+    /// whoever started it** - so a take pressed during a count the red
+    /// button is waiting on counts in from the same instant and begins on
+    /// the same downbeat, rather than at the press.
     ///
-    /// **Only when the red button STARTED the count.** When it joined a
-    /// take's count this stays `None`, so a take pressed later in that count
-    /// cannot find its start - see `R::Toggle`'s join arm.
-    arr_count_from: Option<(std::time::Instant, u32)>,
+    /// Set at every `start_count_in`, the cassette's as well as the red
+    /// button's, and cleared when the count stops: at its downbeat, when it
+    /// is cancelled, and with its engine. It used to be the ARRANGEMENT's
+    /// alone, so a count the red button had only joined left it empty: with
+    /// the take that started that count cancelled, the next take pressed into
+    /// it found nothing and began writing at the press, mid-count, with a
+    /// head of zero.
+    count_from: Option<(std::time::Instant, u32)>,
     /// **Play was pressed while a count-in was running**: the song starts on
     /// the downbeat instead of under the count. Pressing TAKE and then Play
     /// used to be "count me in, then the song plays" by force; this is that,
@@ -5449,6 +5454,7 @@ impl DesktopApp {
             }
             // Whoever started it, the count is over.
             self.recorder.take_count_pending = false;
+            self.recorder.count_from = None;
             // And the song comes in on it, if Play was pressed during it.
             if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {
                 self.recorder.transport.toggle_play();
@@ -6207,7 +6213,7 @@ impl DesktopApp {
                 .is_some_and(crate::instrument::Engine::count_in_done)
         {
             self.recorder.arr_rec_wait = false;
-            self.recorder.arr_count_from = None;
+            self.recorder.count_from = None;
             self.start_arr_record();
         }
         if !self.recorder.session.is_recording() {
@@ -6304,9 +6310,9 @@ impl DesktopApp {
                         // records - unless a take is counting on the same
                         // click, which is then left to finish its own count.
                         self.recorder.arr_rec_wait = false;
-                        self.recorder.arr_count_from = None;
                         if !self.recorder.take_count_pending {
                             self.recorder.play_on_go = false;
+                            self.recorder.count_from = None;
                             if let Some(e) = self.recorder.engine.as_ref() {
                                 e.cancel_count_in();
                             }
@@ -6317,7 +6323,10 @@ impl DesktopApp {
                         // **A take is already counting in: JOIN its count.**
                         // One click, one downbeat, both recordings start on
                         // it. Restarting the count here used to restart the
-                        // take's too, a bar into it.
+                        // take's too, a bar into it. `count_from` already
+                        // says when it began, so a take pressed into it later
+                        // - after the one that started it is cancelled -
+                        // joins it from there too.
                         self.recorder.arr_rec_wait = true;
                     } else {
                         // **The count-in counts the ARRANGEMENT in too** —
@@ -6328,7 +6337,7 @@ impl DesktopApp {
                             if let Some(e) = self.recorder.engine.as_ref() {
                                 e.start_count_in(beats, self.app.tempo_bpm());
                                 self.recorder.arr_rec_wait = true;
-                                self.recorder.arr_count_from =
+                                self.recorder.count_from =
                                     Some((std::time::Instant::now(), beats));
                             } else {
                                 self.start_arr_record();
@@ -6364,7 +6373,7 @@ impl DesktopApp {
                     //   an arrangement record started together share a start.
                     // - Otherwise: its own, from the settings.
                     let joined = if starting && self.recorder.arr_rec_wait {
-                        self.recorder.arr_count_from
+                        self.recorder.count_from
                     } else {
                         None
                     };
@@ -6380,12 +6389,16 @@ impl DesktopApp {
                         if starting && beats > 0 {
                             e.start_count_in(beats, self.app.tempo_bpm());
                             self.recorder.take_count_pending = true;
+                            // When it began, for a red press that joins it
+                            // and for a take pressed into it after that.
+                            self.recorder.count_from = Some((std::time::Instant::now(), beats));
                         } else if self.recorder.take_count_pending && !self.recorder.arr_rec_wait {
                             // Ending or cancelling a take that is still
                             // counting: the count was the take's, so it goes.
                             // One the arrangement is waiting on stays.
                             e.cancel_count_in();
                             self.recorder.play_on_go = false;
+                            self.recorder.count_from = None;
                         }
                     }
                     if !starting {
@@ -6446,8 +6459,8 @@ impl DesktopApp {
                     // click, which only the cassette may cancel.
                     if self.recorder.arr_rec_wait {
                         self.recorder.arr_rec_wait = false;
-                        self.recorder.arr_count_from = None;
                         if !self.recorder.take_count_pending {
+                            self.recorder.count_from = None;
                             if let Some(e) = self.recorder.engine.as_ref() {
                                 e.cancel_count_in();
                             }
@@ -13914,7 +13927,7 @@ impl DesktopApp {
     /// the engine that went.
     fn forget_counts(&mut self) {
         self.recorder.arr_rec_wait = false;
-        self.recorder.arr_count_from = None;
+        self.recorder.count_from = None;
         self.recorder.take_count_pending = false;
         self.recorder.play_on_go = false;
     }
@@ -19244,7 +19257,7 @@ impl DesktopApp {
                 offline_bounce: None,
                 arr_rec_wait: false,
                 take_count_pending: false,
-                arr_count_from: None,
+                count_from: None,
                 play_on_go: false,
                 take_head_s: 0.0,
                 pending_delivery: None,
@@ -22609,6 +22622,52 @@ mod tests {
         assert!(
             before.contains("self.forget_counts();"),
             "an engine is born with the counts of the one before it"
+        );
+    }
+
+    /// One space for every run of whitespace, so a scan reads a line broken
+    /// for width the same as one that is not.
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The cassette's request arm, squashed, from production source only.
+    fn cassette_arm() -> String {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let a = src.find("                R::Capture => {").expect("the cassette's arm");
+        let end = src[a..].find("                R::Stop => {").expect("the arm's end");
+        squash(&src[a..a + end])
+    }
+
+    /// **Every count-in says when it began, whoever started it.** A take
+    /// pressed during a count joins it from that instant and begins on its
+    /// downbeat (`count_in_began_at`), and the instant was kept only when
+    /// the RED button started the count. A cassette count the red button
+    /// had merely joined left nothing behind: cancel that take, press the
+    /// cassette again before the downbeat, and the new take found no start,
+    /// counted nothing and began writing at the press, mid-count, with a
+    /// head of zero.
+    #[test]
+    fn every_count_in_says_when_it_began_whoever_started_it() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let starts: Vec<usize> = src.match_indices(".start_count_in(").map(|(at, _)| at).collect();
+        assert!(!starts.is_empty(), "no count-in is started here any more");
+        for at in starts {
+            let line = src[..at].lines().count();
+            // The few statements after the start, cut on a character.
+            let end = src[at..].char_indices().nth(400).map_or(src.len(), |(i, _)| at + i);
+            assert!(
+                squash(&src[at..end]).contains("self.recorder.count_from = Some("),
+                "the count-in started at line {line} does not say when it began"
+            );
+        }
+        assert!(
+            cassette_arm().contains(
+                "let joined = if starting && self.recorder.arr_rec_wait { self.recorder.count_from }"
+            ),
+            "the cassette joins a count by something other than when that count began"
         );
     }
 
