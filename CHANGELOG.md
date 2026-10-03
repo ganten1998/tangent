@@ -10,6 +10,203 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The launch clean-up no longer deletes a folder that holds anything
+  Tangent did not put there.** It removed any folder in the projects folder
+  whose name began "Untitled " whole, so a saved project filed in a folder
+  of your own called "Untitled Folder", or saved inside an Untitled
+  session's folder, was deleted at the next launch with its recordings.
+  Only folders named exactly "Untitled" or "Untitled" and a number are
+  cleared now, and only when everything in them is Tangent's own; Don't
+  Save and New follow the same rule.
+
+- **New keeps the recordings in the Untitled session it replaces.**
+  Answering Don't Save to New, or pressing New on a session with nothing
+  unsaved (a take undone off the timeline is still on disk), deleted that
+  Untitled folder, recordings and all, while Open and Quit kept it. New now
+  starts the next session beside it, and asks first when no save prompt
+  was shown.
+
+- **Opening a template from File > Open no longer puts the last project
+  at risk.** The template was shown standing in the previous project's
+  folder, so the next Save moved that project's folder to the new name and
+  wrote the template over its arrangement, and the two sessions' plugin
+  settings were mixed. A template opened that way now becomes a fresh
+  Untitled session, as New makes one, and a first save never moves a
+  folder that already holds a saved project.
+
+- **Reset Everything no longer empties the open project's file.** It wrote
+  the reset desk (every instrument, plugin, track name, fader and route
+  gone) over the document of the project that was open. It now discards
+  the open session's unsaved changes, as the save prompt's Discard does,
+  and leaves an earlier Untitled folder with recordings in it alone.
+
+- **A recording running when you quit, start a new project or open
+  another is kept.** Quitting threw an arrangement recording away
+  unwritten, without a question on a session with nothing else unsaved,
+  and New or Open let it run on into the next project, where it landed at
+  Stop. The recording now ends in its own session first: quitting asks
+  about it, Open keeps it in the project it was recorded in, and New asks
+  before replacing the session.
+
+- **Resetting the default template asks before replacing an unsaved
+  session.** Settings > Reset > The Default Template replaced the open
+  session with a fresh one without the save prompt, losing unsaved edits
+  and plugin settings. It asks first now, as New does.
+
+- **Don't Save keeps a drum kit built in an unsaved session.** Answering
+  Don't Save deleted an Untitled folder the session had created even when
+  a drum kit had been built in it. Such a folder is now kept, as one
+  holding a recording is.
+
+- **A template keeps its own audio.** A template saved from a project with
+  audio clips or frozen tracks lost those files the next time it was saved
+  from a new session, and a session made from it left them behind once it
+  was saved or written to disk. They now come along. Not yet heard before
+  then: in a fresh session such a clip stays silent until something in
+  that session is written to disk.
+
+- **Undoing a track move puts its plugins back with their settings.**
+  Undoing a drag, Insert Track, Paste Track or a grouping into a folder
+  brought the plugins on every track that moved back at their factory
+  settings, or with a neighbour's where two tracks held the same plugin.
+  Redoing a swap of two tracks did the same, and so did changing the
+  buffer size after a move. Undo and redo now carry the plugins exactly as
+  the move did.
+
+- **Changing the buffer size keeps every plugin's settings.** Changing the
+  buffer size, the sample rate or the output, an output that dropped out
+  and came back, or closing the band reloaded every plugin at its settings
+  from the last save, or at its factory settings if it had never been
+  saved. What each plugin is playing is now written down first.
+
+- **Moving a track no longer changes a saved project until you save.**
+  Dragging, inserting or grouping tracks rewrote the project's saved plugin
+  settings at once, so leaving with Don't Save, or a crash, reopened the
+  moved tracks with each other's settings or at their factory settings.
+
+- **A moved plugin opens its own window.** After moving a track, opening
+  one of its plugins could open the plugin that used to sit in that slot
+  instead, now on another track, under the new plugin's name.
+
+- **New and Reset Template start clean.** A plugin replaced or deleted in
+  the previous session could come up in the new one with that session's
+  settings, where the same plugin sat in the same slot.
+
+- **Undoing a drum pad swap brings each pad's effects back with their
+  settings.** Carrying a pad onto another swaps the two pads' effect bays
+  too, and an undo or redo of the swap brought each pad's effects back at
+  their factory settings, or with the other pad's where both held the same
+  plugin.
+
+- **Holding Delete no longer removes a track after deleting automation
+  points.** A held Delete or Backspace deleted the chosen points, row or
+  clips, and the key's repeat then removed the selected track too, without
+  asking. A separate press with nothing chosen still removes the selected
+  track.
+
+- **Removing a track takes its automation and settings with it.** A track
+  added where one was removed inherited its automation curves and armed
+  rows, its pan, polarity, icon and drum kit. Copy and Paste Track now
+  carry the track's automation too.
+
+- **A track's polarity flip moves with it.** Insert Track Below, Paste
+  Track Below, a drag or a grouping into a folder carried every other
+  setting of the tracks that moved and left the polarity switch on the row
+  it was pressed on, so a flipped track played the right way up and the
+  track that took its row played upside down.
+
+- **Automation rows armed or bypassed in one project no longer carry into
+  the next.** Opening or creating a project kept the previous project's
+  armed and bypassed rows on the same track numbers, so an armed row could
+  write into the new project unseen. And undoing a track move now takes a
+  bypassed row back with its curve, where it used to leave the bypass on
+  the row the track had moved to and the curve playing.
+
+- **Splitting an audio clip keeps the quantize, gain and stretch on both
+  halves.** The right half of a split came back unquantized, at unity gain,
+  unstretched and reading the wrong part of the file, and stopped following
+  the tempo. It is now the same take as the left half, cut.
+
+- **A second quantize, or a new stretch algorithm, is heard at once.**
+  Applying a quantize again at another swing, window or grid could go on
+  playing and gluing the previous one while an export used the new one, and
+  changing a quantized clip's stretch algorithm kept the old one.
+
+- **A quantized bass, guitar or vocal stays in tune.** Small corrections
+  were resampled, bending each corrected note's pitch by up to a third of a
+  semitone; the stretch algorithm is now chosen once for the whole take and
+  never resamples.
+
+- **A flam at the end of a take no longer stretches everything after it.**
+  The audio after a quantized take's last hit took that last correction's
+  speed, up to four times slower; it now plays as recorded.
+
+- **Zooming no longer shows a quantized take unquantized.** With any clip
+  in the session still missing its waveform, a zoom or scroll redrew a
+  quantized take from the original audio, its hits off the grid, until the
+  next edit.
+
+- **The quantize window's grid sizes are named in the song's meter.** In
+  3/4 or 6/8 each chip quantized one note value finer than it said (the
+  default 1/8 gave sixteenths). The chips are now spelled as the
+  arrangement spells its grid, and follow a meter change while the window
+  is open.
+
+- **The quantize window no longer stalls on a folder of takes or reads
+  stale attacks.** With more than eight takes asked for, every move of the
+  detect slider analysed them all again; after a change of device rate, or
+  a new scratch take under an old name, Q could use the previous file's
+  attacks.
+
+- **Changing the tempo no longer garbles looped MIDI clips.** A tempo
+  change, or stretching clips from their edge, retimed a part's notes but
+  not its loop, so every pass restarted in the wrong place, and the sustain
+  pedal was left behind. The loop and the pedal now move with the notes,
+  and a stretched audio clip's loop with its audio.
+
+- **In 3/4, 6/8 and 7/8, the arrangement's snap lands on the grid lines it
+  draws,** and the arrow keys no longer skip lines. 4/4 is unchanged.
+
+- **Step entry in the MIDI editor works at every tempo with the magnet
+  on.** At most tempos, repeated Enter stacked notes on one grid line and
+  the right arrow could get stuck on the line it stood on. Enter and both
+  arrows now walk one grid line per press.
+
+- **In a loop trimmed at its start, Enter, Backspace and paste in the MIDI
+  editor act where the playhead line is drawn in every pass;** at the top
+  of a later pass a note landed further into the pass and the song could
+  jump forward. An Enter that writes nothing no longer moves the playhead.
+
+- **A tempo drag on the metronome panel is one undo step,** at the
+  release; it made one per BPM it passed. A tempo typed or dragged on an
+  empty song is now its own undo step too.
+
+- **An Analog track's dry stem lines up with the others.** In a dry stems
+  export it came out 68 samples (1.4 ms at 48 kHz) behind every other stem
+  and the mix, by the delay the Analog reports for its own sound. It now
+  leaves on the same frame as its processed stem.
+
+- **A chosen output that is missing plays through the system's own.** With
+  an output chosen in Setup that was unplugged or would not open, every
+  system but ASIO stayed silent and reopened the audio path every few
+  seconds. Tangent now uses the system's own output for the session and
+  says so once; your choice is kept and tried again when the band is
+  reopened.
+
+- **Plugging the interface back in during an ASIO fallback brings ASIO
+  back.** The stand-in was still running when the reopen came, so the input
+  failed and ASIO only returned after the band was closed and reopened. A
+  plugin dialled in while the stand-in played comes back on the interface
+  as it was left.
+
+- **Choosing an audio system in Setup is safer.** Pressing the system that
+  is already chosen, as you might during an ASIO fallback to get back to
+  it, no longer forgets the output chosen for it. Pressing a different
+  system clears the OUTPUT row, where a press could save a device the new
+  system cannot open; its outputs are listed the next time Setup opens.
+
 ### Added
 
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
@@ -177,16 +374,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   inside it), unless the clips already selected are all on tracks you
   picked.
 
-  **Not yet right everywhere.** On a clip trimmed from its front, as the
-  second half of a split is, what the trim hides (a take's audio, a part's
-  notes) is pulled onto the clip's start and heard there. A time-stretched
-  audio clip is quantized and marked as if it were not stretched, and the
-  marks on a looped clip are not limited to the attacks its loop plays. In
-  a song whose tempo or meter changes, the grid is one tempo and one meter
-  counted from 0:00, so after the first change it misses the lines the
-  arrangement draws. And an audio quantize is tied to the sample rate it
-  was made at: exported at another rate, or opened on a device running at
-  another, it is applied to the wrong audio.
+  **Not yet right everywhere.** In a song whose tempo or meter changes,
+  the grid is one tempo and one meter counted from 0:00, so after the first
+  change it misses the lines the arrangement draws. And an audio quantize
+  is tied to the sample rate it was made at: exported at another rate, or
+  opened on a device running at another, it is applied to the wrong audio.
 
 - **Audio clips glue.** Cmd/Ctrl+G welds audio clips the way it has always
   welded MIDI ones: two or more on one track, or one that repeats, become
@@ -253,13 +445,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   system forgets it, since a device name from one system means nothing to
   another, and so does resetting Devices and Folders.
 
-  **Not yet right in two places.** Under ASIO, while a driver is running,
-  the row lists only that driver, so the interface still cannot be picked
-  from it, and "the system's own" there is still the first driver in the
-  list. And on macOS or under WASAPI, an output chosen by name that runs at
-  a different rate from the system's default output makes Tangent rebuild
-  its audio every three seconds or so (setting SAMPLE RATE to the default
-  output's rate avoids it).
+  **Not yet right under ASIO.** While a driver is running, the row lists
+  only that driver, so the interface still cannot be picked from it, and
+  "the system's own" there is still the first driver in the list.
 
 - **A count-in being recorded into the take shows its beat in red** on the
   band's display.
@@ -375,15 +563,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   played by an instrument in its bays (the Analog, the sampler, any hosted
   instrument) rendered its dry stem silent, and so was left out of a dry
   export altogether: the dry copy was taken before the bays ran, and such
-  an instrument makes its sound inside them. An instrument in one of the
-  track's first three bays writes the dry stem too now; one in bays 4 to 6
-  is still left out.
+  an instrument makes its sound inside them. An instrument in any of the
+  track's six bays writes the dry stem too now.
 
 - **The count-in's last click sounded twice.** The count-in and the
   metronome both played the downbeat where one hands over to the other, a
-  sample apart. The metronome lets the count-in's click stand now. Not yet
-  right with the playhead parked between two beats: there the song's first
-  click after the count-in is lost.
+  sample apart. The metronome lets the count-in's click stand now, and the
+  song's first click after the count-in is no longer lost with the
+  playhead parked between two beats.
 
 - **The Analog's arpeggiator follows the song's tempo.** With the transport
   stopped it ran at 120 bpm whatever the song said, until play had been
@@ -405,7 +592,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   loaded: its own, its folders' and those of any track it is routed to. A
   plugin you add by hand does not touch monitoring. And a denoiser that
   has just loaded applies its full reduction from its first moment instead
-  of fading in from none.
+  of fading in from none. On Open or New, a bay still playing the previous
+  session's plugin until it reloads is heard through rather than held, so
+  a folder's Denoise no longer lets through the noise it removes, at full
+  level, while a project loads.
 
 - **"Untitled" folders stopped piling up.** Save As Template on a session
   you had never saved wrote that session into Projects/Untitled before
@@ -417,14 +607,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   session, or its plugin settings, back into the project anyway, and the
   Project window's New and Open now ask before leaving an unsaved session
   at all. An Untitled folder this session created is removed when you
-  answer Don't Save, provided it holds no saved clips and no recording,
-  instead of pushing the next session to "Untitled 2", and a drum kit
-  built in it goes with it. Open and Quit keep one that holds a recording;
-  New does not yet, and unless its kit was changed it removes the Untitled
-  it stands on, recording and all. The launch clean-up no longer mistakes
-  Finder's .DS_Store files, freeze renders or copies of the template's own
-  samples for work. And a new session takes the template's drum kit
-  rather than the last project's.
+  answer Don't Save, provided it holds no saved clips, no recording and no
+  drum kit built in it, instead of pushing the next session to
+  "Untitled 2". New, Open and Quit all keep one that holds a recording.
+  The launch clean-up no longer mistakes Finder's .DS_Store files, freeze
+  renders or copies of the template's own samples for work. And a new
+  session takes the template's drum kit rather than the last project's.
 
 - **The band's controls no longer vanish in a smaller window.** At 900
   points wide (the window at 100% on a 1440-point screen) the transport
@@ -481,16 +669,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   both. A multi-file import left one step per file, and deleting a track
   left one for each plugin on it plus one for its clips. Grouping tracks
   into a folder, inserting a track or pasting one left a step with every
-  track shifted down and nothing in the gap. Each is one step now. Undoing
-  a grouping, an inserted track or a pasted one does not yet put back the
-  settings of the plugins on the tracks that moved: each comes back at its
-  factory settings, or at a neighbour's where both carry the same plugin.
+  track shifted down and nothing in the gap. Each is one step now.
 
-- **Undoing a Paste FX or a bay swap restores the replaced plugin's
-  settings as they were last written to disk**, at a save or when its own
-  window was closed. A plugin dialled in since then (any built-in unit)
-  still comes back at those settings, or at its factory values if it was
-  never saved.
+- **Undoing a Paste FX, a bay swap or a delete brings the plugin back with
+  the settings it was playing at.** It came back at its settings from the
+  last save, or from the last time its window was closed, or at its factory
+  settings if it had never been saved; and dragging another plugin into a
+  bay a deleted one had left could lose the deleted one's settings
+  outright. A long session no longer forgets them all at once, either: the
+  store that keeps them emptied itself after 32.
 
 - **The Stream to OBS window keeps what you typed however it closes.**
   Escape or the window's close button threw away a typed identifier and
@@ -866,10 +1053,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   middle of the arrangement, and a second press closes it. It carries the
   count-in now, counted in bars ("off", "1 bar", "2 bars"), and IN TAKE
   chooses whether the count stops before the take begins or carries on
-  into it, recorded at the head of the file. Not yet right at a click
-  division other than one a beat: the count runs that many clicks instead
-  of beats, so it is shorter or longer than it says, and with a faster
-  click a take whose count stops before it begins loses its opening.
+  into it, recorded at the head of the file. A count lasts its bars at
+  every click division, with one click a beat.
 
 - **During a count-in or an export the tempo is held.** In a count-in the
   tempo knob dims and TAP refuses; while an export renders, both leave the
@@ -891,9 +1076,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a display of another size it gives about the same lane height rather
   than the same number of lanes. Not yet for the header width and the lane
   count while they are on Auto, as on a fresh install: a project saved on
-  Auto opens on whatever the window already had, and undoing the first
-  change away from Auto leaves it standing, after which undo can go no
-  further back and the redo is lost.
+  Auto opens on whatever the window already had.
 
 - **A clip's waveform shows its gain.** Normalising a take changed how it
   sounded and not how it looked. The waveform is drawn at the clip's level
@@ -1595,11 +1778,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   project that was on screen when it quit; it stands on a fresh copy of the
   default template every time, and the last session is a File > Open away.
   A scratch stays on disk for that panel if it holds an audio recording or
-  was saved with clips in it; one this session created that holds neither
-  is deleted, with its kit, imported copies and plugin settings, when you
-  answer Don't Save on New, Open or Quit. New does not keep a recording
-  yet: unless the scratch's kit was changed, it removes the scratch it
-  stands on, recording and all. The
+  a drum kit built in it, or was saved with clips in it; one this session
+  created that holds none of them is deleted, with its imported copies and
+  plugin settings, when you answer Don't Save on New, Open or Quit. The
   owner: "make it so every launch opens the default session, and doesn't
   open the previously open session."
 
