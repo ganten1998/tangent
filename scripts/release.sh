@@ -217,8 +217,9 @@ if [ "$SUMS_ONLY" = 0 ]; then
       if [ "${SKIP_WINDOWS:-0}" = "1" ]; then
         echo "==> Skipping build-cross.sh (SKIP_WINDOWS=1)"
       else
-        # Its Linux stage is expected to fail on the ALSA cross-build and says
-        # so loudly; only a missing Windows zip is a real failure, caught below.
+        # A leg that fails (a Linux tarball, the installer) lets the others
+        # run and then exits non-zero; the set check below names what is
+        # missing, and a missing one is a red run.
         scripts/build-cross.sh || note "build-cross.sh exited non-zero"
       fi
       ;;
@@ -268,6 +269,22 @@ if [ "$(uname -s)" = FreeBSD ] && [ "$SUMS_ONLY" = 0 ]; then
   for kind in desktop complete; do
     ls dist/tangent-"${PKG_VERSION}"-freebsd-*-"$kind".tar.gz >/dev/null 2>&1 \
       || note "no $kind bundle for $PKG_VERSION (build-freebsd.sh needs root or doas to fetch it)"
+  done
+fi
+# **And the set the Mac builds, every piece of it.** Only files that exist
+# are checked below, so a leg that produced nothing used to pass unseen: a
+# failed Linux leg gave a release with no Linux tarball, every check green,
+# and a `releases/latest/download` link in the README and in every
+# supporter email that 404ed. The dmg stays best-effort; SKIP_WINDOWS=1
+# waives the four the cross build makes.
+if [ "$(uname -s)" = Darwin ] && [ "$SUMS_ONLY" = 0 ]; then
+  case "${ARCH:-universal}" in host) MAC_ARCH="$(uname -m)" ;; *) MAC_ARCH=universal ;; esac
+  WANT="Tangent-${VERSION}-macos.pkg Tangent-${VERSION}-macos-${MAC_ARCH}.zip"
+  [ "${SKIP_WINDOWS:-0}" = 1 ] || WANT="$WANT Tangent-${VERSION}-windows-setup.exe
+    tangent-${VERSION}-windows-x86_64.zip tangent-${VERSION}-linux-x86_64.tar.gz
+    tangent-${VERSION}-linux-aarch64.tar.gz"
+  for w in $WANT; do
+    [ -f "dist/$w" ] || note "no $w: its build failed or was skipped (see above)"
   done
 fi
 

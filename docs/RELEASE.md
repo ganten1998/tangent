@@ -190,8 +190,8 @@ Notes on the set:
   (`docs/STORE-CONTENT.md`), the legacy `ivory-windows-x86_64.zip` is in
   supporter emails sent before the installers took over at 3.0.0, and
   `publish-github.sh` can only upload an alias for a file that exists in
-  `dist/`. If `makensis` is missing, only the zip is built and the run warns
-  loudly that no setup.exe was produced. The
+  `dist/`. If `makensis` is missing, only the zip is built and the run
+  fails, saying no setup.exe was produced. The
   `tangent-<v>-windows-x86_64.pdb` beside it turns a crash offset into a
   function name; it is not a deliverable, `publish-github.sh` does not
   upload it, and `release.sh` leaves it out of `SHA256SUMS` (a summed file
@@ -226,6 +226,11 @@ that is wanted (a toolchain regression, a glibc question, the suite on Linux).
 
 Details that matter and are easy to lose:
 
+- **A leg that fails lets the others run, then fails the run.** A Linux
+  failure here is a real one (the glibc floor refusing a binary, a file
+  the readme promises missing, a sysroot that would not download), and the
+  previous run's tarball is kept when its leg fails, so `release.sh` names
+  every missing piece of the Mac's set and goes red.
 - **The Linux and Windows legs build without `mp3`.** LAME's autotools build
   compiles and runs test programs, which a macOS host cannot do for a foreign
   target. Nothing is lost: MP3 delivery goes through the bundled ffmpeg
@@ -258,6 +263,12 @@ Run on each OS, copy the artifacts into one `dist/`, then
 (`SKIP_WINDOWS=1` skips the cross leg; `KEEP_STALE=1` keeps other versions'
 artifacts, which are otherwise purged so no stale file rides a checksum or
 upload glob.)
+
+On the Mac a full run (not `--sums-only`) first requires the whole set the
+Mac builds: the pkg, the macOS zip, the setup.exe, the Windows zip and both
+Linux tarballs (the dmg stays best-effort; `SKIP_WINDOWS=1` waives the four
+the cross build makes). Only files that exist can be checked, so a leg that
+produced nothing used to leave every check green.
 
 Per artifact it runs `scripts/check-artifacts.sh`, the one copy of these
 checks (`publish-dropbox.sh` runs it on every tester build too), and
@@ -339,7 +350,9 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
    re-checks every permalink after upload and exits non-zero if one is dead,
    so a red run is never cosmetic. Before uploading it refuses a checksum
    file that does not cover every artifact, or that names a file it would
-   not upload. A version with a pre-release suffix is
+   not upload, and a stable release with no asset for one of the permanent
+   links `README.md`, `docs/STORE-CONTENT.md` or the supporter email hands
+   out (`scripts/check-store-links.sh --names` lists them). A version with a pre-release suffix is
    published as a GitHub pre-release, deliberately: `latest/download`
    resolves against the latest stable, so a correctly marked beta leaves the
    permanent links alone. Release notes must include the SmartScreen note.
@@ -386,7 +399,9 @@ removes the old one before it starts.
 `scripts/check-store-links.sh` fetches every `releases/latest/download/` URL
 in `README.md`, `docs/STORE-CONTENT.md` and `tools/tangent-fulfil/src/main.rs`.
 They resolve by EXACT asset name against whatever release is currently
-latest, so a new name 404s until it has shipped.
+latest, so a new name 404s until it has shipped. `--names` prints just the
+asset names, fetching nothing, which is how `publish-github.sh` knows what a
+stable release must carry.
 
 The order that keeps this honest: **publish, check, paste, deploy.** It has
 gone wrong twice, both times by getting ahead of the publish: the key email

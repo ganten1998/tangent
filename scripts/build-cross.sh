@@ -476,16 +476,21 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   echo "==> ${stage}.tar.gz"
 }
 
-# Linux stages are non-fatal: midir links ALSA, and alsa-sys cannot cross-compile
-# from macOS without an ALSA sysroot (see docs/RELEASE.md → "Cross-build blocker").
-# Build Linux on Linux (CI with libasound2-dev) or provide a sysroot. Windows
-# (no ALSA) still builds below regardless.
+# **A failed Linux leg lets the others run, and then fails the run.** Linux
+# has been built here since the bullseye sysroot (ensure_alsa_sysroot), so a
+# failure is a real one - the glibc floor refusing a binary, a file the
+# readme promises missing, a sysroot that would not download - and not "the
+# ALSA cross-build" this used to blame. The next leg still runs, so one
+# failure costs nothing else, and the exit status at the end says so. It
+# used to exit 0: release.sh then summed a release with no Linux tarball, or
+# with the previous run's (package_linux keeps the old one on failure), and
+# the README's and every supporter email's Linux link 404ed.
 LINUX_OK=1
 echo "==> Tangent $VERSION — Linux x86_64"
-package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
+package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed — see the log above"; }
 
 echo "==> Tangent $VERSION — Linux aarch64"
-package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
+package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed — see the log above"; }
 
 echo "==> Tangent $VERSION — Windows x86_64"
 # No mp3 on the Windows leg: LAME's autotools build cannot run under
@@ -595,5 +600,18 @@ else
   echo "         Install it with: brew install makensis, then rerun." >&2
 fi
 
-ls -lh dist/tangent-"${VERSION}"-* dist/Tangent-"${VERSION}"-windows-setup.exe 2>/dev/null | sed 's/^/    /'
-[ "$LINUX_OK" = 1 ] || echo "NOTE: Linux artifacts were skipped (ALSA cross-build). Windows built OK."
+# A listing, not a check: `ls` exits non-zero for a name that is not there,
+# and under pipefail that was the only thing that failed a run with no
+# setup.exe - by accident, with no word about why.
+ls -lh dist/tangent-"${VERSION}"-* dist/Tangent-"${VERSION}"-windows-setup.exe 2>/dev/null | sed 's/^/    /' || true
+# **Any leg that failed fails the run**, now that every leg has had its turn.
+BUILD_OK=1
+[ "$LINUX_OK" = 1 ] || {
+  echo "!! a Linux leg failed (above): its tarball is missing, or is still the previous run's" >&2
+  BUILD_OK=0
+}
+[ -f "dist/Tangent-${VERSION}-windows-setup.exe" ] || {
+  echo "!! no setup.exe was built" >&2
+  BUILD_OK=0
+}
+[ "$BUILD_OK" = 1 ] || exit 1
