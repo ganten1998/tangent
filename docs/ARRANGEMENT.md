@@ -120,8 +120,8 @@ where it was dropped. That is the one way in; no picker, no menu row.
   at launch any more; the last session is a File > Open away, and a
   materialised Untitled stays on disk for that panel, unless the session
   that made it real discards it with Don't Save while it is unnamed and
-  clipless on disk and holds no recording (`rec-*`) and no kit of its own:
-  then it was that
+  clipless on disk and holds no recording (`rec-*`), no kit of its own and
+  nothing Tangent did not write (`holds_only_scratch`): then it was that
   session's litter and is removed (`discard_scratch_made_here`,
   2026-09-22; see docs/FOLDERS-AND-SESSIONS.md). New keeps one too: it
   starts beside a scratch the discard refuses, and asks about a clean
