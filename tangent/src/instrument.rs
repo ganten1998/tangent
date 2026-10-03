@@ -1468,10 +1468,10 @@ struct BarClock {
     /// `play_on_go` both just toggle play, and neither locates. From 0:00, or
     /// any playhead parked on a beat line, the first beat this clock reaches
     /// is the one the go just was, and it sounded it a frame or two behind
-    /// the count-in's: measured at 96000 and 96001. Parked BETWEEN beats the
-    /// go stands in for nothing, and this flag still steps past the next
-    /// beat, so the song's first click after the go is lost there. `resync`
-    /// is where that is known, and it does not clear the flag yet.
+    /// the count-in's: measured at 96000 and 96001. Parked between beats the
+    /// go stands in for nothing, and `resync` drops the flag there rather
+    /// than swallow the next beat: it keeps it only for a beat within
+    /// [`GO_STANDS_IN_S`] of the roll.
     ///
     /// `resync`'s note once guessed the resync would land "a frame or two
     /// past beat one". It does after a LOCATE, where the transport was
@@ -1524,6 +1524,17 @@ impl Default for BarClock {
 /// to reach for Play.
 const SOUNDED_GRACE_S: f64 = 0.25;
 
+/// **How close to the roll a beat must land for the count-in's "go" to stand
+/// in for it**, in seconds.
+///
+/// The host rolls the transport from wherever the playhead stands, so the
+/// first beat the bar clock reaches is not always the one the go just was.
+/// ON a beat line it is, and a hair BEFORE one it would sound a poll behind
+/// the go, as a flam: the go stands in for both. Half a beat past a line the
+/// next beat is the song's own, and stepping past it lost the song's first
+/// click. A beat further from the roll than this is the song's.
+const GO_STANDS_IN_S: f64 = 0.03;
+
 impl BarClock {
     /// How many clicks a bar carries at this division.
     ///
@@ -1552,11 +1563,12 @@ impl BarClock {
         //
         // But a resync a frame or two INTO a beat must not fire it: that beat
         // has already been and gone. That is the LOCATE case, where the
-        // transport was already moving. The count-in is NOT handled here: the
+        // transport was already moving. The count-in is a third case: the
         // host rolls the transport from wherever the playhead stands, a UI
         // poll after the go, and a playhead parked ON a beat line resyncs
         // exactly onto it and would fire it as a second "go". `tick` steps
-        // past that beat on `already_sounded`.
+        // past that beat on `already_sounded`, and the end of this function
+        // decides whether the beat found is one the go stood in for.
         // `bar_beat_at_quarter` answers in the signature's BEATS; the clock
         // counts in ticks, which is beats times the division.
         let sig = maps.meter.sig_at_bar(bar);
@@ -1569,6 +1581,13 @@ impl BarClock {
             self.beat += 1;
             self.normalise(maps);
             self.at_frame = self.frame_of(maps, rate);
+        }
+        // **The go stands in only for a beat the transport starts ON.**
+        // Parked half a beat past a line, the beat found above is half a beat
+        // from the roll and has nothing to do with the go; stepping past it
+        // lost the song's first click. See [`GO_STANDS_IN_S`].
+        if self.already_sounded && self.at_frame - pos as f64 > rate.max(1.0) * GO_STANDS_IN_S {
+            self.already_sounded = false;
         }
         self.armed = true;
     }
@@ -1608,9 +1627,16 @@ impl BarClock {
     /// The count-in's downbeat, and the only caller. See
     /// [`already_sounded`](Self::already_sounded) for why a flag and not a
     /// frame number.
+    ///
+    /// **And the clock forgets where it was**, so the first frame that rolls
+    /// re-derives it and `resync` decides whether the go stood in for the
+    /// beat it lands on. A song paused and resumed in place skipped that: the
+    /// clock still expected exactly the frame the transport resumed on, so
+    /// the flag stepped past the next beat however far from the roll it was.
     fn sounded_elsewhere(&mut self) {
         self.already_sounded = true;
         self.sounded_wait = 0;
+        self.armed = false;
     }
 
     /// A frame with the transport NOT rolling. The go stops standing in for
@@ -21335,6 +21361,80 @@ mod tests {
             after[..hand].contains("if !rolling {"),
             "the go hands its beat over even when the song is already rolling"
         );
+    }
+
+    /// **A count-in into a song parked OFF a beat line keeps the song's first
+    /// click.**
+    ///
+    /// The host rolls the transport from wherever the playhead stands
+    /// (`start_arr_record`, `play_on_go`), never from a beat line. The go
+    /// stands in for the bar clock's first beat only when that beat lands as
+    /// the transport rolls: ON the line, or a hair before it, where sounding
+    /// it would be a flam a poll behind the go. Half a beat past a line the
+    /// next beat is the song's own, and the go - on the press's grid, not
+    /// the song's - stepped past it in silence. Parked there two ways: a
+    /// playhead put there, where the clock has never run, and a song PAUSED
+    /// there, which leaves the clock armed and expecting exactly the frame
+    /// the transport resumes on, so it never resyncs on its own.
+    #[test]
+    fn a_count_in_into_a_song_parked_off_the_beat_keeps_its_first_click() {
+        let rate = 48_000.0;
+        let maps = Maps::default(); // 120 bpm, 4/4: 24_000 frames a beat
+        let poll = 800u64; // the host rolls a UI poll after the go
+        // (the road, where the playhead stands, the song played up to it
+        // first, the first song beat that must SOUND after the go)
+        for (road, parked, paused, first) in [
+            ("parked half a beat past beat two", 36_000u64, false, 48_000u64),
+            ("paused half a beat past beat two", 36_000, true, 48_000),
+            ("parked a hair before beat two", 23_990, false, 48_000),
+        ] {
+            let mut b = Beats::new(rate, 120.0);
+            let mut bar = BarClock::default();
+            let mut pos = 0u64;
+            if paused {
+                while pos < parked {
+                    let _ = bar.tick(pos, &maps, rate);
+                    pos += 1;
+                }
+            }
+            pos = parked;
+            b.restart(4);
+            let mut rolling = false;
+            let mut go_at: Option<u64> = None;
+            let mut song: Vec<u64> = Vec::new();
+            for now in 0..(24_000u64 * 10) {
+                if let Some(g) = go_at {
+                    if !rolling && now >= g + poll {
+                        rolling = true;
+                    }
+                }
+                let heard = if b.counting_in() || !rolling {
+                    bar.idle(rate);
+                    b.tick(false, 4)
+                } else {
+                    let h = bar.tick(pos, &maps, rate);
+                    if h.is_some() {
+                        song.push(pos);
+                    }
+                    h
+                };
+                if let Some(beat) = heard {
+                    if beat.downbeat {
+                        go_at = Some(now);
+                        bar.sounded_elsewhere();
+                    }
+                }
+                if rolling {
+                    pos += 1;
+                }
+            }
+            assert!(go_at.is_some(), "{road}: the count-in never reached its downbeat");
+            assert_eq!(
+                song.first().copied(),
+                Some(first),
+                "{road}: the song's first beat after the go: {song:?}"
+            );
+        }
     }
 
     #[test]
