@@ -3404,39 +3404,63 @@ fn warped_clip_audio(
 /// turns a dial. A preview computed separately is a second implementation
 /// of the feature that looks like the first until it does not.
 ///
-/// Anchors are in SOURCE frames, trim included - `warp` reads the whole
-/// file - and ascending in both fields, which `warp` demands and the
+/// Anchors are in SOURCE frames - `warp` reads the whole file, trim
+/// included - and ascending in both fields, which `warp` demands and the
 /// document's reader enforces again on the way back in.
 ///
+/// **Only what the clip PLAYS is quantized.** A pair is kept only when both
+/// its ends lie inside the clip's played window: from its trim, for its
+/// length or one pass of its loop (every pass replays that same span). The
+/// attacks come from the whole FILE, and one in the trim or past the clip's
+/// end is not the clip's: anchored, it moves material the clip never played
+/// INTO it. Placed with `saturating_sub`, every hit in front of the trim was
+/// heard on the clip's first frame, the first of them became an anchor
+/// there, and the clip's own downbeat was dropped as a tie - the right half
+/// of a split take opened on the take's first hit. An attack the clip plays
+/// whose line falls outside the window is left unanchored too, rather than
+/// carried out of the clip.
+///
 /// **Units.** `found` and each pair's `from` are frames of the decode the
-/// analysis was made from, at `rate`; each `to` is a frame of the warped
-/// render, at the same rate. `start_s` is where the clip stands and
-/// `offset_s` its trim, read here as SOURCE seconds - which a stretched
-/// clip's trim is not (it is in the stretched file's seconds). Two attacks
-/// that land on one line keep only the first, and the second is carried
-/// inside the segment; an attack whose target falls before frame zero is
-/// left out.
+/// analysis was made from, at `rate`, and `file_s` is that decode's length;
+/// each `to` is a frame of the warped render, at the same rate. The clip's
+/// `start_s` is where it stands and its `offset_s` its trim, read here as
+/// SOURCE seconds - which a stretched clip's trim is not (it is in the
+/// stretched file's seconds). Two attacks that land on one line keep only
+/// the first, and the second is carried inside the segment.
 #[cfg(feature = "recorder")]
 fn quantize_map(
     found: &[crate::transient::Transient],
     rate: u32,
-    start_s: f64,
-    offset_s: f64,
+    file_s: f64,
+    clip: &tangent_ui::arrangement::ArrClip,
     q: &tangent_ui::quantize::Quantize,
 ) -> Vec<(u64, u64)> {
-    let rate = rate.max(1);
-    let secs = |f: usize| f as f64 / f64::from(rate);
-    let offset = (offset_s * f64::from(rate)).max(0.0).round() as usize;
+    let rate = f64::from(rate.max(1));
+    let start_s = clip.start_s;
+    // The played window, in the frames `from` and `to` count.
+    let offset = (clip.offset_s * rate).max(0.0).round();
+    let len_s = clip.play_len_s(file_s);
+    let played_s = if clip.loop_s > 1.0e-6 {
+        clip.loop_s.min(len_s)
+    } else {
+        len_s
+    };
+    let end = offset + played_s.max(0.0) * rate;
+    let inside = |f: f64| f >= offset && f < end;
     let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
     for t in found {
-        // Where this attack is heard, and where it should be heard.
-        let heard = start_s + secs(t.at.saturating_sub(offset));
-        let want = q.place(heard);
-        let to = offset as f64 + (want - start_s) * f64::from(rate);
-        if to < 0.0 {
+        let from = t.at as f64;
+        if !inside(from) {
             continue;
         }
-        let (f, to) = (t.at as u64, to.round() as u64);
+        // Where this attack is heard, and where it should be heard.
+        let heard = start_s + (from - offset) / rate;
+        let want = q.place(heard);
+        let to = (offset + (want - start_s) * rate).round();
+        if !inside(to) {
+            continue;
+        }
+        let (f, to) = (t.at as u64, to as u64);
         if map.last().is_none_or(|&(lf, lt)| f > lf && to > lt) {
             map.push((f, to));
         }
@@ -12547,14 +12571,15 @@ impl DesktopApp {
         //
         // This ran off a deep clone of the arrangement - every clip, every
         // note, every automation point - once per dial position, for the
-        // sake of four fields on the handful of clips named in the ask.
-        // The borrow is released at the end of the block, which is what the
-        // clone was buying: `attacks_of` below needs `&mut self`.
+        // sake of a few fields on the handful of clips named in the ask.
+        // Those clips are cloned on their own now, which for an audio clip
+        // is its strings and its map: it holds no notes. The borrow is
+        // released at the end of the block, which is what the clone was
+        // buying: `attacks_of` below needs `&mut self`.
         struct Asked {
             id: u64,
             path: std::path::PathBuf,
-            start_s: f64,
-            offset_s: f64,
+            clip: tangent_ui::arrangement::ArrClip,
             anchors: Vec<crate::warp::Anchor>,
         }
         let asked: Vec<Asked> = {
@@ -12566,8 +12591,7 @@ impl DesktopApp {
                     Some(Asked {
                         id: *id,
                         path: tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path),
-                        start_s: c.start_s,
-                        offset_s: c.offset_s,
+                        clip: c.clone(),
                         // **An attack is FOUND in the file and DRAWN over
                         // what the clip plays**, and those are two different
                         // timelines the moment a warp map exists. Projecting
@@ -12590,18 +12614,18 @@ impl DesktopApp {
                 .collect()
         };
         let mut out: Vec<(u64, Vec<(f32, f32)>)> = Vec::with_capacity(asked.len());
-        for clip in &asked {
-            let path = clip.path.clone();
+        for a in &asked {
+            let path = a.path.clone();
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
             let found = self.attacks_of(&path, &decoded, ask.sensitivity);
-            let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
-            let anchors = &clip.anchors;
+            let map = quantize_map(&found, decoded.rate, decoded.seconds(), &a.clip, &q);
+            let anchors = &a.anchors;
             let frames = decoded.frames();
             out.push((
-                clip.id,
+                a.id,
                 map.iter()
                     .map(|&(f, t)| {
                         let at = crate::warp::project_frame(
@@ -12630,7 +12654,8 @@ impl DesktopApp {
     /// means the file is entered part-way through, so a transient found at
     /// file frame N is heard at timeline `start_s + (N - offset)`. Quantizing
     /// against the raw file position would put every hit of a trimmed clip
-    /// out by the trim.
+    /// out by the trim. Only the attacks the clip plays are moved, and only
+    /// to where it still plays them - see `quantize_map`.
     ///
     /// **Everything one quantize was asked for**, so the per-clip worker
     /// takes one argument instead of six and a knob added to the window
@@ -12659,7 +12684,7 @@ impl DesktopApp {
             return (0, 0);
         };
         let found = self.attacks_of(&path, &decoded, ask.sensitivity);
-        let map = quantize_map(&found, decoded.rate, clip.start_s, clip.offset_s, &q);
+        let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
         if map.len() < 2 {
             return (0, found.len());
         }
@@ -24858,6 +24883,95 @@ mod tests {
             scan.contains("late_change(ctx, changed);"),
             "a mark change does not ask for the frame that would show it"
         );
+    }
+
+    /// **A hit the trim hides stays hidden when the clip is quantized.**
+    /// `quantize_map` sees every attack in the FILE and placed the ones in
+    /// front of a clip's trim with `t.at.saturating_sub(offset)`, so each was
+    /// "heard" on the clip's first frame: the first became an anchor ON that
+    /// frame, every later hit aimed at the same line was dropped (the clip's
+    /// own downbeat among them), and the render played the file's opening at
+    /// the head of the clip. A hit past the clip's end is the same stranger
+    /// from the other side, and is left out the same way.
+    #[test]
+    fn an_attack_the_trim_hides_is_not_pulled_onto_the_clip_start() {
+        use crate::transient::Transient;
+        let rate = 48_000u32;
+        let q = tangent_ui::quantize::Quantize::full(
+            tangent_ui::quantize::Grid::new(0.125, None).expect("a 1/16 grid at 120 bpm"),
+        );
+        // The right half of a 16 s take split at 8 s: it stands at 8 s and
+        // enters the file at 8 s, so the file's first eight seconds are trim.
+        // Its end is trimmed too, at 11.9 s of the file.
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            start_s: 8.0,
+            offset_s: 8.0,
+            len_s: 3.9,
+            loop_s: 3.9,
+            ..Default::default()
+        };
+        let (offset, end) = (384_000usize, 571_200u64);
+        // Two quiet hits inside the trim, and one past the end at 11.92 s -
+        // nearer the 11.875 s line inside the clip than any line past it.
+        // The clip's own two, loud: its downbeat 3 ms late and the next
+        // sixteenth 10 ms late.
+        let quiet = [480usize, 48_000, 572_160];
+        let loud = [384_144usize, 396_480];
+        let mut found: Vec<Transient> = quiet
+            .iter()
+            .chain(loud.iter())
+            .map(|&at| Transient { at, strength: 10.0 })
+            .collect();
+        // In the order `pick` reports them.
+        found.sort_by_key(|t| t.at);
+        let map = quantize_map(&found, rate, 16.0, &clip, &q);
+
+        // What the map PLAYS. Slice - what `Fit::Auto` picks for drums - so a
+        // click comes out exactly as it went in.
+        let frames = 16 * rate as usize;
+        let mut s = vec![0.0f32; frames * 2];
+        for (hits, level) in [(&quiet[..], 0.3f32), (&loud[..], 0.9f32)] {
+            for &at in hits {
+                for k in 0..64 {
+                    s[(at + k) * 2] = level;
+                    s[(at + k) * 2 + 1] = level;
+                }
+            }
+        }
+        let file = tangent_record::decode::Clip { samples: s, rate, source: "take.wav".into() };
+        let anchors: Vec<crate::warp::Anchor> = map
+            .iter()
+            .map(|&(from, to)| crate::warp::Anchor { from: from as usize, to: to as usize })
+            .collect();
+        let out = crate::warp::warp(
+            &file,
+            &anchors,
+            crate::stretch::Mode::Auto,
+            crate::warp::Fit::Slice,
+        );
+        let opening = out.samples[offset * 2..(offset + 480) * 2]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            opening > 0.8,
+            "the clip's first 10 ms peak at {opening}: it opens on a hit from its \
+             trim, not on its own downbeat - map {map:?}"
+        );
+        // And the map itself: nothing from the trim or past the end lands
+        // inside the clip, and the clip's own hits are the ones anchored.
+        for &(from, to) in &map {
+            assert!(
+                from >= offset as u64 || to < offset as u64,
+                "a hit the trim hides (file frame {from}) was sent to frame {to}: {map:?}"
+            );
+            assert!(
+                from < end || to >= end,
+                "a hit past the clip's end (file frame {from}) was sent to frame {to}: {map:?}"
+            );
+        }
+        assert!(map.contains(&(384_144, 384_000)), "the clip's own downbeat was dropped: {map:?}");
+        assert!(map.contains(&(396_480, 396_000)), "the clip's next hit was not quantized: {map:?}");
     }
 
     /// **A file's attacks are detected once per dial position.**

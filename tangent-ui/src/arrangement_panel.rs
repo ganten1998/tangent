@@ -177,10 +177,11 @@ pub struct ClipView<'a> {
     /// projected through the current map (`warp::project_frame`), so a take
     /// quantized once wears its ticks on its hits, and the trim is subtracted
     /// here, at the draw. Not through the clip's STRETCH: a stretched clip's
-    /// ticks stand in unstretched seconds. Every attack in the file arrives,
-    /// and a looped clip repeats ALL of them in every pass rather than only
-    /// those inside `offset_s .. offset_s + loop_s`, the span `wave_band`
-    /// folds each pass into. Empty unless that window is open over this clip.
+    /// ticks stand in unstretched seconds. Only the attacks the clip plays
+    /// arrive - inside `offset_s ..` its end, or one pass of its loop, the
+    /// span `wave_band` folds each pass into - so a looped clip repeats them
+    /// in every pass, as it repeats its sound. Empty unless that window is
+    /// open over this clip.
     ///
     /// The owner asked for these: "the waveform should have transient marks
     /// shown as the different settings are tweaked in its menu". A
