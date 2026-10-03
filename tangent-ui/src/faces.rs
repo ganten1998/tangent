@@ -273,7 +273,7 @@ pub struct FaceLive {
     ///
     /// It exists because a chip had exactly two looks, empty and filled,
     /// and the seeded board now ships switched off (see
-    /// `desktop::seed_amp_board`). A default nobody can SEE is a board
+    /// the app's `seed_amp_board`). A default nobody can SEE is a board
     /// that mysteriously does nothing, which is a worse fault than the one
     /// shipping it bypassed fixes. Shift-clicking a chip has toggled this
     /// same flag since the day the chip learned to carry its own modifiers
