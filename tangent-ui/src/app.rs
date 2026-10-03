@@ -10874,12 +10874,11 @@ impl TangentApp {
         // **The arrangement's grid and window**, the timeline's half of what
         // `feel` is for the editor. Clamped on the way in exactly as the
         // settings reader clamps them, or a document could hand the app a
-        // number its own file could never hold. (Not yet for the grid: this
-        // clamps it to -7, where the settings reader and every gesture stop
-        // at -6.)
+        // number its own file could never hold: the grid stops at -6, where
+        // the settings reader and every gesture do.
         if let Some(v) = d.view.as_ref() {
             self.settings.arr_snap = v.snap;
-            self.settings.arr_grid_exp = v.grid_exp.clamp(-7, 3);
+            self.settings.arr_grid_exp = v.grid_exp.clamp(-6, 3);
             self.settings.arr_tempo_lane = v.tempo_lane;
             self.settings.arr_master_row = v.master_row;
             // **Zero is AUTO** for these two: the app derives the width and
@@ -46239,6 +46238,33 @@ mod tests {
         );
         assert!(!third.take_desk_reload());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A document's timeline grid lands on a rung the timeline has.** The
+    /// settings reader and every gesture stop the arrangement's grid at -6,
+    /// the finest line `arr_grid_s` draws, but the document's reader and
+    /// `apply_desk_snapshot` let -7 through - the MIDI editor's floor - so a
+    /// hand-edited document set a grid the snap and the grid seconds read
+    /// two ways, and that the settings file then read back as -6. Both roads
+    /// in: the reader alone, and a desk handed straight to the apply, as an
+    /// undo moment arrives.
+    #[test]
+    fn a_documents_grid_lands_on_a_rung_the_timeline_has() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let mut desk = app.desk_snapshot();
+        desk.view.as_mut().expect("the live desk always says").grid_exp = -7;
+        let text = crate::arrangement::Arrangement::default().to_json_with_desk(Some(&desk));
+        let read = crate::arrangement::Arrangement::from_json(&text);
+        assert_eq!(
+            read.desk.and_then(|d| d.view).map(|v| v.grid_exp),
+            Some(-6),
+            "the document's reader kept a grid the timeline has no line for"
+        );
+        app.apply_desk_snapshot(&desk);
+        assert_eq!(
+            app.settings.arr_grid_exp, -6,
+            "a document set a grid the settings reader and every gesture refuse"
+        );
     }
 
     /// **A note written with the pen UP reaches the engine.**
