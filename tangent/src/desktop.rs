@@ -27016,24 +27016,41 @@ mod tests {
         );
     }
 
-    /// **A file's attacks are detected once per dial position.**
+    /// **A file is analysed once, wherever the detect dial stands.**
     ///
-    /// The marks are redrawn while somebody is dragging the sensitivity
-    /// slider and the detector is a whole-file pass, so without the cache
-    /// that is one pass a frame. Driven through the real function, which
-    /// needs a `DesktopApp` - so what is checked here is the KEY, which is
-    /// where the cache either works or quietly never hits: a dial rounded
-    /// to a thousandth is finer than a slider can be dragged, and two
-    /// frames of one position must land on the same key.
+    /// The marks are redrawn on every frame of a drag on the detect slider
+    /// and the analysis is a whole-file pass, so a cache the dial can miss is
+    /// one pass a frame. The cache holds the ANALYSIS, which reads no dial,
+    /// and re-picks from it, so what decides whether to analyse is the file
+    /// and its decode and never the dial. This test used to check a dial key
+    /// it defined for itself, which production stopped having when the cache
+    /// began holding the analysis, so it passed with the cache gone. A source
+    /// scan, because `attacks_of` is on `DesktopApp`, which cannot be built
+    /// in a test.
     #[test]
-    fn the_attack_cache_keys_on_the_dial_and_not_on_its_noise() {
-        let key = |s: f64| (s.clamp(0.0, 1.0) * 1000.0).round() as i32;
-        assert_eq!(key(0.5), key(0.5000004), "a hair of float noise missed the cache");
-        assert_ne!(key(0.500), key(0.502), "two dial positions shared an answer");
-        // The ends are reachable and do not alias onto each other.
-        assert_eq!(key(-1.0), 0, "below the floor did not clamp");
-        assert_eq!(key(9.0), 1000, "above the ceiling did not clamp");
-        assert_ne!(key(0.0), key(1.0));
+    fn a_file_is_analysed_once_wherever_the_detect_dial_stands() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn attacks_of(").expect("the cache");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let analyse = body
+            .find("crate::transient::analyse(")
+            .expect("the analysis is no longer the cache's");
+        // The question asked in front of the analysis.
+        let gate = body[..analyse]
+            .rfind("if ")
+            .expect("the file is analysed on every call: a whole-file pass a frame");
+        let gate = &body[gate..analyse];
+        assert!(
+            gate.contains("self.attack_cache.get(path)"),
+            "the analysis is not behind the cache, so every frame of a dial drag is a \
+             whole-file pass: `{gate}`"
+        );
+        assert!(
+            !gate.contains("sensitivity"),
+            "the dial decides whether the file is analysed again, so a drag misses the \
+             cache: `{gate}`"
+        );
     }
 
     /// **The attack analyses go wherever the decodes they came from go.** An
