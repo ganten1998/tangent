@@ -2077,6 +2077,103 @@ fn the_damper_pedal_reaches_a_grained_lane() {
     }
 }
 
+/// **A grained lane's plugin automation steps on the frame a chunked one
+/// does.**
+///
+/// The curve is read once per chunk, at the chunk's own position, into one
+/// desk-wide table, and a grained lane renders up to a grain past that
+/// position from the same table: a step reached it up to two grains late,
+/// and a ramp became a staircase a grain wide. Four lanes, so every phase of
+/// the stagger is asked. The trim's glide is per-sample and block-size
+/// invariant, so before the step the two desks send it the same constant and
+/// the first difference is the step itself.
+#[test]
+fn a_grained_lanes_plugin_automation_steps_where_a_chunked_one_does() {
+    use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+    // The trim held at -12 dB, then a step to +19.2 dB at 0.3 s: mid-block
+    // (frame 14 400 of 128) and mid-grain.
+    let curves = || {
+        let mut a = Automation::default();
+        for lane in 0..4 {
+            a.set(Curve::sanitised(
+                lane,
+                AutoParam::Plugin { bay: 0, id: 0 },
+                vec![
+                    Point { at_s: 0.0, value: 0.25, shape: Shape::Linear },
+                    Point { at_s: 0.3, value: 0.25, shape: Shape::Linear },
+                    Point { at_s: 0.3, value: 0.9, shape: Shape::Linear },
+                ],
+            ));
+        }
+        a
+    };
+    let mut chunked = audio_desk(4, &["@tangent-trim"]);
+    let mut grained = audio_desk(4, &["@tangent-trim"]);
+    chunked.set_grain_ms(0.0);
+    grained.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+    chunked.set_automation(curves());
+    grained.set_automation(curves());
+    let (mut a, mut b) = (vec![0.0f32; BLOCK * 2], vec![0.0f32; BLOCK * 2]);
+    let mut peak = 0.0f32;
+    for block in 0..(RATE as usize / BLOCK) {
+        chunked.render_offline(&mut a);
+        grained.render_offline(&mut b);
+        peak = a.iter().fold(peak, |m, s| m.max(s.abs()));
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.to_bits() == y.to_bits(),
+                "block {block} sample {i}: chunked {x}, grained {y} - the plugin \
+                 curve reached the grained lanes late"
+            );
+        }
+    }
+    assert!(peak > 0.001, "the render was silent");
+}
+
+/// **A knob turned while a lane is served from its grain still reaches the
+/// plugin.**
+///
+/// A knob and a preset reach the audio thread on `ui_params`, and the drain
+/// is destructive: the point is popped into a queue that is cleared next
+/// block, and the only reader is the lane's rack. A grained lane runs its
+/// rack on one callback in four here (128 frames into a 512-frame grain), so
+/// an edit popped on any of the other three was dropped, while the face and
+/// the saved project kept the new value. Every phase of the grain, one
+/// engine each, because a lost edit is never sent again.
+#[test]
+fn a_knob_turned_while_a_lane_is_served_from_its_grain_still_lands() {
+    for wait in 0..8usize {
+        let mut e = audio_desk(1, &["@tangent-trim"]);
+        e.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let energy = |out: &[f32]| out.iter().map(|s| s * s).sum::<f32>();
+        for _ in 0..(8 + wait) {
+            e.render_offline(&mut out);
+        }
+        let mut before = 0.0f32;
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+            before += energy(&out);
+        }
+        // 0.9 of the trim's travel: +19.2 dB.
+        assert!(e.set_insert_param(0, 0, 0, 0.9), "the trim refused the knob");
+        for _ in 0..(RATE as usize / BLOCK / 2) {
+            e.render_offline(&mut out);
+        }
+        let mut after = 0.0f32;
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+            after += energy(&out);
+        }
+        assert!(before > 0.0, "the reference was silent");
+        assert!(
+            after > before * 20.0,
+            "an edit {wait} blocks into the steady state never reached the trim: \
+             {before} -> {after}"
+        );
+    }
+}
+
 /// **Auto picks the grain the measurements picked.**
 ///
 /// The rule is one line - eight callbacks' worth, capped at `MAX_BLOCK` -

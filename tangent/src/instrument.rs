@@ -2099,8 +2099,15 @@ struct Shared {
     /// renders this is its END, not its start - and in the chunk that wraps it
     /// is already back at `loop_a` plus the block's overshoot. The host reads it
     /// as the playhead (`Engine::transport_position`); audio-thread code that
-    /// wants the block being rendered uses the `at` that `run_transport` returns.
+    /// wants the block being rendered uses the `at` that `run_transport` returns,
+    /// which it publishes as `transport_anchor`.
     transport_pos: AtomicU64,
+    /// **The FIRST frame of the chunk being rendered** - the `at` of
+    /// `run_transport`, stored before the advance and the loop wrap, beside
+    /// the beat and tempo below. Not the playhead (`transport_pos` is): this
+    /// is the block a rack is rendering, so a rack with no span of its own is
+    /// handed the pair as it stands. See `rack_transport`.
+    transport_anchor: AtomicU64,
     /// **Where that frame is in the MUSIC, and how fast the music is going
     /// there** - the beat as the tempo map reckons it, and the map's
     /// instantaneous tempo, both as `f64` bits.
@@ -2116,19 +2123,21 @@ struct Shared {
     /// the wrong speed. New tempo points default to a RAMP, so that is the
     /// ordinary case and not an exotic one.
     ///
-    /// Published once a chunk by `run_transport` for the same frame as
-    /// `transport_pos` (the END of the chunk, after the wrap), from
+    /// Published once a chunk by `run_transport` for `transport_anchor`, the
+    /// first frame of the chunk being rendered, from
     /// `TempoMap::beat_at_seconds` - the map walk `BarClock::resync` uses - and
-    /// `TempoMap::bpm_at_beat`. The click places each beat exactly from the map;
-    /// the arp extrapolates from this pair (see `rack_transport`), so the two
-    /// agree to within the tempo change across that extrapolation. Single
-    /// writer: read only by the callback itself and by lane workers the
-    /// callback dispatches after the store (`LanePool::run` publishes jobs with
-    /// a Release the workers Acquire), so the three loads cannot tear.
+    /// `TempoMap::bpm_at_beat`. It was published for the END of the chunk, the
+    /// next one's start, after the wrap. The click places each beat exactly
+    /// from the map; the arp extrapolates from this pair across at most its own
+    /// grain (see `rack_transport`), so the two agree to within the tempo
+    /// change across that. Single writer: read only by the callback itself and
+    /// by lane workers the callback dispatches after the store (`LanePool::run`
+    /// publishes jobs with a Release the workers Acquire), so the loads cannot
+    /// tear.
     transport_beat: AtomicU64,
     transport_bpm: AtomicU64,
     /// **The engine's sample rate, for whoever on the audio thread needs
-    /// to turn `transport_pos` into beats.** A built-in voice's
+    /// to turn frames past `transport_anchor` into beats.** A built-in voice's
     /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
     /// has the board but not the renderer. Written once, at start, from
     /// the rate the device actually opened at; 48 kHz until then.
@@ -3183,6 +3192,7 @@ impl Shared {
             grain: AtomicU32::new(0),
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
+            transport_anchor: AtomicU64::new(0),
             transport_beat: AtomicU64::new(0.0f64.to_bits()),
             // The same seed `Arp::new` had, so a rack that runs before the
             // first `run_transport` is no worse off than it was.
@@ -4716,9 +4726,10 @@ mod engine_parts {
     /// document and the position, for both the desk's own controls and the
     /// plugins' parameters. The other half, the one-shot knob and preset
     /// edits that arrive on a ring, is not a function of anything and stays
-    /// where it is. Being pure is the prerequisite, not the use: a grained
-    /// lane's plugin parameters are still filled once per chunk, at the
-    /// chunk's position (see `grain_ok`).
+    /// where it is. Being pure is the prerequisite, not the use: the plugin
+    /// parameters are still filled once per chunk, at the chunk's position,
+    /// and a lane carrying a curve is pinned to the chunk for it (see
+    /// `grain_ok`).
     #[test]
     fn the_automation_answers_for_the_position_it_is_asked_about() {
         use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
@@ -5504,11 +5515,15 @@ fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
 /// * **The lane the insert TAP names**, whose mid-rack signal is pushed from
 ///   inside the render and would lead the audio.
 /// * **Not here: a built-in voice's arpeggiator.** It reads the song's beat
-///   through `rack_transport`, walked from the published anchor to the
-///   span's own frame. That is exact at a constant tempo and off by the
-///   tempo change across the walk otherwise; a lane carrying it renders
-///   ahead like any other, and pinning it would not help the loop wrap,
-///   where a pinned lane walks just as far.
+///   through `rack_transport`, walked from the chunk's first frame to the
+///   span's own: no walk at all for a lane on the chunk, and at most its own
+///   grain for a lane ahead of it, which is exact at a constant tempo and
+///   off by the tempo change inside that grain otherwise - the error the
+///   arp's own one-tempo walk across a span already has. A lane carrying it
+///   renders ahead like any other.
+/// * **Not here either: a plugin-parameter curve**, which the grain clock
+///   pins itself beside the audition (`Renderer::curve_lanes`): the curve
+///   is walked by the renderer, which this board cannot see.
 ///
 /// The Fx bus and the two master seats are not channels and never reach this
 /// loop, so they are asserted rather than tested per lane.
@@ -6306,13 +6321,13 @@ fn lane_range(first: Option<&[u32; CHANNELS + 1]>, ch: usize, len: usize) -> std
 ///
 /// **`secs` is the position of the first frame these values will be
 /// rendered with.** `resolve_automation` passes the chunk's own, which is
-/// right for every lane that renders the chunk. A lane the grain clock has
-/// moved (`plan_grains`, `lane_at`) renders up to a grain past it from this
-/// same table, one point at offset 0 for the whole grain, so its plugin
-/// parameters arrive at the chunk's position, up to two grains late, and
-/// nothing pins a lane for carrying a curve. The desk's fader, pan, send and
-/// mute are not affected: `automation_now` resolves them for the chunk and
-/// the fold applies them at consumption.
+/// right for every lane that renders the chunk. A lane the grain clock moved
+/// (`plan_grains`, `lane_at`) would render up to a grain past it from this
+/// same table, one point at offset 0 for the whole grain, so the lanes this
+/// returns are pinned (`Renderer::curve_lanes`): a lane carrying a curve
+/// renders the chunk the curve was read for. The desk's fader, pan, send and
+/// mute need no pin: `automation_now` resolves them for the chunk and the
+/// fold applies them at consumption.
 fn fill_automation_params(
     automation: &tangent_ui::automation::Automation,
     suspend: u64,
@@ -6386,10 +6401,9 @@ fn fill_automation_params(
 /// the one the callback is on, which is what a lane rendered ahead needs.
 /// The other half of the automation, the one-shot knob and preset edits that
 /// arrive on a ring, is NOT a function of position and stays where it is:
-/// see `resolve_automation`. `param_lanes` only keeps a lane those land on
-/// from PARKING; it is not in the pin set, so a lane served from its grain
-/// ring that block runs no rack and the edit goes with the queue's clear at
-/// the next block.
+/// see `resolve_automation`. `param_lanes` keeps a lane those land on from
+/// PARKING, and `Renderer::ui_held` keeps an edit for a lane served from its
+/// grain ring that block, which runs no rack, until the lane's rack runs.
 fn automation_now(
     automation: &tangent_ui::automation::Automation,
     suspend: u64,
@@ -6874,8 +6888,8 @@ fn run_extra_rack(
     // early by exactly that much. Every other caller - the room, the sends
     // pass, the folders, the pedalboards, the pads, the click, the Fx bus
     // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is the END of
-    // that block (see `rack_transport`).
+    // sentinel, and is handed the published anchor, which is that block's
+    // first frame (see `rack_transport`).
     pos: u64,
 ) -> Option<u32> {
     if is_folder {
@@ -6919,25 +6933,26 @@ fn run_extra_rack(
 /// difference it grew every bar. New tempo points default to a ramp, so that
 /// was the ordinary case rather than an exotic one.
 ///
-/// `run_transport` publishes ONE anchor per chunk: `transport_pos`, and the
+/// `run_transport` publishes ONE anchor per chunk: `transport_anchor`, the
+/// chunk's FIRST frame (taken before the advance and the loop wrap), and the
 /// tempo map's beat (`TempoMap::beat_at_seconds`) and instantaneous tempo
-/// (`TempoMap::bpm_at_beat`) at that frame. The anchor is the END of the
-/// chunk being rendered - stored after the advance and after the loop
-/// wrap - so in the chunk that wraps it is already back near the loop's
-/// head.
+/// (`TempoMap::bpm_at_beat`) at that frame.
 ///
 /// `pos` is the span's own first frame, or `u64::MAX` for a caller that has
-/// none. The sentinel is handed the anchor as it stands, one chunk AHEAD of
-/// the block its caller renders. A real `pos` is walked from the anchor in a
-/// straight line at the anchor's tempo, which is exact only while the tempo
-/// is constant between the two: across a ramp it is off by the ramp's
-/// curvature over the walk (a frame or less on an ordinary ramp), across a
-/// tempo step by the step times the part of the walk beyond it, and across a
-/// loop wrap - where the anchor has already jumped back to the head - by
-/// everything the map does between the head and `pos`. So the beat is NOT a
-/// pure function of the span's position on a tempo map, and `pinned_lanes`
-/// does not pin a lane for it. Three relaxed loads for the sentinel, five
-/// for a lane, read once so every bay in the rack sees one block.
+/// none. The sentinel is handed the anchor as it stands, which is exactly the
+/// block its caller renders. A real `pos` is walked from the anchor in a
+/// straight line at the anchor's tempo. Every lane span of a chunk starts at
+/// the anchor or up to a grain past it, on the same lap - a grain is cut at
+/// the loop's end and the rings are emptied at the wrap - so an ungrained
+/// lane is not walked at all, and a grained one only across its own grain:
+/// exact at a constant tempo, and otherwise off by the ramp's curvature over
+/// the grain (a frame or less) or a tempo step times the part of the grain
+/// beyond it, which is the error the arp's own one-tempo walk across a span
+/// already has. The anchor used to be the END of the chunk, after the wrap:
+/// the sentinel ran a chunk ahead, and in the chunk that wraps a lane at its
+/// own frame was walked back the whole loop from the head. Three relaxed
+/// loads for the sentinel, five for a lane, read once so every bay in the
+/// rack sees one block.
 fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
     let rolling = shared.rolling.load(Ordering::Relaxed);
     let beat = f64::from_bits(shared.transport_beat.load(Ordering::Relaxed));
@@ -6946,7 +6961,7 @@ fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
         beat
     } else {
         let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
-        let here = shared.transport_pos.load(Ordering::Relaxed) as f64;
+        let here = shared.transport_anchor.load(Ordering::Relaxed) as f64;
         beat + (pos as f64 - here) / rate * bpm / 60.0
     };
     crate::analog::arp::Transport { bpm, playing: rolling, beat }
@@ -7019,8 +7034,8 @@ fn run_rack(
     // early by exactly that much. Every other caller - the room, the sends
     // pass, the folders, the pedalboards, the pads, the click, the Fx bus
     // and the master - renders the block the callback is on, passes the
-    // sentinel, and is handed the published anchor, which is the END of
-    // that block (see `rack_transport`).
+    // sentinel, and is handed the published anchor, which is that block's
+    // first frame (see `rack_transport`).
     pos: u64,
 ) -> Option<u32> {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
@@ -7838,19 +7853,21 @@ struct Renderer {
     /// already scaled by how much of it monitoring is currently withholding.
     ///
     /// Subtracted rather than separately summed. **The subtraction is exact
-    /// only for what `mix_monitor` itself applied**: the input's fader, pan,
-    /// pedalboard and own racks (the subtrahend is the same `src` that pass
-    /// added), and its folders' faders and pans (`folder_chain_gain`). It is
-    /// NOT exact for what PROCESSES the input further on: a folder ancestor's
-    /// rack or board (they work on the group's sum), and a route's whole path
-    /// (route gain, the destination's rack, the gain it folds at -
-    /// `lane_gain` - and its pan), none of which is in the subtrahend. While
-    /// an input is withheld (monitoring off, its strip muted or soloed out,
-    /// or the host's rebuild gate `DesktopApp::armed_racks_pending`), the
-    /// room therefore hears `path(src) - src` for those: a folder denoiser's
-    /// removed noise inverted, an amp bus's sound minus the DI, a turned-down
-    /// or muted bus's input inverted. One buffer, filled by the pass that
-    /// made the samples in the first place.
+    /// only through gains**: the input's fader, pan, pedalboard and own racks
+    /// (the subtrahend is the same `src` that pass added), its folders'
+    /// faders and pans (`folder_chain_gain`), and for a ROUTED input the
+    /// route's gain and each destination's fold gain - `lane_gain`, so its
+    /// fader, mute and solo - and pan along the way (`route_transfer`). It
+    /// is NOT exact for what PROCESSES the input further on: a folder
+    /// ancestor's rack or board (they work on the group's sum) and a route
+    /// destination's rack, which the subtrahend takes as unity. While an
+    /// input is withheld (monitoring off, its strip muted or soloed out, or
+    /// the host's rebuild gate `DesktopApp::armed_racks_pending`), the room
+    /// therefore hears `rack(x) - x` for those: a folder denoiser's removed
+    /// noise inverted, an amp bus's sound minus the DI it was handed. Exact
+    /// withholding through a processing bay would need that bay run twice,
+    /// which is two instances of the plugin. One buffer, filled by the pass
+    /// that made the samples in the first place.
     input_dry: Vec<f32>,
     /// Whether the room and the take differ this block — in CONTENT, because
     /// monitoring is withholding an input, or in TREATMENT, because a live
@@ -7964,9 +7981,40 @@ struct Renderer {
     /// That is why a lane with a parameter waiting counts as live. See
     /// `a_parked_lane_still_hears_a_knob`. Counting as live stops a lane
     /// PARKING; it does not stop `plan_grains` serving the lane from its grain
-    /// ring, which runs no rack either, so an edit popped on such a block is
-    /// still lost (see `automation_now`).
+    /// ring, which runs no rack either, so an edit for such a lane is kept in
+    /// `ui_held` and applied again until its rack runs.
     param_lanes: u32,
+    /// **Which lanes carry a plugin-parameter CURVE**, from this chunk's walk
+    /// of the document (`fill_automation_params`), kept apart from the knob
+    /// bits `param_lanes` also holds.
+    ///
+    /// The grain clock pins them. A curve is read once per chunk, at the
+    /// chunk's own position, into one desk-wide table, and a grained lane
+    /// renders up to a grain past that position from it: a step reached it
+    /// up to two grains late and a ramp became a staircase a grain wide.
+    /// Pinned, the lane renders the chunk the table was read for. Reading the
+    /// curve at the grain's own position instead would still hold one value
+    /// for the whole grain, which is the staircase back again.
+    curve_lanes: u32,
+    /// **Knob and preset edits a lane served from its grain ring has not
+    /// heard yet.**
+    ///
+    /// The `ui_params` drain is destructive and `auto_params` is cleared
+    /// every block, and a lane `plan_grains` serves from its ring runs no
+    /// rack that block (`lane_skip`). So an edit for it was cleared before
+    /// anything read it, while the face and the saved project kept the new
+    /// value: a grained lane runs its rack once a grain, and a knob turned in
+    /// an LV2 plugin's own window was lost on every other callback. Pinning
+    /// would not have saved it, because a newly pinned lane is still served
+    /// from its ring until the ring runs out.
+    ///
+    /// Every edit for a lane's seat is kept here as it is applied, the last
+    /// value per id, and the next block's `resolve_automation` applies again,
+    /// ahead of anything new, those whose lane was served from its ring;
+    /// the rest were delivered and go. So the edit lands on the lane's next
+    /// rendered grain, as a curve edit does. Sized once at the ring's own
+    /// size; an edit past it is applied but not kept.
+    ui_held: Vec<UiParam>,
     /// Which lanes the deciding walk left for the render walk to do.
     lane_wants: [bool; CHANNELS],
     /// **The span each lane is rendering this chunk**, which is the chunk's
@@ -10070,10 +10118,11 @@ impl Renderer {
             // so the difference between the file's mix and the speakers' is
             // the input that monitoring is withholding, and `mix_monitor`
             // wrote that down frame by frame as it made it. Exactly so only
-            // where that input reaches the master through plain gains: a
-            // folder's rack and board, and a route's destination, PROCESS
-            // what reaches them, and the subtrahend knows nothing of either -
-            // see `input_dry` for what the room hears then.
+            // where that input reaches the master through plain gains, a
+            // route's included: a folder's rack and board, and a route
+            // destination's rack, PROCESS what reaches them, and the
+            // subtrahend takes them as unity - see `input_dry` for what the
+            // room hears then.
             //
             // After the insert it could not be done at all: a limiter is not
             // linear, and there is no arithmetic that takes one voice back out
@@ -10965,6 +11014,9 @@ impl Renderer {
         // which strip.
         let mut offset = 0usize;
         let capturing = self.shared.arr_capture.load(Ordering::Relaxed);
+        // What the routes make of a routed strip, walked once a chunk and
+        // only if one is open - see `route_transfer`.
+        let mut transfer: Option<[[f32; 2]; CHANNELS]> = None;
         for input in 0..INPUTS {
             let width = self.monitor_widths[input].min(ch_in.saturating_sub(offset));
             if width == 0 {
@@ -11126,10 +11178,11 @@ impl Renderer {
             // fader sits in the same place for both — ahead of the rack, which
             // is where this pass has always put it.
             //
-            // **And only while the transport rolls.** `mix_clips` returns
-            // after zeroing when it is not, and without that term the parked
-            // position is re-read every callback and the clips buzz one block
-            // of themselves under a readout that says nothing is moving.
+            // **And only while the transport rolls**, the gate the lane pass
+            // keeps too (`DeskRef::clips_rolling`): without that term the
+            // parked position is re-read every callback and the clips buzz
+            // one block of themselves under a readout that says nothing is
+            // moving.
             let merge_clip = takes_rack && clip_on_lane && monitoring && rolling;
             if merge_clip {
                 // Pulled for THIS block, into a scratch of its own: the read
@@ -11353,6 +11406,31 @@ impl Renderer {
             // See `folder_chain_gain`: the room's subtrahend for a grouped
             // strip is what its folders will make of it, not the raw input.
             let chain = self.folder_chain_gain(lane);
+            // **And for a ROUTED strip, what its routes make of it**, because
+            // that is where it reaches the mix instead (`route_transfer`).
+            // Routed away, nothing of it goes straight out, so its straight
+            // share is only what its folders fold, and none for a loose strip:
+            // the subtrahend was `chain` alone, as if it went direct, so a
+            // withheld input routed to a bus turned down or muted came out of
+            // the room inverted. A folder's own input keeps the old reckoning.
+            let held = if !is_folder
+                && (0..self.route_n).any(|i| {
+                    let (from, _, hardware, _, _) = self.route_cache[i];
+                    from == lane && !hardware
+                }) {
+                let t = transfer.get_or_insert_with(|| self.route_transfer());
+                let mut held = if self.folders[lane] >= 0 { chain } else { [0.0; 2] };
+                for i in 0..self.route_n {
+                    let (from, target, hardware, _, gain) = self.route_cache[i];
+                    if from == lane && !hardware && gain > 0.0 && target < CHANNELS {
+                        held[0] += gain * t[target][0];
+                        held[1] += gain * t[target][1];
+                    }
+                }
+                held
+            } else {
+                chain
+            };
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -11400,7 +11478,7 @@ impl Renderer {
                     // four inputs share one buffer and the last one to run
                     // would otherwise be the only one the speakers were spared.
                     if let Some(d) = self.input_dry.get_mut(at + c) {
-                        *d += src * keep_out * chain[c.min(1)];
+                        *d += src * keep_out * held[c.min(1)];
                     }
                     // Post-fader, like every other send here, and closed with
                     // the room: a channel nobody can hear must not arrive back
@@ -11504,14 +11582,51 @@ impl Renderer {
             q.clear();
         }
         // **Which lanes are owed a parameter this block.** See
-        // `param_lanes`: a lane that skips its render loses the point
-        // rather than deferring it, so this is what keeps it awake.
+        // `param_lanes`: a parked lane would lose the point rather than
+        // defer it, so this is what keeps it awake.
         self.param_lanes = 0;
+        self.curve_lanes = 0;
+        // **The edits a lane served from its grain ring has not heard yet** -
+        // see `ui_held`. `lane_skip` still holds the LAST block's plan here
+        // (`plan_grains` runs later in the chunk), so what stays is exactly
+        // the edits whose lane ran no rack; the rest were delivered.
+        let skipped = self.lane_skip;
+        self.ui_held.retain(|u| {
+            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| skipped[ch.min(CHANNELS - 1)])
+        });
+        let held = self.ui_held.len();
+        let mut next_held = 0usize;
         // **Before the early return below, not after it.** A plugin's own
         // window works in a song with no automation at all — which is most
         // songs — and draining these after the `is_empty` shortcut would have
         // meant every LV2 knob was dead until somebody drew a curve.
-        while let Ok(u) = self.ui_params.pop() {
+        //
+        // The held edits first, as the older: a fresh one for the same id
+        // then wins in place, below.
+        loop {
+            let u = if next_held < held {
+                let Some(u) = self.ui_held.get(next_held).copied() else {
+                    break;
+                };
+                next_held += 1;
+                u
+            } else if let Ok(u) = self.ui_params.pop() {
+                // Kept until the lane's rack has run, last value per id.
+                if lane_of_seat(usize::from(u.lane)).is_some() {
+                    if let Some(k) = self
+                        .ui_held
+                        .iter_mut()
+                        .find(|k| k.lane == u.lane && k.bay == u.bay && k.id == u.id)
+                    {
+                        k.value = u.value;
+                    } else if self.ui_held.len() < self.ui_held.capacity() {
+                        self.ui_held.push(u);
+                    }
+                }
+                u
+            } else {
+                break;
+            };
             let (lane, bay) = (usize::from(u.lane), usize::from(u.bay));
             // `RACK_SEATS`, not `CHANNELS`: the queues cover every seat now,
             // and bounding this at the channel count would have dropped every
@@ -11568,12 +11683,13 @@ impl Renderer {
         // hundred and forty-four bays; asking every bay whether it has a curve
         // would be four hundred lookups a block to find three. The curve list
         // is the source of truth and it is already sorted.
-        self.param_lanes |= fill_automation_params(
+        self.curve_lanes = fill_automation_params(
             &self.automation,
             suspend,
             secs,
             &mut self.auto_params,
         );
+        self.param_lanes |= self.curve_lanes;
         self.auto = automation_now(&self.automation, suspend, secs);
         // **The master's own curve**, read at the lane the UI addresses it
         // by — one past the channels. Suspended by the same rule a channel
@@ -11810,13 +11926,20 @@ impl Renderer {
             }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
-        // **And where that is in the MUSIC.** The map's beat at that frame
-        // (`beat_at_seconds`, the walk `BarClock::resync` makes too) and its
-        // instantaneous tempo there (`bpm_at_beat`), so the click and a
-        // built-in voice's arpeggiator read one tempo map rather than two
-        // different ideas of the tempo. Once a block, not once a frame: an
-        // arp step is tens of milliseconds and a block is under one.
-        let secs = self.pos as f64 / self.rate.max(1.0);
+        // **And where the block being rendered is in the MUSIC.** The map's
+        // beat at its first frame (`beat_at_seconds`, the walk
+        // `BarClock::resync` makes too) and its instantaneous tempo there
+        // (`bpm_at_beat`), so the click and a built-in voice's arpeggiator
+        // read one tempo map rather than two different ideas of the tempo.
+        // Once a block, not once a frame: an arp step is tens of milliseconds
+        // and a block is under one.
+        //
+        // **At `at`, from before the advance and the wrap.** It was taken at
+        // `self.pos`, the END of the block: a rack with no span of its own got
+        // the next block's beat, and in the block that wraps a loop a lane at
+        // its own frame was walked back the whole loop from the head.
+        self.shared.transport_anchor.store(at, Ordering::Relaxed);
+        let secs = at as f64 / self.rate.max(1.0);
         let beat = self.maps.tempo.beat_at_seconds(secs);
         self.shared
             .transport_beat
@@ -11926,12 +12049,6 @@ impl Renderer {
         }
         self.clip_lanes = lanes;
         self.clip_under = under;
-        // **Stopped means silent, exactly as it always has.** Without this the
-        // parked position is re-read every callback and the clips buzz one
-        // block of themselves under a readout that says nothing is moving.
-        if !rolling || self.clips.is_empty() {
-            return;
-        }
         // **The per-lane fader's own smoothing state, advanced here and read
         // by the SENDS pass.**
         //
@@ -11942,6 +12059,13 @@ impl Renderer {
         // writer it has ever had. Advancing it was interleaved with the clip
         // walk frame by frame; it never depended on the frame, so it is one
         // loop now and the arithmetic is unchanged.
+        //
+        // **Every chunk, rolling or not, clips or not.** It sat behind an
+        // early return for a stopped transport or an empty clip list, left
+        // from when this pass folded the clips itself, so with the song
+        // parked, or in a session of MIDI tracks, a bus kept the gain it last
+        // had and its fader, mute and solo never reached what was routed into
+        // it. The walk above is all this pass still does with the clips.
         let coeff = self.gain_coeff;
         let mut target = [0.0f32; CHANNELS];
         let mut punch = [u64::MAX; CHANNELS];
@@ -13025,7 +13149,8 @@ impl Renderer {
     /// destination, a drum lane, sidechain-keyed, room-owned or named by
     /// the insert tap. An auditioning lane is added to it by the caller,
     /// because an audition is a LEVEL reconciled against the playhead and
-    /// there is no such thing for a span the playhead has not reached.
+    /// there is no such thing for a span the playhead has not reached; and
+    /// so is a lane carrying a plugin curve (`curve_lanes`), below.
     ///
     /// Everything a lane that survives that needs is a pure function of the
     /// position it is asked about: `pull_lane_clips` takes the span, the
@@ -13034,11 +13159,11 @@ impl Renderer {
     /// automated fader, pan, send and mute are applied at consumption.
     /// Those are exactly what steps two and three of this overhaul built.
     ///
-    /// **Plugin-parameter automation is the exception**:
-    /// `fill_automation_params` is asked once per chunk at the chunk's
-    /// position and a grained lane renders a grain ahead from that table, so
-    /// its curves land up to two grains late; nothing in the pin set covers
-    /// a lane that carries one.
+    /// **Plugin-parameter automation is the exception**, and the caller pins
+    /// it: `fill_automation_params` is asked once per chunk at the chunk's
+    /// position, and a lane grained from that table played its curves up to
+    /// two grains late, so a lane carrying one renders the chunk
+    /// (`curve_lanes`).
     fn grain_ok(&self, ch: usize, free: u32) -> bool {
         if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
             return false;
@@ -13330,6 +13455,9 @@ impl Renderer {
                     self.room_rack | self.board_live,
                     self.keys_live,
                 );
+                // **So does a plugin curve**: it was read for this chunk
+                // alone. See `curve_lanes`.
+                free &= !self.curve_lanes;
                 // **An audition pins its own lane.** It is a LEVEL
                 // reconciled against the playhead once a chunk - the key is
                 // held, not scheduled - and there is no such thing for a
@@ -14173,7 +14301,7 @@ impl Renderer {
                     self.room_rack | self.board_live,
                     self.keys_live,
                 );
-                let pinned = desk | self.probe_walk_pins;
+                let pinned = desk | self.probe_walk_pins | self.curve_lanes;
                 (
                     wanted & !(pinned | self.probe_clip_pins | self.probe_inst_pins),
                     wanted & !(pinned | self.probe_inst_pins),
@@ -15080,6 +15208,61 @@ impl Renderer {
             hops += 1;
         }
         g
+    }
+
+    /// **What the routes make of what reaches each channel's ARRIVALS**, per
+    /// side: the room's subtrahend for a routed strip, as `folder_chain_gain`
+    /// is for a grouped one.
+    ///
+    /// One unit gathered into `dest` in the sends pass leaves it at
+    /// `lane_gain[dest]` and its pan, into the master where `route_direct`
+    /// lets it, and on along `dest`'s own routes at their gains - the sends
+    /// pass's own arithmetic, read from the same latched table and the gain
+    /// `mix_clips` advanced this chunk. **The destination's rack is taken as
+    /// unity**: it processes rather than scales, and no subtraction can
+    /// model that (see `input_dry`). A cycle's way back is a block late in
+    /// the sends pass, and is not in this sum.
+    ///
+    /// Each channel once, so a desk of routes costs one walk of the table
+    /// per channel at most, and nothing allocates.
+    fn route_transfer(&self) -> [[f32; 2]; CHANNELS] {
+        fn walk(
+            r: &Renderer,
+            d: usize,
+            path: u32,
+            t: &mut [[f32; 2]; CHANNELS],
+            done: &mut u32,
+        ) -> [f32; 2] {
+            let bit = 1u32 << d;
+            if *done & bit != 0 {
+                return t[d];
+            }
+            if path & bit != 0 {
+                return [0.0; 2];
+            }
+            let mut on = [0.0f32; 2];
+            for i in 0..r.route_n {
+                let (from, target, hardware, _, gain) = r.route_cache[i];
+                if from != d || hardware || gain <= 0.0 || target >= CHANNELS {
+                    continue;
+                }
+                let next = walk(r, target, path | bit, t, done);
+                on[0] += gain * next[0];
+                on[1] += gain * next[1];
+            }
+            let (pl, pr) = pan_gains(r.lane_pan(d));
+            let g = r.lane_gain[d];
+            let direct = r.route_direct[d];
+            t[d] = [g * pl * (direct + on[0]), g * pr * (direct + on[1])];
+            *done |= bit;
+            t[d]
+        }
+        let mut t = [[0.0f32; 2]; CHANNELS];
+        let mut done = 0u32;
+        for d in 0..CHANNELS {
+            walk(self, d, 0, &mut t, &mut done);
+        }
+        t
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -16304,6 +16487,8 @@ impl Engine {
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
+            curve_lanes: 0,
+            ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
@@ -22509,6 +22694,8 @@ mod tests {
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
+            curve_lanes: 0,
+            ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
@@ -28979,6 +29166,69 @@ mod tests {
         );
     }
 
+    /// **A bus's fader and mute reach what is routed into it while the song
+    /// is stopped, and in a session with no audio clip.**
+    ///
+    /// The sends pass folds a destination's arrivals at `lane_gain[dest]`,
+    /// and the only writer of that gain sat after `mix_clips`' early return
+    /// for a stopped transport or an empty clip list. So with the song
+    /// parked, or in a session of MIDI tracks, the bus kept whatever gain it
+    /// last had - unity from engine birth - and pulling its fader down or
+    /// muting it changed nothing routed into it. The test above presets
+    /// `lane_gain` by hand, which is why it never saw this.
+    #[test]
+    fn a_muted_bus_silences_what_is_routed_into_it_while_the_song_is_stopped() {
+        fn heard(r: &mut Renderer, in_tx: &mut Producer<f32>) -> f32 {
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut peak = 0.0f32;
+            for b in 0..16u64 {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = b * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                peak = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            peak
+        }
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+        r.monitor = Some(in_rx);
+        r.monitor_channels = 1;
+        r.monitor_widths = inputs_array([1]);
+        r.monitor_scratch = vec![0.0; 8192];
+        // A live input on channel 1, armed and heard, routed whole to
+        // channel 2 through an empty rack. The transport is parked and there
+        // is no clip anywhere.
+        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        shared.midi_off.store(1 << 1, Ordering::Relaxed);
+        shared.armed.store(1 << 1, Ordering::Relaxed);
+        shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        r.channel_gain[1] = 1.0;
+        shared.routes[0].store(pack_route(1, 2, false, false), Ordering::Relaxed);
+        shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.route_count.store(1, Ordering::Release);
+        shared.monitor_on.store(true, Ordering::Relaxed);
+        r.room_gain = 1.0;
+        // The control: the route carries the input to the speakers.
+        let open = heard(&mut r, &mut in_tx);
+        assert!(open > 0.4, "the routed input never reached the speakers (peak {open})");
+        // The bus's fader, halved.
+        shared.channel_gains[2].store(0.5f32.to_bits(), Ordering::Relaxed);
+        let half = heard(&mut r, &mut in_tx);
+        assert!(
+            (half - 0.25).abs() < 0.02,
+            "a bus pulled down to half passed what was routed into it at {half} while stopped"
+        );
+        // And MUTED.
+        shared.channel_gains[2].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.muted.store(1 << 2, Ordering::Relaxed);
+        let shut = heard(&mut r, &mut in_tx);
+        assert!(shut < 1.0e-3, "a muted bus passed what was routed into it while stopped (peak {shut})");
+    }
+
 
     /// **A CHAIN carries through in one block: A to B to C.**
     ///
@@ -31930,6 +32180,110 @@ mod tests {
         }
     }
 
+    /// **A ROUTED strip's live input reaches the mix through the channel it
+    /// is routed to, so what the room keeps out is what that route
+    /// contributed.** The subtrahend was the input as if it went straight to
+    /// the master; routed away, it arrives at the route's gain and the bus's
+    /// fader, mute and pan instead. With monitoring off (the launch default)
+    /// a bus pulled down to half put the input into the speakers at minus
+    /// half, and a MUTED bus put it there whole and inverted - the folder
+    /// case above, through a route. Rolling over a clip, the one state in
+    /// which the bus's fold gain always followed the desk, and parked. The
+    /// take is the control: the route really does carry the input there.
+    #[test]
+    fn a_routed_armed_input_stays_out_of_the_room_with_monitoring_off() {
+        // A silent clip on lane 9, so a rolling transport has audio under it.
+        let silence = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 2 * 48_000 * 3],
+            rate: 48_000,
+            source: PathBuf::from("silence.wav"),
+        });
+        for (rolling, dest_muted, dest_gain) in [
+            (true, false, 0.5f32),
+            (true, true, 1.0),
+            (false, false, 0.5),
+            (false, true, 1.0),
+        ] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut to_audio, _back) = r.hijack_track_rings();
+            if rolling {
+                to_audio
+                    .push(vec![Placed {
+                        clip: Arc::clone(&silence),
+                        strip: 9,
+                        start: 0,
+                        offset: 0,
+                        len: 48_000 * 3,
+                        fade_in: 0,
+                        fade_out: 0,
+                        gain: 1.0,
+                    }])
+                    .expect("room");
+            }
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1 | 1 << 9, Ordering::Relaxed);
+            shared.armed.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.channel_gains[2].store(dest_gain.to_bits(), Ordering::Relaxed);
+            r.channel_gain[1] = 1.0;
+            r.channel_gain[2] = dest_gain;
+            if dest_muted {
+                shared.muted.store(1 << 2, Ordering::Relaxed);
+            }
+            // Channel 1 -> channel 2, whole, at unity, through an empty rack.
+            shared.routes[0].store(pack_route(1, 2, false, false), Ordering::Relaxed);
+            shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.route_count.store(1, Ordering::Release);
+            // Monitoring OFF: none of channel 1 belongs in the room.
+            shared.monitor_on.store(false, Ordering::Relaxed);
+            if rolling {
+                shared.transport_at.store(0, Ordering::Relaxed);
+                shared.transport_req.store(1, Ordering::Release);
+                shared.rolling.store(true, Ordering::Relaxed);
+            }
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            let (mut taped, mut room) = (0.0f32, 0.0f32);
+            for b in 0..(48_000 * 2 / 256) {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+                taped = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+                room = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            let case = format!("rolling={rolling} dest_muted={dest_muted} dest_gain={dest_gain}");
+            if dest_muted {
+                assert!(taped < 1.0e-3, "{case}: a muted bus put the input in the take (peak {taped})");
+            } else {
+                assert!(
+                    (taped - 0.5 * dest_gain).abs() < 0.02,
+                    "{case}: the take has the routed input at {taped}, not at the bus's level"
+                );
+            }
+            assert!(
+                room < 1.0e-3,
+                "{case}: a withheld routed input reached the speakers (peak {room})"
+            );
+        }
+    }
+
     /// **A frozen lane's seat reports no latency**, so the lane is
     /// compensated as the plain audio lane it now is - its file was
     /// rendered with the lead cut - and its rack stands down before the
@@ -33593,7 +33947,7 @@ mod sampler_road {
         let shared = Shared::new();
         shared.rate.store(48_000, Ordering::Relaxed);
         shared.rolling.store(true, Ordering::Relaxed);
-        shared.transport_pos.store(48_000, Ordering::Relaxed);
+        shared.transport_anchor.store(48_000, Ordering::Relaxed);
         shared.transport_beat.store(4.0f64.to_bits(), Ordering::Relaxed);
         shared.transport_bpm.store(90.0f64.to_bits(), Ordering::Relaxed);
 
@@ -33611,10 +33965,10 @@ mod sampler_road {
             "a lane half a second ahead is at beat {}, not 4.75",
             t.beat
         );
-        // And half a second EARLIER, the side an ungrained lane is on - its
-        // span starts a chunk before the published frame, which is the END
-        // of the chunk (a grained one sits ahead of it): the offset has to
-        // carry its sign.
+        // And half a second EARLIER. No lane sits behind the anchor, which
+        // is its chunk's first frame (a grained lane sits ahead of it), but
+        // the walk is a straight line either way: the offset has to carry
+        // its sign.
         let t = rack_transport(&shared, 48_000 - 24_000);
         assert!(
             (t.beat - 3.25).abs() < 1.0e-9,
@@ -33672,7 +34026,7 @@ mod sampler_road {
         for _ in 0..40 {
             out.fill(0.0);
             e.render_offline(&mut out);
-            let pos = e.shared.transport_pos.load(Ordering::Relaxed);
+            let pos = e.shared.transport_anchor.load(Ordering::Relaxed);
             let beat = f64::from_bits(e.shared.transport_beat.load(Ordering::Relaxed));
             let bpm = f64::from_bits(e.shared.transport_bpm.load(Ordering::Relaxed));
             let secs = pos as f64 / f64::from(rate);
@@ -33695,6 +34049,93 @@ mod sampler_road {
             agreed > 10,
             "the fixture's map never diverged from the dial, so this proves nothing"
         );
+    }
+
+    /// **A lane rendering the chunk that straddles a loop's end is handed
+    /// that chunk's beat, not one walked back from the loop's head.** The
+    /// anchor a lane's beat is walked from used to be the END of the chunk,
+    /// stored after the wrap, so in the wrapping chunk it was already at the
+    /// head and a lane at the chunk's own frame was walked the whole loop
+    /// back in a straight line. On a map with a tempo change inside the loop
+    /// that lands most of a beat off, and an arp fires on any change of step,
+    /// backwards included.
+    #[test]
+    fn a_racks_beat_at_the_loop_end_is_not_walked_from_the_loop_head() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        let tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            TempoPoint { at_beat: 8.0, bpm: 130.0, ramp: false },
+        ]);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        // Beats 0..16: the loop's end is mid-chunk, and the step at beat 8
+        // falls on a chunk boundary, so nothing else is off.
+        let b = (tempo.seconds_at_beat(16.0) * f64::from(rate)) as u64;
+        e.set_loop(0, b);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        let mut worst = (0.0f64, 0u64);
+        for _ in 0..(b / 512 + 4) {
+            // Where the chunk about to render starts.
+            let at = e.transport_position();
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let got = rack_transport(&e.shared, at).beat;
+            let want = tempo.beat_at_seconds(at as f64 / f64::from(rate));
+            if (got - want).abs() > worst.0 {
+                worst = ((got - want).abs(), at);
+            }
+        }
+        assert!(
+            worst.0 < 0.01,
+            "the lane rendering the chunk at frame {} was handed a beat {:.3} off the map",
+            worst.1,
+            worst.0
+        );
+    }
+
+    /// **A rack with no span of its own is handed the beat of the block it
+    /// renders, not the next one.** The room, the sends pass, the folders,
+    /// the pads, the click and the buses pass the sentinel and take the
+    /// published pair as it stands, and that pair was published for the END
+    /// of the chunk: an arp in any of those racks ran a chunk early, and in
+    /// the chunk that wraps a loop it played the next lap's head. Over a
+    /// ramp, so the tempo half of the pair is held to its frame too.
+    #[test]
+    fn a_rack_with_no_span_of_its_own_is_handed_the_block_it_renders() {
+        use tangent_ui::tempo::{TempoMap, TempoPoint};
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        let tempo = TempoMap::sanitised(vec![
+            TempoPoint { at_beat: 0.0, bpm: 90.0, ramp: true },
+            TempoPoint { at_beat: 6.0, bpm: 150.0, ramp: false },
+        ]);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        let b = (tempo.seconds_at_beat(8.0) * f64::from(rate)) as u64;
+        e.set_loop(0, b);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..(b / 512 + 4) {
+            let at = e.transport_position();
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            let t = rack_transport(&e.shared, u64::MAX);
+            let want = tempo.beat_at_seconds(at as f64 / f64::from(rate));
+            assert!(
+                (t.beat - want).abs() < 1.0e-6,
+                "the chunk at frame {at} handed a rack with no span beat {:.4}, where the map says {want:.4}",
+                t.beat
+            );
+            assert!(
+                (t.bpm - tempo.bpm_at_beat(want)).abs() < 1.0e-6,
+                "the chunk at frame {at} handed a rack with no span {:.3} bpm, where the map says {:.3}",
+                t.bpm,
+                tempo.bpm_at_beat(want)
+            );
+        }
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures

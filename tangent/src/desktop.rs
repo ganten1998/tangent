@@ -15303,6 +15303,12 @@ impl DesktopApp {
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());
+        // Polarity, one bit per strip - see `Shared::strip_phase`. **Take or
+        // no take**: the switch is a desk control like mute, and a take is
+        // capture only. It sat in the meter's gate below, so a flip during a
+        // take or its count-in lit and changed nothing, then landed when the
+        // take ended, in the middle of playback.
+        e.set_strip_phase(self.app.strip_phase());
         // The signature drives both halves of the click: which beat is accented
         // and how long a beat lasts. In 6/8 those are "every sixth" and "half a
         // quarter" — get the second wrong and the count-in is twice as long as
@@ -15318,8 +15324,6 @@ impl DesktopApp {
             // Beside the meter, because it is read with it: how many clicks
             // a beat of that signature carries.
             e.set_metronome_div(self.app.metronome_div());
-            // Polarity, one bit per strip — see `Shared::strip_phase`.
-            e.set_strip_phase(self.app.strip_phase());
         }
         // **The instances themselves, last, with the `&mut` the walk above
         // never needed.** Everything before this line is an atomic store;
@@ -21051,8 +21055,9 @@ impl DesktopApp {
     /// **Only AUDIO inputs**, the only thing that can reach the speakers dry.
     /// An armed MIDI track whose instrument is still loading makes no sound.
     ///
-    /// **The whole chain an input is heard through**: its own racks, every
-    /// folder above it and every channel it is routed to - see
+    /// **The whole chain an input is heard through**: its own racks and
+    /// pedals, every folder above it, the first rack of every channel it is
+    /// routed to, and the effects bus's rack when it sends there - see
     /// `armed_rack_pending`. The mask stops at 32 because `armed_mask` is a
     /// `u32` and there are 32 channels; there is no thirty-third to miss.
     ///
@@ -21075,6 +21080,8 @@ impl DesktopApp {
         }
         let inserts = tangent_ui::recorder::INSERTS;
         let routes = self.app.routes();
+        let desk = self.app.desk();
+        let automation = self.app.automation();
         armed_rack_pending(
             self.app.armed_mask(),
             |ch| self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio),
@@ -21084,6 +21091,12 @@ impl DesktopApp {
                     tangent_ui::routing::Target::Channel(n) if n < 32 => m | 1 << n,
                     _ => m,
                 })
+            },
+            // The send knob, or a curve on it, which can open a send the knob
+            // leaves shut.
+            |ch| {
+                desk.send.get(ch).is_some_and(|s| *s > 0.0)
+                    || automation.get(ch, tangent_ui::automation::AutoParam::Send).is_some()
             },
             |seat, bay| {
                 self.recorder.inserts_loaded.get(seat * inserts + bay).is_some_and(|got| {
@@ -21907,12 +21920,22 @@ fn chain_bay_pending(wanted: Option<&str>, ledger: Option<&str>, engine_holds: b
 /// that it can be driven by a test. `DesktopApp` cannot be built in one.
 ///
 /// `armed` is the arm mask and `is_input` says which channels take a live
-/// AUDIO input; only those can be heard dry. An input is heard through every seat
-/// of every channel in its CHAIN: itself, the folder above it (and the one
-/// above that), and any channel it is routed to, followed the same way. A
-/// denoiser on a microphone's folder is as much the microphone's as one on
-/// its own strip, and the gate that looked only at the strip let the room
-/// open onto a mic whose folder's denoiser had not loaded yet.
+/// AUDIO input; only those can be heard dry. An input is heard through every
+/// seat its audio MEETS on the way out, and the walk names exactly those:
+///
+/// - **every seat of its own channel and of each folder above it** (and the
+///   one above that): the room runs the strip's racks and pedalboard over
+///   the input, and a folder runs both racks and its board over the group's
+///   sum. A denoiser on a microphone's folder is as much the microphone's as
+///   one on its own strip, and the gate that looked only at the strip let
+///   the room open onto a mic whose folder's denoiser had not loaded yet;
+/// - **only the first rack of a channel it is routed to**, from any of
+///   those and onward along the routes: the sends pass runs `racks[dest]`
+///   over the arrivals and nothing else of the destination, and runs after
+///   the folds, so a destination's second rack, pedals and folders never
+///   meet them;
+/// - **the effects bus's rack** when its own strip or a folder above it
+///   sends there (`sends`): the room hears the send through it.
 ///
 /// `parents` is the engine's folder table (`folder_parents`, -1 for none);
 /// `routed_to` answers the channels one channel is routed to, as a mask.
@@ -21925,35 +21948,54 @@ fn armed_rack_pending(
     is_input: impl Fn(usize) -> bool,
     parents: &[i32; tangent_ui::recorder::CHANNELS],
     routed_to: impl Fn(usize) -> u32,
+    sends: impl Fn(usize) -> bool,
     mismatched: impl Fn(usize, usize) -> bool,
 ) -> bool {
-    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, INSERTS};
-    // The chain, as a mask: a worklist over 32 channels, each visited once,
-    // so a folder two inputs share or a route loop costs nothing twice.
-    let mut chain = 0u32;
+    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip, AMP_PEDALS, INSERTS};
+    // The input's own channels, as a mask: a worklist over 32 channels, each
+    // visited once, so a folder two inputs share costs nothing twice.
+    let mut own = 0u32;
     let mut todo = (0..32usize)
         .filter(|&ch| armed & 1 << ch != 0 && is_input(ch))
         .fold(0u32, |m, ch| m | 1 << ch);
     while todo != 0 {
         let ch = todo.trailing_zeros() as usize;
         todo &= todo - 1;
-        if chain & 1 << ch != 0 {
+        if own & 1 << ch != 0 {
             continue;
         }
-        chain |= 1 << ch;
+        own |= 1 << ch;
         if let Some(p) = parents.get(ch).and_then(|p| usize::try_from(*p).ok()).filter(|p| *p < 32) {
             todo |= 1 << p;
         }
-        todo |= routed_to(ch);
-        todo &= !chain;
+        todo &= !own;
     }
+    // And the channels the routes carry it to, onward, but never up into a
+    // destination's folders. A route loop is walked once and ends.
+    let mut routed = 0u32;
+    let mut todo = (0..32usize)
+        .filter(|ch| own & 1 << ch != 0)
+        .fold(0u32, |m, ch| m | routed_to(ch));
+    while todo != 0 {
+        let ch = todo.trailing_zeros() as usize;
+        todo &= todo - 1;
+        if routed & 1 << ch != 0 {
+            continue;
+        }
+        routed |= 1 << ch;
+        todo |= routed_to(ch);
+        todo &= !routed;
+    }
+    let via_bus = (0..32usize).any(|ch| own & 1 << ch != 0 && sends(ch));
     (0..32usize)
-        .filter(|ch| chain & 1 << ch != 0)
+        .filter(|ch| own & 1 << ch != 0)
         .flat_map(|ch| {
             [ch, folder_extra_seat(ch)]
                 .into_iter()
                 .chain((0..AMP_PEDALS).map(move |pedal| amp_pedal_seat(ch, pedal)))
         })
+        .chain((0..32usize).filter(|ch| routed & !own & 1 << ch != 0))
+        .chain(via_bus.then(|| Strip::Fx.index()))
         .any(|seat| (0..INSERTS).any(|bay| mismatched(seat, bay)))
 }
 
@@ -25848,26 +25890,27 @@ mod tests {
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
         let no_routes = |_: usize| 0u32;
+        let no_sends = |_: usize| false;
 
         // Nothing armed: the room is nobody's to hold.
         assert!(
-            !armed_rack_pending(0, audio, &flat, no_routes, |_, _| true),
+            !armed_rack_pending(0, audio, &flat, no_routes, no_sends, |_, _| true),
             "a desk with nothing armed was reported as waiting"
         );
         // A bay on the armed strip itself.
         assert!(
-            armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, bay| seat == 3 && bay == 1),
+            armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, bay| seat == 3 && bay == 1),
             "the armed strip's own bay did not hold the room"
         );
         // Its FOLDER-EXTRA rack and its PEDALBOARD, which travel with the
         // track and are as much of the chain as the first rack.
         assert!(
-            armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| seat == folder_extra_seat(3)),
+            armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == folder_extra_seat(3)),
             "the armed strip's second rack did not hold the room"
         );
         for pedal in 0..AMP_PEDALS {
             assert!(
-                armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| {
+                armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
                     seat == amp_pedal_seat(3, pedal)
                 }),
                 "pedal {pedal} of the armed strip's board did not hold the room"
@@ -25875,11 +25918,11 @@ mod tests {
         }
         // And the bay belongs to somebody else: the monitor stays open.
         assert!(
-            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| seat == 4),
+            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == 4),
             "another track's plugin dipped a live monitor"
         );
         assert!(
-            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, |seat, _| {
+            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
                 seat == folder_extra_seat(4)
             }),
             "another track's second rack dipped a live monitor"
@@ -25890,14 +25933,14 @@ mod tests {
         // is allowed to make.
         for ch in [0, 1, CHANNELS / 2, CHANNELS - 1] {
             assert!(
-                armed_rack_pending(armed_on(ch), audio, &flat, no_routes, |seat, _| seat == ch),
+                armed_rack_pending(armed_on(ch), audio, &flat, no_routes, no_sends, |seat, _| seat == ch),
                 "channel {ch} could not hold the room"
             );
         }
         // And every bay of a seat is looked at, not just the first.
         for bay in 0..INSERTS {
             assert!(
-                armed_rack_pending(armed_on(2), audio, &flat, no_routes, |seat, b| seat == 2 && b == bay),
+                armed_rack_pending(armed_on(2), audio, &flat, no_routes, no_sends, |seat, b| seat == 2 && b == bay),
                 "bay {bay} was never examined"
             );
         }
@@ -25918,29 +25961,30 @@ mod tests {
         parents[6] = 5;
         parents[7] = 5;
         let no_routes = |_: usize| 0u32;
+        let no_sends = |_: usize| false;
         assert!(
-            !armed_rack_pending(armed, audio, &parents, no_routes, |seat, bay| seat == 2 && bay == 0),
+            !armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 2 && bay == 0),
             "Kontakt on the armed piano held the microphones' room"
         );
         assert!(
-            armed_rack_pending(armed, audio, &parents, no_routes, |seat, bay| seat == 5 && bay == 0),
+            armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 5 && bay == 0),
             "the mics' folder's denoiser was not waited for"
         );
         assert!(
-            armed_rack_pending(armed, audio, &parents, no_routes, |seat, _| seat == folder_extra_seat(5)),
+            armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, _| seat == folder_extra_seat(5)),
             "the mics' folder's second rack was not waited for"
         );
         // An UNARMED mic's folder is not the armed one's: with only the DI
         // armed, the MICS folder's bays are nobody's to wait on.
         assert!(
-            !armed_rack_pending(1 << 4, audio, &parents, no_routes, |seat, _| seat == 5),
+            !armed_rack_pending(1 << 4, audio, &parents, no_routes, no_sends, |seat, _| seat == 5),
             "an unarmed folder held the DI's room"
         );
         // Two folders deep: the grandparent is in the chain too.
         let mut nested = parents;
         nested[5] = 1;
         assert!(
-            armed_rack_pending(armed, audio, &nested, no_routes, |seat, _| seat == 1),
+            armed_rack_pending(armed, audio, &nested, no_routes, no_sends, |seat, _| seat == 1),
             "the folder above the mics' folder was not waited for"
         );
         // A route: the mic moved to channel 9, whose bay is its chain now -
@@ -25951,12 +25995,95 @@ mod tests {
             _ => 0,
         };
         assert!(
-            armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, |seat, _| seat == 9),
+            armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 9),
             "the channel the mic is routed to was not waited for"
         );
         assert!(
-            !armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, |seat, _| seat == 10),
+            !armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 10),
             "a bay off the mic's chain held its room"
+        );
+    }
+
+    /// **The chain is the racks the input's audio actually meets.** The
+    /// walk missed one and over-held three. A send carries an armed input
+    /// through the EFFECTS BUS's rack, so a reverb still loading there let
+    /// the room open onto the send heard dry; and a channel it is routed to
+    /// meets the arrivals with its first rack alone - the sends pass runs
+    /// nothing else of it, after the folds - so its second rack, its pedals
+    /// and its folders held the room over bays the input never reaches.
+    #[test]
+    fn an_armed_inputs_chain_is_the_racks_its_audio_meets() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip, CHANNELS};
+        let flat = [-1i32; CHANNELS];
+        let audio = |_: usize| true;
+        let no_routes = |_: usize| 0u32;
+        let no_sends = |_: usize| false;
+        let fx = |seat: usize, _: usize| seat == Strip::Fx.index();
+        // A send on the armed strip: the bus's rack is its chain.
+        assert!(
+            armed_rack_pending(1 << 3, audio, &flat, no_routes, |ch| ch == 3, fx),
+            "the effects bus an armed input sends to was not waited for"
+        );
+        // No send anywhere on its way: the bus is somebody else's.
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &flat, no_routes, no_sends, fx),
+            "the effects bus held the room of an input that does not send to it"
+        );
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &flat, no_routes, |ch| ch == 4, fx),
+            "another track's send held this input's room"
+        );
+        // A folder above it that sends carries it there too.
+        let mut parents = flat;
+        parents[3] = 5;
+        assert!(
+            armed_rack_pending(1 << 3, audio, &parents, no_routes, |ch| ch == 5, fx),
+            "the effects bus the input's folder sends to was not waited for"
+        );
+        // A route: the destination's FIRST rack, and nothing else of it.
+        let to_nine = |ch: usize| if ch == 3 { 1u32 << 9 } else { 0 };
+        assert!(
+            armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| seat == 9),
+            "the channel the input is routed to was not waited for"
+        );
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
+                seat == folder_extra_seat(9)
+            }),
+            "a route destination's second rack held the room; routed audio never meets it"
+        );
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
+                seat == amp_pedal_seat(9, 0)
+            }),
+            "a route destination's pedalboard held the room; routed audio never meets it"
+        );
+        let mut nine_in_a_folder = flat;
+        nine_in_a_folder[9] = 11;
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &nine_in_a_folder, to_nine, no_sends, |seat, _| seat == 11),
+            "a route destination's folder held the room; the folds have run before the sends pass"
+        );
+        // And a destination's own send does not carry routed arrivals: the
+        // sends pass folds them into the mix and nowhere near the bus.
+        assert!(
+            !armed_rack_pending(1 << 3, audio, &flat, to_nine, |ch| ch == 9, fx),
+            "a route destination's send held the room"
+        );
+        // Onward along the routes, from the input and from its folders.
+        let onward = |ch: usize| match ch {
+            3 => 1u32 << 9,
+            9 => 1u32 << 10,
+            _ => 0,
+        };
+        assert!(
+            armed_rack_pending(1 << 3, audio, &flat, onward, no_sends, |seat, _| seat == 10),
+            "the second hop of a route was not waited for"
+        );
+        let from_the_folder = |ch: usize| if ch == 5 { 1u32 << 12 } else { 0 };
+        assert!(
+            armed_rack_pending(1 << 3, audio, &parents, from_the_folder, no_sends, |seat, _| seat == 12),
+            "the channel the input's folder is routed to was not waited for"
         );
     }
 
@@ -29429,6 +29556,34 @@ mod tests {").expect("the tests module")];
         assert!(gate < routes && gate < desk, "a table publish sits outside the change gate");
         assert!(body[gate..routes].contains("self.engine_epoch"), "the gate is not keyed on the engine");
         assert_eq!(body.matches("self.app.desk()").count(), 1, "the desk is built more than once a frame");
+    }
+
+    /// **Polarity is pushed under a take.** Only the meter and the click's
+    /// division are held while a take runs (`Session::set_meter` refuses
+    /// mid-take, and the division is read with the meter). The Ø switch is a
+    /// desk control like mute, and a take is capture only, but it sat inside
+    /// the same gate: flipped during a take or its count-in, it lit and was
+    /// neither heard nor recorded, and landed when the take ended, in the
+    /// middle of playback. A scan, because `DesktopApp` cannot be built in a
+    /// test.
+    #[test]
+    fn polarity_reaches_the_engine_under_a_take() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn push_monitor_settings(&mut self)").expect("push_monitor_settings");
+        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+        let body = &src[at..end];
+        let gate = body
+            .find("if !self.recorder.session.is_recording() {")
+            .expect("the meter's take gate");
+        let gate_end = gate + body[gate..].find("\n        }\n").expect("the gate's end");
+        let push = body
+            .find("e.set_strip_phase(self.app.strip_phase());")
+            .expect("polarity is not pushed to the live engine at all");
+        assert!(
+            !(gate..gate_end).contains(&push),
+            "polarity is pushed only while no take runs: the switch lights and the engine never hears it"
+        );
     }
 
     /// **What the four table publishes cost per frame**, release, on an

@@ -1331,9 +1331,8 @@ struct Spectral {
     /// gain to follow FROM: the first frame `spectral_suppress` writes takes
     /// its target outright. A frame that passes at unity first - a learn
     /// pass, or a wire with nothing learned - returns before that and leaves
-    /// this standing. (The bank's own `Denoise::fresh` is spent on its first
-    /// tick, learning or not, so after a fresh unit's first learn this kernel
-    /// snaps onto the cut and the bank glides it in.) A follower started at
+    /// this standing. (The bank's own `Denoise::fresh` keeps the same rule,
+    /// for its first tick that can cut.) A follower started at
     /// unity glided down at the RELEASE rate, and a bay rebuilt under a live
     /// microphone reopened the room onto its noise at full level for a
     /// quarter of a second. The target was right from the first frame; only
@@ -1778,11 +1777,13 @@ pub struct Denoise {
     /// through the current tick the sample loop is.
     tick_len: u32,
     phase: u32,
-    /// **No tick has run since the bands were cleared**, so there is no cut
-    /// to smooth FROM: the first tick takes its target outright. A LEARNING
-    /// tick is a tick too (its target is no cut), so a fresh unit made to
-    /// learn first still glides its first cut in; the spectral kernel's own
-    /// `fresh` waits for its first suppressing frame instead. The cut
+    /// **No tick has CUT since the bands were cleared**, so there is no cut
+    /// to smooth FROM: the first tick that can cut (not learning, something
+    /// learned) takes its target outright - the rule the spectral kernel's
+    /// own `fresh` keeps for its first suppressing frame. A learning tick, or
+    /// one with nothing learned, leaves this standing; it was spent on any
+    /// tick once, so a fresh unit made to learn glided its first cut in while
+    /// the spectral kernel snapped onto it. The cut
     /// used to start at zero and climb at the RELEASE rate, and a bay rebuilt
     /// under a live microphone reopened the room onto its noise 13 dB over
     /// the settled level. One tick only: after it every move is smoothed
@@ -2400,7 +2401,8 @@ impl Denoise {
     fn control(&mut self, plan: &TickPlan) {
         let inv_tick = 1.0 / self.tick_len as f32;
         let mut depth = [0.0_f32; DENOISE_BANDS];
-        let fresh = std::mem::replace(&mut self.fresh, false);
+        // Spent only by a tick that can CUT - see the field.
+        let fresh = !plan.learning && self.live > 0 && std::mem::replace(&mut self.fresh, false);
 
         for (k, b) in self.band.iter_mut().enumerate() {
             // The tick's band level. The ×4 calibrates the complex
@@ -4860,8 +4862,14 @@ mod tests {
                 drop_at(kernel, 96_000.0),
             );
             for (x, y) in [(a, b), (b, c), (a, c)] {
+                // **2 dB, and the bank is why.** Settled, it lands at 16.7 /
+                // 17.0 / 18.2 dB at 44.1k / 48k / 96k: 1.5 dB apart, which
+                // was the whole of the old bound. That passed (1.49) only
+                // while the bank's first cut after a learn glided in, so the
+                // window above had not settled; it is taken outright now, as
+                // the spectral kernels' always was. They agree to 0.1 dB.
                 assert!(
-                    (x - y).abs() < 1.5,
+                    (x - y).abs() < 2.0,
                     "{}: suppression across rates disagrees: {a:.2} / {b:.2} / {c:.2} dB",
                     kernel.label()
                 );
@@ -4991,6 +4999,50 @@ mod tests {
                     kernel.label()
                 );
             }
+        }
+    }
+
+    /// **Either kernel is on the noise at once after its FIRST learn.**
+    ///
+    /// The two kernels' `fresh` flags disagreed about when it is spent. The
+    /// spectral one waits for the first frame it suppresses, so a learn pass
+    /// leaves it standing; the bank spent its own on its first tick of any
+    /// kind, a learning tick included, so a new unit made to learn glided its
+    /// first cut in at the RELEASE rate while the spectral one snapped onto
+    /// it. Measured as the cleared case above is: 10 ms windows from the
+    /// first frame out, against the level a warm unit settles to.
+    #[test]
+    fn a_new_unit_is_on_the_noise_at_once_after_its_first_learn_on_either_kernel() {
+        for kernel in DenoiseKernel::ALL {
+            let p = on(kernel);
+            let mut warm = learned(kernel, 0x71, 0.05, SR, 1.0);
+            let mut noise = Noise::new(0x72, 0.05, SR);
+            let mut buf = noise.frames(SR as usize);
+            for chunk in buf.chunks_mut(512) {
+                warm.process(chunk, chunk.len() / 2, 2, &p);
+            }
+            let settled = rms_db(&buf, SR as usize - SR as usize / 5);
+            let mut dn = learned(kernel, 0x71, 0.05, SR, 1.0);
+            let lat = dn.latency() as usize;
+            let win = SR as usize / 100;
+            let span = lat + 20 * win;
+            let mut after = Noise::new(0x73, 0.05, SR).frames(span);
+            for chunk in after.chunks_mut(512) {
+                dn.process(chunk, chunk.len() / 2, 2, &p);
+            }
+            // From the first frame the unit writes out after the learn.
+            let first = lat + lat / 4;
+            let (mut worst, mut k) = (f32::MIN, 0);
+            while first + (k + 1) * win <= span {
+                let at = &after[(first + k * win) * 2..(first + (k + 1) * win) * 2];
+                worst = worst.max(rms_db(at, 0) - settled);
+                k += 1;
+            }
+            assert!(
+                worst < 3.0,
+                "{}: the first learn's cut glided in, {worst:.1} dB over the settled level",
+                kernel.label()
+            );
         }
     }
 
@@ -5523,8 +5575,13 @@ mod tests {
     /// So the second assertion pins THAT, two ways: against the envelope's
     /// own arithmetic ceiling (structural — nothing may move faster than
     /// the smoother it goes through, which is exactly what the constraint
-    /// used to do), and against 10.0 dB (the recorded number, 8.95, with
-    /// room). If a 9 dB coefficient step per 1.33 ms is judged too fast for
+    /// used to do), and against 12.0 dB (the recorded number, with room).
+    /// That number was 8.95 while a new unit's first cut glided in after
+    /// its learn: a quarter second of noise never let the glide reach the
+    /// full cut, though any longer stretch of noise does. The cut is taken
+    /// outright now (`Denoise::fresh`), so the first tone here opens a band
+    /// from the full 24 dB and the fixture reads the ceiling itself, 11.68.
+    /// If a 9 dB coefficient step per 1.33 ms is judged too fast for
     /// a minimum-phase bell, the lever is `DENOISE_OPEN_MS` and both bounds
     /// follow it down on their own.
     #[test]
@@ -5553,11 +5610,19 @@ mod tests {
         let dry = buf.clone();
 
         // One control tick at a time, so a "one-tick move" is what it says.
+        // The first tick after the learn is not one of them: it takes its
+        // target outright (`Denoise::fresh` - there is no cut to move from,
+        // and the bells start from silence), so the moves are counted from
+        // the state it leaves.
         let tick = dn.tick_len as usize;
+        dn.process(&mut buf[..tick * 2], tick, 2, &p);
         let mut prev_depth = dn.depth_db();
         let mut prev_open = [false; DENOISE_BANDS];
+        for (k, b) in dn.band.iter().enumerate() {
+            prev_open[k] = b.open;
+        }
         let (mut worst, mut at) = (0.0_f32, 0);
-        let mut done = 0usize;
+        let mut done = tick;
         let mut moved = false;
         while done < frames {
             let n = tick.min(frames - done);
@@ -5625,8 +5690,8 @@ mod tests {
             "band {open_at} moved {open_worst:.2} dB in one {block}-frame block, past the              {ceiling:.2} dB the {DENOISE_OPEN_MS} ms open envelope can cover in {ticks}              ticks — something is reaching the applied depth without going through the              smoother"
         );
         assert!(
-            open_worst < 10.0,
-            "the ordinary open moved {open_worst:.2} dB in one {block}-frame block              (it was 9.52 dB before the constraint was reordered and 8.95 after; the              defect report's 10.40 dB figure is this measurement, not the constraint's)"
+            open_worst < 12.0,
+            "the ordinary open moved {open_worst:.2} dB in one {block}-frame block              (it was 9.52 dB before the constraint was reordered and 8.95 after, from a              cut that had glided in, and 11.68 from the full cut; the defect report's              10.40 dB figure is this measurement, not the constraint's)"
         );
     }
 
