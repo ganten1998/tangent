@@ -88,7 +88,11 @@ Related invariants that keep this working:
 - **New, Open and Quit ask, and "Don't Save" sticks.** The menu's and the
   Project window's New and Open go through `ask_before`, as Quit does
   (Settings > Reset does not: The Default Template replaces the session
-  without asking, and Everything opens a fresh one through New). The
+  without asking, and Everything opens a fresh one through New with the
+  session DISCARDED - `reset_settings` commits the reset as a moment, then
+  gives Discard's answer, so the emptied desk is never written into the
+  open project's document - and keeping, so a leftover Untitled with takes
+  is never reclaimed unasked). The
   prompt's Discard reaches the host as `take_outgoing_discarded` and gates
   the document save-back AND the project plugin-state mirror in
   `switch_project`, the New arm and `on_exit`, and it survives New's detour

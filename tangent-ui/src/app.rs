@@ -34016,13 +34016,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // open 'new'." A reset that leaves you looking at the thing you
             // were resetting is a reset you have to finish by hand.
             //
-            // `NewDiscarding` rather than `New`, because `New` is allowed to
-            // stop and ask about a scratch with takes in it — and this road
+            // `NewKeeping` rather than `New`, because `New` is allowed to
+            // stop and ask about a scratch with takes in it - and this road
             // has already asked. `ask_before_resetting` is the only way in
             // and its confirmation now says a fresh session is part of the
             // deal, so a second question here would be the same question
-            // twice.
-            self.project_request = Some(crate::ports::ProjectRequest::NewDiscarding);
+            // twice. Not `NewDiscarding`, the scratch warning's "Discard
+            // it": that reclaimed a leftover Untitled, recordings and all,
+            // with no warning ever shown and under a confirmation that says
+            // nothing recorded is deleted. Keeping leaves it standing.
+            //
+            // **And the reset IS the discard.** New's save-back writes the
+            // outgoing document when it is dirty and nobody said Don't Save,
+            // and by then the desk is the reset one: every instrument,
+            // plugin, name, fader and route went out of the open project's
+            // own document. The answer is given at the end of this function,
+            // as the prompt's Don't Save gives it.
+            self.project_request = Some(crate::ports::ProjectRequest::NewKeeping);
             // **And the Konami walk, quietly.**
             //
             // The owner: "Have 'reset everything' quietly reset the konami
@@ -34111,6 +34121,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
         }
         self.save_settings();
+        // **The reset is one moment, then the discard** - see the
+        // `NewKeeping` above. A press commits where it is pressed, and here,
+        // after everything the reset touches, because a NEW moment is what
+        // clears a Don't Save (`undo_commit_moment`): left to the frame's own
+        // commit (`commit_view_change` sees the reset grid), the answer was
+        // gone before New could read it.
+        if scope == R::Everything {
+            self.undo_commit();
+            self.outgoing_discarded = true;
+        }
         self.report_the_reset(scope, undoable);
     }
 
@@ -63687,6 +63707,45 @@ mod tests {").expect("the tests module")];
             "a plugin's host still has to be asked"
         );
         assert_eq!(plugin.pending_window_size, None);
+    }
+
+    /// **Reset Everything never hands New a session to write back.** The
+    /// reset empties the desk and then opens a fresh session through New,
+    /// and New's save-back writes the outgoing document when it is dirty and
+    /// was not discarded. Nobody had said Don't Save, so the emptied desk -
+    /// every instrument, plugin, name, fader and route gone - was written
+    /// over the open project's document. The reset IS the discard, and New
+    /// is told so. Nor may it reclaim a leftover Untitled without the
+    /// scratch warning, recordings and all (`NewDiscarding`): the reset's
+    /// own confirmation says nothing recorded is deleted.
+    #[test]
+    fn reset_everything_never_hands_new_a_session_to_write_back() {
+        // No settings file and no backup written: `Settings::path()` is one
+        // shared file whenever `IVORY_SETTINGS_PATH` is set, and the backup
+        // beside it is what `a_confirmed_reset_does_its_scope_and_offers_undo`
+        // undoes from.
+        let (ctx, mut app) = headless(Caps { persist_global_settings: false, ..Caps::DESKTOP });
+        app.settings.master_gain = 0.3; // the open project's own desk...
+        app.undo_reset(); // ...as it was last saved
+        assert!(!app.project_dirty_exact());
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Everything));
+        run_frame(&ctx, &mut app);
+        let request = app.take_project_request();
+        let raised = request.is_some();
+        let asked = matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. }));
+        let discarded = app.take_outgoing_discarded();
+        let dirty = app.project_dirty_exact();
+        // The host's New arm writes the outgoing document when it was not
+        // discarded and is dirty - with the desk as it stands: the reset one.
+        assert!(
+            !raised || asked || discarded || !dirty,
+            "Reset Everything hands New a dirty session it was never told to discard: \
+             the host writes the emptied desk over the open project's document"
+        );
+        assert!(
+            !matches!(request, Some(crate::ports::ProjectRequest::NewDiscarding)),
+            "Reset Everything reclaims a leftover Untitled, recordings and all, without the scratch warning"
+        );
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
