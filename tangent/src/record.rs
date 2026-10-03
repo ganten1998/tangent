@@ -307,6 +307,10 @@ struct Writer {
     /// See [`StartArgs::audio_tx`]. Cleared at Stop, so a take with no video
     /// does not go on copying samples to a receiver nobody is draining.
     audio_tx: Option<mpsc::Sender<AudioChunk>>,
+    /// **The file frame where the desk's engine was found gone, mid-take** -
+    /// see [`tap_lost_problem`]. Set by `mix_plugin`, reported at Stop,
+    /// cleared at Start.
+    plugin_lost_at: Option<u64>,
 }
 
 /// **Every tap still queued for a writer that is being told to stop.**
@@ -358,6 +362,25 @@ const DEAD_TAP: &str = "nothing from the desk reached this take - the audio engi
 /// only the desk, so with no desk the file is silence too.
 const NO_TAP: &str = "nothing from the desk reached this take - no audio engine was \
      running when it started, so the file is silence";
+
+/// What a take says when the desk stopped reaching it HALF WAY: the fault
+/// watch dropped a dead or stalled engine mid-take, and the reopen that
+/// brings one back waits for the take to end (`open_audio_path_now`).
+/// [`tap_problem`] asks only at Start, so the take was filed as an ordinary
+/// one - an input-driven file going on in the desk's zeros, an
+/// instrument-only file simply ending - and a realtime export over it as a
+/// success. `at_s` is where in the FILE the engine's last frame landed.
+fn tap_lost_problem(at_s: f64, file_goes_on: bool) -> String {
+    format!(
+        "the audio engine this take was listening to stopped {} into it, so {}",
+        tangent_ui::recorder::timecode(at_s),
+        if file_goes_on {
+            "everything after that in the file is silence"
+        } else {
+            "the file ends there"
+        }
+    )
+}
 
 /// The first problem a take start can see about its own tap: a live one is
 /// fine, a dead one is the silent take above.
@@ -538,8 +561,18 @@ impl Writer {
         };
         let out_ch = self.tracker.channels().max(1);
         let in_ch = tap.channels().max(1);
+        // **Asked BEFORE the drain.** A tap abandoned before it already holds
+        // every frame its engine will ever write, so a drain that comes up
+        // short after that has reached the end of them - not a callback that
+        // is merely late, which is the ordinary short block below.
+        let live = tap.is_live();
         self.plugin_buf.clear();
         let got = tap.drain_frames(frames, &mut self.plugin_buf);
+        if !live && got < frames && self.plugin_lost_at.is_none() {
+            // Where in the file the engine's last frame lands. Only a take
+            // has a file, so only a take is told.
+            self.plugin_lost_at = self.wav.as_ref().map(|w| w.frames() + got as u64);
+        }
         // Short is not an error: the output device is free-running and may not
         // have produced this block yet. The missing frames stay silent rather
         // than shifting everything after them, which is the same rule the input
@@ -633,6 +666,16 @@ impl Writer {
                 if self.error.is_none() {
                     self.error = Some(format!("could not close the audio file: {e}"));
                 }
+            }
+        }
+        // **The desk went half way**, and the file kept the input's pace in
+        // its zeros - only this can say so. A tap dead from the start has
+        // said so already (`input_tap_problem`).
+        if let Some(at) = self.plugin_lost_at.take() {
+            if self.error.is_none() {
+                let p = tap_lost_problem(at as f64 / f64::from(self.sample_rate.max(1)), true);
+                log::error!("take: {p}");
+                self.error = Some(p);
             }
         }
         let mut m = AudioMeters::new(self.tracker.channels());
@@ -867,6 +910,7 @@ impl Audio {
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
             audio_tx: None,
+            plugin_lost_at: None,
             buf: Vec::with_capacity(channels * 4096),
             // One block of zeros, reused. Allocating a pad the size of the
             // dropout would allocate megabytes on the worst possible thread at
@@ -892,6 +936,7 @@ impl Audio {
                             writer.error = None;
                             writer.first_frame_ns = None;
                             writer.short_frames = 0;
+                            writer.plugin_lost_at = None;
                             writer.dropped_at_arm = writer.sink.stats().frames_dropped();
                             // `arm()`, not just a baseline: the instrument's
                             // ring has been filling since the device opened —
@@ -1704,6 +1749,16 @@ impl Session {
     /// `Manifest::head_seconds`.
     pub fn set_take_head(&mut self, head_s: f64) {
         self.take_facts.2 = head_s;
+    }
+
+    /// Where the take begins on the timeline and whether the transport rolls
+    /// under it, set by a press that MOVES the transport in the same call
+    /// that begins the take: the realtime export locates to its span's head
+    /// and rolls after this frame's facts were pushed, and its manifest kept
+    /// the parked playhead and a stopped transport.
+    pub fn set_take_place(&mut self, timeline_start_s: f64, rolling: bool) {
+        self.take_facts.0 = timeline_start_s;
+        self.take_facts.1 = rolling;
     }
 
     /// **The count-in began earlier than the press** - it is the
@@ -3019,6 +3074,7 @@ mod tests {
             audio_tx: None,
             channels: channels as u16,
             sample_rate: 48_000,
+            tap_lost_at: None,
         };
         (w, tx, note)
     }
@@ -3259,6 +3315,7 @@ mod tests {
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
             audio_tx: None,
+            plugin_lost_at: None,
             buf: Vec::new(),
             silence: vec![0.0; take * 1024],
         };
@@ -3506,6 +3563,7 @@ mod tests {
             unstamped_at_arm: 0,
             plugin_dropped_at_arm: 0,
             audio_tx: None,
+            plugin_lost_at: None,
             buf: Vec::new(),
             silence: vec![0.0; CH * 1024],
         };
@@ -3661,6 +3719,99 @@ mod tests {
         let report = live.finish();
         assert!(report.error.is_none(), "{:?}", report.error);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A tap that dies HALF WAY is reported too, and where.** `tap_problem`
+    /// asks once, at Start. An engine the fault watch drops mid-take - the
+    /// output unplugged, or gone quiet - leaves the instrument writer's file
+    /// ending where the engine did, and the reopen that brings one back
+    /// waits for the take to end; the take was filed as an ordinary one,
+    /// under a manifest saying `complete: true`.
+    #[test]
+    fn a_tap_that_dies_mid_take_is_reported_at_stop() {
+        let dir = std::env::temp_dir().join(format!("tangent-mid-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            format: TAKE_FORMAT,
+        };
+        let (mut w, mut write_end, _) = plugin_writer(2, 4096);
+        w.begin(StartArgs {
+            path: dir.join("mid.wav"),
+            spec,
+            bext: Bext::new(WallTime::from_unix(1_786_804_327, 0), spec),
+            audio_tx: None,
+        });
+        assert!(w.error.is_none(), "a live tap was accused at Start");
+        // One second of the engine, a hundredth at a time, as the thread pumps.
+        for _ in 0..100 {
+            for _ in 0..960 {
+                let _ = write_end.push(0.5f32);
+            }
+            w.pump();
+        }
+        assert_eq!(w.frames, 48_000, "the second before the engine died reached the file");
+        drop(write_end); // the engine goes, mid-take
+        let report = w.finish();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.frames, 48_000);
+        let error = report
+            .error
+            .expect("a take whose engine died half way is filed as an ordinary take");
+        assert_ne!(error, DEAD_TAP, "a tap that was live at Start was called dead from the start");
+        assert!(error.contains("0:01"), "the report does not say where the engine went: {error}");
+    }
+
+    /// **And the input writer says so too.** It goes on at the input's pace
+    /// once the desk's engine has gone, writing the desk's zeros, so its file
+    /// keeps the take's whole length - and only the report can say that
+    /// everything after the engine went is not what was played.
+    #[test]
+    fn an_input_take_whose_engine_dies_half_way_says_where() {
+        let dir = std::env::temp_dir().join(format!("tangent-mid-dead-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        const CH: usize = 2;
+        // A tenth of a second a block, so ten of them are one second.
+        const BLOCK: usize = 4_800;
+        let (mut source, mut writer) = writer_with_ring(CH);
+        let (tap, tap_tx, _) = crate::instrument::RecorderTap::for_test(BLOCK * 2 * 2, 2);
+        writer.plugin = Some(tap);
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: CH as u16,
+            format: TAKE_FORMAT,
+        };
+        let at = WallTime::from_unix(1_786_804_327, 0);
+        writer.wav = Some(
+            WavWriter::create(&dir.join("t.wav"), spec, &Bext::new(at, spec)).expect("create"),
+        );
+        let block = vec![0.25f32; BLOCK * CH];
+        let mut host_ns: Nanos = 1_000_000;
+        let mut tap_tx = Some(tap_tx);
+        for i in 0..20 {
+            if i == 10 {
+                tap_tx = None; // the engine goes, one second in
+            }
+            source.accept(&block, Some(host_ns), host_ns);
+            host_ns += (BLOCK as Nanos * 1_000_000_000) / 48_000;
+            if let Some(tx) = tap_tx.as_mut() {
+                for _ in 0..(BLOCK * 2) {
+                    let _ = tx.push(0.5);
+                }
+            }
+            writer.pump();
+        }
+        let report = writer.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.frames, (BLOCK * 20) as u64, "the input no longer decides the take's length");
+        let error = report
+            .error
+            .expect("an input take whose engine died half way is filed as an ordinary take");
+        assert!(error.contains("0:01"), "the report does not say where the engine went: {error}");
     }
 
     /// The input writer runs the same exit as the instrument writer, and it
@@ -4173,6 +4324,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A press that moves the transport as it begins its take places the
+    /// take where it moved it.** The realtime export locates to its span's
+    /// head and rolls after the frame's facts were pushed, so its manifest
+    /// kept the parked playhead, a stopped transport and the last cassette
+    /// press's head.
+    #[test]
+    fn a_press_that_moves_the_transport_places_its_take_where_it_moved_it() {
+        let dir = std::env::temp_dir().join(format!("tangent-take-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        // What the frame's push said: parked at 12 s, stopped, a 2 s head
+        // left over from the last take's count.
+        s.set_take_facts(12.0, false, 2.0, 0, 0);
+        // What the export did before it began its take.
+        s.set_take_head(0.0);
+        s.set_take_place(30.0, true);
+        s.toggle(&dir, Some("bounce"), 0, ExportSpec::default());
+        s.stop();
+        let folder = s.last_summary().expect("a summary").folder.clone();
+        let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(json.contains("\"timeline_start_seconds\": 30"), "{json}");
+        assert!(json.contains("\"timeline_rolling\": true"), "{json}");
+        assert!(json.contains("\"head_seconds\": 0"), "{json}");
+    }
+
     /// **A downbeat that is not this take's count-in's is never its T0.**
     ///
     /// The engine has one count-in, and two things now land a downbeat on a
@@ -4489,6 +4666,7 @@ impl PluginAudio {
                     audio_tx: None,
                     channels: channels as u16,
                     sample_rate,
+                    tap_lost_at: None,
                 };
                 while alive.load(Ordering::Relaxed) {
                     match cmd_rx.try_recv() {
@@ -4581,6 +4759,10 @@ struct PluginWriter {
     audio_tx: Option<mpsc::Sender<AudioChunk>>,
     channels: u16,
     sample_rate: u32,
+    /// **The file frame where the engine was found gone, mid-take** - see
+    /// [`tap_lost_problem`]. Set by `pump`, reported at `finish`, cleared at
+    /// `begin`.
+    tap_lost_at: Option<u64>,
 }
 
 impl PluginWriter {
@@ -4598,6 +4780,7 @@ impl PluginWriter {
         self.fit = RateFit::new();
         self.first_frame_ns = None;
         self.error = None;
+        self.tap_lost_at = None;
         self.audio_tx = args.audio_tx;
         match WavWriter::create(&args.path, args.spec, &args.bext) {
             Ok(w) => self.wav = Some(w),
@@ -4618,6 +4801,9 @@ impl PluginWriter {
         let Some(tap) = self.tap.as_mut() else {
             return;
         };
+        // Asked BEFORE the drain, as `Writer::mix_plugin` does: abandoned
+        // before it, the drain below takes the engine's last frames.
+        let live = tap.is_live();
         self.buf.clear();
         tap.drain(&mut self.buf);
         if !self.buf.is_empty() {
@@ -4641,6 +4827,11 @@ impl PluginWriter {
                 // the input's fit gets, and enough to measure a crystal.
                 self.fit.push(self.frames, self.timebase.now());
             }
+        }
+        // **The engine has gone, and its last frame is in the file now.**
+        // Nothing more will come: the file ends here.
+        if !live && self.wav.is_some() && self.tap_lost_at.is_none() {
+            self.tap_lost_at = Some(self.frames);
         }
         if let Ok(mut m) = self.meters.lock() {
             self.tracker.publish(&mut m);
@@ -4675,6 +4866,15 @@ impl PluginWriter {
                 if self.error.is_none() {
                     self.error = Some(format!("could not finish the audio file: {e}"));
                 }
+            }
+        }
+        // **The engine went half way**, and the file ends where it did. A tap
+        // dead from the start has said so already (`tap_problem`).
+        if let Some(at) = self.tap_lost_at.take() {
+            if self.error.is_none() {
+                let p = tap_lost_problem(at as f64 / f64::from(self.sample_rate.max(1)), false);
+                log::error!("take: {p}");
+                self.error = Some(p);
             }
         }
         let (clipped_samples, take_peak) = match self.meters.lock() {
