@@ -2416,9 +2416,12 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
             first.map(|i| i / 2)
         );
     }
+    // Emptied by hand before the engines drop, all four of them, so the
+    // plugins are torn down on this thread rather than with the renderers.
     for lane in 0..LANES {
         let _ = one.load_insert(lane, 0, None, None);
         let _ = two.load_insert(lane, 0, None, None);
+        let _ = three.load_insert(lane, 0, None, None);
         let _ = many.load_insert(lane, 0, None, None);
     }
 }
