@@ -1847,10 +1847,17 @@ pub enum DialogAction {
     },
     /// One of the keyboard panel's knobs moved, 0..=1. Fired per change so
     /// the sound follows the drag, exactly as the DX7 editor's rows do.
+    ///
+    /// `done` is the END of the gesture - the hand let go of the knob, or
+    /// the change was one step (a key, a double-click) - and is where the
+    /// app takes the knob's one undo moment. Only this window can know it:
+    /// on the desktop the panel is its own viewport, and the main frame
+    /// cannot see the pointer let go inside it.
     SetKeysParam {
         slot: usize,
         knob: usize,
         value: f32,
+        done: bool,
     },
     /// **Initialise the sound**: every knob of the strip's current patch back
     /// to the value the bench signed off. The other sound is untouched.
@@ -1904,8 +1911,13 @@ pub enum DialogAction {
     /// There is deliberately no unconfirmed road to this: the menu row opens
     /// a [`Dialog::Confirm`] and this arrives from its button.
     ResetTo(crate::settings::ResetScope),
-    /// Put the settings back to the copy taken just before the last reset.
-    UndoReset,
+    /// Put the settings back to the copy taken just before the last reset,
+    /// which was of this scope. The scope rides along so the undo touches
+    /// the window only where the reset did: an Everything reset resizes it,
+    /// and undoing a Colours one must not take a full-screen window out of
+    /// full screen. The only Undo is on the latest receipt, so it cannot go
+    /// stale.
+    UndoReset(crate::settings::ResetScope),
     /// Put the whole song back to one tempo, dropping its map.
     FlattenTempo,
     /// Start a new project, and take the unsaved one's directory with it.
@@ -7975,12 +7987,19 @@ fn show_on(
                                             let resp = resp.on_hover_text(format!(
                                                 "{about}\ndouble-click to reset"
                                             ));
-                                            if resp.changed() || resp.double_clicked() {
+                                            // **The gesture's end**: a drag let
+                                            // go, a reset, or a step from the
+                                            // keyboard, which no drag frames.
+                                            let done = resp.drag_stopped()
+                                                || resp.double_clicked()
+                                                || (resp.changed() && !resp.dragged());
+                                            if resp.changed() || done {
                                                 *cur = v;
                                                 action = Some(DialogAction::SetKeysParam {
                                                     slot,
                                                     knob,
                                                     value: v,
+                                                    done,
                                                 });
                                             }
                                             ui.label(
@@ -21407,6 +21426,124 @@ at: None,
             message: "Learned. This voicing now reads Cmaj7.".to_owned(),
         };
         assert!(report.is_modal());
+    }
+
+    /// **A Keys knob says when the hand lets go.** The panel reports every
+    /// frame a knob moves, so the sound follows the drag, and it reported
+    /// nothing else: the release is knowable only in this window (on the
+    /// desktop its own viewport, whose pointer the main frame cannot see),
+    /// so the app had nowhere to take the knob's undo moment. Now a drag's
+    /// frames say `done: false` and its release `done: true`, and a step
+    /// from the keyboard - which no drag frames - says `done` at once.
+    ///
+    /// The knobs are found as the panel's drag-only widgets of a slider's
+    /// size (the window's title bar and its resize corner sense drag too,
+    /// and dragging either would move everything else), and a candidate
+    /// counts only if dragging it moves a knob.
+    #[test]
+    fn a_keys_knob_reports_the_end_of_its_gesture() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        };
+        let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut dialog = Some(Dialog::KeysPatch {
+            slot: 0,
+            selected: 0,
+            params: [0.5; KEYS_PARAMS],
+        });
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut action = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show(ctx, &mut dialog, face, placement);
+                },
+            );
+            action
+        };
+        let _ = frame(Vec::new());
+        let _ = frame(Vec::new());
+        let knobs: Vec<(egui::Id, Rect)> = ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| {
+                    w.sense.senses_drag()
+                        && !w.sense.senses_click()
+                        && (10.0..40.0).contains(&w.rect.height())
+                        && (60.0..300.0).contains(&w.rect.width())
+                })
+                .map(|w| (w.id, w.rect))
+                .collect()
+        });
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // `DialogAction` has no `Debug`; what a failure needs to say is this.
+        let say = |a: &Option<DialogAction>| match a {
+            Some(DialogAction::SetKeysParam { done, .. }) => format!("a knob change, done: {done}"),
+            Some(_) => "another action".to_owned(),
+            None => "nothing".to_owned(),
+        };
+        let mut knob = None;
+        for (id, r) in knobs {
+            let (from, to) = (r.lerp_inside(Vec2::new(0.25, 0.5)), r.lerp_inside(Vec2::new(0.75, 0.5)));
+            let pressed = frame(vec![egui::Event::PointerMoved(from), button(from, true)]);
+            let moved = frame(vec![egui::Event::PointerMoved(to)]);
+            let let_go = frame(vec![button(to, false)]);
+            if !matches!(moved, Some(DialogAction::SetKeysParam { .. })) {
+                continue;
+            }
+            for (what, a) in [("the press", &pressed), ("a frame of the drag", &moved)] {
+                assert!(
+                    matches!(a, Some(DialogAction::SetKeysParam { done: false, .. })),
+                    "{what} said the gesture had ended: {}",
+                    say(a)
+                );
+            }
+            assert!(
+                matches!(let_go, Some(DialogAction::SetKeysParam { done: true, .. })),
+                "letting go of the knob did not end its gesture: {}",
+                say(&let_go)
+            );
+            knob = Some(id);
+            break;
+        }
+        let knob = knob.expect("no drag-only widget in the panel moved a knob");
+        // A step from the keyboard is a whole gesture on its own.
+        ctx.memory_mut(|m| m.request_focus(knob));
+        let _ = frame(Vec::new());
+        let step = frame(vec![egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            matches!(step, Some(DialogAction::SetKeysParam { done: true, .. })),
+            "a keyboard step on the knob did not end its gesture: {}",
+            say(&step)
+        );
     }
 
     /// **The classification is the only switch.** A plugin dialog goes
