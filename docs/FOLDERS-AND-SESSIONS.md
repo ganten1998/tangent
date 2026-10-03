@@ -50,10 +50,14 @@ makes no folder. Renaming before that repoints alone, so the folder is
 born under the chosen name; any of those writers makes `Untitled` real
 without a save. The launch sweep (`sweep_disposable_untitleds`) removes,
 WHOLE, every folder directly under the project root named `Untitled` or
-`Untitled …` whose `media/` holds nothing `count_media` counts, whose kit
-is not custom and whose document is missing, empty, or unnamed and
-clipless. It looks nowhere else in the folder: a subfolder or a nested
-project goes with it.
+`Untitled <n>` (`is_scratch_name`) whose `media/` holds nothing
+`count_media` counts, whose kit is not custom, whose document is missing,
+empty, or unnamed and clipless, and which holds nothing but what Tangent
+writes into a scratch (`holds_only_scratch`: the document, the kit and its
+write temp, `state/`, `export/`, `media/` with files only, dotfiles). A
+subfolder, a nested project or anybody's own file keeps the folder; it used
+to go with it. New's reclaim (`fresh_project_dir`) and Don't Save
+(`discard_scratch_made_here`) apply the same contents rule.
 
 Related invariants that keep this working:
 
@@ -89,9 +93,10 @@ Related invariants that keep this working:
   the document save-back AND the project plugin-state mirror in
   `switch_project`, the New arm and `on_exit`, and it survives New's detour
   through the scratch warning (`rearm_outgoing_discarded`). Then a scratch
-  THIS session made real (`made_real_this_session`), named Untitled,
-  unnamed and clipless ON DISK, off the shelf and holding no recording
-  (`rec-*`) is removed WHOLE (`discard_scratch_made_here`): its kit (a kit
+  THIS session made real (`made_real_this_session`), named `Untitled` or
+  `Untitled <n>`, unnamed and clipless ON DISK, off the shelf, holding
+  nothing but Tangent's own files and no recording (`rec-*`) is removed
+  WHOLE (`discard_scratch_made_here`): its kit (a kit
   built there included), the samples and imports it copied in, freeze
   renders, glued files, `state/` and the export staging. Open and Quit
   leave a scratch holding a recording on disk; New's reclaim of the

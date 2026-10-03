@@ -10993,15 +10993,16 @@ impl DesktopApp {
     }
 
     /// **Clear the Untitled litter.** Every folder directly under the
-    /// project root named `Untitled` or `Untitled …` is removed WHOLE when
-    /// all three hold: `count_media` counts nothing in its `media/` (a
+    /// project root named `Untitled` or `Untitled <n>`
+    /// (`tangent_ui::app::is_scratch_name`) is removed WHOLE when all of
+    /// these hold: `count_media` counts nothing in its `media/` (a
     /// recording, an import or a glued file counts; dotfiles, `frozen-*`
     /// renders and byte-copies of the template's own media do not), its kit
-    /// is not custom against the template's, and its document is missing,
-    /// empty, or unnamed and clipless (`TangentApp::scratch_is_disposable`).
-    /// Nothing else in the folder is looked at - a subfolder, a nested
-    /// project or anybody's own files go with it - so a scratch must never
-    /// hold anything Tangent did not write there.
+    /// is not custom against the template's, its document is missing,
+    /// empty, or unnamed and clipless, and nothing in it is anything but
+    /// what Tangent writes into a scratch (`TangentApp::scratch_is_disposable`,
+    /// through `holds_only_scratch`). A subfolder, a nested project or
+    /// anybody's own file keeps the folder; it used to go with it.
     fn sweep_disposable_untitleds(root: &std::path::Path, template: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(root) else {
             return;
@@ -11009,7 +11010,7 @@ impl DesktopApp {
         for e in entries.flatten() {
             let dir = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
-            if !dir.is_dir() || !(name == "Untitled" || name.starts_with("Untitled ")) {
+            if !dir.is_dir() || !tangent_ui::app::is_scratch_name(&name) {
                 continue;
             }
             if count_media(&dir, template) == 0
@@ -15065,8 +15066,12 @@ pub(crate) fn os_reader_attached() -> bool {
 /// removal:
 /// - `made_here`: `materialize_project_dir` turned nothing into this folder
 ///   since the session was opened or adopted (`made_real_here`, in memory);
-/// - the folder is named `Untitled` or starts with `Untitled `, and is not on
-///   the template shelf (`inside_template_shelf`);
+/// - the folder is named `Untitled` or `Untitled <n>`
+///   (`tangent_ui::app::is_scratch_name`), and is not on the template shelf
+///   (`inside_template_shelf`);
+/// - everything in it is something Tangent writes into a scratch
+///   (`tangent_ui::app::holds_only_scratch`) - a subfolder, a project filed
+///   inside or a file of anybody's own spares it;
 /// - its document is missing, empty, or unnamed with no clips - a damaged,
 ///   named or clip-holding one spares it (the in-memory flag can be undone
 ///   past a first save);
@@ -15075,10 +15080,9 @@ pub(crate) fn os_reader_attached() -> bool {
 /// Then the folder goes WHOLE (`remove_dir_all`): the kit sidecar - a kit
 /// built in this scratch included - the samples and imports it copied in,
 /// freeze renders, glued files, `state/` and the export staging in `export/`.
-/// Nothing but the document and the names in `media/` is looked at. Open and
-/// Quit stop here; New calls this too, but when it spares a recording New's
-/// own reclaim then removes the scratch it stands on regardless - see the
-/// New arm.
+/// Open and Quit stop here; New calls this too, but when it spares a
+/// recording New's own reclaim then removes the scratch it stands on
+/// regardless - see the New arm.
 fn discard_scratch_made_here(
     made_here: bool,
     dir: Option<&std::path::Path>,
@@ -15091,8 +15095,9 @@ fn discard_scratch_made_here(
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if !made_here
         || !dir.is_dir()
-        || !(name == "Untitled" || name.starts_with("Untitled "))
+        || !tangent_ui::app::is_scratch_name(&name)
         || tangent_ui::app::inside_template_shelf(dir, root)
+        || !tangent_ui::app::holds_only_scratch(dir)
     {
         return false;
     }
@@ -23760,6 +23765,64 @@ mod tests {
         std::fs::write(scratch.join("media").join("frozen-03-1.wav"), b"frozen").expect("freeze");
         assert_eq!(count_media(&scratch, &template), 2, "a freeze render counted as a take");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The launch sweep and Don't Save spare a folder that holds more than
+    /// a scratch.** Both matched any folder whose name began `Untitled ` and
+    /// judged it by its document, its kit and its `media/` alone, then
+    /// removed it WHOLE: a saved project filed inside a folder of the user's
+    /// (GNOME Files names a new one "Untitled Folder") went with it at the
+    /// next launch, takes and all, and so did a first save typed into a
+    /// scratch's own folder. Runs on a TEMP root only: the sweep lists that
+    /// root and can remove only its own `Untitled …` children.
+    #[test]
+    fn the_sweep_spares_a_folder_that_holds_more_than_a_scratch() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sweep-nested-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).expect("template");
+        let song = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir.join("media")).expect("song");
+            std::fs::write(dir.join("media").join("rec-1-1.wav"), b"a take").expect("take");
+            let mut song = tangent_ui::arrangement::Arrangement::default();
+            song.named = true;
+            song.save_to(&tangent_ui::arrangement::doc_in(dir));
+        };
+        // A folder of the user's, holding a saved project...
+        let filed = root.join("Untitled Folder").join("Song");
+        song(&filed);
+        // ...one of the user's that holds nothing, which is still not ours...
+        let theirs = root.join("Untitled draft");
+        std::fs::create_dir_all(&theirs).expect("their folder");
+        // ...a scratch's own name with a saved project inside it...
+        let nested = root.join("Untitled 2").join("Song");
+        song(&nested);
+        // ...and the litter the sweep is for: everything in it is Tangent's.
+        let litter = root.join("Untitled 3");
+        std::fs::create_dir_all(litter.join("media")).expect("litter");
+        std::fs::create_dir_all(litter.join("state")).expect("its shelf");
+        std::fs::write(litter.join("media").join(".DS_Store"), b"finder").expect("finder");
+        DesktopApp::sweep_disposable_untitleds(&root, &template);
+        let survived = filed.join("media").join("rec-1-1.wav").is_file();
+        let theirs_kept = theirs.is_dir();
+        let nested_kept = nested.join("media").join("rec-1-1.wav").is_file();
+        let litter_gone = !litter.exists();
+        // Don't Save on the scratch that holds the nested project.
+        let discarded = discard_scratch_made_here(true, Some(&root.join("Untitled 2")), &root);
+        let nested_kept_by_discard = nested.join("media").join("rec-1-1.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(survived, "the launch sweep deleted a saved project nested in a folder named Untitled …");
+        assert!(theirs_kept, "the launch sweep deleted a folder whose name Tangent never mints");
+        assert!(nested_kept, "the launch sweep deleted a saved project nested in an Untitled scratch");
+        assert!(litter_gone, "the sweep no longer clears a scratch holding only its own litter");
+        assert!(
+            !discarded && nested_kept_by_discard,
+            "Don't Save deleted a saved project nested in the scratch it discarded"
+        );
     }
 
     /// **"Don't Save" clears a scratch this session made real - and nothing
