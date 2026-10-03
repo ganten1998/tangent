@@ -2127,8 +2127,9 @@ impl DeskRef<'_> {
         // **And a term here is an UNDOABLE field.** This walk is what an
         // undo moment is compared by (`TangentApp::walk`), so adding one is
         // three jobs, not one: append it here; give every gesture that
-        // writes it exactly one commit (or make it part of `View`, which
-        // `commit_view_change` commits once a frame); and make
+        // writes it exactly one commit (or make it part of what
+        // `commit_view_change` commits once a frame: `View`, `Feel` and the
+        // view on show); and make
         // `apply_desk_snapshot` restore every value it can hold, sentinels
         // included - a value the apply declines leaves undo re-applying
         // that moment on every press.

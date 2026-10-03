@@ -16528,10 +16528,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * per FRAME: a drag that commits on every tick (a two-second marker
     ///   carry was 120 moments in a 100-moment history).
     ///
-    /// Not every gesture keeps the rule yet: the metronome panel's tempo
-    /// track commits on every frame it moves the tempo, and some presses and
-    /// knobs still commit nothing. A writer found breaking it is a bug to
-    /// fix, not a precedent to follow.
+    /// Not every gesture keeps the rule yet: a number typed into the band (a
+    /// level, a send, the varispeed or its range), the range panel's RESET,
+    /// a mixer figure finished by a click away, and a keyboard nudge of a
+    /// band knob, a desk fader or a header dial still commit nothing. A
+    /// writer found breaking it is a bug to fix, not a precedent to follow.
     ///
     /// How each shape must commit:
     ///
@@ -16540,6 +16541,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * a DRAG marks `arr_gesture_dirty` (or its own surface's grab) and
     ///   commits once at its release, so a release an early return can
     ///   swallow must still end the gesture;
+    /// * a held KEY, which repeats, commits once when it comes up (the
+    ///   transpose's `transpose_owed`);
     /// * a BATCH of committing writers is held with `begin_one_moment` and
     ///   released with `commit_undo_moment` in the same function and the
     ///   same frame, on every exit;
@@ -16548,8 +16551,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   every write of the gesture has landed.
     ///
     /// Two frame-level rules stand in for gestures: `commit_view_change`
-    /// commits the timeline's `View` once a frame, and the end of a
-    /// playback pass commits the automation it wrote (in `frame`).
+    /// commits the timeline's `View`, the editor's `Feel` and the view on
+    /// show once a frame, and the end of a playback pass commits the
+    /// automation it wrote (in `frame`).
     ///
     /// The other half lives in `apply_desk_snapshot`: applying a moment
     /// must reproduce its words exactly. A value the apply declines to
@@ -37434,9 +37438,9 @@ impl TangentApp {
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
         // ...and acted on after it, once every panel has had its turn.
         self.nudge_focused(ctx);
-        // **And the timeline's own grid and window, if one of them moved.**
-        // AFTER the paint, because that is where they are moved from. See
-        // `commit_view_change`.
+        // **And the timeline's own grid and window, the editor's feel and
+        // the view on show, if one of them moved.** AFTER the paint, because
+        // that is where they are moved from. See `commit_view_change`.
         self.commit_view_change();
     }
 
