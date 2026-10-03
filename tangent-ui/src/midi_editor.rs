@@ -614,10 +614,27 @@ pub fn view_grid(view: &MidiEditView<'_>) -> Option<crate::quantize::Grid> {
     )
 }
 
+/// **How near a grid line still counts as ON it**, in seconds, for the
+/// floor and next snaps.
+///
+/// A head that should stand on a line arrives a hair off it: the engine
+/// locates in whole frames and truncates, so the playhead reads back BELOW
+/// the line, and `n * step` in doubles is not always a value
+/// `(t / step).floor()` finds line `n` in again. With no tolerance the floor
+/// put such a head on the line before, so Enter stacked its notes on one
+/// line and the right arrow re-located onto the line it stood on, at every
+/// tempo but a handful of powers of two. A tenth of a millisecond: several
+/// frames at any rate, a tenth of the shortest step a grid may have.
+///
+/// A caller asking for the line STRICTLY before `t` floors
+/// `t - 2.0 * SNAP_EPS_S`; anything nearer is the line `t` stands on.
+pub const SNAP_EPS_S: f64 = 1.0e-4;
+
 /// As [`snap_t`], but FLOOR: the grid line at or before `t`. Note
 /// CREATION uses it — a click lands in the cell under the hand, never the
 /// next one, however close to the boundary. Swing floors to the last
-/// candidate at or before `t`.
+/// candidate at or before `t`. A line up to [`SNAP_EPS_S`] after `t` is the
+/// one `t` stands on.
 pub fn snap_floor_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     if !view.snap_on {
         return t.max(0.0);
@@ -631,20 +648,21 @@ pub fn snap_floor_t(view: &MidiEditView<'_>, t: f64) -> f64 {
         let base = (t / pair).floor() * pair;
         let mut best = base;
         for c in [base, base + pair * view.swing_pct.clamp(0.5, 0.95), base + pair] {
-            if c <= t + 1.0e-9 && c > best {
+            if c <= t + SNAP_EPS_S && c > best {
                 best = c;
             }
         }
         best.max(0.0)
     } else {
-        ((t / step).floor() * step).max(0.0)
+        (((t + SNAP_EPS_S) / step).floor() * step).max(0.0)
     }
 }
 
 /// The first grid line STRICTLY after `t` — shape-aware, so a note drawn
 /// on the on-beat of a swung pair runs long to the off-beat line and one
 /// drawn on the off-beat runs short to the next pair. Durations and
-/// nudges walk the same lines the magnet lands on.
+/// nudges walk the same lines the magnet lands on. A line within
+/// [`SNAP_EPS_S`] of `t` is the one `t` stands on, never the next.
 pub fn snap_next_t(view: &MidiEditView<'_>, t: f64) -> f64 {
     let step = grid_step_s(view);
     if step <= 0.0 {
@@ -658,13 +676,13 @@ pub fn snap_next_t(view: &MidiEditView<'_>, t: f64) -> f64 {
             base + pair,
             base + pair + pair * view.swing_pct.clamp(0.5, 0.95),
         ] {
-            if c > t + 1.0e-9 {
+            if c > t + SNAP_EPS_S {
                 return c;
             }
         }
         base + pair * 2.0
     } else {
-        ((t / step).floor() + 1.0) * step
+        (((t + SNAP_EPS_S) / step).floor() + 1.0) * step
     }
 }
 

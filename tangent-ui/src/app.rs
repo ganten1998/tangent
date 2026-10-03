@@ -19579,7 +19579,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             let to = if steps_t > 0.0 {
                                 crate::midi_editor::snap_next_t(&view, abs)
                             } else {
-                                crate::midi_editor::snap_floor_t(&view, abs - 1.0e-6)
+                                crate::midi_editor::snap_floor_t(
+                                    &view,
+                                    abs - 2.0 * crate::midi_editor::SNAP_EPS_S,
+                                )
                             };
                             Some(to - abs)
                         })
@@ -19659,9 +19662,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A playhead parked outside the clip writes at the nearest end of it
         // rather than nowhere: the alternative is a key that silently does
         // nothing, which is the thing this editor's notes keep warning about.
-        // Where the line is DRAWN, in a loop - see `me_playhead`.
+        // Where the line is DRAWN, in a loop - see `me_playhead`. The end is
+        // held off by more than the snaps' tolerance, or a clip ending on a
+        // line floors the head onto its end, where nothing can be written.
         let (at, shift) = self.me_playhead();
-        let at = at.clamp(c0, c1 - 1.0e-6);
+        let at = at.clamp(c0, c1 - 2.0 * crate::midi_editor::SNAP_EPS_S);
         self.me_create_note(at, key);
         // **The mouse's create leaves a DRAG standing** so the hand can size
         // the note by pulling before it lets go. A keyboard insert has no
@@ -19748,7 +19753,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if steps > 0.0 {
                 crate::midi_editor::snap_next_t(&view, at)
             } else {
-                crate::midi_editor::snap_floor_t(&view, at - 1.0e-6)
+                crate::midi_editor::snap_floor_t(&view, at - 2.0 * crate::midi_editor::SNAP_EPS_S)
             }
         } else {
             at + steps * crate::midi_editor::grid_step_s(&view).max(0.01)
@@ -19766,7 +19771,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if steps > 0.0 && to > turn + 1.0e-9 {
                 turn
             } else if steps < 0.0 && at <= top + 1.0e-9 {
-                crate::midi_editor::snap_floor_t(&view, turn - 1.0e-6) - clip.loop_s
+                crate::midi_editor::snap_floor_t(&view, turn - 2.0 * crate::midi_editor::SNAP_EPS_S)
+                    - clip.loop_s
             } else {
                 to
             }
@@ -46314,6 +46320,118 @@ mod tests {
             "the song left its pass: {}",
             app.playhead_s()
         );
+    }
+
+    /// **Enter walks one grid step per press at any tempo, magnet on.** The
+    /// snaps had no tolerance, and `n * step` in doubles is not always a
+    /// value `(t / step).floor()` finds line `n` in again: a playhead walked
+    /// onto a line by the last note floored onto the line BEFORE it, and the
+    /// next note was written there. With the head on a bar line at 95 bpm,
+    /// eight Enters wrote five onsets; the default 120 bpm hid it.
+    #[test]
+    fn step_entry_walks_a_grid_step_per_enter_off_the_power_of_two_tempos() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.settings.midi_snap = true;
+        app.settings.record_export.tempo_bpm = 95.0; // an eighth is 6/19 s
+        let bar = 4.0 * 60.0 / 95.0;
+        {
+            let c = &mut app.arrangement.clips[0];
+            c.start_s = bar; // the head on a bar line
+            c.len_s = 4.0 * bar;
+        }
+        app.me_locate(bar);
+        for _ in 0..8 {
+            app.me_insert_at_playhead();
+        }
+        let mut at: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
+        at.sort_by(f64::total_cmp);
+        at.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+        assert_eq!(at.len(), 8, "Enter stacked notes with no engine at all: {at:?}");
+    }
+
+    /// **A playhead the engine located in whole frames is still ON its
+    /// line.** The engine truncates a locate to a frame and the next frame's
+    /// readback is that frame over the rate, a hair BELOW the line: at 105
+    /// bpm every Enter floored back onto one line, and the right arrow
+    /// re-located onto the line it stood on, forever. The left arrow asks for
+    /// the line strictly before the head, so it has to step back further than
+    /// the snaps' tolerance or it stalls the same way.
+    #[test]
+    fn step_entry_survives_a_playhead_located_in_whole_frames() {
+        let (_ctx, mut app) = editor_on_an_empty_clip(); // 2.0..6.0 s
+        app.settings.midi_snap = true;
+        app.settings.record_export.tempo_bpm = 105.0; // an eighth is 2/7 s
+        let engine_says = |t: f64| ((t * 48_000.0) as u64) as f64 / 48_000.0;
+        app.recorder.position_s = 2.0;
+        for _ in 0..4 {
+            app.me_insert_at_playhead();
+            app.recorder.position_s = engine_says(app.recorder.position_s);
+        }
+        let mut at: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
+        at.sort_by(f64::total_cmp);
+        at.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+        assert_eq!(at.len(), 4, "Enter stacked notes on one line: {at:?}");
+        let line = 2.0 + 2.0 / 7.0;
+        app.recorder.position_s = engine_says(line);
+        app.me_step_playhead(1.0);
+        assert!(app.playhead_s() > line + 0.1, "the arrow re-located to the line it stood on: {}", app.playhead_s());
+        app.recorder.position_s = engine_says(app.playhead_s());
+        app.me_step_playhead(-1.0);
+        assert!(
+            (app.playhead_s() - line).abs() < 1.0e-6,
+            "the left arrow did not step back to {line}: {}",
+            app.playhead_s()
+        );
+    }
+
+    /// **Enter with the playhead past the clip's end writes in its last
+    /// cell, magnet on.** The head is held just inside the end and then
+    /// floored; held by less than the snaps' tolerance, a clip that ends on a
+    /// line floored onto its own end, where nothing can be written.
+    #[test]
+    fn enter_past_a_clips_end_writes_in_its_last_cell() {
+        let (_ctx, mut app) = editor_on_an_empty_clip(); // 2.0..6.0 s, eighths of 0.25 s
+        app.settings.midi_snap = true;
+        app.me_locate(7.0);
+        app.me_insert_at_playhead();
+        let n = app.arrangement.clips[0].notes.last().expect("Enter past the clip's end wrote nothing");
+        assert!((n.at_s - 3.75).abs() < 1.0e-9, "the note landed {} into the clip, not in its last cell", n.at_s);
+    }
+
+    /// **Every walk to the line BEFORE leaves the line it stands on.** The
+    /// snaps count a line within their tolerance as the one a head stands
+    /// on, so a caller asking for the line strictly before steps back further
+    /// than that, or it is handed the line it stands on: the left arrow from
+    /// the top of a whole-step loop's later pass stayed there, and a swung
+    /// nudge left left the note where it was.
+    #[test]
+    fn every_walk_to_the_line_before_leaves_the_line_it_stands_on() {
+        let (_ctx, mut app) = editor_on_an_empty_clip(); // 2.0..6.0 s, eighths of 0.25 s
+        app.settings.midi_snap = true;
+        // A loop of four whole steps, the song at the top of its second pass.
+        app.arrangement.clips[0].loop_s = 1.0;
+        app.me_locate(3.0);
+        app.me_step_playhead(-1.0);
+        assert!(
+            (app.playhead_s() - 2.75).abs() < 1.0e-9,
+            "left from the top of the second pass went to {}, not the first pass's last line",
+            app.playhead_s()
+        );
+        // Swung pairs of 0.5 s: a note on an on-beat line, nudged left, walks
+        // to the swung off-beat before it.
+        app.arrangement.clips[0].loop_s = 0.0;
+        app.settings.midi_swing = true;
+        app.arrangement.clips[0].notes.push(crate::arrangement::ArrNote {
+            at_s: 1.0,
+            dur_s: 0.1,
+            key: 60,
+            vel: 100,
+            muted: false,
+        });
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        app.me_nudge(-1.0, 0);
+        let at = app.arrangement.clips[0].notes[0].at_s;
+        assert!(at < 0.9, "a swung nudge left left the note on its line, at {at}");
     }
 
     /// **The loop bar stands where the loop turns over**, on a part trimmed
