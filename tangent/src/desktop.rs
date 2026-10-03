@@ -639,6 +639,9 @@ struct Bounce {
     stem_writers: Vec<StemWriter>,
     /// The drain buffer, reused.
     stem_scratch: Vec<f32>,
+    /// **The engine went mid-pass, and that is what ended it** - see
+    /// `tick_bounce`. Filed as a failure.
+    engine_lost: bool,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -9850,6 +9853,7 @@ impl DesktopApp {
             stems,
             stem_writers,
             stem_scratch: Vec::new(),
+            engine_lost: false,
         });
     }
 
@@ -9900,17 +9904,29 @@ impl DesktopApp {
                 .recorder
                 .transport
                 .position_s(self.recorder.engine.as_ref(), rate);
+            // **An engine that goes ends the pass, as a failure.** With no
+            // engine the playhead is the last one known and never moves, so
+            // `until_s` was never reached: "Exporting..." stood until Stop,
+            // and the short or silent-tailed pass was then filed as a success.
+            let lost = self.recorder.engine.is_none();
             // Past the end — or somebody pressed Stop, which ends the pass
             // early and exports what there is.
-            if pos >= b.until_s || !self.recorder.session.is_recording() {
+            if lost || pos >= b.until_s || !self.recorder.session.is_recording() {
                 self.recorder.session.stop();
                 self.recorder.transport.stop();
                 b.finishing = true;
+                b.engine_lost = lost;
             }
         } else if !self.recorder.session.is_recording() {
+            let lost = b.engine_lost;
             if let Some(sum) = self.recorder.session.last_summary() {
                 let folder = sum.folder.clone();
-                let problem = sum.problem.clone();
+                // The take says why when its writer saw the desk go (see
+                // `record::tap_lost_problem`); a pass that ended on the loss
+                // fails whatever its report found time to say.
+                let problem = sum.problem.clone().or_else(|| {
+                    lost.then(|| "the audio engine stopped during the export".to_owned())
+                });
                 if let Some(e) = self.recorder.engine.as_ref() {
                     e.set_stems(false);
                 }
@@ -14046,8 +14062,9 @@ impl DesktopApp {
         // deadlocks. A take CAN outlive its engine - the fault path drops a
         // dead engine mid-take - and from that moment an input-driven take
         // writes the desk's silence while an instrument-only take's file
-        // stops growing; the reopen this refusal defers is what brings the
-        // engine back, after the take.
+        // stops growing, and the take says where when it ends
+        // (`record::tap_lost_problem`); the reopen this refusal defers is
+        // what brings the engine back, after the take.
         if self.recorder.session.state().is_active() {
             self.recorder.audio_path_deferred = true;
             return;
@@ -22918,6 +22935,32 @@ mod tests {
             facts.contains("let rolling = take_rolls_from_frame_0(")
                 && facts.contains("self.recorder.play_on_go"),
             "the facts say the song is still when a Play waits on the downbeat the take begins on"
+        );
+    }
+
+    /// **An export whose engine goes ends, and fails.** With no engine the
+    /// playhead freezes where it stopped (`position_s` with no engine is
+    /// the last one known), so `until_s` was never reached: "Exporting..."
+    /// stood until somebody pressed Stop, and the short or silent-tailed
+    /// pass was then filed as `export/track.wav` with no error. The take's
+    /// own report says where its writer saw the desk go
+    /// (`record::tests::a_tap_that_dies_mid_take_is_reported_at_stop`).
+    #[test]
+    fn an_export_whose_engine_goes_ends_and_fails() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn tick_bounce(&mut self").expect("tick_bounce");
+        let body = squash(&src[at..at + src[at..].find("\n    fn ").expect("its end")]);
+        let lost = body
+            .find("let lost = self.recorder.engine.is_none();")
+            .expect("an export never asks whether its engine is still there");
+        let ends = body
+            .find("if lost || pos >= b.until_s")
+            .expect("an export whose engine went waits for a playhead that froze");
+        assert!(lost < ends, "the pass ends on a loss it has not asked about yet");
+        assert!(
+            body.contains("b.engine_lost = lost;") && body.contains(".or_else(|| { lost.then("),
+            "an export that ended on a lost engine is filed as a success"
         );
     }
 
