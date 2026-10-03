@@ -13563,6 +13563,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
         }
+        // **A session never written has no `media/` to copy**: its kit's
+        // samples and its clips' audio are still in the template it was
+        // adopted from (`media_doc`). They come from there, by the rules
+        // `materialize_project_dir` brings them across with, or the copy's
+        // pads and template clips name files nothing put in it.
+        if !src_dir.is_dir() {
+            if let Some(src) = self.media_source.clone() {
+                copy_kit_samples(&self.drumpad_kits, &src, &dir);
+                copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, &src, &dir);
+            }
+        }
         let doc = crate::arrangement::doc_in(&dir);
         // A Save As is a name somebody CHOSE: the copy is a kept project,
         // never a scratch a new session may reclaim.
@@ -27622,7 +27633,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Write it, and say so in the place errors from this panel already go.
     fn write_kit_preset(&mut self, path: &std::path::Path) {
-        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+        // **Where the samples ARE**, which in a session not written yet is
+        // its template: resolved against the project's own unmade folder,
+        // every pad was unreadable and the kit saved its layout alone. See
+        // `kit_doc`.
+        let Some(doc) = self.kit_doc() else {
             self.track.error = "no project is open".to_owned();
             return;
         };
@@ -69451,6 +69466,65 @@ mod folder_tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(brought, [true, true], "a scratch made real left its clip's or its freeze's audio in the template");
         assert_eq!(saved, [true, true], "a first save left its clip's or its freeze's audio in the template");
+    }
+
+    /// **Duplicate of a session never written brings its template's
+    /// files.** The copy took `media/` from the session's own folder, which
+    /// a fresh session does not have yet, and then moved the session into
+    /// the copy: every pad and every template clip named a file in the
+    /// copy's `media/` that nothing had put there.
+    #[test]
+    fn duplicating_a_fresh_session_brings_its_templates_files() {
+        let root = temp_root("tpl-dup");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFxxxxWAVE").expect("template audio");
+        let mut doc = crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&template));
+        doc.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/Loop.wav".to_owned(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        doc.save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        assert!(!scratch.exists(), "fixture: the session is not written");
+        assert!(app.save_project_as(&projects.join("Copy")), "the duplicate was refused");
+        let copy = app
+            .project_doc()
+            .and_then(std::path::Path::parent)
+            .expect("the copy is open")
+            .to_path_buf();
+        let got = ["Kick.wav", "Loop.wav"].map(|f| copy.join("media").join(f).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, [true, true], "the copy's pad or clip names a file nothing brought across");
+    }
+
+    /// **Save Kit from a session never written carries the template's
+    /// samples.** The preset resolved each pad against the project's own
+    /// folder, which does not exist until something is written, so every
+    /// sample was unreadable and the kit saved its layout alone.
+    #[test]
+    fn save_kit_from_a_fresh_session_carries_the_templates_samples() {
+        let root = temp_root("tpl-kit");
+        let projects = root.join("Projects");
+        let template = shelf_template(&projects, 36, "Kick.wav");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        assert_eq!(app.drumpad().pads[36].path, "media/Kick.wav", "fixture: the template's kit");
+        let kit = root.join("Fresh.kit");
+        app.write_kit_preset(&kit);
+        let (written, error, untouched) = (kit.is_file(), app.track.error.clone(), !scratch.exists());
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(written, "no kit file was written");
+        assert!(error.is_empty(), "the kit saved without its samples: {error}");
+        assert!(untouched, "saving a kit wrote the session's folder");
     }
 
     /// **New hands over the TEMPLATE's kit, never the last project's.** A
