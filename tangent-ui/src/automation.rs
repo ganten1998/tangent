@@ -515,8 +515,9 @@ impl Automation {
     /// at a step. The engine asks once per rendered chunk, at the chunk's
     /// FIRST frame (`secs = at / rate` in `resolve_automation`), so on the
     /// desk's own controls a step at `t` is heard from the first chunk that
-    /// starts at or after `t`. A plugin parameter on a lane rendered ahead is
-    /// read at the chunk's position too, not the grain's - see `grain_ok`.
+    /// starts at or after `t`. A plugin parameter is read at the chunk's
+    /// position too, and a lane carrying one is not rendered ahead, so it
+    /// hears its curve on that same chunk - see the engine's `grain_ok`.
     pub fn value_at(&self, lane: usize, param: AutoParam, seconds: f64) -> Option<f64> {
         self.get(lane, param)?.value_at(seconds)
     }

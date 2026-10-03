@@ -4726,9 +4726,10 @@ mod engine_parts {
     /// document and the position, for both the desk's own controls and the
     /// plugins' parameters. The other half, the one-shot knob and preset
     /// edits that arrive on a ring, is not a function of anything and stays
-    /// where it is. Being pure is the prerequisite, not the use: a grained
-    /// lane's plugin parameters are still filled once per chunk, at the
-    /// chunk's position (see `grain_ok`).
+    /// where it is. Being pure is the prerequisite, not the use: the plugin
+    /// parameters are still filled once per chunk, at the chunk's position,
+    /// and a lane carrying a curve is pinned to the chunk for it (see
+    /// `grain_ok`).
     #[test]
     fn the_automation_answers_for_the_position_it_is_asked_about() {
         use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
@@ -5520,6 +5521,9 @@ fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
 ///   off by the tempo change inside that grain otherwise - the error the
 ///   arp's own one-tempo walk across a span already has. A lane carrying it
 ///   renders ahead like any other.
+/// * **Not here either: a plugin-parameter curve**, which the grain clock
+///   pins itself beside the audition (`Renderer::curve_lanes`): the curve
+///   is walked by the renderer, which this board cannot see.
 ///
 /// The Fx bus and the two master seats are not channels and never reach this
 /// loop, so they are asserted rather than tested per lane.
@@ -6317,13 +6321,13 @@ fn lane_range(first: Option<&[u32; CHANNELS + 1]>, ch: usize, len: usize) -> std
 ///
 /// **`secs` is the position of the first frame these values will be
 /// rendered with.** `resolve_automation` passes the chunk's own, which is
-/// right for every lane that renders the chunk. A lane the grain clock has
-/// moved (`plan_grains`, `lane_at`) renders up to a grain past it from this
-/// same table, one point at offset 0 for the whole grain, so its plugin
-/// parameters arrive at the chunk's position, up to two grains late, and
-/// nothing pins a lane for carrying a curve. The desk's fader, pan, send and
-/// mute are not affected: `automation_now` resolves them for the chunk and
-/// the fold applies them at consumption.
+/// right for every lane that renders the chunk. A lane the grain clock moved
+/// (`plan_grains`, `lane_at`) would render up to a grain past it from this
+/// same table, one point at offset 0 for the whole grain, so the lanes this
+/// returns are pinned (`Renderer::curve_lanes`): a lane carrying a curve
+/// renders the chunk the curve was read for. The desk's fader, pan, send and
+/// mute need no pin: `automation_now` resolves them for the chunk and the
+/// fold applies them at consumption.
 fn fill_automation_params(
     automation: &tangent_ui::automation::Automation,
     suspend: u64,
@@ -7981,6 +7985,18 @@ struct Renderer {
     /// ring, which runs no rack either, so an edit popped on such a block is
     /// still lost (see `automation_now`).
     param_lanes: u32,
+    /// **Which lanes carry a plugin-parameter CURVE**, from this chunk's walk
+    /// of the document (`fill_automation_params`), kept apart from the knob
+    /// bits `param_lanes` also holds.
+    ///
+    /// The grain clock pins them. A curve is read once per chunk, at the
+    /// chunk's own position, into one desk-wide table, and a grained lane
+    /// renders up to a grain past that position from it: a step reached it
+    /// up to two grains late and a ramp became a staircase a grain wide.
+    /// Pinned, the lane renders the chunk the table was read for. Reading the
+    /// curve at the grain's own position instead would still hold one value
+    /// for the whole grain, which is the staircase back again.
+    curve_lanes: u32,
     /// Which lanes the deciding walk left for the render walk to do.
     lane_wants: [bool; CHANNELS],
     /// **The span each lane is rendering this chunk**, which is the chunk's
@@ -11551,6 +11567,7 @@ impl Renderer {
         // `param_lanes`: a lane that skips its render loses the point
         // rather than deferring it, so this is what keeps it awake.
         self.param_lanes = 0;
+        self.curve_lanes = 0;
         // **Before the early return below, not after it.** A plugin's own
         // window works in a song with no automation at all — which is most
         // songs — and draining these after the `is_empty` shortcut would have
@@ -11612,12 +11629,13 @@ impl Renderer {
         // hundred and forty-four bays; asking every bay whether it has a curve
         // would be four hundred lookups a block to find three. The curve list
         // is the source of truth and it is already sorted.
-        self.param_lanes |= fill_automation_params(
+        self.curve_lanes = fill_automation_params(
             &self.automation,
             suspend,
             secs,
             &mut self.auto_params,
         );
+        self.param_lanes |= self.curve_lanes;
         self.auto = automation_now(&self.automation, suspend, secs);
         // **The master's own curve**, read at the lane the UI addresses it
         // by — one past the channels. Suspended by the same rule a channel
@@ -13077,7 +13095,8 @@ impl Renderer {
     /// destination, a drum lane, sidechain-keyed, room-owned or named by
     /// the insert tap. An auditioning lane is added to it by the caller,
     /// because an audition is a LEVEL reconciled against the playhead and
-    /// there is no such thing for a span the playhead has not reached.
+    /// there is no such thing for a span the playhead has not reached; and
+    /// so is a lane carrying a plugin curve (`curve_lanes`), below.
     ///
     /// Everything a lane that survives that needs is a pure function of the
     /// position it is asked about: `pull_lane_clips` takes the span, the
@@ -13086,11 +13105,11 @@ impl Renderer {
     /// automated fader, pan, send and mute are applied at consumption.
     /// Those are exactly what steps two and three of this overhaul built.
     ///
-    /// **Plugin-parameter automation is the exception**:
-    /// `fill_automation_params` is asked once per chunk at the chunk's
-    /// position and a grained lane renders a grain ahead from that table, so
-    /// its curves land up to two grains late; nothing in the pin set covers
-    /// a lane that carries one.
+    /// **Plugin-parameter automation is the exception**, and the caller pins
+    /// it: `fill_automation_params` is asked once per chunk at the chunk's
+    /// position, and a lane grained from that table played its curves up to
+    /// two grains late, so a lane carrying one renders the chunk
+    /// (`curve_lanes`).
     fn grain_ok(&self, ch: usize, free: u32) -> bool {
         if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
             return false;
@@ -13382,6 +13401,9 @@ impl Renderer {
                     self.room_rack | self.board_live,
                     self.keys_live,
                 );
+                // **So does a plugin curve**: it was read for this chunk
+                // alone. See `curve_lanes`.
+                free &= !self.curve_lanes;
                 // **An audition pins its own lane.** It is a LEVEL
                 // reconciled against the playhead once a chunk - the key is
                 // held, not scheduled - and there is no such thing for a
@@ -14225,7 +14247,7 @@ impl Renderer {
                     self.room_rack | self.board_live,
                     self.keys_live,
                 );
-                let pinned = desk | self.probe_walk_pins;
+                let pinned = desk | self.probe_walk_pins | self.curve_lanes;
                 (
                     wanted & !(pinned | self.probe_clip_pins | self.probe_inst_pins),
                     wanted & !(pinned | self.probe_inst_pins),
@@ -16411,6 +16433,7 @@ impl Engine {
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
+            curve_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
@@ -22616,6 +22639,7 @@ mod tests {
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
+            curve_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
             lane_len: [0; CHANNELS],
