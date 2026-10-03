@@ -3575,6 +3575,7 @@ dependencies = [
 name = "tangent-record"
 version = "5.0.0-dev"
 dependencies = [
+ "asio-sys",
  "cpal",
  "dispatch2",
  "linuxvideo",
