@@ -13011,6 +13011,10 @@ impl DesktopApp {
         // lets it be asked again - so the marks for that clip would arrive
         // never rather than late. Nothing about the ask changes when a
         // decode lands, so the ask is the only thing that can remember.
+        // A file the decoder REFUSED never lands, so it answers at once with
+        // no marks (see `quantize_marks_for`), and its refusal is in the
+        // signature, so a file asked again after a project switch or an
+        // engine rebuild reopens the ask.
         if marks.len() == want {
             self.quantize_marked = ask.map(|a| (a, sig));
         }
@@ -13032,8 +13036,9 @@ impl DesktopApp {
     ///
     /// Everything `quantize_marks_for` reads that the ask does not carry:
     /// the file, the placement, the trim, the loop, the warp map and its
-    /// rate, and the stretch. A clip that moves changes this and the ticks
-    /// are rebuilt.
+    /// rate, the stretch, and whether the decoder refused the file. A clip
+    /// that moves changes this and the ticks are rebuilt; so does a refusal
+    /// that is lifted, so the file is asked again.
     ///
     /// **Not the document's own fingerprint**, which is the obvious
     /// one-liner and is wrong: it includes the desk, so a fader moved with
@@ -13045,6 +13050,7 @@ impl DesktopApp {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let doc = self.app.arrangement();
+        let doc_path = self.app.clip_doc();
         for id in &ask.ids {
             if let Some(c) = doc.clips.iter().find(|c| c.id == *id) {
                 c.path.hash(&mut h);
@@ -13055,6 +13061,11 @@ impl DesktopApp {
                 c.warp.hash(&mut h);
                 c.warp_rate.hash(&mut h);
                 c.stretch.to_bits().hash(&mut h);
+                let refused = doc_path.as_ref().is_some_and(|d| {
+                    self.warm_refused
+                        .contains(&tangent_ui::arrangement::Arrangement::resolve(d, &c.path))
+                });
+                refused.hash(&mut h);
             }
         }
         h.finish()
@@ -13117,6 +13128,14 @@ impl DesktopApp {
         for a in &asked {
             let path = a.path.clone();
             let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
+                // **A file the decoder refused answers now, with no marks.**
+                // It never reaches `track_cache`; skipped like a decode still
+                // on its way, it kept the ask from ever latching, and while
+                // the window was up every frame rebuilt every mark and asked
+                // for another frame. A decode on its way is skipped: it lands.
+                if self.warm_refused.contains(&path) {
+                    out.push((a.id, Vec::new()));
+                }
                 continue;
             };
             let rate = f64::from(decoded.rate.max(1));
@@ -25886,6 +25905,34 @@ mod tests {
         assert!(
             scan.contains("let sig = ask.as_ref().map_or(0, |a| self.quantize_clip_sig(a));"),
             "the pusher no longer asks where the clips are"
+        );
+    }
+
+    /// **A file the decoder refused lets the marks rest.** It never reaches
+    /// `track_cache`, so `quantize_marks_for` skipped it like a decode still
+    /// on its way; the ask latches only once every clip has answered, so it
+    /// never latched, and with the window up every frame rebuilt every mark
+    /// and asked for another frame - one missing take kept the app from
+    /// resting. It answers at once with no marks now, and its refusal is in
+    /// the signature, so a file that is asked again reopens the ask. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_refused_file_answers_the_marks_with_none() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |f: &str| {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        let marks = body("fn quantize_marks_for(");
+        assert!(
+            marks.contains("if self.warm_refused.contains(&path) {")
+                && marks.contains("out.push((a.id, Vec::new()));"),
+            "a refused file is skipped like a decode on its way, so the ask never latches"
+        );
+        assert!(
+            body("fn quantize_clip_sig(").contains("refused.hash(&mut h);"),
+            "the signature ignores a refusal, so one lifted leaves the clip unmarked"
         );
     }
 
