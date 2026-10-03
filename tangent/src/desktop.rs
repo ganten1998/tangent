@@ -999,29 +999,32 @@ pub struct DesktopApp {
     /// that changed nothing asks nothing. See `push_quantize_marks`.
     #[cfg(feature = "recorder")]
     quantize_marked: Option<(tangent_ui::ports::QuantizeAsk, u64)>,
-    /// **A plugin's settings, shelved because something wrote over the
-    /// file they lived in.** Keyed by seat, bay and the bundle they belong
-    /// to. See `shelve_displaced_state`: a bay's sidecar is one file tagged
-    /// with its current tenant, so a paste or a swap DESTROYS the outgoing
-    /// tenant's only copy - and the bay itself is undoable, so Ctrl+Z asks
-    /// for a plugin whose settings are no longer anywhere.
+    /// **What a plugin was PLAYING when the reconcile took it out of a
+    /// bay**, keyed by seat, bay and the bundle it belongs to, so an undo
+    /// that puts it back there gets its settings back with it.
+    ///
+    /// A bay's sidecar is one file tagged with its current tenant, written
+    /// at a save, when a plugin's own window closes, when a session is
+    /// replaced, at a reorder, at an engine teardown and at quit - never by
+    /// a knob, and a built-in unit has no window to close. So the file is
+    /// stale for anything dialled in since, and a paste, a swap, a copy or a
+    /// move re-tags it for the tenant it brings in and destroys the old
+    /// tenant's copy outright. The reconcile asks the outgoing instance for
+    /// its state just before `load_insert` drops it - the one place paste,
+    /// swap, delete, replace, undo and redo all pass while the plugin is
+    /// still alive - and shelves that.
+    ///
+    /// **Taken FIRST when that bay loads that bundle again, and spent
+    /// there**; see `incoming_state` for why it may outrank the file. Not
+    /// filled during a whole-desk rebuild (`racks_restoring`): the tenants a
+    /// switch or a New tears down belong to the session that is leaving.
     ///
     /// **In memory**, never on disk: the sidecar naming round-trips
     /// strictly, so a second file would be invisible to the shelf sweep and
-    /// would leak another project's knobs into this one's bays.
-    ///
-    /// **What is shelved is the FILE as it last stood, not what the plugin
-    /// was playing.** A sidecar is written by a save, a plugin's own window
-    /// closing, a session switch, New's stash and quit (and by a copy, move,
-    /// paste or swap for the tenant it brings in) - never by a knob, and a
-    /// built-in unit has no window to close. So an undo brings the displaced
-    /// plugin back at its last-written settings, or at factory if it never
-    /// had a file. Only the paste and the swap shelve: a copy or a move into
-    /// a bay that still holds a removed tenant's file, and the Paste Track
-    /// state copy, write over it unshelved. Cleared by `switch_project`
-    /// only - New and Reset Template keep it.
+    /// would leak another project's knobs into this one's bays. Cleared by
+    /// `switch_project`; bounded by `shelve_displaced`, oldest first.
     #[cfg(feature = "recorder")]
-    displaced_states: std::collections::HashMap<(usize, usize, String), Vec<u8>>,
+    displaced_states: DisplacedShelf,
     /// The ReaStream config the sender was last handed. See
     /// `reconcile_reastream`.
     #[cfg(feature = "recorder")]
@@ -5266,6 +5269,11 @@ impl DesktopApp {
             // project's plugin states in the new layout under a document
             // still in the old one, and "Don't Save" - or a crash - reopened
             // the moved tracks with each other's settings, or at factory.
+            //
+            // And the displaced-state shelf, which is keyed by seat exactly
+            // like the files and has to stay beside them - see
+            // `permute_displaced`.
+            permute_displaced(&mut self.displaced_states, &full);
 
             // **Only the rows that MOVED**, which is why this is not
             // `force_insert_reload`.
@@ -5337,6 +5345,12 @@ impl DesktopApp {
                 // `saved_insert_state` anyway.
                 if src.exists() {
                     let _ = std::fs::copy(&src, &dst);
+                    // The pasted plugin's file is the newest word on it in
+                    // this bay; an earlier tenant of the same bundle shelved
+                    // here must not outrank it. See `incoming_state`.
+                    if let Some(b) = self.app.insert(to_seat, to_bay).map(str::to_owned) {
+                        self.displaced_states.remove(&(to_seat, to_bay, b));
+                    }
                 }
                 // **And the bay is rebuilt even when its NAME did not
                 // change.** A paste that overwrites a live track can land
@@ -5380,6 +5394,37 @@ impl DesktopApp {
             .filter(|&i| mismatched(&self.app, &self.recorder.inserts_loaded, i));
         if let Some(i) = due {
             let want = self.app.insert(i / inserts, i % inserts).map(str::to_owned);
+            // **The outgoing tenant's settings, asked while it is still
+            // alive.** `load_insert` below drops whatever this bay holds, and
+            // nothing on that road asks it for its state, so a plugin pasted
+            // over, swapped out, deleted, replaced or undone away went with
+            // the knobs it was playing at, and the undo that wanted it back
+            // found its sidecar: the last save, or nothing. This is the one
+            // place every one of those roads passes before the instance is
+            // gone. Shelved under the ENGINE's record of the tenant, which
+            // names what is really seated even when `inserts_loaded` holds a
+            // reload marker or a load that failed; never when the incoming
+            // plugin is the same bundle, which reloads from the file written
+            // for it; and not during a whole-desk rebuild, whose tenants
+            // belong to the session that is leaving. See `displaced_states`.
+            if !self.racks_restoring {
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    let gone = e
+                        .insert(i / inserts, i % inserts)
+                        .and_then(|l| l.bundle.to_str())
+                        .filter(|g| want.as_deref() != Some(*g))
+                        .map(str::to_owned);
+                    if let Some(gone) = gone {
+                        if let Some(blob) = e.save_insert_state(i / inserts, i % inserts) {
+                            shelve_displaced(
+                                &mut self.displaced_states,
+                                (i / inserts, i % inserts, gone),
+                                blob,
+                            );
+                        }
+                    }
+                }
+            }
             self.recorder.inserts_loaded[i] = want.clone();
             // **THE DEFAULT PEDALBOARD.** The amp landing in a CHANNEL bay
             // whose pedal slots have never been touched seeds the classic
@@ -5393,22 +5438,19 @@ impl DesktopApp {
                 seed_amp_board(&mut self.app, i / inserts);
             }
             // **The bay's settings, worked out BEFORE the engine is
-            // borrowed**, because the shelf is a field of the same `self`.
-            //
-            // The sidecar first, and the shelf when the sidecar has been
-            // written over: a bay's file is one file tagged with its
-            // current tenant, so a paste or a swap destroys the outgoing
-            // plugin's only copy - and the bay is undoable, so Ctrl+Z can
-            // ask for it. See `displaced_states`.
+            // borrowed**: the shelf first, and the sidecar when the shelf has
+            // nothing. What this plugin was playing when it last left this
+            // bay is newer than its file by construction - see
+            // `incoming_state`.
             let bay_state = want
                 .as_deref()
                 .filter(|p| !is_instrument_sentinel(p))
                 .and_then(|p| {
-                    saved_insert_state(i / inserts, i % inserts, p).or_else(|| {
-                        self.displaced_states
-                            .get(&(i / inserts, i % inserts, p.to_owned()))
-                            .cloned()
-                    })
+                    incoming_state(
+                        &self.displaced_states,
+                        &(i / inserts, i % inserts, p.to_owned()),
+                        || saved_insert_state(i / inserts, i % inserts, p),
+                    )
                 });
             if let Some(e) = self.recorder.engine.as_mut() {
                 // **A built-in INSTRUMENT is not a bundle.** Its sentinel
@@ -5431,6 +5473,15 @@ impl DesktopApp {
                 match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
                     Ok(_) => {
                         self.recorder.engine_error = None;
+                        // **A shelved state is spent once it is seated.** The
+                        // plugin plays it now, and its next departure shelves
+                        // it afresh; left standing it would outrank the file
+                        // the next save writes for this very plugin. Kept on
+                        // a failed load, which seated nothing.
+                        if let Some(p) = engine_want {
+                            self.displaced_states
+                                .remove(&(i / inserts, i % inserts, p.to_owned()));
+                        }
                         // **What the bay now offers an automation lane**, read
                         // once, HERE.
                         //
@@ -12382,36 +12433,6 @@ impl DesktopApp {
         }
     }
 
-    #[cfg(feature = "recorder")]
-    /// **Shelve the settings a write is about to destroy.**
-    ///
-    /// A bay's sidecar is ONE file tagged with the bay's current tenant, so
-    /// pasting over a loaded bay - or swapping two - re-tags it and the
-    /// outgoing plugin's only copy is gone. The bay itself is undoable:
-    /// Ctrl+Z restores the bundle name and the reconcile then asks for
-    /// settings nothing has any more, so the plugin comes back at its
-    /// factory values with no error and the rack quietly sounds wrong.
-    ///
-    /// Called with the bundle that is ABOUT to own the file; a sidecar
-    /// already tagged with it is not being displaced by anything.
-    ///
-    /// **Bounded by clearing**, the same cap-and-drop the attack cache
-    /// uses: a sampler's blob is large, and the only thing that ever wants
-    /// an old entry is an undo across the gesture that made it.
-    fn shelve_displaced_state(&mut self, strip: usize, bay: usize, incoming: &str) {
-        let Some((owner, blob)) = sidecar_owner_and_state(strip, bay) else {
-            return;
-        };
-        if owner == incoming || blob.is_empty() {
-            return;
-        }
-        const CAP: usize = 32;
-        if self.displaced_states.len() >= CAP {
-            self.displaced_states.clear();
-        }
-        self.displaced_states.insert((strip, bay, owner), blob);
-    }
-
     /// **This file's attacks at this sensitivity.**
     fn attacks_of(
         &mut self,
@@ -13012,6 +13033,11 @@ impl DesktopApp {
             .and_then(|e| e.save_insert_state(from_strip, from_bay))
         {
             write_insert_state(to_strip, to_bay, &bundle, &state);
+            // **The file just written is this bundle's newest word here**,
+            // so whatever the shelf kept of an earlier one in this bay must
+            // not outrank it. See `incoming_state`.
+            self.displaced_states
+                .remove(&(to_strip, to_bay, bundle.clone()));
         }
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
@@ -13079,6 +13105,9 @@ impl DesktopApp {
             .and_then(|e| e.save_insert_state(from_strip, from_bay))
         {
             write_insert_state(to_strip, to_bay, &bundle, &state);
+            // Newer than anything shelved for it here - see `copy_insert`.
+            self.displaced_states
+                .remove(&(to_strip, to_bay, bundle.clone()));
         }
         // **ONE moment for the drag.** `set_insert` commits its own, so
         // filling the destination and clearing the source left two - and
@@ -13124,10 +13153,11 @@ impl DesktopApp {
         // Its state BEFORE either bay is re-pointed — `copy_insert`'s
         // ordering rule, for its reason: the reconcile reads the sidecar as
         // it constructs the instance.
-        // Whatever is in that bay's file now belongs to whatever was in
-        // the bay, and the line below is about to re-tag it. See
-        // `shelve_displaced_state`.
-        self.shelve_displaced_state(to_strip, to_bay, &bundle);
+        //
+        // The write buries the file of whatever is in that bay now, and
+        // nothing here has to save it first: the reconcile asks the plugin
+        // it tears down for the settings it is PLAYING, which is newer than
+        // that file, and shelves them. See `displaced_states`.
         if let Some(state) = self
             .recorder
             .engine
@@ -13135,6 +13165,9 @@ impl DesktopApp {
             .and_then(|e| e.save_insert_state(from_strip, from_bay))
         {
             write_insert_state(to_strip, to_bay, &bundle, &state);
+            // Newer than anything shelved for it here - see `copy_insert`.
+            self.displaced_states
+                .remove(&(to_strip, to_bay, bundle.clone()));
         }
         let bays = tangent_ui::recorder::INSERTS;
         if let Some(cell) = self.recorder.inserts_loaded.get_mut(to_strip * bays + to_bay) {
@@ -13188,17 +13221,19 @@ impl DesktopApp {
             ),
             None => (None, None),
         };
-        // **Both files are about to be cross-tagged**, so both are shelved
-        // first - a swap is the worse of the two cases, because undoing it
-        // would otherwise bring BOTH plugins back at their defaults. This
-        // function's own doc already states the rule it was breaking.
-        self.shelve_displaced_state(b_strip, b_bay, &a);
-        self.shelve_displaced_state(a_strip, a_bay, &b);
+        // **Both files are about to be cross-tagged**, which buries each
+        // bay's own copy - and undoing the swap asks for both. The
+        // reconcile shelves what each plugin is PLAYING as it tears the two
+        // instances down (see `displaced_states`); what this road owes the
+        // shelf is that the two files written here are the newest word on
+        // each incoming plugin, so nothing shelved earlier outranks them.
         if let Some(state) = a_state {
             write_insert_state(b_strip, b_bay, &a, &state);
+            self.displaced_states.remove(&(b_strip, b_bay, a.clone()));
         }
         if let Some(state) = b_state {
             write_insert_state(a_strip, a_bay, &b, &state);
+            self.displaced_states.remove(&(a_strip, a_bay, b.clone()));
         }
         // Which side had its window up, read BEFORE the bays are re-pointed
         // and the reconcile tears both instances down.
@@ -16073,16 +16108,100 @@ fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>>
 /// **A bay's sidecar and WHOSE it is**, without asking whether it is the
 /// one wanted.
 ///
-/// [`saved_insert_state`]'s inner half, split out for the one caller that
-/// needs the mismatch: a paste or a swap is about to write over this file,
-/// and the blob it is about to destroy belongs to a plugin the undo stack
-/// can still ask for. See `DesktopApp::shelve_displaced_state`.
+/// [`saved_insert_state`]'s inner half, split out so the owner a write left
+/// in the file can be read on its own: a paste, a swap, a copy or a move
+/// re-tags the file for its new tenant, and the old tenant's copy is gone -
+/// which is what `DesktopApp::displaced_states` is for.
 #[cfg(feature = "recorder")]
 fn sidecar_owner_and_state(strip: usize, bay: usize) -> Option<(String, Vec<u8>)> {
     let raw = std::fs::read(insert_state_path(strip, bay)).ok()?;
     let split = raw.iter().position(|b| *b == 0)?;
     let owner = std::str::from_utf8(&raw[..split]).ok()?.to_owned();
     Some((owner, raw[split + 1..].to_vec()))
+}
+
+/// **One plugin's settings on the displaced-state shelf**, and when they
+/// were put there. See `DesktopApp::displaced_states`.
+struct ShelvedState {
+    /// What the plugin's `save_insert_state` answered as it left the bay.
+    blob: Vec<u8>,
+    /// Later shelvings count higher; the lowest goes first when the shelf
+    /// is full.
+    stamp: u64,
+}
+
+/// The displaced-state shelf: `(seat, bay, bundle)` to what that plugin was
+/// playing when the reconcile took it out of that bay.
+type DisplacedShelf = std::collections::HashMap<(usize, usize, String), ShelvedState>;
+
+/// The most plugin states the shelf holds, and the most bytes of them.
+const SHELF_MAX_ENTRIES: usize = 256;
+const SHELF_MAX_BYTES: usize = 64 << 20;
+
+/// **Shelve one plugin's settings, and when the shelf is full drop the
+/// OLDEST, never all of it.**
+///
+/// Every unload shelves, so the shelf fills in ordinary work, and the answer
+/// to a full shelf used to be to clear it: thirty-two entries, and the
+/// thirty-third threw away exactly the settings the next Ctrl+Z was about to
+/// ask for. Undo walks back from the newest end, so the oldest entry is the
+/// one least likely to be asked for; the newest is kept whatever its size,
+/// because it is the one the very next undo wants. An empty blob restores
+/// nothing and is not kept.
+fn shelve_displaced(shelf: &mut DisplacedShelf, key: (usize, usize, String), blob: Vec<u8>) {
+    if blob.is_empty() {
+        return;
+    }
+    let stamp = shelf.values().map(|s| s.stamp + 1).max().unwrap_or(0);
+    shelf.insert(key, ShelvedState { blob, stamp });
+    loop {
+        let bytes: usize = shelf.values().map(|s| s.blob.len()).sum();
+        if shelf.len() <= 1 || (shelf.len() <= SHELF_MAX_ENTRIES && bytes <= SHELF_MAX_BYTES) {
+            break;
+        }
+        let Some(oldest) = shelf.iter().min_by_key(|(_, s)| s.stamp).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        shelf.remove(&oldest);
+    }
+}
+
+/// **The settings a bay's incoming plugin is seated with**: what the shelf
+/// kept of that bundle at that seat FIRST, its sidecar when the shelf has
+/// nothing, and nothing when neither belongs to it.
+///
+/// The shelf outranks the file because it is newer by construction: an
+/// entry is what the plugin was playing when it left the bay, every road
+/// that writes the bay's sidecar for that bundle afterwards forgets the
+/// entry, and a reorder moves the shelf with its seats as it moves the
+/// files (`permute_displaced`). The file first would be the last SAVE: a
+/// unit dialled in since, deleted and brought back by Ctrl+Z, came back at
+/// the setting it had before the dial.
+fn incoming_state(
+    shelf: &DisplacedShelf,
+    key: &(usize, usize, String),
+    sidecar: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    shelf.get(key).map(|s| s.blob.clone()).or_else(sidecar)
+}
+
+/// **The shelf follows its seats through a reorder**, exactly as the
+/// sidecars do: `full[new] = old`, the order lifted onto the whole seat space
+/// (`recorder::seat_order`). Left behind, an entry would sit at a seat its
+/// row has moved away from and outrank the file of the same plugin carried
+/// in there.
+fn permute_displaced(shelf: &mut DisplacedShelf, full: &[usize]) {
+    let mut to: Vec<usize> = (0..full.len()).collect();
+    for (new, &old) in full.iter().enumerate() {
+        if let Some(slot) = to.get_mut(old) {
+            *slot = new;
+        }
+    }
+    let moved: Vec<_> = shelf
+        .drain()
+        .map(|((seat, bay, bundle), s)| ((to.get(seat).copied().unwrap_or(seat), bay, bundle), s))
+        .collect();
+    shelf.extend(moved);
 }
 
 /// **What a bay sounds like RIGHT NOW** — the desk that is playing first, its
@@ -24734,17 +24853,20 @@ mod tests {
         );
     }
 
-    /// **A plugin's settings survive the undo of a paste or a swap.**
+    /// **A plugin's settings survive the undo of a paste, a swap or a
+    /// delete - the settings it was PLAYING, not its last save.**
     ///
     /// A bay's sidecar is ONE file tagged with its tenant, and the bay is
     /// undoable - so pasting over a loaded bay re-tags the file, Ctrl+Z
     /// restores the bundle NAME, and the reconcile then asks for settings
-    /// nothing has any more. The plugin comes back at its factory values
-    /// with no error at all, and a swap does it to BOTH plugins.
+    /// the file no longer has. And a file is only as new as the last save:
+    /// a unit dialled in since came back at the setting it had before the
+    /// dial, even where nothing had written over its file.
     ///
-    /// Driven through the real file road: write two sidecars, shelve one,
-    /// re-tag the file the way the paste does, and ask for the displaced
-    /// plugin's blob back.
+    /// Driven through the real file road and the real shelf: the amp's file
+    /// holds its last SAVE, the reconcile shelves what the amp is PLAYING as
+    /// the paste tears it down, the paste re-tags the file for the delay,
+    /// and the lookup the reconcile makes is asked for both plugins.
     #[test]
     fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
         // `insert_state_path` is per-install, and `(CHANNELS + 3, 2)` is
@@ -24764,26 +24886,16 @@ mod tests {
             }
         };
 
-        // A plugin with settings somebody dialled in.
-        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as tweaked");
-        assert_eq!(
-            saved_insert_state(strip, bay, "/x/Amp.vst3").as_deref(),
-            Some(&b"the amp as tweaked"[..]),
-            "the fixture did not write a sidecar"
-        );
-        // And the reader that does not filter, which is what the shelf uses.
+        // A plugin saved at one setting and dialled to another since.
+        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as saved");
         let (owner, blob) = sidecar_owner_and_state(strip, bay).expect("a sidecar");
-        assert_eq!(owner, "/x/Amp.vst3");
-        assert_eq!(blob, b"the amp as tweaked");
-
-        // The paste: shelve, then re-tag the file for the incoming plugin.
-        let mut shelf: std::collections::HashMap<(usize, usize, String), Vec<u8>> =
-            std::collections::HashMap::new();
-        if let Some((owner, blob)) = sidecar_owner_and_state(strip, bay) {
-            if owner != "/x/Delay.vst3" {
-                shelf.insert((strip, bay, owner), blob);
-            }
-        }
+        assert_eq!(owner, "/x/Amp.vst3", "the fixture did not write a sidecar");
+        assert_eq!(blob, b"the amp as saved");
+        let mut shelf = DisplacedShelf::new();
+        let key = |b: &str| (strip, bay, b.to_owned());
+        // The paste: the reconcile shelves what the amp is PLAYING as it
+        // tears it down, and the delay's state is written under the bay.
+        shelve_displaced(&mut shelf, key("/x/Amp.vst3"), b"the amp as dialled".to_vec());
         write_insert_state(strip, bay, "/x/Delay.vst3", b"the delay");
 
         // **The file no longer knows the amp**, which is the whole defect.
@@ -24792,55 +24904,180 @@ mod tests {
             None,
             "the paste did not actually bury the old tenant"
         );
-        // And the shelf does, which is the fix. This is exactly the lookup
-        // the reconcile makes.
+        // This is exactly the lookup the reconcile makes.
+        let seat = |b: &str| incoming_state(&shelf, &key(b), || saved_insert_state(strip, bay, b));
         assert_eq!(
-            shelf
-                .get(&(strip, bay, "/x/Amp.vst3".to_owned()))
-                .map(Vec::as_slice),
-            Some(&b"the amp as tweaked"[..]),
-            "the displaced settings were not shelved"
+            seat("/x/Amp.vst3").as_deref(),
+            Some(&b"the amp as dialled"[..]),
+            "Ctrl+Z of the paste does not bring the amp back as it was playing"
         );
-        // The incoming plugin still reads its own from the file, so the
-        // shelf is a fallback and never a replacement.
+        // The incoming plugin reads its own file: nothing is shelved for it.
+        assert_eq!(seat("/x/Delay.vst3").as_deref(), Some(&b"the delay"[..]));
+        // And a delete leaves the file standing - tagged with the amp, at its
+        // last save - which must not outrank what the amp was playing.
+        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as saved");
         assert_eq!(
-            saved_insert_state(strip, bay, "/x/Delay.vst3").as_deref(),
-            Some(&b"the delay"[..])
+            seat("/x/Amp.vst3").as_deref(),
+            Some(&b"the amp as dialled"[..]),
+            "the last save outranked what the plugin was playing when it left"
         );
         restore();
     }
 
-    /// **And the two roads that bury a sidecar both shelve first.**
+    /// **A full shelf drops its OLDEST entry, never all of them.**
     ///
-    /// A source scan, because `DesktopApp` cannot be built in a test. What
-    /// it stops is a third road - or one of these two losing the line -
-    /// putting the loss back silently, which is how it shipped.
+    /// It used to clear itself at thirty-two, so the thirty-third shelving
+    /// threw away the settings the next Ctrl+Z was about to ask for. Every
+    /// unload shelves now, so a full shelf is ordinary work: the oldest goes,
+    /// a re-shelved entry counts as new, and the newest is kept however big.
     #[test]
-    fn every_write_that_buries_a_sidecar_shelves_it_first() {
-        let src = include_str!("desktop.rs");
-        let scan = &src[..src.find("mod sidecar_walk_probe").expect("this module")];
-        // The paste, and BOTH bays of the swap.
-        assert_eq!(
-            scan.matches("self.shelve_displaced_state(").count(),
-            3,
-            "a road that writes over a loaded bay's sidecar no longer shelves it"
-        );
-        // And the reconcile still falls back to the shelf.
-        assert!(
-            scan.contains("self.displaced_states
-                            .get(&(i / inserts, i % inserts, p.to_owned()))"),
-            "the reconcile no longer reads the shelf"
-        );
-        // The shelf is cleared with the session, or it leaks another
-        // project's knobs into this one's bays.
-        let switch = {
-            let at = scan.find("fn switch_project(&mut self").expect("switch_project");
-            &scan[at..at + 3000]
+    fn a_full_shelf_drops_its_oldest_entry_and_keeps_the_rest() {
+        let mut shelf = DisplacedShelf::new();
+        let key = |n: usize| (n, 0, format!("/x/P{n}.vst3"));
+        for n in 0..SHELF_MAX_ENTRIES + 5 {
+            shelve_displaced(&mut shelf, key(n), vec![1; 16]);
+        }
+        assert_eq!(shelf.len(), SHELF_MAX_ENTRIES, "the shelf is not bounded by count");
+        for n in 0..5 {
+            assert!(!shelf.contains_key(&key(n)), "entry {n}, among the oldest, survived");
+        }
+        for n in 5..SHELF_MAX_ENTRIES + 5 {
+            assert!(shelf.contains_key(&key(n)), "entry {n} went while older ones stood");
+        }
+        // Shelved again, an entry is the newest one.
+        shelve_displaced(&mut shelf, key(5), vec![2; 16]);
+        shelve_displaced(&mut shelf, key(9_999), vec![3; 16]);
+        assert!(shelf.contains_key(&key(5)), "a re-shelved entry was dropped as if it were old");
+        assert!(!shelf.contains_key(&key(6)), "the oldest entry outlived a newer one");
+        // The byte bound: one blob over the whole budget pushes the rest out
+        // and is itself kept, because the next undo is the one that wants it.
+        shelve_displaced(&mut shelf, key(10_000), vec![0; SHELF_MAX_BYTES + 1]);
+        assert_eq!(shelf.len(), 1, "the shelf is not bounded by size");
+        assert!(shelf.contains_key(&key(10_000)), "the newest entry was dropped");
+        // An empty blob restores nothing and takes no room.
+        shelve_displaced(&mut shelf, key(10_001), Vec::new());
+        assert!(!shelf.contains_key(&key(10_001)), "an empty state was shelved");
+    }
+
+    /// **A shelved state follows its seat through a reorder** - the channel
+    /// row, its folder-extra rack and its pedals - exactly as its sidecar
+    /// does, and a seat past the channels holds still.
+    #[test]
+    fn a_shelved_state_follows_its_seat_through_a_reorder() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, seat_order, CHANNELS};
+        let master = CHANNELS + 3;
+        let mut shelf = DisplacedShelf::new();
+        for (seat, name) in [
+            (2, "amp"),
+            (folder_extra_seat(2), "extra"),
+            (amp_pedal_seat(2, 1), "pedal"),
+            (master, "master"),
+        ] {
+            shelve_displaced(&mut shelf, (seat, 0, name.to_owned()), name.as_bytes().to_vec());
+        }
+        // Track 2 dragged to row 5: rows 3, 4 and 5 come up one.
+        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        let moved = order.remove(2);
+        order.insert(5, moved);
+        permute_displaced(&mut shelf, &seat_order(&order));
+        for (seat, name) in [
+            (5, "amp"),
+            (folder_extra_seat(5), "extra"),
+            (amp_pedal_seat(5, 1), "pedal"),
+            (master, "master"),
+        ] {
+            assert_eq!(
+                shelf.get(&(seat, 0, name.to_owned())).map(|s| s.blob.as_slice()),
+                Some(name.as_bytes()),
+                "the {name}'s shelved state did not follow its row to seat {seat}"
+            );
+        }
+        assert_eq!(shelf.len(), 4, "the move lost or doubled an entry");
+    }
+
+    /// **The shelf stays newer than every sidecar it outranks.**
+    ///
+    /// A bay reads the shelf FIRST (`incoming_state`), which is right only
+    /// while an entry is newer than the bay's file. Three things keep it so,
+    /// and losing any one brings a plugin back at stale settings: the
+    /// reconcile shelves the outgoing tenant's LIVE state, never its file;
+    /// every road that writes a bay's sidecar for the tenant it brings in -
+    /// copy, move, paste, both bays of a swap, the Paste Track state copy -
+    /// forgets that tenant's entry there; and a reorder moves the shelf with
+    /// its seats. A source scan, because `DesktopApp` cannot be built in a
+    /// test; `a_displaced_plugin_state_survives_the_write_that_buried_it`
+    /// drives the lookup itself.
+    #[test]
+    fn every_sidecar_write_leaves_the_shelf_newer_than_the_file() {
+        let whole = include_str!("desktop.rs");
+        let scan = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |name: &str| {
+            let at = scan.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let rest = &scan[at..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
         };
+        // Nothing shelves a FILE: the reconcile shelves what is playing.
         assert!(
-            switch.contains("self.displaced_states.clear();"),
-            "the shelf outlives the session it was filled in"
+            !scan.contains("sidecar_owner_and_state(strip, bay) else"),
+            "a road shelves the stale file instead of the plugin's live settings"
         );
+        let at = scan
+            .find("// **The bay this frame loads is the bay the LAST frame announced.**")
+            .expect("the reconcile");
+        let reconcile = &scan[at..at + scan[at..].find("e.load_insert(i / inserts").expect("its load")];
+        assert!(
+            reconcile.contains("shelve_displaced(") && reconcile.contains("incoming_state("),
+            "the reconcile no longer shelves the outgoing tenant, or no longer reads the shelf first"
+        );
+        // Every write for an incoming tenant forgets that tenant's entry.
+        for road in [
+            "fn copy_insert(",
+            "fn move_insert(",
+            "fn paste_insert(",
+            "fn swap_inserts(",
+        ] {
+            let b = body(road);
+            assert_eq!(
+                b.matches("write_insert_state(").count(),
+                b.matches("self.displaced_states").count(),
+                "`{road}` writes a sidecar and leaves an older shelved state outranking it"
+            );
+        }
+        let copy = &scan[scan.find("let _ = std::fs::copy(&src, &dst);").expect("the Paste Track copy")..];
+        let copy = &copy[..copy.find("// **And the bay is rebuilt even when").expect("the copy's end")];
+        assert!(
+            copy.contains("self.displaced_states.remove("),
+            "the Paste Track state copy leaves an older shelved state outranking the pasted file"
+        );
+        // And the shelf moves with its seats.
+        assert!(
+            body("fn after_frame(&mut self").contains("permute_displaced(&mut self.displaced_states, &full);"),
+            "a reorder leaves the shelf at the seats its rows moved away from"
+        );
+    }
+
+    /// **The reconcile asks the tenant it tears down for its settings
+    /// first** - the one place paste, swap, delete, replace, undo and redo
+    /// all pass while the instance is still alive.
+    ///
+    /// The shelf used to be filled from the bay's FILE, by the paste and the
+    /// swap alone. A sidecar is written at a save and when a plugin's own
+    /// window closes, never by a knob, so an undo brought a dialled-in unit
+    /// back at its last-saved settings, or at factory if it had none. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_reconcile_asks_the_outgoing_tenant_for_its_settings_before_replacing_it() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src
+            .find("// **The bay this frame loads is the bay the LAST frame announced.**")
+            .expect("the reconcile");
+        let load = at + src[at..]
+            .find("e.load_insert(i / inserts, i % inserts, path, state.as_deref())")
+            .expect("the reconcile's load");
+        assert!(src[at..load].contains(".save_insert_state(i / inserts, i % inserts)"),
+            "the reconcile replaces a bay's tenant without asking it for its settings: undoing a \
+             paste, a swap or a delete brings the plugin back at its last SAVED settings, or factory");
     }
 
     /// **The ticks on the waveform and the warp the Apply writes come from
