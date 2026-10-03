@@ -4066,10 +4066,8 @@ impl DesktopApp {
                         .to_owned(),
                 };
                 log::warn!("{why}");
-                self.recorder.engine = None;
+                self.retire_engine();
                 self.recorder.engine_error = Some(why);
-                self.recorder.inserts_loaded =
-                    vec![None; tangent_ui::recorder::INSERT_SPACE];
                 // **No timed retries here — the reprobe thread owns recovery.**
                 // The yank test proved why: a watchdog-declared death is
                 // usually GONE HARDWARE, and `Engine::start` against a dead
@@ -4200,10 +4198,9 @@ impl DesktopApp {
             // The old stream's `Drop` releases the device before the new one
             // asks for it, which is the ordering CoreAudio needs. The
             // five-second instrument load still happens over the following
-            // frames, announced as usual.
-            self.recorder.engine = None;
-            self.recorder.inserts_loaded =
-                vec![None; tangent_ui::recorder::INSERT_SPACE];
+            // frames, announced as usual - and with the settings every
+            // plugin was playing at, because the retire writes them down.
+            self.retire_engine();
             self.open_audio_path(ctx);
         }
 
@@ -4978,15 +4975,13 @@ impl DesktopApp {
                 // Dropping it stops the output stream and unloads the plugin,
                 // which is what "the band is closed" should mean: no device
                 // held, no third-party code resident.
-                self.recorder.engine = None;
+                self.retire_engine();
                 // The reprobe goes with it. It only exists because the engine
                 // died while the band was OPEN; left alive past this edge it
                 // kept polling for the lost device — and the replug then
                 // reopened the engine and the microphone behind a closed band.
                 // Recovery restarts from the open edge like everything else.
                 self.recorder.reprobe = None;
-                self.recorder.inserts_loaded =
-                    vec![None; tangent_ui::recorder::INSERT_SPACE];
             }
         } else if open {
             self.reconcile_audio(false);
@@ -13300,15 +13295,49 @@ impl DesktopApp {
                 continue;
             };
             let (strip, bay) = (i / bays, i % bays);
+            // **And only where the ENGINE agrees about the tenant.** A load
+            // that failed writes the wanted name into `inserts_loaded` and
+            // leaves the outgoing plugin seated, so asking that seat for its
+            // state and filing it under the ledger's name hands one plugin's
+            // blob to another the next time the bay loads - the check
+            // `desk_insert_state` makes, for the reason it gives.
             if let Some(state) = self
                 .recorder
                 .engine
                 .as_ref()
+                .filter(|e| {
+                    e.insert(strip, bay)
+                        .is_some_and(|l| l.bundle == std::path::Path::new(&bundle))
+                })
                 .and_then(|e| e.save_insert_state(strip, bay))
             {
                 write_insert_state(strip, bay, &bundle, &state);
             }
         }
+    }
+
+    /// **Retire the engine: every plugin's settings written down, THEN the
+    /// engine dropped**, and the ledger of what it held wiped with it.
+    ///
+    /// Dropping an engine unloads every plugin in it, and nothing on that
+    /// road asked one for its settings: a knob writes no sidecar, and a
+    /// built-in unit has no window whose closing would. The rebuild then
+    /// seats each bay from its sidecar, so a buffer-size or sample-rate
+    /// change, a new output, the output dying or the band closing brought
+    /// every plugin dialled in since the last save back at that save's
+    /// settings, or at factory if it had never been saved. The four
+    /// teardowns come through here, so none of them can drop the plugins
+    /// before they are asked.
+    ///
+    /// Written by what is LOADED, not by what the desk asks for: a bay the
+    /// reconcile has not reached yet still holds its outgoing tenant. The
+    /// ledger is wiped here too, because "`inserts_loaded` is all `None`
+    /// whenever the engine goes" is what `force_insert_reload` and the
+    /// reconcile both rely on.
+    fn retire_engine(&mut self) {
+        self.save_plugin_states_as_loaded_for(None);
+        self.recorder.engine = None;
+        self.recorder.inserts_loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
     }
 
     /// Start the monitor output, once, when the band opens.
@@ -13571,8 +13600,7 @@ impl DesktopApp {
         // The same teardown `path_changed` does, for the same reason: the old
         // stream's Drop releases the device before the new one asks for it,
         // which is the ordering CoreAudio needs.
-        self.recorder.engine = None;
-        self.recorder.inserts_loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        self.retire_engine();
         // `rate_open` is what the SETTING last asked for and the setting has
         // not changed, so it is left exactly as it is — writing the device's
         // new rate into it would make the next `path_changed` fire a second
@@ -16064,8 +16092,9 @@ fn sidecar_owner_and_state(strip: usize, bay: usize) -> Option<(String, Vec<u8>)
 /// unprocessed".** The full-speed export builds a second engine and furnishes
 /// it by hand, and it used to fill every rack from [`saved_insert_state`]
 /// alone. That file is not the desk: it is written when a project is SAVED,
-/// when a plugin's own OS window is closed, when a session is replaced, and at
-/// quit — and nowhere else. No knob writes it. The suite's own units have no
+/// when a plugin's own OS window is closed, when a session is replaced, when a
+/// reorder moves its row, when the audio engine is torn down (`retire_engine`),
+/// and at quit — and nowhere else. No knob writes it. The suite's own units have no
 /// OS window whose closing writes it either, so a unit dialled in on an audio
 /// track and exported before the next save was rendered by a mirror wearing
 /// whatever that bay was wearing at the last save: its shipped defaults if it
@@ -27059,6 +27088,47 @@ mod tests {").expect("the tests module")];
             "the watch is armed before the engine is seated, so it can only \
              ever read `None` for the device it is supposed to be watching"
         );
+    }
+
+    /// **Every engine teardown writes the plugins' settings down before it
+    /// drops them.**
+    ///
+    /// Dropping an engine unloads every plugin in it, and the rebuild seats
+    /// each bay from its sidecar - which a knob never writes. So a buffer
+    /// size, a sample rate, a new output, the output dying or the band
+    /// closing brought every unit dialled in since the last save back at
+    /// that save's settings, or at factory. A source scan, because none of
+    /// the four teardowns can be driven without a `DesktopApp` and a device:
+    /// one function drops the engine, it saves first, and all four call it.
+    #[test]
+    fn every_engine_teardown_writes_the_plugins_down_first() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let rest = &src[at..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        assert_eq!(
+            src.matches("self.recorder.engine = None;").count(),
+            1,
+            "an engine is dropped somewhere other than `retire_engine`, so its plugins go \
+             without their settings written down"
+        );
+        let retire = body("fn retire_engine(&mut self)");
+        let save = retire
+            .find("self.save_plugin_states_as_loaded_for(None);")
+            .expect("`retire_engine` no longer writes the plugins' settings down");
+        let gone = retire
+            .find("self.recorder.engine = None;")
+            .expect("`retire_engine` no longer drops the engine");
+        assert!(save < gone, "`retire_engine` drops the plugins before it asks them for their settings");
+        // The four teardowns: the output dying and the path changing, the
+        // device moving its own rate, and the band closing.
+        let calls = |name: &str| body(name).matches("self.retire_engine();").count();
+        assert_eq!(calls("fn fill_recorder_state(&mut self"), 2, "a fill_recorder_state teardown skips the save");
+        assert_eq!(calls("fn follow_device_rate("), 1, "following the device's rate skips the save");
+        assert_eq!(calls("fn after_frame(&mut self"), 1, "closing the band skips the save");
     }
 
     /// **The MP3 pass writes a real MPEG stream.** A sine goes in, a file
