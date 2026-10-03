@@ -2433,7 +2433,8 @@ struct Moment {
     /// **The lane permutation that carried the desk INTO this moment** from
     /// the one before it - `order[new] = old`, channel space - when the
     /// gesture that made it reordered tracks, composed when it reordered
-    /// more than once.
+    /// more than once. A drum pad swap keeps its SEAT order here, which
+    /// `compose_orders` and the host's `seat_order` both read as such.
     ///
     /// The words cannot say it. They name each bay's BUNDLE, and the plugin
     /// playing in it, settings and all, is the host's: undoing a reorder put
@@ -21303,6 +21304,48 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_dirty = true;
     }
 
+    /// **Two pads of the shown kit trade places**: the drop of a carried
+    /// pad on another. `from` and `to` are KEYS.
+    fn swap_pads(&mut self, from: usize, to: usize) {
+        // The whole slot rides: path AND knobs, and the
+        // two pads trade places — nothing is lost either way.
+        self.drumpad_mut().pads.swap(from, to);
+        self.drumpad_status.swap(from, to);
+        self.drumpad_peaks.swap(from, to);
+        self.drumpad_sel = to;
+        // **And the pad's FX bays, which never rode
+        // before.** The chips live in seat-indexed insert
+        // space; the host follows with the saved states,
+        // through the same door a channel reorder uses.
+        use crate::recorder::{pad_insert_index, INSERTS};
+        let (a, b) = (pad_insert_index(from), pad_insert_index(to));
+        let full = recorder::INSERT_SPACE;
+        while self.settings.strip_inserts.len() < full {
+            self.settings.strip_inserts.push(String::new());
+        }
+        for bay in 0..INSERTS {
+            self.settings
+                .strip_inserts
+                .swap(a * INSERTS + bay, b * INSERTS + bay);
+        }
+        let mut order: Vec<usize> = (0..=a.max(b)).collect();
+        order.swap(a, b);
+        // **Composed, and kept in the moment the swap makes**, as a reorder
+        // keeps its own: a plain assignment replaced an order the host had
+        // not taken yet, and with nothing in the moment an undo or redo of
+        // the swap put both pads' bay NAMES back and the reconcile rebuilt
+        // each pad's FX from the other pad's file. A seat order, which
+        // `compose_orders` lifts a channel order onto.
+        self.send_desk_perm(&order);
+        self.perm_since_moment = Some(match self.perm_since_moment.take() {
+            Some(first) => compose_orders(&first, &order),
+            None => order,
+        });
+        self.save_settings();
+        self.drumpad_edited();
+        self.drumpad_dirty = true;
+    }
+
     /// **The kit CHANGED**: write it down and put the moment on the undo
     /// timeline.
     ///
@@ -21802,33 +21845,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .and_then(|slot| self.drumpad_key_of(slot))
                         .filter(|to| *to != from)
                     {
-                        // The whole slot rides: path AND knobs, and the
-                        // two pads trade places — nothing is lost either way.
-                        self.drumpad_mut().pads.swap(from, to);
-                        self.drumpad_status.swap(from, to);
-                        self.drumpad_peaks.swap(from, to);
-                        self.drumpad_sel = to;
-                        // **And the pad's FX bays, which never rode
-                        // before.** The chips live in seat-indexed insert
-                        // space; the host follows with the saved states,
-                        // through the same door a channel reorder uses.
-                        use crate::recorder::{pad_insert_index, INSERTS};
-                        let (a, b) = (pad_insert_index(from), pad_insert_index(to));
-                        let full = recorder::INSERT_SPACE;
-                        while self.settings.strip_inserts.len() < full {
-                            self.settings.strip_inserts.push(String::new());
-                        }
-                        for bay in 0..INSERTS {
-                            self.settings
-                                .strip_inserts
-                                .swap(a * INSERTS + bay, b * INSERTS + bay);
-                        }
-                        let mut order: Vec<usize> = (0..=a.max(b)).collect();
-                        order.swap(a, b);
-                        self.desk_state_perm = Some(order);
-                        self.save_settings();
-                        self.drumpad_edited();
-                        self.drumpad_dirty = true;
+                        self.swap_pads(from, to);
                     }
                 }
                 self.pad_carry = None;
@@ -49467,6 +49484,50 @@ mod tests {
         }
         app.redo();
         assert_eq!(app.take_desk_state_perm(), Some(forward), "redo of the insert told the host nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Undo and redo of a drum pad swap hand the host the swap**, as a
+    /// reorder's do. The swap gave the host its seat order and kept nothing
+    /// in its moment, so undoing it put both pads' bay names back and the
+    /// reconcile rebuilt each pad's FX from the other pad's state file: at
+    /// factory, or with the other pad's settings where both held the same
+    /// plugin.
+    #[test]
+    fn undo_and_redo_of_a_pad_swap_hand_the_host_the_swap() {
+        use crate::recorder::pad_insert_index;
+        let root = project_scratch("padswapundo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+            path: "media/kick.wav".to_owned(),
+            ..Default::default()
+        };
+        app.set_insert(pad_insert_index(36), 0, Some("/x/A.vst3"));
+        app.commit_view_change();
+        let _ = app.take_desk_state_perm();
+
+        app.swap_pads(36, 38);
+        let forward = app.take_desk_state_perm().expect("the swap told the host nothing");
+        assert_eq!(
+            app.insert(pad_insert_index(38), 0),
+            Some("/x/A.vst3"),
+            "fixture: the FX did not ride with the pad"
+        );
+        app.undo();
+        assert_eq!(
+            app.insert(pad_insert_index(36), 0),
+            Some("/x/A.vst3"),
+            "fixture: undo did not put the bay back"
+        );
+        let back = app.take_desk_state_perm().expect(
+            "undo put the bay NAMES back and told the host nothing, so each pad's FX \
+             reloads from the other pad's state file");
+        for (new, &old) in forward.iter().enumerate() {
+            assert_eq!(back[old], new, "undo's order is not the swap's inverse");
+        }
+        app.redo();
+        assert_eq!(app.take_desk_state_perm(), Some(forward), "redo of the swap told the host nothing");
         let _ = std::fs::remove_dir_all(&root);
     }
 
