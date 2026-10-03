@@ -645,6 +645,10 @@ pub struct TangentApp {
     /// **A node drag's anchor** — see `AutoDragFrom`. Taken on the drag's
     /// first frame and dropped at the release.
     arr_auto_drag_from: Option<AutoDragFrom>,
+    /// **This hold of Delete has already deleted something** - nodes, a row
+    /// or clips - so nothing else in it may remove the selected TRACK.
+    /// Raised by the delete, lowered by the first frame that sees the key up.
+    arr_delete_held: bool,
     /// The tempo point under the pointer, if any. Drawn a size larger.
     arr_tempo_hot: Option<usize>,
     /// The tempo point being dragged, if any.
@@ -4214,6 +4218,7 @@ impl TangentApp {
             auto_clipboard_from: None,
             arr_auto_focus: None,
             arr_auto_drag_from: None,
+            arr_delete_held: false,
             arr_tempo_hot: None,
             arr_tempo_drag: None,
             arr_tempo_drag_from: None,
@@ -26302,6 +26307,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.arr_fit_view();
             }
         }
+        let is_delete = |k: &egui::Key| matches!(k, egui::Key::Delete | egui::Key::Backspace);
+        if ctx.input(|i| {
+            (!i.key_down(egui::Key::Delete) && !i.key_down(egui::Key::Backspace))
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { key, pressed: false, .. } if is_delete(key)))
+        }) {
+            self.arr_delete_held = false;
+        }
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
@@ -26316,14 +26330,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // row. Choosing nodes clears the clip selection, so this used
             // to read chosen nodes as "nothing chosen" and hand Delete to
             // the TRACK: the nodes stayed and the whole track went.
+            //
+            // **And the track answers a fresh press only.** `key_pressed`
+            // counts the OS's repeats of a held key, and a repeat after the
+            // nodes, the row or the clips found nothing chosen and removed
+            // the track, unprompted: never in the hold that deleted them,
+            // and never on a repeat. Their own repeats find nothing to take.
+            let fresh = ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { key, pressed: true, repeat: false, .. } if is_delete(key))
+                })
+            });
             if !self.arr_auto_nodes.is_empty() || self.arr_auto_sel.is_some() {
                 self.arr_delete_selected();
+                self.arr_delete_held = true;
             } else if self.arr_selected.is_none() && self.arr_multi.is_empty() {
-                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                if let Some(n) = self
+                    .selected_channel
+                    .filter(|n| fresh && !self.arr_delete_held && self.channel_used(*n))
+                {
                     self.remove_selected_channels(n);
                 }
             } else {
                 self.arr_delete_selected();
+                self.arr_delete_held = true;
             }
         }
         // **Copy and paste, the system's own chord** — which the winit
@@ -57209,6 +57239,42 @@ mod tests {
         app.arr_auto_nodes = vec![(0, 0, 0), (0, 0, 1)];
         key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5)], "the base node was deleted");
+    }
+
+    /// **A held Delete takes the chosen nodes and stops there.** The OS
+    /// repeats a held key and egui counts every repeat as a press; the
+    /// repeat found nothing chosen and removed the selected TRACK - the last
+    /// one touched, which a press on a node never changes, so it could be a
+    /// track scrolled out of sight. Let go and tap again with nothing chosen,
+    /// and the track answers, by the rule.
+    #[test]
+    fn a_held_delete_after_nodes_leaves_the_track() {
+        let (ctx, mut app) = auto_bench("autodelheld");
+        app.selected_channel = Some(0);
+        assert!(app.channel_used(0));
+        let a = auto_at(&app, 2.0, 0.8);
+        press(&ctx, &mut app, a);
+        release(&ctx, &mut app, a);
+        key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(auto_nodes(&app).len(), 3, "the node did not go");
+        let delete = |pressed: bool| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed,
+                repeat: pressed,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        // `key_with` never releases the key, so egui marks this one a REPEAT
+        // itself (it recomputes `repeat` from its own keys-down set).
+        let _ = ctx.run(delete(true), |ctx| app.frame(ctx));
+        assert!(app.channel_used(0), "a held Delete removed the TRACK after its nodes");
+        let _ = ctx.run(delete(false), |ctx| app.frame(ctx));
+        key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(!app.channel_used(0), "a fresh Delete with nothing chosen no longer takes the selected track");
     }
 
     /// **A node DROPPED on its neighbour's time makes a step**; one CARRIED
