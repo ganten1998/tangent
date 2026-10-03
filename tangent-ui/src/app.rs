@@ -1263,7 +1263,8 @@ pub struct TangentApp {
     arr_gesture_dirty: bool,
     /// The arrangement's grid and window as they stood at the last moment,
     /// so a frame that did not move them costs one compare. See
-    /// `commit_view_change`.
+    /// `commit_view_change` - and `apply_quantize_window`, which sets it
+    /// ahead of the host's moment that will record them.
     view_committed: Option<crate::arrangement::View>,
     /// **How many batches are holding their moment back.** See
     /// [`TangentApp::begin_one_moment`]: a gesture that reaches several
@@ -17526,6 +17527,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         self.project_request = Some(crate::ports::ProjectRequest::QuantizeClips(ask));
+        // **The knobs ride in the host's moment.** The Apply has just written
+        // them, and they are in the session's `View`, so `commit_view_change`
+        // would commit them alone at the end of this frame, with the old
+        // warp, and the host's warp would land frames later as a second
+        // moment: one press, two Ctrl+Z. Marked as committed here instead,
+        // the host's one `commit_undo_moment` after the quantize takes knobs
+        // and warp together, however many frames its cover waits. Only where
+        // a host takes the request - the gate `request_recorder` uses: a
+        // plugin never drains it, and there the knobs are the whole press
+        // and keep their own moment.
+        if self.caps.capture_devices {
+            self.view_committed = Self::desk_view(&self.settings).view.map(|v| v.to_view());
+        }
     }
 
     /// Ask the host to normalise whatever audio is selected.
@@ -37187,10 +37201,10 @@ impl TangentApp {
     /// is invisible to it, so a `View` change made during one commits that
     /// drag's half-way state as a moment of its own.
     ///
-    /// **Nor can it see a host request raised in the same frame**: an
-    /// audio Apply in the quantize window that moves a knob has the knobs
-    /// committed here at the end of its frame, and the host's warp commits
-    /// a second moment when it lands, frames later. One press, two moments.
+    /// **Nor can it see a host request raised in the same frame**, so the
+    /// one that carries `View` fields says so itself: an audio Apply in the
+    /// quantize window marks its knobs committed (`apply_quantize_window`),
+    /// and the host's warp moment takes them when it lands, frames later.
     fn commit_view_change(&mut self) {
         let now = Self::desk_view(&self.settings).view;
         if self.arr_drag.is_some() || self.arr_gesture_dirty {
@@ -43299,6 +43313,99 @@ mod tests {
             assert_eq!(c.warp_rate, 44_100, "the redo did not bring the map's rate back");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An audio Apply that moves a knob is ONE moment, in the order the
+    /// host runs it.**
+    ///
+    /// The seven knobs are in the session's `View`, so in the undo
+    /// fingerprint, and the Apply writes them at once; the warp is the
+    /// host's and lands frames later. So the end of the Apply's frame
+    /// (`commit_view_change`) committed the knobs alone, with the old warp,
+    /// and the host's commit then made the warp a second moment: normalize,
+    /// quantize at 80%, and the second Ctrl+Z only put the remembered knobs
+    /// back while the third took the normalize. The MIDI Apply was always
+    /// one moment.
+    ///
+    /// Driven in the host's frame order: the request is taken at the end of
+    /// the Apply's frame, the busy cover paints another, and the quantize
+    /// lands at the top of the one after - so a guard that only waits while
+    /// the request is still queued commits the knobs a frame later instead.
+    /// And in a plugin, where nothing ever takes the request, the knobs are
+    /// the whole press and still owe it a moment.
+    #[test]
+    fn an_audio_apply_that_moves_a_knob_is_one_moment_in_the_hosts_frame_order() {
+        let apply_at_80 = || DialogAction::ApplyQuantize {
+            grid_exp: -3,
+            triplet: false,
+            swing_pct: 50.0,
+            strength_pct: 80.0,
+            window_ms: 0.0,
+            sensitivity: 0.5,
+            fit: String::new(),
+        };
+        let take = || crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/a.wav".to_owned(),
+            lane: 0,
+            len_s: 4.0,
+            ..Default::default()
+        };
+        let root = project_scratch("q-knobs-one-moment");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let a = app.arrangement.add_clip(take());
+        app.arr_selected = Some(a);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let strength = app.settings.midi_quantize_pct;
+        assert!((strength - 80.0).abs() > 1.0, "fixture: the strength already stands at 80");
+        // Frame N: Apply, with the strength moved.
+        app.apply_dialog_action(apply_at_80());
+        app.commit_view_change(); // the end of `frame` N
+        // `after_frame` N takes the request and announces it under a cover...
+        let ask = match app.take_project_request() {
+            Some(crate::ports::ProjectRequest::QuantizeClips(ask)) => ask,
+            other => panic!("Apply asked for {:?}", other.is_some()),
+        };
+        app.commit_view_change(); // ...frame N+1, while the cover paints again...
+        // ...and `run_chore` at the top of frame N+2 quantizes and commits.
+        for id in ask.ids.clone() {
+            app.set_clip_warp_with_fit(id, vec![(0, 100), (48_000, 47_900)], ask.fit.clone(), 48_000);
+        }
+        app.commit_undo_moment();
+        app.commit_view_change(); // the end of frame N+2
+        assert_eq!(app.hist_at, before + 1, "one Apply left {} undo moments", app.hist_at - before);
+        // ONE step back takes the warp and the knobs together.
+        app.undo();
+        assert!(
+            app.arrangement.clips.iter().all(|c| c.warp.is_empty()),
+            "one Ctrl+Z did not take the quantize off"
+        );
+        assert!(
+            (app.settings.midi_quantize_pct - strength).abs() < 1e-9,
+            "one Ctrl+Z left the strength at {}",
+            app.settings.midi_quantize_pct
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // **A plugin never takes the request**, so the knobs are all the
+        // Apply did there, and they are still a moment of their own.
+        let (_ctx, mut plugin) = headless(Caps::PLUGIN);
+        let a = plugin.arrangement.add_clip(take());
+        plugin.arr_selected = Some(a);
+        plugin.commit_undo_moment();
+        plugin.commit_view_change();
+        let before = plugin.hist_at;
+        plugin.apply_dialog_action(apply_at_80());
+        plugin.commit_view_change();
+        assert_eq!(
+            plugin.hist_at,
+            before + 1,
+            "in a plugin the Apply's knobs left {} moments",
+            plugin.hist_at - before
+        );
     }
 
     /// **The quantize window's Apply, in the arrangement, asks the host to
