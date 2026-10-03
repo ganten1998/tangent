@@ -12849,11 +12849,10 @@ impl DesktopApp {
         let Some(doc_path) = self.app.clip_doc() else {
             return Vec::new();
         };
-        let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
-            return Vec::new();
-        };
+        // The grid the window built, on the song's maps: the ticks stand
+        // where the Apply will put each hit.
         let q = tangent_ui::quantize::Quantize {
-            grid,
+            grid: ask.grid.clone(),
             strength: ask.strength,
             window: ask.window,
         };
@@ -12972,11 +12971,10 @@ impl DesktopApp {
         let Some(doc_path) = self.app.clip_doc() else {
             return (0, 0);
         };
-        let Some(grid) = tangent_ui::quantize::Grid::new(ask.step_s, ask.swing) else {
-            return (0, 0);
-        };
+        // The grid the window built, on the song's maps - the lines the
+        // arrangement draws - and not one rebuilt here from a step.
         let q = tangent_ui::quantize::Quantize {
-            grid,
+            grid: ask.grid.clone(),
             strength: ask.strength,
             window: ask.window,
         };
@@ -26139,7 +26137,8 @@ mod tests {
         use crate::transient::Transient;
         let rate = 48_000u32;
         let q = tangent_ui::quantize::Quantize::full(
-            tangent_ui::quantize::Grid::new(0.125, None).expect("a 1/16 grid at 120 bpm"),
+            tangent_ui::quantize::Grid::from_document(-4, 4, 4, 120.0, false, None)
+                .expect("a 1/16 grid at 120 bpm"),
         );
         // The right half of a 16 s take split at 8 s: it stands at 8 s and
         // enters the file at 8 s, so the file's first eight seconds are trim.
@@ -26227,7 +26226,8 @@ mod tests {
         // 0.5 s as played, the quarter grid at 120 bpm.
         let r = 1.25;
         let q = tangent_ui::quantize::Quantize::full(
-            tangent_ui::quantize::Grid::new(0.5, None).expect("a quarter grid at 120 bpm"),
+            tangent_ui::quantize::Grid::from_document(-2, 4, 4, 120.0, false, None)
+                .expect("a quarter grid at 120 bpm"),
         );
         let found: Vec<Transient> = (0..5)
             .map(|i| Transient { at: (0.4 * f64::from(i) * 48_000.0) as usize, strength: 10.0 })
