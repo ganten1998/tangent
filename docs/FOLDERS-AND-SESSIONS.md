@@ -123,11 +123,18 @@ Related invariants that keep this working:
   before the quit question, so the question covers the take; Open before
   the save-back, which keeps it; New before it decides anything, asking
   New's question again when the take is unsaved work nobody was asked
-  about (`ask_before_new`); and `on_exit` for one still running. The
+  about (`ask_before_new`); Settings > Reset > The Default Template the
+  same way (`ask_before_reset_template`); and `on_exit` for one still
+  running. The
   roads take the save prompt's answer before finishing and put it back
   (`finish_arr_record_keeping_the_answer`), since the finish commits a
-  moment and a new moment clears Don't Save. A close used to drop the take
-  unwritten, and a New or an Open carried it into the next session. New's
+  moment and a new moment clears Don't Save. A record still waiting on its
+  count-in is called off on the same roads, as a second red press calls it
+  off (`call_off_arr_count`): the click stops with it unless a take is
+  counting on the same click, and a take rolls on through the switch. A
+  close used to drop the take unwritten, a New, an Open or a reset carried
+  a running one into the next session, and one still counting in began on
+  its downbeat there. New's
   reclaim treats a document holding clips as work, as the sweep and the
   discard do, so a scratch Open wrote back with a take is never reclaimed.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings

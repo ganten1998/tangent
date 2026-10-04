@@ -714,8 +714,10 @@ const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10)
 /// lands. `finish_arr_record` is the only way out that keeps it, and it hands
 /// the clips to whatever document is open WHEN it runs - so every road that
 /// lets a session go runs it first: a window close before the quit question,
-/// New and Open before the outgoing session is written or replaced, and
-/// `on_exit` for one still running (`finish_arr_record_keeping_the_answer`).
+/// New, Open and Reset Template before the outgoing session is written or
+/// replaced, and `on_exit` for one still running
+/// (`finish_arr_record_keeping_the_answer`, which also calls off a record
+/// still waiting on its count-in).
 #[cfg(feature = "recorder")]
 struct ArrRec {
     /// The playhead second the record began at.
@@ -9739,8 +9741,9 @@ impl DesktopApp {
 
     /// **A running arrangement record ends with the session it was recorded
     /// in, and the save prompt's answer survives the ending.** For the roads
-    /// that let a session go: New and Open, before the outgoing session is
-    /// written or replaced, and `on_exit` for one still running at the end.
+    /// that let a session go: New, Open and Reset Template, before the
+    /// outgoing session is written or replaced, and `on_exit` for one still
+    /// running at the end.
     /// Without it the take rolled on into the next session and landed there
     /// at Stop, or went down with the process unwritten.
     ///
@@ -9751,13 +9754,37 @@ impl DesktopApp {
     /// was told to throw away. So it is taken first and put back, and
     /// returned. The take's files are in `media/` either way, and a scratch
     /// holding one is never cleared (`discard_scratch_made_here`).
+    ///
+    /// **And a record still WAITING on its count-in is called off** - see
+    /// `call_off_arr_count`. Nothing ended it, so it began on the downbeat
+    /// in the NEXT session, on that session's armed tracks and into its
+    /// folder, with the tempo and undo held for the rest of the count.
     fn finish_arr_record_keeping_the_answer(&mut self) -> bool {
+        self.call_off_arr_count();
         let discarded = self.app.take_outgoing_discarded();
         self.finish_arr_record();
         if discarded {
             self.app.rearm_outgoing_discarded();
         }
         discarded
+    }
+
+    /// **A record waiting on its count-in is called off, as a second red
+    /// press calls it off**: nothing records, and the click stops with the
+    /// Play that waits on its downbeat - unless a take is counting on the
+    /// same click, which only the cassette may cancel. A take is capture
+    /// only and rolls on through a session switch, count and all.
+    fn call_off_arr_count(&mut self) {
+        if !std::mem::take(&mut self.recorder.arr_rec_wait) {
+            return;
+        }
+        if !self.recorder.take_count_pending {
+            self.recorder.play_on_go = false;
+            self.recorder.count_from = None;
+            if let Some(e) = self.recorder.engine.as_ref() {
+                e.cancel_count_in();
+            }
+        }
     }
 
     /// Start an export: the whole arrangement, played from the top through
@@ -11136,6 +11163,18 @@ impl DesktopApp {
             // `Settings::default`, and the session adopts it, so the desk on
             // screen is the one a fresh install would show.
             tangent_ui::ports::ProjectRequest::ResetTemplate => {
+                // **A take still rolling ends here, in the session it was
+                // recorded in, and is then asked about**, as New's is: the
+                // app asked before the take was in the document, and a clean
+                // session was asked nothing. Not after Don't Save, which
+                // covers everything since the last save - the take's files
+                // stay in `media/` either way. See
+                // `finish_arr_record_keeping_the_answer`.
+                let recording = self.recorder.arr_rec.is_some();
+                let refused = self.finish_arr_record_keeping_the_answer();
+                if recording && !refused && self.app.ask_before_reset_template() {
+                    return;
+                }
                 // **The outgoing session first, left as New leaves it.** The
                 // app asked about unsaved work before raising this; the
                 // plugins' knobs, which never dirty the document, go into its
@@ -29343,6 +29382,75 @@ mod tests {").expect("the tests module")];
             );
         }
         assert!(carried.is_empty(), "{}", carried.join("; "));
+    }
+
+    /// **A record still waiting on its count-in goes with the session it was
+    /// pressed in.** The roads that let a session go finish a running record
+    /// first, and nothing touched one still counting in: `arr_rec_wait`
+    /// stayed up through the switch, and on the downbeat the record began in
+    /// the NEXT session, on its armed tracks and into its folder, with the
+    /// tempo and undo held until then. Every one of those roads calls it off
+    /// now, as a second red press does: the click stops with it unless a
+    /// take is counting on the same click, which only the cassette may
+    /// cancel. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_session_switch_calls_off_a_record_waiting_on_its_count_in() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let rest = &src[at..];
+            &rest[..rest.find("\n    }\n").unwrap_or(rest.len())]
+        };
+        assert!(
+            body("fn finish_arr_record_keeping_the_answer(&mut self)").contains("self.call_off_arr_count();"),
+            "New, Open, Reset Template and Quit leave a record waiting on its count-in up, \
+             so it begins on the downbeat in the next session"
+        );
+        let call_off = squash(body("fn call_off_arr_count(&mut self)"));
+        let taken = call_off.find("std::mem::take(&mut self.recorder.arr_rec_wait)");
+        let guard = call_off.find("if !self.recorder.take_count_pending {");
+        let cancel = call_off.find("e.cancel_count_in();");
+        assert!(taken.is_some(), "the waiting record is left up, to begin on the downbeat");
+        assert!(
+            guard.is_some_and(|g| cancel.is_some_and(|c| g < c)),
+            "the click is left counting with nothing waiting on it, or a take's count is cancelled under it"
+        );
+        for flag in ["self.recorder.play_on_go = false;", "self.recorder.count_from = None;"] {
+            assert!(
+                call_off.find(flag).is_some_and(|f| guard.is_some_and(|g| g < f)),
+                "the click stops and `{flag}` is left standing, or goes under a take still counting"
+            );
+        }
+    }
+
+    /// **Reset Template never carries a running record into the fresh
+    /// session.** New and Open finish one in the session it was recorded in
+    /// (`finish_arr_record_keeping_the_answer`), and the reset - which
+    /// replaces the session as New does - did not: the take rolled on into
+    /// the fresh scratch and landed there at Stop, carving that document. It
+    /// ends first now, before the outgoing session is shelved or replaced,
+    /// and Reset Template's question is asked again when the take is unsaved
+    /// work nobody was asked about. A source scan.
+    #[test]
+    fn reset_template_never_carries_a_running_record_into_the_fresh_session() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("ProjectRequest::ResetTemplate => {").expect("the Reset Template arm");
+        let arm = &src[at..at + src[at..].find("ProjectRequest::Save =>").expect("the arm after it")];
+        let finish = arm.find("self.finish_arr_record_keeping_the_answer();");
+        let ask = arm.find("self.app.ask_before_reset_template()");
+        let answer = arm.find("let discarded = self.app.take_outgoing_discarded();").expect("the answer");
+        let adopt = arm.find("self.adopt_fresh_from_template(").expect("the adopt");
+        assert!(
+            finish.is_some_and(|f| f < answer && f < adopt),
+            "Reset Template replaces the session under a running arrangement record, \
+             which lands in the fresh session at Stop"
+        );
+        assert!(
+            finish.is_some_and(|f| ask.is_some_and(|a| f < a && a < answer)),
+            "Reset Template lets a session go without asking about the take it just finished"
+        );
     }
 
     /// **Every road out of this app ends at the hardened exit.**

@@ -16565,6 +16565,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.ask_before(AfterSave::New)
     }
 
+    /// **Ask Reset Template's question again**, for the same reason as
+    /// `ask_before_new`: the host finishes a running arrangement record in
+    /// the session it was recorded in before the reset replaces it, and the
+    /// take reached the document after the question. `true` when the prompt
+    /// is up; its Save or Discard carries on with the reset.
+    pub fn ask_before_reset_template(&mut self) -> bool {
+        self.ask_before(AfterSave::ResetTemplate)
+    }
+
     /// The host's cue that the answer was "go", taken once.
     pub fn take_quit_now(&mut self) -> bool {
         std::mem::take(&mut self.quit_now)
@@ -68341,6 +68350,45 @@ mod tests {").expect("the tests module")];
             Some(crate::ports::ProjectRequest::ResetTemplate),
             "a clean session was asked about nothing"
         );
+    }
+
+    /// **Reset Template asks again about a take it finished.** The host ends
+    /// an arrangement record still running when the reset arrives, in the
+    /// session it was recorded in, so the take's clips reach the document
+    /// after the question that let the reset go ahead - none at all, on a
+    /// clean session. `ask_before_reset_template` is the second question,
+    /// and its answer carries on with the RESET: a New in its place would
+    /// stand the session on the old template instead of the rebuilt one.
+    #[test]
+    fn reset_template_asks_again_about_a_take_it_finished() {
+        let root = project_scratch("reset-take");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.undo_reset();
+        assert!(!app.ask_before_reset_template(), "a clean session was asked about nothing");
+        // The take the host has just landed.
+        app.set_channel_kind(0, Some(recorder::ChannelKind::Midi));
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
+            lane: 0,
+            start_s: 0.0,
+            len_s: 2.0,
+            path: None,
+            notes: vec![crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 90, muted: false }],
+        }]);
+        assert!(
+            app.ask_before_reset_template(),
+            "the reset went ahead over a take nobody was asked about"
+        );
+        assert!(matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. })), "no prompt is up");
+        app.apply_dialog_action(DialogAction::SaveChangesDiscard);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "the answer did not carry on with the reset"
+        );
+        assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
