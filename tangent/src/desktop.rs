@@ -3605,7 +3605,9 @@ const MAX_EXPANDED_NOTES: usize = 1_000_000;
 /// MIDI export already share, and which knows the one thing that is easy to
 /// get wrong: every pass restates the level it OPENS at, so a loop whose
 /// pedal goes down in its second half still holds the damper across the seam.
-/// All this does is move it from song seconds to clip frames.
+/// All this does is move it from song seconds to clip frames. The lift it
+/// states at the clip's end lands on `len`, which the walk never reads: the
+/// engine lets the pedal go there on its own.
 fn midi_clip_pedal(
     clip: &tangent_ui::arrangement::ArrClip,
     rate: f64,
