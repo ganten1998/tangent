@@ -21473,13 +21473,18 @@ mod tests {
                 if sounds { "was swallowed" } else { "doubled the go" }
             );
         }
-        // And the engine really does age the flag where the model does.
-        let src = include_str!("instrument.rs");
+        // And the engine really does age the flag where the model does. In
+        // the production code only: this test spells the branch and the call,
+        // so on the whole file a reworded branch was "found" at the literal
+        // below, the call right after it, and the scan passed whatever the
+        // engine did.
+        let whole = include_str!("instrument.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         let at = src
             .find("let heard_beat = if self.beats.counting_in() || !rolling {")
             .expect("the click's two-clock branch");
         assert!(
-            src[at..at + 600].contains("self.bar_clock.idle(self.rate);"),
+            src[at..(at + 600).min(src.len())].contains("self.bar_clock.idle(self.rate);"),
             "the engine does not age the go while the transport is still"
         );
     }
@@ -27045,12 +27050,14 @@ mod tests {
     ///
     /// Measured against the PROCESSED stem of the same desk rather than
     /// against a constant, so the test says "the dry stem has the
-    /// instrument in it" and not "the analog is this loud".
+    /// instrument in it" and not "the analog is this loud": a voice-only
+    /// lane's two stems are one signal through one fader, so a dry peak under
+    /// half the processed one is a voice that did not arrive whole. It used
+    /// to ask only that the dry stem was not silent, which a voice reaching
+    /// it at a tenth of its level passed.
     ///
-    /// **What it does not pin.** A voice-only lane's dry and processed
-    /// stems should be the same samples; this asserts only that the dry one
-    /// is not silent - the processed peak is a fixture guard - and only for
-    /// a voice in bay 1. The two tests below pin bays 4..6 and the timing.
+    /// **What it does not pin.** The level only, and only for a voice in bay
+    /// 1: the two tests below pin bays 4..6 and the timing.
     #[test]
     fn a_voice_in_a_bay_reaches_the_dry_stem() {
         use std::sync::Arc;
@@ -27092,9 +27099,9 @@ mod tests {
             "the fixture never made sound at all: {processed}"
         );
         assert!(
-            dry > 0.0,
-            "the dry stem of a lane played by a bay voice is SILENT \
-             ({dry}) while its processed stem peaked at {processed}"
+            dry > processed * 0.5,
+            "the dry stem of a lane played by a bay voice is missing the voice: \
+             it peaked at {dry} while its processed stem peaked at {processed}"
         );
     }
 
@@ -34004,8 +34011,11 @@ mod sampler_road {
     /// (`bpm_at_beat`) beside the frame now. This drives a real engine over
     /// a real ramp and checks the published pair against the map - and
     /// against the straight line, so it cannot pass by accident on a map
-    /// the two agree about. No voice is built and no arp runs: what it pins
-    /// is the published pair that `rack_transport` reads.
+    /// the two agree about. Then it plays an Analog in a bay, its arp on
+    /// over the same ramp and the same dial, and times the steps it sounds.
+    /// The pair alone is half of it: this test used to stop there, and a
+    /// rack that handed its voice the dial's line again kept the pair right
+    /// and the arp wrong.
     #[test]
     fn a_built_in_voices_arp_reads_the_tempo_map_and_not_the_dial() {
         use tangent_ui::tempo::{TempoMap, TempoPoint};
@@ -34053,6 +34063,93 @@ mod sampler_road {
             agreed > 10,
             "the fixture's map never diverged from the dial, so this proves nothing"
         );
+
+        // **And the arp PLAYS on the map.** An Analog in a bay, its arp
+        // stepping in sixteenths over one held key, each step a short strike
+        // that has died away before the next: over the ramp's first second
+        // every strike lands on a sixteenth of the map, five of them, where
+        // the dial's line would put eight, one every eighth of a second.
+        use crate::analog::{
+            P_ARP_MODE, P_ARP_RATE, P_A_DECAY, P_A_SUSTAIN, P_CONTOUR, P_CUTOFF, P_DRIFT,
+            P_OSC_DRIFT,
+        };
+        const CH: usize = 2;
+        let mut e = Engine::offline(rate, Timebase::new()).expect("offline engine");
+        e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+            .expect("the analog must load")
+            .expect("a load reports what it seated");
+        for (id, v) in [
+            (P_ARP_MODE, 0.2),       // up
+            (P_ARP_RATE, 4.0 / 6.0), // 1/16: four steps a beat
+            (P_A_DECAY, 0.2),
+            (P_A_SUSTAIN, 0.0),
+            (P_DRIFT, 0.0),
+            (P_OSC_DRIFT, 0.0),
+            (P_CUTOFF, 1.0),
+            (P_CONTOUR, 0.0),
+        ] {
+            assert!(e.set_insert_param(CH, 0, id as u32, v), "the analog refused param {id}");
+        }
+        e.set_channel_gain(CH, 0.8);
+        e.set_master_gain(1.0);
+        e.set_stems(true);
+        e.set_stems_dry(false);
+        e.set_tempo(120.0);
+        e.set_maps(Maps { tempo: tempo.clone(), meter: Default::default() });
+        e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: CH,
+            start: 0,
+            len: 4 * u64::from(rate),
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 3 * u64::from(rate), key: 60, vel: 110 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        // A little under a second: the map's first beat, in sixteenths.
+        let mut drained: Vec<f32> = Vec::new();
+        for _ in 0..(rate as usize / 512) {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        let wide = CHANNELS * 2;
+        let lane: Vec<f32> = (0..drained.len() / wide)
+            .map(|f| drained[f * wide + CH * 2].abs().max(drained[f * wide + CH * 2 + 1].abs()))
+            .collect();
+        // Strikes: 5 ms windows rising past a tenth of the loudest after
+        // falling under a fiftieth of it. The first strike is twice as loud
+        // as the rest (the knobs set above are still gliding from their
+        // defaults while it sounds), and between strikes the lane is silent.
+        let hop = rate as usize / 200;
+        let env: Vec<f32> =
+            lane.chunks(hop).map(|w| w.iter().copied().fold(0.0, f32::max)).collect();
+        let loudest = env.iter().copied().fold(0.0f32, f32::max);
+        assert!(loudest > 0.002, "the arp never sounded: {loudest}");
+        let (mut struck, mut low) = (Vec::new(), true);
+        for (i, &v) in env.iter().enumerate() {
+            if low && v > 0.1 * loudest {
+                struck.push(i * hop);
+                low = false;
+            } else if !low && v < 0.02 * loudest {
+                low = true;
+            }
+        }
+        let steps: Vec<usize> = (0..)
+            .map(|s| (tempo.seconds_at_beat(f64::from(s) / 4.0) * f64::from(rate)) as usize)
+            .take_while(|&f| f + hop < lane.len())
+            .collect();
+        assert_eq!(
+            struck.len(),
+            steps.len(),
+            "the arp struck at frames {struck:?}, where the map's sixteenths fall at {steps:?}"
+        );
+        for (got, want) in struck.iter().zip(&steps) {
+            assert!(
+                got.abs_diff(*want) < rate as usize / 50,
+                "the arp struck at frame {got}, where the map's sixteenth falls at {want}: \
+                 struck {struck:?}, sixteenths {steps:?}"
+            );
+        }
     }
 
     /// **A lane rendering the chunk that straddles a loop's end is handed
