@@ -553,9 +553,9 @@ pub fn nav_window(l: &Layout, view: &MidiEditView<'_>) -> Rect {
 /// One grid step in seconds, where the roll's playhead stands: the rung of
 /// that bar's signature at the song's tempo there. Triplet divides the next
 /// size UP into three — an eighth-triplet is a third of a quarter — which
-/// is the 2/3 in it; a swung grid's step is its straight one. What a
-/// duplicate, a nudge and a resize move by, and how long a note drawn with
-/// the magnet off is.
+/// is the 2/3 in it; a swung grid's step is its straight one. What the
+/// playhead walks by with the magnet off; an edit of a note asks where the
+/// note is ([`grid_step_at`]).
 pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
     // **A NOTE VALUE, not a fraction of the bar.**
     //
@@ -568,7 +568,16 @@ pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
     //
     // **And the song's step, not the tempo dial's**: after a tempo change
     // the dial's step is a length the song does not have there.
-    view_grid(view).map_or(0.0, |g| g.step_at(view.playhead_s))
+    grid_step_at(view, view.playhead_s)
+}
+
+/// **One grid step at `t`**, the song second a note stands at: what a
+/// duplicate, a nudge and a resize move that note by, and how long a note
+/// drawn with the magnet off is. Asked at the playhead, as these edits used
+/// to ask, a note after a tempo change inside the part moved by the step
+/// the playhead's side of the change has, and left the lines.
+pub fn grid_step_at(view: &MidiEditView<'_>, t: f64) -> f64 {
+    view_grid(view).map_or(0.0, |g| g.step_at(t))
 }
 
 /// `t`, magnetised to the grid's own lines — straight, triplet or swung.
