@@ -33000,15 +33000,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **A bay that changes tenant loses its bypass**, and this is the
         // one place that can know it did.
         //
-        // Every road into a bay ends here — the picker, the FX menu's
-        // Replace, alt-click, the track delete, a carried copy landing
-        // (`Desktop::copy_insert`), a project load. A flag left behind by any
+        // Every road that seats or empties one bay ends here: the picker, the
+        // FX menu's Replace, alt-click, the track delete, a carried copy
+        // landing (`Desktop::copy_insert`), a move or a swap
+        // (`trade_inserts`). A flag left behind by any
         // of them would come back on with the NEXT plugin, which would then
         // be loaded, drawn, named on its chip and silent for no reason
         // anybody could see. That is the worst failure this feature has
         // available to it, so it is closed at the single writer rather than
         // at six call sites, one of which somebody would later add a seventh
         // beside.
+        //
+        // A whole desk never comes here: an open, an undo and a redo land it
+        // through `apply_desk_snapshot`, which writes the bays directly.
         //
         // Only when the path really MOVES: the reconcile and the settings
         // reader both rewrite bays with what is already in them, and a
