@@ -631,6 +631,11 @@ pub struct TangentApp {
     /// put them back exactly where they were copied from, which is the one
     /// place a paste is never wanted.
     auto_clipboard: Vec<crate::automation::Point>,
+    /// **The row each copied node came from**, `(lane, param)`, parallel to
+    /// `auto_clipboard`. Nodes chosen on several rows are pasted back row
+    /// for row (see `arr_paste_auto_nodes`); merged into one shape, a pan
+    /// position used to land on a volume row as a fader level.
+    auto_clipboard_rows: Vec<(usize, crate::automation::AutoParam)>,
     /// **The row the copied nodes came from**, as `(lane, param)`: where a
     /// paste lands when nothing on the timeline names a row.
     auto_clipboard_from: Option<(usize, crate::automation::AutoParam)>,
@@ -4419,6 +4424,7 @@ impl TangentApp {
             arr_auto_sel: None,
             arr_auto_nodes: Vec::new(),
             auto_clipboard: Vec::new(),
+            auto_clipboard_rows: Vec::new(),
             auto_clipboard_from: None,
             arr_auto_focus: None,
             arr_auto_drag_from: None,
@@ -12308,6 +12314,7 @@ impl TangentApp {
         let at = recorder::Strip::Channel(n).index();
         // A paste means what was copied LAST — see the clip copy.
         self.auto_clipboard.clear();
+        self.auto_clipboard_rows.clear();
         self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
             from: n,
@@ -14999,7 +15006,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // leave them in whatever order they happened to be chosen.
         let mut picks = self.arr_auto_node_picks();
         picks.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-        let mut pts: Vec<crate::automation::Point> = Vec::new();
+        // Each node with the row it came from - see `auto_clipboard_rows`.
+        let mut pts: Vec<((usize, crate::automation::AutoParam), crate::automation::Point)> =
+            Vec::new();
         for (lane, param, index) in &picks {
             if let Some(p) = self
                 .arrangement
@@ -15007,15 +15016,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .get(*lane, *param)
                 .and_then(|c| c.points().get(*index))
             {
-                pts.push(*p);
+                pts.push(((*lane, *param), *p));
             }
         }
         if pts.is_empty() {
             return false;
         }
-        pts.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
-        let first = pts[0].at_s;
-        for p in &mut pts {
+        pts.sort_by(|a, b| a.1.at_s.total_cmp(&b.1.at_s));
+        let first = pts[0].1.at_s;
+        for (_, p) in &mut pts {
             p.at_s -= first;
         }
         self.auto_clipboard_from = picks.first().map(|(l, p, _)| (*l, *p));
@@ -15023,7 +15032,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Clips and notes stamped it and nodes did not, so with no text on
         // the system clipboard the paste chord was swallowed whole.
         self.clipboard_stamp = Some(format!("Tangent: {} automation node(s)", pts.len()));
-        self.auto_clipboard = pts;
+        self.auto_clipboard_rows = pts.iter().map(|(row, _)| *row).collect();
+        self.auto_clipboard = pts.into_iter().map(|(_, p)| p).collect();
         // **The track clipboard stands down.** Both are consulted by one
         // chord, and a stale track copy would win a paste the hand meant for
         // the nodes it had just taken.
@@ -15045,48 +15055,81 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// first and last instant go, so what lands is what was copied rather
     /// than the two shapes interleaved. What was pasted comes back CHOSEN,
     /// ready to be carried or copied again.
+    ///
+    /// **Nodes copied from SEVERAL rows go back row for row**: each row's
+    /// share lands on the row it came from, at the playhead, as far from the
+    /// others as it was, and the aim above is not asked. One shape on one
+    /// row put a pan position on the volume row as a fader level. A share
+    /// whose row is no longer open is skipped, the rule the aim keeps too.
+    ///
+    /// **A MUTE row takes switches**: whatever lands there holds, as a
+    /// drawn or written mute node does - a ramp would flip it halfway along.
     fn arr_paste_auto_nodes(&mut self) -> bool {
-        use crate::automation::SAME_INSTANT_S;
+        use crate::automation::{AutoParam, Point, Shape, SAME_INSTANT_S};
         if self.auto_clipboard.is_empty() {
             return false;
         }
         self.arr_end_node_drag();
-        let chosen = self
-            .arr_auto_nodes
-            .first()
-            .and_then(|(l, s, _)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p)));
-        let aimed = self
-            .arr_auto_sel
-            .and_then(|(l, s)| self.arr_auto_param_at(l, s).map(|p| (l, p)));
-        let Some((lane, param)) = [chosen, aimed, self.arr_auto_focus, self.auto_clipboard_from]
-            .into_iter()
-            .flatten()
-            .find(|(l, p)| self.arr_auto_is_open(*l, *p))
-        else {
-            return false;
-        };
-        let at = self.arr_snap_t(self.playhead_s());
-        let pasted: Vec<crate::automation::Point> = self
-            .auto_clipboard
-            .iter()
-            .map(|p| crate::automation::Point { at_s: (at + p.at_s).max(0.0), ..*p })
-            .collect();
-        let lo = pasted.first().map_or(at, |p| p.at_s) - SAME_INSTANT_S;
-        let hi = pasted.last().map_or(at, |p| p.at_s) + SAME_INSTANT_S;
-        {
-            let curve = self.arrangement.automation.entry(lane, param);
-            let mut pts: Vec<crate::automation::Point> = curve
-                .points()
-                .iter()
-                .filter(|p| p.at_s < lo || p.at_s > hi)
-                .copied()
-                .collect();
-            pts.extend(pasted.iter().copied());
-            curve.set_points(pts);
+        let mut shares: Vec<((usize, AutoParam), Vec<Point>)> = Vec::new();
+        if self.auto_clipboard_rows.len() == self.auto_clipboard.len() {
+            for (row, p) in self.auto_clipboard_rows.iter().zip(&self.auto_clipboard) {
+                match shares.iter_mut().find(|(r, _)| r == row) {
+                    Some((_, shape)) => shape.push(*p),
+                    None => shares.push((*row, vec![*p])),
+                }
+            }
         }
-        let slot = self.arr_auto_slot(lane, param).unwrap_or(0);
-        let landed = self.arr_auto_find(lane, param, &pasted);
-        self.arr_choose_auto_nodes(landed.into_iter().map(|i| (lane, slot, i)).collect());
+        let targets: Vec<((usize, AutoParam), Vec<Point>)> = if shares.len() > 1 {
+            shares.into_iter().filter(|((l, p), _)| self.arr_auto_is_open(*l, *p)).collect()
+        } else {
+            let chosen = self
+                .arr_auto_nodes
+                .first()
+                .and_then(|(l, s, _)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p)));
+            let aimed = self
+                .arr_auto_sel
+                .and_then(|(l, s)| self.arr_auto_param_at(l, s).map(|p| (l, p)));
+            let Some(row) = [chosen, aimed, self.arr_auto_focus, self.auto_clipboard_from]
+                .into_iter()
+                .flatten()
+                .find(|(l, p)| self.arr_auto_is_open(*l, *p))
+            else {
+                return false;
+            };
+            vec![(row, self.auto_clipboard.clone())]
+        };
+        if targets.is_empty() {
+            return false;
+        }
+        let at = self.arr_snap_t(self.playhead_s());
+        let mut landed: Vec<(usize, usize, usize)> = Vec::new();
+        for ((lane, param), shape) in targets {
+            let pasted: Vec<Point> = shape
+                .iter()
+                .map(|p| Point {
+                    at_s: (at + p.at_s).max(0.0),
+                    shape: if param == AutoParam::Mute { Shape::Hold } else { p.shape },
+                    ..*p
+                })
+                .collect();
+            let lo = pasted.first().map_or(at, |p| p.at_s) - SAME_INSTANT_S;
+            let hi = pasted.last().map_or(at, |p| p.at_s) + SAME_INSTANT_S;
+            {
+                let curve = self.arrangement.automation.entry(lane, param);
+                let mut pts: Vec<Point> = curve
+                    .points()
+                    .iter()
+                    .filter(|p| p.at_s < lo || p.at_s > hi)
+                    .copied()
+                    .collect();
+                pts.extend(pasted.iter().copied());
+                curve.set_points(pts);
+            }
+            let slot = self.arr_auto_slot(lane, param).unwrap_or(0);
+            let found = self.arr_auto_find(lane, param, &pasted);
+            landed.extend(found.into_iter().map(|i| (lane, slot, i)));
+        }
+        self.arr_choose_auto_nodes(landed);
         self.arr_auto_hot = None;
         self.arr_save_edits();
         true
@@ -18740,6 +18783,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // down, or the next Cmd+V would land old nodes where the hand meant
         // these clips — the paste finds a row to aim at almost always now.
         self.auto_clipboard.clear();
+        self.auto_clipboard_rows.clear();
         self.auto_clipboard_from = None;
     }
 
@@ -60947,6 +60991,58 @@ mod tests {
         // 3..5 s is the pasted span: the old 4 s node inside it is gone.
         let got = auto_nodes(&app);
         assert_eq!(got, vec![(0.0, 0.5), (2.0, 0.8), (3.0, 0.8), (5.0, 0.2), (6.0, 0.6)], "{got:?}");
+    }
+
+    /// **Nodes copied from two rows paste onto two rows**, each back onto
+    /// the row it came from, as far apart as they were. The copy merged
+    /// every chosen node into one shape and the paste put it all on one
+    /// row: a pan position landed on the volume row as a fader level.
+    #[test]
+    fn nodes_copied_from_two_rows_are_not_merged_onto_one() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let (_ctx, mut app) = auto_bench("autotworows");
+        app.arr_auto_open.insert((0, AutoParam::Pan));
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        app.arrangement.automation.set(Curve::sanitised(0, AutoParam::Pan, vec![pt(0.0, 0.5), pt(3.0, 0.1)]));
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 1, 1)]; // volume 2 s (0.8), pan 3 s (0.1)
+        let _ = app.arr_copy_auto_nodes();
+        app.arr_auto_nodes.clear();
+        app.recorder.position_s = 10.0;
+        let _ = app.arr_paste_auto_nodes();
+        assert!(
+            !auto_nodes(&app).iter().any(|p| p.0 >= 10.0 && (p.1 - 0.1).abs() < 1e-9),
+            "a pan position landed on the volume row: {:?}",
+            auto_nodes(&app)
+        );
+        assert!(auto_nodes(&app).contains(&(10.0, 0.8)), "the volume node did not land: {:?}", auto_nodes(&app));
+        let pan: Vec<(f64, f64)> = app
+            .arrangement
+            .automation
+            .get(0, AutoParam::Pan)
+            .map(|c| c.points().iter().map(|p| (p.at_s, p.value)).collect())
+            .unwrap_or_default();
+        assert!(pan.contains(&(11.0, 0.1)), "the pan node did not land on its own row: {pan:?}");
+        assert_eq!(app.arr_auto_nodes.len(), 2, "the pasted nodes did not come back chosen");
+    }
+
+    /// **A shape pasted onto a MUTE row arrives as switches.** A mute is a
+    /// switch written as a curve, so every other road that writes one holds
+    /// its nodes; the paste landed a volume ride's ramps there, and the mute
+    /// flipped halfway along a segment.
+    #[test]
+    fn a_shape_pasted_onto_a_mute_row_holds() {
+        use crate::automation::{AutoParam, Shape};
+        let (_ctx, mut app) = auto_bench("autopastemute");
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        assert!(app.arr_copy_auto_nodes());
+        app.arr_toggle_automation_param(0, AutoParam::Mute);
+        app.arr_auto_focus = Some((0, AutoParam::Mute));
+        app.recorder.position_s = 8.0;
+        assert!(app.arr_paste_auto_nodes());
+        let mute = app.arrangement.automation.get(0, AutoParam::Mute).expect("nothing landed on the mute row");
+        let pasted: Vec<_> = mute.points().iter().filter(|p| p.at_s >= 8.0).collect();
+        assert_eq!(pasted.len(), 2, "{:?}", mute.points());
+        assert!(pasted.iter().all(|p| p.shape == Shape::Hold), "the mute row got ramps: {:?}", mute.points());
     }
 
     /// **Cmd+A opens the selected track's automation lanes** — what the A on
