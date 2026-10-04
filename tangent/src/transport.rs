@@ -125,14 +125,17 @@ impl Transport {
 
     /// Reconcile once a frame.
     ///
-    /// The locate is published BEFORE the level rises, which ORDERS the two
-    /// without making them one fact: `run_transport` loads the generation
-    /// before the level, so a callback can still read the old generation with
-    /// the level already up and roll one block from the old position. On the
-    /// way down the level falls BEFORE the return-to-cursor locate (see
-    /// `stores`): a callback between the two stores is a stopped one at the
-    /// old position, and `set_transport`'s Release carries the fall, so a
-    /// callback that Acquires the new generation cannot read the level up.
+    /// The locate is published BEFORE the level rises, and `run_transport`
+    /// loads the generation again after the level and rolls only on a pair
+    /// it read whole, so the two arrive as one fact: a callback that meets
+    /// the push between its own loads holds a chunk on the new place. While
+    /// the generation was loaded once, before the level, such a callback read
+    /// the old generation with the level already up and rolled one block
+    /// from the old position. On the way down the level falls BEFORE the
+    /// return-to-cursor locate (see `stores`): a callback between the two
+    /// stores is a stopped one at the old position, and `set_transport`'s
+    /// Release carries the fall, so a callback that Acquires the new
+    /// generation cannot read the level up.
     /// The locate used to go first, and a callback landing between the two
     /// stores - or reading the Relaxed level stale - rolled one block at the
     /// cursor and left the playhead there.
@@ -241,6 +244,144 @@ mod tests {
             48_000,
             "a callback between Stop's two stores rolled a block from the cursor"
         );
+    }
+
+    /// **Wherever a callback meets `push`, it rolls only from where the host
+    /// sent it.** It can meet a push between two of its stores, or in the
+    /// middle of its own read of them: `run_transport` loads the generation
+    /// and then the level, and the host's stores can land between the two.
+    /// Play from a new place met there showed the callback the old
+    /// generation with the level already up, and it rolled one block from
+    /// where the playhead WAS, a moment of the wrong part of the song,
+    /// before the locate landed. Play and Stop, each met after every store
+    /// and with the whole push landing after each of the callback's loads
+    /// (`instrument::meet_transport_loads_for_test`), on an offline engine:
+    /// the callback that meets it, and the one after.
+    #[test]
+    fn wherever_a_callback_meets_a_push_it_rolls_only_from_where_it_was_sent() {
+        use crate::instrument::{meet_transport_loads_for_test, TransportStores};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        const BLOCK: u64 = 256;
+        let rate = 48_000u32;
+        let cursor = u64::from(rate);
+        let apply = |e: &Engine, store: Store| match store {
+            Store::Locate { generation, frames } => e.set_transport(generation, frames),
+            Store::Rolling(rolling) => e.set_rolling(rolling),
+        };
+        // `Between(k)`: the push's first `k` stores, the callback, the rest.
+        // `Inside(n)`: all of them, landing after the callback's `n`th load.
+        #[derive(Clone, Copy, Debug)]
+        enum Meet {
+            Between(usize),
+            Inside(u32),
+        }
+        for play in [true, false] {
+            for meet in [
+                Meet::Between(0),
+                Meet::Between(1),
+                Meet::Between(2),
+                Meet::Inside(1),
+                Meet::Inside(2),
+                Meet::Inside(3),
+            ] {
+                let mut e = Engine::offline(rate, tangent_record::audio::Timebase::new())
+                    .expect("an offline engine needs no device");
+                let mut out = vec![0.0f32; 2 * BLOCK as usize];
+                // Play starts parked at two seconds; Stop, rolling from the
+                // cursor at one.
+                let mut t = Transport::new();
+                if play {
+                    t.locate(2.0);
+                } else {
+                    t.locate(1.0);
+                    t.toggle_play();
+                }
+                for _ in 0..8 {
+                    t.push(Some(&e));
+                    e.render_offline(&mut out);
+                }
+                let was = e.transport_position();
+                if play {
+                    t.locate(1.0);
+                    t.toggle_play();
+                } else {
+                    t.stop();
+                }
+                let acked = e.transport_acked(t.generation);
+                let stores: Vec<Store> =
+                    t.stores(acked, was, f64::from(rate)).into_iter().flatten().collect();
+                match meet {
+                    Meet::Between(k) => {
+                        for &store in stores.iter().take(k) {
+                            apply(&e, store);
+                        }
+                        e.render_offline(&mut out);
+                        for &store in stores.iter().skip(k) {
+                            apply(&e, store);
+                        }
+                    }
+                    Meet::Inside(n) => {
+                        let fired = Rc::new(Cell::new(false));
+                        let (landed, all) = (Rc::clone(&fired), stores.clone());
+                        meet_transport_loads_for_test(Some(Box::new(
+                            move |loads: u32, host: &TransportStores<'_>| {
+                                if loads != n || landed.get() {
+                                    return;
+                                }
+                                landed.set(true);
+                                for &store in &all {
+                                    match store {
+                                        Store::Locate { generation, frames } => {
+                                            host.set_transport(generation, frames);
+                                        }
+                                        Store::Rolling(rolling) => host.set_rolling(rolling),
+                                    }
+                                }
+                            },
+                        )));
+                        e.render_offline(&mut out);
+                        meet_transport_loads_for_test(None);
+                        // A read of fewer loads met it after the callback.
+                        if !fired.get() {
+                            for &store in &stores {
+                                apply(&e, store);
+                            }
+                        }
+                    }
+                }
+                let met = e.transport_position();
+                e.render_offline(&mut out);
+                let next = e.transport_position();
+                let what = format!("{} met at {meet:?}", if play { "Play" } else { "Stop" });
+                if play {
+                    assert_ne!(
+                        met,
+                        was + BLOCK,
+                        "{what}: the callback rolled a block from where the playhead was"
+                    );
+                    assert!(
+                        [was, cursor, cursor + BLOCK].contains(&met),
+                        "{what}: the callback left the playhead at {met}"
+                    );
+                    assert!(
+                        [cursor + BLOCK, cursor + 2 * BLOCK].contains(&next),
+                        "{what}: the callback after it left the playhead at {next}, not rolling from the cursor"
+                    );
+                } else {
+                    assert_ne!(
+                        met,
+                        cursor + BLOCK,
+                        "{what}: the callback rolled a block from the cursor after Stop"
+                    );
+                    assert!(
+                        [was, was + BLOCK, cursor].contains(&met),
+                        "{what}: the callback left the playhead at {met}"
+                    );
+                    assert_eq!(next, cursor, "{what}: the callback after it is not stopped at the cursor");
+                }
+            }
+        }
     }
 
     /// **Play pauses in place; only stop goes home.** The second press of

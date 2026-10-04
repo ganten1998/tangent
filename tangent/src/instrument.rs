@@ -2071,8 +2071,9 @@ struct Shared {
     /// made a locate inexpressible: the edges were found ON the audio thread,
     /// so a seek while rolling changed nothing and a seek while stopped was
     /// overwritten by the rewind. The host stores the payload first and the
-    /// generation last, Release; the callback consumes generation-first,
-    /// Acquire. See `Renderer::run_transport`.
+    /// generation last, Release; the callback consumes the generation, the
+    /// level and the generation again, Acquire, so it takes a locate and the
+    /// level as one fact. See `Renderer::run_transport`.
     transport_at: AtomicU64,
     transport_req: AtomicU64,
     /// The generation the callback has APPLIED. `ack == req` means
@@ -2081,8 +2082,9 @@ struct Shared {
     /// The transport is moving. A LEVEL, and correctly so — "should I be
     /// moving" genuinely is a level; only the seek was ever an event wearing a
     /// level's clothes. Safe to re-assert every frame, because nothing keys
-    /// off its edges any more. Read by `run_transport` alone, once a chunk:
-    /// the racks read what it latched (`transport_rolling`).
+    /// off its edges any more. Read by `run_transport` alone, once a chunk,
+    /// between two loads of the generation (`Engine::set_rolling` Releases
+    /// it for that): the racks read what it latched (`transport_rolling`).
     rolling: AtomicBool,
     /// **How long a grain is, in FRAMES; zero is off.** See
     /// [`Engine::set_grain_ms`], which is where the milliseconds become
@@ -3350,6 +3352,18 @@ impl Shared {
             .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
     }
 
+    /// `Engine::set_transport`'s stores, which see. Here so a test's host
+    /// can make them from inside a callback (`TransportStores`).
+    fn set_transport(&self, generation: u64, frames: u64) {
+        self.transport_at.store(frames, Ordering::Relaxed);
+        self.transport_req.store(generation, Ordering::Release);
+    }
+
+    /// `Engine::set_rolling`'s store, which see, and here for the same reason.
+    fn set_rolling(&self, rolling: bool) {
+        self.rolling.store(rolling, Ordering::Release);
+    }
+
     /// One channel fader. An out-of-range channel is a no-op, never a panic:
     /// this is reached from UI code, where the panic hook turns a panic into
     /// a dialog and `exit(1)`.
@@ -3414,6 +3428,56 @@ impl Shared {
             self.params_dirty.store(true, Ordering::Release);
         }
     }
+}
+
+/// **Tests only: the stores `Transport::push` makes, made from inside a
+/// callback**, where the engine they belong to is borrowed by the render.
+/// The same code as `Engine::set_transport` and `Engine::set_rolling`.
+#[cfg(test)]
+pub(crate) struct TransportStores<'a>(&'a Shared);
+
+#[cfg(test)]
+impl TransportStores<'_> {
+    pub(crate) fn set_transport(&self, generation: u64, frames: u64) {
+        self.0.set_transport(generation, frames);
+    }
+
+    pub(crate) fn set_rolling(&self, rolling: bool) {
+        self.0.set_rolling(rolling);
+    }
+}
+
+/// Tests only: a host waiting inside `run_transport`'s read. See
+/// [`meet_transport_loads_for_test`].
+#[cfg(test)]
+pub(crate) type TransportMeet = Box<dyn FnMut(u32, &TransportStores<'_>)>;
+
+#[cfg(test)]
+thread_local! {
+    static TRANSPORT_MEET: RefCell<Option<TransportMeet>> = const { RefCell::new(None) };
+}
+
+/// **Tests only: land a host's stores INSIDE the callback's read of the
+/// transport**, the one moment a test cannot otherwise put a store at and
+/// one a live callback meets. On this thread's renders, `meet` is called
+/// after each of `run_transport`'s loads of the host's transport but the
+/// last, with the count of loads made, and handed the engine's stores.
+/// `None` takes it away. Per thread, as libtest runs each test on its own.
+#[cfg(test)]
+pub(crate) fn meet_transport_loads_for_test(meet: Option<TransportMeet>) {
+    TRANSPORT_MEET.with(|slot| *slot.borrow_mut() = meet);
+}
+
+/// The other end of [`meet_transport_loads_for_test`], in `run_transport`.
+#[cfg(test)]
+fn meet_transport(shared: &Shared, loads: u32) {
+    TRANSPORT_MEET.with(|slot| {
+        if let Ok(mut meet) = slot.try_borrow_mut() {
+            if let Some(host) = meet.as_mut() {
+                host(loads, &TransportStores(shared));
+            }
+        }
+    });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -11542,18 +11606,6 @@ impl Renderer {
         self.room_live = withheld > 1.0e-4 || live_in_room;
     }
 
-    /// The whole transport: where this chunk starts, and whether it moves.
-    ///
-    /// **The locate is consumed BEFORE the level is read, in one call**, so a
-    /// seek published before a stop can never be honoured after it — the
-    /// Acquire pairs with the host's Release, and a callback that sees the new
-    /// generation is guaranteed to see every store that preceded it. Per
-    /// CHUNK, not per callback: `mix_track` runs inside the chunk loop, and
-    /// advancing once per callback would hand every chunk after the first the
-    /// same clip samples.
-    ///
-    /// Returns `(at, rolling, jumped)`. A jump — or the level falling — is what
-    /// ends the notes the move strands; see the flush at the call site.
     /// **The gain lane `i` is actually playing at.**
     ///
     /// The automation curve when one is reading, the fader otherwise. This
@@ -11883,7 +11935,38 @@ impl Renderer {
         out
     }
 
+    /// The whole transport: where this chunk starts, and whether it moves.
+    ///
+    /// **The locate and the level are taken as ONE fact.** The host stores
+    /// them one after the other (`Transport::stores`: on the way up the
+    /// locate first, on the way down the level first), so a callback can
+    /// meet a push between two of its stores or between two of its own
+    /// loads. So the generation is loaded, then the level, then the
+    /// generation again, all Acquire against the host's Release: a level up
+    /// stored after its locate reaches the second load with that locate's
+    /// generation, and the seek is taken from the second load. And the
+    /// chunk rolls only if both loads saw one generation, or a Stop landing
+    /// after the level was read would be sought to with the level still up
+    /// and roll a block from the cursor. Either way a locate that lands
+    /// mid-read holds this one chunk on its place, stopped. The generation
+    /// used to be loaded once, before the level, and Play from a new place
+    /// landing between the two rolled a block from where the playhead WAS.
+    /// Per CHUNK, not per callback: `mix_track` runs inside the chunk loop,
+    /// and advancing once per callback would hand every chunk after the
+    /// first the same clip samples.
+    ///
+    /// Returns `(at, rolling, jumped, wrap_from)`. A jump, or the level
+    /// falling, is what ends the notes the move strands; see the flush at
+    /// the call site.
     fn run_transport(&mut self, frames: usize) -> (u64, bool, bool, Option<u64>) {
+        // **The generation, the level, and the generation again.** See the
+        // doc above; the seek is the second generation's.
+        let first = self.shared.transport_req.load(Ordering::Acquire);
+        #[cfg(test)]
+        meet_transport(&self.shared, 1);
+        let level = self.shared.rolling.load(Ordering::Acquire);
+        #[cfg(test)]
+        meet_transport(&self.shared, 2);
         let req = self.shared.transport_req.load(Ordering::Acquire);
         let seek = req != self.seen_req;
         if seek {
@@ -11937,7 +12020,9 @@ impl Renderer {
                 g.clear();
             }
         }
-        let rolling = self.shared.rolling.load(Ordering::Relaxed);
+        // Only a level read between two loads of ONE generation: a locate
+        // that landed mid-read holds this chunk on its place, stopped.
+        let rolling = level && req == first;
         let at = self.pos;
         if rolling {
             self.pos += frames as u64;
@@ -19459,16 +19544,19 @@ impl Engine {
     /// matches a host that has published anything and is re-located on its
     /// first pushed frame.
     pub fn set_transport(&self, generation: u64, frames: u64) {
-        self.shared.transport_at.store(frames, Ordering::Relaxed);
-        self.shared
-            .transport_req
-            .store(generation, Ordering::Release);
+        self.shared.set_transport(generation, frames);
     }
 
     /// The transport level: rolling or stopped. Safe to re-assert every frame;
     /// nothing keys off its edges.
+    ///
+    /// **Released**, so a callback that Acquires the level up sees the
+    /// locate `Transport::stores` puts before it: `run_transport` loads the
+    /// generation again after the level, and that load must not miss it.
+    /// On a weakly ordered CPU a Relaxed level could be seen before the
+    /// generation stored ahead of it, which no test on one thread can show.
     pub fn set_rolling(&self, rolling: bool) {
-        self.shared.rolling.store(rolling, Ordering::Relaxed);
+        self.shared.set_rolling(rolling);
     }
 
     /// Set the loop region in frames, or clear it with `a >= b`. Re-asserted
