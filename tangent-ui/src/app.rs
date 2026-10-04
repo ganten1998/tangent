@@ -599,8 +599,11 @@ pub struct TangentApp {
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: HashMap<(usize, usize), f32>,
-    /// The point under the pointer or being dragged: `(lane, index)`.
-    arr_auto_hot: Option<(usize, usize)>,
+    /// The node being pressed or carried, drawn a size larger: `(lane, slot,
+    /// index)`. ONE row's - by lane and index alone, the same index lit on
+    /// every open row of the lane - and let go with the gesture (the
+    /// release, or the quiet frame that stands in for an unseen one).
+    arr_auto_hot: Option<(usize, usize, usize)>,
     /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
     ///
     /// A row can be closed by its × or by Delete, and Delete needs to know
@@ -6771,7 +6774,7 @@ impl TangentApp {
         self.arr_auto_focus = gone(self.arr_auto_focus);
         self.auto_clipboard_from = gone(self.auto_clipboard_from);
         self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| *l != n);
-        self.arr_auto_hot = self.arr_auto_hot.filter(|(l, _)| *l != n);
+        self.arr_auto_hot = self.arr_auto_hot.filter(|(l, _, _)| *l != n);
         // And its drum KIT: a drum track made here later played the old
         // one's samples at the old one's settings.
         if self.drumpad_kits.get(n).is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default()) {
@@ -16070,7 +16073,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.arr_auto_nodes = chosen;
-        self.arr_auto_hot = lead_now.map(|(_, i)| (lane, i));
+        self.arr_auto_hot = lead_now.map(|(slot, i)| (lane, slot, i));
         if let Some(anchor) = self.arr_auto_drag_from.as_mut() {
             anchor.produced = produced;
             if let Some((_, i)) = lead_now {
@@ -24911,6 +24914,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_tempo_drag = None;
             self.arr_tempo_drag_from = None;
             self.arr_auto_drag_from = None;
+            self.arr_auto_hot = None;
             self.arr_move_orig.clear();
             self.arr_stretch_orig.clear();
             self.arr_band = None;
@@ -25814,7 +25818,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // them to one.
                             self.arr_select_auto_node(n, row, i);
                         }
-                        self.arr_auto_hot = Some((n, i));
+                        self.arr_auto_hot = Some((n, row, i));
                         // **A shift-press that took the node OUT is only
                         // that**: it starts no drag. The drag's first frame
                         // runs on the press itself, carries the node under
@@ -25963,7 +25967,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // The new node comes CHOSEN, so the Delete or the
                             // copy that follows acts on what was just made.
                             self.arr_choose_auto_nodes(vec![(n, row, i)]);
-                            self.arr_auto_hot = Some((n, i));
+                            self.arr_auto_hot = Some((n, row, i));
                             self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                             self.arr_auto_drag_from = self.arr_auto_anchor(n, param, i).map(|mut a| {
                                 a.grab = Some((t, v));
@@ -27032,6 +27036,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ));
             }
             self.arr_auto_drag_from = None;
+            // The node the hand held is not hot once it has let go.
+            self.arr_auto_hot = None;
             // A ruler press that never became a drag: a plain CLICK —
             // locate there, and the old selection clears with it.
             if let Some(ArrDrag::RulerPress { t0, .. }) = self.arr_drag {
@@ -27628,8 +27634,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .map_or(&[][..], crate::automation::Curve::points),
                     hot: self
                         .arr_auto_hot
-                        .filter(|(l, _)| *l == crate::arrangement_panel::MASTER_LANE)
-                        .map(|(_, i)| i),
+                        .filter(|(l, s, _)| {
+                            *l == crate::arrangement_panel::MASTER_LANE && *s == slot
+                        })
+                        .map(|(_, _, i)| i),
                     chosen: self
                         .arr_auto_nodes
                         .iter()
@@ -27675,8 +27683,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                 .map_or(&[][..], crate::automation::Curve::points),
                             hot: self
                                 .arr_auto_hot
-                                .filter(|(l, _)| *l == n)
-                                .map(|(_, i)| i),
+                                .filter(|(l, s, _)| *l == n && *s == slot)
+                                .map(|(_, _, i)| i),
                             chosen: self
                                 .arr_auto_nodes
                                 .iter()
@@ -60533,6 +60541,34 @@ mod tests {
         assert_eq!(app.arr_auto_nodes, vec![(0, 0, 1)], "the click did not choose the node");
         assert_eq!(auto_nodes(&app), before, "a click moved the node");
         assert_eq!(app.history.len(), moments, "a click left an undo step");
+    }
+
+    /// **A hot node is one row's, and it lets go at the release.** The node
+    /// drawn a size larger was named by lane and index alone, so the same
+    /// index lit on every open row of the lane, and nothing put it out when
+    /// the hand let go.
+    #[test]
+    fn a_hot_node_is_one_rows_and_lets_go_on_release() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let (ctx, mut app) = auto_bench("autohot");
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        app.arr_auto_open.insert((0, AutoParam::Pan));
+        app.arrangement.automation.set(Curve::sanitised(
+            0,
+            AutoParam::Pan,
+            vec![pt(0.0, 0.5), pt(3.0, 0.1), pt(5.0, 0.9)],
+        ));
+        let _ = run_frame(&ctx, &mut app);
+        let hot = |app: &TangentApp, slot: usize| {
+            let clips = app.arr_clip_views();
+            app.arrange_view(&clips).lanes[0].automation[slot].hot
+        };
+        let a = auto_at(&app, 2.0, 0.8); // volume node 1
+        press(&ctx, &mut app, a);
+        assert_eq!(hot(&app, 0), Some(1), "fixture: the pressed node is not drawn hot");
+        assert!(hot(&app, 1).is_none(), "the PAN row's node 1 is drawn hot");
+        release(&ctx, &mut app, a);
+        assert!(hot(&app, 0).is_none(), "the node stayed hot after the hand let go");
     }
 
     /// **Several chosen nodes move as ONE shape**, and stay chosen.
