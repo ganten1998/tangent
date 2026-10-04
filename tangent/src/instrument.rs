@@ -7859,8 +7859,9 @@ struct Renderer {
     /// route's gain and each destination's fold gain - `lane_gain`, so its
     /// fader, mute and solo - and pan along the way (`route_transfer`). It
     /// is NOT exact for what PROCESSES the input further on: a folder
-    /// ancestor's rack or board (they work on the group's sum) and a route
-    /// destination's rack, which the subtrahend takes as unity. While an
+    /// ancestor's rack or board (they work on the group's sum, as a folder's
+    /// own do on its own input) and a route destination's rack, which the
+    /// subtrahend takes as unity. While an
     /// input is withheld (monitoring off, its strip muted or soloed out, or
     /// the host's rebuild gate `DesktopApp::armed_racks_pending`), the room
     /// therefore hears `rack(x) - x` for those: a folder denoiser's removed
@@ -11092,7 +11093,16 @@ impl Renderer {
             let heard = live && audible;
             live_in_room |= heard;
             let target = if live {
-                lane_gain_of(&self.auto, &self.shared, strip.index())
+                // **Unity on a FOLDER's own strip**: the fold fades the whole
+                // group, this input included (see `is_folder` below). Its
+                // fader here as well faded it twice - a folder at half played
+                // its own input at a quarter, and a flipped polarity flipped
+                // back.
+                if self.folder_is.get(strip.index()).copied().unwrap_or(false) {
+                    1.0
+                } else {
+                    lane_gain_of(&self.auto, &self.shared, strip.index())
+                }
             } else {
                 0.0
             };
@@ -11120,8 +11130,9 @@ impl Renderer {
             // to somebody's own playing coming through the desk.
             let lane = strip.index().min(CHANNELS - 1);
             // **A live input on a FOLDER goes into the bus raw**, like every
-            // other source standing on one: the folder's rack, pan, send and
-            // meter are the fold's to apply, once, over the whole group.
+            // other source standing on one: the folder's fader, rack, pan,
+            // send and meter are the fold's to apply, once, over the whole
+            // group.
             // This is the fourth writer of the four, and the rule holds in
             // all of them or it holds in none — the two it was missing from
             // are what made a grouped track static and play at half level.
@@ -11411,7 +11422,8 @@ impl Renderer {
             // reaches the master by has to answer to the same switch.
             let direct = self.route_direct.get(strip.index()).copied().unwrap_or(1.0);
             // See `folder_chain_gain`: the room's subtrahend for a grouped
-            // strip is what its folders will make of it, not the raw input.
+            // strip is what its folders will make of it, not the raw input,
+            // and for a folder's own strip that starts with its own fold.
             let chain = self.folder_chain_gain(lane);
             // **And for a ROUTED strip, what its routes make of it**, because
             // that is where it reaches the mix instead (`route_transfer`).
@@ -15196,8 +15208,10 @@ impl Renderer {
         }
     }
 
-    /// **What the folders above a lane will make of what it puts on the
-    /// bus**, per side: the product of every ancestor's slewed gain and pan.
+    /// **What the folders a lane's audio is folded through will make of
+    /// what it puts on the bus**, per side: the product of each one's slewed
+    /// gain and pan. For a folder's own strip the folder itself is the
+    /// first, as in `folder_send_gain`.
     ///
     /// A grouped strip reaches the mix through its folder's fold, not on
     /// its own, so what the room has to keep out of a withheld live input
@@ -15205,12 +15219,20 @@ impl Renderer {
     /// to be the raw input: a muted folder contributed nothing, and taking
     /// the input off a room that never received it put it into the
     /// speakers inverted — the owner's "tracks can be heard if record armed
-    /// and their parent folder is muted". The folder's RACK is not
-    /// modelled: with inserts on a folder the cancellation is as
-    /// approximate as it has always been. A lane with no folder gets 1.
+    /// and their parent folder is muted". A live input on the folder's own
+    /// strip goes into its bus raw and is faded by that fold too, so the
+    /// walk starts there for it: it started at the parent, and a folder off
+    /// unity left the difference in the speakers, a muted one the input
+    /// whole. The folder's RACK is not modelled: with inserts on a folder
+    /// the cancellation is as approximate as it has always been. A lane
+    /// folded through nothing gets 1.
     fn folder_chain_gain(&self, lane: usize) -> [f32; 2] {
         let mut g = [1.0f32; 2];
-        let mut up = self.folders.get(lane).copied().unwrap_or(-1);
+        let mut up = if self.folder_is.get(lane).copied().unwrap_or(false) {
+            i32::try_from(lane).unwrap_or(-1)
+        } else {
+            self.folders.get(lane).copied().unwrap_or(-1)
+        };
         let mut hops = 0;
         while let Ok(a) = usize::try_from(up) {
             if a >= CHANNELS || hops > CHANNELS {
@@ -32542,6 +32564,85 @@ mod tests {
                 "{what}: the send never carried the child to the bus, so this proves nothing ({carried})"
             );
         }
+    }
+
+    /// **A live input on a FOLDER's own strip is faded once, by the fold,
+    /// and the room keeps out what the fold made of it.** `mix_monitor` put
+    /// the input on the bus at the folder's fader, and the fold, which fades
+    /// everything the group holds, faded it again: a folder at half played
+    /// its own input at a quarter, and a flipped polarity flipped back. And
+    /// the room's subtrahend modelled only the folders ABOVE the strip, so
+    /// with that fader off unity the speakers heard the difference with
+    /// monitoring off, and a muted folder put the input into them whole and
+    /// inverted. The take is the control: it carries the input at the
+    /// folder's level whatever the room hears.
+    #[test]
+    fn a_live_input_on_a_folders_own_strip_is_faded_once_and_kept_out_of_the_room() {
+        let mut bad = Vec::new();
+        // (folder muted, polarity flipped, monitoring), for a folder at half.
+        for (muted, flipped, monitoring) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, false, true),
+        ] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            // Lane 1 in lane 2 is what makes lane 2 a folder, and the input
+            // is bound to the folder's OWN strip.
+            shared.folder_of[1].store(2, Ordering::Relaxed);
+            shared.pick_strip[0].store(2, Ordering::Relaxed);
+            shared.midi_off.store(1 << 2, Ordering::Relaxed);
+            shared.armed.store(1 << 2, Ordering::Relaxed);
+            shared.channel_gains[2].store(0.5f32.to_bits(), Ordering::Relaxed);
+            r.channel_gain[2] = 0.5;
+            if muted {
+                shared.muted.store(1 << 2, Ordering::Relaxed);
+            }
+            if flipped {
+                shared.strip_phase.store(1 << 2, Ordering::Relaxed);
+            }
+            shared.monitor_on.store(monitoring, Ordering::Relaxed);
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            for b in 0..(48_000 * 2 / 256) {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+            }
+            // A constant input, so the last frame of each is the level, sign
+            // and all.
+            let taped = captured.last().copied().unwrap_or(0.0);
+            let room = out.last().copied().unwrap_or(0.0);
+            let case = format!("muted={muted} flipped={flipped} monitoring={monitoring}");
+            let want = if flipped { -0.25 } else { 0.25 };
+            if !muted && (taped - want).abs() > 0.01 {
+                bad.push(format!("{case}: the take has the folder's own input at {taped}, not {want}"));
+            }
+            let room_wants = if monitoring && !muted { want } else { 0.0 };
+            if (room - room_wants).abs() > 1.0e-3 {
+                bad.push(format!("{case}: the speakers have it at {room}, not {room_wants}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     /// **A frozen lane's seat reports no latency**, so the lane is
