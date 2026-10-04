@@ -21788,6 +21788,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.undo_commit();
     }
 
+    /// **A drum pad knob let go** - at its release, or on the quiet frame
+    /// that stands in for a release nobody saw
+    /// (`end_desk_drags_let_go_unseen`), which lands it the same way.
+    ///
+    /// **A click on the NUMBER types it; a DOUBLE on the track resets it** —
+    /// judged HERE because the pair is closed by the second release, never
+    /// by a press. A single motionless click on the track means nothing at
+    /// all, and a drag is its one moment.
+    fn drumpad_let_go(&mut self, grab: DrumpadGrab) {
+        let double = self.primary_paired;
+        self.drumpad_grab = None;
+        if !grab.moved && !grab.on_number && double {
+            self.drumpad_set(grab.param, grab.param.default_value());
+            self.drumpad_edited();
+        } else if !grab.moved && grab.on_number {
+            self.drumpad_num = Some((grab.param, String::new()));
+        } else if grab.moved {
+            self.drumpad_edited();
+        }
+    }
+
     fn drumpad_save(&mut self) {
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
             // The kit saves itself, so the kit is a REAL thing: the folder
@@ -22236,20 +22257,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             } else {
-                // **A click on the NUMBER types it; a DOUBLE on the track
-                // resets it** — judged HERE because the pair is closed by the
-                // second release, never by a press. A single motionless click
-                // on the track means nothing at all.
-                let double = self.primary_paired;
-                self.drumpad_grab = None;
-                if !grab.moved && !grab.on_number && double {
-                    self.drumpad_set(grab.param, grab.param.default_value());
-                    self.drumpad_edited();
-                } else if !grab.moved && grab.on_number {
-                    self.drumpad_num = Some((grab.param, String::new()));
-                } else if grab.moved {
-                    self.drumpad_edited();
-                }
+                self.drumpad_let_go(grab);
             }
             return;
         }
@@ -37653,6 +37661,39 @@ impl TangentApp {
         self.commit_view_change();
     }
 
+    /// **A release nobody saw still ends the desk's drags**, on the first
+    /// frame with no button down and no release: the lanes' and the
+    /// editor's rule (see `arrangement_input`), for the four drags that live
+    /// outside them - the mixer's fader, an effect panel's row, the
+    /// metronome panel's tempo and a drum pad's knob.
+    ///
+    /// Each reads its release behind a gate - a dialog raised mid-drag, a
+    /// menu, a band popup, the input menu - and a release that arrived
+    /// while one stood went by unseen. The fader then followed the bare
+    /// pointer once the gate lifted (its drag never asks whether the button
+    /// is still down); the others stayed armed, every one of them held the
+    /// frame's view commit off, the drum pad's kept the surfaces under it
+    /// standing down, and what the drag had changed rode the next gesture's
+    /// step back. So this runs once a frame ahead of every gate, and each
+    /// drag ends with the moment its own release would have committed.
+    fn end_desk_drags_let_go_unseen(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released()) {
+            return;
+        }
+        if self.mixer_grab.take().is_some() {
+            self.undo_commit();
+        }
+        if self.fx_drag.take().is_some() {
+            self.undo_commit();
+        }
+        if std::mem::take(&mut self.met_drag) {
+            self.arr_save_edits();
+        }
+        if let Some(grab) = self.drumpad_grab {
+            self.drumpad_let_go(grab);
+        }
+    }
+
     /// **A change to the arrangement's grid or window, or to the editor's
     /// feel, is a moment.**
     ///
@@ -38190,6 +38231,9 @@ impl TangentApp {
         // `dialog_blocks_pointer` and that answer now depends on where the
         // press LANDED rather than on where the pointer happens to be.
         self.track_overlay_grab(&ctx);
+        // **And the desk's drags whose release went by unseen end now**,
+        // ahead of the gates that hid it - see the function.
+        self.end_desk_drags_let_go_unseen(&ctx);
 
         // **The Welcome card waits for the splash.** It is a separate OS
         // window and the splash is a layer inside this one, so the layer
@@ -42793,6 +42837,110 @@ mod tests {
         assert!(st.drag.is_none(), "the lost release left the note drag standing");
         assert!(!st.dirty, "the lost release left the note drag's moment owed");
         assert_eq!(app.hist_at, before + 1, "the note drag left {} moments", app.hist_at - before);
+    }
+
+    /// **The desk's own drags end on a quiet frame too**, each with the
+    /// moment it owes.
+    ///
+    /// The lanes and the editor learned the rule above; the mixer's fader,
+    /// an effect panel's row, the metronome panel's tempo and a drum pad's
+    /// knob still read their release behind a gate. A question raised
+    /// mid-drag (or a band popup over the timeline) swallowed it: the fader
+    /// then followed the bare pointer once the question went, the others
+    /// stayed armed, every one of them held the frame's view commit off,
+    /// and what the drag had changed rode the next gesture's step back.
+    /// Here the gate is still up on the quiet frame after the release.
+    #[test]
+    fn a_desk_drag_whose_release_nobody_saw_ends_on_the_next_quiet_frame() {
+        let let_go_under_a_gate = |ctx: &egui::Context, app: &mut TangentApp, at: Pos2| {
+            release(ctx, app, at);
+            move_to(ctx, app, at + Vec2::new(0.0, -40.0));
+        };
+
+        // The MIXER's fader, under a question.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        app.arrangement_open = false;
+        let _ = run_frame(&ctx, &mut app);
+        let at = app.mixer_rect.expect("the mixer was not drawn").center();
+        let fader = crate::mixer_panel::Hit::Fader(recorder::Column(1));
+        app.apply_mixer_hit(fader, 0.3);
+        app.undo_commit();
+        let before = app.hist_at;
+        // The drag in flight, as its last frame left it.
+        app.apply_mixer_hit(fader, 0.6);
+        app.mixer_grab = Some(MixerGrab { hit: fader, from: at, moved: true, from_value: 0.6 });
+        app.dialog = Some(Dialog::About);
+        let_go_under_a_gate(&ctx, &mut app, at);
+        assert!(app.mixer_grab.is_none(), "the lost release left the fader's drag standing");
+        assert_eq!(app.hist_at, before + 1, "the fader's drag left {} moments", app.hist_at - before);
+        // The question goes and the bare pointer travels: nothing follows it.
+        app.dialog = None;
+        move_to(&ctx, &mut app, at + Vec2::new(0.0, -160.0));
+        assert!(
+            (app.mixer_value(fader) - 0.6).abs() < 1e-6,
+            "the fader followed a pointer with no button down, to {}",
+            app.mixer_value(fader)
+        );
+
+        // An EFFECT panel's row, under a question.
+        let (ctx, mut app) = headless_with_fx(Caps::DESKTOP);
+        let fx = recorder_panel::Fx::Chorus;
+        app.fx_open = Some(fx);
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let was = app.effect_param("chorus_depth");
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", if was > 0.5 { 0.1 } else { 0.9 });
+        app.press_in_fx_panel(screen, fx, at, true);
+        assert_eq!(app.fx_drag, Some("chorus_depth"), "fixture: the row was not grabbed");
+        assert!((app.effect_param("chorus_depth") - was).abs() > 0.2, "fixture: the press moved nothing");
+        app.dialog = Some(Dialog::About);
+        let_go_under_a_gate(&ctx, &mut app, at);
+        assert!(app.fx_drag.is_none(), "the lost release left the effect row's drag standing");
+        assert_eq!(app.hist_at, before + 1, "the row's drag left {} moments", app.hist_at - before);
+
+        // The METRONOME panel's tempo, under a band popup: the timeline's
+        // input, which reads this drag's release, stands down for one.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let bpm = app.tempo_bpm();
+        app.met_menu = Some(());
+        app.met_drag = true;
+        app.set_tempo_fraction(if bpm > 120.0 { 0.2 } else { 0.8 });
+        assert!((app.tempo_bpm() - bpm).abs() > 1.0, "fixture: the tempo did not move");
+        app.setup_open = true;
+        let_go_under_a_gate(&ctx, &mut app, Pos2::new(650.0, 600.0));
+        assert!(!app.met_drag, "the lost release left the tempo drag standing");
+        assert_eq!(app.hist_at, before + 1, "the tempo drag left {} moments", app.hist_at - before);
+
+        // A DRUM PAD's knob, under a question.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        let at = app.drumpad_rect.expect("the drum pads did not lay out").center();
+        // A pad with a sample in it: an empty pad's knobs are not saved.
+        let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.undo_commit();
+        let before = app.hist_at;
+        let param = crate::drumpad_panel::Param::Gain;
+        let was = app.drumpad_get(param);
+        app.drumpad_set(param, was * 0.5);
+        assert!((app.drumpad_get(param) - was).abs() > 1e-3, "fixture: the knob did not move");
+        app.drumpad_grab = Some(DrumpadGrab {
+            param,
+            from: at,
+            from_value: app.drumpad_get(param),
+            moved: true,
+            on_number: false,
+        });
+        app.dialog = Some(Dialog::About);
+        let_go_under_a_gate(&ctx, &mut app, at);
+        assert!(app.drumpad_grab.is_none(), "the lost release left the drum pad's knob standing");
+        assert_eq!(app.hist_at, before + 1, "the knob's drag left {} moments", app.hist_at - before);
     }
 
     /// **The frame's own commit waits for every drag in flight, not only
