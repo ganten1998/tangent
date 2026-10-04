@@ -1115,6 +1115,14 @@ pub struct TangentApp {
     /// Track's shift and the track that lands in the gap are one moment
     /// carrying one permutation.
     perm_since_moment: Option<Vec<usize>>,
+    /// **The moment the last click on a jump-to-the-pointer row left**, by
+    /// its words, and the row: what a double-click's reset takes the place
+    /// of. See `undo_commit_double_click`.
+    click_moment: Option<(ClickRow, std::sync::Arc<Vec<u64>>)>,
+    /// **The automation rows closed since the standing moment**, waiting,
+    /// like `perm_since_moment`, for the commit that keeps them in
+    /// `Moment::rows_closed`. Filled by `close_auto_rows`.
+    rows_closed_since_moment: ClosedRows,
     /// The marquee'd SET of clips, beside the single selection — the
     /// right-drag band fills it, Delete empties it with the clips.
     arr_multi: Vec<u64>,
@@ -2466,6 +2474,13 @@ struct Moment {
     /// sends the host this order's inverse on the way back and the order
     /// itself on the way forward, through the door a reorder uses.
     perm: Option<std::sync::Arc<Vec<usize>>>,
+    /// **The automation rows the gesture that made this moment closed with
+    /// their curves**: a track's removal, a plugin's replace. The words
+    /// cannot say them either - which rows are open, armed and bypassed is
+    /// session state beside the document - so the undo brought the curves
+    /// back with their rows shut and a bypassed curve playing. `undo_apply`
+    /// opens them again going back and shuts them again going forward.
+    rows_closed: Option<std::sync::Arc<ClosedRows>>,
 }
 
 impl Moment {
@@ -2473,6 +2488,21 @@ impl Moment {
     /// for both? The question every exact caller asks.
     fn same_text(&self, other: &Self) -> bool {
         self.words == other.words
+    }
+}
+
+/// **Automation rows closed with their curves**, by the set each stood in -
+/// see `Moment::rows_closed`.
+#[derive(Clone, Debug, Default)]
+struct ClosedRows {
+    open: Vec<(usize, crate::automation::AutoParam)>,
+    armed: Vec<(usize, crate::automation::AutoParam)>,
+    bypassed: Vec<(usize, crate::automation::AutoParam)>,
+}
+
+impl ClosedRows {
+    fn is_empty(&self) -> bool {
+        self.open.is_empty() && self.armed.is_empty() && self.bypassed.is_empty()
     }
 }
 
@@ -3923,6 +3953,17 @@ struct DrumpadGrab {
     on_number: bool,
 }
 
+/// **Which jump-to-the-pointer row a click landed on**, so a double-click's
+/// reset takes the place of its own first click's moment and no other row's
+/// (`TangentApp::undo_commit_double_click`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickRow {
+    /// A row of the band's effect panel, by its parameter key.
+    Fx(&'static str),
+    /// A knob of the Keys panel: the strip's slot and the knob.
+    Keys(usize, usize),
+}
+
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
 use crate::recorder_panel::KNOB_TRAVEL;
 
@@ -4275,6 +4316,8 @@ impl TangentApp {
             mixer_reorder: None,
             desk_state_perm: None,
             perm_since_moment: None,
+            click_moment: None,
+            rows_closed_since_moment: ClosedRows::default(),
             arr_multi: Vec::new(),
             arr_sel_seen: (None, Vec::new()),
             arr_band: None,
@@ -6770,9 +6813,7 @@ impl TangentApp {
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
         }
-        self.arr_auto_open.retain(|(l, _)| *l != n);
-        self.arr_auto_armed.retain(|(l, _)| *l != n);
-        self.arr_auto_bypassed.retain(|(l, _)| *l != n);
+        self.close_auto_rows(|(l, _)| *l == n);
         self.arr_auto_nodes.retain(|(l, _, _)| *l != n);
         let gone = |aim: Option<(usize, crate::automation::AutoParam)>| aim.filter(|(l, _)| *l != n);
         self.arr_auto_focus = gone(self.arr_auto_focus);
@@ -8385,16 +8426,19 @@ impl TangentApp {
                 // panel chrome cannot reset by accident.
                 if let Some(key) = self.fx_drag {
                     let double = self.primary_paired;
-                    if double {
-                        self.settings.effect_params.shift_remove(key);
-                        self.save_settings();
-                    }
                     // **The drag's one moment, at the release** - and the
-                    // double-click reset's, which lands here too. The rack's
+                    // double-click reset's, which lands here too and takes
+                    // the place of its first click's jump. The rack's
                     // parameters are hashed, and the row saved per frame and
                     // committed nothing, so a turned decay rode the next
                     // gesture's step back.
-                    self.undo_commit();
+                    if double {
+                        self.settings.effect_params.shift_remove(key);
+                        self.save_settings();
+                        self.undo_commit_double_click(ClickRow::Fx(key));
+                    } else {
+                        self.undo_commit_click(ClickRow::Fx(key));
+                    }
                 }
                 self.fx_drag = None;
             }
@@ -8844,92 +8888,13 @@ impl TangentApp {
         }
     }
 
-    // ── Detach / attach (spec §5.7) ────────────────────────────────────────
-
-    fn detach_chord_window(&mut self) {
-        // Python seeded the detached height from the attached strip on every
-        // detach, which is what made the window a piano-wide sliver each time
-        // and quietly discarded whatever size the user had chosen. The window
-        // now reopens wherever and however they last left it.
-        self.settings.chord_window_detached = true;
-        self.detach_window_visible = true;
-        self.detached_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.detached_size_for_use(),
-            self.monitor_size,
-        );
-        self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
-        });
-        self.detached_live_size = None;
-        self.detached_live_pos = None;
-        self.detached_shown_at = Some(Instant::now());
-        self.detached_wm_managed = false;
-        self.save_settings();
-    }
-
-    // ── The popped-out neck (D-UI-16) ─────────────────────────────────────
-
-    fn detach_fretboard(&mut self) {
-        self.settings.fretboard_detached = true;
-        self.fret_window_visible = true;
-        self.fret_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.fretboard_win_size(),
-            self.monitor_size,
-        );
-        self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
-        });
-        self.fret_live_size = None;
-        self.fret_live_pos = None;
-        self.fret_shown_at = Some(Instant::now());
-        self.fret_wm_managed = false;
-        self.save_settings();
-    }
-
-    fn detach_theory(&mut self) {
-        self.settings.theory_detached = true;
-        self.theory_window_visible = true;
-        self.theory_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.theory_win_size(),
-            self.monitor_size,
-        );
-        self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.theory_builder_size, self.monitor_size)
-        });
-        // The guard is armed with the SAME size handed to the builder, and both
-        // must stay fixed for as long as the window lives: a guard measuring
-        // against a size that drifts cannot tell a tiling WM from a user.
-        self.theory_guard = Some(theory_panel::GeometryGuard::opened(
-            self.theory_builder_size,
-            Instant::now(),
-        ));
-        self.save_settings();
-    }
-
     // ── The Recorder popout ────────────────────────────────────────────────
     //
-    // Four fields and three methods, the same three the theory window has. The
+    // Four fields and two methods, the same two the theory window has. The
     // one difference worth noting is that this popout has a REASON beyond
     // taste: a second monitor holding a big framing view of the camera while
-    // the piano stays where it is.
-
-    fn detach_recorder(&mut self) {
-        self.settings.recorder_detached = true;
-        self.recorder_window_visible = true;
-        self.recorder_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.recorder_win_size(),
-            self.monitor_size,
-        );
-        self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.recorder_builder_size, self.monitor_size)
-        });
-        self.recorder_guard = Some(theory_panel::GeometryGuard::opened(
-            self.recorder_builder_size,
-            Instant::now(),
-        ));
-        self.save_settings();
-        self.request_natural_size();
-    }
+    // the piano stays where it is. Nothing pops it out any more (and `new`
+    // clears the flag on the way in), so what is left is the way back.
 
     fn reattach_recorder(&mut self) {
         if self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
@@ -12171,7 +12136,8 @@ impl TangentApp {
     /// **The automation rows the session holds, carried to the lanes they
     /// now name.** Which rows are open, armed or bypassed, and the paste's
     /// two aims, are `(lane, param)` pairs kept beside the document rather
-    /// than in it, so nothing else moves them. A reorder calls this, and so
+    /// than in it, so nothing else moves them; so are each lane's mode,
+    /// latch and last written point. A reorder calls this, and so
     /// does an undo or redo that crosses one: the words put each curve back
     /// on its old lane, and a bypass left where the reorder had taken it
     /// let that curve play and silenced whichever curve took its row.
@@ -12195,6 +12161,52 @@ impl TangentApp {
         self.arr_auto_bypassed = remap(&self.arr_auto_bypassed);
         self.arr_auto_focus = self.arr_auto_focus.map(|(l, p)| (to(l), p));
         self.auto_clipboard_from = self.auto_clipboard_from.map(|(l, p)| (to(l), p));
+        self.arr_auto_modes = self.arr_auto_modes.iter().map(|(&l, &m)| (to(l), m)).collect();
+        self.arr_auto_latched = self.arr_auto_latched.iter().map(|&l| to(l)).collect();
+        self.arr_auto_last = self
+            .arr_auto_last
+            .iter()
+            .map(|(&(l, p), &v)| ((to(l), p), v))
+            .collect();
+    }
+
+    /// **Close the automation rows `named` picks, open, armed and bypassed,
+    /// and keep them for the moment this gesture leaves**, so the undo that
+    /// brings their curves back opens them again (`Moment::rows_closed`).
+    /// For a track's removal and a plugin's replace, which take the curves
+    /// those rows draw.
+    fn close_auto_rows(&mut self, named: impl Fn(&(usize, crate::automation::AutoParam)) -> bool) {
+        let kept = &mut self.rows_closed_since_moment;
+        kept.open.extend(self.arr_auto_open.iter().filter(|r| named(r)));
+        kept.armed.extend(self.arr_auto_armed.iter().filter(|r| named(r)));
+        kept.bypassed.extend(self.arr_auto_bypassed.iter().filter(|r| named(r)));
+        self.arr_auto_open.retain(|r| !named(r));
+        self.arr_auto_armed.retain(|r| !named(r));
+        self.arr_auto_bypassed.retain(|r| !named(r));
+    }
+
+    /// The rows a moment closed, open again: an undo back across it brought
+    /// their curves back. See `Moment::rows_closed`. A row chosen on one of
+    /// their lanes goes, since its slot now counts other rows.
+    fn reopen_auto_rows(&mut self, rows: &ClosedRows) {
+        self.arr_auto_open.extend(rows.open.iter().copied());
+        self.arr_auto_armed.extend(rows.armed.iter().copied());
+        self.arr_auto_bypassed.extend(rows.bypassed.iter().copied());
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
+    }
+
+    /// The rows a moment closed, shut again with the aims that name them: a
+    /// redo across it took their curves away again, as its gesture did.
+    fn shut_auto_rows(&mut self, rows: &ClosedRows) {
+        let named = |row: &(usize, crate::automation::AutoParam)| {
+            rows.open.contains(row) || rows.armed.contains(row) || rows.bypassed.contains(row)
+        };
+        self.arr_auto_open.retain(|r| !named(r));
+        self.arr_auto_armed.retain(|r| !named(r));
+        self.arr_auto_bypassed.retain(|r| !named(r));
+        self.arr_auto_focus = self.arr_auto_focus.filter(|r| !named(r));
+        self.auto_clipboard_from = self.auto_clipboard_from.filter(|r| !named(r));
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
     }
 
     /// **Open an empty lane directly below `n`**, the rows under it shifting
@@ -13949,13 +13961,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
     }
 
-    /// One bar in seconds, from the band's own tempo and signature.
     /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
     /// a bar, a beat, or a hundredth of one. Start PANS the viewport, End
     /// moves its far edge, Length zooms around its centre.
     fn lcd_adjust(&mut self, row: u8, part: u8, steps: f64) {
-        let bar = self.arr_bar_s();
-        let beat = bar / f64::from(self.time_signature().beats.max(1));
+        // A bar and a beat where the row moves - the window's start, its far
+        // edge, its centre or the playhead - on the song's maps.
+        let (s, l) = self.arr_window_now();
+        let at = match row {
+            0 => s,
+            1 => s + l,
+            3 => self.recorder.position_s,
+            _ => s + l * 0.5,
+        };
+        let bar = self.arr_bar_s(at);
+        let beats = {
+            let (tempo, meter) = (self.live_tempo_map(), self.live_meter_map());
+            meter.sig_at_bar(meter.bar_beat_at_quarter(tempo.beat_at_seconds(at.max(0.0))).0).beats
+        };
+        let beat = bar / f64::from(beats.max(1));
         let unit = match part {
             0 => bar,
             1 => beat,
@@ -13969,7 +13993,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.request_recorder(recorder::RecorderRequest::Locate(to));
             return;
         }
-        let (s, l) = self.arr_window_now();
         match row {
             0 => self.arr_steer(s + d, l),
             1 => self.arr_steer(s, (l + d).max(0.25)),
@@ -13980,22 +14003,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    fn arr_bar_s(&self) -> f64 {
-        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
-        let sig = self.time_signature();
-        f64::from(sig.beats) * (60.0 / bpm) * (4.0 / f64::from(sig.unit))
+    /// One bar in seconds where `at` stands: the bar the ruler draws there,
+    /// on the song's tempo and meter maps, from `at`.
+    fn arr_bar_s(&self, at: f64) -> f64 {
+        self.arr_rung_s(0, at)
     }
 
-    /// The grid in seconds: one rung of `grid_quarters`, the note value the
-    /// ruler draws, so an arrow step is one drawn line. It was the bar times
-    /// `2^exp`, which in 3/4, 6/8 and 7/8 is no line at all, and the magnet
-    /// after the step skipped lines. At the dial's tempo and signature, not
-    /// the maps', as `arr_bar_s` is.
-    fn arr_grid_s(&self) -> f64 {
-        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
-        let sig = self.time_signature();
-        let exp = self.settings.arr_grid_exp.clamp(-6, 3) as i8;
-        crate::arrangement_panel::grid_quarters(exp, sig.beats, sig.unit) * (60.0 / bpm)
+    /// The grid in seconds where `at` stands: one rung of `grid_quarters`,
+    /// the note value the ruler draws in that bar's signature, so an arrow
+    /// step is one drawn line. It was the bar times `2^exp`, which in 3/4,
+    /// 6/8 and 7/8 is no line at all, and the magnet after the step skipped
+    /// lines. On the song's maps, as `arr_bar_s` is.
+    fn arr_grid_s(&self, at: f64) -> f64 {
+        self.arr_rung_s(self.settings.arr_grid_exp.clamp(-6, 3) as i8, at)
+    }
+
+    /// **One step of rung `exp` where `at` stands** (a bar at zero), in
+    /// seconds: the straight grid `quantize::Grid` walks on the song's maps,
+    /// which is the arrangement magnet's walk (`snap_quarter`). Both lengths
+    /// above came from the tempo dial and the settings' signature, so past a
+    /// tempo or meter change a step was a length the song does not have
+    /// there.
+    fn arr_rung_s(&self, exp: i8, at: f64) -> f64 {
+        crate::quantize::Grid::new(self.live_tempo_map(), self.live_meter_map(), exp, false, None)
+            .map_or(0.0, |g| g.step_at(at.max(0.0)))
     }
 
     /// **The playhead walks the grid on the arrow keys**, in the arrange
@@ -14006,8 +14037,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// step is rounded to the nearest line, which from a line IS the next
     /// line, and from between two lines is the nearer of the two ahead.
     fn arr_step_playhead(&mut self, dir: f64, by_bar: bool) {
-        let step = if by_bar { self.arr_bar_s() } else { self.arr_grid_s() }.max(0.01);
-        let to = (self.playhead_s() + dir.signum() * step).max(0.0);
+        let at = self.playhead_s();
+        let step = if by_bar { self.arr_bar_s(at) } else { self.arr_grid_s(at) }.max(0.01);
+        let to = (at + dir.signum() * step).max(0.0);
         let to = self.arr_snap_t(to);
         self.locate(to);
     }
@@ -16636,6 +16668,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             mark,
             // Attached where a moment is KEPT - see `undo_commit_moment`.
             perm: None,
+            rows_closed: None,
         }
     }
 
@@ -16715,6 +16748,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * a DRAG marks `arr_gesture_dirty` (or its own surface's grab) and
     ///   commits once at its release, so a release an early return can
     ///   swallow must still end the gesture;
+    /// * a DOUBLE-CLICK that resets a row its presses jump to the pointer
+    ///   takes the place of its first click's moment
+    ///   (`undo_commit_double_click`);
     /// * a held KEY, which repeats, commits once when it comes up (the
     ///   transpose's `transpose_owed`);
     /// * a BATCH of committing writers is held with `begin_one_moment` and
@@ -16772,10 +16808,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // word (two empty lanes trading places) must not ride into the
             // NEXT gesture's moment and be undone with it.
             self.perm_since_moment = None;
+            self.rows_closed_since_moment = ClosedRows::default();
             return;
         }
-        // The reorders this gesture made ride in the moment they made.
+        // The reorders this gesture made ride in the moment they made, and
+        // so do the automation rows it closed.
         state.perm = self.perm_since_moment.take().map(std::sync::Arc::new);
+        let closed = std::mem::take(&mut self.rows_closed_since_moment);
+        state.rows_closed = (!closed.is_empty()).then(|| std::sync::Arc::new(closed));
         self.history.truncate(self.hist_at.saturating_add(1));
         self.history.push(state);
         // New work since "Don't Save": nobody has been asked about THIS.
@@ -16787,6 +16827,46 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.history.drain(..overflow);
         }
         self.hist_at = self.history.len() - 1;
+    }
+
+    /// **The commit at a click's release on a row that jumps to the
+    /// pointer**, remembering the moment it left: the click may turn out to
+    /// be the first of a double, and nothing can know that yet.
+    fn undo_commit_click(&mut self, row: ClickRow) {
+        let top = |s: &Self| s.history.get(s.hist_at).map(|m| std::sync::Arc::clone(&m.words));
+        let was = top(self);
+        self.undo_commit();
+        self.click_moment = top(self)
+            .filter(|now| !was.as_ref().is_some_and(|w| std::sync::Arc::ptr_eq(w, now)))
+            .map(|now| (row, now));
+    }
+
+    /// **A double-click's reset is one step back with its first click.**
+    ///
+    /// Each press on such a row jumps it to the pointer, so the first click
+    /// committed its jump at its release (`undo_commit_click`), and the
+    /// reset at the second release made a second moment: one Ctrl+Z after
+    /// a double-click landed on a value nobody chose. The reset takes that
+    /// moment's place instead, but only while it is still the moment stood
+    /// on, is this row's, and carries no reorder and no closed rows;
+    /// anything else between the two clicks leaves the reset a moment of
+    /// its own.
+    fn undo_commit_double_click(&mut self, row: ClickRow) {
+        if let Some((clicked, words)) = self.click_moment.take() {
+            let first_click_on_top = clicked == row
+                && self.undo_hold == 0
+                && self.hist_at > 0
+                && self.history.get(self.hist_at).is_some_and(|m| {
+                    std::sync::Arc::ptr_eq(&m.words, &words)
+                        && m.perm.is_none()
+                        && m.rows_closed.is_none()
+                });
+            if first_click_on_top {
+                self.history.truncate(self.hist_at);
+                self.hist_at -= 1;
+            }
+        }
+        self.undo_commit();
     }
 
     /// A fresh project starts a fresh line of time.
@@ -16802,6 +16882,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.hist_at = 0;
         // Moment zero has no moment before it to have been carried from.
         self.perm_since_moment = None;
+        self.rows_closed_since_moment = ClosedRows::default();
         self.undo_commit_moment(state);
     }
 
@@ -16829,9 +16910,37 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let carry = steps.into_iter().reduce(|first, then| compose_orders(&first, &then));
         if let Some(order) = carry {
             self.send_desk_perm(&order);
-            // And the automation rows the session keeps beside the words,
-            // which the words cannot put back - see `carry_automation_rows`.
-            self.carry_automation_rows(&invert_order(&order));
+        }
+        // And the automation rows the session keeps beside the words, which
+        // the words cannot put back, one crossed moment at a time: a
+        // reorder's carry (see `carry_automation_rows`), and the rows its
+        // gesture closed with their curves, open again going back and shut
+        // again going forward (see `Moment::rows_closed`).
+        let crossed: Vec<usize> = if at < from {
+            (at + 1..=from).rev().collect()
+        } else {
+            (from + 1..=at).collect()
+        };
+        for k in crossed {
+            let Some(m) = self.history.get(k) else {
+                continue;
+            };
+            let (perm, rows) = (m.perm.clone(), m.rows_closed.clone());
+            if at < from {
+                if let Some(rows) = rows {
+                    self.reopen_auto_rows(&rows);
+                }
+                if let Some(order) = perm {
+                    self.carry_automation_rows(&order);
+                }
+            } else {
+                if let Some(order) = perm {
+                    self.carry_automation_rows(&invert_order(&order));
+                }
+                if let Some(rows) = rows {
+                    self.shut_auto_rows(&rows);
+                }
+            }
         }
         // The document moves, so an earlier "Don't Save" no longer covers it.
         self.outgoing_discarded = false;
@@ -19384,7 +19493,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let dur = if view.snap_on {
                 (crate::midi_editor::snap_next_t(&view, t0) - t0).max(0.02)
             } else {
-                crate::midi_editor::grid_step_s(&view).max(0.05)
+                crate::midi_editor::grid_step_at(&view, t0).max(0.05)
             };
             (dur, (clip.start_s, clip.start_s + clip.len_s, clip.offset_s))
         };
@@ -20214,26 +20323,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let step = {
+        // **The step where each note stands**: across a tempo change inside
+        // the part the two sides' steps differ, and a copy one playhead's
+        // step later left the lines on the other side.
+        let steps: Vec<f64> = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
             let view = self.midi_edit_view(st, clip);
-            let g = crate::midi_editor::grid_step_s(&view).max(0.05);
-            // A swung phrase copied one straight step later lands its long
-            // notes in the short slots: the copy moves by the PAIR.
-            if view.snap_on && view.swing && !view.triplet {
-                g * 2.0
-            } else {
-                g
-            }
+            let pair = view.snap_on && view.swing && !view.triplet;
+            sel.iter()
+                .map(|&i| {
+                    let at = clip
+                        .notes
+                        .get(i)
+                        .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                    let g = crate::midi_editor::grid_step_at(&view, at).max(0.05);
+                    // A swung phrase copied one straight step later lands its
+                    // long notes in the short slots: the copy moves by the PAIR.
+                    if pair { g * 2.0 } else { g }
+                })
+                .collect()
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let end = clip.offset_s + clip.len_s;
         let mut fresh = Vec::new();
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             let Some(n) = clip.notes.get(i) else { continue };
             let mut c = n.clone();
             c.at_s += step;
@@ -20361,7 +20478,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let (step, walked) = {
+        let (steps, walked) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
@@ -20391,7 +20508,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .collect::<Vec<f64>>()
                 });
             (
-                crate::midi_editor::grid_step_s(&view).max(0.01),
+                // The step where each note stands - see `me_duplicate`.
+                sel.iter()
+                    .map(|&i| {
+                        let at = clip
+                            .notes
+                            .get(i)
+                            .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                        crate::midi_editor::grid_step_at(&view, at).max(0.01)
+                    })
+                    .collect::<Vec<f64>>(),
                 walked,
             )
         };
@@ -20410,18 +20536,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_save_edits();
             return;
         }
-        let dt = steps_t * step;
-        // The set's clamps, exactly as a drag's.
-        let mut dt_all = dt;
+        // The set's clamps, exactly as a drag's: every note travels the same
+        // SHARE of its own step, cut down at the first wall, so the set stops
+        // as one. With one step for all - one tempo - it is the uniform
+        // clamp it was.
+        let mut share = steps_t;
         let mut dk_all = dk;
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             let Some(n) = clip.notes.get(i) else { continue };
-            dt_all = dt_all.clamp(-n.at_s + clip.offset_s, (end - n.dur_s.max(0.05) - n.at_s).max(0.0));
+            share = (share * step)
+                .clamp(-n.at_s + clip.offset_s, (end - n.dur_s.max(0.05) - n.at_s).max(0.0))
+                / step;
             dk_all = dk_all.clamp(-i32::from(n.key), 127 - i32::from(n.key));
         }
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             if let Some(n) = clip.notes.get_mut(i) {
-                n.at_s += dt_all;
+                n.at_s += share * step;
                 n.key = (i32::from(n.key) + dk_all).clamp(0, 127) as u8;
             }
         }
@@ -20640,9 +20770,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// left and right arrows, the owner's "Shift+Left/Right arrow = elongate
     /// note".
     ///
-    /// Every selected note by the same amount rather than to the same length,
-    /// so a chord of unequal notes keeps its shape. A note can never be
-    /// shortened out of existence or lengthened past its clip's end.
+    /// Every selected note by the same amount rather than to the same length
+    /// (the grid step where it starts), so a chord of unequal notes keeps
+    /// its shape. A note can never be shortened out of existence or
+    /// lengthened past its clip's end.
     fn me_resize_selection(&mut self, steps: f64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -20651,17 +20782,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let step = {
+        // The step where each note starts - see `me_duplicate`. A chord
+        // shares its start, so it keeps its shape.
+        let note_steps: Vec<f64> = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
-            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.01)
+            let view = self.midi_edit_view(st, clip);
+            sel.iter()
+                .map(|&i| {
+                    let at = clip
+                        .notes
+                        .get(i)
+                        .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                    crate::midi_editor::grid_step_at(&view, at).max(0.01)
+                })
+                .collect()
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let end = clip.offset_s + clip.len_s;
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&note_steps) {
             if let Some(n) = clip.notes.get_mut(i) {
                 let room = (end - n.at_s).max(ME_MIN_DUR_S);
                 n.dur_s = (n.dur_s + steps * step).clamp(ME_MIN_DUR_S, room);
@@ -20892,7 +21034,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// before the fourth arrived, and four copies of `0.08` is how a rail
     /// and a fit come to disagree about where the clip ends.
     fn me_clip_pad_s(&self, clip: &crate::arrangement::ArrClip) -> f64 {
-        (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5)
+        (clip.len_s * 0.08).max(self.arr_bar_s(clip.start_s) * 0.5)
     }
 
     /// **The navigator's world**, `(start, len)` in absolute seconds: the
@@ -21405,7 +21547,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 on: false,
             });
         }
-        self.drumpad_grab = None;
+        // A knob let go by the closing (Esc, with the hand still on it) ends
+        // as its release would: one moment, and the sidecar written.
+        if self.drumpad_grab.take().is_some_and(|g| g.moved) {
+            self.drumpad_edited();
+        }
         self.drumpad_move = None;
         self.pad_menu = None;
         self.pad_trim_drag = None;
@@ -21995,7 +22141,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 return;
             }
             if self.pad_menu.take().is_some() {
-                self.pad_trim_drag = None;
+                // A trim handle let go by the same Esc lands as its release
+                // would: one moment, and the sidecar written.
+                if self.pad_trim_drag.take().is_some() {
+                    self.drumpad_edited();
+                }
                 return;
             }
             self.close_drumpad();
@@ -24637,14 +24787,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
                 MeDrag::Create { i } => {
+                    // One step where the note being drawn starts.
                     let step = self
                         .midi_edit
                         .as_ref()
                         .and_then(|st| {
                             let clip =
                                 self.arrangement.clips.iter().find(|c| c.id == st.id)?;
+                            let at = clip.start_s + (clip.notes.get(i)?.at_s - clip.offset_s);
                             let view = self.midi_edit_view(st, clip);
-                            Some(crate::midi_editor::grid_step_s(&view))
+                            Some(crate::midi_editor::grid_step_at(&view, at))
                         })
                         .unwrap_or(0.05)
                         .max(0.05);
@@ -25013,6 +25165,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The timeline's gesture ends where it stands and keeps what it
+    /// did**: the drag and everything it carries stand down, and the moment
+    /// it owes is committed. What only its release would have done (a lane
+    /// landing, a drawn item, a locate) is not guessed at. For a release
+    /// nobody saw (the top of `arrangement_input`) and for a view switch
+    /// that takes the timeline from under the hand
+    /// (`end_drags_for_a_view_switch`).
+    fn end_arr_gesture(&mut self) {
+        self.arr_drag = None;
+        self.arr_tempo_drag = None;
+        self.arr_tempo_drag_from = None;
+        self.arr_auto_drag_from = None;
+        self.arr_auto_hot = None;
+        self.arr_move_orig.clear();
+        self.arr_stretch_orig.clear();
+        self.arr_band = None;
+        self.arr_pending = None;
+        if std::mem::take(&mut self.arr_gesture_dirty) {
+            self.arr_save_edits();
+        }
+    }
+
     fn arrangement_input(&mut self, ctx: &egui::Context) {
         // **A release nobody saw still ends the gesture.** A dialog raised
         // mid-drag, a menu, a view that closed under the hand: every early
@@ -25027,18 +25201,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if (self.arr_drag.is_some() || self.arr_gesture_dirty)
             && ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released())
         {
-            self.arr_drag = None;
-            self.arr_tempo_drag = None;
-            self.arr_tempo_drag_from = None;
-            self.arr_auto_drag_from = None;
-            self.arr_auto_hot = None;
-            self.arr_move_orig.clear();
-            self.arr_stretch_orig.clear();
-            self.arr_band = None;
-            self.arr_pending = None;
-            if std::mem::take(&mut self.arr_gesture_dirty) {
-                self.arr_save_edits();
-            }
+            self.end_arr_gesture();
         }
         // **While a take rolls, the window holds the WHOLE of it** — the
         // owner's ruling: the viewport and the growing clip scale together,
@@ -26354,7 +26517,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // algorithm.
                             //
                             // Snapshot at the press — every tick scales from
-                            // these originals.
+                            // these originals. Every clip of the set is
+                            // measured first, not only the one under the
+                            // hand: one still on the whole-file sentinel
+                            // would scale from zero to a 0.05 s sliver.
+                            let set: Vec<u64> = self
+                                .arrangement
+                                .clips
+                                .iter()
+                                .filter(|c| c.id == id || self.arr_multi.contains(&c.id))
+                                .map(|c| c.id)
+                                .collect();
+                            for member in set {
+                                self.arr_resolve_len(member);
+                            }
                             let orig: Vec<crate::arrangement::ArrClip> = self
                                 .arrangement
                                 .clips
@@ -27085,7 +27261,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The MIDI item the shift-drag drew, taken into the document —
             // and the lane with it, if it was nobody's yet.
             if let Some((lane, t0, t1)) = self.arr_pending.take() {
-                let min_len = (self.arr_grid_s() * 0.5).max(0.05);
+                let min_len = (self.arr_grid_s(t0) * 0.5).max(0.05);
                 if t1 - t0 >= min_len {
                     if self.channel_kind(lane).is_none() {
                         // Drawing a MIDI item on a bare lane makes it a
@@ -28797,7 +28973,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it is the only place that knows how. A parameter whose plugin has
     /// since been unloaded still gets a name, because a curve outlives the
     /// plugin that made it and a lane labelled with nothing is a lane
-    /// somebody deletes by mistake.
+    /// somebody deletes by mistake: the plugin it is kept for
+    /// (`Curve::tenant`), or failing that its address.
     pub fn auto_param_label(
         &self,
         lane: usize,
@@ -28827,7 +29004,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // can be found and removed.
                 None => format!("{} (gone: {id})", fx.name),
             },
-            None => param.label(),
+            // **A curve kept for its plugin names it**, and says it is out:
+            // the bay is empty, so there is no list to read the title from.
+            None => match self.arrangement.automation.get(lane, param) {
+                Some(c) if !c.tenant.is_empty() => {
+                    format!("{} (unloaded): parameter {id}", insert_chip_name(&c.tenant))
+                }
+                _ => param.label(),
+            },
         }
     }
 
@@ -33112,7 +33296,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   newcomer's too - the EQ's band-1 frequency and the compressor's
     ///   attack are both id 2 - so kept, it rode the newcomer's knob and
     ///   that knob's face followed it and refused the hand. One undo puts
-    ///   the old plugin back WITH its curves.
+    ///   the old plugin back WITH its curves, and their rows as they were
+    ///   (`Moment::rows_closed`).
     ///
     /// A curve with no owner on record (left on an empty bay by a build
     /// that kept none) stays as it is. Keeping a replaced plugin's curves
@@ -33150,9 +33335,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.automation = Automation::from_curves(curves);
         if !gone.is_empty() {
             let named = |row: &(usize, AutoParam)| gone.contains(row);
-            self.arr_auto_open.retain(|row| !named(row));
-            self.arr_auto_armed.retain(|row| !named(row));
-            self.arr_auto_bypassed.retain(|row| !named(row));
+            self.close_auto_rows(named);
             self.arr_auto_focus = self.arr_auto_focus.filter(|row| !named(row));
             self.auto_clipboard_from = self.auto_clipboard_from.filter(|row| !named(row));
             // Rows closed, slots renumbered: the choices that name slots go.
@@ -34146,9 +34329,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
-        // Every caller is a single press (the setup panel's count-in chip,
-        // the metronome panel's COUNT row, and the menu's `SetCountIn` arm,
-        // which no menu row builds today), so one moment each.
+        // Every caller is a single press (the setup panel's count-in chip and
+        // the metronome panel's COUNT row), so one moment each.
         // `CountIn::bars` is hashed.
         self.undo_commit();
     }
@@ -34543,7 +34725,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // and the bands under it are replaced by the desk for as long as
             // you are there, and the recorder band stays exactly where it is
             // so the transport never moves. A half-finished drag does not
-            // survive the swap, because the control it was on is gone.
+            // survive the swap, because the control it was on is gone; it
+            // ends here, a moment of its own (`end_drags_for_a_view_switch`).
             K::ToggleMixer => {
                 // **Tab CYCLES: theory, ARRANGE, mixer** — the owner's
                 // order. Three surfaces on one spot; the band never moves.
@@ -34552,10 +34735,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     (false, true) => (true, false),
                     (true, _) => (false, false),
                 };
+                self.end_drags_for_a_view_switch();
                 self.arrangement_open = arrangement;
                 self.mixer_open = mixer;
-                self.mixer_grab = None;
-                self.arr_drag = None;
             }
             // A popup, not a Tab stop: it rises over whichever view is up
             // and goes away by the same key, Esc, its ×, or a press outside.
@@ -34881,8 +35063,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Window resize follows from band_sizes() on the next pass.
                 self.request_natural_size();
             }
-            MenuAction::DetachChordWindow => self.detach_chord_window(),
-            MenuAction::AttachChordWindow => self.reattach_chord_window(),
             MenuAction::TeachChordName => self.open_teach_dialog(),
             MenuAction::ManageTaughtChords => self.open_manage_dialog(),
             MenuAction::CorrectChordName => self.open_correct_dialog(),
@@ -34958,52 +35138,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .set_staff_set(&staff::StaffSet::from_key(key));
                 self.save_settings();
             }
-            MenuAction::ToggleCustomClef(key) => {
-                if let Some(clef) = staff::Clef::from_key(key) {
-                    // Toggling from a PRESET starts the custom stack off from
-                    // what is on screen, so ticking "Alto" while the grand
-                    // staff is showing gives you treble, alto and bass — not
-                    // alto alone, which is what starting from nothing would do
-                    // and is never what anybody means.
-                    match self.settings.staff_set().with_clef_toggled(clef) {
-                        Some(set) => {
-                            self.settings.set_staff_set(&set);
-                            self.settings.custom_staff_set = Some(set.key());
-                        }
-                        // The last staff was just removed. A band with nothing
-                        // in it is not a view.
-                        None => {
-                            self.settings.staff_set = "grand".to_owned();
-                            self.settings.custom_staff_set = None;
-                        }
-                    }
-                    self.show_the_staff();
-                    self.save_settings();
-                    self.request_natural_size();
-                }
-            }
             MenuAction::SetStaffKey(k) => {
                 self.settings.staff_key = k.clamp(-staff::MAX_KEY, staff::MAX_KEY);
                 self.show_the_staff();
                 self.save_settings();
                 self.request_natural_size();
                 self.undo_commit();
-            }
-            MenuAction::ToggleNoteNames => {
-                self.settings.staff_note_names = !self.settings.staff_note_names;
-                // Like every other control that changes what the staff shows.
-                // Without this, `U` on a window with no sheet music in it
-                // silently flips a setting nothing is drawing.
-                self.show_the_staff();
-                self.save_settings();
-                self.request_natural_size();
-            }
-            // The take's settings that moved out of the band. Each one is the
-            // SAME action the band's own hit produced, so the two can never
-            // drift: one handler, two ways in.
-            MenuAction::ToggleKeyNoteNames => {
-                self.settings.show_piano_note_names = !self.settings.show_piano_note_names;
-                self.save_settings();
             }
             MenuAction::ToggleGuitarIntervals => {
                 self.settings.guitar_intervals = !self.settings.guitar_intervals;
@@ -35017,13 +35157,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.show_chord_strip = !self.settings.show_chord_strip;
                 self.save_settings();
             }
-            MenuAction::ChooseFolder => self.apply_recorder_hit(recorder_panel::Hit::ChooseFolder),
-            MenuAction::RevealFolder => self.apply_recorder_hit(recorder_panel::Hit::RevealFolder),
-            MenuAction::ToggleOpenWhenDone => {
-                self.apply_recorder_hit(recorder_panel::Hit::ToggleOpenWhenDone);
-            }
-            MenuAction::PickCamera => self.apply_recorder_hit(recorder_panel::Hit::PickCamera),
-            MenuAction::PickAudio => self.apply_recorder_hit(recorder_panel::Hit::PickAudio),
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
             }
@@ -35049,10 +35182,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.fretboard_wood = key.to_owned();
                 self.save_settings();
             }
-            MenuAction::DetachFretboard => self.detach_fretboard(),
-            MenuAction::AttachFretboard => self.reattach_fretboard(),
-            MenuAction::DetachTheory => self.detach_theory(),
-            MenuAction::AttachTheory => self.reattach_theory(),
             MenuAction::ToggleRecorder => {
                 // Refused while a take is running, and this is a safety rule
                 // rather than tidiness. Stop lives only in the band, so hiding
@@ -35077,28 +35206,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // there is nothing to send from here.
                 self.save_settings();
                 self.request_natural_size();
-            }
-            MenuAction::DetachRecorder => self.detach_recorder(),
-            MenuAction::AttachRecorder => self.reattach_recorder(),
-            MenuAction::ShowExportDialog => self.open_export_dialog(),
-            MenuAction::ShowAudioStatus => self.open_audio_setup(),
-            MenuAction::SetCountIn(bars) => self.set_count_in_bars(bars),
-            MenuAction::SetTimeSignature(sig) => self.set_time_signature(sig),
-            MenuAction::ToggleCountInInTake => {
-                self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
-                self.save_settings();
-            }
-            MenuAction::ToggleMetronome => {
-                self.settings.metronome_on = !self.settings.metronome_on;
-                self.save_settings();
-            }
-            MenuAction::ToggleMetronomeInTake => {
-                self.settings.metronome_in_take = !self.settings.metronome_in_take;
-                self.save_settings();
-            }
-            MenuAction::ToggleHideElapsed => {
-                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
-                self.save_settings();
             }
             MenuAction::EditCustomTuning => {
                 // Seeded from whatever tuning is LIVE, because almost every
@@ -36657,14 +36764,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             }
-            DialogAction::SetKeysParam { slot, knob, value, done } => {
+            DialogAction::SetKeysParam { slot, knob, value, done, double } => {
                 self.set_keys_param_of(slot, knob, value);
                 // **The knob's one moment, when the hand lets go.** It moves
                 // the sound on every frame of the drag, and the knobs are
                 // hashed (`keys_params`): it committed nothing, so a turned
-                // Hammer rode the next gesture's step back.
-                if done {
-                    self.undo_commit();
+                // Hammer rode the next gesture's step back. A double-click's
+                // reset takes the place of its first click's jump.
+                if done && double {
+                    self.undo_commit_double_click(ClickRow::Keys(slot, knob));
+                } else if done {
+                    self.undo_commit_click(ClickRow::Keys(slot, knob));
                 }
             }
             DialogAction::ResetKeysParams { slot } => {
@@ -38036,6 +38146,25 @@ impl TangentApp {
         }
         if let Some(grab) = self.drumpad_grab {
             self.drumpad_let_go(grab);
+        }
+    }
+
+    /// **A view switch ends the drags on the surfaces it takes away**, each
+    /// with the moment its release would have committed: the mixer's fader
+    /// and the timeline's gesture. Called by Tab and Shift+1/2/3 BEFORE the
+    /// flags move.
+    ///
+    /// The hand is still down, so neither quiet-frame sweep sees these end,
+    /// and the grab used to be dropped bare: the fader's change, or the
+    /// carry's, then went into the switch's own moment (`commit_view_change`
+    /// at the end of the frame), and one Ctrl+Z put back the view and the
+    /// drag together.
+    fn end_drags_for_a_view_switch(&mut self) {
+        if self.mixer_grab.take().is_some() {
+            self.undo_commit();
+        }
+        if self.arr_drag.is_some() || self.arr_gesture_dirty {
+            self.end_arr_gesture();
         }
     }
 
@@ -39655,9 +39784,10 @@ impl TangentApp {
             .then(|| band_at(recorder_h, (target.y - recorder_h).max(0.0)))
             .filter(Rect::is_positive);
         self.mixer_rect = mixer_rect;
-        if mixer_rect.is_none() {
-            // The control being dragged is not on screen any more.
-            self.mixer_grab = None;
+        if mixer_rect.is_none() && self.mixer_grab.take().is_some() {
+            // The control being dragged is not on screen any more, so its
+            // drag ends here, with the moment its release would have taken.
+            self.undo_commit();
         }
         // The ARRANGEMENT takes the same spot on its turn of the Tab cycle.
         let arrangement_rect = self
@@ -41246,10 +41376,9 @@ impl TangentApp {
                 }
             });
             if let Some((mixer, arrangement)) = view_key {
+                self.end_drags_for_a_view_switch();
                 self.mixer_open = mixer;
                 self.arrangement_open = arrangement;
-                self.mixer_grab = None;
-                self.arr_drag = None;
             }
         }
         if !input_menu_owns && !self.band_popup_owns() {
@@ -43288,6 +43417,187 @@ mod tests {
         assert_eq!(app.hist_at, before + 1, "the knob's drag left {} moments", app.hist_at - before);
     }
 
+    /// **A drag that a view switch ends is a moment of its own**, taken
+    /// where the switch ended it.
+    ///
+    /// Tab, Shift+1/2/3 and the mixer going away let go of the fader's grab
+    /// without the commit its release owes, and Esc putting the drum pads
+    /// away did the same to a knob's. The drag's change then rode the next
+    /// moment back: the view switch's own, so one Ctrl+Z put the fader back
+    /// together with the view, and the drum pad's knob went back with
+    /// whatever was done next. The hand is still down in every case here,
+    /// so the quiet-frame sweep cannot be what ends the drag.
+    #[test]
+    fn a_drag_that_a_view_switch_ends_is_a_moment_of_its_own() {
+        // The MIXER's fader, pulled, and ended by each key off the mixer.
+        let mixer_with_a_pulled_fader = || {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = false;
+            app.mixer_open = true;
+            let _ = run_frame(&ctx, &mut app);
+            let rect = app.mixer_rect.expect("the mixer did not open");
+            let (at, hit) = {
+                let view = app.mixer_view();
+                let f = crate::mixer_panel::Layout::new(rect, &view).strips[0].fader;
+                let hit = crate::mixer_panel::hit_test(rect, &view, f.center())
+                    .expect("nothing at all is at the fader's centre");
+                (f.center(), hit)
+            };
+            app.apply_mixer_hit(hit, 0.5);
+            app.undo_commit();
+            app.commit_view_change();
+            let before = app.hist_at;
+            press(&ctx, &mut app, at);
+            move_to(&ctx, &mut app, at - Vec2::new(0.0, 12.0));
+            assert!(app.mixer_grab.is_some(), "fixture: the press did not grab the fader");
+            let pulled = app.mixer_value(hit);
+            assert!(pulled > 0.5 + 1e-3, "fixture: the fader did not follow the hand");
+            (ctx, app, at, hit, before, pulled)
+        };
+        for (road, key, mods) in [
+            ("Tab", egui::Key::Tab, egui::Modifiers::NONE),
+            ("Shift+1", egui::Key::Num1, egui::Modifiers::SHIFT),
+            ("Shift+2", egui::Key::Num2, egui::Modifiers::SHIFT),
+        ] {
+            let (ctx, mut app, at, hit, before, pulled) = mixer_with_a_pulled_fader();
+            key_with(&ctx, &mut app, key, mods);
+            assert!(!app.mixer_open, "fixture: {road} left the mixer up");
+            assert!(app.mixer_grab.is_none(), "{road} left the fader's drag standing");
+            assert_eq!(
+                app.hist_at,
+                before + 2,
+                "{road} and the fader it let go of made {} moments, not one each",
+                app.hist_at - before
+            );
+            release(&ctx, &mut app, at);
+            let _ = run_frame(&ctx, &mut app);
+            assert_eq!(app.hist_at, before + 2, "the release after {road} pushed another moment");
+            app.undo();
+            assert!(app.mixer_open, "one Ctrl+Z after {road} did not bring the mixer back");
+            assert!(
+                (app.mixer_value(hit) - pulled).abs() < 1e-6,
+                "one Ctrl+Z after {road} put the fader back with the view"
+            );
+            app.undo();
+            assert!(
+                (app.mixer_value(hit) - 0.5).abs() < 1e-6,
+                "the fader's own step back did not put it back"
+            );
+        }
+        // The mixer going away under the hand with no key at all: a window
+        // too short to give it any room. The view never changed, so before
+        // the fader's drag was simply lost into the next moment.
+        let (ctx, mut app, at, hit, before, pulled) = mixer_with_a_pulled_fader();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 90.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        assert!(app.mixer_rect.is_none(), "fixture: the short window still drew the mixer");
+        assert!(app.mixer_grab.is_none(), "the mixer went and left the fader's drag standing");
+        assert_eq!(app.hist_at, before + 1, "the fader the mixer let go of left {} moments", app.hist_at - before);
+        release(&ctx, &mut app, at);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.hist_at, before + 1, "the release pushed another moment");
+        app.undo();
+        assert!(
+            (app.mixer_value(hit) - 0.5).abs() < 1e-6,
+            "one Ctrl+Z did not put back the fader pulled to {pulled}"
+        );
+
+        // A DRUM PAD's knob, turned, and the pads put away by Esc.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.drumpad_rect.expect("the drum pads did not lay out");
+        // A pad with a sample in it: an empty pad has no knobs to turn.
+        let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.undo_commit();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let param = crate::drumpad_panel::Param::Gain;
+        let was = app.drumpad_get(param);
+        let knob = crate::drumpad_panel::Layout::new(rect).knob_of(param);
+        let at = Pos2::new(knob.center().x, knob.top() + knob.height() * 0.8);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, at - Vec2::new(40.0, 0.0));
+        assert!(app.drumpad_grab.is_some_and(|g| g.moved), "fixture: the knob was not grabbed");
+        let turned = app.drumpad_get(param);
+        assert!((turned - was).abs() > 1e-3, "fixture: the knob did not turn");
+        key_with(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!app.drumpad_open, "fixture: Esc left the drum pads up");
+        assert_eq!(app.hist_at, before + 1, "the knob Esc let go of left {} moments", app.hist_at - before);
+        release(&ctx, &mut app, at);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.hist_at, before + 1, "the release pushed another moment");
+        app.undo();
+        assert!((app.drumpad_get(param) - was).abs() < 1e-6, "one Ctrl+Z did not put the knob back");
+
+        // The pad menu's TRIM handle, dragged, and the menu put away by Esc.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.drumpad_rect.expect("the drum pads did not lay out");
+        let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.pad_menu = Some(sel);
+        app.undo_commit();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let slot = app.pad_menu_slot().expect("the menu's pad is not on the page shown");
+        let menu = pad_menu_rect(crate::drumpad_panel::Layout::new(rect).pads[slot], rect);
+        let wave = pad_menu_wave(menu);
+        let end = app.drumpad().pads[sel].params.trim_end;
+        let at = Pos2::new(wave.left() + wave.width() * end - 1.0, wave.center().y);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, wave.center());
+        assert_eq!(app.pad_trim_drag, Some(true), "fixture: the press took no trim handle");
+        let trimmed = app.drumpad().pads[sel].params.trim_end;
+        assert!((trimmed - end).abs() > 1e-3, "fixture: the handle did not follow the hand");
+        key_with(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.pad_menu.is_none(), "fixture: Esc left the pad menu up");
+        assert_eq!(app.hist_at, before + 1, "the trim Esc let go of left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.drumpad().pads[sel].params.trim_end - end).abs() < 1e-6,
+            "one Ctrl+Z did not put the trim back"
+        );
+
+        // A CLIP carried on the timeline, and Tab with the hand still down.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let at = arr_clip_centre(&app, rect, id);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, at + Vec2::new(30.0, 0.0));
+        move_to(&ctx, &mut app, at + Vec2::new(60.0, 0.0));
+        let carried = app.arrangement.clips[0].start_s;
+        assert!(carried > 2.0 + 1e-3, "fixture: the clip did not ride the hand");
+        key_with(&ctx, &mut app, egui::Key::Tab, egui::Modifiers::NONE);
+        assert!(app.mixer_open, "fixture: Tab from the timeline did not land on the mixer");
+        release(&ctx, &mut app, at + Vec2::new(60.0, 0.0));
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.hist_at,
+            before + 2,
+            "Tab and the carry it let go of made {} moments, not one each",
+            app.hist_at - before
+        );
+        app.undo();
+        assert!(app.arrangement_open, "one Ctrl+Z after Tab did not bring the timeline back");
+        assert!(
+            (app.arrangement.clips[0].start_s - carried).abs() < 1e-9,
+            "one Ctrl+Z after Tab put the clip back with the view"
+        );
+    }
+
     /// **The frame's own commit waits for every drag in flight, not only
     /// the arrangement's.**
     ///
@@ -43889,10 +44199,17 @@ mod tests {
                 knob: 1,
                 value: f32::from(f) * 0.08,
                 done: false,
+                double: false,
             });
         }
         assert_eq!(app.hist_at, before, "the knob pushed {} moments mid-drag", app.hist_at - before);
-        app.apply_dialog_action(DialogAction::SetKeysParam { slot: 3, knob: 1, value: 0.8, done: true });
+        app.apply_dialog_action(DialogAction::SetKeysParam {
+            slot: 3,
+            knob: 1,
+            value: 0.8,
+            done: true,
+            double: false,
+        });
         assert_eq!(app.hist_at, before + 1, "the knob's release left {} moments", app.hist_at - before);
         // One step back puts the knob where the hand found it.
         app.undo();
@@ -43900,6 +44217,55 @@ mod tests {
             (app.keys_param_of(3, 1) - was).abs() < 1.0e-6,
             "one Ctrl+Z left the knob at {} rather than {was}",
             app.keys_param_of(3, 1)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A double-click on a Keys knob is one step back**, to where the knob
+    /// stood before the first click.
+    ///
+    /// The knob jumps to the pointer on each press, and the first click's
+    /// release said `done` and committed that jump before anything could
+    /// know a second click was coming; the reset at the second release
+    /// committed again, so one Ctrl+Z after a double-click left the knob at
+    /// the first click's jump. The panel marks the reset
+    /// (`SetKeysParam::double`) and it takes the first click's place - but
+    /// never another knob's moment.
+    #[test]
+    fn a_double_click_on_a_keys_knob_is_one_step_back() {
+        let root = project_scratch("keysdouble");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let knob = |app: &mut TangentApp, knob: usize, value: f32, done: bool, double: bool| {
+            app.apply_dialog_action(DialogAction::SetKeysParam { slot: 3, knob, value, done, double });
+        };
+        knob(&mut app, 1, 0.2, true, false);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        // The first click: its press jumps the knob, its release ends it.
+        knob(&mut app, 1, 0.95, false, false);
+        knob(&mut app, 1, 0.95, true, false);
+        // The second click's release: the bench's own value.
+        knob(&mut app, 1, 0.5, true, true);
+        assert_eq!(app.hist_at, before + 1, "the double-click left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.keys_param_of(3, 1) - 0.2).abs() < 1.0e-6,
+            "one Ctrl+Z after the double-click left the knob at {}, not 0.2",
+            app.keys_param_of(3, 1)
+        );
+
+        // A reset on another knob takes nothing from this knob's click.
+        app.redo();
+        let before = app.hist_at;
+        knob(&mut app, 1, 0.9, true, false);
+        knob(&mut app, 2, 0.33, true, true);
+        assert_eq!(app.hist_at, before + 2, "a click and another knob's reset left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.keys_param_of(3, 1) - 0.9).abs() < 1.0e-6,
+            "undoing the other knob's reset took this knob's click with it"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -49848,6 +50214,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A uniform step in the MIDI editor is the step where the note is.**
+    ///
+    /// A duplicate, a straight-grid nudge, a resize, a note drawn with the
+    /// magnet off and the length a note being drawn is held to all moved by
+    /// one grid step - the step at the PLAYHEAD. With 120 changing to 90
+    /// inside a part and the playhead before the change, a note after it
+    /// moved by the 120's eighth (a quarter second) on a grid whose eighths
+    /// there are a third of one, and left the lines. Each asks the grid
+    /// where the note stands now.
+    #[test]
+    fn the_editors_uniform_steps_are_the_step_where_the_note_is() {
+        let root = project_scratch("me-note-step");
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+        app.bootstrap_project(&root.join("Projects"));
+        app.dialog = None;
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.midi_snap = true;
+        app.settings.midi_swing = false;
+        app.settings.midi_triplet = false;
+        app.settings.midi_grid_exp = -3;
+        // 120 for four bars, then 90: eighths of 0.25 s, then of 1/3 s.
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 90.0, ramp: false },
+        ]);
+        let eighth = 1.0 / 3.0;
+        let beat = |app: &TangentApp, b: f64| app.live_tempo_map().seconds_at_beat(b);
+        // A part from 6 s to 14 s, a note on beat 18 (9 + 1/3 s), after the
+        // change; the playhead at 6.5 s, before it.
+        let at = beat(&app, 18.0);
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote { at_s: at - 6.0, dur_s: 0.2, key: 60, vel: 100, muted: false }],
+            lane: 1, start_s: 6.0, len_s: 8.0, name: "MIDI".to_owned(), ..Default::default()
+        });
+        app.arrangement_open = true;
+        app.open_midi_editor(id);
+        app.recorder.position_s = 6.5;
+        let note = |app: &TangentApp, i: usize| {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part");
+            (6.0 + c.notes[i].at_s, c.notes[i].dur_s)
+        };
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        app.me_nudge(1.0, 0);
+        assert!((note(&app, 0).0 - beat(&app, 18.5)).abs() < 1e-9, "a nudge moved the note to {}", note(&app, 0).0);
+        app.me_nudge(-1.0, 0);
+        assert!((note(&app, 0).0 - at).abs() < 1e-9, "the nudge back left it at {}", note(&app, 0).0);
+        app.me_resize_selection(1.0);
+        assert!((note(&app, 0).1 - (0.2 + eighth)).abs() < 1e-9, "a resize made it {} long", note(&app, 0).1);
+        app.me_resize_selection(-1.0);
+        assert!((note(&app, 0).1 - 0.2).abs() < 1e-9, "the resize back made it {} long", note(&app, 0).1);
+        app.me_duplicate();
+        assert!((note(&app, 1).0 - beat(&app, 18.5)).abs() < 1e-9, "the duplicate landed at {}", note(&app, 1).0);
+        // A note drawn with the magnet off is one step long where it starts.
+        app.settings.midi_snap = false;
+        app.me_create_note(11.1, 64);
+        assert!((note(&app, 2).1 - eighth).abs() < 1e-9, "a note drawn with the magnet off ran {}", note(&app, 2).1);
+        // The length a note being DRAWN is held to: the pen down on beat 22
+        // (12 s), then pulled back over its own head.
+        app.settings.midi_snap = true;
+        app.settings.midi_draw_mode = true;
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.view_start_s = 11.5;
+            st.view_len_s = 2.5;
+            st.selected.clear();
+            st.drag = None;
+        }
+        let _ = run_frame(&ctx, &mut app);
+        assert!(app.dialog.is_none(), "fixture: a dialog stands over the editor");
+        let rect = app.midi_edit_rect.expect("the editor drew nowhere");
+        let (down, back) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let v = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            let y = l.roll.center().y;
+            let x = |t: f64| crate::midi_editor::x_of(&l, &v, t);
+            (Pos2::new(x(12.05), y), Pos2::new(x(11.95), y))
+        };
+        let count = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part").notes.len();
+        press(&ctx, &mut app, down);
+        move_to(&ctx, &mut app, back);
+        let drawn = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part").notes.clone();
+        assert_eq!(drawn.len(), count + 1, "fixture: the pen drew no note");
+        let held = drawn[count].dur_s;
+        assert!((held - eighth).abs() < 1e-9, "a note pulled back while drawn was held to {held}");
+        release(&ctx, &mut app, back);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The loop bar stands where the loop turns over**, on a part trimmed
     /// from its front too. The passes count from the clip's source origin,
     /// `start - offset`, and the bar counted from the clip's head, so on a
@@ -49947,8 +50405,8 @@ mod tests {
         let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.arr_snap = true;
         app.settings.arr_grid_exp = -2;
-        let grid = app.arr_grid_s();
-        let bar = app.arr_bar_s();
+        let grid = app.arr_grid_s(0.0);
+        let bar = app.arr_bar_s(0.0);
         app.locate(0.0);
         while app.take_recorder_request().is_some() {}
 
@@ -49999,6 +50457,45 @@ mod tests {
                     app.playhead_s()
                 );
             }
+        }
+    }
+
+    /// **The arrange view's arrows walk the song's grid and bars past a
+    /// change, not the dial's.** A press stepped by `arr_grid_s` and
+    /// `arr_bar_s`, the tempo dial's and the settings' signature's, so after
+    /// a tempo or meter change it walked a length the song does not have
+    /// there: with the magnet off the head left the lines. Both follow the
+    /// maps now, where the head stands, as the magnet does.
+    #[test]
+    fn the_arrange_views_arrows_walk_the_songs_grid_past_a_change() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.arr_grid_exp = -2; // a quarter in 4/4
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.record_time_signature = "4/4".to_owned();
+        // 120 for four bars, then 80; 4/4, then 3/4 from bar 6 (beat 24).
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 80.0, ramp: false },
+        ]);
+        app.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint { at_bar: 0, sig: recorder::TimeSignature { beats: 4, unit: 4 } },
+            crate::tempo::MeterPoint { at_bar: 6, sig: recorder::TimeSignature { beats: 3, unit: 4 } },
+        ]);
+        let at_beat = |app: &TangentApp, b: f64| app.live_tempo_map().seconds_at_beat(b);
+        for (what, from, by_bar, to) in [
+            ("a grid step from beat 17", 17.0, false, 18.0),
+            ("a bar from bar 4's line", 16.0, true, 20.0),
+            ("a bar from bar 6's line, in 3/4", 24.0, true, 27.0),
+        ] {
+            app.locate(at_beat(&app, from));
+            app.arr_step_playhead(1.0, by_bar);
+            let want = at_beat(&app, to);
+            assert!(
+                (app.playhead_s() - want).abs() < 1.0e-9,
+                "{what} went to {}, not beat {to} at {want}",
+                app.playhead_s()
+            );
         }
     }
 
@@ -57444,6 +57941,84 @@ mod tests {
         assert!((ac.loop_s - 4.0).abs() < 1e-9, "the audio loop is {} while its audio doubled", ac.loop_s);
     }
 
+    /// **A stretch carries every clip of the set from its measured length.**
+    ///
+    /// An audio clip still on the whole-file sentinel (`len_s == 0`) is
+    /// measured the moment a hand lands on it, but only the clip under the
+    /// hand was: the set's other members were snapshotted at zero, and the
+    /// stretch's `0 * k` floored them to 0.05 s - a whole take reduced to a
+    /// sliver by stretching its neighbour. Driven through the real
+    /// shift-press on an edge, where the snapshot is taken.
+    #[test]
+    fn a_stretch_carries_an_unmeasured_clip_of_the_set_from_its_file_length() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.settings.arr_snap = false;
+        let audio = |lane: usize, len_s: f64| crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: format!("media/{lane}.wav"),
+            lane,
+            start_s: 1.0,
+            len_s,
+            ..Default::default()
+        };
+        let a = app.arrangement.add_clip(audio(0, 2.0));
+        let b = app.arrangement.add_clip(audio(1, 0.0));
+        app.set_clip_infos(vec![crate::ports::ClipInfo {
+            id: b,
+            wave: Vec::new(),
+            file_s: 3.0,
+            wave_from_s: 0.0,
+            wave_span_s: 0.0,
+            peaks: None,
+        }]);
+        app.arr_selected = Some(a);
+        app.arr_multi = vec![a, b];
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        let r = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let c = clips.iter().find(|c| c.id == a).expect("the clip has a view");
+            crate::arrangement_panel::clip_rect(rect, &view, c)
+        };
+        let shifted = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    modifiers: egui::Modifiers::SHIFT,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        // A's right edge (3 s) out to 5 s: twice as long from the set's start.
+        let from = Pos2::new(r.right() - 2.0, r.center().y);
+        let to = Pos2::new(from.x + r.width(), from.y);
+        shifted(&ctx, &mut app, vec![egui::Event::PointerMoved(from), button(from, true)]);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::Stretch { .. })),
+            "fixture: the shift-press on the edge did not stretch"
+        );
+        shifted(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        shifted(&ctx, &mut app, vec![button(to, false)]);
+        let len = |id: u64| app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").len_s;
+        let k = len(a) / 2.0;
+        assert!(k > 1.5, "fixture: the grabbed clip did not stretch: {}", len(a));
+        assert!(
+            (len(b) - 3.0 * k).abs() < 1e-6,
+            "the unmeasured clip of the set came out {} s long, not its 3 s file times {k}",
+            len(b)
+        );
+    }
+
     /// **Seven notes into the space of four.** The editor's shift-drag
     /// stretch scales the whole selection from its press-time values around
     /// the fixed end; the arrangement's does the same for whole MIDI clips.
@@ -61015,6 +61590,58 @@ mod tests {
         assert_ne!(app.choice_key("delay_division"), was, "one Ctrl+Z also undid the pick");
     }
 
+    /// **A double-click on an effect row is one step back**, to where the
+    /// row stood before the first click.
+    ///
+    /// Each press on a row jumps it to the pointer, and the first click's
+    /// release committed that jump before anything could know a second
+    /// click was coming; the second release then put the row back and
+    /// committed again. So one Ctrl+Z after a double-click landed on the
+    /// first click's jump, a value nobody chose. The reset now takes that
+    /// moment's place - and only that one: two clicks too far apart in time
+    /// are two gestures, and stay two steps.
+    #[test]
+    fn a_double_click_on_an_effect_row_is_one_step_back() {
+        let (ctx, mut app) = headless_with_fx(Caps::DESKTOP);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let fx = recorder_panel::Fx::Chorus;
+        app.set_effect_param("chorus_depth", 0.3);
+        app.fx_open = Some(fx);
+        let _ = run_frame(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.9);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        let jumped = app.effect_param("chorus_depth");
+        assert!((jumped - 0.3).abs() > 0.2, "fixture: the first click did not jump the row");
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        assert!(
+            !app.settings.effect_params.contains_key("chorus_depth"),
+            "fixture: the double-click did not put the row back"
+        );
+        assert_eq!(app.hist_at, before + 1, "the double-click left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.effect_param("chorus_depth") - 0.3).abs() < 1.0e-6,
+            "one Ctrl+Z after the double-click left the row at {}, the first click's {jumped}",
+            app.effect_param("chorus_depth")
+        );
+
+        // Two clicks half a second apart are not a double: two steps.
+        let before = app.hist_at;
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.8);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        let _ = hold_frame(&ctx, &mut app, 0.5);
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.1);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        assert_eq!(app.hist_at, before + 2, "two separate clicks left {} moments", app.hist_at - before);
+    }
+
     /// A named parameter steps through its list and wraps.
     ///
     /// Both of them, because "the delay's time" and "a filter's slope" are the
@@ -62808,8 +63435,10 @@ mod tests {
     fn hiding_the_recorder_takes_its_window_with_it() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.show_recorder = true;
-        app.detach_recorder();
-        assert!(app.recorder_window_visible);
+        // The band out in its own window, set by hand: nothing pops it out
+        // any more, and `new` clears the flag on the way in.
+        app.settings.recorder_detached = true;
+        app.recorder_window_visible = true;
 
         app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
         assert!(!app.settings.show_recorder);
@@ -67697,7 +68326,7 @@ mod tests {").expect("the tests module")];
             (st.view_start_s, st.view_len_s)
         };
         let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
-        let pad = (clip.len_s * 0.08).max(app.arr_bar_s() * 0.5);
+        let pad = (clip.len_s * 0.08).max(app.arr_bar_s(clip.start_s) * 0.5);
         let wall = clip.start_s + clip.len_s + pad;
         assert!(
             start + len <= wall + 1.0e-6,
@@ -72128,6 +72757,37 @@ mod folder_tests {
         );
     }
 
+    /// **A lane's automation mode and latch follow its track through a
+    /// reorder, and back through its undo.** Both are keyed by lane beside
+    /// the words, like the rows, and nothing carried them: a track moved up
+    /// left its Latch on the row it came from, for whichever track took
+    /// that row. Latent while no control sets a mode, but the mode machinery
+    /// is wired and its own tests set them.
+    #[test]
+    fn a_lanes_automation_mode_follows_its_track() {
+        use crate::automation::AutoMode;
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        a.arr_auto_modes.insert(3, AutoMode::Latch);
+        a.arr_auto_latched.insert(3);
+        // Move 3 up to 1: order[new] = old.
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+        assert_eq!(a.arr_auto_mode(1), AutoMode::Latch, "the mode stayed on the row the track left");
+        assert_eq!(a.arr_auto_mode(3), AutoMode::Read, "the track that took row 3 took its Latch");
+        assert!(
+            a.arr_auto_latched.contains(&1) && !a.arr_auto_latched.contains(&3),
+            "the latch stayed on the row the track left"
+        );
+        a.undo();
+        assert_eq!(a.arr_auto_mode(3), AutoMode::Latch, "the undo left the mode on the row it had moved to");
+        assert!(a.arr_auto_latched.contains(&3), "the undo left the latch on the row it had moved to");
+    }
+
     /// **A removed track takes its automation with it.** The curves are
     /// keyed by lane, so a removed track's ride went on driving the next
     /// track made in its slot (Cmd+T reuses the first free one), and its
@@ -72223,6 +72883,69 @@ mod folder_tests {
         assert!(a.arrangement.automation.get(3, freq).is_some(), "the undo put the EQ back without its curve");
     }
 
+    /// **An undo that brings curves back brings their rows back as they
+    /// were**: open, armed and bypassed.
+    ///
+    /// A track's removal and a plugin's replace close the rows of the curves
+    /// they take, and the rows are session state beside the words. So the
+    /// undo put the curves back with their rows shut, their arms gone and a
+    /// bypassed curve PLAYING. The moment that closed them keeps them now,
+    /// as a reorder's keeps its order (`Moment::rows_closed`), and the redo
+    /// closes them again.
+    #[test]
+    fn an_undo_that_brings_curves_back_brings_their_rows_back() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        // A track's REMOVAL.
+        let mut a = app();
+        a.add_bare_track(3);
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            a.arr_toggle_automation_param(3, p);
+            a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
+        }
+        a.arr_auto_armed.insert((3, AutoParam::Mute));
+        a.arr_auto_bypassed.insert((3, AutoParam::Gain));
+        a.arr_save_edits();
+        a.remove_channel(3);
+        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "fixture: the removal left its row open");
+        a.undo();
+        assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "fixture: the undo brought no curve back");
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            assert!(a.arr_auto_is_open(3, p), "the undo brought {p:?}'s curve back with its row shut");
+        }
+        assert!(a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the undo left the row disarmed");
+        assert!(
+            a.engine_automation().get(3, AutoParam::Gain).is_none(),
+            "the undo brought a bypassed curve back playing"
+        );
+        a.redo();
+        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "the redo left a row open under the empty slot");
+        assert!(!a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the redo left the arm for the next track");
+        assert!(!a.arr_auto_bypassed.contains(&(3, AutoParam::Gain)), "the redo left the bypass behind");
+
+        // A plugin's REPLACE.
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+        ));
+        a.arr_auto_open.insert((3, freq));
+        a.arr_auto_bypassed.insert((3, freq));
+        a.arr_save_edits();
+        a.set_insert(3, 0, Some("@tangent-comp"));
+        assert!(!a.arr_auto_is_open(3, freq), "fixture: the replace left the EQ's row open");
+        a.undo();
+        assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
+        assert!(a.arr_auto_is_open(3, freq), "the undo put the EQ's curve back with its row shut");
+        assert!(a.engine_automation().get(3, freq).is_none(), "the undo brought the EQ's bypassed curve back playing");
+        a.redo();
+        assert!(!a.arr_auto_is_open(3, freq), "the redo left the EQ's row open over the compressor's knob");
+        assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
+    }
+
     /// **A curve outlives its plugin and never attaches to the next one.**
     /// Taking a plugin out keeps its curves (they are somebody's work, and
     /// the plugin may come back), and they remember whose they are: the
@@ -72251,6 +72974,40 @@ mod folder_tests {
             a.arrangement.automation.get(3, freq).is_none(),
             "the EQ's curve, kept through the unload, now rides the compressor's attack"
         );
+    }
+
+    /// **A curve kept for its plugin is named for that plugin.** With the
+    /// bay empty there is no parameter list to read a title from, so its row
+    /// fell back to the address, "bay 1 parameter 2", on a curve that
+    /// remembers whose it is (`Curve::tenant`). It names the plugin now, and
+    /// says the plugin is out.
+    #[test]
+    fn a_curve_kept_for_its_plugin_is_named_for_it() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+        ));
+        a.arr_save_edits();
+        a.set_insert(3, 0, None);
+        assert_eq!(
+            a.auto_param_label(3, freq),
+            format!("{} (unloaded): parameter 2", insert_chip_name("@tangent-eq")),
+            "the curve kept for the EQ is not named for it"
+        );
+        // A curve nobody is on record for keeps the address.
+        let other = AutoParam::Plugin { bay: 1, id: 7 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            other,
+            vec![Point { at_s: 0.0, value: 0.5, shape: Shape::Linear }],
+        ));
+        assert_eq!(a.auto_param_label(3, other), other.label());
     }
 
     /// **A plugin carried to another bay takes its automation along**, and
