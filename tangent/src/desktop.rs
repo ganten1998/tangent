@@ -786,14 +786,28 @@ fn deliver_stems(landed: &[std::path::PathBuf], dst_dir: &std::path::Path) -> Ve
         .collect()
 }
 
+/// **What a realtime pass's receipt says of its stems**: how many landed,
+/// and in which folder - `export/stems/`, or `export/stems-dry/` for a dry
+/// pass - read off the stems themselves. Nothing when none landed.
+#[cfg(feature = "recorder")]
+fn stems_receipt(landed: &[std::path::PathBuf]) -> String {
+    let folder = landed
+        .first()
+        .and_then(|stem| stem.parent()?.file_name())
+        .map(|f| f.to_string_lossy().into_owned());
+    match (landed.len(), folder) {
+        (0, _) | (_, None) => String::new(),
+        (1, Some(folder)) => format!(" + 1 stem in export/{folder}/"),
+        (n, Some(folder)) => format!(" + {n} stems in export/{folder}/"),
+    }
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
     /// reverbs to ring out.
     until_s: f64,
     finishing: bool,
-    /// Stems too. (The per-lane tap arrives with them.)
-    stems: bool,
     /// One WAV per used lane, fed from the engine's stem tap as the pass
     /// runs — never buffered whole: a long song is a lot of floats.
     stem_writers: Vec<StemWriter>,
@@ -10032,7 +10046,6 @@ impl DesktopApp {
             // track.
             until_s,
             finishing: false,
-            stems,
             stem_writers,
             stem_scratch: Vec::new(),
             engine_lost: false,
@@ -10117,7 +10130,6 @@ impl DesktopApp {
                 let Some(b) = self.recorder.bounce.take() else {
                     return;
                 };
-                let stems = b.stems;
                 // Into place only for a pass that ran whole; a failed one
                 // takes back what it wrote and leaves the folder as it was.
                 let landed = match b.stem_dir.as_deref() {
@@ -10136,7 +10148,6 @@ impl DesktopApp {
                     Chore::FinishBounce {
                         folder,
                         problem,
-                        stems,
                         landed,
                     },
                 );
@@ -10212,12 +10223,17 @@ impl DesktopApp {
         // So the delivery is taken FIRST, and while there is one standing the
         // staging copy says nothing: the message that ends this pass is the
         // delivery's own, pushed after its files exist.
+        //
+        // **The stems ride the same receipt**, the folder they landed in
+        // named off the stems themselves: a chore of its own used to add
+        // "... stems in export/stems/" after every pass, a dialog's included,
+        // and in `stems/` for dry stems too.
         let mut delivery = self.recorder.pending_delivery.take();
         match std::fs::copy(&wav, export_dir.join(&name)) {
             Ok(_) if delivery.is_none() => {
                 self.app.notify_lower(EXPORT_RUNNING);
                 self.app
-                    .notify(Kind::Success, format!("exported  export/{name}"));
+                    .notify(Kind::Success, format!("exported  export/{name}{}", stems_receipt(landed)));
             }
             Ok(_) => {}
             Err(e) => {
@@ -21410,7 +21426,6 @@ enum Chore {
     FinishBounce {
         folder: String,
         problem: Option<String>,
-        stems: bool,
         landed: Vec<std::path::PathBuf>,
     },
 }
@@ -22300,19 +22315,13 @@ impl DesktopApp {
                     );
                 }
             }
+            // The pass's one receipt is the finish's own, stems and all.
             Chore::FinishBounce {
                 folder,
                 problem,
-                stems,
                 landed,
             } => {
                 self.finish_bounce(&folder, problem, &landed);
-                if stems && !landed.is_empty() {
-                    self.app.notify(
-                        Kind::Success,
-                        format!("exported  export/track + {} stems in export/stems/", landed.len()),
-                    );
-                }
             }
         }
     }
@@ -23421,6 +23430,48 @@ mod tests {
         assert!(
             src.contains("self.finish_bounce(&folder, problem, &landed);"),
             "the finish is not told which stems its pass landed"
+        );
+    }
+
+    /// **A realtime pass's receipt names the folder its stems landed in,
+    /// and an Export dialog's pass leaves the word to its delivery.** The
+    /// chore that finishes a pass added "exported  export/track + N stems in
+    /// export/stems/" after every pass whose stems landed: in `stems/` even
+    /// for dry stems, which land in `stems-dry/`; beside the delivery's own
+    /// receipt on a dialog pass, naming the staging folder `finish_bounce`
+    /// keeps quiet about there; and as a second receipt after Export Stems'
+    /// own. The pass's one receipt carries its stems now. The words are
+    /// driven; that the chore says nothing of its own is a source scan,
+    /// because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_realtime_receipt_names_its_stems_folder_and_leaves_a_dialog_pass_to_its_delivery() {
+        let export = std::path::Path::new("/p/song/export");
+        let dry = export.join(tangent_ui::ports::stems_folder_name(true));
+        let wet = export.join(tangent_ui::ports::stems_folder_name(false));
+        assert_eq!(
+            stems_receipt(&[dry.join("01-Bass.wav"), dry.join("02-Keys.wav")]),
+            " + 2 stems in export/stems-dry/",
+            "dry stems were said to be in the processed stems' folder"
+        );
+        assert_eq!(stems_receipt(&[wet.join("01-Bass.wav")]), " + 1 stem in export/stems/");
+        assert_eq!(stems_receipt(&[]), "", "a pass with no stems spoke of them");
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn run_chore_now(").expect("run_chore_now");
+        let chores = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let finish = &chores[chores.find("Chore::FinishBounce {").expect("the finish's chore")..];
+        let finish = &finish[..finish.find("\n            }\n").expect("the arm's end")];
+        assert!(
+            finish.contains("self.finish_bounce(") && !finish.contains(".notify("),
+            "the finish's chore pushes a receipt of its own beside the pass's"
+        );
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let quiet = body.find("Ok(_) if delivery.is_none() => {").expect("the staging copy's receipt");
+        let arm = &body[quiet..quiet + body[quiet..].find("Ok(_) => {}").expect("the dialog's arm")];
+        assert!(
+            arm.contains("stems_receipt(landed)"),
+            "the pass's own receipt does not carry its stems"
         );
     }
 
