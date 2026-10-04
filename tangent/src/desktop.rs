@@ -11118,8 +11118,9 @@ impl DesktopApp {
                 if name.is_empty() {
                     return;
                 }
-                // **Is the session's own folder REAL?** Asked before anything
-                // is written, because the answer decides what may be.
+                // **Is the session's own folder REAL?** Asked first, because
+                // the answer decides what the template is built from: a real
+                // folder is copied whole, and a scratch has none to copy.
                 //
                 // A session that has never been saved has no folder, and
                 // this road used to give it one: it saved the session into
@@ -11127,24 +11128,22 @@ impl DesktopApp {
                 // the template from a fresh launch, so every Save As
                 // Template left a `Projects/Untitled` behind - "why am i
                 // getting untitled tracks building up again". A template is
-                // not a save of the session; the scratch stays unwritten and
-                // the template is written straight from memory.
+                // not a save of the session, from a scratch or a real folder:
+                // nothing of the session is written, and the template is
+                // written straight from memory.
                 let src = self
                     .app
                     .project_doc()
                     .and_then(std::path::Path::parent)
                     .map(std::path::Path::to_path_buf);
                 let was_real = src.as_deref().is_some_and(std::path::Path::is_dir);
-                // **Everything written down first, so the copy IS the
-                // session** — its plugins' knobs included. A REAL folder is
-                // saved and copied whole, media and takes with it, as it
-                // always was; a scratch puts its knobs on the global shelf
-                // only, which is where they are mirrored from below.
-                if was_real {
-                    self.save_project_and_states();
-                } else {
-                    self.save_plugin_states();
-                }
+                // **The live knobs on the global shelf, and nothing else
+                // written.** `build_template` mirrors that shelf into the
+                // template. A REAL folder used to be saved first and copied,
+                // so an experiment went into the project's document and
+                // `state/`, the asterisk went with it, and Don't Save had
+                // nothing left to refuse.
+                self.save_plugin_states();
                 // **Built beside the shelf and swapped in.** The old road
                 // deleted the template before writing its replacement, so a
                 // failed copy left no template at all - and a scratch adopted
@@ -11153,21 +11152,12 @@ impl DesktopApp {
                 let shelf = self.templates_dir();
                 let stage = shelf.join(format!(".{name}.writing"));
                 let _ = std::fs::remove_dir_all(&stage);
-                let built = match src.as_deref() {
-                    Some(src) if was_real => copy_dir_all(src, &stage).map(|()| {
-                        // A project whose kit was never edited has no sidecar
-                        // of its own, and a template without one makes every
-                        // later scratch's kit look like work to the sweep.
-                        if !stage.join(tangent_ui::drumpad::FILE_NAME).exists() {
-                            self.app.write_kit_into(&stage);
-                        }
-                    }),
-                    _ => self.app.write_template_into(&stage).map(|()| {
-                        let shelf_dir = stage.join("state");
-                        let _ = std::fs::create_dir_all(&shelf_dir);
-                        mirror_sidecars(&global_state_dir(), &shelf_dir);
-                    }),
-                };
+                let built = build_template(
+                    &self.app,
+                    src.as_deref().filter(|_| was_real),
+                    &stage,
+                    &global_state_dir(),
+                );
                 let dst = shelf.join(&name);
                 // **And it says so, either way.** This row replaces a whole
                 // folder - the stencil every New and every launch is made
@@ -11544,7 +11534,7 @@ impl DesktopApp {
     /// exist yet, and then created it, empty of state, one line later.
     ///
     /// **That is why the owner's default template had no `state/` folder in
-    /// it at all.** Save As Template copies the session's whole folder, and
+    /// it at all.** Save As Template copied the session's whole folder, and
     /// the session a launch stands on is an unmaterialised scratch, so the
     /// copy carried the two things the materialise had just made — `media/`
     /// and the document — and nothing else. His template names Brusfri in a
@@ -15995,6 +15985,34 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
         return Err(e);
     }
     let _ = std::fs::remove_dir_all(&aside);
+    Ok(())
+}
+
+/// **A template built into `stage`, and nothing of the session written.**
+///
+/// A REAL folder is copied whole first - media, takes and anything else in
+/// it, as Save As Template always carried them - and the session is then
+/// written over the copy from memory (`TangentApp::write_template_into`: the
+/// document with the live desk and `named` off, the kit, the files they
+/// name), with the live knobs mirrored from `shelf` into its `state/`. A
+/// scratch has no folder to copy and gets the rest. So the template is the
+/// session as it stands either way, and the session's own document,
+/// `state/` and saved mark are left alone: Save As Template used to save a
+/// real folder's session first and copy that, writing an experiment into
+/// the project and clearing its asterisk.
+fn build_template(
+    app: &TangentApp,
+    real: Option<&std::path::Path>,
+    stage: &std::path::Path,
+    shelf: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(src) = real {
+        copy_dir_all(src, stage)?;
+    }
+    app.write_template_into(stage)?;
+    let state = stage.join("state");
+    let _ = std::fs::create_dir_all(&state);
+    mirror_sidecars(shelf, &state);
     Ok(())
 }
 
@@ -26001,6 +26019,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Save As Template writes the template, never the session.** From a
+    /// saved project it saved the session first and copied the folder, so an
+    /// experiment went into the project's document and `state/`, the title
+    /// lost its asterisk, and Don't Save had nothing left to refuse. The
+    /// folder is still copied whole, and the session is written over the
+    /// copy from memory: its edits and its live knobs are the template's,
+    /// and the project on disk stays as it was saved.
+    #[test]
+    fn a_template_from_a_saved_project_leaves_the_project_as_it_was_saved() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-tpl-real-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // A saved project: a named document with one clip, takes on disk, a
+        // sidecar from its last save and a file of somebody's own.
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).unwrap();
+        std::fs::create_dir_all(song.join("state")).unwrap();
+        let mut doc = tangent_ui::arrangement::Arrangement::default();
+        doc.named = true;
+        let clip = doc.add_clip(tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "media/take.wav".to_owned(),
+            len_s: 2.0,
+            ..Default::default()
+        });
+        let saved = song.join(tangent_ui::arrangement::DOC_NAME);
+        doc.save_to(&saved);
+        std::fs::write(song.join("media/take.wav"), b"pcm").unwrap();
+        std::fs::write(song.join("media/outtake.wav"), b"more pcm").unwrap();
+        let sidecar = sidecar_name(0, 0);
+        std::fs::write(song.join("state").join(&sidecar), b"as saved").unwrap();
+        std::fs::write(song.join("notes.txt"), b"mine").unwrap();
+        let on_disk = std::fs::read(&saved).unwrap();
+        // Opened, and turned down since: an edit nobody has saved.
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        app.open_project(&saved);
+        app.set_clip_gain(clip, 0.5);
+        assert!(app.project_dirty_exact(), "the fixture's edit is not unsaved");
+        // The live knobs, on a shelf of the test's own.
+        let shelf = root.join("shelf");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join(&sidecar), b"live").unwrap();
+
+        let stage = root.join(".rig.writing");
+        build_template(&app, Some(&song), &stage, &shelf).expect("the template was built");
+        let project_now = std::fs::read(&saved).unwrap();
+        let knobs_now = std::fs::read(song.join("state").join(&sidecar)).unwrap();
+        let unsaved = app.project_dirty_exact();
+        let tpl = tangent_ui::arrangement::Arrangement::load_from(&stage.join(tangent_ui::arrangement::DOC_NAME));
+        let tpl_knobs = std::fs::read(stage.join("state").join(&sidecar)).ok();
+        let carried = ["media/take.wav", "media/outtake.wav", "notes.txt", tangent_ui::drumpad::FILE_NAME]
+            .map(|f| (f, stage.join(f).is_file()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The project is as it was saved, and its edit is still unsaved...
+        assert!(project_now == on_disk, "Save As Template rewrote the project's document");
+        assert_eq!(knobs_now, b"as saved", "Save As Template rewrote the project's knobs");
+        assert!(unsaved, "Save As Template marked the session saved");
+        // ...and the template is the session as it stands, the folder copied
+        // whole, with a kit to be compared against.
+        assert!(!tpl.named, "the template was born named");
+        assert_eq!(
+            tpl.clips.iter().find(|c| c.id == clip).map(|c| c.gain),
+            Some(0.5),
+            "the template is not the session as it stands"
+        );
+        assert_eq!(
+            tpl_knobs.as_deref(),
+            Some(&b"live"[..]),
+            "the template carries the last save's knobs, not the live ones"
+        );
+        for (file, there) in carried {
+            assert!(there, "{file} did not come with the template");
+        }
+    }
+
     /// **A rack that has not arrived yet holds the room shut**, and only for
     /// the inputs somebody is actually playing through.
     ///
@@ -28545,9 +28643,10 @@ mod tests {
     /// the two entries his template has.
     ///
     /// `save_project_and_states` is the one spelling of the order now, and
-    /// the two roads that keep a session whole go through it. The two that
-    /// save the outgoing session only when it is dirty cannot (the write is
-    /// conditional), so they are asserted where they stand.
+    /// Save, the road that keeps a session whole, goes through it; Save As
+    /// Template writes nothing of the session at all, and is held to that.
+    /// The two that save the outgoing session only when it is dirty cannot
+    /// (the write is conditional), so they are asserted where they stand.
     ///
     /// A source scan because `DesktopApp` cannot be built in a test — the
     /// precedent is `every_edge_where_frames_stop_flushes_the_settings_debounce`
@@ -28556,7 +28655,7 @@ mod tests {
     /// seat, and watches the learned profile arrive.
     ///
     /// Revert-check: put `copy_states_to_project` back above
-    /// `save_project_doc` in any of the four and this goes red naming it.
+    /// `save_project_doc` in any of the three and this goes red naming it.
     #[test]
     fn a_road_that_writes_a_project_shelves_the_states_after_the_document() {
         let whole = include_str!("desktop.rs");
@@ -28583,60 +28682,40 @@ mod tests {
              lose them"
         );
 
-        // The two roads that keep a session whole go through it.
-        for (arm, next) in [
-            ("ProjectRequest::Save =>", "ProjectRequest::Template(name)"),
-            ("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)"),
-        ] {
-            let body = between(arm, next);
-            assert!(
-                body.contains("self.save_project_and_states()"),
-                "the {arm} arm no longer keeps the session through \
-                 `save_project_and_states`, so it has an order of its own \
-                 again"
-            );
-            assert!(
-                !body.contains("self.copy_states_to_project()"),
-                "the {arm} arm shelves the plugin states itself as well, \
-                 which is a second spelling of an order that has exactly one"
-            );
-        }
-        // Save As Template copies a REAL folder, so both writes have to have
-        // happened before the copy or the template is a session missing its
-        // shelf — which is the whole fault.
+        // The road that keeps a session whole goes through it.
+        let save = between("ProjectRequest::Save =>", "ProjectRequest::Template(name)");
+        assert!(
+            save.contains("self.save_project_and_states()"),
+            "the Save arm no longer keeps the session through \
+             `save_project_and_states`, so it has an order of its own again"
+        );
+        assert!(
+            !save.contains("self.copy_states_to_project()"),
+            "the Save arm shelves the plugin states itself as well, which is \
+             a second spelling of an order that has exactly one"
+        );
+        // **Save As Template is not a save, from a scratch or a real folder.**
+        // It puts the live knobs on the global shelf and builds the template
+        // from memory with that shelf mirrored into it (`build_template`,
+        // driven by `a_template_from_a_saved_project_leaves_the_project_as_it_was_saved`),
+        // and writes nothing of the session. It used to save a real folder's
+        // session first and copy that, and before that it wrote a scratch
+        // into `Projects/Untitled`, every time.
         let template = between("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)");
-        let saved = template.find("self.save_project_and_states()").expect("the real-folder save");
-        let copied = template.find("copy_dir_all(src, &stage)").expect("the real-folder copy");
+        for write in ["save_project", "copy_states_to_project", "materialize_project_dir"] {
+            assert!(!template.contains(write), "Save As Template writes the session: `{write}`");
+        }
+        let shelved = template
+            .find("self.save_plugin_states();")
+            .expect("Save As Template no longer puts the live knobs on the shelf");
+        let built = template
+            .find("build_template(")
+            .expect("Save As Template no longer builds through `build_template`");
+        assert!(shelved < built, "the template is built before the live knobs are on the shelf it mirrors");
+        let helper = between("fn build_template(", "\n}\n");
         assert!(
-            saved < copied,
-            "Save As Template copies the session folder before it writes the \
-             session into it, so the template is a stencil with no plugin \
-             state in it"
-        );
-        // **And a scratch is never written on the way.** The save is the
-        // REAL folder's alone: asked about before any write, and the scratch
-        // gets the template written from memory with its shelf mirrored.
-        // Without this every Save As Template from a fresh launch left a
-        // `Projects/Untitled` behind.
-        let real = template.find("let was_real").expect("the template road no longer asks whether the folder is real");
-        assert!(
-            real < saved && real < template.find("self.save_plugin_states()").unwrap_or(usize::MAX),
-            "the template road writes before it knows whether the session has a folder"
-        );
-        let scratch = template
-            .split("if was_real {")
-            .nth(1)
-            .and_then(|t| t.split("} else {").nth(1))
-            .and_then(|t| t.split('}').next())
-            .expect("the scratch branch of the template save");
-        assert!(
-            !scratch.contains("save_project") && scratch.contains("self.save_plugin_states()"),
-            "a template saved from a scratch writes the scratch: {scratch}"
-        );
-        assert!(
-            template.contains("self.app.write_template_into(&stage)")
-                && template.contains("mirror_sidecars(&global_state_dir(), &shelf_dir)"),
-            "a scratch's template is no longer written from memory with its shelf"
+            helper.contains("app.write_template_into(stage)") && helper.contains("mirror_sidecars(shelf, &state)"),
+            "a template is no longer written from memory with its shelf"
         );
 
         // And the two that write the outgoing document only if it is dirty.
@@ -33851,11 +33930,10 @@ mod sidecar_walk_probe {
 
     /// **And the cure: a template that carries its rack carries its state.**
     ///
-    /// The same adopt, against a template whose folder was copied from a
-    /// session that had a shelf in it - which is what
-    /// `save_project_and_states` makes `Save As Template` produce. The
-    /// learned profile arrives on the live shelf and the plugin comes back
-    /// with it.
+    /// The same adopt, against a template that carries its shelf, as every
+    /// template `Save As Template` writes now does (`build_template` mirrors
+    /// the live knobs into its `state/`). The learned profile arrives on the
+    /// live shelf and the plugin comes back with it.
     ///
     /// **The leak is still shut.** A seat the template does NOT name still
     /// loses its sidecar, which is the whole reason the mirror clears: "the

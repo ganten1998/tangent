@@ -64,22 +64,26 @@ Related invariants that keep this working:
 - The session's document is written by a save the hand asked for: Save,
   the prompt's Save, the first save (`save_project_first`, which MOVES a
   materialised scratch to the chosen name) and Save As (a copy the session
-  then stands on). Two side roads write it too: Save As Template from a
-  REAL folder (`save_project_and_states`, before the copy), and the
-  save-back on New and Open (`switch_project`, the New arm), which writes
-  only when `project_dirty_exact()` and the prompt was not answered Don't
-  Save. `on_exit` never writes it. Plugin states always go to the global
+  then stands on). One side road writes it too: the save-back on New and
+  Open (`switch_project`, the New arm), which writes only when
+  `project_dirty_exact()` and the prompt was not answered Don't Save.
+  `on_exit` and Save As Template never write it. Plugin states always go to the global
   shelf first (`save_plugin_states`); `copy_states_to_project` mirrors them
   into the project's `state/` only when the answer was not Don't Save, and
   stands down while the folder is unmaterialised.
-- **Save As Template never makes a scratch real** (2026-09-22). A session
-  whose folder does not exist yet is not written: its template is built
-  from memory (`write_template_into`) into a staging folder and swapped
-  onto the shelf (`swap_in_template`), and the scratch is marked as needing
-  no save (`mark_template_saved`). A REAL folder (a saved project, or a
-  scratch something already materialised) is still saved first
-  (`save_project_and_states`) and copied whole, as it always was. The old
-  road saved the scratch into `Projects/Untitled` first, which was the
+- **Save As Template never writes the session** (a scratch since
+  2026-09-22, a real folder since 2026-10-03). The template is built from
+  memory (`build_template`, through `write_template_into`) into a staging
+  folder, with the live plugin knobs mirrored into its `state/`, and
+  swapped onto the shelf (`swap_in_template`). A REAL folder (a saved
+  project, or a scratch something already materialised) is copied whole
+  first, media and takes with it, as it always was, and the session is
+  written over the copy; the project's own document, `state/` and saved
+  mark are left alone, so its unsaved edits stay unsaved. A scratch is
+  marked as needing no save (`mark_template_saved`), since the template
+  holds it. The old roads saved the session first: a real folder's
+  experiment went into its document and Don't Save had nothing left to
+  refuse, and a scratch was saved into `Projects/Untitled`, which was the
   pile's main source. Every template Save As Template writes carries a
   `drumpad.json`, an empty kit included, because `kit_is_custom` compares
   against it; one seeded by a fresh install has none, and with no template
