@@ -138,6 +138,11 @@ pub(crate) fn device_id(_device: Option<&str>) -> Option<u32> {
 #[cfg(all(target_os = "macos", feature = "recorder"))]
 pub(crate) use mac::output_names;
 
+/// See `mac::default_output_plays`. Read only by the reprobe, like
+/// `output_names`; off macOS it asks cpal (`desktop::default_output_alive`).
+#[cfg(all(target_os = "macos", feature = "recorder"))]
+pub(crate) use mac::default_output_plays;
+
 #[cfg(target_os = "macos")]
 mod mac {
     use super::OutputPath;
@@ -174,6 +179,18 @@ mod mac {
     /// `kAudioDeviceProcessorOverload`. Not a value: the HAL POSTS this when
     /// an IO cycle on the device missed its deadline. See [`OverloadWatch`].
     const PROCESSOR_OVERLOAD: u32 = fourcc(b"over");
+
+    /// `kAudioDevicePropertyStreamFormat`, the `AudioStreamBasicDescription`
+    /// cpal's `default_output_config` takes its channels and sample format
+    /// from. See [`default_output_plays`].
+    #[cfg(feature = "recorder")]
+    const STREAM_FORMAT: u32 = fourcc(b"sfmt");
+    /// `kAudioDevicePropertyDeviceIsAlive`: zero once the device has gone.
+    #[cfg(feature = "recorder")]
+    const IS_ALIVE: u32 = fourcc(b"livn");
+    /// `kAudioFormatLinearPCM`.
+    #[cfg(feature = "recorder")]
+    const LINEAR_PCM: u32 = fourcc(b"lpcm");
 
     const T_VIRTUAL: u32 = fourcc(b"virt");
     const T_AGGREGATE: u32 = fourcc(b"grup");
@@ -401,6 +418,71 @@ mod mac {
             .filter(|&id| has_output(id))
             .filter_map(|id| get_string(id, &PropertyAddress::global(NAME)))
             .collect()
+    }
+
+    /// `AudioStreamBasicDescription`, laid out as the header lays it out.
+    #[cfg(feature = "recorder")]
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct StreamFormat {
+        _sample_rate: f64,
+        format_id: u32,
+        format_flags: u32,
+        _bytes_per_packet: u32,
+        _frames_per_packet: u32,
+        _bytes_per_frame: u32,
+        channels_per_frame: u32,
+        bits_per_channel: u32,
+        _reserved: u32,
+    }
+
+    /// **Whether cpal opens a stream in this format**: linear PCM, as a
+    /// packed 32-bit float or a packed 16-bit signed integer, the only two
+    /// sample formats cpal's macOS `default_output_config` accepts (through
+    /// `coreaudio-rs`'s `SampleFormat::from_flags_and_bits_per_sample`).
+    /// Anything else is `StreamTypeNotSupported` there, a device the engine
+    /// will not seat (`instrument::output_is_live`), so it does not read as
+    /// back here either.
+    #[cfg(feature = "recorder")]
+    fn cpal_opens(f: &StreamFormat) -> bool {
+        const FLOAT: u32 = 1 << 0; // kAudioFormatFlagIsFloat
+        const SIGNED: u32 = 1 << 2; // kAudioFormatFlagIsSignedInteger
+        const PACKED: u32 = 1 << 3; // kAudioFormatFlagIsPacked
+        if f.format_id != LINEAR_PCM || f.format_flags & PACKED == 0 {
+            return false;
+        }
+        if f.format_flags & FLOAT != 0 {
+            f.bits_per_channel == 32
+        } else {
+            f.format_flags & SIGNED != 0 && f.bits_per_channel == 16
+        }
+    }
+
+    /// **Whether the default output can play, from property reads alone.**
+    ///
+    /// The reprobe asks this every two seconds while the engine is down
+    /// (`desktop::default_output_alive`). cpal answers it with
+    /// `default_output_config`, which reads the device's stream format and
+    /// then builds an AUHAL to read a buffer range it throws away: about
+    /// 21 ms a time, measured, the cost `nominal_rate` exists to keep off a
+    /// timer. This reads what cpal reads before building the unit: the
+    /// default output device, its stream format, a format cpal opens
+    /// ([`cpal_opens`]), and at least one channel; and
+    /// `kAudioDevicePropertyDeviceIsAlive`, the HAL's own word for a device
+    /// that has gone, which is what the unit would mostly have found out. A
+    /// device that passes all of that and still cannot host the unit reads
+    /// as back here and not there: the probe then tries the open, which
+    /// fails as it would have, and the next probe tries it again.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn default_output_plays() -> bool {
+        let Some(id) = resolve(None) else {
+            return false;
+        };
+        if get::<u32>(id, &PropertyAddress::global(IS_ALIVE)) == Some(0) {
+            return false;
+        }
+        get::<StreamFormat>(id, &PropertyAddress::output(STREAM_FORMAT))
+            .is_some_and(|f| f.channels_per_frame > 0 && cpal_opens(&f))
     }
 
     /// The transport in a word the panel can print.
@@ -631,6 +713,15 @@ mod mac {
             ] {
                 assert_eq!(got, want, "a selector does not match the header");
             }
+            // The reprobe's, which only the recorder has.
+            #[cfg(feature = "recorder")]
+            for (got, want) in [
+                (STREAM_FORMAT, 0x7366_6d74), // 'sfmt'
+                (IS_ALIVE, 0x6c69_766e),      // 'livn'
+                (LINEAR_PCM, 0x6c70_636d),    // 'lpcm'
+            ] {
+                assert_eq!(got, want, "a selector does not match the header");
+            }
         }
 
         /// **The probe answers on this machine and does not hang.**
@@ -698,6 +789,70 @@ mod mac {
                 "the HAL read and cpal's AudioUnit disagree about the default \
                  output's rate - the rate follower would reopen the path forever"
             );
+        }
+
+        /// **The probe's cheap road and cpal's expensive one agree that the
+        /// default output plays**, or the engine-down probe would reopen on
+        /// a device the engine will not seat, or wait for ever on one it
+        /// would. The same no-regression case as the rate's, for
+        /// [`default_output_plays`]; cpal's road builds one AUHAL here.
+        /// Skips only where there is no default output to ask about.
+        #[cfg(feature = "recorder")]
+        #[test]
+        fn the_hal_liveness_agrees_with_the_audio_unit_it_replaces() {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let Some(device) = cpal::default_host().default_output_device() else {
+                eprintln!("skipping: no default output on this machine");
+                return;
+            };
+            let via_unit = device
+                .default_output_config()
+                .is_ok_and(|c| c.channels() > 0);
+            assert_eq!(
+                default_output_plays(),
+                via_unit,
+                "the HAL read and cpal's AudioUnit disagree about whether the \
+                 default output plays"
+            );
+        }
+
+        /// **The formats the probe reads as playable are the two cpal
+        /// opens**: packed 32-bit float and packed 16-bit signed linear PCM,
+        /// as `coreaudio-rs` maps flags and bits to a sample format and cpal
+        /// keeps only `F32` and `I16`. Anything else is a device the engine
+        /// skips, and a probe that called it back would reopen the audio
+        /// path every two seconds onto an open that fails.
+        #[cfg(feature = "recorder")]
+        #[test]
+        fn the_probe_reads_as_playable_only_the_formats_cpal_opens() {
+            const FLOAT: u32 = 1 << 0;
+            const SIGNED: u32 = 1 << 2;
+            const PACKED: u32 = 1 << 3;
+            let format = |format_id: u32, format_flags: u32, bits_per_channel: u32| StreamFormat {
+                format_id,
+                format_flags,
+                bits_per_channel,
+                channels_per_frame: 2,
+                ..StreamFormat::default()
+            };
+            for (id, flags, bits, opens) in [
+                (LINEAR_PCM, FLOAT | PACKED, 32, true),
+                (LINEAR_PCM, SIGNED | PACKED, 16, true),
+                (LINEAR_PCM, FLOAT, 32, false),
+                (LINEAR_PCM, FLOAT | PACKED, 64, false),
+                (LINEAR_PCM, SIGNED | PACKED, 24, false),
+                (LINEAR_PCM, SIGNED | PACKED, 32, false),
+                (LINEAR_PCM, SIGNED | PACKED, 8, false),
+                (LINEAR_PCM, SIGNED, 16, false),
+                (LINEAR_PCM, PACKED, 16, false),
+                (fourcc(b"aac "), FLOAT | PACKED, 32, false),
+            ] {
+                assert_eq!(
+                    cpal_opens(&format(id, flags, bits)),
+                    opens,
+                    "format {id:#x}, flags {flags:#b}, {bits} bits"
+                );
+            }
         }
 
         /// A watch installs, answers a number, and comes back down without
