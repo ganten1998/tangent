@@ -385,6 +385,26 @@ pub trait AudioSetup: Send {
     }
 }
 
+/// The index of the output whose name a caller asked for: exact first, then the
+/// loose substring a human would type. Pure, so it can be tested without a sound
+/// card — cpal has no stable device identifier on any backend, `name()` is the
+/// only identity method there is (`tangent-record`'s `audio.rs` documents the dig
+/// through the backends), so a name and a substring are all a caller has.
+///
+/// **One rule for three askers**, which is why it lives on this side of the
+/// firewall: the host's open (`instrument::resolve_output`), its reprobe
+/// (`desktop::OutputReturn`, so the plug it waits for is the device the open
+/// would find), and Setup's OUTPUT row, which lights the chip this picks. The
+/// row matched exactly on its own, so a saved "Komplete Audio 6" opened the
+/// "Komplete Audio 6 MK2" with no chip lit.
+pub fn match_output_name(names: &[String], want: &str) -> Option<usize> {
+    if let Some(i) = names.iter().position(|n| n == want) {
+        return Some(i);
+    }
+    let lower = want.to_lowercase();
+    names.iter().position(|n| n.to_lowercase().contains(&lower))
+}
+
 /// **What the OS says about the device the monitor plays into.**
 ///
 /// The panel could always say how many milliseconds the two buffers hold. It

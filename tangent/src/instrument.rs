@@ -19860,21 +19860,11 @@ fn output_is_live(device: &cpal::Device) -> bool {
         .unwrap_or(false)
 }
 
-/// The index of the output whose name a caller asked for: exact first, then the
-/// loose substring a human would type. Pure, so it can be tested without a sound
-/// card — cpal has no stable device identifier on any backend, `name()` is the
-/// only identity method there is (`tangent-record`'s `audio.rs` documents the dig
-/// through the backends), so a name and a substring are all a caller has.
-///
-/// The reprobe asks it too (`desktop::OutputReturn`), so the plug it waits for
-/// is the device this open would find.
-pub(crate) fn match_output_name(names: &[String], want: &str) -> Option<usize> {
-    if let Some(i) = names.iter().position(|n| n == want) {
-        return Some(i);
-    }
-    let lower = want.to_lowercase();
-    names.iter().position(|n| n.to_lowercase().contains(&lower))
-}
+// The index of the output whose name a caller asked for: exact first, then the
+// loose substring. It lives in `tangent_ui::ports`, beside `AudioSetup::outputs`,
+// because Setup's OUTPUT row lights the chip it picks: the open, the reprobe's
+// plug watch and the row ask the one rule. See its doc there.
+pub(crate) use tangent_ui::ports::match_output_name;
 
 /// Find the output device to open.
 ///

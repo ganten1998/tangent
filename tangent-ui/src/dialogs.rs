@@ -10068,8 +10068,18 @@ fn show_on(
                                         *output = None;
                                         action = Some(DialogAction::SetAudioOutput(None));
                                     }
-                                    for name in outputs.iter() {
-                                        let on = output.as_deref() == Some(name.as_str());
+                                    // **The chip the OPEN would pick**, by
+                                    // its own rule (exact, then a case-blind
+                                    // substring): an exact match here alone
+                                    // left a renamed device playing with no
+                                    // chip lit. A name that matches nothing
+                                    // lights nothing - the setting still
+                                    // names it, and the stand-in is said.
+                                    let lit = output
+                                        .as_deref()
+                                        .and_then(|want| crate::ports::match_output_name(outputs, want));
+                                    for (i, name) in outputs.iter().enumerate() {
+                                        let on = lit == Some(i);
                                         if ui.selectable_label(on, name).clicked() && !on {
                                             *output = Some(name.clone());
                                             action =
@@ -15888,6 +15898,94 @@ at: None,
             "a list a system press left behind does not say when the new one comes"
         );
         assert!(!bare.says("none reported"), "a system not yet asked reads as one with no outputs");
+    }
+
+    /// **The lit OUTPUT chip is the device that opens.** The open finds the
+    /// setting's name exactly and then as a case-blind substring
+    /// (`ports::match_output_name`), and the row lit a chip only on an exact
+    /// match: a "Komplete Audio 6" saved before the box was renamed opened
+    /// the "Komplete Audio 6 MK2" with nothing lit, so the panel said no
+    /// output was chosen while one played. The row lights by the open's own
+    /// rule now.
+    ///
+    /// A lit chip is told by the fill behind its word: a selected label
+    /// paints one and an unselected one does not (the theme gives both the
+    /// same ink).
+    #[test]
+    fn the_output_row_lights_the_device_that_opens() {
+        let fills_under = |output: Option<&str>, word: &str| -> usize {
+            let mut slot = Slot::new(Dialog::AudioSetup {
+                status: crate::recorder::AudioStatus::default(),
+                buffer: None,
+                ahead: 0.0,
+                rate: None,
+                systems: vec!["WASAPI".to_owned()],
+                system: Some("WASAPI".to_owned()),
+                outputs: vec![
+                    "Speakers (Realtek High Definition Audio)".to_owned(),
+                    "Komplete Audio 6 MK2".to_owned(),
+                ],
+                output: output.map(str::to_owned),
+                outputs_stale: false,
+                rates: Vec::new(),
+                input_channels: 0,
+                exposed: Vec::new(),
+                take_summary: true,
+                alias: String::new(),
+                output_path: crate::ports::OutputPath::default(),
+            });
+            let _ = slot.settle();
+            let face = slot.face;
+            let dialog = &mut slot.dialog;
+            let out = slot.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                    time: Some(slot.clock + 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, dialog, face, Slot::placement());
+                },
+            );
+            let mut texts: Vec<(Rect, String)> = Vec::new();
+            let mut fills: Vec<Rect> = Vec::new();
+            fn walk(s: &egui::epaint::Shape, texts: &mut Vec<(Rect, String)>, fills: &mut Vec<Rect>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => texts.push((
+                        Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        t.galley.text().to_owned(),
+                    )),
+                    egui::epaint::Shape::Rect(r) if r.fill.a() > 0 => fills.push(r.rect),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts, fills)),
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                walk(&c.shape, &mut texts, &mut fills);
+            }
+            let at = texts
+                .iter()
+                .find(|(_, t)| t == word)
+                .unwrap_or_else(|| panic!("nothing on screen says {word:?}"))
+                .0
+                .center();
+            fills.iter().filter(|r| r.contains(at)).count()
+        };
+        let lit = fills_under(Some("Komplete Audio 6 MK2"), "Komplete Audio 6 MK2");
+        let unlit = fills_under(None, "Komplete Audio 6 MK2");
+        assert!(lit > unlit, "the fixture cannot tell a lit chip from an unlit one ({lit} fills against {unlit})");
+        for saved in ["Komplete Audio 6", "komplete audio 6 mk2"] {
+            assert_eq!(
+                fills_under(Some(saved), "Komplete Audio 6 MK2"),
+                lit,
+                "a saved {saved:?} opens the Komplete Audio 6 MK2, and its chip is not lit"
+            );
+            assert_eq!(
+                fills_under(Some(saved), "the system's own"),
+                fills_under(Some("Komplete Audio 6 MK2"), "the system's own"),
+                "a saved {saved:?} lit the system's own"
+            );
+        }
     }
 
     /// **The buffer chip and the readout above it cannot disagree about who

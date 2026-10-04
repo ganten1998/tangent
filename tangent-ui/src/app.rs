@@ -31339,7 +31339,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .and_then(|s| s.active_system())
                 .or_else(|| self.settings.audio_system().map(str::to_owned)),
             outputs,
-            output: self.settings.audio_output_device.clone(),
+            // What the ENGINE reads, not the raw setting: a blank one is the
+            // system's own there, and handed over raw it lit no chip at all.
+            output: self.audio_output_device(),
             outputs_stale: false,
             rates,
             exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
@@ -43805,6 +43807,27 @@ mod tests {
                 assert!(*outputs_stale, "the row does not say its list belongs to the old system");
             }
             _ => panic!("Setup closed"),
+        }
+    }
+
+    /// **Setup opens on the output the engine opens.** A blank setting is
+    /// the system's own to the engine (`audio_output_device` reads it so),
+    /// and the panel was handed the raw setting instead: whitespace lit no
+    /// chip at all, "the system's own" included, while the system's own
+    /// played.
+    #[test]
+    fn a_blank_output_setting_opens_setup_on_the_systems_own() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_output_device = Some("   ".to_owned());
+        assert_eq!(app.audio_output_device(), None, "the fixture's setting opens a named output");
+        app.open_audio_setup();
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { output, .. }) => assert_eq!(
+                output.as_deref(),
+                None,
+                "a blank setting plays the system's own, and Setup lit neither it nor anything else"
+            ),
+            _ => panic!("Setup did not open"),
         }
     }
 
