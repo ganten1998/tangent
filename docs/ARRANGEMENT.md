@@ -80,7 +80,10 @@ dissolves no folder either (`folders_held`): the export chose its stems by
 the folders at its press. No track is removed under an export or an
 arrangement record, by any road (`tracks_held`): a removal empties a row
 the export or the record is writing, and renumbers the input picks the
-record captures by.
+record captures by. And no road replaces the session while a take counts
+in or an export runs (`session_held`): a take rolls on through New and
+Open, but the incoming desk's tempo would retime the click under its
+count, and an export plays this project into this project's folder.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 

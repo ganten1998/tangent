@@ -16507,14 +16507,47 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         !self.arrangement.named && !self.project_dirty_exact()
     }
 
+    /// **Whether the session holds, saying so when it does: a take counts
+    /// in, or a realtime export runs.** A take is capture only and rolls on
+    /// through a switch, count and all, but the incoming desk brings its own
+    /// tempo and signature (`apply_desk_snapshot`), and the engine's click
+    /// reads the tempo every callback: the count a take saved something
+    /// from (its pre-roll's wall clock, the head latched at its press) was
+    /// retimed under it, which is what the tempo hold is for. An export
+    /// plays this project into this project's folder. The arrangement's
+    /// count alone does not hold the session: the switch calls that record
+    /// off (the host's `call_off_arr_count`). Asked by `ask_before` for New,
+    /// Open and Reset Template, by Reset Everything, and by the host's Open,
+    /// whose panel can be answered under a count.
+    pub fn session_held(&mut self) -> bool {
+        let take_counting = self.recorder.state.is_active() && self.recorder.tempo_held();
+        let held = self.recorder.exporting || take_counting;
+        if held {
+            let why = if self.recorder.exporting {
+                "This project stays open while an export runs - it is playing it."
+            } else {
+                "This project stays open while a take counts in - open another after its downbeat."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+        }
+        held
+    }
+
     /// **Ask before losing anything.** Returns whether the caller should
-    /// stop and wait for the answer.
+    /// stop and wait for the answer - or stop outright, for a switch the
+    /// session refuses while a take counts in or an export runs
+    /// (`session_held`).
     ///
     /// With the autosave gone, this is the only thing standing between an
     /// afternoon's work and a keystroke — so it is one function, and New,
     /// Open and Quit all go through it rather than each growing their own
     /// version of the question.
     fn ask_before(&mut self, next: AfterSave) -> bool {
+        // Refused before anything is asked, so no question is answered for
+        // nothing. Quitting replaces no session.
+        if next != AfterSave::Quit && self.session_held() {
+            return true;
+        }
         // A fresh question; an earlier "Don't Save" answered a different one.
         self.outgoing_discarded = false;
         // **The EXACT comparison, and it stays exact.** This is the one
@@ -16615,7 +16648,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// moment, so the question asked when New was pressed (none at all, on a
     /// clean session) never covered it. `true` when the prompt is up and the
     /// New must wait; its Save or Discard raises New again, as the menu's
-    /// does.
+    /// does. `true` as well, with no prompt, when a take counts in or an
+    /// export runs: the session holds (`session_held`).
     pub fn ask_before_new(&mut self) -> bool {
         self.ask_before(AfterSave::New)
     }
@@ -16624,7 +16658,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `ask_before_new`: the host finishes a running arrangement record in
     /// the session it was recorded in before the reset replaces it, and the
     /// take reached the document after the question. `true` when the prompt
-    /// is up; its Save or Discard carries on with the reset.
+    /// is up, its Save or Discard carrying on with the reset, or when the
+    /// session holds (`session_held`).
     pub fn ask_before_reset_template(&mut self) -> bool {
         self.ask_before(AfterSave::ResetTemplate)
     }
@@ -35232,6 +35267,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Private, and reached only from [`Dialog::Confirm`]'s button.
     fn reset_settings(&mut self, ctx: &egui::Context, scope: crate::settings::ResetScope) {
+        // **Everything replaces the session too** - it raises New once the
+        // settings are back - so it is refused before it resets anything
+        // while a take counts in or an export runs: see `session_held`. The
+        // template scope is refused by `ask_before` below.
+        if scope == crate::settings::ResetScope::Everything && self.session_held() {
+            return;
+        }
         // **The template scope touches no setting**, so it takes none of the
         // road below — no backup, no font reload, no window resize. It is a
         // file on disk in the user's Projects folder and only the host can
@@ -68677,6 +68719,75 @@ mod tests {").expect("the tests module")];
         );
         assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **No road replaces the session while a take counts in or an export
+    /// runs.** A take is capture only and rolls on through a session
+    /// switch, count and all - but the incoming document's desk carries its
+    /// own tempo and signature, and `apply_desk_snapshot` applied them under
+    /// the count the tempo hold exists for: the engine's click reads the
+    /// tempo every callback, so it was retimed under the take, away from the
+    /// downbeat its pre-roll counts to on the wall clock and its head was
+    /// measured against. An export plays THIS project, into this project's
+    /// folder. New, Open, Reset Template and Reset Everything refuse now,
+    /// from the menu and from the Project window, and say why. The
+    /// arrangement's count alone holds the tempo but not the session: the
+    /// host calls that record off.
+    #[test]
+    fn the_session_stays_while_a_take_counts_in_or_an_export_runs() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.record_export.tempo_bpm = 97.0;
+        app.undo_reset();
+        assert!(!app.project_dirty_exact(), "the fixture has unsaved work, so New would ask instead");
+        for (label, state, counting, exporting) in [
+            ("a take's pre-roll", recorder::RecordState::CountIn { beat: 1, of: 4 }, true, false),
+            ("a count in a take's file", recorder::RecordState::Rolling, true, false),
+            ("a realtime export", recorder::RecordState::Rolling, false, true),
+            // Its take stopped, its files not landed yet.
+            ("an export filing itself", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.take_counting = counting;
+            app.recorder.exporting = exporting;
+            app.messages.clear();
+            for window in [false, true] {
+                let road = if window { "the Project window" } else { "the menu" };
+                if window {
+                    app.apply_dialog_action(DialogAction::ProjectNew);
+                } else {
+                    app.apply_menu_action(&ctx, MenuAction::NewProject);
+                }
+                assert_eq!(app.take_project_request(), None, "New from {road} replaced the session under {label}");
+                if window {
+                    app.apply_dialog_action(DialogAction::ProjectOpen);
+                } else {
+                    app.apply_menu_action(&ctx, MenuAction::OpenProject);
+                }
+                assert!(app.take_file_request().is_none(), "Open from {road} asked for a project under {label}");
+            }
+            for scope in [crate::settings::ResetScope::Template, crate::settings::ResetScope::Everything] {
+                app.apply_dialog_action(DialogAction::ResetTo(scope));
+                run_frame(&ctx, &mut app);
+                assert_eq!(
+                    app.take_project_request(),
+                    None,
+                    "{scope:?} replaced the session under {label}"
+                );
+            }
+            assert_eq!(app.tempo_bpm(), 97.0, "the held tempo moved under {label}");
+            assert!(!app.said().notes().is_empty(), "the refusals under {label} said nothing");
+            // Quitting replaces no session, and is not held.
+            assert!(!app.intercept_quit(), "{label} held the window open");
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.take_counting = true;
+        app.recorder.exporting = false;
+        app.apply_menu_action(&ctx, MenuAction::NewProject);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::New),
+            "the arrangement's count alone held the session the host calls it off from"
+        );
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
