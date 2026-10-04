@@ -113,15 +113,18 @@ else
   say "tangent-ui does not depend on the binary" "ok"
 fi
 
-# ââ The Minimal build still compiles âââââââââââââââââââââââââââââ
+# ── The Minimal build still compiles ─────────────────────────────────────────
 # `tangent` with NO features is the chord display alone: no recorder, no camera,
-# no plugin host. It is a real configuration â the fallback when a platform
-# cannot carry the rest â and it had stopped compiling, because nothing in the
-# repo ever built it. Every other script builds `--features recorder`.
+# no plugin host. It is a real configuration, the fallback when a platform
+# cannot carry the rest, and it had stopped compiling, because nothing in the
+# repo ever built it.
 #
 # This is the only stage here that invokes the compiler. It is a `check`, not a
 # build, and it shares the workspace target dir, so it is seconds once warm.
 # Set NO_MINIMAL=1 to skip it when iterating on the structural checks alone.
+# scripts/check.sh does exactly that: the gate checks the Minimal build in a
+# leg of its own, which shows the compiler's errors when it fails, and then
+# runs this script with NO_MINIMAL=1 so the configuration is checked once.
 if [ "${NO_MINIMAL:-0}" = 1 ]; then
   say "Minimal build check skipped (NO_MINIMAL=1)" "--"
 elif cargo check -q -p tangent --no-default-features 2>/dev/null; then
