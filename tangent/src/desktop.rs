@@ -645,7 +645,8 @@ fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
     dir.with_file_name(format!(".{name}.writing"))
 }
 
-/// **A realtime pass's stems into place, or gone**, and how many landed.
+/// **A realtime pass's stems into place, or gone**, and where each one that
+/// landed is now.
 ///
 /// Every writer is closed. When the pass `ran_whole`, a stem that sounded
 /// and closed cleanly moves from the stage into `dir`, over the last
@@ -657,8 +658,12 @@ fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
 /// into `dir`, emptying each lane's old stem as it began, and a failure
 /// returned with the partial files standing there.
 #[cfg(feature = "recorder")]
-fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) -> usize {
-    let mut landed = 0;
+fn land_stems(
+    writers: Vec<StemWriter>,
+    dir: &std::path::Path,
+    ran_whole: bool,
+) -> Vec<std::path::PathBuf> {
+    let mut landed = Vec::new();
     for s in writers {
         let closed = s.writer.finish().is_ok();
         let home = s.path.file_name().map(|n| dir.join(n));
@@ -666,7 +671,7 @@ fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) 
             Some(home) if ran_whole && closed && s.loud => {
                 let _ = std::fs::create_dir_all(dir);
                 if std::fs::rename(&s.path, &home).is_ok() {
-                    landed += 1;
+                    landed.push(home);
                 }
             }
             home => {
@@ -762,6 +767,23 @@ fn land_export(
         Some(p) => Err(p),
         None => Ok((landed, silent)),
     }
+}
+
+/// **A realtime pass's stems, copied out to the Export dialog's folder**:
+/// each stem the pass landed (`land_stems`), into `dst_dir` under its own
+/// name, and where each copy went. Only those: the stems folder also holds
+/// what earlier exports wrote for lanes since renamed, and anybody's own
+/// files, and the delivery used to copy the whole folder.
+#[cfg(feature = "recorder")]
+fn deliver_stems(landed: &[std::path::PathBuf], dst_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let _ = std::fs::create_dir_all(dst_dir);
+    landed
+        .iter()
+        .filter_map(|stem| {
+            let dst = dst_dir.join(stem.file_name()?);
+            std::fs::copy(stem, &dst).is_ok().then_some(dst)
+        })
+        .collect()
 }
 
 #[cfg(feature = "recorder")]
@@ -9852,10 +9874,11 @@ impl DesktopApp {
     /// two paths is what stops them drifting.
     ///
     /// The pass does NOT store the mode: the folder it writes into and the
-    /// folder `finish_bounce` copies out of are both named by
+    /// folder `finish_bounce` delivers into are both named by
     /// `ports::stems_folder_name`, and the spec the finish reads is the same
     /// object this pair was taken from a line earlier. A third copy of the
-    /// answer would be a third thing that can disagree.
+    /// answer would be a third thing that can disagree. The delivery copies
+    /// the stems the pass landed, handed to it, never the folder's listing.
     fn start_bounce(&mut self, stems: bool, stems_dry: bool, span: Option<(f64, f64)>) {
         // **A standing message stands until somebody lowers it.** The request
         // raises `EXPORT_RUNNING` before it knows whether the pass can even
@@ -10097,9 +10120,9 @@ impl DesktopApp {
                 let stems = b.stems;
                 // Into place only for a pass that ran whole; a failed one
                 // takes back what it wrote and leaves the folder as it was.
-                let wrote = match b.stem_dir.as_deref() {
+                let landed = match b.stem_dir.as_deref() {
                     Some(dir) => land_stems(b.stem_writers, dir, problem.is_none()),
-                    None => 0,
+                    None => Vec::new(),
                 };
                 // **The same format pass the offline export runs**, and the
                 // same reason for holding it a frame: a copy per stem and an
@@ -10114,7 +10137,7 @@ impl DesktopApp {
                         folder,
                         problem,
                         stems,
-                        wrote,
+                        landed,
                     },
                 );
             }
@@ -10123,7 +10146,7 @@ impl DesktopApp {
 
     /// The pass is done: the take's WAV becomes `export/track.wav` (counted
     /// up past what exists), and the band's status line says where.
-    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, _stems: bool) {
+    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, landed: &[std::path::PathBuf]) {
         // The reveal-when-done watcher must not open a Finder window for a
         // bounce — the export note says where the real file went.
         self.recorder.seen_take = Some(folder.to_owned());
@@ -10237,17 +10260,10 @@ impl DesktopApp {
                 }
             }
             if spec.stems {
-                let src = export_dir.join(spec.stems_folder());
-                let dst_dir = out_dir.join(spec.stems_folder());
-                let _ = std::fs::create_dir_all(&dst_dir);
-                if let Ok(rd) = std::fs::read_dir(&src) {
-                    for f in rd.flatten() {
-                        let dst = dst_dir.join(f.file_name());
-                        if std::fs::copy(f.path(), &dst).is_ok() {
-                            paths.push(dst);
-                        }
-                    }
-                }
+                // **The stems this pass landed, and only those**: the folder
+                // also holds what earlier exports wrote for lanes since
+                // renamed, and anybody's own files. See `deliver_stems`.
+                paths.extend(deliver_stems(landed, &out_dir.join(spec.stems_folder())));
             }
             self.app.set_export_progress(None);
             match deliver_formats_inner(&paths, &spec, true) {
@@ -21390,11 +21406,12 @@ enum Chore {
     /// a warp or stretch render, a mix and a file write, all on this thread.
     GlueAudio(Vec<u64>),
     /// The realtime pass landed: copy it out, run the format pass, say where.
+    /// `landed` is where each of its stems is now (`land_stems`).
     FinishBounce {
         folder: String,
         problem: Option<String>,
         stems: bool,
-        wrote: usize,
+        landed: Vec<std::path::PathBuf>,
     },
 }
 
@@ -22287,13 +22304,13 @@ impl DesktopApp {
                 folder,
                 problem,
                 stems,
-                wrote,
+                landed,
             } => {
-                self.finish_bounce(&folder, problem, stems);
-                if stems && wrote > 0 {
+                self.finish_bounce(&folder, problem, &landed);
+                if stems && !landed.is_empty() {
                     self.app.notify(
                         Kind::Success,
-                        format!("exported  export/track + {wrote} stems in export/stems/"),
+                        format!("exported  export/track + {} stems in export/stems/", landed.len()),
                     );
                 }
             }
@@ -23286,7 +23303,7 @@ mod tests {
         };
         let read = |name: &str| std::fs::read(dir.join(name)).ok();
         // Failed: nothing it wrote is left, and nothing that was there is gone.
-        assert_eq!(land_stems(pass(), &dir, false), 0, "a failed pass landed stems");
+        assert_eq!(land_stems(pass(), &dir, false), Vec::<std::path::PathBuf>::new(), "a failed pass landed stems");
         assert_eq!(
             read("01-Bass.wav").as_deref(),
             Some(&b"last bass"[..]),
@@ -23301,7 +23318,7 @@ mod tests {
         assert!(!stems_stage(&dir).exists(), "a failed export left its stage behind");
         // Whole: the stem that sounded takes its place, and the lane that
         // never sounded has none, as before.
-        assert_eq!(land_stems(pass(), &dir, true), 1);
+        assert_eq!(land_stems(pass(), &dir, true), vec![dir.join("01-Bass.wav")]);
         let bass = tangent_record::decode::decode(&dir.join("01-Bass.wav"), 8_000).expect("the new stem decodes");
         assert_eq!(bass.frames(), 32, "the bass that landed is not this pass's");
         assert!(read("02-Keys.wav").is_none(), "a lane that never sounded kept a stem");
@@ -23331,6 +23348,79 @@ mod tests {
         assert!(
             tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
             "a pass's stems land whether or not it ran whole"
+        );
+    }
+
+    /// **The Export dialog's realtime delivery carries the stems its pass
+    /// landed, and only those.** It copied every file in `export/stems/`, so
+    /// the stem an earlier export wrote for a lane since renamed came along
+    /// under its old name beside the new one, and so did anybody's own file
+    /// in that folder.
+    #[test]
+    fn a_realtime_delivery_carries_only_the_stems_its_pass_landed() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-delivery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("export").join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The stem an earlier export wrote when lane 3 was "Guitar", and a
+        // file of somebody's own.
+        std::fs::write(dir.join("03-Guitar.wav"), b"old guitar").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        // This pass, as `start_bounce` opens it and `tick_bounce` lands it:
+        // lane 3 is "Lead" now.
+        let stage = open_stems_stage(&dir);
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: 8_000,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let path = stage.join("03-Lead.wav");
+        let mut writer = tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a stem writer");
+        writer.write_interleaved(&[0.5; 64]).expect("a block");
+        let landed = land_stems(vec![StemWriter { lane: 2, path, writer, loud: true }], &dir, true);
+        assert_eq!(landed, vec![dir.join("03-Lead.wav")], "the pass's stem did not land");
+        // The delivery into the dialog's own folder.
+        let out = root.join("Exports").join("Song").join(tangent_ui::ports::stems_folder_name(false));
+        let delivered = deliver_stems(&landed, &out);
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .expect("the delivery's stems folder")
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["03-Lead.wav".to_owned()],
+            "the delivery carried files this pass never wrote"
+        );
+        assert_eq!(delivered, vec![out.join("03-Lead.wav")], "the format pass is not handed what was copied");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The realtime delivery copies what its pass landed** - the wiring
+    /// `a_realtime_delivery_carries_only_the_stems_its_pass_landed` stands
+    /// on: the landed stems ride the finish's chore to the delivery, which
+    /// no longer lists the stems folder. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_realtime_delivery_copies_what_its_pass_landed() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let finish = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            finish.contains("deliver_stems(landed, &out_dir.join(spec.stems_folder()))")
+                && !finish.contains("std::fs::read_dir(&src)"),
+            "the realtime delivery copies the whole stems folder again"
+        );
+        assert!(
+            src.contains("self.finish_bounce(&folder, problem, &landed);"),
+            "the finish is not told which stems its pass landed"
         );
     }
 
