@@ -19404,7 +19404,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Only the START is held inside the clip: pulled before the head it
     /// stops at the head, and a note whose line is at or past the clip's end
     /// stays put, since there it would sound nowhere. A note that rings past
-    /// the end may, as playback lets it.
+    /// the end may: the document keeps its length, and playback lets it go
+    /// at the clip's end.
     fn me_quantize_with(&mut self, q: crate::quantize::Quantize) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
