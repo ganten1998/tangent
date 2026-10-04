@@ -25965,7 +25965,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
                             self.arr_tempo_drag_from = Some(self.live_tempo_map());
-            self.arr_tempo_drag_from = Some(self.live_tempo_map());
                             self.arr_drag = Some(ArrDrag::TempoPoint(i));
                         }
                     }
