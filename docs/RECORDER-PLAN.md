@@ -704,6 +704,11 @@ framing *before* the take.
 `menu.rs:41-42, 66-67`) so a second monitor can hold a big framing view. That is
 free architecture; the app already does it twice.
 
+> **2026-10-04:** nothing detaches any more. The Detach and Attach rows went in
+> 4.82.0, round four of the 2026-10-02 audit removed the actions named here and
+> below, and round five removed the windows themselves, with `caps.detachable`
+> and the settings that placed them. The plan is kept as it was written.
+
 ### How the band is turned on — the affordance the first draft forgot
 
 `show_recorder` defaults to `false` and is deliberately kept out of
@@ -725,6 +730,10 @@ Concretely, mirroring `ToggleFretboard` (`menu.rs:54` / `:437`) exactly:
   Missing this is how a plugin row for a camera would slip through.
 - `Hide Recorder` closes the detached window rather than orphaning it, exactly
   as `Hide Fretboard` does.
+
+> **2026-10-04:** of this list only `ToggleRecorder` and its Show/Hide row
+> remain, gated on `caps.capture_devices`; the detach rows, their actions and
+> the detached window are gone (see the note above).
 
 **Space is not free either.** §5 binds Record to Space, but `keys.rs`'s
 `BINDINGS` table (`:46-72`) is single-letter and modifier-free by construction
