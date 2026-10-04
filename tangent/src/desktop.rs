@@ -10758,6 +10758,11 @@ impl DesktopApp {
                 e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
             }
         }
+        // ── the samplers, decoded at the export rate ──
+        // Their bays were seated above, file names and all; their audio
+        // lives outside the bay and has to be handed over, or a lane the
+        // sampler plays renders silent. See `mirror_sampler_samples`.
+        mirror_sampler_samples(&mut e, rate);
         // The chips' answer, through the one place either road turns a spec
         // into the engine's two atomics. See `arm_stem_tap`.
         arm_stem_tap(&e, spec.stems, spec.stems_dry);
@@ -17347,6 +17352,42 @@ fn furnish_mirror_bay(
             state.as_deref(),
         )
         .map(|_| ())
+}
+
+/// **Hand a MIRROR engine its samplers' audio**: each sampler bay's file,
+/// read out of the mirror's own bays (`sampler_bays_of`), decoded at the
+/// mirror's `rate` and handed over the way `reload_sampler` hands the live
+/// engine its own.
+///
+/// A sampler's audio is not in its bay's state: the bay names its file, and
+/// the engine plays out of a per-lane store that only `set_sampler_sample`
+/// fills. The export seated the mirror's bays, file names and all, and left
+/// that store empty, so a lane the sampler plays exported and froze silent.
+/// Called after the bays are seated, on this thread: the decode is here, and
+/// the hand-off crosses the engine's own ring, so the audio thread neither
+/// decodes nor frees a file. A file that will not decode leaves its lane
+/// silent, as the live reload does.
+#[cfg(feature = "recorder")]
+fn mirror_sampler_samples(mirror: &mut crate::instrument::Engine, rate: u32) {
+    for (lane, path, root_key) in DesktopApp::sampler_bays_of(mirror) {
+        let Some(path) = path else { continue };
+        let Ok(clip) = tangent_record::decode::decode(&path, rate) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        mirror.set_sampler_sample(
+            lane,
+            Some(crate::instrument::SamplerSample {
+                clip: Arc::new(clip),
+                name,
+                source: path,
+                root_key,
+            }),
+        );
+    }
 }
 
 /// The frozen lanes as the engine's mask - see `Shared::frozen`.
@@ -25602,6 +25643,131 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         assert!(peak > 0.005, "a bound sampler in bay {BAY} made no sound: {peak}");
+    }
+
+    /// **An export plays a lane the sampler plays, as the desk does.** A
+    /// sampler's audio is not in its bay's state: the bay names its file
+    /// (`sample_path`), and `reload_sampler` decodes it and hands it to the
+    /// LIVE engine's per-lane store, which only `set_sampler_sample` fills.
+    /// `start_offline_render` seated the mirror's bays with their state,
+    /// file name and all, and never handed the mirror the audio, so a lane
+    /// played by the sampler came out of a full-speed export, and out of a
+    /// freeze (the same road), as silence. Driven through the export's own
+    /// seating (`furnish_mirror_bay`) beside a live engine playing the same
+    /// note: the mirror has to render what the desk renders.
+    #[test]
+    fn an_export_mirror_plays_the_sample_its_sampler_bay_names() {
+        use crate::instrument::{ClipNote, Engine, PlacedMidi, SamplerSample};
+        use std::sync::Arc;
+        use tangent_record::audio::Timebase;
+        const LANE: usize = 3;
+        const BAY: usize = 1;
+        const RATE: u32 = 48_000;
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-mirror-sampler-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch folder");
+        // A real file, because the mirror decodes it for itself.
+        let file = dir.join("tone.wav");
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: RATE,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let mut writer = tangent_record::wav::WavWriter::create(&file, spec, &bext).expect("the sample");
+        writer.write_interleaved(&vec![0.6f32; RATE as usize * 2]).expect("its audio");
+        writer.finish().expect("closed");
+
+        // The desk: a sampler bound to the file the way `bind_insert_sample`
+        // binds it, and the audio handed over the way `reload_sampler` does.
+        let mut live = Engine::offline(RATE, Timebase::new()).expect("offline");
+        live.load_insert(LANE, BAY, Some(std::path::Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+            .expect("the sampler must load")
+            .expect("a load reports what it seated");
+        let extra = vec![
+            ("sample_path".to_owned(), file.to_string_lossy().into_owned()),
+            ("sample_name".to_owned(), "tone.wav".to_owned()),
+            ("root_key".to_owned(), crate::instrument::SAMPLER_ROOT_KEY.to_string()),
+        ];
+        assert!(live.set_builtin_extra(LANE, BAY, extra), "the engine refused the bind");
+        let decoded = tangent_record::decode::decode(&file, RATE).expect("the sample decodes");
+        assert!(live.set_sampler_sample(
+            LANE,
+            Some(SamplerSample {
+                clip: Arc::new(decoded),
+                name: "tone.wav".to_owned(),
+                source: file.clone(),
+                root_key: crate::instrument::SAMPLER_ROOT_KEY,
+            })
+        ));
+
+        // The export's mirror, seated as `start_offline_render` seats it.
+        let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
+        furnish_mirror_bay(&mut mirror, Some(&live), LANE, BAY, crate::builtin_fx::SAMPLER_PATH)
+            .expect("the mirror seats the sampler");
+        mirror_sampler_samples(&mut mirror, RATE);
+
+        // One note on the lane in each, and listen.
+        let play = |e: &mut Engine| -> Vec<f32> {
+            e.set_channel_gain(LANE, 0.5);
+            e.set_master_gain(1.0);
+            e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: LANE,
+                start: 0,
+                len: u64::from(RATE) * 2,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: u64::from(RATE),
+                    key: crate::instrument::SAMPLER_ROOT_KEY,
+                    vel: 110,
+                }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut heard = Vec::new();
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+            }
+            heard
+        };
+        let desk = play(&mut live);
+        let export = play(&mut mirror);
+        let _ = std::fs::remove_dir_all(&dir);
+        let peak = |s: &[f32]| s.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(peak(&desk) > 0.005, "the desk's sampler made no sound, so this compares nothing");
+        assert!(
+            peak(&export) > 0.005,
+            "the export rendered the sampler's lane silent: {}",
+            peak(&export)
+        );
+        let apart = desk.iter().zip(&export).fold(0.0f32, |a, (d, x)| a.max((d - x).abs()));
+        assert!(apart < 1.0e-6, "the export did not render what the desk plays: {apart} apart");
+    }
+
+    /// **The export hands its mirror the samplers' audio after it has
+    /// seated their bays** - the wiring `an_export_mirror_plays_the_sample_its_sampler_bay_names`
+    /// stands on: the files are read out of the mirror's own bays, so they
+    /// have to be seated first. Freeze takes the same road. A source scan,
+    /// because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_export_hands_its_mirror_the_samplers_audio_after_seating_their_bays() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_offline_render(").expect("start_offline_render");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let seated = start.find("furnish_mirror_bay(&mut e,").expect("the rack seats");
+        let handed = start
+            .find("mirror_sampler_samples(&mut e, rate);")
+            .expect("the export never hands its mirror the samplers' audio");
+        assert!(seated < handed, "the samplers' audio is handed over before their bays are seated");
     }
 
     /// **The sampler's file is read out of the BAY, and one bay per lane.**
