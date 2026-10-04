@@ -2071,8 +2071,9 @@ struct Shared {
     /// made a locate inexpressible: the edges were found ON the audio thread,
     /// so a seek while rolling changed nothing and a seek while stopped was
     /// overwritten by the rewind. The host stores the payload first and the
-    /// generation last, Release; the callback consumes generation-first,
-    /// Acquire. See `Renderer::run_transport`.
+    /// generation last, Release; the callback consumes the generation, the
+    /// level and the generation again, Acquire, so it takes a locate and the
+    /// level as one fact. See `Renderer::run_transport`.
     transport_at: AtomicU64,
     transport_req: AtomicU64,
     /// The generation the callback has APPLIED. `ack == req` means
@@ -2081,7 +2082,9 @@ struct Shared {
     /// The transport is moving. A LEVEL, and correctly so — "should I be
     /// moving" genuinely is a level; only the seek was ever an event wearing a
     /// level's clothes. Safe to re-assert every frame, because nothing keys
-    /// off its edges any more.
+    /// off its edges any more. Read by `run_transport` alone, once a chunk,
+    /// between two loads of the generation (`Engine::set_rolling` Releases
+    /// it for that): the racks read what it latched (`transport_rolling`).
     rolling: AtomicBool,
     /// **How long a grain is, in FRAMES; zero is off.** See
     /// [`Engine::set_grain_ms`], which is where the milliseconds become
@@ -2108,6 +2111,12 @@ struct Shared {
     /// is the block a rack is rendering, so a rack with no span of its own is
     /// handed the pair as it stands. See `rack_transport`.
     transport_anchor: AtomicU64,
+    /// **Whether that chunk ROLLS**: the level `run_transport` latched for
+    /// it, published with the anchor and read by `rack_transport` in place
+    /// of `rolling`, the host's level, which can move while the chunk
+    /// renders. Read live, a Play or a Stop landing mid-chunk gave every
+    /// rack after it the other answer for that chunk.
+    transport_rolling: AtomicBool,
     /// **Where that frame is in the MUSIC, and how fast the music is going
     /// there** - the beat as the tempo map reckons it, and the map's
     /// instantaneous tempo, both as `f64` bits.
@@ -3193,6 +3202,7 @@ impl Shared {
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
             transport_anchor: AtomicU64::new(0),
+            transport_rolling: AtomicBool::new(false),
             transport_beat: AtomicU64::new(0.0f64.to_bits()),
             // The same seed `Arp::new` had, so a rack that runs before the
             // first `run_transport` is no worse off than it was.
@@ -3342,6 +3352,18 @@ impl Shared {
             .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
     }
 
+    /// `Engine::set_transport`'s stores, which see. Here so a test's host
+    /// can make them from inside a callback (`TransportStores`).
+    fn set_transport(&self, generation: u64, frames: u64) {
+        self.transport_at.store(frames, Ordering::Relaxed);
+        self.transport_req.store(generation, Ordering::Release);
+    }
+
+    /// `Engine::set_rolling`'s store, which see, and here for the same reason.
+    fn set_rolling(&self, rolling: bool) {
+        self.rolling.store(rolling, Ordering::Release);
+    }
+
     /// One channel fader. An out-of-range channel is a no-op, never a panic:
     /// this is reached from UI code, where the panic hook turns a panic into
     /// a dialog and `exit(1)`.
@@ -3406,6 +3428,56 @@ impl Shared {
             self.params_dirty.store(true, Ordering::Release);
         }
     }
+}
+
+/// **Tests only: the stores `Transport::push` makes, made from inside a
+/// callback**, where the engine they belong to is borrowed by the render.
+/// The same code as `Engine::set_transport` and `Engine::set_rolling`.
+#[cfg(test)]
+pub(crate) struct TransportStores<'a>(&'a Shared);
+
+#[cfg(test)]
+impl TransportStores<'_> {
+    pub(crate) fn set_transport(&self, generation: u64, frames: u64) {
+        self.0.set_transport(generation, frames);
+    }
+
+    pub(crate) fn set_rolling(&self, rolling: bool) {
+        self.0.set_rolling(rolling);
+    }
+}
+
+/// Tests only: a host waiting inside `run_transport`'s read. See
+/// [`meet_transport_loads_for_test`].
+#[cfg(test)]
+pub(crate) type TransportMeet = Box<dyn FnMut(u32, &TransportStores<'_>)>;
+
+#[cfg(test)]
+thread_local! {
+    static TRANSPORT_MEET: RefCell<Option<TransportMeet>> = const { RefCell::new(None) };
+}
+
+/// **Tests only: land a host's stores INSIDE the callback's read of the
+/// transport**, the one moment a test cannot otherwise put a store at and
+/// one a live callback meets. On this thread's renders, `meet` is called
+/// after each of `run_transport`'s loads of the host's transport but the
+/// last, with the count of loads made, and handed the engine's stores.
+/// `None` takes it away. Per thread, as libtest runs each test on its own.
+#[cfg(test)]
+pub(crate) fn meet_transport_loads_for_test(meet: Option<TransportMeet>) {
+    TRANSPORT_MEET.with(|slot| *slot.borrow_mut() = meet);
+}
+
+/// The other end of [`meet_transport_loads_for_test`], in `run_transport`.
+#[cfg(test)]
+fn meet_transport(shared: &Shared, loads: u32) {
+    TRANSPORT_MEET.with(|slot| {
+        if let Ok(mut meet) = slot.try_borrow_mut() {
+            if let Some(host) = meet.as_mut() {
+                host(loads, &TransportStores(shared));
+            }
+        }
+    });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -6936,7 +7008,9 @@ fn run_extra_rack(
 /// `run_transport` publishes ONE anchor per chunk: `transport_anchor`, the
 /// chunk's FIRST frame (taken before the advance and the loop wrap), and the
 /// tempo map's beat (`TempoMap::beat_at_seconds`) and instantaneous tempo
-/// (`TempoMap::bpm_at_beat`) at that frame.
+/// (`TempoMap::bpm_at_beat`) at that frame, and whether the chunk rolls
+/// (`transport_rolling`, the level it latched). That level was read live
+/// here, so a Play or a Stop landing mid-chunk told a rack the other answer.
 ///
 /// `pos` is the span's own first frame, or `u64::MAX` for a caller that has
 /// none. The sentinel is handed the anchor as it stands, which is exactly the
@@ -6954,7 +7028,7 @@ fn run_extra_rack(
 /// loads for the sentinel, five for a lane, read once so every bay in the
 /// rack sees one block.
 fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
-    let rolling = shared.rolling.load(Ordering::Relaxed);
+    let rolling = shared.transport_rolling.load(Ordering::Relaxed);
     let beat = f64::from_bits(shared.transport_beat.load(Ordering::Relaxed));
     let bpm = f64::from_bits(shared.transport_bpm.load(Ordering::Relaxed));
     let beat = if pos == u64::MAX {
@@ -7859,8 +7933,9 @@ struct Renderer {
     /// route's gain and each destination's fold gain - `lane_gain`, so its
     /// fader, mute and solo - and pan along the way (`route_transfer`). It
     /// is NOT exact for what PROCESSES the input further on: a folder
-    /// ancestor's rack or board (they work on the group's sum) and a route
-    /// destination's rack, which the subtrahend takes as unity. While an
+    /// ancestor's rack or board (they work on the group's sum, as a folder's
+    /// own do on its own input) and a route destination's rack, which the
+    /// subtrahend takes as unity. While an
     /// input is withheld (monitoring off, its strip muted or soloed out, or
     /// the host's rebuild gate `DesktopApp::armed_racks_pending`), the room
     /// therefore hears `rack(x) - x` for those: a folder denoiser's removed
@@ -11092,7 +11167,16 @@ impl Renderer {
             let heard = live && audible;
             live_in_room |= heard;
             let target = if live {
-                lane_gain_of(&self.auto, &self.shared, strip.index())
+                // **Unity on a FOLDER's own strip**: the fold fades the whole
+                // group, this input included (see `is_folder` below). Its
+                // fader here as well faded it twice - a folder at half played
+                // its own input at a quarter, and a flipped polarity flipped
+                // back.
+                if self.folder_is.get(strip.index()).copied().unwrap_or(false) {
+                    1.0
+                } else {
+                    lane_gain_of(&self.auto, &self.shared, strip.index())
+                }
             } else {
                 0.0
             };
@@ -11120,8 +11204,9 @@ impl Renderer {
             // to somebody's own playing coming through the desk.
             let lane = strip.index().min(CHANNELS - 1);
             // **A live input on a FOLDER goes into the bus raw**, like every
-            // other source standing on one: the folder's rack, pan, send and
-            // meter are the fold's to apply, once, over the whole group.
+            // other source standing on one: the folder's fader, rack, pan,
+            // send and meter are the fold's to apply, once, over the whole
+            // group.
             // This is the fourth writer of the four, and the rule holds in
             // all of them or it holds in none — the two it was missing from
             // are what made a grouped track static and play at half level.
@@ -11411,7 +11496,8 @@ impl Renderer {
             // reaches the master by has to answer to the same switch.
             let direct = self.route_direct.get(strip.index()).copied().unwrap_or(1.0);
             // See `folder_chain_gain`: the room's subtrahend for a grouped
-            // strip is what its folders will make of it, not the raw input.
+            // strip is what its folders will make of it, not the raw input,
+            // and for a folder's own strip that starts with its own fold.
             let chain = self.folder_chain_gain(lane);
             // **And for a ROUTED strip, what its routes make of it**, because
             // that is where it reaches the mix instead (`route_transfer`).
@@ -11520,18 +11606,6 @@ impl Renderer {
         self.room_live = withheld > 1.0e-4 || live_in_room;
     }
 
-    /// The whole transport: where this chunk starts, and whether it moves.
-    ///
-    /// **The locate is consumed BEFORE the level is read, in one call**, so a
-    /// seek published before a stop can never be honoured after it — the
-    /// Acquire pairs with the host's Release, and a callback that sees the new
-    /// generation is guaranteed to see every store that preceded it. Per
-    /// CHUNK, not per callback: `mix_track` runs inside the chunk loop, and
-    /// advancing once per callback would hand every chunk after the first the
-    /// same clip samples.
-    ///
-    /// Returns `(at, rolling, jumped)`. A jump — or the level falling — is what
-    /// ends the notes the move strands; see the flush at the call site.
     /// **The gain lane `i` is actually playing at.**
     ///
     /// The automation curve when one is reading, the fader otherwise. This
@@ -11861,7 +11935,38 @@ impl Renderer {
         out
     }
 
+    /// The whole transport: where this chunk starts, and whether it moves.
+    ///
+    /// **The locate and the level are taken as ONE fact.** The host stores
+    /// them one after the other (`Transport::stores`: on the way up the
+    /// locate first, on the way down the level first), so a callback can
+    /// meet a push between two of its stores or between two of its own
+    /// loads. So the generation is loaded, then the level, then the
+    /// generation again, all Acquire against the host's Release: a level up
+    /// stored after its locate reaches the second load with that locate's
+    /// generation, and the seek is taken from the second load. And the
+    /// chunk rolls only if both loads saw one generation, or a Stop landing
+    /// after the level was read would be sought to with the level still up
+    /// and roll a block from the cursor. Either way a locate that lands
+    /// mid-read holds this one chunk on its place, stopped. The generation
+    /// used to be loaded once, before the level, and Play from a new place
+    /// landing between the two rolled a block from where the playhead WAS.
+    /// Per CHUNK, not per callback: `mix_track` runs inside the chunk loop,
+    /// and advancing once per callback would hand every chunk after the
+    /// first the same clip samples.
+    ///
+    /// Returns `(at, rolling, jumped, wrap_from)`. A jump, or the level
+    /// falling, is what ends the notes the move strands; see the flush at
+    /// the call site.
     fn run_transport(&mut self, frames: usize) -> (u64, bool, bool, Option<u64>) {
+        // **The generation, the level, and the generation again.** See the
+        // doc above; the seek is the second generation's.
+        let first = self.shared.transport_req.load(Ordering::Acquire);
+        #[cfg(test)]
+        meet_transport(&self.shared, 1);
+        let level = self.shared.rolling.load(Ordering::Acquire);
+        #[cfg(test)]
+        meet_transport(&self.shared, 2);
         let req = self.shared.transport_req.load(Ordering::Acquire);
         let seek = req != self.seen_req;
         if seek {
@@ -11915,7 +12020,9 @@ impl Renderer {
                 g.clear();
             }
         }
-        let rolling = self.shared.rolling.load(Ordering::Relaxed);
+        // Only a level read between two loads of ONE generation: a locate
+        // that landed mid-read holds this chunk on its place, stopped.
+        let rolling = level && req == first;
         let at = self.pos;
         if rolling {
             self.pos += frames as u64;
@@ -11952,6 +12059,8 @@ impl Renderer {
         // the next block's beat, and in the block that wraps a loop a lane at
         // its own frame was walked back the whole loop from the head.
         self.shared.transport_anchor.store(at, Ordering::Relaxed);
+        // And whether it moves, as latched here: see `transport_rolling`.
+        self.shared.transport_rolling.store(rolling, Ordering::Relaxed);
         let secs = at as f64 / self.rate.max(1.0);
         let beat = self.maps.tempo.beat_at_seconds(secs);
         self.shared
@@ -15196,8 +15305,10 @@ impl Renderer {
         }
     }
 
-    /// **What the folders above a lane will make of what it puts on the
-    /// bus**, per side: the product of every ancestor's slewed gain and pan.
+    /// **What the folders a lane's audio is folded through will make of
+    /// what it puts on the bus**, per side: the product of each one's slewed
+    /// gain and pan. For a folder's own strip the folder itself is the
+    /// first, as in `folder_send_gain`.
     ///
     /// A grouped strip reaches the mix through its folder's fold, not on
     /// its own, so what the room has to keep out of a withheld live input
@@ -15205,12 +15316,20 @@ impl Renderer {
     /// to be the raw input: a muted folder contributed nothing, and taking
     /// the input off a room that never received it put it into the
     /// speakers inverted — the owner's "tracks can be heard if record armed
-    /// and their parent folder is muted". The folder's RACK is not
-    /// modelled: with inserts on a folder the cancellation is as
-    /// approximate as it has always been. A lane with no folder gets 1.
+    /// and their parent folder is muted". A live input on the folder's own
+    /// strip goes into its bus raw and is faded by that fold too, so the
+    /// walk starts there for it: it started at the parent, and a folder off
+    /// unity left the difference in the speakers, a muted one the input
+    /// whole. The folder's RACK is not modelled: with inserts on a folder
+    /// the cancellation is as approximate as it has always been. A lane
+    /// folded through nothing gets 1.
     fn folder_chain_gain(&self, lane: usize) -> [f32; 2] {
         let mut g = [1.0f32; 2];
-        let mut up = self.folders.get(lane).copied().unwrap_or(-1);
+        let mut up = if self.folder_is.get(lane).copied().unwrap_or(false) {
+            i32::try_from(lane).unwrap_or(-1)
+        } else {
+            self.folders.get(lane).copied().unwrap_or(-1)
+        };
         let mut hops = 0;
         while let Ok(a) = usize::try_from(up) {
             if a >= CHANNELS || hops > CHANNELS {
@@ -19425,16 +19544,19 @@ impl Engine {
     /// matches a host that has published anything and is re-located on its
     /// first pushed frame.
     pub fn set_transport(&self, generation: u64, frames: u64) {
-        self.shared.transport_at.store(frames, Ordering::Relaxed);
-        self.shared
-            .transport_req
-            .store(generation, Ordering::Release);
+        self.shared.set_transport(generation, frames);
     }
 
     /// The transport level: rolling or stopped. Safe to re-assert every frame;
     /// nothing keys off its edges.
+    ///
+    /// **Released**, so a callback that Acquires the level up sees the
+    /// locate `Transport::stores` puts before it: `run_transport` loads the
+    /// generation again after the level, and that load must not miss it.
+    /// On a weakly ordered CPU a Relaxed level could be seen before the
+    /// generation stored ahead of it, which no test on one thread can show.
     pub fn set_rolling(&self, rolling: bool) {
-        self.shared.rolling.store(rolling, Ordering::Relaxed);
+        self.shared.set_rolling(rolling);
     }
 
     /// Set the loop region in frames, or clear it with `a >= b`. Re-asserted
@@ -32544,6 +32666,85 @@ mod tests {
         }
     }
 
+    /// **A live input on a FOLDER's own strip is faded once, by the fold,
+    /// and the room keeps out what the fold made of it.** `mix_monitor` put
+    /// the input on the bus at the folder's fader, and the fold, which fades
+    /// everything the group holds, faded it again: a folder at half played
+    /// its own input at a quarter, and a flipped polarity flipped back. And
+    /// the room's subtrahend modelled only the folders ABOVE the strip, so
+    /// with that fader off unity the speakers heard the difference with
+    /// monitoring off, and a muted folder put the input into them whole and
+    /// inverted. The take is the control: it carries the input at the
+    /// folder's level whatever the room hears.
+    #[test]
+    fn a_live_input_on_a_folders_own_strip_is_faded_once_and_kept_out_of_the_room() {
+        let mut bad = Vec::new();
+        // (folder muted, polarity flipped, monitoring), for a folder at half.
+        for (muted, flipped, monitoring) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, false, true),
+        ] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            // Lane 1 in lane 2 is what makes lane 2 a folder, and the input
+            // is bound to the folder's OWN strip.
+            shared.folder_of[1].store(2, Ordering::Relaxed);
+            shared.pick_strip[0].store(2, Ordering::Relaxed);
+            shared.midi_off.store(1 << 2, Ordering::Relaxed);
+            shared.armed.store(1 << 2, Ordering::Relaxed);
+            shared.channel_gains[2].store(0.5f32.to_bits(), Ordering::Relaxed);
+            r.channel_gain[2] = 0.5;
+            if muted {
+                shared.muted.store(1 << 2, Ordering::Relaxed);
+            }
+            if flipped {
+                shared.strip_phase.store(1 << 2, Ordering::Relaxed);
+            }
+            shared.monitor_on.store(monitoring, Ordering::Relaxed);
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            for b in 0..(48_000 * 2 / 256) {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+            }
+            // A constant input, so the last frame of each is the level, sign
+            // and all.
+            let taped = captured.last().copied().unwrap_or(0.0);
+            let room = out.last().copied().unwrap_or(0.0);
+            let case = format!("muted={muted} flipped={flipped} monitoring={monitoring}");
+            let want = if flipped { -0.25 } else { 0.25 };
+            if !muted && (taped - want).abs() > 0.01 {
+                bad.push(format!("{case}: the take has the folder's own input at {taped}, not {want}"));
+            }
+            let room_wants = if monitoring && !muted { want } else { 0.0 };
+            if (room - room_wants).abs() > 1.0e-3 {
+                bad.push(format!("{case}: the speakers have it at {room}, not {room_wants}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     /// **A frozen lane's seat reports no latency**, so the lane is
     /// compensated as the plain audio lane it now is - its file was
     /// rendered with the lead cut - and its rack stands down before the
@@ -34209,7 +34410,7 @@ mod sampler_road {
     fn a_racks_beat_is_the_published_one_walked_to_the_spans_own_frame() {
         let shared = Shared::new();
         shared.rate.store(48_000, Ordering::Relaxed);
-        shared.rolling.store(true, Ordering::Relaxed);
+        shared.transport_rolling.store(true, Ordering::Relaxed);
         shared.transport_anchor.store(48_000, Ordering::Relaxed);
         shared.transport_beat.store(4.0f64.to_bits(), Ordering::Relaxed);
         shared.transport_bpm.store(90.0f64.to_bits(), Ordering::Relaxed);
@@ -34241,7 +34442,7 @@ mod sampler_road {
 
         // Stopped, a rack still gets the tempo - that is what an arp
         // free-runs at while a patch is auditioned.
-        shared.rolling.store(false, Ordering::Relaxed);
+        shared.transport_rolling.store(false, Ordering::Relaxed);
         let t = rack_transport(&shared, u64::MAX);
         assert!(!t.playing);
         assert!((t.bpm - 90.0).abs() < 1.0e-9, "stopped, the tempo is {}", t.bpm);
@@ -34489,6 +34690,42 @@ mod sampler_road {
                 tempo.bpm_at_beat(want)
             );
         }
+    }
+
+    /// **A rack is told whether ITS chunk rolls, not what the host has
+    /// asked for since.** `run_transport` latches the level once a chunk and
+    /// publishes the anchor for it, but `rack_transport` read the host's
+    /// level live, so a Play or a Stop landing while a chunk rendered gave
+    /// every rack after it the other answer for that chunk: an arp put on
+    /// the song's grid in a chunk that did not move, or left free-running in
+    /// one that did. Here the host's store lands between a chunk and the
+    /// rack's read, as it can between `run_transport` and a rack.
+    #[test]
+    fn a_rack_is_told_whether_its_own_chunk_rolls() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        e.set_transport(1, 48_000);
+        let mut out = vec![0.0f32; 2 * 512];
+        e.render_offline(&mut out);
+        e.set_rolling(true);
+        assert!(
+            !rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a parked chunk was told the song is playing"
+        );
+        e.render_offline(&mut out);
+        assert!(
+            rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a rolling chunk was told the song is stopped"
+        );
+        e.set_rolling(false);
+        assert!(
+            rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a rolling chunk was told the song has stopped"
+        );
+        e.render_offline(&mut out);
+        assert!(
+            !rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a stopped chunk was told the song is playing"
+        );
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures

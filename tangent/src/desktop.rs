@@ -3387,6 +3387,35 @@ fn listed_outputs() -> Vec<String> {
     }
 }
 
+/// **Whether the platform default output can play**, asked every two
+/// seconds while the engine is down off ASIO (see [`hardware_back`]).
+///
+/// **macOS: from the HAL's properties, not from cpal.** cpal's
+/// `default_output_config` builds an AUHAL to read a buffer range it then
+/// throws away, about 21 ms a time, measured, and the probe asked it for as
+/// long as the engine stayed down. `outpath::default_output_plays` reads what
+/// cpal reads before building that unit.
+///
+/// **Windows and Linux: cpal's road, as before.** On WASAPI it activates an
+/// audio client on the default endpoint to read its mix format (a cheaper
+/// road needs COM on this thread, as `listed_outputs` says); on ALSA it opens
+/// the default PCM to read its parameters. Neither was measured here.
+#[cfg(feature = "recorder")]
+fn default_output_alive() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::outpath::default_output_plays()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.default_output_config().ok())
+            .is_some_and(|c| c.channels() > 0)
+    }
+}
+
 #[cfg(feature = "recorder")]
 impl Reprobe {
     /// `asio`: watch for a plug event rather than a live default output —
@@ -3461,11 +3490,7 @@ impl Reprobe {
                         }
                         continue;
                     }
-                    let default_alive = !asio
-                        && cpal::default_host()
-                            .default_output_device()
-                            .and_then(|d| d.default_output_config().ok())
-                            .is_some_and(|c| c.channels() > 0);
+                    let default_alive = !asio && default_output_alive();
                     let now = if asio { outputs() } else { Vec::new() };
                     if hardware_back(asio, &baseline, &now, default_alive) {
                         live_t.store(true, Ordering::Relaxed);
@@ -32001,6 +32026,47 @@ mod tests {").expect("the tests module")];
             .find("if self.recorder.engine.is_some() {\n                    self.retire_engine();")
             .expect("the plug reopens with an output's stand-in alive, so `start_engine` returns at once");
         assert!(guard < retire, "the record is asked about after the engine has gone");
+    }
+
+    /// **While the engine is down, the probe asks the HAL whether the
+    /// default output can play, and builds no AUHAL to find out.** It asked
+    /// cpal for the default output's config every two seconds, and on macOS
+    /// cpal answers that by building an AUHAL to read a buffer range it then
+    /// throws away, about 21 ms a time (see `outpath::nominal_rate`), for as
+    /// long as the engine stayed down. A source scan, for the reason the
+    /// stand-in's scan above is one; the HAL's answer is held to cpal's in
+    /// `outpath`'s `the_hal_liveness_agrees_with_the_audio_unit_it_replaces`.
+    #[test]
+    fn the_engine_down_probe_reads_the_default_output_without_building_an_audio_unit() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let spawn = {
+            let a = src
+                .find("fn spawn(asio: bool, output: Option<String>, ctx: &egui::Context)")
+                .expect("`Reprobe::spawn` is gone");
+            &src[a..a + src[a..].find("\n    fn ").expect("its end")]
+        };
+        assert!(
+            !spawn.contains("default_output_config"),
+            "the engine-down probe asks cpal for the default output's config, which on macOS \
+             builds an AUHAL every two seconds for as long as the engine is down"
+        );
+        assert!(
+            spawn.contains("let default_alive = !asio && default_output_alive();"),
+            "the engine-down probe no longer asks `default_output_alive`"
+        );
+        let alive = {
+            let a = src
+                .find("fn default_output_alive() -> bool {")
+                .expect("`default_output_alive` is gone");
+            &src[a..a + src[a..].find("\n}\n").expect("its end")]
+        };
+        assert!(
+            alive.contains(
+                "#[cfg(target_os = \"macos\")]\n    {\n        crate::outpath::default_output_plays()\n    }"
+            ),
+            "on macOS the engine-down probe no longer asks the HAL"
+        );
     }
 
     /// **The rate poll's thread never asks the chosen host under ASIO**, and
