@@ -50,7 +50,8 @@ Nothing is written at launch or New. The template is adopted IN MEMORY
 The folder MATERIALISES at the first thing worth keeping, always through
 `materialize_project_dir` (the one door, below): a Save (the first save
 moves it to the chosen name), a kit edit or pad load, a sample loaded into
-the sampler, an import, an arrangement take with audio, a freeze, a glue, or a realtime export pass
+the sampler, an import, an arrangement take with audio, a freeze, a glue,
+or a realtime export pass
 (its staging copy lands in the project's `export/`); a MIDI-only take
 makes no folder. Renaming before that repoints alone, so the folder is
 born under the chosen name; any of those writers makes `Untitled` real
