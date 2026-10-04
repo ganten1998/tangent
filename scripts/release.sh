@@ -162,13 +162,14 @@ fi
 rm -f "$TPL_TMP"
 
 # 6. The gate must be green before the build spends the version. The commands
-#    are docs/RELEASE.md gate 1 plus the Cargo.toml lint policy under the
-#    clippy driver, all in scripts/check.sh — one script, so CI can someday
-#    call the same thing instead of restating it in YAML (docs/RELEASE.md's
-#    one hard rule for when CI returns). Skipped on --sums-only, which
-#    re-checks artifacts that already passed this gate when they were built,
-#    and on SKIP_TESTS=1 — which must be TYPED, deliberately, because a
-#    warning that can be scrolled past is how versions got burnt.
+#    are docs/RELEASE.md gate 1, the Minimal build, the crate firewall and the
+#    Cargo.toml lint policy under the clippy driver, all in scripts/check.sh:
+#    one script, so CI can someday call the same thing instead of restating
+#    it in YAML (docs/RELEASE.md's one hard rule for when CI returns).
+#    Skipped on --sums-only, which re-checks artifacts that already passed
+#    this gate when they were built, and on SKIP_TESTS=1, which must be
+#    TYPED, deliberately, because a warning that can be scrolled past is how
+#    versions got burnt.
 if [ "$SUMS_ONLY" = 0 ] && [ "${SKIP_TESTS:-0}" != "1" ]; then
   scripts/check.sh || {
     echo "refusing: the release gate is red (scripts/check.sh, above)." >&2

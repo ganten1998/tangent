@@ -46,8 +46,9 @@ counted. Do not rewrite history to tidy burnt numbers away.
 
    This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (the
    three commands above, a compile of the Minimal build with
-   `cargo check -p tangent --no-default-features`, the clippy lint policy,
-   and the check that three scripts spell the FreeBSD version alike) and
+   `cargo check -p tangent --no-default-features`, the crate firewall
+   `scripts/check-firewall.sh`, the clippy lint policy, and the check that
+   three scripts spell the FreeBSD version alike) and
    refuses to cut a release on any failure. The checklist entry remains so
    a human knows what the refusal means.
 

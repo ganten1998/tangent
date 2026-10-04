@@ -4341,7 +4341,6 @@ struct KeyFeed<'a> {
     io: &'a mut [Vec<f32>],
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Unit tests for the engine's own machinery: the seat carve the fan-out
 /// rests on, and the real-time meter. Apart from `tests` below, which needs
 /// a whole engine for most of what it asserts.
@@ -6847,6 +6846,7 @@ fn render_lane(
 /// twice a block. The guard is inside so that no caller can hold a different
 /// opinion — and it is the word `no_writer_runs_a_folders_rack_except_the_fold`
 /// looks for above the call below.
+#[allow(clippy::too_many_arguments)]
 fn run_extra_rack(
     // **The one seat, not the whole bank.** It took `&mut [Rack]` and an
     // absolute index, which reads naturally and borrows all 4,389 seats to
@@ -17397,7 +17397,6 @@ impl Engine {
         self.inserts_loaded.get(strip)?.get(slot)?.as_ref()
     }
 
-    #[must_use]
     /// **Put `next` in the seat and hand back what it displaced.**
     ///
     /// `Err(next)` when the ring refused — the callback has stalled and the
@@ -17448,6 +17447,7 @@ impl Engine {
     /// `load_insert` carried on installing its editor and state handles as if
     /// it were seated. The desk then named a plugin that existed nowhere, and
     /// the auto-open built a view on a terminated controller.
+    #[must_use]
     fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) -> Option<PluginBox> {
         // The displaced plugin is DROPPED here, on this thread — never on
         // the callback, which is the whole reason the box comes back at all.

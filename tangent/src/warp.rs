@@ -147,8 +147,6 @@ const ATTACK_KEEP: usize = 240;
 /// attack, which is worse than the smear it was fixing.
 const ATTACK_FADE: usize = 240;
 
-
-#[must_use]
 /// **The anchors this map can actually be rendered from**: ascending in both
 /// fields, inside the clip, and no two on one frame.
 ///
@@ -279,6 +277,7 @@ pub fn project_frame(frames: usize, anchors: &[Anchor], at: usize) -> usize {
 /// - The anchors and `clip` are in the SAME frame rate. A map is frames at
 ///   the rate it was made at, and nothing here rescales it: the host hands
 ///   over a clip's map already rescaled to the decode (`warp_anchors`).
+#[must_use]
 pub fn warp(clip: &Clip, anchors: &[Anchor], mode: Mode, fit: Fit) -> Clip {
     let frames = clip.frames();
     if frames == 0 || anchors.is_empty() {

@@ -258,10 +258,10 @@ egui-wgpu = { version = "0.33", default-features = false, features = [
 # Not new crates: tangent-host already puts these exact versions in the lock
 # file. Named here because a transitive dependency is not a nameable one.
 #
-# **UNCONDITIONAL, not behind `recorder`.** `check-firewall.sh` runs
-# `cargo check -p tangent --no-default-features`, and tangent-host is optional
-# — so a feature-gated dependency here breaks the Minimal build, and that
-# failure only shows up in the slow firewall run people skip.
+# **UNCONDITIONAL, not behind `recorder`.** The Minimal build
+# (`cargo check -p tangent --no-default-features`) compiles `macwin` too, and
+# tangent-host is optional, so a feature-gated dependency here breaks that
+# build, which `scripts/check.sh`, the release gate, checks.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",

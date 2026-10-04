@@ -5525,8 +5525,8 @@ impl DesktopApp {
             .and_then(|e| e.count_in_downbeat_ns())
         {
             // **Once per count-in, not once per frame.** `count_in_done` is a
-            // LATCH: it stays true after the count finishes and is only cleared
-            // when the next one starts. So this armed the session with the same
+            // LATCH: it stays true once the count finishes, cleared only by the
+            // next start or a cancel. So this armed the session with the same
             // downbeat on every frame for the rest of the session — and the
             // next take that began WITHOUT a count-in took that stale instant
             // as its T0. With "record the count-in into the take" on, every
@@ -16682,7 +16682,6 @@ fn render_placed_span(
     Ok(())
 }
 
-#[cfg(feature = "recorder")]
 /// A file stem the filesystem will take: separators out, trimmed, never
 /// empty.
 ///

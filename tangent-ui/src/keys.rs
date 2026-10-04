@@ -607,7 +607,12 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("2-CLK", "double-click a MIDI item: open its editor"),
             ("DEL", "delete the selected clips · nodes · close a chosen row · else the track"),
             ("A-CLK", "alt-click: empty an insert bay · remove a node (right-click too)"),
-            ("R-CLK", "empty room: the app menu · header: the track menu · loaded insert: delete / replace"),
+            // **A right press on a lane's empty room is a box first.** It
+            // arms the box that chooses clips, and the app menu opens only
+            // on a release that never moved (the `ClipBand` release), so
+            // the menu is said on the drag's row.
+            ("R-CLK", "a clip: its menu · header: the track menu · loaded insert: delete / replace"),
+            ("R-DRG", "right-drag empty room: choose the clips it crosses · no drag: the app menu"),
             ("SEAM", "the header's edge: drag to size the headers · click: playhead home"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport"),
@@ -1586,6 +1591,33 @@ mod tests {
         assert!(
             !said.contains("pointer"),
             "the card says Cmd+M opens at the pointer; it opens in the middle of the timeline: {said}"
+        );
+    }
+
+    /// **The right button's two clip gestures are on the arrangement's
+    /// card.** A right-press on a clip opens that clip's menu, and a
+    /// right-drag over a lane's empty room draws the box that chooses the
+    /// clips it crosses; only a right click there that never moves opens
+    /// the app menu (see the `ClipBand` release). The R-CLK row named
+    /// neither and gave empty room to the app menu outright.
+    #[test]
+    fn the_arrange_card_names_the_clip_menu_and_the_right_drag_box() {
+        let rows = card_rows(Gates::default(), HelpView::Arrange);
+        let said = |key: &str| -> &str {
+            rows.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, d)| *d)
+                .unwrap_or_else(|| panic!("no {key} row on the arrangement's card"))
+        };
+        assert!(
+            said("R-CLK").contains("a clip"),
+            "the R-CLK row does not say a right-press on a clip opens its menu: {}",
+            said("R-CLK")
+        );
+        let drag = said("R-DRG");
+        assert!(
+            drag.contains("clips") && drag.contains("app menu"),
+            "the R-DRG row should say the box chooses clips and a still click is the app menu: {drag}"
         );
     }
 
