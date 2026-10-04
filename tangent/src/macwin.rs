@@ -131,9 +131,9 @@ pub struct Facts {
 /// The window the hook is allowed to touch.
 ///
 /// Every winit window in the process shares the delegate CLASS, so the patch
-/// reaches the detached recorder, the fretboard, chord and theory viewports
-/// and the Welcome card too. This pointer is the only thing that keeps their
-/// resizes untouched, so it is compared before anything else happens.
+/// reaches the Welcome card and every dialog that opens in a window of its
+/// own too. This pointer is the only thing that keeps their resizes
+/// untouched, so it is compared before anything else happens.
 static TARGET: AtomicPtr<NSWindow> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The height curve, as a table the callback can read without allocating.
@@ -440,7 +440,7 @@ unsafe extern "C-unwind" fn will_resize(
     proposed: NSSize,
 ) -> NSSize {
     // Not our window. Every other winit window shares this delegate class, so
-    // this is what keeps the detached recorder and the theory viewports free.
+    // this is what keeps the Welcome card and the dialog windows free.
     if sender.is_null() || !std::ptr::eq(sender, TARGET.load(Ordering::Acquire)) {
         return proposed;
     }

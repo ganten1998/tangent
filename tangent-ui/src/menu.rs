@@ -133,10 +133,6 @@ pub enum MenuAction {
     /// this menu is the entire chrome — there is no menu bar and no preferences
     /// dialog — so an earlier draft of the recorder shipped completely
     /// invisible. Every row below exists because of that.
-    ///
-    /// Hiding also CLOSES the detached window rather than orphaning it, which
-    /// is what `ToggleFretboard` already means; the app does the closing, so
-    /// the contract lives in the action name.
     ToggleRecorder,
     /// Draw the menu and the dialogs in the canvas, so a screen reader can
     /// reach them. See `Settings::screen_reader_mode`.
@@ -184,7 +180,6 @@ pub struct MenuView {
     /// Whether the chord strip band is up. Independent of detection: the staff
     /// reads the same chord, so detection can be on with no strip at all.
     pub chord_strip: bool,
-    pub detached: bool,
     /// "Teach Chord Name..." and "Correct Chord Name..." are greyed when no
     /// notes are held — both act on the voicing you are playing.
     pub notes_held: bool,
@@ -207,19 +202,10 @@ pub struct MenuView {
     pub tuning: String,
     pub capo: u8,
     pub wood: &'static str,
-    /// D-UI-16: the guitar view is in its own window.
-    pub fretboard_detached: bool,
     /// D-UI-17: which theory diagrams are showing.
     pub theory: crate::theory_panel::Views,
     /// D-UI-17: whether the theory band follows live playing.
     pub theory_follows_midi: bool,
-    /// D-UI-17: the theory band is in its own window.
-    ///
-    /// Needed for the same reason `fretboard_detached` is: the Detach row
-    /// renames itself to Attach, and there are no checkmarks in this menu, so
-    /// the label IS the state readout. Without this the row could only ever say
-    /// one of the two things, and half of it would be a lie.
-    pub theory_detached: bool,
     /// §5: the Recorder band is showing.
     ///
     /// Named to match `fretboard_on` rather than the `show_recorder` setting it
@@ -250,11 +236,6 @@ pub struct MenuView {
     pub staff_first: bool,
     /// The key signature, sharps positive.
     pub staff_key: i32,
-    /// §5: the Recorder band is in its own window.
-    ///
-    /// Needed for the same reason `theory_detached` is: the Detach row renames
-    /// itself to Attach, so the label IS the state readout.
-    pub recorder_detached: bool,
     /// §5: the take's time signature, so the count-in submenu can say what a
     /// bar is worth.
     pub time_signature: crate::recorder::TimeSignature,
@@ -456,11 +437,11 @@ enum Entry {
 /// Push a category, as a hover when there is something worth hovering for.
 ///
 /// The shape follows the content, which is what keeps `Caps` honest: under
-/// `Caps::PLUGIN` the Window category loses Borderless, Keyboard loses its
-/// device row and Fretboard loses Detach, so a category can arrive here with
-/// one item or none. An empty hover is a dead end the user cannot tell from a
-/// bug, and a one-item hover charges a hover to reach a single row. So nothing
-/// vanishes, one item is drawn as an ordinary row, and two or more open.
+/// `Caps::PLUGIN` the Window category loses Borderless and Keyboard loses its
+/// device row, so a category can arrive here with one item or none. An empty
+/// hover is a dead end the user cannot tell from a bug, and a one-item hover
+/// charges a hover to reach a single row. So nothing vanishes, one item is
+/// drawn as an ordinary row, and two or more open.
 ///
 /// It also gives the fretboard block its shape for free: with the guitar view
 /// off there is only "Show Fretboard" to say, so the category IS that row.
@@ -2765,7 +2746,6 @@ mod tests {
             guitar_intervals: true,
             detection_enabled: true,
             chord_strip: true,
-            detached: false,
             notes_held: false,
             learning_on: false,
             next_font: None,
@@ -2775,10 +2755,8 @@ mod tests {
             tuning: "Standard".to_string(),
             capo: 0,
             wood: "rosewood",
-            fretboard_detached: false,
             theory: crate::theory_panel::Views::default(),
             theory_follows_midi: false,
-            theory_detached: false,
             // Off, like the setting it mirrors: the band is 200 points tall and
             // a window that grows on its own is the geometry surprise this app
             // has already been bitten by twice.
@@ -2794,7 +2772,6 @@ mod tests {
             staff_first: false,
             stave_key: "grand".to_owned(),
             staff_key: 0,
-            recorder_detached: false,
             count_in_beats: 4,
             time_signature: crate::recorder::TimeSignature::default(),
             count_in_bars: 1,
@@ -3429,10 +3406,10 @@ mod tests {
 
     /// A category must be worth the hover it costs.
     ///
-    /// `Caps` can hollow one out — Window loses Borderless in a plugin,
-    /// Keyboard loses its device row, Fretboard loses Detach — and an empty
-    /// hover is a dead end the user cannot tell from a bug, while a one-item
-    /// hover charges a hover for a single row.
+    /// `Caps` can hollow one out (Window loses Borderless in a plugin,
+    /// Keyboard loses its device row), and an empty hover is a dead end the
+    /// user cannot tell from a bug, while a one-item hover charges a hover for
+    /// a single row.
     #[test]
     fn no_category_opens_onto_nothing_or_onto_a_single_row() {
         for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
@@ -3440,15 +3417,9 @@ mod tests {
                 let v = MenuView {
                     caps,
                     fretboard_on: on,
-                    detached: on,
-                    fretboard_detached: on,
-                    theory_detached: on,
-                    // Both states matter under both `Caps`: a Recorder hover
-                    // holding only "Detach Recorder" is exactly what a
-                    // `capture_devices`-true / `detachable`-false host would
-                    // produce if the show/hide row were ever gated too.
+                    // Both states matter under every `Caps`: what the band
+                    // brings into a hover comes and goes with it.
                     recorder_on: on,
-                    recorder_detached: on,
                     supporter: on,
                     next_font: on.then_some("Terminess"),
                     ..view()
@@ -3537,35 +3508,25 @@ mod tests {
     /// nobody would find until a user did.
     ///
     /// The actions themselves are gone (`every_menu_action_is_built_somewhere`
-    /// keeps a dead one from lingering), so what is left to hold is the words:
-    /// no row offers to pop a surface out or put one back.
+    /// keeps a dead one from lingering), and so are the windows and the state
+    /// that said a surface was out, so what is left to hold is the words: no
+    /// row offers to pop a surface out or put one back.
     #[test]
     fn nothing_can_be_detached_any_more() {
-        // Detached in the settings as well as attached: the rows renamed
-        // themselves, so half of them only ever appeared in one of the states.
-        for detached in [false, true] {
-            for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
-                let v = MenuView {
-                    caps,
-                    detached,
-                    fretboard_detached: detached,
-                    theory_detached: detached,
-                    recorder_detached: detached,
-                    ..fullest()
-                };
-                for (label, ..) in all_rows(v) {
-                    assert!(
-                        !label.to_lowercase().contains("attach"),
-                        "{label:?} survived at caps={caps:?} detached={detached}"
-                    );
-                }
+        for caps in [Caps::DESKTOP, Caps::PLUGIN, Caps::MINIMAL] {
+            let v = MenuView { caps, ..fullest() };
+            for (label, ..) in all_rows(v) {
+                assert!(
+                    !label.to_lowercase().contains("attach"),
+                    "{label:?} survived at caps={caps:?}"
+                );
             }
         }
     }
 
     /// The custom-tuning editor is a fretboard control, so it appears with the
-    /// fretboard and not before. It is a dialog rather than a window, so unlike
-    /// Detach it survives a plugin — the same reasoning that keeps "Teach Chord
+    /// fretboard and not before. It is a dialog rather than a window, so it
+    /// survives a plugin, by the same reasoning that keeps "Teach Chord
     /// Name..." there.
     #[test]
     fn custom_tuning_is_offered_only_while_the_fretboard_is_showing() {
@@ -3647,15 +3608,11 @@ mod tests {
             fretboard_on: true,
             detection_enabled: true,
             chord_strip: true,
-            detached: true,
-            fretboard_detached: true,
-            theory_detached: true,
             // Turned ON deliberately. The settings file is shared with the
             // standalone, so a plugin WILL be handed `show_recorder: true` by
             // somebody's config; the category has to be absent because of
             // `caps`, not because the flag happened to be false.
             recorder_on: true,
-            recorder_detached: true,
             // And an instrument LOADED, for the same reason: the settings file
             // remembers a plugin path, so a plugin instance will be handed one.
             // The Instrument Window and Unload rows have to be absent because
@@ -4242,7 +4199,6 @@ mod tests {
             let v = MenuView {
                 caps,
                 recorder_on: true,
-                recorder_detached: true,
                 ..view()
             };
             assert!(

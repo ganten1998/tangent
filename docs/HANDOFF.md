@@ -1366,6 +1366,13 @@ The viewport plumbing is left in place and inert — the owner's own words were
 larger, riskier change than the pivot asked for. `nothing_can_be_detached_any_
 more` asserts absence over every `Caps` and both detached states.
 
+> **2026-10-04:** the plumbing is gone now. Round five of the 2026-10-02 audit
+> removed the four windows, their restore and reattach code, their geometry
+> memory, the `*_detached` and popout geometry settings, `Caps::detachable` and
+> the clamp in `new`. Nothing reads the old keys, so a file that says
+> `theory_detached: true` opens with the band in the window without the clamp,
+> and `main` now sizes the opening window for every band too.
+
 ### Setup came back, and had been unreachable for a release
 
 **Read this one before touching the take-settings panel.** 4.19.0 moved the
