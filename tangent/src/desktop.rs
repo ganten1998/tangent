@@ -12002,6 +12002,15 @@ impl DesktopApp {
     /// Switch sessions WHOLE: the old one keeps its desk and its plugin
     /// states, the new one arrives with its own — instruments included.
     fn switch_project(&mut self, doc: &std::path::Path) {
+        // **Not while a take counts in or an export runs** - see
+        // `TangentApp::session_held`. The app refused the press; Open's panel
+        // answers whenever it is answered, and on Linux the window stays live
+        // under it, so a count can start before the file comes back. The save
+        // prompt's answer goes with the refused Open.
+        if self.app.session_held() {
+            let _ = self.app.take_outgoing_discarded();
+            return;
+        }
         // Whatever the debounce owes for the OUTGOING desk lands before the
         // incoming one replaces it; the open writes synchronously anyway, so
         // this costs a write only when one was actually pending.
@@ -30197,6 +30206,34 @@ mod tests {").expect("the tests module")];
                 "the click stops and `{flag}` is left standing, or goes under a take still counting"
             );
         }
+    }
+
+    /// **Open asks again whether the session holds before it switches.** The
+    /// app refuses New, Open and Reset Template at the press while a take
+    /// counts in or an export runs (`TangentApp::session_held`), but Open's
+    /// panel answers whenever it is answered - and on Linux the window stays
+    /// live under it - so a count could start between the press and the
+    /// file, and the incoming desk's tempo then retimed the click under the
+    /// take. `switch_project` asks first, before it writes or replaces
+    /// anything, and the save prompt's answer goes with the refused Open. A
+    /// source scan.
+    #[test]
+    fn open_asks_whether_the_session_holds_before_it_switches() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn switch_project(&mut self, doc:").expect("switch_project");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let asks = body.find("if self.app.session_held() {");
+        let flush = body.find("self.app.flush_settings_now();").expect("the flush");
+        assert!(
+            asks.is_some_and(|a| a < flush),
+            "Open switches the session under a take's count or an export"
+        );
+        let refused = &body[asks.unwrap_or(0)..flush];
+        assert!(
+            refused.contains("let _ = self.app.take_outgoing_discarded();") && refused.contains("return;"),
+            "a refused Open goes on, or leaves the save prompt's answer for another road"
+        );
     }
 
     /// **Reset Template never carries a running record into the fresh
