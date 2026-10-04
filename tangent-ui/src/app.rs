@@ -11749,6 +11749,25 @@ impl TangentApp {
         held
     }
 
+    /// **Whether the folders hold their shape, saying so when they do.** A
+    /// realtime export chose its stems by the folders at its press - a
+    /// folder that collects children writes a stem of its bus - and the
+    /// engine folds by the same table (`folder_parents`), so a folder made
+    /// or dissolved under one moves its children onto another bus
+    /// mid-render, and the undo that could put it back waits for the export
+    /// to end. Asked by Cmd/Ctrl+F's two single-row branches, which move no
+    /// lane and so are not `lane_order_held`'s. An arrangement record binds
+    /// no bus and is not asked about.
+    fn folders_held(&mut self) -> bool {
+        if self.recorder.exporting {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Folders keep their shape while an export runs - it writes each folder's bus.",
+            );
+        }
+        self.recorder.exporting
+    }
+
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
     /// Everything a channel is follows it: kind, input, icon, colour, name,
     /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
@@ -30015,6 +30034,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the children and the row goes back to being a track.
         if sel.len() < 2 {
             if let Some(f) = self.selected_channel.filter(|n| self.is_folder(*n)) {
+                // Not under an export, which writes this folder's bus - see
+                // `folders_held`.
+                if self.folders_held() {
+                    return false;
+                }
                 self.toggle_folder(f);
                 return true;
             }
@@ -30027,6 +30051,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             else {
                 return false;
             };
+            // Not under an export either: an empty row left inside a group
+            // takes the members below it into a folder of its own.
+            if self.folders_held() {
+                return false;
+            }
             self.set_is_folder(n, true);
             // A folder is a ROW, so it has to exist as one: without this it
             // is a flag on a slot nothing draws.
@@ -47533,6 +47562,73 @@ mod tests {
             app.eject_from_folder(9);
             assert_eq!(lanes(&app), before, "a drag home ejected a middle child under {held}");
             assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **A folder keeps its shape while an export runs.** The export chose
+    /// its stems by the folders at its press - a folder that collects
+    /// children writes a stem of its bus - and the engine folds by the same
+    /// table (`folder_parents`), so Cmd/Ctrl+F on a folder mid-render took
+    /// its bus, fader and bays and all, off its children halfway through the
+    /// master, and left the bus's stem silent from there on. On an empty row
+    /// left inside a group it made a folder that took the members below it
+    /// onto a bus of its own. Neither moves a lane, so `lane_order_held` let
+    /// both through, and the undo that could have put them back is refused
+    /// until the export ends. They refuse now, and say why. An arrangement
+    /// record binds no bus - it records each track by its row - so a folder
+    /// still dissolves under one.
+    #[test]
+    fn cmd_f_never_reshapes_a_folder_under_an_export() {
+        for (exporting, arr) in [(true, false), (false, true)] {
+            let root = project_scratch("folder-held");
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.bootstrap_project(&root.join("Projects"));
+            app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+            app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+            // A folder over two tracks with an empty row between them, the
+            // row a removed member leaves indented.
+            for ch in [8usize, 9, 11] {
+                app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+            }
+            app.settings.strip_is_folder[8] = true;
+            for ch in [9, 10, 11] {
+                app.settings.strip_in_folder[ch] = true;
+            }
+            assert!(!app.channel_used(10), "the fixture's empty row is in use");
+            assert_eq!(app.folder_of(11), Some(8), "the fixture's folder");
+            let folds = app.folder_parents();
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            let held = format!("export={exporting} record={arr}");
+            if exporting {
+                app.selected_tracks = vec![10];
+                app.selected_channel = Some(10);
+                assert!(!app.make_folder(), "Cmd/Ctrl+F says it made a folder under {held}");
+                assert_eq!(
+                    app.folder_parents(),
+                    folds,
+                    "Cmd/Ctrl+F on an empty row made a folder under {held}, moving the rows below it onto its bus"
+                );
+            }
+            app.selected_tracks = vec![8];
+            app.selected_channel = Some(8);
+            let dissolved = app.make_folder();
+            if exporting {
+                assert!(!dissolved, "Cmd/Ctrl+F says it dissolved a folder under {held}");
+                assert_eq!(
+                    app.folder_parents(),
+                    folds,
+                    "Cmd/Ctrl+F dissolved a folder under {held}, moving its bus mid-render"
+                );
+                assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            } else {
+                assert!(
+                    dissolved && !app.is_folder(8) && app.folder_of(11).is_none(),
+                    "a folder no longer dissolves under {held}, which binds no bus"
+                );
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }
