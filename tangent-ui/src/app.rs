@@ -34473,6 +34473,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // returns the playhead to the EDIT CURSOR.
                 if self.recorder.arr_recording || self.recorder.playing {
                     self.request_recorder(recorder::RecorderRequest::Stop);
+                } else if self.recorder.play_pending {
+                    // **A Play waiting on a count's downbeat is taken back**,
+                    // as the band's Pause takes it back: the band lights it
+                    // as rolling, and Space sent Play again over it. The
+                    // count goes on.
+                    self.request_recorder(recorder::RecorderRequest::Pause);
                 } else if self.mixer_open || self.arrangement_open {
                     // **And on the desk's surfaces, Space is PLAY too** —
                     // idle, it rolls from the edit cursor; rolling, the arm
@@ -35798,8 +35804,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // **Space, from a window that owns the input while it is up.**
             //
             // The same body the main window's own Space runs, so the one key
-            // means the one thing wherever it is pressed: rolling stops,
-            // idle rolls from the edit cursor. A take in progress is not a
+            // means the one thing wherever it is pressed: rolling stops, a
+            // Play waiting on a count's downbeat is taken back, idle rolls
+            // from the edit cursor. A take in progress is not a
             // reason to refuse - it cannot be reached from here, because
             // `Stop` does not end a take (only the cassette does).
             DialogAction::Transport => {
@@ -35819,6 +35826,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if self.settings.show_recorder && !self.recorder.exporting {
                     if self.recorder.arr_recording || self.recorder.playing {
                         self.request_recorder(recorder::RecorderRequest::Stop);
+                    } else if self.recorder.play_pending {
+                        self.request_recorder(recorder::RecorderRequest::Pause);
                     } else if self.mixer_open || self.arrangement_open {
                         self.request_recorder(recorder::RecorderRequest::Play);
                     }
@@ -62693,6 +62702,47 @@ mod tests {
             space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Stop)
         );
+    }
+
+    /// **Space takes back a Play waiting on a count-in's downbeat**, as the
+    /// band's Pause does. Play pressed during a count waits for its downbeat
+    /// (the host's `play_on_go`), and the band lights the Play triangle for
+    /// it as for a rolling song - but Space read only `playing`, which a
+    /// waiting Play is not, so it sent Play again and changed nothing: only
+    /// the Pause button could take it back. It is the transport's state, so
+    /// Space takes it back wherever it is pressed, as it stops a rolling
+    /// song wherever it is pressed, and from a window that forwards the key;
+    /// the count itself goes on.
+    #[test]
+    fn space_takes_back_a_play_waiting_on_a_count_ins_downbeat() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.show_recorder = true;
+        // A count is running - a take's or the red button's, the band is
+        // told the same - and a Play waits on its downbeat.
+        app.recorder.take_counting = true;
+        app.recorder.play_pending = true;
+        for (view, arrangement) in [("the arrangement", true), ("the piano view", false)] {
+            app.arrangement_open = arrangement;
+            while app.take_recorder_request().is_some() {}
+            assert_eq!(
+                space(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Pause),
+                "Space on {view} pressed Play again over a Play waiting on the downbeat"
+            );
+            while app.take_recorder_request().is_some() {}
+            app.apply_dialog_action(DialogAction::Transport);
+            assert_eq!(
+                app.take_recorder_request(),
+                Some(recorder::RecorderRequest::Pause),
+                "a forwarded Space on {view} pressed Play again over a waiting Play"
+            );
+        }
+        // With nothing waiting, Space on the desk plays from the count, as it
+        // always did: it is the press that makes the Play wait.
+        app.arrangement_open = true;
+        app.recorder.play_pending = false;
+        while app.take_recorder_request().is_some() {}
+        assert_eq!(space(&ctx, &mut app), Some(recorder::RecorderRequest::Play));
     }
 
     /// A plugin drains nothing, so a request it can never honour must not be
