@@ -645,7 +645,8 @@ fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
     dir.with_file_name(format!(".{name}.writing"))
 }
 
-/// **A realtime pass's stems into place, or gone**, and how many landed.
+/// **A realtime pass's stems into place, or gone**, and where each one that
+/// landed is now.
 ///
 /// Every writer is closed. When the pass `ran_whole`, a stem that sounded
 /// and closed cleanly moves from the stage into `dir`, over the last
@@ -657,8 +658,12 @@ fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
 /// into `dir`, emptying each lane's old stem as it began, and a failure
 /// returned with the partial files standing there.
 #[cfg(feature = "recorder")]
-fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) -> usize {
-    let mut landed = 0;
+fn land_stems(
+    writers: Vec<StemWriter>,
+    dir: &std::path::Path,
+    ran_whole: bool,
+) -> Vec<std::path::PathBuf> {
+    let mut landed = Vec::new();
     for s in writers {
         let closed = s.writer.finish().is_ok();
         let home = s.path.file_name().map(|n| dir.join(n));
@@ -666,7 +671,7 @@ fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) 
             Some(home) if ran_whole && closed && s.loud => {
                 let _ = std::fs::create_dir_all(dir);
                 if std::fs::rename(&s.path, &home).is_ok() {
-                    landed += 1;
+                    landed.push(home);
                 }
             }
             home => {
@@ -683,14 +688,126 @@ fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) 
     landed
 }
 
+/// **Where a full-speed export waits until every file it wrote has
+/// closed**: a hidden folder in the export's own folder, the way the
+/// realtime pass stages its stems (`stems_stage`). See [`land_export`].
+#[cfg(feature = "recorder")]
+fn export_stage(out_dir: &std::path::Path) -> std::path::PathBuf {
+    out_dir.join(".export.writing")
+}
+
+/// The stage, emptied of whatever a pass that never finished left in it,
+/// and made. A file waits there under the name and in the folder it lands
+/// in - the master at the top, each stem in its stems folder - so landing
+/// it is one rename.
+#[cfg(feature = "recorder")]
+fn open_export_stage(out_dir: &std::path::Path) -> std::path::PathBuf {
+    let stage = export_stage(out_dir);
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::create_dir_all(&stage);
+    stage
+}
+
+/// **A full-speed export's files into place, or gone**: where each one that
+/// landed is now and how many lanes never sounded, or what failed the pass.
+///
+/// `files` is what the pass wrote into `stage`, the master and every stem,
+/// each with whether anything reached it and how its writer closed. **One
+/// file that did not close fails the pass**, as it always has, and a failed
+/// pass takes back everything it wrote and nothing else: `out_dir` is left
+/// as it was found, the last export's files of these names and anybody's
+/// own in it. A pass that closed every file moves each one that sounded to
+/// its place in `out_dir`, over the last export's file of that name; a lane
+/// that never sounded has no stem, and its old one goes, as it always did
+/// (see [`StemWriter`]). The pass used to write straight into `out_dir`,
+/// emptying each old file as it began, and a writer that failed left the
+/// partial files standing where the last export's had been.
+#[cfg(feature = "recorder")]
+fn land_export(
+    stage: &std::path::Path,
+    out_dir: &std::path::Path,
+    files: Vec<(std::path::PathBuf, bool, std::io::Result<()>)>,
+) -> Result<(Vec<std::path::PathBuf>, usize), String> {
+    let problem = files
+        .iter()
+        .find_map(|(_, _, closed)| closed.as_ref().err().map(ToString::to_string));
+    let mut landed = Vec::new();
+    let mut silent = 0usize;
+    for (path, loud, _) in files {
+        let home = path.strip_prefix(stage).ok().map(|rel| out_dir.join(rel));
+        match home {
+            Some(home) if problem.is_none() && loud => {
+                if let Some(dir) = home.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if std::fs::rename(&path, &home).is_ok() {
+                    landed.push(home);
+                }
+            }
+            home => {
+                let _ = std::fs::remove_file(&path);
+                if problem.is_none() {
+                    silent += 1;
+                    if let Some(home) = home {
+                        let _ = std::fs::remove_file(home);
+                    }
+                }
+            }
+        }
+    }
+    // Empty now, unless a file could not be moved: then it waits there for
+    // the next pass to clear, rather than be destroyed.
+    if let Ok(dirs) = std::fs::read_dir(stage) {
+        for dir in dirs.flatten() {
+            let _ = std::fs::remove_dir(dir.path());
+        }
+    }
+    let _ = std::fs::remove_dir(stage);
+    match problem {
+        Some(p) => Err(p),
+        None => Ok((landed, silent)),
+    }
+}
+
+/// **A realtime pass's stems, copied out to the Export dialog's folder**:
+/// each stem the pass landed (`land_stems`), into `dst_dir` under its own
+/// name, and where each copy went. Only those: the stems folder also holds
+/// what earlier exports wrote for lanes since renamed, and anybody's own
+/// files, and the delivery used to copy the whole folder.
+#[cfg(feature = "recorder")]
+fn deliver_stems(landed: &[std::path::PathBuf], dst_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let _ = std::fs::create_dir_all(dst_dir);
+    landed
+        .iter()
+        .filter_map(|stem| {
+            let dst = dst_dir.join(stem.file_name()?);
+            std::fs::copy(stem, &dst).is_ok().then_some(dst)
+        })
+        .collect()
+}
+
+/// **What a realtime pass's receipt says of its stems**: how many landed,
+/// and in which folder - `export/stems/`, or `export/stems-dry/` for a dry
+/// pass - read off the stems themselves. Nothing when none landed.
+#[cfg(feature = "recorder")]
+fn stems_receipt(landed: &[std::path::PathBuf]) -> String {
+    let folder = landed
+        .first()
+        .and_then(|stem| stem.parent()?.file_name())
+        .map(|f| f.to_string_lossy().into_owned());
+    match (landed.len(), folder) {
+        (0, _) | (_, None) => String::new(),
+        (1, Some(folder)) => format!(" + 1 stem in export/{folder}/"),
+        (n, Some(folder)) => format!(" + {n} stems in export/{folder}/"),
+    }
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
     /// reverbs to ring out.
     until_s: f64,
     finishing: bool,
-    /// Stems too. (The per-lane tap arrives with them.)
-    stems: bool,
     /// One WAV per used lane, fed from the engine's stem tap as the pass
     /// runs — never buffered whole: a long song is a lot of floats.
     stem_writers: Vec<StemWriter>,
@@ -3702,7 +3819,8 @@ fn warped_clip_audio(
 }
 
 /// **The warp map one quantize would write**, and only the map: a caller
-/// that reports how many attacks it found counts its own `found`.
+/// that reports how many attacks there were counts them in the same window
+/// with [`played_attacks`].
 ///
 /// Its own function because TWO callers need it and they must not disagree:
 /// the Apply, which writes it onto the clip, and the PREVIEW, which turns
@@ -3756,14 +3874,7 @@ fn quantize_map(
     let r = heard_ratio(clip);
     let start_s = clip.start_s;
     // The played window, in the frames `from` and `to` count.
-    let offset = (clip.offset_s * rate / r).max(0.0).round();
-    let len_s = clip.play_len_s(file_s * r);
-    let played_s = if clip.loop_s > 1.0e-6 {
-        clip.loop_s.min(len_s)
-    } else {
-        len_s
-    };
-    let end = offset + played_s.max(0.0) * rate / r;
+    let (offset, end) = played_frames(clip, rate, file_s);
     let inside = |f: f64| f >= offset && f < end;
     let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
     for t in found {
@@ -3787,6 +3898,39 @@ fn quantize_map(
         map.clear();
     }
     map
+}
+
+/// **The frames of a decode at `rate` that `clip` PLAYS**, `(from, to)`:
+/// from its trim, for its length or one pass of its loop (every pass
+/// replays that same span), in the frames of the warp's render (see
+/// [`heard_ratio`]). The window [`quantize_map`] anchors in, and the one
+/// the quantize's receipt counts attacks in ([`played_attacks`]).
+#[cfg(feature = "recorder")]
+fn played_frames(clip: &tangent_ui::arrangement::ArrClip, rate: f64, file_s: f64) -> (f64, f64) {
+    let r = heard_ratio(clip);
+    let offset = (clip.offset_s * rate / r).max(0.0).round();
+    let len_s = clip.play_len_s(file_s * r);
+    let played_s = if clip.loop_s > 1.0e-6 {
+        clip.loop_s.min(len_s)
+    } else {
+        len_s
+    };
+    (offset, offset + played_s.max(0.0) * rate / r)
+}
+
+/// **How many of `found` the clip plays**: the attacks inside its played
+/// window ([`played_frames`]), which is what "quantized N of M attacks"
+/// counts. The detector reads the whole file, and the receipt counted all
+/// of it, so a trimmed or split clip was told of attacks it never plays.
+#[cfg(feature = "recorder")]
+fn played_attacks(
+    found: &[crate::transient::Transient],
+    rate: u32,
+    file_s: f64,
+    clip: &tangent_ui::arrangement::ArrClip,
+) -> usize {
+    let (from, to) = played_frames(clip, f64::from(rate.max(1)), file_s);
+    found.iter().filter(|t| (from..to).contains(&(t.at as f64))).count()
 }
 
 /// **Heard seconds per second of the warp's render**: the clip's stretch as
@@ -9771,10 +9915,11 @@ impl DesktopApp {
     /// two paths is what stops them drifting.
     ///
     /// The pass does NOT store the mode: the folder it writes into and the
-    /// folder `finish_bounce` copies out of are both named by
+    /// folder `finish_bounce` delivers into are both named by
     /// `ports::stems_folder_name`, and the spec the finish reads is the same
     /// object this pair was taken from a line earlier. A third copy of the
-    /// answer would be a third thing that can disagree.
+    /// answer would be a third thing that can disagree. The delivery copies
+    /// the stems the pass landed, handed to it, never the folder's listing.
     fn start_bounce(&mut self, stems: bool, stems_dry: bool, span: Option<(f64, f64)>) {
         // **A standing message stands until somebody lowers it.** The request
         // raises `EXPORT_RUNNING` before it knows whether the pass can even
@@ -9928,7 +10073,6 @@ impl DesktopApp {
             // track.
             until_s,
             finishing: false,
-            stems,
             stem_writers,
             stem_scratch: Vec::new(),
             engine_lost: false,
@@ -10013,12 +10157,11 @@ impl DesktopApp {
                 let Some(b) = self.recorder.bounce.take() else {
                     return;
                 };
-                let stems = b.stems;
                 // Into place only for a pass that ran whole; a failed one
                 // takes back what it wrote and leaves the folder as it was.
-                let wrote = match b.stem_dir.as_deref() {
+                let landed = match b.stem_dir.as_deref() {
                     Some(dir) => land_stems(b.stem_writers, dir, problem.is_none()),
-                    None => 0,
+                    None => Vec::new(),
                 };
                 // **The same format pass the offline export runs**, and the
                 // same reason for holding it a frame: a copy per stem and an
@@ -10032,8 +10175,7 @@ impl DesktopApp {
                     Chore::FinishBounce {
                         folder,
                         problem,
-                        stems,
-                        wrote,
+                        landed,
                     },
                 );
             }
@@ -10042,7 +10184,7 @@ impl DesktopApp {
 
     /// The pass is done: the take's WAV becomes `export/track.wav` (counted
     /// up past what exists), and the band's status line says where.
-    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, _stems: bool) {
+    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, landed: &[std::path::PathBuf]) {
         // The reveal-when-done watcher must not open a Finder window for a
         // bounce — the export note says where the real file went.
         self.recorder.seen_take = Some(folder.to_owned());
@@ -10108,12 +10250,17 @@ impl DesktopApp {
         // So the delivery is taken FIRST, and while there is one standing the
         // staging copy says nothing: the message that ends this pass is the
         // delivery's own, pushed after its files exist.
+        //
+        // **The stems ride the same receipt**, the folder they landed in
+        // named off the stems themselves: a chore of its own used to add
+        // "... stems in export/stems/" after every pass, a dialog's included,
+        // and in `stems/` for dry stems too.
         let mut delivery = self.recorder.pending_delivery.take();
         match std::fs::copy(&wav, export_dir.join(&name)) {
             Ok(_) if delivery.is_none() => {
                 self.app.notify_lower(EXPORT_RUNNING);
                 self.app
-                    .notify(Kind::Success, format!("exported  export/{name}"));
+                    .notify(Kind::Success, format!("exported  export/{name}{}", stems_receipt(landed)));
             }
             Ok(_) => {}
             Err(e) => {
@@ -10156,17 +10303,10 @@ impl DesktopApp {
                 }
             }
             if spec.stems {
-                let src = export_dir.join(spec.stems_folder());
-                let dst_dir = out_dir.join(spec.stems_folder());
-                let _ = std::fs::create_dir_all(&dst_dir);
-                if let Ok(rd) = std::fs::read_dir(&src) {
-                    for f in rd.flatten() {
-                        let dst = dst_dir.join(f.file_name());
-                        if std::fs::copy(f.path(), &dst).is_ok() {
-                            paths.push(dst);
-                        }
-                    }
-                }
+                // **The stems this pass landed, and only those**: the folder
+                // also holds what earlier exports wrote for lanes since
+                // renamed, and anybody's own files. See `deliver_stems`.
+                paths.extend(deliver_stems(landed, &out_dir.join(spec.stems_folder())));
             }
             self.app.set_export_progress(None);
             match deliver_formats_inner(&paths, &spec, true) {
@@ -10635,14 +10775,23 @@ impl DesktopApp {
         };
         let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), wav_spec);
         let stem_name = sanitize_file_stem(&spec.name);
+        // **Written aside, and moved in only by a pass whose every file
+        // closed** (`land_export`): written in place, over the last export's
+        // files of these names, a writer that failed left its partial files
+        // standing where those had been. A freeze writes a new file of its
+        // own and opens none.
+        let stage = match freeze {
+            None => open_export_stage(&out_dir),
+            Some(_) => export_stage(&out_dir),
+        };
         let master = if spec.master {
-            let path = out_dir.join(format!("{stem_name}.wav"));
-            let _ = std::fs::remove_file(&path);
+            let path = stage.join(format!("{stem_name}.wav"));
             match tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                 Ok(w) => Some((path, w)),
                 Err(err) => {
+                    let _ = std::fs::remove_dir(&stage);
                     self.app.notify(Kind::Error, format!("export: {err}"));
-                    return;
+                    refuse!();
                 }
             }
         } else {
@@ -10666,7 +10815,7 @@ impl DesktopApp {
             }
             freeze_job = Some(FreezeJob { lane, rel_path: format!("media/{name}"), skip: None });
         } else if spec.stems {
-            let dir = out_dir.join(spec.stems_folder());
+            let dir = stage.join(spec.stems_folder());
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 self.app
                     .notify(Kind::Error, format!("export: stems dir: {e}"));
@@ -10690,7 +10839,6 @@ impl DesktopApp {
                     .map(|c| if std::path::is_separator(c) { '-' } else { c })
                     .collect();
                 let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
-                let _ = std::fs::remove_file(&path);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                     stems.push(StemWriter { lane, path, writer: w, loud: false });
                 }
@@ -10914,7 +11062,7 @@ impl DesktopApp {
         let Some(b) = self.recorder.offline_bounce.take() else {
             return;
         };
-        // ── done: close the files, then the format pass ──
+        // ── done: close the files, land them, then the format pass ──
         let OfflineBounce {
             spec,
             master,
@@ -10922,40 +11070,22 @@ impl DesktopApp {
             out_dir,
             ..
         } = b;
-        let mut problem: Option<String> = None;
-        let mut master_path = None;
-        if let Some((path, w)) = master {
-            if let Err(e) = w.finish() {
-                problem = Some(e.to_string());
+        // **Every file closed first, and moved into place only if every one
+        // did** (`land_export`): a failed pass takes back what it wrote and
+        // leaves the folder as it was. A used lane that never sounded is not
+        // a stem (see `StemWriter`); the count goes in the notice below so
+        // the folder's contents and the message agree.
+        let mut files: Vec<_> = master.into_iter().map(|(path, w)| (path, true, w.finish())).collect();
+        files.extend(stems.into_iter().map(|s| (s.path, s.loud, s.writer.finish())));
+        let (paths, silent) = match land_export(&export_stage(&out_dir), &out_dir, files) {
+            Ok(landed) => landed,
+            Err(p) => {
+                self.app.notify_lower(EXPORT_RUNNING);
+                self.app.notify(Kind::Error, format!("export failed: {p}"));
+                self.app.set_export_progress(None);
+                return;
             }
-            master_path = Some(path);
-        }
-        let mut stem_paths = Vec::new();
-        let mut silent = 0usize;
-        for s in stems {
-            if let Err(e) = s.writer.finish() {
-                problem = Some(e.to_string());
-            }
-            if s.loud {
-                stem_paths.push(s.path);
-            } else {
-                // A used lane that never sounded is not a stem. See
-                // `StemWriter`; the count goes in the notice below so the
-                // folder's contents and the message agree.
-                let _ = std::fs::remove_file(&s.path);
-                silent += 1;
-            }
-        }
-        if let Some(p) = problem {
-            self.app.notify_lower(EXPORT_RUNNING);
-            self.app.notify(Kind::Error, format!("export failed: {p}"));
-            self.app.set_export_progress(None);
-            return;
-        }
-        let mut paths = stem_paths;
-        if let Some(m) = master_path {
-            paths.push(m);
-        }
+        };
         if let Err(e) = deliver_formats(&paths, &spec) {
             self.app.notify_lower(EXPORT_RUNNING);
             self.app.notify(Kind::Error, format!("export: {e}"));
@@ -13341,8 +13471,11 @@ impl DesktopApp {
             strength: ask.strength,
             window: ask.window,
         };
-        let doc = self.app.arrangement().clone();
-        let Some(clip) = doc.clips.iter().find(|c| c.id == id) else {
+        // **The one clip, not the document.** This runs once per clip in the
+        // ask, and it deep-cloned the arrangement - every clip, note and
+        // automation point - to read a few fields of one; the clone of the
+        // clip alone releases the borrow `attacks_of` needs just the same.
+        let Some(clip) = self.app.arrangement().clips.iter().find(|c| c.id == id).cloned() else {
             return (0, 0);
         };
         if clip.kind != tangent_ui::arrangement::ClipKind::Audio {
@@ -13354,11 +13487,14 @@ impl DesktopApp {
         };
         let files = self.asked_files(ask);
         let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
-        let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
+        let map = quantize_map(&found, decoded.rate, decoded.seconds(), &clip, &q);
+        // What the receipt counts: the attacks the clip PLAYS, not every
+        // one in its file. See `played_attacks`.
+        let played = played_attacks(&found, decoded.rate, decoded.seconds(), &clip);
         // Nothing to quantize - fewer than two pairs, which `quantize_map`
         // answers with no map at all - keeps the map the clip already has.
         if map.is_empty() {
-            return (0, found.len());
+            return (0, played);
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
         // The FIT travels with the map, because the render is made from the
@@ -13367,7 +13503,7 @@ impl DesktopApp {
         // map is frames of this decode: a reader at another rate rescales
         // it (`warp_anchors`) rather than applying it to other audio.
         self.app.set_clip_warp_with_fit(id, map, ask.fit.clone(), decoded.rate);
-        (moved, found.len())
+        (moved, played)
     }
 
     /// Bring each clip up so its loudest point sits just under full scale.
@@ -21318,11 +21454,11 @@ enum Chore {
     /// a warp or stretch render, a mix and a file write, all on this thread.
     GlueAudio(Vec<u64>),
     /// The realtime pass landed: copy it out, run the format pass, say where.
+    /// `landed` is where each of its stems is now (`land_stems`).
     FinishBounce {
         folder: String,
         problem: Option<String>,
-        stems: bool,
-        wrote: usize,
+        landed: Vec<std::path::PathBuf>,
     },
 }
 
@@ -22211,19 +22347,13 @@ impl DesktopApp {
                     );
                 }
             }
+            // The pass's one receipt is the finish's own, stems and all.
             Chore::FinishBounce {
                 folder,
                 problem,
-                stems,
-                wrote,
+                landed,
             } => {
-                self.finish_bounce(&folder, problem, stems);
-                if stems && wrote > 0 {
-                    self.app.notify(
-                        Kind::Success,
-                        format!("exported  export/track + {wrote} stems in export/stems/"),
-                    );
-                }
+                self.finish_bounce(&folder, problem, &landed);
             }
         }
     }
@@ -23214,7 +23344,7 @@ mod tests {
         };
         let read = |name: &str| std::fs::read(dir.join(name)).ok();
         // Failed: nothing it wrote is left, and nothing that was there is gone.
-        assert_eq!(land_stems(pass(), &dir, false), 0, "a failed pass landed stems");
+        assert_eq!(land_stems(pass(), &dir, false), Vec::<std::path::PathBuf>::new(), "a failed pass landed stems");
         assert_eq!(
             read("01-Bass.wav").as_deref(),
             Some(&b"last bass"[..]),
@@ -23229,7 +23359,7 @@ mod tests {
         assert!(!stems_stage(&dir).exists(), "a failed export left its stage behind");
         // Whole: the stem that sounded takes its place, and the lane that
         // never sounded has none, as before.
-        assert_eq!(land_stems(pass(), &dir, true), 1);
+        assert_eq!(land_stems(pass(), &dir, true), vec![dir.join("01-Bass.wav")]);
         let bass = tangent_record::decode::decode(&dir.join("01-Bass.wav"), 8_000).expect("the new stem decodes");
         assert_eq!(bass.frames(), 32, "the bass that landed is not this pass's");
         assert!(read("02-Keys.wav").is_none(), "a lane that never sounded kept a stem");
@@ -23259,6 +23389,238 @@ mod tests {
         assert!(
             tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
             "a pass's stems land whether or not it ran whole"
+        );
+    }
+
+    /// **The Export dialog's realtime delivery carries the stems its pass
+    /// landed, and only those.** It copied every file in `export/stems/`, so
+    /// the stem an earlier export wrote for a lane since renamed came along
+    /// under its old name beside the new one, and so did anybody's own file
+    /// in that folder.
+    #[test]
+    fn a_realtime_delivery_carries_only_the_stems_its_pass_landed() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-delivery-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("export").join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The stem an earlier export wrote when lane 3 was "Guitar", and a
+        // file of somebody's own.
+        std::fs::write(dir.join("03-Guitar.wav"), b"old guitar").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        // This pass, as `start_bounce` opens it and `tick_bounce` lands it:
+        // lane 3 is "Lead" now.
+        let stage = open_stems_stage(&dir);
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: 8_000,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let path = stage.join("03-Lead.wav");
+        let mut writer = tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a stem writer");
+        writer.write_interleaved(&[0.5; 64]).expect("a block");
+        let landed = land_stems(vec![StemWriter { lane: 2, path, writer, loud: true }], &dir, true);
+        assert_eq!(landed, vec![dir.join("03-Lead.wav")], "the pass's stem did not land");
+        // The delivery into the dialog's own folder.
+        let out = root.join("Exports").join("Song").join(tangent_ui::ports::stems_folder_name(false));
+        let delivered = deliver_stems(&landed, &out);
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .expect("the delivery's stems folder")
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["03-Lead.wav".to_owned()],
+            "the delivery carried files this pass never wrote"
+        );
+        assert_eq!(delivered, vec![out.join("03-Lead.wav")], "the format pass is not handed what was copied");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The realtime delivery copies what its pass landed** - the wiring
+    /// `a_realtime_delivery_carries_only_the_stems_its_pass_landed` stands
+    /// on: the landed stems ride the finish's chore to the delivery, which
+    /// no longer lists the stems folder. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_realtime_delivery_copies_what_its_pass_landed() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let finish = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            finish.contains("deliver_stems(landed, &out_dir.join(spec.stems_folder()))")
+                && !finish.contains("std::fs::read_dir(&src)"),
+            "the realtime delivery copies the whole stems folder again"
+        );
+        assert!(
+            src.contains("self.finish_bounce(&folder, problem, &landed);"),
+            "the finish is not told which stems its pass landed"
+        );
+    }
+
+    /// **A realtime pass's receipt names the folder its stems landed in,
+    /// and an Export dialog's pass leaves the word to its delivery.** The
+    /// chore that finishes a pass added "exported  export/track + N stems in
+    /// export/stems/" after every pass whose stems landed: in `stems/` even
+    /// for dry stems, which land in `stems-dry/`; beside the delivery's own
+    /// receipt on a dialog pass, naming the staging folder `finish_bounce`
+    /// keeps quiet about there; and as a second receipt after Export Stems'
+    /// own. The pass's one receipt carries its stems now. The words are
+    /// driven; that the chore says nothing of its own is a source scan,
+    /// because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn a_realtime_receipt_names_its_stems_folder_and_leaves_a_dialog_pass_to_its_delivery() {
+        let export = std::path::Path::new("/p/song/export");
+        let dry = export.join(tangent_ui::ports::stems_folder_name(true));
+        let wet = export.join(tangent_ui::ports::stems_folder_name(false));
+        assert_eq!(
+            stems_receipt(&[dry.join("01-Bass.wav"), dry.join("02-Keys.wav")]),
+            " + 2 stems in export/stems-dry/",
+            "dry stems were said to be in the processed stems' folder"
+        );
+        assert_eq!(stems_receipt(&[wet.join("01-Bass.wav")]), " + 1 stem in export/stems/");
+        assert_eq!(stems_receipt(&[]), "", "a pass with no stems spoke of them");
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn run_chore_now(").expect("run_chore_now");
+        let chores = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let finish = &chores[chores.find("Chore::FinishBounce {").expect("the finish's chore")..];
+        let finish = &finish[..finish.find("\n            }\n").expect("the arm's end")];
+        assert!(
+            finish.contains("self.finish_bounce(") && !finish.contains(".notify("),
+            "the finish's chore pushes a receipt of its own beside the pass's"
+        );
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let quiet = body.find("Ok(_) if delivery.is_none() => {").expect("the staging copy's receipt");
+        let arm = &body[quiet..quiet + body[quiet..].find("Ok(_) => {}").expect("the dialog's arm")];
+        assert!(
+            arm.contains("stems_receipt(landed)"),
+            "the pass's own receipt does not carry its stems"
+        );
+    }
+
+    /// **A failed full-speed export leaves its folder as it found it.** The
+    /// full-speed pass wrote its master and stems straight into the export's
+    /// folder, emptying the last export's files of those names as it began,
+    /// and when a writer would not close, `write_export` said "export
+    /// failed" and returned with the partial files standing where the last
+    /// export's had been. It writes aside now and lands only when every file
+    /// closed; a failed pass takes back what it wrote and nothing else.
+    #[test]
+    fn a_failed_full_speed_export_leaves_its_folder_as_it_found_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-full-speed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let out_dir = root.join("Exports").join("Song");
+        let stems = out_dir.join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&stems).unwrap();
+        // The last export of these names, and a file of somebody's own.
+        std::fs::write(out_dir.join("Mix.wav"), b"last mix").unwrap();
+        std::fs::write(stems.join("01-Bass.wav"), b"last bass").unwrap();
+        std::fs::write(stems.join("02-Keys.wav"), b"last keys").unwrap();
+        std::fs::write(out_dir.join("notes.txt"), b"mine").unwrap();
+        // A pass, as `start_offline_render` opens it and `write_export`
+        // closes it: the master and the bass sound, the keys never do, and
+        // the bass's writer does not close when the disk is `full`.
+        let pass = |full: bool| {
+            let stage = open_export_stage(&out_dir);
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: 8_000,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let stems = stage.join(tangent_ui::ports::stems_folder_name(false));
+            std::fs::create_dir_all(&stems).unwrap();
+            let mut files = Vec::new();
+            for (path, level, fails) in [
+                (stage.join("Mix.wav"), 0.5f32, false),
+                (stems.join("01-Bass.wav"), 0.5, full),
+                (stems.join("02-Keys.wav"), 0.0, false),
+            ] {
+                let mut writer =
+                    tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a writer");
+                writer.write_interleaved(&[level; 64]).expect("a block");
+                let closed = writer.finish();
+                let closed = if fails { Err(std::io::Error::other("the disk is full")) } else { closed };
+                files.push((path, level != 0.0, closed));
+            }
+            (stage, files)
+        };
+        let read = |path: std::path::PathBuf| std::fs::read(path).ok();
+        // Failed: nothing it wrote is left, and nothing that was there is gone.
+        let (stage, files) = pass(true);
+        assert_eq!(land_export(&stage, &out_dir, files), Err("the disk is full".to_owned()));
+        assert!(
+            read(out_dir.join("Mix.wav")).as_deref() == Some(&b"last mix"[..]),
+            "a failed export left its partial master where the last export's was"
+        );
+        assert!(
+            read(stems.join("01-Bass.wav")).as_deref() == Some(&b"last bass"[..]),
+            "a failed export left its partial stem where the last export's was"
+        );
+        assert!(
+            read(stems.join("02-Keys.wav")).as_deref() == Some(&b"last keys"[..]),
+            "a failed export took a stem it never replaced"
+        );
+        assert!(read(out_dir.join("notes.txt")).as_deref() == Some(&b"mine"[..]), "somebody's own file went");
+        assert!(!stage.exists(), "a failed export left its stage behind");
+        // Whole: the master and the stem that sounded take their places, and
+        // the lane that never sounded has no stem, as before.
+        let (stage, files) = pass(false);
+        let (landed, silent) = land_export(&stage, &out_dir, files).expect("a whole pass lands");
+        assert_eq!(landed, vec![out_dir.join("Mix.wav"), stems.join("01-Bass.wav")]);
+        assert_eq!(silent, 1, "the lane that never sounded was not counted");
+        let mix = tangent_record::decode::decode(&out_dir.join("Mix.wav"), 8_000).expect("the new master decodes");
+        assert_eq!(mix.frames(), 32, "the master that landed is not this pass's");
+        assert!(read(stems.join("02-Keys.wav")).is_none(), "a lane that never sounded kept a stem");
+        assert!(
+            read(out_dir.join("notes.txt")).as_deref() == Some(&b"mine"[..]),
+            "somebody's own file went with the export"
+        );
+        assert!(!stage.exists(), "the stage was left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The full-speed pass writes aside, and lands only a pass whose every
+    /// file closed** - the wiring `a_failed_full_speed_export_leaves_its_folder_as_it_found_it`
+    /// stands on. And a master that cannot even be opened takes the standing
+    /// "Exporting..." down with it, as every other refusal there does. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_full_speed_pass_stages_its_files_and_lands_them_only_when_every_one_closed() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_offline_render(").expect("start_offline_render");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            start.contains("None => open_export_stage(&out_dir),")
+                && start.contains("let path = stage.join(format!(\"{stem_name}.wav\"));")
+                && start.contains("let dir = stage.join(spec.stems_folder());"),
+            "the full-speed pass writes straight into the export's folder again"
+        );
+        let master = &start[start.find("let master = if spec.master {").expect("the master")..];
+        let master = &master[..master.find("let mut stems = Vec::new();").expect("the stems")];
+        assert!(
+            master.contains("refuse!();") && !master.contains("return;"),
+            "a master that cannot be opened leaves \"Exporting...\" standing"
+        );
+        let at = src.find("fn write_export(&mut self)").expect("write_export");
+        let write = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            write.contains("land_export(&export_stage(&out_dir), &out_dir, files)"),
+            "the full-speed pass lands its files whether or not every one closed"
         );
     }
 
@@ -27598,6 +27960,74 @@ mod tests {
             quantize_map(&two, 48_000, 2.0, &clip, &q),
             vec![(25_440, 24_000), (72_960, 72_000)],
             "two attacks were not quantized"
+        );
+    }
+
+    /// **The quantize's receipt counts the attacks the clip plays.** The
+    /// detector reads the whole FILE, and "quantized N of M attacks" counted
+    /// every attack in it: the right half of a split take was told of the
+    /// left half's hits, and a clip that plays none of the file's attacks
+    /// heard how many the file had instead of "no attacks found". The count
+    /// is taken in the window `quantize_map` anchors in. Its use in
+    /// `quantize_clip` is a source scan, because `DesktopApp` cannot be
+    /// built in a test.
+    #[test]
+    fn the_quantize_receipt_counts_only_the_attacks_the_clip_plays() {
+        use crate::transient::Transient;
+        // The right half of a 16 s take split at 8 s, its end trimmed at
+        // 11.9 s of the file - `an_attack_the_trim_hides_is_not_pulled_onto_the_clip_start`'s clip.
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            start_s: 8.0,
+            offset_s: 8.0,
+            len_s: 3.9,
+            loop_s: 3.9,
+            ..Default::default()
+        };
+        // Two attacks in the trim, the clip's own two, and one past its end.
+        let found: Vec<Transient> = [480usize, 48_000, 384_144, 396_480, 572_160]
+            .iter()
+            .map(|&at| Transient { at, strength: 10.0 })
+            .collect();
+        assert_eq!(
+            played_attacks(&found, 48_000, 16.0, &clip),
+            2,
+            "the receipt counted attacks the clip does not play"
+        );
+        // Untrimmed, every attack in the file is the clip's.
+        let whole = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            len_s: 16.0,
+            ..Default::default()
+        };
+        assert_eq!(played_attacks(&found, 48_000, 16.0, &whole), 5);
+        let src = include_str!("desktop.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn quantize_clip(").expect("quantize_clip");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("played_attacks(&found, decoded.rate, decoded.seconds(),")
+                && !body.contains("found.len()"),
+            "the quantize's receipt counts every attack in the file again"
+        );
+    }
+
+    /// **A quantize clones the clip it quantizes, not the whole document.**
+    /// `quantize_clip` runs once per clip in the ask, and each run
+    /// deep-cloned the arrangement - every clip, every note, every
+    /// automation point - to read a few fields of one audio clip, so a
+    /// marquee over eight takes copied the song eight times.
+    /// `quantize_marks_for` already clones only the clips it names.
+    /// Performance only, so a source scan.
+    #[test]
+    fn a_quantize_clones_the_clip_it_quantizes_and_not_the_document() {
+        let src = include_str!("desktop.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn quantize_clip(").expect("quantize_clip");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("self.app.arrangement().clone()"),
+            "a quantize copies the whole document once per clip again"
         );
     }
 

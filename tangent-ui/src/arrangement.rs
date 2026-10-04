@@ -937,17 +937,19 @@ pub fn fold_into_midi_pass(start_s: f64, len_s: f64, loop_s: f64, offset_s: f64,
 /// not for the bounce. The two that CAN share must, or an exported file will
 /// eventually disagree with the sound for the same reason.
 ///
-/// The two skips and the bound are all inherited from that schedule, verbatim
-/// in effect: a note that would sound before the clip's own head is dropped
-/// rather than played early; a repeat that BEGINS past the clip's end is not
-/// played at all, because the last pass is usually a partial one; and the
-/// pass count is clamped, because a clip dragged out to an hour over a loop
-/// of a sixteenth is not something to hand the audio thread — or, here, to
-/// build a note list from.
+/// The two skips and the bound are inherited from that schedule, and the
+/// engine's wall at the clip's end (`PlacedMidi::len`) is spelled out here:
+/// a note that would sound before the clip's own head is dropped rather than
+/// played early; a note that BEGINS at or past the clip's end is not played
+/// at all, whether it is a loop's last, partial pass or a note a right trim
+/// hides on a clip that does not loop; and the pass count is clamped,
+/// because a clip dragged out to an hour over a loop of a sixteenth is not
+/// something to hand the audio thread - or, here, to build a note list from.
 ///
-/// Nothing is truncated at the clip's end. A note that STARTS inside the clip
-/// and rings past it rings past it, which is what playback does and therefore
-/// what an export has to write.
+/// **A note is let go at the clip's end.** One that STARTS inside the clip
+/// and rings past it is cut there, because the engine sends its note-off at
+/// the clip's end: that is what playback does and therefore what an export
+/// has to write. It used to ring its whole length here, past what was heard.
 pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
     // **The clip's OFFSET is part of the span to cover.** The notes are
     // placed at `at_s - offset_s + shift`, so a clip trimmed from its front
@@ -985,12 +987,16 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
             if at < -1.0e-9 {
                 continue;
             }
-            if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
+            // **Looped or not.** The engine walls every clip at its end, so
+            // a note past the end of a clip that does not loop - one a right
+            // trim hides - is no more heard than a pass that begins there.
+            if at >= clip.len_s - 1.0e-9 {
                 continue;
             }
             out.push(ArrNote {
                 at_s: clip.start_s + at,
-                dur_s: n.dur_s,
+                // Let go at the clip's end, where the engine lets it go.
+                dur_s: n.dur_s.min(clip.len_s - at),
                 key: n.key,
                 vel: n.vel,
             muted: false,
@@ -1006,9 +1012,8 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
 ///
 /// A pass stands the note at `at_s - offset_s + shift` from the clip's head
 /// and sounds it only when that falls INSIDE the clip: [`clip_notes_in_song_time`]'s
-/// two skips (before the head; at or past the end of a looped clip) and its
-/// bound on the passes, plus the engine's wall at the end of a clip that
-/// does not loop - nothing past `PlacedMidi::len` sounds. So a note the trim
+/// two skips (before the head; at or past the end, the engine's wall at
+/// `PlacedMidi::len`, looped or not) and its bound on the passes. So a note the trim
 /// hides on the first pass is first heard one loop later, and one the trim
 /// hides on every pass, or that only ever falls past the end, is heard
 /// nowhere. The quantize asks this, so it moves a note where it is heard and
@@ -1101,8 +1106,11 @@ pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
             if at <= pass_start + 1.0e-9 {
                 continue;
             }
-            // The same past-the-end rule the notes twin uses, and only for
-            // a loop, so the two cannot disagree about what a clip holds.
+            // Past the end of a LOOP an edge is a repeat's partial, and goes
+            // as the notes twin's note does. Past the end of a clip that
+            // does not loop it is kept, where a note is not: the engine lets
+            // the pedal go at the clip's end and this list states no lift
+            // there, so dropping the edge would hold a pedal down for good.
             if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
                 continue;
             }
@@ -5716,6 +5724,53 @@ mod tests {
             .map(|n| n.at_s - flush.start_s)
             .collect();
         assert_eq!(at, vec![0.0, 4.0], "an untrimmed loop changed: {at:?}");
+    }
+
+    /// **A clip schedules only what the engine sounds, looped or not.** The
+    /// engine walls every clip at its end (`PlacedMidi::len`): a note that
+    /// begins at or past it never sounds, and one that rings past it is let
+    /// go there. The expansion skipped a note past the end only on a loop
+    /// and rang every note its whole length, so the MIDI export wrote notes
+    /// a right trim hides, and glue welded them into a clip long enough to
+    /// play them, where they began to sound.
+    #[test]
+    fn a_clip_schedules_only_what_the_engine_sounds() {
+        let n = |at_s: f64, dur_s: f64, key: u8| ArrNote { at_s, dur_s, key, vel: 100, muted: false };
+        // No loop, trimmed on the right to two seconds: the note at 1.5
+        // rings a second and is let go at the end; the one at 3.0 is hidden.
+        let clip = ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![n(0.0, 0.5, 60), n(1.5, 1.0, 62), n(3.0, 0.5, 64)],
+            start_s: 10.0,
+            len_s: 2.0,
+            loop_s: 0.0,
+            ..Default::default()
+        };
+        let heard = |clip: &ArrClip| -> Vec<(f64, f64, u8)> {
+            clip_notes_in_song_time(clip)
+                .into_iter()
+                .map(|n| (n.at_s - clip.start_s, n.dur_s, n.key))
+                .collect()
+        };
+        let once = heard(&clip);
+        assert_eq!(
+            once.iter().map(|h| h.2).collect::<Vec<_>>(),
+            vec![60, 62],
+            "a note past the end of a clip that does not loop was scheduled: {once:?}"
+        );
+        assert!((once[1].1 - 0.5).abs() < 1e-9, "a note rang past the clip's end: {once:?}");
+        assert!((once[0].1 - 0.5).abs() < 1e-9, "a note inside the clip was cut: {once:?}");
+        // A loop is let go at the CLIP's end, not at a pass's: the 62 of
+        // the first pass rings on into the second, the second pass's is cut.
+        let looped = ArrClip {
+            notes: vec![n(0.0, 0.25, 60), n(0.75, 1.0, 62)],
+            loop_s: 1.0,
+            ..clip.clone()
+        };
+        let passes = heard(&looped);
+        assert_eq!(passes.len(), 4, "{passes:?}");
+        assert!((passes[1].1 - 1.0).abs() < 1e-9, "a note was cut at a pass's end: {passes:?}");
+        assert!((passes[3].1 - 0.25).abs() < 1e-9, "the last pass rang past the clip's end: {passes:?}");
     }
 
     /// **A clip repeats when the picture shows a seam inside it** - glue's
