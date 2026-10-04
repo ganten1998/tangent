@@ -26385,7 +26385,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // mappings the row draws with, like the node drag above.
                 ArrDrag::AutoMarquee { lane, slot, from, press, moved, .. } => {
                     let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
-                    let (band, t) = {
+                    let (band, t, window) = {
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
                         let band = crate::arrangement_panel::Layout::new(rect, &view)
@@ -26398,7 +26398,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                     )
                             })
                             .map(|r| r.lane);
-                        (band, crate::arrangement_panel::time_at(rect, &view, p.x))
+                        (
+                            band,
+                            crate::arrangement_panel::time_at(rect, &view, p.x),
+                            (view.view_start_s, view.view_start_s + view.view_len_s),
+                        )
                     };
                     if let Some(band) = band.filter(Rect::is_positive) {
                         let v = crate::arrangement_panel::auto_value_at(band, p.y);
@@ -26415,7 +26419,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             moved,
                         });
                         if moved {
-                            let boxed = self.arr_auto_boxed(lane, slot, from, (t, v));
+                            // **Only what the window shows.** The box is
+                            // drawn clipped to its row, so the time it
+                            // chooses over is clipped to the window as
+                            // well: pulled out over the headers it chose
+                            // every node back to the song's start, unseen.
+                            let span = |s: f64| s.max(window.0).min(window.1);
+                            let boxed = self.arr_auto_boxed(
+                                lane,
+                                slot,
+                                (span(from.0), from.1),
+                                (span(t), v),
+                            );
                             self.arr_choose_auto_nodes(boxed);
                         }
                     }
@@ -60528,6 +60543,26 @@ mod tests {
                 .any(|r| matches!(r, recorder::RecorderRequest::Locate(t) if (t - 3.0).abs() < 0.3)),
             "the tap did not locate: {asked:?}"
         );
+    }
+
+    /// **A box never chooses a node the window does not show.** The box is
+    /// drawn clipped to its row and its time span was not: pulled out over
+    /// the headers, it chose every node back to the song's start, lit
+    /// nowhere anybody could see, for a Delete or a Cut to take.
+    #[test]
+    fn a_box_never_chooses_a_node_off_screen() {
+        let (ctx, mut app) = auto_bench("autoboxoff");
+        let (_, len) = app.arr_window_now();
+        app.arr_steer(2.5, len);
+        let _ = run_frame(&ctx, &mut app);
+        let from = auto_at(&app, 3.5, 0.95);
+        let rect = app.arrangement_rect.expect("drawn");
+        drag_through(&ctx, &mut app, from, &[Pos2::new(rect.left() + 10.0, from.y + 60.0)]);
+        assert!(!app.arr_auto_nodes.contains(&(0, 0, 1)), "the 2 s node, left of the window, was chosen");
+        // The window's own nodes are still the box's to choose.
+        let to = auto_at(&app, 5.0, 0.05);
+        drag_through(&ctx, &mut app, from, &[to]);
+        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 2)], "the box lost the 4 s node it covers");
     }
 
     /// **Copy, click where it should go, paste**: it lands on that row, at
