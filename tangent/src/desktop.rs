@@ -626,6 +626,63 @@ fn any_sound(samples: &[f32]) -> bool {
     samples.iter().any(|s| *s != 0.0)
 }
 
+/// **Where a realtime pass writes its stems until it has run whole**: a
+/// hidden folder beside `dir`, emptied of whatever a pass that never
+/// finished left in it, and made. See [`land_stems`].
+#[cfg(feature = "recorder")]
+fn open_stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
+    let stage = stems_stage(dir);
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::create_dir_all(&stage);
+    stage
+}
+
+/// The stage's name for `dir`: `export/.stems.writing` beside
+/// `export/stems`, the way a template is staged as `.<name>.writing`.
+#[cfg(feature = "recorder")]
+fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    dir.with_file_name(format!(".{name}.writing"))
+}
+
+/// **A realtime pass's stems into place, or gone**, and how many landed.
+///
+/// Every writer is closed. When the pass `ran_whole`, a stem that sounded
+/// and closed cleanly moves from the stage into `dir`, over the last
+/// export's stem of that name, which is the export's own; a lane that never
+/// sounded has no stem, and its old one goes, as it always did (see
+/// [`StemWriter`]). A pass that did not run whole takes back everything it
+/// wrote and nothing else: `dir` is left as it was found, the last export's
+/// stems and anybody's own files in it. The pass used to write straight
+/// into `dir`, emptying each lane's old stem as it began, and a failure
+/// returned with the partial files standing there.
+#[cfg(feature = "recorder")]
+fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) -> usize {
+    let mut landed = 0;
+    for s in writers {
+        let closed = s.writer.finish().is_ok();
+        let home = s.path.file_name().map(|n| dir.join(n));
+        match home {
+            Some(home) if ran_whole && closed && s.loud => {
+                let _ = std::fs::create_dir_all(dir);
+                if std::fs::rename(&s.path, &home).is_ok() {
+                    landed += 1;
+                }
+            }
+            home => {
+                let _ = std::fs::remove_file(&s.path);
+                if let Some(home) = home.filter(|_| ran_whole && closed) {
+                    let _ = std::fs::remove_file(home);
+                }
+            }
+        }
+    }
+    // Empty now, unless a stem could not be moved: then it waits there for
+    // the next pass to clear, rather than be destroyed.
+    let _ = std::fs::remove_dir(stems_stage(dir));
+    landed
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -642,6 +699,10 @@ struct Bounce {
     /// **The engine went mid-pass, and that is what ended it** - see
     /// `tick_bounce`. Filed as a failure.
     engine_lost: bool,
+    /// Where the stems belong (`export/stems` or `export/stems-dry`): the
+    /// pass writes them beside it in `stems_stage`, and `land_stems` moves
+    /// them in only if it ran whole. `None` with no stems written.
+    stem_dir: Option<std::path::PathBuf>,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -1453,8 +1514,9 @@ struct ClipAudio {
     audio: Decoded,
     /// `Some(ratio)` while a render is owed: `audio` is then drawn at
     /// `1/ratio` of the clip's time and measured `ratio` times as long (see
-    /// `clip_picture`). The warp's projected length over the file's while
-    /// the warp is out, the stretch while it is.
+    /// `clip_picture`). The warp's projected length over the file's, times
+    /// the stretch it holds back, while the warp is out; the stretch while
+    /// it is.
     stand_in: Option<f64>,
     /// The warp render the clip names, when it has a map.
     warp_key: Option<StretchKey>,
@@ -1514,8 +1576,17 @@ fn clip_audio(
                     } else {
                         out as f64 / src as f64
                     };
+                    // **Times the stretch it holds back** (below): once both
+                    // are made, the clip is heard at the two together. Stood
+                    // in at the warp alone, a stretched take was drawn and
+                    // measured short by its stretch until the warp landed.
+                    // Not past the ceiling, where that stretch is never made.
+                    let held = match stretch_key(clip, path) {
+                        Some(_) if !stretch_over_ceiling(out, clip.stretch) => clip.stretch,
+                        _ => 1.0,
+                    };
                     warp_owed = Some((anchors, mode, fit));
-                    (decoded.clone(), Some(ratio))
+                    (decoded.clone(), Some(ratio * held))
                 }
             }
         }
@@ -3492,6 +3563,11 @@ fn audio_clip_passes(
 /// a per-export one — its decodes are at the export rate, and stretched
 /// copies of live-rate audio would be wrong-rate in the file (the rate rule
 /// on the cache fields).
+///
+/// **Past the ceiling it is the audio itself**, unstretched and cached
+/// under the key, as `reload_clips` plays such a clip (see
+/// [`stretch_over_ceiling`]). The export, glue and normalize used to render
+/// it anyway: the allocation playback refuses, and a stretch nobody heard.
 #[cfg(feature = "recorder")]
 fn stretched_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3514,7 +3590,11 @@ fn stretched_clip_audio(
     match cache.get(&key) {
         Some(c) => Arc::clone(c),
         None => {
-            let made = Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
+            let made = if stretch_over_ceiling(decoded.frames(), clip.stretch) {
+                Arc::clone(&decoded)
+            } else {
+                Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode))
+            };
             cache.insert(key, Arc::clone(&made));
             made
         }
@@ -9736,6 +9816,7 @@ impl DesktopApp {
         // The stems: one writer per USED lane — clips on it, or a kind —
         // fed live from the engine's tap so nothing is buffered whole.
         let mut stem_writers = Vec::new();
+        let mut stem_dir = None;
         if stems {
             if let (Some(e), Some(dir)) = (
                 self.recorder.engine.as_ref(),
@@ -9754,7 +9835,10 @@ impl DesktopApp {
                 // The one door, so a scratch made real by an export keeps
                 // its kit - see `finish_bounce`.
                 self.app.materialize_project_dir();
-                let _ = std::fs::create_dir_all(&dir);
+                // **Written aside, and moved in by a pass that ran whole**
+                // (`land_stems`): straight into `dir`, a pass that failed
+                // left its partial stems where the last export's had been.
+                let stage = open_stems_stage(&dir);
                 let rate = e.output().sample_rate;
                 let spec = tangent_record::wav::WavSpec {
                     sample_rate: rate,
@@ -9792,14 +9876,14 @@ impl DesktopApp {
                         .chars()
                         .map(|c| if std::path::is_separator(c) { '-' } else { c })
                         .collect();
-                    let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
-                    let _ = std::fs::remove_file(&path);
+                    let path = stage.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
                         stem_writers.push(StemWriter { lane, path: path.clone(), writer: w, loud: false });
                     }
                 }
+                stem_dir = Some(dir);
                 // The same door the offline twin arms its tap through, so the
                 // two passes cannot disagree about what a mode means. See
                 // `arm_stem_tap`.
@@ -9815,6 +9899,7 @@ impl DesktopApp {
             stem_writers,
             stem_scratch: Vec::new(),
             engine_lost: false,
+            stem_dir,
         });
     }
 
@@ -9896,18 +9981,12 @@ impl DesktopApp {
                     return;
                 };
                 let stems = b.stems;
-                let mut wrote = 0usize;
-                for s in b.stem_writers {
-                    if s.writer.finish().is_ok() {
-                        if s.loud {
-                            wrote += 1;
-                        } else {
-                            // A used lane that never sounded is not a stem.
-                            // See `StemWriter`.
-                            let _ = std::fs::remove_file(&s.path);
-                        }
-                    }
-                }
+                // Into place only for a pass that ran whole; a failed one
+                // takes back what it wrote and leaves the folder as it was.
+                let wrote = match b.stem_dir.as_deref() {
+                    Some(dir) => land_stems(b.stem_writers, dir, problem.is_none()),
+                    None => 0,
+                };
                 // **The same format pass the offline export runs**, and the
                 // same reason for holding it a frame: a copy per stem and an
                 // mp3 encode per file, all of it on this thread. The writers
@@ -10079,7 +10158,7 @@ impl DesktopApp {
     // ── the FULL-SPEED export ──────────────────────────────────────────────
 
     /// Where an export lands: the spec's directory, or the project's own
-    /// `export/` folder.
+    /// folder under the Exports root (`TangentApp::export_home`).
     fn export_out_dir(
         &self,
         spec: &tangent_ui::ports::ProjectExportSpec,
@@ -10094,16 +10173,10 @@ impl DesktopApp {
         // "where are my exports" a per-project answer. They go under one
         // roof now — see `Settings::media_root` — with a subfolder per
         // project, because two projects both writing `master.wav` into one
-        // folder is one of them overwriting the other.
-        let name = self
-            .app
-            .project_doc()
-            .and_then(|d| d.file_stem().map(|s| s.to_string_lossy().into_owned()))
-            .filter(|s| !s.is_empty());
-        Some(match name {
-            Some(n) => self.app.export_root().join(n),
-            None => self.app.export_root(),
-        })
+        // folder is one of them overwriting the other. Named for the
+        // project's FOLDER: named for the document's stem, it was `project`
+        // for every project, and one room held them all.
+        Some(self.app.export_home())
     }
 
     /// Start a full-speed export: an OFFLINE engine, furnished exactly like
@@ -11105,8 +11178,9 @@ impl DesktopApp {
                 if name.is_empty() {
                     return;
                 }
-                // **Is the session's own folder REAL?** Asked before anything
-                // is written, because the answer decides what may be.
+                // **Is the session's own folder REAL?** Asked first, because
+                // the answer decides what the template is built from: a real
+                // folder is copied whole, and a scratch has none to copy.
                 //
                 // A session that has never been saved has no folder, and
                 // this road used to give it one: it saved the session into
@@ -11114,24 +11188,22 @@ impl DesktopApp {
                 // the template from a fresh launch, so every Save As
                 // Template left a `Projects/Untitled` behind - "why am i
                 // getting untitled tracks building up again". A template is
-                // not a save of the session; the scratch stays unwritten and
-                // the template is written straight from memory.
+                // not a save of the session, from a scratch or a real folder:
+                // nothing of the session is written, and the template is
+                // written straight from memory.
                 let src = self
                     .app
                     .project_doc()
                     .and_then(std::path::Path::parent)
                     .map(std::path::Path::to_path_buf);
                 let was_real = src.as_deref().is_some_and(std::path::Path::is_dir);
-                // **Everything written down first, so the copy IS the
-                // session** — its plugins' knobs included. A REAL folder is
-                // saved and copied whole, media and takes with it, as it
-                // always was; a scratch puts its knobs on the global shelf
-                // only, which is where they are mirrored from below.
-                if was_real {
-                    self.save_project_and_states();
-                } else {
-                    self.save_plugin_states();
-                }
+                // **The live knobs on the global shelf, and nothing else
+                // written.** `build_template` mirrors that shelf into the
+                // template. A REAL folder used to be saved first and copied,
+                // so an experiment went into the project's document and
+                // `state/`, the asterisk went with it, and Don't Save had
+                // nothing left to refuse.
+                self.save_plugin_states();
                 // **Built beside the shelf and swapped in.** The old road
                 // deleted the template before writing its replacement, so a
                 // failed copy left no template at all - and a scratch adopted
@@ -11140,21 +11212,12 @@ impl DesktopApp {
                 let shelf = self.templates_dir();
                 let stage = shelf.join(format!(".{name}.writing"));
                 let _ = std::fs::remove_dir_all(&stage);
-                let built = match src.as_deref() {
-                    Some(src) if was_real => copy_dir_all(src, &stage).map(|()| {
-                        // A project whose kit was never edited has no sidecar
-                        // of its own, and a template without one makes every
-                        // later scratch's kit look like work to the sweep.
-                        if !stage.join(tangent_ui::drumpad::FILE_NAME).exists() {
-                            self.app.write_kit_into(&stage);
-                        }
-                    }),
-                    _ => self.app.write_template_into(&stage).map(|()| {
-                        let shelf_dir = stage.join("state");
-                        let _ = std::fs::create_dir_all(&shelf_dir);
-                        mirror_sidecars(&global_state_dir(), &shelf_dir);
-                    }),
-                };
+                let built = build_template(
+                    &self.app,
+                    src.as_deref().filter(|_| was_real),
+                    &stage,
+                    &global_state_dir(),
+                );
                 let dst = shelf.join(&name);
                 // **And it says so, either way.** This row replaces a whole
                 // folder - the stencil every New and every launch is made
@@ -11226,7 +11289,9 @@ impl DesktopApp {
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 // Raised, not pushed: from here until the files land this is
                 // a thing that is HAPPENING, and the render below can run for
-                // minutes. Both passes lower it when they report.
+                // minutes. Both passes lower it when they report. It names
+                // the folder the files will land in, as the dialog did.
+                let to = self.export_out_dir(&spec).unwrap_or_default();
                 self.app.notify_raise(
                     EXPORT_RUNNING,
                     Kind::Info,
@@ -11238,11 +11303,7 @@ impl DesktopApp {
                         "full-speed"
                     },
                     spec.source_label(),
-                    if spec.dir.trim().is_empty() {
-                        "project/export"
-                    } else {
-                        spec.dir.trim()
-                    },
+                    to.display(),
                     ),
                 );
                 if spec.realtime {
@@ -11533,7 +11594,7 @@ impl DesktopApp {
     /// exist yet, and then created it, empty of state, one line later.
     ///
     /// **That is why the owner's default template had no `state/` folder in
-    /// it at all.** Save As Template copies the session's whole folder, and
+    /// it at all.** Save As Template copied the session's whole folder, and
     /// the session a launch stands on is an unmaterialised scratch, so the
     /// copy carried the two things the materialise had just made — `media/`
     /// and the document — and nothing else. His template names Brusfri in a
@@ -13380,22 +13441,29 @@ impl DesktopApp {
     /// and the app refuses a frozen track before asking. The caches it reuses
     /// (`track_cache`, `stretch_cache`) hold audio at the rate of the engine
     /// that filled them: `start_engine` clears them, but an engine that dies
-    /// or a band that closes leaves them standing. **Not yet guarded:** with
-    /// no engine running the weld is written at 48 kHz while those caches may
-    /// still hold another engine's rate, and then it plays at the wrong
-    /// speed. The weld is one undo moment, taken in `finish_audio_glue`; the
-    /// sources' files stay on disk so that moment can be undone.
+    /// or a band that closes leaves them standing. So **with no engine
+    /// running it refuses**: it used to write the weld at an invented 48 kHz
+    /// over whatever rate those caches held, and the weld played at the
+    /// wrong speed. The weld is one undo moment, taken in
+    /// `finish_audio_glue`; the sources' files stay on disk so that moment
+    /// can be undone.
     #[cfg(feature = "recorder")]
     fn glue_audio_clips(&mut self, ids: &[u64]) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             self.app.notify(Kind::Info, "Nothing to glue into - no project is open.");
             return;
         };
-        let rate = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or(48_000, |e| e.output().sample_rate);
+        // **The running engine's rate, or no weld.** The caches below hold
+        // audio at the rate of the engine that filled them, and one that
+        // died or closed with the band left them standing: a weld written at
+        // a guessed rate over them plays at the wrong speed.
+        let Some(rate) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {
+            self.app.notify(
+                Kind::Info,
+                "Open the band to glue audio - the audio path is closed.",
+            );
+            return;
+        };
         let doc = self.app.arrangement().clone();
         let picked: Vec<&tangent_ui::arrangement::ArrClip> = doc
             .clips
@@ -15977,6 +16045,35 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// **A template built into `stage`, and nothing of the session written.**
+///
+/// A REAL folder is copied whole first - media, takes and anything else in
+/// it, as Save As Template always carried them - and the session is then
+/// written over the copy from memory (`TangentApp::write_template_into`: the
+/// document with the live desk and `named` off, the kit, the files they
+/// name), with the live knobs mirrored from `shelf` into its `state/`. A
+/// scratch has no folder to copy and gets the rest. So the template is the
+/// session as it stands either way, and the session's own document,
+/// `state/` and saved mark are left alone: Save As Template used to save a
+/// real folder's session first and copy that, writing an experiment into
+/// the project and clearing its asterisk.
+#[cfg(feature = "recorder")]
+fn build_template(
+    app: &TangentApp,
+    real: Option<&std::path::Path>,
+    stage: &std::path::Path,
+    shelf: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(src) = real {
+        copy_dir_all(src, stage)?;
+    }
+    app.write_template_into(stage)?;
+    let state = stage.join("state");
+    let _ = std::fs::create_dir_all(&state);
+    mirror_sidecars(shelf, &state);
+    Ok(())
+}
+
 /// Copy a directory tree, best effort — the project system's clone.
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -16505,16 +16602,20 @@ fn unique_ir_stem(dir: &std::path::Path, stem: &str) -> String {
 /// neither on disk in `media` nor named by any clip in the document (`named`
 /// holds the clips' `path`s, `media/<file>`). A clip whose file went missing
 /// still names it, and a weld written there would bring that clip back to
-/// life playing the new audio.
+/// life playing the new audio. **In any case**, because the disk compares
+/// that way: APFS and NTFS answer `Take-glued-1.wav` to `take-glued-1.wav`.
 #[cfg(feature = "recorder")]
 fn glue_file_name(
     media: &std::path::Path,
     stem: &str,
     named: &std::collections::HashSet<&str>,
 ) -> String {
+    let named: std::collections::HashSet<String> = named.iter().map(|n| n.to_lowercase()).collect();
     (1..10_000)
         .map(|n| format!("{stem}-glued-{n}.wav"))
-        .find(|cand| !media.join(cand).exists() && !named.contains(format!("media/{cand}").as_str()))
+        .find(|cand| {
+            !media.join(cand).exists() && !named.contains(&format!("media/{cand}").to_lowercase())
+        })
         .unwrap_or_else(|| format!("{stem}-glued.wav"))
 }
 
@@ -16557,8 +16658,11 @@ fn render_placed_span(
 /// **Every system's filesystem, not only this one's.** A project is a folder
 /// that travels, and Windows refuses `< > : " | ? *` and control characters
 /// where macOS and Linux shrug; a clip or an export named with any of them
-/// wrote here and failed there. And Windows drops a trailing dot, so a stem
-/// ending in one names a different file than the one written.
+/// wrote here and failed there. And Windows drops trailing dots and spaces,
+/// so a stem ending in either names a different file than the one written:
+/// every one goes, not one pass of each. And it keeps CON, NUL, COM1 and
+/// the rest for devices, so such a stem gets a `_` in front
+/// ([`is_windows_device_name`]).
 #[cfg(feature = "recorder")]
 fn sanitize_file_stem(name: &str) -> String {
     let s: String = name
@@ -16574,12 +16678,32 @@ fn sanitize_file_stem(name: &str) -> String {
             }
         })
         .collect();
-    let s = s.trim().trim_end_matches('.').trim();
+    let s = s.trim().trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if s.is_empty() {
         "mix".to_owned()
+    } else if is_windows_device_name(s) {
+        format!("_{s}")
     } else {
         s.to_owned()
     }
+}
+
+/// **A name Windows keeps for a device**: CON, PRN, AUX, NUL, COM0-9 and
+/// LPT0-9 (and COM or LPT with a superscript one, two or three), in any
+/// case, judged on what comes before the first dot, as Windows judges it -
+/// `nul.tar.gz` is NUL. Such a file is the device on a Windows machine, and
+/// the project's folder travels there.
+#[cfg(feature = "recorder")]
+fn is_windows_device_name(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let digit = base.strip_prefix("COM").or_else(|| base.strip_prefix("LPT"));
+    digit.is_some_and(|d| {
+        let mut c = d.chars();
+        matches!((c.next(), c.next()), (Some(n), None) if n.is_ascii_digit() || matches!(n, '¹' | '²' | '³'))
+    })
 }
 
 // ── the browser's three verbs, host-side ────────────────────────────────────
@@ -21290,7 +21414,8 @@ fn stretch_step(
 /// Whether a render would come out past the decoder's own ceiling.
 /// `stretch::tape` allocates `frames * ratio` and nothing else bounded it:
 /// a document saying `"stretch": 4.0` on a twenty-minute clip asked for
-/// 1.84 GB in one allocation. Such a clip plays unstretched and says so.
+/// 1.84 GB in one allocation. Such a clip plays unstretched and says so,
+/// and the export and glue render it unstretched (`stretched_clip_audio`).
 #[cfg(feature = "recorder")]
 fn stretch_over_ceiling(frames: usize, ratio: f64) -> bool {
     !(ratio.is_finite()) || frames as f64 * ratio.max(1.0) > tangent_record::decode::MAX_FRAMES as f64
@@ -22908,6 +23033,33 @@ mod tests {
         }
     }
 
+    /// **An export's room is named for its project, not its document.**
+    /// Every document is `<project>/project.tan`, so a room named for the
+    /// document's file stem was `Exports/project/` for every project, and
+    /// each project's `mix.wav` replaced the last one's. The host asks the
+    /// app's `export_home`, which `each_projects_exports_land_in_a_folder_of_its_own`
+    /// drives; this pins that it asks, and names no stem of its own. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn an_export_room_is_named_for_its_project_not_its_document() {
+        // The premise: every document is `<project>/project.tan`.
+        assert_eq!(
+            std::path::Path::new(tangent_ui::arrangement::DOC_NAME)
+                .file_stem()
+                .and_then(|s| s.to_str()),
+            Some("project")
+        );
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn export_out_dir(").expect("export_out_dir");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("self.app.export_home()") && !body.contains(".file_stem()"),
+            "export_out_dir names the room after the document's stem - `project` for \
+             every project - so every project's exports share one folder"
+        );
+    }
+
     /// **A press writes a head only for a count that clicks.** With the
     /// count recorded into the take and no engine to click it, the file
     /// opens at the press with no count in it, and its `take.json` said a
@@ -22987,6 +23139,96 @@ mod tests {
         assert!(
             body.contains("b.engine_lost = lost;") && body.contains(".or_else(|| { lost.then("),
             "an export that ended on a lost engine is filed as a success"
+        );
+    }
+
+    /// **A failed export leaves the stems folder as it found it.** The
+    /// realtime pass wrote its stems straight into `export/stems/`, emptying
+    /// each lane's old stem as it began, and a pass that failed - its engine
+    /// gone, its take in trouble - returned with its partial files standing
+    /// where the last export's had been. They are written aside now and
+    /// moved in by a pass that ran whole; a failed one takes back what it
+    /// wrote and nothing else.
+    #[test]
+    fn a_failed_export_leaves_the_stems_folder_as_it_found_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-stems-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("export").join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The last export's two stems, and a file of somebody's own.
+        std::fs::write(dir.join("01-Bass.wav"), b"last bass").unwrap();
+        std::fs::write(dir.join("02-Keys.wav"), b"last keys").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        // A pass, as `start_bounce` opens it: the bass sounds, the keys never do.
+        let pass = || {
+            let stage = open_stems_stage(&dir);
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: 8_000,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let mut writers = Vec::new();
+            for (lane, name, level) in [(0, "01-Bass.wav", 0.5f32), (1, "02-Keys.wav", 0.0)] {
+                let path = stage.join(name);
+                let mut writer =
+                    tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a stem writer");
+                writer.write_interleaved(&[level; 64]).expect("a block");
+                writers.push(StemWriter { lane, path, writer, loud: level != 0.0 });
+            }
+            writers
+        };
+        let read = |name: &str| std::fs::read(dir.join(name)).ok();
+        // Failed: nothing it wrote is left, and nothing that was there is gone.
+        assert_eq!(land_stems(pass(), &dir, false), 0, "a failed pass landed stems");
+        assert_eq!(
+            read("01-Bass.wav").as_deref(),
+            Some(&b"last bass"[..]),
+            "a failed export left its partial stem where the last export's was"
+        );
+        assert_eq!(
+            read("02-Keys.wav").as_deref(),
+            Some(&b"last keys"[..]),
+            "a failed export took a stem it never replaced"
+        );
+        assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]));
+        assert!(!stems_stage(&dir).exists(), "a failed export left its stage behind");
+        // Whole: the stem that sounded takes its place, and the lane that
+        // never sounded has none, as before.
+        assert_eq!(land_stems(pass(), &dir, true), 1);
+        let bass = tangent_record::decode::decode(&dir.join("01-Bass.wav"), 8_000).expect("the new stem decodes");
+        assert_eq!(bass.frames(), 32, "the bass that landed is not this pass's");
+        assert!(read("02-Keys.wav").is_none(), "a lane that never sounded kept a stem");
+        assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]), "somebody's own file went with the stems");
+        assert!(!stems_stage(&dir).exists(), "the stage was left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The realtime pass stages its stems and lands them only when it ran
+    /// whole** - the wiring `a_failed_export_leaves_the_stems_folder_as_it_found_it`
+    /// stands on. A source scan, because `DesktopApp` cannot be built in a
+    /// test.
+    #[test]
+    fn the_realtime_pass_stages_its_stems_and_lands_them_only_when_it_ran_whole() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            start.contains("let stage = open_stems_stage(&dir);")
+                && start.contains("let path = stage.join(format!(")
+                && start.contains("stem_dir = Some(dir);"),
+            "the realtime pass writes its stems straight into the export's folder again"
+        );
+        let at = src.find("fn tick_bounce(&mut self").expect("tick_bounce");
+        let tick = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
+            "a pass's stems land whether or not it ran whole"
         );
     }
 
@@ -24111,6 +24353,61 @@ mod tests {
         assert!(stretch_over_ceiling(100, f64::INFINITY));
     }
 
+    /// **The export and glue keep the ceiling playback keeps.** A stretch
+    /// whose render would pass the decoder's ceiling plays unstretched: the
+    /// live road caches the audio itself under the stretch key and says so.
+    /// `stretched_clip_audio`, the road the export, glue and normalize take,
+    /// rendered it all the same - the 1.84 GB allocation the ceiling exists
+    /// to refuse, on the UI thread - and welded or exported a stretch nobody
+    /// had heard. The long decode is zeroed pages nothing reads, so this
+    /// costs nothing while it passes.
+    #[test]
+    fn the_export_and_glue_play_a_stretch_past_the_ceiling_unstretched() {
+        // A ratio that is not a number is over the ceiling too: the cheap
+        // case first, so a road with no ceiling at all fails here at once
+        // rather than after rendering the long one.
+        let short = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 64],
+            rate: 48_000,
+            source: std::path::PathBuf::from("short.wav"),
+        });
+        let nan = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "short.wav".to_owned(),
+            stretch: f64::NAN,
+            ..Default::default()
+        };
+        let mut renders = std::collections::HashMap::new();
+        let out = stretched_clip_audio(&nan, Arc::clone(&short), std::path::Path::new("short.wav"), &mut renders);
+        assert!(Arc::ptr_eq(&out, &short), "a stretch that is not a number was rendered, not refused");
+        let frames = tangent_record::decode::MAX_FRAMES / 4 + 1;
+        let decoded = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; frames * 2],
+            rate: 48_000,
+            source: std::path::PathBuf::from("long.wav"),
+        });
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "long.wav".to_owned(),
+            stretch: 4.0,
+            stretch_mode: "tape".to_owned(),
+            ..Default::default()
+        };
+        let path = std::path::Path::new("long.wav");
+        assert!(stretch_over_ceiling(frames, clip.stretch), "the fixture is under the ceiling");
+        let mut cache = std::collections::HashMap::new();
+        let out = stretched_clip_audio(&clip, Arc::clone(&decoded), path, &mut cache);
+        assert!(
+            Arc::ptr_eq(&out, &decoded),
+            "the export and glue stretched past the ceiling that playback refuses"
+        );
+        let (key, _) = stretch_key(&clip, path).expect("a stretched clip has a key");
+        assert!(
+            cache.get(&key).is_some_and(|c| Arc::ptr_eq(c, &decoded)),
+            "the key does not hold the unstretched audio, as playback's cache does"
+        );
+    }
+
     /// **A stand-in picture lands where the render's will.** A clip
     /// stretched to 2.0 whose render is pending is drawn from the
     /// unstretched pyramid at half the clip's time: a burst at 0.2 s of the
@@ -24225,12 +24522,12 @@ mod tests {
         assert!(landed.warp_owed.is_none() && landed.stretch.is_none());
 
         // Warped and stretched, with the warp still out: the stretch is held
-        // back and the file stands in at the warp's length.
+        // back, and the file stands in at the length the two will make.
         let both = tangent_ui::arrangement::ArrClip { stretch: 2.0, ..warped.clone() };
         cache.clear();
         let held = clip_audio(&both, path, &file, &cache);
         assert!(held.stretch.is_none(), "a stretch was asked for while its warp was still out");
-        assert_eq!(held.stand_in, Some(ratio));
+        assert_eq!(held.stand_in, Some(ratio * 2.0), "a pending warp stood in at its own ratio, short by the stretch");
 
         // The warp in, the stretch owed: the warp render stands in at the stretch.
         cache.insert(key, render.clone());
@@ -24247,6 +24544,51 @@ mod tests {
         assert!(Arc::ptr_eq(&done.audio.clip, &stretched.clip), "the clip does not play its stretch of the warp");
         assert_eq!(done.stand_in, None);
         assert!(!done.stretch_owed);
+    }
+
+    /// **A stretched clip whose warp is pending stands in at both.** The
+    /// stretch waits for the warp, which it is made from, and the stand-in
+    /// carried the warp's ratio alone: on every open, quantize Apply or undo
+    /// of one, a take stretched to 2.0 was drawn at half its length inside
+    /// its box, and an open-ended one measured half as long, until the warp
+    /// landed. A stretch past the ceiling is never made, so there the warp
+    /// stands in alone. The long decode is zeroed pages nothing reads.
+    #[test]
+    fn a_pending_warp_on_a_stretched_clip_stands_in_at_both() {
+        let rate = 8_000u32;
+        let path = std::path::Path::new("a.wav");
+        let cache: std::collections::HashMap<StretchKey, Decoded> = std::collections::HashMap::new();
+        let take = |frames: usize| Decoded {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.0; frames * 2],
+                rate,
+                source: path.to_path_buf(),
+            }),
+            peaks: tangent_ui::peaks::Peaks::build(&[], 2, rate).shared(),
+        };
+        let quantized = |stretch: f64| tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "a.wav".to_owned(),
+            warp: vec![(0, 0), (8_000, 10_000)],
+            stretch,
+            ..Default::default()
+        };
+        let warp_ratio = |file: &Decoded, clip: &tangent_ui::arrangement::ArrClip| {
+            let (_, anchors, _, _) = warp_plan(clip, path, rate).expect("a warped clip has a plan");
+            crate::warp::projected_frames(file.clip.frames(), &anchors) as f64 / file.clip.frames() as f64
+        };
+        let (file, doubled) = (take(16_000), quantized(2.0));
+        assert_eq!(
+            clip_audio(&doubled, path, &file, &cache).stand_in,
+            Some(warp_ratio(&file, &doubled) * 2.0),
+            "a pending warp stood in at its own ratio, short by the stretch"
+        );
+        let (long, quadrupled) = (take(tangent_record::decode::MAX_FRAMES / 4 + 1), quantized(4.0));
+        assert_eq!(
+            clip_audio(&quadrupled, path, &long, &cache).stand_in,
+            Some(warp_ratio(&long, &quadrupled)),
+            "a stretch the ceiling refuses was stood in for"
+        );
     }
 
     /// **The lengths a reload measured go over in ONE call, and an empty
@@ -25572,6 +25914,30 @@ mod tests {
         );
     }
 
+    /// **The glue welds only at the rate its decodes were made at.** With no
+    /// engine running - the band closed, or the device gone - it wrote the
+    /// weld at an invented 48 kHz while `track_cache` and `stretch_cache`
+    /// still held audio at the last engine's rate (only `start_engine`
+    /// clears them), so a weld made after a 44.1 kHz session played 8.8%
+    /// fast, and it replaced its sources. It refuses now, before it reads a
+    /// cache. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_glue_never_mixes_a_decode_made_at_another_rate() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn glue_audio_clips(&mut self").expect("the glue");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("map_or(48_000"),
+            "with no engine the glue invents 48 kHz and mixes whatever rate the caches were filled at"
+        );
+        let asks = body
+            .find("let Some(rate) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {")
+            .expect("the glue no longer refuses when there is no engine to take its rate from");
+        let reads = body.find("self.track_cache.get(&path)").expect("the glue's decode");
+        assert!(asks < reads, "the glue reads the caches before it knows an engine filled them");
+    }
+
     /// **A stretch of warped audio is not a stretch of the file.** The
     /// stretch is made from the warped render, so its cache key names the
     /// warp: under file, ratio and mode alone, undoing a quantize on a
@@ -25722,6 +26088,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&media);
     }
 
+    /// **Nor a name a missing clip holds in another case.** APFS and NTFS
+    /// answer a name in any case, so a clip whose missing file is
+    /// `media/Take-glued-1.wav` woke up playing a weld written as
+    /// `take-glued-1.wav`, while the exact-match check called that name free.
+    #[test]
+    fn a_glued_name_is_not_one_a_missing_clip_holds_in_another_case() {
+        let media = std::env::temp_dir().join(format!(
+            "tangent-glue-case-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&media);
+        std::fs::create_dir_all(&media).unwrap();
+        let named: std::collections::HashSet<&str> = ["media/Take-glued-1.wav"].into_iter().collect();
+        let got = glue_file_name(&media, "take", &named);
+        let _ = std::fs::remove_dir_all(&media);
+        assert_ne!(got, "take-glued-1.wav", "a name a missing clip holds in another case was reused");
+        assert_eq!(got, "take-glued-2.wav");
+    }
+
     /// **A file stem every system can write.** A clip or an export named with
     /// a character Windows refuses wrote here and failed there.
     #[test]
@@ -25732,6 +26118,27 @@ mod tests {
         assert_eq!(sanitize_file_stem("tab\tbell\u{7}"), "tab-bell-");
         assert_eq!(sanitize_file_stem("ends with a dot."), "ends with a dot");
         assert_eq!(sanitize_file_stem("  ...  "), "mix");
+    }
+
+    /// **Every trailing dot goes, and no device name survives.** One pass of
+    /// dots between two trims left "take. ." as "take." and ". ." as "."
+    /// (a weld written as the hidden `.-glued-1.wav`), and "con" passed:
+    /// exported as `con.wav`, it is the console on Windows, not a file.
+    #[test]
+    fn a_file_stem_loses_every_trailing_dot_and_no_device_name_survives() {
+        assert_eq!(sanitize_file_stem("take. ."), "take");
+        assert_eq!(sanitize_file_stem(". ."), "mix");
+        for dev in ["con", "PRN", "aux", "NUL", "com1", "LPT9", "nul.backup"] {
+            assert_ne!(
+                sanitize_file_stem(dev).to_ascii_uppercase(),
+                dev.to_ascii_uppercase(),
+                "{dev} is a Windows device name"
+            );
+        }
+        // A name that only begins like one is nobody's device.
+        for name in ["console", "com10", "lpt", "auxiliary"] {
+            assert_eq!(sanitize_file_stem(name), name);
+        }
     }
 
     /// **A staged template takes the shelf's place, and a failure leaves one
@@ -25764,6 +26171,86 @@ mod tests {
         swap_in_template(&stage, &fresh).expect("a first template");
         assert!(fresh.is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Save As Template writes the template, never the session.** From a
+    /// saved project it saved the session first and copied the folder, so an
+    /// experiment went into the project's document and `state/`, the title
+    /// lost its asterisk, and Don't Save had nothing left to refuse. The
+    /// folder is still copied whole, and the session is written over the
+    /// copy from memory: its edits and its live knobs are the template's,
+    /// and the project on disk stays as it was saved.
+    #[test]
+    fn a_template_from_a_saved_project_leaves_the_project_as_it_was_saved() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-tpl-real-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // A saved project: a named document with one clip, takes on disk, a
+        // sidecar from its last save and a file of somebody's own.
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).unwrap();
+        std::fs::create_dir_all(song.join("state")).unwrap();
+        let mut doc = tangent_ui::arrangement::Arrangement::default();
+        doc.named = true;
+        let clip = doc.add_clip(tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "media/take.wav".to_owned(),
+            len_s: 2.0,
+            ..Default::default()
+        });
+        let saved = song.join(tangent_ui::arrangement::DOC_NAME);
+        doc.save_to(&saved);
+        std::fs::write(song.join("media/take.wav"), b"pcm").unwrap();
+        std::fs::write(song.join("media/outtake.wav"), b"more pcm").unwrap();
+        let sidecar = sidecar_name(0, 0);
+        std::fs::write(song.join("state").join(&sidecar), b"as saved").unwrap();
+        std::fs::write(song.join("notes.txt"), b"mine").unwrap();
+        let on_disk = std::fs::read(&saved).unwrap();
+        // Opened, and turned down since: an edit nobody has saved.
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        app.open_project(&saved);
+        app.set_clip_gain(clip, 0.5);
+        assert!(app.project_dirty_exact(), "the fixture's edit is not unsaved");
+        // The live knobs, on a shelf of the test's own.
+        let shelf = root.join("shelf");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join(&sidecar), b"live").unwrap();
+
+        let stage = root.join(".rig.writing");
+        build_template(&app, Some(&song), &stage, &shelf).expect("the template was built");
+        let project_now = std::fs::read(&saved).unwrap();
+        let knobs_now = std::fs::read(song.join("state").join(&sidecar)).unwrap();
+        let unsaved = app.project_dirty_exact();
+        let tpl = tangent_ui::arrangement::Arrangement::load_from(&stage.join(tangent_ui::arrangement::DOC_NAME));
+        let tpl_knobs = std::fs::read(stage.join("state").join(&sidecar)).ok();
+        let carried = ["media/take.wav", "media/outtake.wav", "notes.txt", tangent_ui::drumpad::FILE_NAME]
+            .map(|f| (f, stage.join(f).is_file()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The project is as it was saved, and its edit is still unsaved...
+        assert!(project_now == on_disk, "Save As Template rewrote the project's document");
+        assert_eq!(knobs_now, b"as saved", "Save As Template rewrote the project's knobs");
+        assert!(unsaved, "Save As Template marked the session saved");
+        // ...and the template is the session as it stands, the folder copied
+        // whole, with a kit to be compared against.
+        assert!(!tpl.named, "the template was born named");
+        assert_eq!(
+            tpl.clips.iter().find(|c| c.id == clip).map(|c| c.gain),
+            Some(0.5),
+            "the template is not the session as it stands"
+        );
+        assert_eq!(
+            tpl_knobs.as_deref(),
+            Some(&b"live"[..]),
+            "the template carries the last save's knobs, not the live ones"
+        );
+        for (file, there) in carried {
+            assert!(there, "{file} did not come with the template");
+        }
     }
 
     /// **A rack that has not arrived yet holds the room shut**, and only for
@@ -28380,9 +28867,10 @@ mod tests {
     /// the two entries his template has.
     ///
     /// `save_project_and_states` is the one spelling of the order now, and
-    /// the two roads that keep a session whole go through it. The two that
-    /// save the outgoing session only when it is dirty cannot (the write is
-    /// conditional), so they are asserted where they stand.
+    /// Save, the road that keeps a session whole, goes through it; Save As
+    /// Template writes nothing of the session at all, and is held to that.
+    /// The two that save the outgoing session only when it is dirty cannot
+    /// (the write is conditional), so they are asserted where they stand.
     ///
     /// A source scan because `DesktopApp` cannot be built in a test — the
     /// precedent is `every_edge_where_frames_stop_flushes_the_settings_debounce`
@@ -28391,7 +28879,7 @@ mod tests {
     /// seat, and watches the learned profile arrive.
     ///
     /// Revert-check: put `copy_states_to_project` back above
-    /// `save_project_doc` in any of the four and this goes red naming it.
+    /// `save_project_doc` in any of the three and this goes red naming it.
     #[test]
     fn a_road_that_writes_a_project_shelves_the_states_after_the_document() {
         let whole = include_str!("desktop.rs");
@@ -28418,60 +28906,40 @@ mod tests {
              lose them"
         );
 
-        // The two roads that keep a session whole go through it.
-        for (arm, next) in [
-            ("ProjectRequest::Save =>", "ProjectRequest::Template(name)"),
-            ("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)"),
-        ] {
-            let body = between(arm, next);
-            assert!(
-                body.contains("self.save_project_and_states()"),
-                "the {arm} arm no longer keeps the session through \
-                 `save_project_and_states`, so it has an order of its own \
-                 again"
-            );
-            assert!(
-                !body.contains("self.copy_states_to_project()"),
-                "the {arm} arm shelves the plugin states itself as well, \
-                 which is a second spelling of an order that has exactly one"
-            );
-        }
-        // Save As Template copies a REAL folder, so both writes have to have
-        // happened before the copy or the template is a session missing its
-        // shelf — which is the whole fault.
+        // The road that keeps a session whole goes through it.
+        let save = between("ProjectRequest::Save =>", "ProjectRequest::Template(name)");
+        assert!(
+            save.contains("self.save_project_and_states()"),
+            "the Save arm no longer keeps the session through \
+             `save_project_and_states`, so it has an order of its own again"
+        );
+        assert!(
+            !save.contains("self.copy_states_to_project()"),
+            "the Save arm shelves the plugin states itself as well, which is \
+             a second spelling of an order that has exactly one"
+        );
+        // **Save As Template is not a save, from a scratch or a real folder.**
+        // It puts the live knobs on the global shelf and builds the template
+        // from memory with that shelf mirrored into it (`build_template`,
+        // driven by `a_template_from_a_saved_project_leaves_the_project_as_it_was_saved`),
+        // and writes nothing of the session. It used to save a real folder's
+        // session first and copy that, and before that it wrote a scratch
+        // into `Projects/Untitled`, every time.
         let template = between("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)");
-        let saved = template.find("self.save_project_and_states()").expect("the real-folder save");
-        let copied = template.find("copy_dir_all(src, &stage)").expect("the real-folder copy");
+        for write in ["save_project", "copy_states_to_project", "materialize_project_dir"] {
+            assert!(!template.contains(write), "Save As Template writes the session: `{write}`");
+        }
+        let shelved = template
+            .find("self.save_plugin_states();")
+            .expect("Save As Template no longer puts the live knobs on the shelf");
+        let built = template
+            .find("build_template(")
+            .expect("Save As Template no longer builds through `build_template`");
+        assert!(shelved < built, "the template is built before the live knobs are on the shelf it mirrors");
+        let helper = between("fn build_template(", "\n}\n");
         assert!(
-            saved < copied,
-            "Save As Template copies the session folder before it writes the \
-             session into it, so the template is a stencil with no plugin \
-             state in it"
-        );
-        // **And a scratch is never written on the way.** The save is the
-        // REAL folder's alone: asked about before any write, and the scratch
-        // gets the template written from memory with its shelf mirrored.
-        // Without this every Save As Template from a fresh launch left a
-        // `Projects/Untitled` behind.
-        let real = template.find("let was_real").expect("the template road no longer asks whether the folder is real");
-        assert!(
-            real < saved && real < template.find("self.save_plugin_states()").unwrap_or(usize::MAX),
-            "the template road writes before it knows whether the session has a folder"
-        );
-        let scratch = template
-            .split("if was_real {")
-            .nth(1)
-            .and_then(|t| t.split("} else {").nth(1))
-            .and_then(|t| t.split('}').next())
-            .expect("the scratch branch of the template save");
-        assert!(
-            !scratch.contains("save_project") && scratch.contains("self.save_plugin_states()"),
-            "a template saved from a scratch writes the scratch: {scratch}"
-        );
-        assert!(
-            template.contains("self.app.write_template_into(&stage)")
-                && template.contains("mirror_sidecars(&global_state_dir(), &shelf_dir)"),
-            "a scratch's template is no longer written from memory with its shelf"
+            helper.contains("app.write_template_into(stage)") && helper.contains("mirror_sidecars(shelf, &state)"),
+            "a template is no longer written from memory with its shelf"
         );
 
         // And the two that write the outgoing document only if it is dirty.
@@ -28566,7 +29034,7 @@ mod tests {
         let stems = between("fn start_bounce(", "let rate = e.output().sample_rate;");
         let door = stems.find("self.app.materialize_project_dir();").expect("the stems road's door");
         assert!(
-            Some(door) < stems.find("let _ = std::fs::create_dir_all(&dir);"),
+            Some(door) < stems.find("let stage = open_stems_stage(&dir);"),
             "the stems road makes its folder before the door"
         );
     }
@@ -33686,11 +34154,10 @@ mod sidecar_walk_probe {
 
     /// **And the cure: a template that carries its rack carries its state.**
     ///
-    /// The same adopt, against a template whose folder was copied from a
-    /// session that had a shelf in it - which is what
-    /// `save_project_and_states` makes `Save As Template` produce. The
-    /// learned profile arrives on the live shelf and the plugin comes back
-    /// with it.
+    /// The same adopt, against a template that carries its shelf, as every
+    /// template `Save As Template` writes now does (`build_template` mirrors
+    /// the live knobs into its `state/`). The learned profile arrives on the
+    /// live shelf and the plugin comes back with it.
     ///
     /// **The leak is still shut.** A seat the template does NOT name still
     /// loses its sidecar, which is the whole reason the mirror clears: "the
