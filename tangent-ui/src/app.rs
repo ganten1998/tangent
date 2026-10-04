@@ -32397,9 +32397,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.project_root()
     }
 
-    /// Where an EXPORT lands when the dialog does not name a folder.
+    /// The root an EXPORT lands under when the dialog does not name a
+    /// folder: in a folder of each project's own (`export_home`).
     pub fn export_root(&self) -> std::path::PathBuf {
         self.settings.export_root()
+    }
+
+    /// **Where an export lands when the dialog names no folder**: a folder
+    /// of the project's own under [`Self::export_root`], named for the
+    /// project's FOLDER. It was named for the document's file stem, and
+    /// every document is `<project>/project.tan`, so every project exported
+    /// into one `Exports/project/` and each `mix.wav` replaced the last
+    /// project's. With no project, the root itself. The host's
+    /// `export_out_dir` and the Export dialog's DIRECTORY row both ask here,
+    /// so the row says where the file will land.
+    pub fn export_home(&self) -> std::path::PathBuf {
+        match self.project_name() {
+            name if name.is_empty() => self.export_root(),
+            name => self.export_root().join(name),
+        }
     }
 
     /// Where saved PRESETS live, resolved. The host scans and writes under
@@ -35856,6 +35872,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = Some(Dialog::ExportProject {
                     spec,
                     sel: self.time_sel.filter(|(a, b)| b > a),
+                    home: self.export_home().display().to_string(),
                 });
             }
             DialogAction::ProjectExportRun(spec) => {
@@ -51063,6 +51080,42 @@ mod tests {
         assert_ne!(app.project_name(), "Nocturne");
         assert!(app.arrangement().clips.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Each project's exports land in a folder of its own**, named for the
+    /// project's folder. The room was named for the document's file stem,
+    /// and every document is `<project>/project.tan`, so every project
+    /// exported into one `Exports/project/` and each `mix.wav` replaced the
+    /// last project's. The Export dialog's DIRECTORY row says which folder,
+    /// before anything is written.
+    #[test]
+    fn each_projects_exports_land_in_a_folder_of_its_own() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let root = app.export_root();
+        let doc_in = |folder: &str| {
+            std::path::Path::new("songs").join(folder).join(crate::arrangement::DOC_NAME)
+        };
+        app.project_doc = doc_in("Nocturne");
+        let nocturne = app.export_home();
+        app.project_doc = doc_in("Bossa");
+        let bossa = app.export_home();
+        assert_ne!(nocturne, bossa, "two projects export into one folder, each over the other's files");
+        assert_eq!(nocturne, root.join("Nocturne"));
+        assert_eq!(bossa, root.join("Bossa"));
+        // No project at all: the root itself.
+        app.project_doc = std::path::PathBuf::new();
+        assert_eq!(app.export_home(), root);
+        // The dialog's DIRECTORY row says where, before anything is written.
+        app.project_doc = doc_in("Nocturne");
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        match &app.dialog {
+            Some(Dialog::ExportProject { home, .. }) => assert_eq!(
+                *home,
+                nocturne.display().to_string(),
+                "the Export dialog does not say where the export lands"
+            ),
+            _ => panic!("the Export dialog did not open"),
+        }
     }
 
     /// **An unsaved session's Save is the panel, and its first save MOVES
