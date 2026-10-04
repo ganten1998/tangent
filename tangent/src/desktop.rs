@@ -813,6 +813,25 @@ fn stems_receipt(landed: &[std::path::PathBuf]) -> String {
     }
 }
 
+/// **What a menu pass says when its take cannot be copied into `export/`**
+/// as `name`: the file that is missing, and why. Its stems landed before
+/// that copy was tried (`land_stems`, in `tick_bounce`) and are on disk, so
+/// they are named too, read off the stems as [`stems_receipt`] reads them:
+/// "export failed" alone sent somebody to export again for files they had.
+#[cfg(feature = "recorder")]
+fn take_copy_failed(name: &str, e: &std::io::Error, landed: &[std::path::PathBuf]) -> String {
+    let folder = landed
+        .first()
+        .and_then(|stem| stem.parent()?.file_name())
+        .map(|f| f.to_string_lossy().into_owned());
+    let missing = format!("export failed: export/{name} could not be written ({e})");
+    match (landed.len(), folder) {
+        (0, _) | (_, None) => format!("export failed: {e}"),
+        (1, Some(folder)) => format!("{missing}, but its stem landed in export/{folder}/"),
+        (n, Some(folder)) => format!("{missing}, but its {n} stems landed in export/{folder}/"),
+    }
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -10373,7 +10392,15 @@ impl DesktopApp {
             }
             Ok(_) => {}
             Err(e) => {
-                self.app.notify(Kind::Error, format!("export failed: {e}"));
+                // **A menu pass's stems are on disk by now**, so its failure
+                // says where (`take_copy_failed`). A dialog pass's stems are
+                // its delivery's to report, from the folder it chose.
+                let said = if delivery.is_none() {
+                    take_copy_failed(&name, &e, landed)
+                } else {
+                    format!("export failed: {e}")
+                };
+                self.app.notify(Kind::Error, said);
                 match delivery.as_mut() {
                     // The dialog's master is a COPY of the file that just
                     // failed to appear, so there is no master to deliver.
@@ -23733,6 +23760,53 @@ mod tests {
         assert!(
             arm.contains("stems_receipt(landed)"),
             "the pass's own receipt does not carry its stems"
+        );
+    }
+
+    /// **A menu pass whose take cannot be copied into `export/` says where
+    /// its stems landed.** They land before that copy is tried (`land_stems`,
+    /// in `tick_bounce`), so they are on disk; the failure said only "export
+    /// failed: ...", which sent somebody to export again for files they had.
+    /// It names the file that is missing and the stems that landed now; with
+    /// no stems it is the sentence it was, and a dialog pass leaves its
+    /// stems to its delivery's receipt. The words are driven; that the menu
+    /// road says them is a source scan, because `DesktopApp` cannot be built
+    /// in a test.
+    #[test]
+    fn a_menu_pass_whose_take_cannot_be_copied_says_where_its_stems_landed() {
+        let wet = std::path::Path::new("/p/song/export").join(tangent_ui::ports::stems_folder_name(false));
+        let full = std::io::Error::other("no space left");
+        let said = take_copy_failed("track.wav", &full, &[wet.join("01-Bass.wav"), wet.join("02-Keys.wav")]);
+        assert!(
+            said.contains("export/track.wav") && said.contains("no space left"),
+            "the failure does not say which file failed, or why: {said:?}"
+        );
+        assert!(
+            said.contains("2 stems landed in export/stems/"),
+            "the failure does not say the stems landed, or where: {said:?}"
+        );
+        assert!(
+            take_copy_failed("track 2.wav", &full, &[wet.join("01-Bass.wav")]).contains("stem landed in export/stems/"),
+            "one stem is not said to have landed"
+        );
+        assert_eq!(
+            take_copy_failed("track.wav", &full, &[]),
+            "export failed: no space left",
+            "a pass with no stems spoke of them"
+        );
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let arm = &body[body.find("Err(e) => {").expect("the copy's failure")..];
+        let arm = &arm[..arm.find("Some(spec) => spec.master = false").expect("the dialog's road")];
+        assert!(
+            arm.contains("take_copy_failed(&name, &e, landed)"),
+            "a menu pass whose copy failed still says only that the export failed"
+        );
+        assert!(
+            arm.contains("if delivery.is_none() {\n                    take_copy_failed("),
+            "a dialog pass's failure names the staging folder its delivery keeps quiet about"
         );
     }
 
