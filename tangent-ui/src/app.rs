@@ -8888,92 +8888,13 @@ impl TangentApp {
         }
     }
 
-    // ── Detach / attach (spec §5.7) ────────────────────────────────────────
-
-    fn detach_chord_window(&mut self) {
-        // Python seeded the detached height from the attached strip on every
-        // detach, which is what made the window a piano-wide sliver each time
-        // and quietly discarded whatever size the user had chosen. The window
-        // now reopens wherever and however they last left it.
-        self.settings.chord_window_detached = true;
-        self.detach_window_visible = true;
-        self.detached_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.detached_size_for_use(),
-            self.monitor_size,
-        );
-        self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
-        });
-        self.detached_live_size = None;
-        self.detached_live_pos = None;
-        self.detached_shown_at = Some(Instant::now());
-        self.detached_wm_managed = false;
-        self.save_settings();
-    }
-
-    // ── The popped-out neck (D-UI-16) ─────────────────────────────────────
-
-    fn detach_fretboard(&mut self) {
-        self.settings.fretboard_detached = true;
-        self.fret_window_visible = true;
-        self.fret_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.fretboard_win_size(),
-            self.monitor_size,
-        );
-        self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
-        });
-        self.fret_live_size = None;
-        self.fret_live_pos = None;
-        self.fret_shown_at = Some(Instant::now());
-        self.fret_wm_managed = false;
-        self.save_settings();
-    }
-
-    fn detach_theory(&mut self) {
-        self.settings.theory_detached = true;
-        self.theory_window_visible = true;
-        self.theory_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.theory_win_size(),
-            self.monitor_size,
-        );
-        self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.theory_builder_size, self.monitor_size)
-        });
-        // The guard is armed with the SAME size handed to the builder, and both
-        // must stay fixed for as long as the window lives: a guard measuring
-        // against a size that drifts cannot tell a tiling WM from a user.
-        self.theory_guard = Some(theory_panel::GeometryGuard::opened(
-            self.theory_builder_size,
-            Instant::now(),
-        ));
-        self.save_settings();
-    }
-
     // ── The Recorder popout ────────────────────────────────────────────────
     //
-    // Four fields and three methods, the same three the theory window has. The
+    // Four fields and two methods, the same two the theory window has. The
     // one difference worth noting is that this popout has a REASON beyond
     // taste: a second monitor holding a big framing view of the camera while
-    // the piano stays where it is.
-
-    fn detach_recorder(&mut self) {
-        self.settings.recorder_detached = true;
-        self.recorder_window_visible = true;
-        self.recorder_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.recorder_win_size(),
-            self.monitor_size,
-        );
-        self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
-            crate::settings::clamp_to_monitor(p, self.recorder_builder_size, self.monitor_size)
-        });
-        self.recorder_guard = Some(theory_panel::GeometryGuard::opened(
-            self.recorder_builder_size,
-            Instant::now(),
-        ));
-        self.save_settings();
-        self.request_natural_size();
-    }
+    // the piano stays where it is. Nothing pops it out any more; a window a
+    // saved settings file left out is still put back.
 
     fn reattach_recorder(&mut self) {
         if self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
@@ -34348,9 +34269,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
-        // Every caller is a single press (the setup panel's count-in chip,
-        // the metronome panel's COUNT row, and the menu's `SetCountIn` arm,
-        // which no menu row builds today), so one moment each.
+        // Every caller is a single press (the setup panel's count-in chip and
+        // the metronome panel's COUNT row), so one moment each.
         // `CountIn::bars` is hashed.
         self.undo_commit();
     }
@@ -35077,8 +34997,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Window resize follows from band_sizes() on the next pass.
                 self.request_natural_size();
             }
-            MenuAction::DetachChordWindow => self.detach_chord_window(),
-            MenuAction::AttachChordWindow => self.reattach_chord_window(),
             MenuAction::TeachChordName => self.open_teach_dialog(),
             MenuAction::ManageTaughtChords => self.open_manage_dialog(),
             MenuAction::CorrectChordName => self.open_correct_dialog(),
@@ -35154,52 +35072,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .set_staff_set(&staff::StaffSet::from_key(key));
                 self.save_settings();
             }
-            MenuAction::ToggleCustomClef(key) => {
-                if let Some(clef) = staff::Clef::from_key(key) {
-                    // Toggling from a PRESET starts the custom stack off from
-                    // what is on screen, so ticking "Alto" while the grand
-                    // staff is showing gives you treble, alto and bass — not
-                    // alto alone, which is what starting from nothing would do
-                    // and is never what anybody means.
-                    match self.settings.staff_set().with_clef_toggled(clef) {
-                        Some(set) => {
-                            self.settings.set_staff_set(&set);
-                            self.settings.custom_staff_set = Some(set.key());
-                        }
-                        // The last staff was just removed. A band with nothing
-                        // in it is not a view.
-                        None => {
-                            self.settings.staff_set = "grand".to_owned();
-                            self.settings.custom_staff_set = None;
-                        }
-                    }
-                    self.show_the_staff();
-                    self.save_settings();
-                    self.request_natural_size();
-                }
-            }
             MenuAction::SetStaffKey(k) => {
                 self.settings.staff_key = k.clamp(-staff::MAX_KEY, staff::MAX_KEY);
                 self.show_the_staff();
                 self.save_settings();
                 self.request_natural_size();
                 self.undo_commit();
-            }
-            MenuAction::ToggleNoteNames => {
-                self.settings.staff_note_names = !self.settings.staff_note_names;
-                // Like every other control that changes what the staff shows.
-                // Without this, `U` on a window with no sheet music in it
-                // silently flips a setting nothing is drawing.
-                self.show_the_staff();
-                self.save_settings();
-                self.request_natural_size();
-            }
-            // The take's settings that moved out of the band. Each one is the
-            // SAME action the band's own hit produced, so the two can never
-            // drift: one handler, two ways in.
-            MenuAction::ToggleKeyNoteNames => {
-                self.settings.show_piano_note_names = !self.settings.show_piano_note_names;
-                self.save_settings();
             }
             MenuAction::ToggleGuitarIntervals => {
                 self.settings.guitar_intervals = !self.settings.guitar_intervals;
@@ -35213,13 +35091,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.show_chord_strip = !self.settings.show_chord_strip;
                 self.save_settings();
             }
-            MenuAction::ChooseFolder => self.apply_recorder_hit(recorder_panel::Hit::ChooseFolder),
-            MenuAction::RevealFolder => self.apply_recorder_hit(recorder_panel::Hit::RevealFolder),
-            MenuAction::ToggleOpenWhenDone => {
-                self.apply_recorder_hit(recorder_panel::Hit::ToggleOpenWhenDone);
-            }
-            MenuAction::PickCamera => self.apply_recorder_hit(recorder_panel::Hit::PickCamera),
-            MenuAction::PickAudio => self.apply_recorder_hit(recorder_panel::Hit::PickAudio),
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
             }
@@ -35245,10 +35116,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.fretboard_wood = key.to_owned();
                 self.save_settings();
             }
-            MenuAction::DetachFretboard => self.detach_fretboard(),
-            MenuAction::AttachFretboard => self.reattach_fretboard(),
-            MenuAction::DetachTheory => self.detach_theory(),
-            MenuAction::AttachTheory => self.reattach_theory(),
             MenuAction::ToggleRecorder => {
                 // Refused while a take is running, and this is a safety rule
                 // rather than tidiness. Stop lives only in the band, so hiding
@@ -35273,28 +35140,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // there is nothing to send from here.
                 self.save_settings();
                 self.request_natural_size();
-            }
-            MenuAction::DetachRecorder => self.detach_recorder(),
-            MenuAction::AttachRecorder => self.reattach_recorder(),
-            MenuAction::ShowExportDialog => self.open_export_dialog(),
-            MenuAction::ShowAudioStatus => self.open_audio_setup(),
-            MenuAction::SetCountIn(bars) => self.set_count_in_bars(bars),
-            MenuAction::SetTimeSignature(sig) => self.set_time_signature(sig),
-            MenuAction::ToggleCountInInTake => {
-                self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
-                self.save_settings();
-            }
-            MenuAction::ToggleMetronome => {
-                self.settings.metronome_on = !self.settings.metronome_on;
-                self.save_settings();
-            }
-            MenuAction::ToggleMetronomeInTake => {
-                self.settings.metronome_in_take = !self.settings.metronome_in_take;
-                self.save_settings();
-            }
-            MenuAction::ToggleHideElapsed => {
-                self.settings.record_hide_elapsed = !self.settings.record_hide_elapsed;
-                self.save_settings();
             }
             MenuAction::EditCustomTuning => {
                 // Seeded from whatever tuning is LIVE, because almost every
@@ -63365,8 +63210,10 @@ mod tests {
     fn hiding_the_recorder_takes_its_window_with_it() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.show_recorder = true;
-        app.detach_recorder();
-        assert!(app.recorder_window_visible);
+        // The band out in its own window, as a saved settings file can leave
+        // it (nothing pops it out any more).
+        app.settings.recorder_detached = true;
+        app.recorder_window_visible = true;
 
         app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
         assert!(!app.settings.show_recorder);
