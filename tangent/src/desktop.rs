@@ -551,7 +551,9 @@ struct Recorder {
     /// `Manifest::head_seconds`. It was recomputed every frame from the
     /// settings, which is wrong whenever the press skipped or joined a count.
     take_head_s: f64,
-    /// The realtime pass's delivery instructions, applied at the finish.
+    /// The realtime pass's delivery instructions, applied at the finish:
+    /// set by `start_bounce` with the pass it belongs to, and taken by
+    /// `finish_bounce` whatever road the pass leaves by.
     pending_delivery: Option<tangent_ui::ports::ProjectExportSpec>,
 }
 
@@ -9914,13 +9916,22 @@ impl DesktopApp {
     /// carries the same pair off `ProjectExportSpec`, and one shape for the
     /// two paths is what stops them drifting.
     ///
+    /// `delivery` is the Export dialog's: where and in what shapes the pass's
+    /// files go at the finish. The menu rows pass none.
+    ///
     /// The pass does NOT store the mode: the folder it writes into and the
     /// folder `finish_bounce` delivers into are both named by
     /// `ports::stems_folder_name`, and the spec the finish reads is the same
     /// object this pair was taken from a line earlier. A third copy of the
     /// answer would be a third thing that can disagree. The delivery copies
     /// the stems the pass landed, handed to it, never the folder's listing.
-    fn start_bounce(&mut self, stems: bool, stems_dry: bool, span: Option<(f64, f64)>) {
+    fn start_bounce(
+        &mut self,
+        stems: bool,
+        stems_dry: bool,
+        span: Option<(f64, f64)>,
+        delivery: Option<tangent_ui::ports::ProjectExportSpec>,
+    ) {
         // **A standing message stands until somebody lowers it.** The request
         // raises `EXPORT_RUNNING` before it knows whether the pass can even
         // start, which is right — the user pressed Export and deserves to see
@@ -10068,6 +10079,11 @@ impl DesktopApp {
                 arm_stem_tap(e, true, stems_dry);
             }
         }
+        // **The delivery is the pass's, set with it and never before**: set
+        // ahead of the refusals above, a refused Export dialog pass left it
+        // standing for the next menu export to deliver into its folder, and
+        // replaced the delivery of a pass already running.
+        self.recorder.pending_delivery = delivery;
         self.recorder.bounce = Some(Bounce {
             // Two seconds of tail: the reverbs' ring-out is part of the
             // track.
@@ -10185,6 +10201,10 @@ impl DesktopApp {
     /// The pass is done: the take's WAV becomes `export/track.wav` (counted
     /// up past what exists), and the band's status line says where.
     fn finish_bounce(&mut self, folder: &str, problem: Option<String>, landed: &[std::path::PathBuf]) {
+        // **The pass's delivery goes with it, whatever road it leaves by.**
+        // Taken before the first return: a failed pass left it standing, and
+        // the next menu export delivered into this dialog's folder.
+        let mut delivery = self.recorder.pending_delivery.take();
         // The reveal-when-done watcher must not open a Finder window for a
         // bounce — the export note says where the real file went.
         self.recorder.seen_take = Some(folder.to_owned());
@@ -10255,7 +10275,6 @@ impl DesktopApp {
         // named off the stems themselves: a chore of its own used to add
         // "... stems in export/stems/" after every pass, a dialog's included,
         // and in `stems/` for dry stems too.
-        let mut delivery = self.recorder.pending_delivery.take();
         match std::fs::copy(&wav, export_dir.join(&name)) {
             Ok(_) if delivery.is_none() => {
                 self.app.notify_lower(EXPORT_RUNNING);
@@ -11478,19 +11497,18 @@ impl DesktopApp {
                     // The realtime pass: the live engine, the live rate. The
                     // spec's shaping (name, dir, formats, mono) is applied
                     // when the pass lands — see `finish_bounce`.
-                    self.recorder.pending_delivery = Some(spec.clone());
-                    self.start_bounce(spec.stems, spec.stems_dry, spec.span);
+                    self.start_bounce(spec.stems, spec.stems_dry, spec.span, Some(spec.clone()));
                 } else {
                     self.start_offline_bounce(spec);
                 }
             }
             tangent_ui::ports::ProjectRequest::ExportTrack => {
-                self.start_bounce(false, false, None);
+                self.start_bounce(false, false, None, None);
             }
             // Processed, like the dialog's own default: the files sum to the
             // record, which is what a bare "export stems" row means.
             tangent_ui::ports::ProjectRequest::ExportStems => {
-                self.start_bounce(true, false, None);
+                self.start_bounce(true, false, None, None);
             }
             tangent_ui::ports::ProjectRequest::Freeze(lane) => {
                 self.start_freeze(lane);
@@ -23546,6 +23564,46 @@ mod tests {
         assert!(
             arm.contains("stems_receipt(landed)"),
             "the pass's own receipt does not carry its stems"
+        );
+    }
+
+    /// **An export's delivery never outlives its pass.** The Export arm set
+    /// `pending_delivery` before `start_bounce` could refuse (a pass or a
+    /// recording already running, no audio engine, an empty timeline), and
+    /// `finish_bounce` returned on a failed pass before taking it: either
+    /// way the delivery stood after its pass, and the next Export Track or
+    /// Export Stems from the menu delivered into that dialog's folder under
+    /// its name. A dialog export refused behind a running pass also put its
+    /// own delivery in place of that pass's. The delivery is handed to
+    /// `start_bounce` now, set only past its last refusal, and taken at the
+    /// top of the finish. A source scan, because `DesktopApp` cannot be
+    /// built in a test.
+    #[test]
+    fn an_exports_delivery_never_outlives_its_pass() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        assert_eq!(
+            src.matches("self.recorder.pending_delivery = ").count(),
+            1,
+            "something other than a starting pass sets the delivery"
+        );
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let set = start
+            .find("self.recorder.pending_delivery = delivery;")
+            .expect("the pass does not take its delivery as it starts");
+        assert!(
+            !start[set..].contains("refuse!()"),
+            "the pass can refuse after it has taken its delivery"
+        );
+        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let finish = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let taken = finish
+            .find("self.recorder.pending_delivery.take()")
+            .expect("the finish never takes the delivery");
+        assert!(
+            !finish[..taken].contains("return;"),
+            "a pass can end before its delivery is taken"
         );
     }
 
