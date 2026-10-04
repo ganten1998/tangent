@@ -12196,7 +12196,8 @@ impl TangentApp {
     /// **The automation rows the session holds, carried to the lanes they
     /// now name.** Which rows are open, armed or bypassed, and the paste's
     /// two aims, are `(lane, param)` pairs kept beside the document rather
-    /// than in it, so nothing else moves them. A reorder calls this, and so
+    /// than in it, so nothing else moves them; so are each lane's mode,
+    /// latch and last written point. A reorder calls this, and so
     /// does an undo or redo that crosses one: the words put each curve back
     /// on its old lane, and a bypass left where the reorder had taken it
     /// let that curve play and silenced whichever curve took its row.
@@ -12220,6 +12221,13 @@ impl TangentApp {
         self.arr_auto_bypassed = remap(&self.arr_auto_bypassed);
         self.arr_auto_focus = self.arr_auto_focus.map(|(l, p)| (to(l), p));
         self.auto_clipboard_from = self.auto_clipboard_from.map(|(l, p)| (to(l), p));
+        self.arr_auto_modes = self.arr_auto_modes.iter().map(|(&l, &m)| (to(l), m)).collect();
+        self.arr_auto_latched = self.arr_auto_latched.iter().map(|&l| to(l)).collect();
+        self.arr_auto_last = self
+            .arr_auto_last
+            .iter()
+            .map(|(&(l, p), &v)| ((to(l), p), v))
+            .collect();
     }
 
     /// **Close the automation rows `named` picks, open, armed and bypassed,
@@ -72318,6 +72326,37 @@ mod folder_tests {
             a.engine_automation().get(1, AutoParam::Gain).is_none(),
             "the bypassed curve plays after the redo"
         );
+    }
+
+    /// **A lane's automation mode and latch follow its track through a
+    /// reorder, and back through its undo.** Both are keyed by lane beside
+    /// the words, like the rows, and nothing carried them: a track moved up
+    /// left its Latch on the row it came from, for whichever track took
+    /// that row. Latent while no control sets a mode, but the mode machinery
+    /// is wired and its own tests set them.
+    #[test]
+    fn a_lanes_automation_mode_follows_its_track() {
+        use crate::automation::AutoMode;
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        a.arr_auto_modes.insert(3, AutoMode::Latch);
+        a.arr_auto_latched.insert(3);
+        // Move 3 up to 1: order[new] = old.
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+        assert_eq!(a.arr_auto_mode(1), AutoMode::Latch, "the mode stayed on the row the track left");
+        assert_eq!(a.arr_auto_mode(3), AutoMode::Read, "the track that took row 3 took its Latch");
+        assert!(
+            a.arr_auto_latched.contains(&1) && !a.arr_auto_latched.contains(&3),
+            "the latch stayed on the row the track left"
+        );
+        a.undo();
+        assert_eq!(a.arr_auto_mode(3), AutoMode::Latch, "the undo left the mode on the row it had moved to");
+        assert!(a.arr_auto_latched.contains(&3), "the undo left the latch on the row it had moved to");
     }
 
     /// **A removed track takes its automation with it.** The curves are
