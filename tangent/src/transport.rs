@@ -129,32 +129,69 @@ impl Transport {
     /// without making them one fact: `run_transport` loads the generation
     /// before the level, so a callback can still read the old generation with
     /// the level already up and roll one block from the old position. On the
-    /// way down the return-to-cursor locate is stored BEFORE the level falls,
-    /// so a callback landing between the two stores - or reading the Relaxed
-    /// level stale after Acquiring the new generation - rolls one block at
-    /// the cursor. Publishing `set_rolling(false)` first closes the falling
-    /// half.
+    /// way down the level falls BEFORE the return-to-cursor locate (see
+    /// `stores`): a callback between the two stores is a stopped one at the
+    /// old position, and `set_transport`'s Release carries the fall, so a
+    /// callback that Acquires the new generation cannot read the level up.
+    /// The locate used to go first, and a callback landing between the two
+    /// stores - or reading the Relaxed level stale - rolled one block at the
+    /// cursor and left the playhead there.
     ///
     /// No session in the signature any more: see `playing` for why a take has
     /// no say in whether the transport rolls.
     pub fn push(&mut self, engine: Option<&Engine>) {
-        let rolling = self.playing;
         let Some(e) = engine else {
             return;
         };
         let rate = f64::from(e.output().sample_rate).max(1.0);
+        let acked = e.transport_acked(self.generation);
+        for store in self.stores(acked, e.transport_position(), rate).into_iter().flatten() {
+            match store {
+                Store::Locate { generation, frames } => e.set_transport(generation, frames),
+                Store::Rolling(rolling) => e.set_rolling(rolling),
+            }
+        }
+    }
+
+    /// **What `push` stores, in the order it stores them**, for an engine
+    /// that has (`acked`) or has not applied this generation and whose clock
+    /// stands at `engine_frames`. A callback can land between any two, so
+    /// the order is the contract, and a list is what lets a test put a
+    /// callback between them.
+    fn stores(&mut self, acked: bool, engine_frames: u64, rate: f64) -> [Option<Store>; 2] {
+        let rolling = self.playing;
         // While rolling and acked, the engine's clock is the truth — carried
         // back into seconds continuously, so an engine that dies mid-roll is
         // survived by the position it had reached, not by where it started.
-        if rolling && e.transport_acked(self.generation) {
-            self.pos_s = e.transport_position() as f64 / rate;
+        if rolling && acked {
+            self.pos_s = engine_frames as f64 / rate;
         }
-        if !e.transport_acked(self.generation) {
-            let frames = (self.pos_s.max(0.0) * rate) as u64;
-            e.set_transport(self.generation, frames);
+        let locate = (!acked).then(|| Store::Locate {
+            generation: self.generation,
+            frames: (self.pos_s.max(0.0) * rate) as u64,
+        });
+        // **On the way down the level falls FIRST.** A callback between the
+        // two stores is then a stopped one at the old position, and the
+        // locate's Release carries the fall with it, so a callback that
+        // Acquires the new generation reads the level down. The return to
+        // the cursor went first, and a callback between the two rolled a
+        // block from the cursor. On the way up the locate still goes first:
+        // see `push`.
+        if rolling {
+            [locate, Some(Store::Rolling(true))]
+        } else {
+            [Some(Store::Rolling(false)), locate]
         }
-        e.set_rolling(rolling);
     }
+}
+
+/// **One store `push` makes**: see [`Transport::stores`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Store {
+    /// `Engine::set_transport`: the locate, stamped with its generation.
+    Locate { generation: u64, frames: u64 },
+    /// `Engine::set_rolling`: the level.
+    Rolling(bool),
 }
 
 impl Default for Transport {
@@ -166,6 +203,45 @@ impl Default for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Stop lets the level fall BEFORE it returns to the cursor**, so a
+    /// callback landing between the two stores is a stopped one. The locate
+    /// went first, and a callback between them applied the return to the
+    /// cursor and rolled one block from there: a block of the song heard
+    /// after Stop, and the playhead left a block past the cursor, so the next
+    /// Play started late. Driven store by store through `stores`, which is
+    /// `push`'s own order, with a callback after each, on an offline engine.
+    #[test]
+    fn stop_lets_the_level_fall_before_it_returns_to_the_cursor() {
+        let rate = 48_000u32;
+        let mut e = Engine::offline(rate, tangent_record::audio::Timebase::new())
+            .expect("an offline engine needs no device");
+        // Play from the cursor at one second, and roll a while.
+        let mut t = Transport::new();
+        t.locate(1.0);
+        t.toggle_play();
+        let mut out = vec![0.0f32; 2 * 256];
+        for _ in 0..20 {
+            t.push(Some(&e));
+            e.render_offline(&mut out);
+        }
+        assert!(e.transport_position() > 48_000 + 256, "the song never rolled from the cursor");
+        // Stop, one store at a time, a callback after each.
+        t.stop();
+        let acked = e.transport_acked(t.generation);
+        for store in t.stores(acked, e.transport_position(), f64::from(rate)).into_iter().flatten() {
+            match store {
+                Store::Locate { generation, frames } => e.set_transport(generation, frames),
+                Store::Rolling(rolling) => e.set_rolling(rolling),
+            }
+            e.render_offline(&mut out);
+        }
+        assert_eq!(
+            e.transport_position(),
+            48_000,
+            "a callback between Stop's two stores rolled a block from the cursor"
+        );
+    }
 
     /// **Play pauses in place; only stop goes home.** The second press of
     /// play used to locate to 0:00, which made it a second stop button — a
