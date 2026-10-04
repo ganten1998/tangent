@@ -18,7 +18,9 @@ a third flag (`strip_folder_shut`). Consequences, all deliberate:
   chose its stems by the folders at its press (a folder that collects
   children writes a stem of its bus): grouping moves a lane
   (`lane_order_held`), and the other two would move children onto another
-  bus mid-render (`folders_held`); each says why.
+  bus mid-render (`folders_held`); each says why. Removing a folder track,
+  which hands its children up, is refused there too, as every Remove Track
+  is under an export or an arrangement record (`tracks_held`).
 - **No input selector, no record arm, no theory note.** A folder cannot
   record and cannot carry its own MIDI. In the arrangement the second
   rack takes the input selector's band (three bays on three); in the
