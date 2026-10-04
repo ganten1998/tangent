@@ -614,11 +614,11 @@ pub struct TangentApp {
     /// Distinct from `arr_auto_sel`, which chooses a whole ROW: one of them
     /// answers Delete by closing the lane and the other by removing points,
     /// and a single field could not mean both. Choosing a row clears this
-    /// (`arr_select_auto_row`), and only the two presses on a node
-    /// (`arr_select_auto_node`, and `arr_toggle_auto_node` with Shift) clear
-    /// the row and the clip selection. Not yet the other roads that fill
-    /// this: the box, the shift-click that adds a node and a paste leave the
-    /// row and the clips chosen, so a Delete or a copy can find two subjects.
+    /// (`arr_select_auto_row`), and every road that fills this clears the
+    /// row and the clip selection: the presses on a node, the box, the
+    /// shift-click that adds a node and a paste (`arr_choose_auto_nodes`,
+    /// and `arr_toggle_auto_node` with Shift). A Delete or a copy has one
+    /// subject.
     ///
     /// Indices, not identities — a `Curve`'s points have no ids. Anything
     /// that reorders a curve therefore has to REMAP or clear this: a drag
@@ -14866,7 +14866,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// One node, alone.
     fn arr_select_auto_node(&mut self, lane: usize, slot: usize, index: usize) {
-        self.arr_auto_nodes = vec![(lane, slot, index)];
+        self.arr_choose_auto_nodes(vec![(lane, slot, index)]);
+    }
+
+    /// **These nodes are the choice now**, and nothing else is chosen: the
+    /// row and the clips let go, so Delete and Copy have one subject. Every
+    /// road that fills the choice comes through here - a press on a node,
+    /// the box, the shift-click that adds one, a paste. Only the presses
+    /// used to clear the others, and a box or a paste beside a chosen clip
+    /// on a frozen track had Delete refuse the nodes for the clip's sake.
+    fn arr_choose_auto_nodes(&mut self, nodes: Vec<(usize, usize, usize)>) {
+        self.arr_auto_nodes = nodes;
         self.arr_auto_sel = None;
         self.arr_selected = None;
         self.arr_multi.clear();
@@ -15076,7 +15086,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let slot = self.arr_auto_slot(lane, param).unwrap_or(0);
         let landed = self.arr_auto_find(lane, param, &pasted);
-        self.arr_auto_nodes = landed.into_iter().map(|i| (lane, slot, i)).collect();
+        self.arr_choose_auto_nodes(landed.into_iter().map(|i| (lane, slot, i)).collect());
         self.arr_auto_hot = None;
         self.arr_save_edits();
         true
@@ -18684,9 +18694,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn arr_copy(&mut self) {
         // **Chosen NODES are the most specific thing on this timeline**, so
-        // they answer first — ahead of clips and ahead of the track. (Not
-        // yet the only thing chosen: a box, a shift-click add or a paste
-        // leaves a clip selection standing beside them.)
+        // they answer first — ahead of clips and ahead of the track. They
+        // are also the only thing chosen: every road to them lets the clips
+        // go (`arr_choose_auto_nodes`).
         if self.arr_copy_auto_nodes() {
             return;
         }
@@ -18802,27 +18812,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn arr_delete_selected(&mut self) {
-        // **A frozen lane's clips stay** - they are what the frozen file was
-        // rendered from, and thawing has to find them. The nodes and rows
-        // below are untouched by this: only clips are frozen.
-        if let Some(lane) = self.arr_selected_frozen_lane() {
-            self.frozen_refuses(lane);
-            return;
-        }
         // **Chosen nodes first, then a chosen row, then the clips.** Nodes
         // before the row, because Delete closing a lane somebody meant to
-        // thin out would take the work with it. The subjects are not yet
-        // exclusive: choosing a row lets the nodes and clips go
-        // (`arr_select_auto_row`) and pressing a node lets the row and clips
-        // go, but the box, a shift-click add and a paste leave the clips
-        // chosen, and a chosen clip on a frozen lane then refuses this Delete
-        // before the nodes are reached.
+        // thin out would take the work with it. The subjects are exclusive -
+        // choosing a row lets the nodes and clips go (`arr_select_auto_row`)
+        // and every road to chosen nodes lets the row and clips go
+        // (`arr_choose_auto_nodes`) - and the order still decides if a
+        // stray pair ever stands together.
         if !self.arr_auto_nodes.is_empty() {
             self.arr_delete_auto_nodes();
             return;
         }
         if let Some((lane, slot)) = self.arr_auto_sel.take() {
             self.arr_close_auto_row(lane, slot);
+            return;
+        }
+        // **A frozen lane's clips stay** - they are what the frozen file was
+        // rendered from, and thawing has to find them. Below the nodes and
+        // the row, which are not frozen: a frozen clip chosen beside them
+        // refused their Delete.
+        if let Some(lane) = self.arr_selected_frozen_lane() {
+            self.frozen_refuses(lane);
             return;
         }
         let mut doomed = std::mem::take(&mut self.arr_multi);
@@ -25901,7 +25911,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         } else if let Some(i) = self.arr_put_auto_point(n, param, t, v) {
                             // The new node comes CHOSEN, so the Delete or the
                             // copy that follows acts on what was just made.
-                            self.arr_auto_nodes = vec![(n, row, i)];
+                            self.arr_choose_auto_nodes(vec![(n, row, i)]);
                             self.arr_auto_hot = Some((n, i));
                             self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                             self.arr_auto_drag_from = self.arr_auto_anchor(n, param, i).map(|mut a| {
@@ -26405,7 +26415,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             moved,
                         });
                         if moved {
-                            self.arr_auto_nodes = self.arr_auto_boxed(lane, slot, from, (t, v));
+                            let boxed = self.arr_auto_boxed(lane, slot, from, (t, v));
+                            self.arr_choose_auto_nodes(boxed);
                         }
                     }
                 }
@@ -60669,6 +60680,59 @@ mod tests {
         app.arr_delete_selected();
         assert_eq!(auto_nodes(&app).len(), 4, "the menu's Delete took a node");
         assert_eq!(app.arrangement.clips.len(), clips - 1, "the take was not deleted");
+    }
+
+    /// **However nodes come to be chosen, the clips and the row let go.**
+    ///
+    /// One subject for Delete and Copy is the field's rule, and only the
+    /// two presses on a node kept it. A box, a shift-click that adds a node
+    /// and a paste left the clips (and a row chosen by its name) standing
+    /// beside the nodes, and a chosen clip on a FROZEN track then refused
+    /// the Delete before it ever reached them.
+    #[test]
+    fn choosing_nodes_by_box_add_or_paste_lets_the_clips_and_the_row_go() {
+        let (ctx, mut app) = auto_bench("autoboxclip");
+        let id = app.arrangement.add_clip(bench_item(1, 1.0));
+        let from = auto_at(&app, 1.0, 0.95);
+        let via = [auto_at(&app, 3.0, 0.5), auto_at(&app, 5.0, 0.05)];
+        let (room, more_room) = (auto_at(&app, 7.0, 0.4), auto_at(&app, 8.0, 0.4));
+        // The box, over a chosen clip and then over a chosen row. (A frame
+        // with clips chosen lets a chosen row go on its own - see
+        // `arr_sync_tracks_to_clips` - so the two are tried apart.)
+        app.arr_selected = Some(id);
+        drag_through(&ctx, &mut app, from, &via);
+        assert_eq!(app.arr_auto_nodes.len(), 2, "fixture: the box chose {:?}", app.arr_auto_nodes);
+        assert!(app.arr_selected.is_none(), "the box left the clip chosen beside its nodes");
+        app.arr_auto_sel = Some((0, 0));
+        drag_through(&ctx, &mut app, from, &via);
+        assert!(app.arr_auto_sel.is_none(), "the box left the row chosen beside its nodes");
+        // A node added with Shift, the same two ways.
+        app.arr_multi = vec![id];
+        click_with(&ctx, &mut app, room, egui::Modifiers::SHIFT);
+        assert_eq!(app.arr_auto_nodes.len(), 1, "fixture: the shift-click chose {:?}", app.arr_auto_nodes);
+        assert!(app.arr_multi.is_empty(), "the added node left the clips chosen beside it");
+        app.arr_auto_sel = Some((0, 0));
+        click_with(&ctx, &mut app, more_room, egui::Modifiers::SHIFT);
+        assert!(app.arr_auto_sel.is_none(), "the added node left the row chosen beside it");
+        // A paste, over both at once: no frame runs in between.
+        assert!(app.arr_copy_auto_nodes());
+        app.arr_selected = Some(id);
+        app.arr_auto_sel = Some((0, 0));
+        app.recorder.position_s = 9.0;
+        assert!(app.arr_paste_auto_nodes());
+        assert_eq!(app.arr_auto_nodes.len(), 1, "fixture: the paste chose {:?}", app.arr_auto_nodes);
+        assert_eq!(
+            (app.arr_selected, app.arr_auto_sel),
+            (None, None),
+            "the pasted nodes came back beside another subject"
+        );
+        // And a frozen track's clip chosen as well does not stand between
+        // Delete and the nodes.
+        let nodes = auto_nodes(&app).len();
+        app.note_frozen(1, "media/frozen-02-1.wav".into(), 2.0);
+        app.arr_selected = Some(id);
+        app.arr_delete_selected();
+        assert_eq!(auto_nodes(&app).len(), nodes - 1, "a frozen clip refused the nodes' Delete");
     }
 
     /// **A node added on a step's instant is the node that comes chosen.**
