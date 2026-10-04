@@ -67,7 +67,7 @@ chord engine reads what you are holding: plain triads, sevenths, extensions,
 altered dominants, sus and add chords, slash chords, rootless jazz voicings,
 and 28 scales and modes. 95 chord patterns against all 12 roots.
 
-It shows the same notes three more ways.
+It shows the same notes two more ways.
 
 On a guitar neck, where a player would actually put their fingers. One MIDI
 note can be six places on a guitar, so Tangent picks the shape a hand would
@@ -80,9 +80,6 @@ As geometry, on the circle of fifths, on a Tonnetz, and as the I, IV and V
 triangles. Every key shaded by how much of your chord belongs to it, so keys
 that are close light up together.
 
-And inside your DAW. Tangent 3.0 ships a VST3 plugin with the same display,
-reading the notes on the track it is on.
-
 Teach it your own names. If you call something a Hendrix chord, right-click,
 type it, and that is what it says from then on, in every key if you want.
 
@@ -92,7 +89,7 @@ supporter key, which turns on a small pixel heart and nothing else, and my
 thanks.
 
 macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64.
-Signed and notarized on macOS. Installers include the app, the plugin, or both.
+Signed and notarized on macOS.
 
 ---
 
@@ -119,11 +116,12 @@ and before pasting.
 
 ## The 3.0.0 swap — done
 
-The block below hands out the **installers** rather than the archives, because
-each one offers the app and the plugin as separate choices and puts the plugin
-where the DAW already looks. Those assets first existed at 3.0.0, published
-2026-08-14; `tools/tangent-fulfil/src/main.rs` was swapped at the same moment and
-must be redeployed for a NEW buyer to get them.
+The block below hands out the **installers** rather than the archives. At 3.0.0
+that was because each one offered the app and the plugin as separate choices and
+put the plugin where the DAW already looks; the plugin was retired at 4.77.0,
+and the installers carry the app alone now. Those assets first existed at
+3.0.0, published 2026-08-14; `tools/tangent-fulfil/src/main.rs` was swapped at
+the same moment and must be redeployed for a NEW buyer to get them.
 
 The order that keeps this honest, and the one that was got wrong twice:
 **publish, check, paste, deploy.** Never edit the links in anticipation.
@@ -156,9 +154,6 @@ DOWNLOAD TANGENT
 
 These links always give you the current version, so they are worth keeping.
 
-Each installer offers the app and the VST3 plugin as separate choices, so you
-can take either or both. The plugin goes where your DAW already looks.
-
 macOS 11 or later, Apple Silicon or Intel
 https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
 
@@ -188,19 +183,19 @@ The key has no expiry, contacts no server, and works on every machine you own.
 
 FIRST LAUNCH
 
-macOS: open the .pkg and follow it. It asks which pieces you want, the app and
-the plugin, and installs the plugin where your DAW already looks. It is signed
-with a Developer ID certificate and notarized by Apple, so there is no security
-prompt. If you took the .dmg instead, drag Tangent into your Applications
-folder.
+macOS: open the .pkg and follow it. It is signed with a Developer ID
+certificate and notarized by Apple, so there is no security prompt. If you took
+the .dmg instead, drag Tangent into your Applications folder.
 
-Windows: run the setup.exe and follow it, same two choices. The installer is not
-code-signed, so SmartScreen shows "Windows protected your PC" the first time.
-Click "More info", then "Run anyway". Windows remembers the choice. If you took
-the .zip instead, unzip it anywhere and run tangent.exe.
+Windows: run the setup.exe and follow it. Every release after 5.0.0 is
+code-signed under the author's name (5.0.0 itself is not), but SmartScreen goes
+on reputation, which a new signature has to earn, so it may still show "Windows
+protected your PC" the first time. Click "More info", then "Run anyway". Windows
+remembers the choice. If you took the .zip instead, unzip it anywhere and run
+tangent.exe.
 
 Linux: extract the archive and run ./install.sh, which needs no root and takes
---app, --vst3 and --uninstall. Or just chmod +x tangent and ./tangent. MIDI goes
+--app and --uninstall. Or just chmod +x tangent and ./tangent. MIDI goes
 through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or
 newer.
 
@@ -209,9 +204,6 @@ built from FFmpeg and used for audio export. FFmpeg is licensed under the GPL.
 Its licence text ships next to it, and the complete source code for those
 exact builds is available from the project's releases page:
 https://github.com/ganten1998/tangent/releases
-
-The plugin reads the notes on the track it is on and makes no sound of its own,
-so put it on a MIDI or instrument track rather than in an effect slot.
 
 Plug your MIDI keyboard in before you start Tangent. Everything in the app
 lives in the right-click menu, and holding H shows every keyboard shortcut.
