@@ -232,6 +232,218 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   system clears the OUTPUT row, where a press could save a device the new
   system cannot open; its outputs are listed the next time Setup opens.
 
+- **Each project's exports land in a folder of their own.** With the
+  Export dialog's folder left empty, every project exported into one
+  Exports/project folder, so a mix exported from one project replaced
+  another project's file of the same name. Exports now go to a folder
+  named for the project, and the dialog's DIRECTORY row shows it before
+  you export. Earlier exports stay in Exports/project.
+
+- **Save As Template no longer saves the project you are in.** Saving a
+  template from a saved project first saved that project, so an unsaved
+  experiment was written into it and could no longer be discarded. The
+  template is written from the session as it stands, with the project's
+  media copied in as before, and the project is left as it was last saved.
+
+- **A take whose audio output fails halfway through says so, and when.**
+  The rest of the file was silence, or the file simply stopped, and the
+  take was filed as ordinary. A realtime export whose output fails now
+  ends with an error instead of hanging on "Exporting..." until Stop, and
+  a failed export no longer leaves broken stems in the stems folder: it
+  removes what it wrote and leaves the folder as it was.
+
+- **Closing the band or losing the audio output during a count-in no longer
+  leaves the tempo and undo locked.** Undo, redo and every tempo control
+  stayed refused, with nothing saying why, until the band was reopened.
+  The count now ends with the engine it was counting on.
+
+- **Tracks can no longer be inserted, pasted below, grouped or dragged out
+  of a folder during an export or an arrangement recording.** These moved
+  track rows under a running export or recording, so stems and recorded
+  clips landed on the wrong tracks. They are refused now with a note
+  saying why, as dragging tracks already was.
+
+- **The count-in holds together.** A take started during a count-in the
+  red button had joined began at once, mid-count, with no head in its
+  take.json; it begins on the downbeat. Stop and the red button silenced
+  a count-in that a take was recording into its file; they no longer do.
+  Pause takes back a Play pressed during a count-in, and the Play button
+  lights while it waits for the downbeat. A tempo typed into the Export
+  dialog no longer changes the tempo during a count-in.
+
+- **take.json says where a take really began.** For a take whose song
+  starts on its count-in's downbeat, `timeline_rolling` came out true or
+  false by chance. A realtime export's take.json carried the previous
+  take's count-in head and the playhead from before the export moved to
+  its start, and a take with its count-in recorded into it, started with
+  no audio engine, claimed a head for a count that never sounded.
+
+- **Pressing the cassette just as a realtime export finishes no longer
+  turns the new take into the export.** That take was filed as the
+  export's file and the real export was left in Takes.
+
+- **Flipping a track's polarity during a take is heard and recorded at
+  once.** The switch lit during a take or its count-in but changed nothing
+  until the take ended, when the flip landed in the middle of playback.
+
+- **An armed input stays out of the speakers when monitoring is off,
+  wherever it goes.** Routed to a bus, it was removed as if it went
+  straight to the master, so with the bus turned down it played at minus
+  the difference, and with the bus muted at full level, inverted; on a
+  track inside a folder it was heard through the folder's send to the
+  effects bus. A plugin on the bus it is routed to is still not fully
+  removed (the speakers hear what that plugin changes), as with a plugin
+  on a folder.
+
+- **A bus's fader and mute affect what is routed into it while the song is
+  stopped.** With the transport parked, or in a session with no audio
+  clips, muting a bus or pulling its fader changed nothing routed into it.
+
+- **The Analog's arpeggiator keeps its step at the end of a loop that has a
+  tempo change in it.** Just before each wrap it was given a beat measured
+  back from the start of the loop, so it fired a stray step or dropped
+  one, and an arp on a track being monitored live ran a buffer early.
+
+- **Stopping no longer, now and then, plays a moment from the start point
+  and leaves the playhead a little past it.**
+
+- **A new Denoise bay on the Bank kernel cuts as soon as it finishes
+  learning.** It faded its reduction in over about a quarter of a second,
+  while the spectral kernels applied theirs at once.
+
+- **A drag always ends when you let go.** A clip dragged onto the open MIDI
+  editor and let go there never finished, and the next press on a track's
+  switch or a toolbar button could jump the clip to the pointer; a mixer
+  fader went on following the pointer after a dialog that appeared
+  mid-drag had closed. Every drag now ends at its release, as one undo
+  step, even when a dialog hid the release.
+
+- **Undoing a reset no longer takes the window out of full screen.**
+  Undoing any reset asked the window for a size, which left full screen
+  or unmaximised it. Only undoing a reset that resizes the window (Reset
+  Everything, or Reset Layout and Windows) puts its size back now.
+
+- **Pressing the MIDI editor's loop bar without moving it no longer snaps a
+  recorded loop to the grid.**
+
+- **The quantize window keeps what you were trying.** Pressing Q with the
+  window open put every dial back to the last applied settings, so the
+  next Apply used the old ones; it now only re-aims the window. Q on a
+  track with no audio quantized a take still selected on another track;
+  that take is let go now. The window's top line follows a selection made
+  in the MIDI editor, where it went on saying "all 47 notes" while Apply
+  quantized the ones picked.
+
+- **Applying a quantize no longer covers the screen.** Every Apply put up a
+  "Quantizing" cover for at least 0.4 seconds and ignored clicks
+  meanwhile. With the window open its detections are already made, so
+  Apply acts at once; a take it still has to analyse keeps the cover.
+
+- **The quantize window no longer shows a move it will not make**: with one
+  attack left in a clip, the ticks showed it moving while Apply kept the
+  old quantize. And it lets the app rest when a selected take's file is
+  missing, instead of redrawing every tick on every frame.
+
+- **Normalize measures what a clip plays.** A looped, stretched or quantized
+  clip was measured over parts of its file it never plays, so a take could
+  come up by almost nothing, or past the -1 dBFS normalize aims for.
+
+- **One key press with a pedal window open over an amp acts once.** In the
+  plugin, or with child windows off, T skipped a theme and Space sent the
+  transport two commands.
+
+- **The export and glue no longer stretch a clip past the length playback
+  allows.** A clip whose stretch would make it longer than 20 minutes
+  plays unstretched; an export, glue or normalize made soon after opening
+  could still render it, a huge allocation. They play it unstretched too
+  now.
+
+- **A stretched take keeps its length on screen while its quantize
+  renders.** After opening, a quantize Apply or an undo, a stretched and
+  quantized take was briefly drawn at its unstretched length.
+
+- **Glue says no where it cannot glue.** MIDI glue welded clips on a frozen
+  track, which plays its render and keeps its clips for the thaw; it now
+  refuses, as audio glue does. Cmd/Ctrl+G on audio clips in a build with
+  no audio engine did nothing; it says why.
+
+- **File names made from clip and export names are safe on Windows.** A
+  trailing dot could survive, a name of dots became a hidden file, and a
+  name like "con" made a file Windows treats as a device. And a glued file
+  can no longer take the name of a missing clip's file in another case,
+  which made that clip play the glued audio.
+
+- **A plugin's automation stays with that plugin.** Replacing a plugin left
+  its automation driving whichever of the new plugin's knobs shared its
+  parameter numbers. Replacing now removes it (Undo brings both back),
+  moving or swapping plugins on the mixer takes each one's automation
+  along, and automation kept after removing a plugin waits for that same
+  plugin to return.
+
+- **A quick tap on an automation row's empty room moves the playhead
+  there.** A trackpad tap, whose press and release arrive together, did
+  nothing.
+
+- **Choosing automation nodes lets go of the selected clips and row, and
+  chooses only nodes you can see.** Nodes chosen with the box, by
+  Shift-clicking in a new node or by pasting left a clip selection
+  standing beside them, and a clip on a frozen track then stopped Delete
+  from removing the nodes. The box, dragged out over the track headers,
+  also chose every node back to the start of the song, out of view.
+
+- **An automation row's dial changes the level it shows.** When a curve
+  opened on a step, turning or double-clicking the dial changed the level
+  after the step instead.
+
+- **The first node of an automation lane stays at the start of the song
+  when dragged**, where a slightly sideways drag with the magnet off moved
+  it off the start and it could then be deleted. Only the node you hold is
+  drawn larger, and only while you hold it. Cmd/Ctrl+A on an empty track
+  slot no longer opens the automation menu, where a row ticked drew a
+  curve the next track made there inherited.
+
+- **Reset Layout and Windows resizes the window to its opening size at
+  once**, as Reset Everything does, and undoing it puts the size back. Its
+  confirmation no longer promises the window's position, which it never
+  moved.
+
+- **A count-in set in the metronome panel steps on at the COUNT-IN chip.**
+  A 3-bar count-in (or 5 to 8 bars) set there went to off at one press of
+  the chip; it now steps to the next length up, and goes round to off only
+  past 4 bars.
+
+- **The settings panels are modal to the keyboard and the right button
+  too.** With one open, a right-click opened an effect panel or the band
+  menu on top of it, and in reader mode the band's controls still answered
+  Tab and Enter underneath. A RECORDING panel left open when a realtime
+  export started stays drawn now, instead of turning invisible and eating
+  the next click. Under a take, the TAKE panel greys the rows it will not
+  change.
+
+- **The settings cog is named for what it opens**: a screen reader
+  announced it as "Take settings", and it is "Settings - audio and media"
+  now. The SIG field under the cog and in the red button's panel shows a
+  caret while you type into it.
+
+- **When ASIO cannot play, Tangent says why.** The fallback asked whether
+  the interface was plugged in even when its driver had refused the buffer
+  size or rate; it now names the driver's reason and points to Setup,
+  where changing the buffer or rate tries ASIO again.
+
+- **Setup's OUTPUT row lights the output that is actually playing.** A
+  saved name that matched a renamed device loosely, or a blank one, played
+  that device or the system's own while no chip was lit.
+
+- **A short name given to an interface stays with that interface, chosen
+  or not.** With no input chosen, unplugging the interface moved its short
+  name onto the microphone the session fell back to. Short names typed
+  from now on remember their interface; one typed before keeps the old
+  behaviour until it is typed again.
+
+- **Double-clicking a knob in the Keys panel puts it back to the sound's
+  own value**, as its tooltip always said; it jumped the knob to the
+  pointer instead.
+
 ### Added
 
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
@@ -250,10 +462,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   clock for the same positions in the song, so the sound comes out when it
   always did. What does arrive later is the desk's answer to a CHANGE: an
   automation edit or a clip edit lands on a rendered-ahead track up to the
-  chosen number of milliseconds late. And a plugin parameter's own
-  automation is read once per stretch, so on a rendered-ahead track it
-  plays up to twice that late. Faders, sends, mute and solo, and their
-  automation, are applied at the moment the audio is played and are
+  chosen number of milliseconds late, and up to about twice that, since a
+  track may already have its next stretch rendered while it plays this
+  one. A knob turned in a plugin's own window lands with the track's next
+  stretch. A track whose plugins carry automation is not rendered ahead,
+  so that automation plays on time. Faders, sends, mute and solo, and
+  their automation, are applied at the moment the audio is played and are
   unaffected.
 
   Measured here on thirty-two tracks carrying three FabFilter Pro-R 2
@@ -399,6 +613,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   inside it), unless the clips already selected are all on tracks you
   picked.
 
+  **Not yet right everywhere.** Quantizing a multi-mic kit moves each mic
+  on its own: each take is quantized from its own attacks, so the bleed
+  between a drum folder's mics stops lining up and can flam.
+
 - **Audio clips glue.** Cmd/Ctrl+G welds audio clips the way it has always
   welded MIDI ones: two or more on one track, or one that repeats, become
   one clip. They are rendered exactly as they play (trim, loops, fades,
@@ -406,10 +624,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the project's media folder, and replaced by one plain clip that loops
   over its own length and plays the same samples they did. Like a MIDI
   glue it takes one track and one kind of clip at a time, and it is
-  refused on a frozen track. Not yet safe with no audio engine running, as
-  when the recorder band is closed: the weld is then written as 48 kHz
-  audio whatever rate the clips were decoded at, so where the device ran
-  at another rate it plays at the wrong speed (undo brings the clips back).
+  refused on a frozen track. With no audio engine running, as when the
+  recorder band is closed, it asks you to open the band first.
 
 - **Automation nodes make steps, and move as a set.** Two nodes may now
   share an instant, which is a step: the curve arrives at the first and
@@ -426,11 +642,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   shape instead of piling onto one spot. Shift-click on a node still adds
   it to the choice or takes it back out. Delete or Backspace removes the
   chosen nodes, all but a node at the very start of the song, which holds
-  the row's level; it used to remove the selected track, and held down it
-  still does once the nodes are gone. Copy, cut and paste work on them: a
-  paste lands at the playhead, snapped when the magnet is on, on the row
-  you chose, pressed or copied from, replaces the nodes in the span it
-  covers, and arrives chosen. The clip menu's Delete and Copy act on the
+  the row's level; it used to remove the selected track. Copy, cut and
+  paste work on them: a paste lands at the playhead, snapped when the
+  magnet is on, on the row you chose, pressed or copied from, replaces the
+  nodes in the span it covers, and arrives chosen. Nodes copied from
+  several rows paste back onto their own rows, and a paste onto a mute row
+  arrives as switches. The clip menu's Delete and Copy act on the
   clip even while nodes are chosen, and undo, or opening or closing a row,
   lets the choice go rather than leave it on the wrong nodes.
 
@@ -444,7 +661,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   knob with automation on it follows its curve rather than the mouse, so a
   drag never writes the curve's passing value into your setting (moving an
   EQ band whose frequency is automated changes only its gain); a value
-  typed into its reading still sets it.
+  typed into its reading still sets it, and Init or the EQ's reset puts it
+  back to its default.
 
 - **Mute and solo take the record arm's alt and shift.** A plain click
   toggles and carries the selected strips with it. Alt-click makes that
@@ -468,9 +686,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   plugged in is listed too, and choosing it plays through the system's own
   audio and says so.
 
-  **Not yet right under ASIO.** "The system's own" there is still the
-  first driver in Windows' list that answers, which can be a wrapper such
-  as ASIO4ALL; choose the interface by name.
+  Under ASIO, "the system's own" is the first driver in Windows' list
+  that answers, which can be a wrapper such as ASIO4ALL, and Setup says so
+  under the row; choose the interface by name.
 
 - **A count-in being recorded into the take shows its beat in red** on the
   band's display.
@@ -612,7 +830,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   rebuilt (a session opening or a new one starting, or the audio engine
   restarting, as it does for a new buffer size or sample rate), monitoring
   now waits until every plugin an armed audio input is heard through has
-  loaded: its own, its folders' and those of any track it is routed to. A
+  loaded: its own, its folders', the first three bays of any track it is
+  routed to, and the effects bus's when it sends there. A
   plugin you add by hand does not touch monitoring. And a denoiser that
   has just loaded applies its full reduction from its first moment instead
   of fading in from none. On Open or New, a bay still playing the previous
@@ -693,6 +912,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   left one for each plugin on it plus one for its clips. Grouping tracks
   into a folder, inserting a track or pasting one left a step with every
   track shifted down and nothing in the gap. Each is one step now.
+
+  So are these, which still folded into whatever came next: the MIDI
+  editor's magnet, grid, triplet, swing and humanize; the master's MONO
+  and a plugin's bypass, from the mixer, either FX menu, a shift-click on
+  a bay or the plugin's own BYPASS button; switching the click on or off;
+  each change in an effect's parameter panel; a time signature typed into
+  SIG or stepped with the metronome panel's BEATS and UNIT, and a typed
+  take name, taken when you leave the field; a turned Keys knob, when you
+  let go; and flats, the staff's key, the guitar's tuning, capo and capo
+  style, a transpose (a held arrow is one step), the view on show and a
+  theme saved under a new name. Two more took two steps: a Shift-added
+  automation or tempo node dragged into place, and an audio quantize
+  Apply that also changed a setting in the window, whose second step only
+  put the setting back. Choosing the amp took eight, one per pedal of the
+  board it arrives wearing, each leaving the newest pedal switched on; it
+  is one now, and redoing past it no longer seeds the board again or
+  throws the rest of the redo away.
 
 - **Undoing a Paste FX, a bay swap or a delete brings the plugin back with
   the settings it was playing at.** It came back at its settings from the
@@ -1110,8 +1346,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   unsigned one it does not know, with no override, not even for an
   administrator: a tester's installed Tangent stopped opening the day Smart
   App Control switched itself on. The app, its bundled video encoder, the
-  installer and the uninstaller are all signed now, under the author's own
-  name, and a Windows release cannot be cut with any of them unsigned.
+  installer, the helpers inside it and the uninstaller are all signed now,
+  under the author's own name, and neither a Windows release nor a tester
+  build can be published with any of them unsigned.
   SmartScreen may still say "Windows protected your PC" on the first signed
   releases, because that warning goes on reputation, which a new signature
   has to earn.
@@ -1547,8 +1784,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   held pad the reverse. Velocity moves by a proportion rather than a fixed
   number so the part keeps its shape — a ghost note shifts by a few and an
   accent by a dozen, and nothing is ever pushed to silence. The amounts are
-  remembered, so the second part costs one press. Notes stay inside their
-  clip, exactly as the quantiser keeps them.
+  remembered, so the second part costs one press. Notes stay wholly
+  inside their clip.
 
   **The shift is not a preference.** Bare H is held for the shortcut card and
   the editor has a card of its own, so taking the letter outright cost the one
