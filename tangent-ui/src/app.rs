@@ -28747,7 +28747,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// into the saved setting — and when the curve went, the band was not
     /// where anybody had set it. The curve plays either way; what is kept is
     /// the setting the knob was left at by hand. A value TYPED into the
-    /// reading is still written: typing is saying exactly that.
+    /// reading is still written: typing is saying exactly that. So are Init
+    /// and the EQ's reset (`DialogAction::SetInsertParamsMany`), which put
+    /// each knob back to its shipped default and read nothing off the face.
     fn face_param_automated(&self, seat: usize, bay: usize, id: u32) -> bool {
         self.builtin_faces_live
             .get(&(seat, bay))
@@ -35387,12 +35389,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // In order, through the one road a single one takes, so a run is
             // exactly N of the same thing and not a second way to set a
             // parameter.
+            //
+            // **Every knob, automated or not.** The run's only senders are
+            // Init and the EQ's reset, and both write each knob's shipped
+            // DEFAULT: never a curve's momentary value, which is all
+            // `face_param_automated` keeps out. Filtered, Init put back
+            // every control but the automated ones.
             DialogAction::SetInsertParamsMany { strip, slot, sets } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 for (id, value) in sets {
-                    if !self.face_param_automated(seat, bay, id) {
-                        self.set_insert_param(seat, bay, id, value);
-                    }
+                    self.set_insert_param(seat, bay, id, value);
                 }
             }
             DialogAction::FaceSavePreset { strip, slot, name } => {
@@ -60964,6 +60970,49 @@ mod tests {
         app.set_live_face(seat, bay, None);
         app.apply_dialog_action(DialogAction::SetInsertParam { strip: 2, slot: 1, id: 22, value: 0.4 });
         assert_eq!(saved(&app, 22), Some(0.4));
+    }
+
+    /// **Init and the EQ's reset put an automated knob's setting back too.**
+    /// Both write each knob's shipped DEFAULT, never a curve's momentary
+    /// value, so the filter that keeps a face gesture off a knob the curve
+    /// owns bought them nothing: Init promised "every control back to what
+    /// this unit ships with" and kept that promise for every knob but the
+    /// automated ones, while a preset load wrote those too.
+    #[test]
+    fn init_puts_an_automated_knobs_setting_back_too() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let param = |id: u32, value: f32| crate::ports::BuiltinFaceParam {
+            id,
+            symbol: format!("p{id}"),
+            name: format!("P{id}"),
+            units: String::new(),
+            default: 0.0,
+            reading: String::new(),
+            choices: Vec::new(),
+            steps: 0,
+            value,
+        };
+        let (seat, bay) = recorder::seat_bay(2, 1);
+        let face = |params| crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: "@tangent-eq".into(),
+            params,
+            ..Default::default()
+        };
+        app.set_builtin_face(face(vec![param(22, 0.2), param(23, 0.5)]));
+        app.set_live_face(seat, bay, Some(face(vec![param(22, 0.8)])));
+        // What Init sends: every pushed knob at its default.
+        app.apply_dialog_action(DialogAction::SetInsertParamsMany {
+            strip: 2,
+            slot: 1,
+            sets: vec![(22, 0.0), (23, 0.0)],
+        });
+        let saved = |app: &TangentApp, id| {
+            app.builtin_face(seat, bay).and_then(|f| f.params.iter().find(|p| p.id == id)).map(|p| p.value)
+        };
+        assert_eq!(saved(&app, 23), Some(0.0));
+        assert_eq!(saved(&app, 22), Some(0.0), "Init left the automated knob's setting where it was");
     }
 
     /// **A Delete under a held node ends the drag.** The drag re-anchored on
