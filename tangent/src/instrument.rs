@@ -9250,9 +9250,11 @@ impl Renderer {
             self.beats.seen_req = req;
             let want = self.shared.count_in_beats.load(Ordering::Relaxed);
             self.beats.restart(want);
-            self.shared
-                .count_in_done
-                .store(want == 0, Ordering::Relaxed);
+            // **Done is a downbeat, and a new generation has had none.** A
+            // cancel is a generation of zero beats, which never reaches a go
+            // (`restart(0)` counts nothing in), and it published done with no
+            // downbeat. Only the go, in the click loop below, raises it.
+            self.shared.count_in_done.store(false, Ordering::Relaxed);
             self.shared.beat_now.store(0, Ordering::Relaxed);
             self.shared.downbeat_ns.store(i64::MIN, Ordering::Relaxed);
             self.voice.playing = false;
@@ -19738,7 +19740,8 @@ impl Engine {
     /// recording starts on the downbeat after them, which is one further beat
     /// period. The clicks and the countdown are the same event: both come from
     /// the audio thread's frame counter, so what the UI shows cannot drift from
-    /// what the player hears.
+    /// what the player hears. A count of zero beats has no downbeat, so it
+    /// never reports done; the host starts none.
     ///
     /// **Not yet true for a pre-roll take.** Its countdown and its start run on
     /// the wall clock in `record::Session::tick`, not on this frame counter.
@@ -19761,11 +19764,10 @@ impl Engine {
         s.count_in_req.fetch_add(1, Ordering::Release);
     }
 
-    /// Abandon a count-in. [`Engine::count_in_done`] reads false until the
-    /// next callback, which restarts the clock with ZERO beats - and a
-    /// zero-beat generation publishes `count_in_done == true` with no downbeat
-    /// (`count_in_downbeat_ns() == None`). A caller that means "a count
-    /// reached its go" asks for the downbeat, not the latch.
+    /// Abandon a count-in. [`Engine::count_in_done`] reads false from here
+    /// until a later count reaches its downbeat: the next callback restarts
+    /// the clock with ZERO beats, a generation that never reaches a go, and
+    /// `count_in_downbeat_ns()` answers `None`.
     pub fn cancel_count_in(&self) {
         let s = &self.shared;
         s.count_in_beats.store(0, Ordering::Relaxed);
@@ -19786,8 +19788,11 @@ impl Engine {
         }
     }
 
-    /// True from the downbeat that ends the count-in until the next
-    /// [`Engine::start_count_in`].
+    /// True from the downbeat that ends a count-in until the next
+    /// [`Engine::start_count_in`] or [`Engine::cancel_count_in`]: the count
+    /// reached its go. A cancelled count never reads done, and neither does
+    /// a count of zero beats, which has no downbeat; the instant the go was
+    /// heard is [`Engine::count_in_downbeat_ns`].
     pub fn count_in_done(&self) -> bool {
         self.shared.count_in_done.load(Ordering::Relaxed)
     }
@@ -29957,6 +29962,37 @@ mod tests {
             done_at.is_some(),
             "the count-in never finished — the record waits forever"
         );
+    }
+
+    /// **A cancelled count-in does not read as done.** `count_in_done` is
+    /// the count reaching its downbeat - the arrangement's start acts on the
+    /// latch alone - and a cancel is a generation of zero beats, which never
+    /// reaches a go. It published done anyway, with no downbeat, and the
+    /// arrangement was safe only because every cancel arm clears its wait
+    /// first. The control: a count started after the cancel still reaches
+    /// its go, downbeat and all.
+    #[test]
+    fn a_cancelled_count_in_does_not_read_as_done() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let mut out = vec![0.0f32; 256 * 2];
+        e.start_count_in(4, 120.0);
+        e.render_offline(&mut out);
+        e.cancel_count_in();
+        // Past where its go would have been: four beats and the go at 120
+        // bpm is two and a half seconds.
+        for _ in 0..(48_000 * 3 / 256) {
+            e.render_offline(&mut out);
+            assert!(!e.count_in_done(), "a cancelled count reads as having reached its downbeat");
+        }
+        assert_eq!(e.count_in_downbeat_ns(), None, "a cancelled count published a downbeat");
+        e.start_count_in(2, 240.0);
+        let mut blocks = 0;
+        while !e.count_in_done() && blocks < 2_000 {
+            e.render_offline(&mut out);
+            blocks += 1;
+        }
+        assert!(e.count_in_done(), "a count after a cancel never reached its go");
+        assert!(e.count_in_downbeat_ns().is_some(), "the go after a cancel has no downbeat");
     }
 
     /// **A count-in is BEATS of the signature, whatever the click's
