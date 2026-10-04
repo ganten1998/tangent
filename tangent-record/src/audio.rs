@@ -1274,7 +1274,7 @@ pub fn active_system() -> String {
 /// not a preference worth honouring, so it is not honoured.
 fn build_host(want: &Option<String>) -> cpal::Host {
     #[cfg(test)]
-    HOSTS_BUILT.fetch_add(1, Ordering::Relaxed);
+    HOSTS_BUILT.set(HOSTS_BUILT.get() + 1);
     if let Some(want) = want {
         return cpal::available_hosts()
             .into_iter()
@@ -1324,9 +1324,16 @@ fn host_has_a_device(host: &cpal::Host) -> bool {
     host.default_output_device().is_some() || host.default_input_device().is_some()
 }
 
-/// How many times a host was actually constructed, for the cache test.
 #[cfg(test)]
-static HOSTS_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many hosts THIS thread has built, for the cache test. Per thread
+    /// like the cache it counts: libtest runs tests side by side, each on a
+    /// thread of its own, so a test that builds a host alongside the cache
+    /// test moves only its own count. A process-wide counter let one land
+    /// between the cache test's two reads and fail it for a rebuild it never
+    /// made.
+    static HOSTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 thread_local! {
     /// The ONE host per thread, keyed by the system name it was built for.
@@ -3556,35 +3563,51 @@ mod tests {
     /// under ASIO is a fresh driver-guard, and a fresh guard is a license to
     /// ask the SDK's process-global loader to unload the driver a running
     /// stream is playing through. The cache is what makes that impossible, so
-    /// the cache is what this test pins. The CACHE is thread-local; the
-    /// counter is not. Any test that builds a host on its own thread
-    /// (`the_active_system_is_the_one_the_host_was_built_as` does) can move it
-    /// mid-test.
+    /// the cache is what this test pins. The cache is thread-local and so is
+    /// the counter: a test that builds a host on its own thread
+    /// (`the_active_system_is_the_one_the_host_was_built_as` does) moves its
+    /// own count and never this one's, which the check on another thread
+    /// below holds it to. The counter used to be process-wide, and such a
+    /// build landing between two reads here failed this test for a rebuild
+    /// it never made.
     #[test]
     fn the_host_is_cached_until_the_system_choice_changes() {
-        // Nothing serializes this against other tests: SYSTEM and HOSTS_BUILT
-        // are both process-wide.
+        // SYSTEM is still process-wide: no other test that runs sets it (the
+        // ASIO list test is ignored), and the active-system test, which reads
+        // it alongside, answers the platform default for the name set below
+        // as well.
         let baseline_system = system();
         with_host(|_| ()); // whatever key is current: cached from here on
-        let start = HOSTS_BUILT.load(Ordering::Relaxed);
+        let start = HOSTS_BUILT.get();
         with_host(|_| ());
         with_host(|_| ());
         assert_eq!(
-            HOSTS_BUILT.load(Ordering::Relaxed),
+            HOSTS_BUILT.get(),
             start,
             "a second and third with_host on the same system rebuilt the host \
              - under ASIO that rebuild is the driver-teardown bug"
+        );
+        // **A host another thread builds is that thread's own**, so a test
+        // building one alongside cannot move the count this test reads.
+        std::thread::spawn(|| with_host(|_| ()))
+            .join()
+            .expect("a host built on another thread");
+        assert_eq!(
+            HOSTS_BUILT.get(),
+            start,
+            "a host built on another thread moved this thread's count, so a \
+             test running alongside can fail this one"
         );
         // A DIFFERENT system name (even one this build does not have - it
         // falls back to the default host) is a new key: built once, then
         // cached again.
         set_system(Some("not-a-real-system-name"));
         with_host(|_| ());
-        let after_switch = HOSTS_BUILT.load(Ordering::Relaxed);
+        let after_switch = HOSTS_BUILT.get();
         assert_eq!(after_switch, start + 1, "the new key should build exactly once");
         with_host(|_| ());
         assert_eq!(
-            HOSTS_BUILT.load(Ordering::Relaxed),
+            HOSTS_BUILT.get(),
             after_switch,
             "the new key should then be cached"
         );
