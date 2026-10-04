@@ -7868,6 +7868,11 @@ struct Renderer {
     /// withholding through a processing bay would need that bay run twice,
     /// which is two instances of the plugin. One buffer, filled by the pass
     /// that made the samples in the first place.
+    ///
+    /// **The effects bus is not subtracted here at all**: past its reverb
+    /// there is nothing left to subtract from. The input's own send is
+    /// closed with the room, and the share of it its FOLDERS send is taken
+    /// off the bus before the bus runs (`folder_send_gain`).
     input_dry: Vec<f32>,
     /// Whether the room and the take differ this block — in CONTENT, because
     /// monitoring is withholding an input, or in TREATMENT, because a live
@@ -11431,6 +11436,9 @@ impl Renderer {
             } else {
                 chain
             };
+            // And what the folders above it send of it - see
+            // `folder_send_gain`.
+            let folder_sent = self.folder_send_gain(lane);
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -11482,9 +11490,12 @@ impl Renderer {
                     }
                     // Post-fader, like every other send here, and closed with
                     // the room: a channel nobody can hear must not arrive back
-                    // in the speakers through the reverb.
+                    // in the speakers through the reverb. **Through its
+                    // folders' sends too**: the fold sends the group's sum,
+                    // withheld share and all, so that share is taken off the
+                    // bus here, before the bus runs.
                     if let Some(a) = self.aux.get_mut(at + c) {
-                        *a += src * send * heard_now;
+                        *a += src * send * heard_now - src * keep_out * folder_sent[c.min(1)];
                     }
                 }
             }
@@ -15169,6 +15180,9 @@ impl Renderer {
                         mix[f * TAP_CHANNELS + 1] += r;
                     }
                 }
+                // The whole group's sum, a live input the room withholds
+                // included: `mix_monitor` has already taken that share off
+                // the bus (`folder_send_gain`).
                 if let Some(aux) = self.aux.get_mut(..want) {
                     aux[f * TAP_CHANNELS] += l * send;
                     aux[f * TAP_CHANNELS + 1] += r * send;
@@ -15208,6 +15222,43 @@ impl Renderer {
             hops += 1;
         }
         g
+    }
+
+    /// **What the folders a lane's audio is folded through SEND of it to the
+    /// effects bus**, per side: over each of them, its send times every
+    /// fold's gain and pan on the way up to it, its own included. For a
+    /// folder's own input the folder itself is the first.
+    ///
+    /// The fold sends the GROUP's sum, which still holds a live input the
+    /// room is withholding, and once the reverb has it no subtraction can
+    /// take it back out. So `mix_monitor` takes the withheld share off the
+    /// bus before the bus runs, as it closes the input's own send. The same
+    /// gains `folder_chain_gain` reads, with each folder's rack taken as
+    /// unity, as there.
+    fn folder_send_gain(&self, lane: usize) -> [f32; 2] {
+        let mut path = [1.0f32; 2];
+        let mut sent = [0.0f32; 2];
+        let mut up = if self.folder_is.get(lane).copied().unwrap_or(false) {
+            i32::try_from(lane).unwrap_or(-1)
+        } else {
+            self.folders.get(lane).copied().unwrap_or(-1)
+        };
+        let mut hops = 0;
+        while let Ok(a) = usize::try_from(up) {
+            if a >= CHANNELS || hops > CHANNELS {
+                break;
+            }
+            let (pl, pr) = pan_gains(self.lane_pan(a));
+            let fg = self.channel_gain.get(a).copied().unwrap_or(1.0);
+            path[0] *= fg * pl;
+            path[1] *= fg * pr;
+            let send = self.lane_send(Strip::Channel(a).index());
+            sent[0] += path[0] * send;
+            sent[1] += path[1] * send;
+            up = self.folders.get(a).copied().unwrap_or(-1);
+            hops += 1;
+        }
+        sent
     }
 
     /// **What the routes make of what reaches each channel's ARRIVALS**, per
@@ -32280,6 +32331,99 @@ mod tests {
             assert!(
                 room < 1.0e-3,
                 "{case}: a withheld routed input reached the speakers (peak {room})"
+            );
+        }
+    }
+
+    /// **A grouped strip's withheld input stays off the effects bus its
+    /// FOLDER sends to.** The input's own send is closed with the room
+    /// (`heard_now`), but the fold sends the group's sum, which still holds
+    /// the withheld input, and no subtraction takes it back out once the
+    /// reverb has had it: with monitoring off the room heard the input
+    /// through the folder's reverb. Two controls: the take, that the input
+    /// is there at all, and monitoring on against the same desk with the
+    /// folder's send shut, that the send really does carry it. Once with the
+    /// send on the child's folder, once on the folder above that one.
+    #[test]
+    fn an_armed_childs_input_stays_out_of_the_room_through_its_folders_send() {
+        // The room's last second, and the take's peak over it. `tree` is the
+        // child, then each (lane, parent) pair; `sender` is the folder that
+        // sends. A parent is a lower lane than its child, as the desk keeps it.
+        let render = |tree: &[(usize, i32)], sender: usize, monitoring: bool, folder_send: f32| -> (Vec<f32>, f32) {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            let child = tree[0].0;
+            for &(lane, parent) in tree {
+                shared.folder_of[lane].store(parent, Ordering::Relaxed);
+                shared.channel_gains[lane].store(1.0f32.to_bits(), Ordering::Relaxed);
+                r.channel_gain[lane] = 1.0;
+                if let Ok(p) = usize::try_from(parent) {
+                    shared.channel_gains[p].store(1.0f32.to_bits(), Ordering::Relaxed);
+                    r.channel_gain[p] = 1.0;
+                }
+            }
+            shared.pick_strip[0].store(child as i64, Ordering::Relaxed);
+            shared.midi_off.store(1 << child, Ordering::Relaxed);
+            shared.armed.store(1 << child, Ordering::Relaxed);
+            shared.send[sender].store(folder_send.to_bits(), Ordering::Relaxed);
+            // The bus is wet only, so its reverb is up: what reaches the bus
+            // comes back.
+            shared.reverb_mix.store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.monitor_on.store(monitoring, Ordering::Relaxed);
+            if monitoring {
+                r.room_gain = 1.0;
+            }
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            let (mut room, mut taped) = (Vec::new(), 0.0f32);
+            let blocks = 48_000 * 2 / 256;
+            let mut n = 0u32;
+            for b in 0..blocks {
+                // A tone, not a constant: a reverb has little to say about DC.
+                for _ in 0..256 {
+                    let _ = in_tx.push((n as f32 * std::f32::consts::TAU * 440.0 / 48_000.0).sin() * 0.5);
+                    n += 1;
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+                if b >= blocks / 2 {
+                    taped = captured.iter().fold(taped, |a, s| a.max(s.abs()));
+                    room.extend_from_slice(&out);
+                }
+            }
+            (room, taped)
+        };
+        for (what, tree, sender) in [
+            ("its folder", &[(1usize, 2i32)][..], 2usize),
+            ("the folder above its folder", &[(5, 3), (3, 1)][..], 1),
+        ] {
+            let (shut, taped) = render(tree, sender, false, 1.0);
+            assert!(taped > 0.4, "{what}: the child is missing from the take (peak {taped})");
+            let leak = shut.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            assert!(
+                leak < 1.0e-3,
+                "{what}: with monitoring off the child reached the speakers through the send (peak {leak})"
+            );
+            let (dry, _) = render(tree, sender, true, 0.0);
+            let (wet, _) = render(tree, sender, true, 1.0);
+            let carried = dry.iter().zip(&wet).fold(0.0f32, |a, (d, w)| a.max((w - d).abs()));
+            assert!(
+                carried > 0.01,
+                "{what}: the send never carried the child to the bus, so this proves nothing ({carried})"
             );
         }
     }
