@@ -13372,22 +13372,29 @@ impl DesktopApp {
     /// and the app refuses a frozen track before asking. The caches it reuses
     /// (`track_cache`, `stretch_cache`) hold audio at the rate of the engine
     /// that filled them: `start_engine` clears them, but an engine that dies
-    /// or a band that closes leaves them standing. **Not yet guarded:** with
-    /// no engine running the weld is written at 48 kHz while those caches may
-    /// still hold another engine's rate, and then it plays at the wrong
-    /// speed. The weld is one undo moment, taken in `finish_audio_glue`; the
-    /// sources' files stay on disk so that moment can be undone.
+    /// or a band that closes leaves them standing. So **with no engine
+    /// running it refuses**: it used to write the weld at an invented 48 kHz
+    /// over whatever rate those caches held, and the weld played at the
+    /// wrong speed. The weld is one undo moment, taken in
+    /// `finish_audio_glue`; the sources' files stay on disk so that moment
+    /// can be undone.
     #[cfg(feature = "recorder")]
     fn glue_audio_clips(&mut self, ids: &[u64]) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             self.app.notify(Kind::Info, "Nothing to glue into - no project is open.");
             return;
         };
-        let rate = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or(48_000, |e| e.output().sample_rate);
+        // **The running engine's rate, or no weld.** The caches below hold
+        // audio at the rate of the engine that filled them, and one that
+        // died or closed with the band left them standing: a weld written at
+        // a guessed rate over them plays at the wrong speed.
+        let Some(rate) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {
+            self.app.notify(
+                Kind::Info,
+                "Open the band to glue audio - the audio path is closed.",
+            );
+            return;
+        };
         let doc = self.app.arrangement().clone();
         let picked: Vec<&tangent_ui::arrangement::ArrClip> = doc
             .clips
@@ -25586,6 +25593,30 @@ mod tests {
                 && src.contains("Chore::GlueAudio(ids) => self.glue_audio_clips(&ids),"),
             "the glue request is not answered behind the busy cover"
         );
+    }
+
+    /// **The glue welds only at the rate its decodes were made at.** With no
+    /// engine running - the band closed, or the device gone - it wrote the
+    /// weld at an invented 48 kHz while `track_cache` and `stretch_cache`
+    /// still held audio at the last engine's rate (only `start_engine`
+    /// clears them), so a weld made after a 44.1 kHz session played 8.8%
+    /// fast, and it replaced its sources. It refuses now, before it reads a
+    /// cache. A source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_glue_never_mixes_a_decode_made_at_another_rate() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn glue_audio_clips(&mut self").expect("the glue");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("map_or(48_000"),
+            "with no engine the glue invents 48 kHz and mixes whatever rate the caches were filled at"
+        );
+        let asks = body
+            .find("let Some(rate) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {")
+            .expect("the glue no longer refuses when there is no engine to take its rate from");
+        let reads = body.find("self.track_cache.get(&path)").expect("the glue's decode");
+        assert!(asks < reads, "the glue reads the caches before it knows an engine filled them");
     }
 
     /// **A stretch of warped audio is not a stretch of the file.** The
