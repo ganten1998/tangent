@@ -13471,8 +13471,11 @@ impl DesktopApp {
             strength: ask.strength,
             window: ask.window,
         };
-        let doc = self.app.arrangement().clone();
-        let Some(clip) = doc.clips.iter().find(|c| c.id == id) else {
+        // **The one clip, not the document.** This runs once per clip in the
+        // ask, and it deep-cloned the arrangement - every clip, note and
+        // automation point - to read a few fields of one; the clone of the
+        // clip alone releases the borrow `attacks_of` needs just the same.
+        let Some(clip) = self.app.arrangement().clips.iter().find(|c| c.id == id).cloned() else {
             return (0, 0);
         };
         if clip.kind != tangent_ui::arrangement::ClipKind::Audio {
@@ -13484,10 +13487,10 @@ impl DesktopApp {
         };
         let files = self.asked_files(ask);
         let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
-        let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
+        let map = quantize_map(&found, decoded.rate, decoded.seconds(), &clip, &q);
         // What the receipt counts: the attacks the clip PLAYS, not every
         // one in its file. See `played_attacks`.
-        let played = played_attacks(&found, decoded.rate, decoded.seconds(), clip);
+        let played = played_attacks(&found, decoded.rate, decoded.seconds(), &clip);
         // Nothing to quantize - fewer than two pairs, which `quantize_map`
         // answers with no map at all - keeps the map the clip already has.
         if map.is_empty() {
@@ -28007,6 +28010,25 @@ mod tests {
             body.contains("played_attacks(&found, decoded.rate, decoded.seconds(),")
                 && !body.contains("found.len()"),
             "the quantize's receipt counts every attack in the file again"
+        );
+    }
+
+    /// **A quantize clones the clip it quantizes, not the whole document.**
+    /// `quantize_clip` runs once per clip in the ask, and each run
+    /// deep-cloned the arrangement - every clip, every note, every
+    /// automation point - to read a few fields of one audio clip, so a
+    /// marquee over eight takes copied the song eight times.
+    /// `quantize_marks_for` already clones only the clips it names.
+    /// Performance only, so a source scan.
+    #[test]
+    fn a_quantize_clones_the_clip_it_quantizes_and_not_the_document() {
+        let src = include_str!("desktop.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn quantize_clip(").expect("quantize_clip");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            !body.contains("self.app.arrangement().clone()"),
+            "a quantize copies the whole document once per clip again"
         );
     }
 
