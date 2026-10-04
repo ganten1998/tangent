@@ -3492,6 +3492,11 @@ fn audio_clip_passes(
 /// a per-export one — its decodes are at the export rate, and stretched
 /// copies of live-rate audio would be wrong-rate in the file (the rate rule
 /// on the cache fields).
+///
+/// **Past the ceiling it is the audio itself**, unstretched and cached
+/// under the key, as `reload_clips` plays such a clip (see
+/// [`stretch_over_ceiling`]). The export, glue and normalize used to render
+/// it anyway: the allocation playback refuses, and a stretch nobody heard.
 #[cfg(feature = "recorder")]
 fn stretched_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -3514,7 +3519,11 @@ fn stretched_clip_audio(
     match cache.get(&key) {
         Some(c) => Arc::clone(c),
         None => {
-            let made = Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
+            let made = if stretch_over_ceiling(decoded.frames(), clip.stretch) {
+                Arc::clone(&decoded)
+            } else {
+                Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode))
+            };
             cache.insert(key, Arc::clone(&made));
             made
         }
@@ -21292,7 +21301,8 @@ fn stretch_step(
 /// Whether a render would come out past the decoder's own ceiling.
 /// `stretch::tape` allocates `frames * ratio` and nothing else bounded it:
 /// a document saying `"stretch": 4.0` on a twenty-minute clip asked for
-/// 1.84 GB in one allocation. Such a clip plays unstretched and says so.
+/// 1.84 GB in one allocation. Such a clip plays unstretched and says so,
+/// and the export and glue render it unstretched (`stretched_clip_audio`).
 #[cfg(feature = "recorder")]
 fn stretch_over_ceiling(frames: usize, ratio: f64) -> bool {
     !(ratio.is_finite()) || frames as f64 * ratio.max(1.0) > tangent_record::decode::MAX_FRAMES as f64
@@ -24138,6 +24148,61 @@ mod tests {
         assert!(stretch_over_ceiling(ceiling + 1, 0.25), "a file already over it stays over it");
         assert!(stretch_over_ceiling(100, f64::NAN));
         assert!(stretch_over_ceiling(100, f64::INFINITY));
+    }
+
+    /// **The export and glue keep the ceiling playback keeps.** A stretch
+    /// whose render would pass the decoder's ceiling plays unstretched: the
+    /// live road caches the audio itself under the stretch key and says so.
+    /// `stretched_clip_audio`, the road the export, glue and normalize take,
+    /// rendered it all the same - the 1.84 GB allocation the ceiling exists
+    /// to refuse, on the UI thread - and welded or exported a stretch nobody
+    /// had heard. The long decode is zeroed pages nothing reads, so this
+    /// costs nothing while it passes.
+    #[test]
+    fn the_export_and_glue_play_a_stretch_past_the_ceiling_unstretched() {
+        // A ratio that is not a number is over the ceiling too: the cheap
+        // case first, so a road with no ceiling at all fails here at once
+        // rather than after rendering the long one.
+        let short = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 64],
+            rate: 48_000,
+            source: std::path::PathBuf::from("short.wav"),
+        });
+        let nan = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "short.wav".to_owned(),
+            stretch: f64::NAN,
+            ..Default::default()
+        };
+        let mut renders = std::collections::HashMap::new();
+        let out = stretched_clip_audio(&nan, Arc::clone(&short), std::path::Path::new("short.wav"), &mut renders);
+        assert!(Arc::ptr_eq(&out, &short), "a stretch that is not a number was rendered, not refused");
+        let frames = tangent_record::decode::MAX_FRAMES / 4 + 1;
+        let decoded = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; frames * 2],
+            rate: 48_000,
+            source: std::path::PathBuf::from("long.wav"),
+        });
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "long.wav".to_owned(),
+            stretch: 4.0,
+            stretch_mode: "tape".to_owned(),
+            ..Default::default()
+        };
+        let path = std::path::Path::new("long.wav");
+        assert!(stretch_over_ceiling(frames, clip.stretch), "the fixture is under the ceiling");
+        let mut cache = std::collections::HashMap::new();
+        let out = stretched_clip_audio(&clip, Arc::clone(&decoded), path, &mut cache);
+        assert!(
+            Arc::ptr_eq(&out, &decoded),
+            "the export and glue stretched past the ceiling that playback refuses"
+        );
+        let (key, _) = stretch_key(&clip, path).expect("a stretched clip has a key");
+        assert!(
+            cache.get(&key).is_some_and(|c| Arc::ptr_eq(c, &decoded)),
+            "the key does not hold the unstretched audio, as playback's cache does"
+        );
     }
 
     /// **A stand-in picture lands where the render's will.** A clip
