@@ -2734,6 +2734,13 @@ const AUDIO_W: f32 = 430.0;
 /// string the panel controls.
 const MAKER_MAX: usize = 46;
 
+/// **What "the system's own" is under ASIO**, said under Setup's OUTPUT row
+/// while ASIO is the system running. ASIO has no default device: cpal opens
+/// the first driver in Windows' list that answers (`resolve_output` skips
+/// one with no hardware), which can be a wrapper such as ASIO4ALL - and the
+/// chip that reads as "whatever the OS uses" was lit over it.
+const ASIO_OWN_OUTPUT: &str = "under ASIO, the system's own is the first driver that answers";
+
 /// `s`, cut to `max` characters with an ellipsis when it was longer.
 ///
 /// Counted in CHARACTERS and not bytes: a maker name with an accent in it
@@ -10089,6 +10096,17 @@ fn show_on(
                                         }
                                     }
                                 });
+                                // **And under ASIO, said where it is pressed.**
+                                // The comment above is no use to the person
+                                // at the panel, who saw "the system's own"
+                                // lit and believed it was their interface.
+                                if system.as_deref() == Some("ASIO") {
+                                    ui.label(
+                                        RichText::new(ASIO_OWN_OUTPUT)
+                                            .font(plain(10.0))
+                                            .color(dim),
+                                    );
+                                }
                             }
                             ui.add_space(10.0);
 
@@ -15738,6 +15756,8 @@ at: None,
             "REPORTS".to_owned(),
             "Say what each take produced".to_owned(),
             "a take with a PROBLEM says so either way".to_owned(),
+            // The OUTPUT row's line under ASIO, small print at 10.
+            ASIO_OWN_OUTPUT.to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -15752,7 +15772,7 @@ at: None,
                         // The output-path block: its heading is bold at 11
                         // and everything under it is small print at 10.
                         15 => (11.0, fonts::courier_bold()),
-                        14 | 16..=18 | 21 => (10.0, fonts::courier()),
+                        14 | 16..=18 | 21 | 22 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(
@@ -15986,6 +16006,38 @@ at: None,
                 "a saved {saved:?} lit the system's own"
             );
         }
+    }
+
+    /// **Under ASIO the row says what "the system's own" is.** ASIO has no
+    /// default device - cpal opens the first driver in Windows' list that
+    /// answers - so the chip that reads as "whatever the OS uses" is, there,
+    /// ASIO4ALL or FL Studio ASIO as often as the interface: the Komplete
+    /// Audio 6 owner saw it lit and believed he had chosen his box. Said
+    /// under the row while ASIO is the system running, and not otherwise.
+    #[test]
+    fn under_asio_the_output_row_says_what_the_systems_own_is() {
+        let says_it = |system: &str| {
+            let mut slot = Slot::new(Dialog::AudioSetup {
+                status: crate::recorder::AudioStatus::default(),
+                buffer: None,
+                ahead: 0.0,
+                rate: None,
+                systems: vec!["ASIO".to_owned(), "WASAPI".to_owned()],
+                system: Some(system.to_owned()),
+                outputs: vec!["ASIO4ALL v2".to_owned(), "Komplete Audio 6 MK2".to_owned()],
+                output: None,
+                outputs_stale: false,
+                rates: Vec::new(),
+                input_channels: 0,
+                exposed: Vec::new(),
+                take_summary: true,
+                alias: String::new(),
+                output_path: crate::ports::OutputPath::default(),
+            });
+            slot.says(ASIO_OWN_OUTPUT)
+        };
+        assert!(says_it("ASIO"), "under ASIO the row does not say what the system's own is");
+        assert!(!says_it("WASAPI"), "the ASIO line is drawn under a system that has a default");
     }
 
     /// **The buffer chip and the readout above it cannot disagree about who
