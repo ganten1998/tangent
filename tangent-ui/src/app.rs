@@ -2192,10 +2192,9 @@ enum ArrDrag {
     /// value)` at the press and under the hand now; `press` is where the
     /// press was on screen. A press that never travels is a CLICK, and
     /// locates at the release (a press on the row's room used to locate on
-    /// the press itself). Not yet when a tap's press and release arrive in
-    /// ONE frame: the press arm returns before the release block runs, so
-    /// that tap does not locate, and the box stays armed until a later
-    /// gesture replaces or releases it.
+    /// the press itself) - on the press's own frame when a tap's press and
+    /// release arrive together, because the press arm goes on to the
+    /// release block rather than returning.
     AutoMarquee {
         lane: usize,
         slot: usize,
@@ -25893,9 +25892,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                 press: p,
                                 moved: false,
                             });
-                            return;
-                        }
-                        if let Some(i) = self.arr_put_auto_point(n, param, t, v) {
+                            // **On to the release block, not out of the
+                            // input.** A tap whose press and release share
+                            // this frame (a trackpad's, as often as not) is
+                            // let go below and locates there. This arm used
+                            // to return, so that click never located and its
+                            // box stood armed.
+                        } else if let Some(i) = self.arr_put_auto_point(n, param, t, v) {
                             // The new node comes CHOSEN, so the Delete or the
                             // copy that follows acts on what was just made.
                             self.arr_auto_nodes = vec![(n, row, i)];
@@ -60485,6 +60488,35 @@ mod tests {
             other => panic!("a click on the row did not locate: {other:?}"),
         }
         assert!(app.arr_auto_nodes.is_empty(), "a click kept the old choice");
+    }
+
+    /// **A tap on a row's room locates even when its press and release
+    /// share a frame**, and leaves no gesture behind.
+    ///
+    /// A trackpad's tap-to-click delivers both in one frame as often as
+    /// not. The press armed the box and returned before the release block
+    /// ran, so that click never located, and the unmoved box stood armed
+    /// until some later frame let it go.
+    #[test]
+    fn a_tap_on_a_rows_room_locates_when_press_and_release_share_a_frame() {
+        let (ctx, mut app) = auto_bench("autotap");
+        let here = auto_at(&app, 3.0, 0.95);
+        move_to(&ctx, &mut app, here);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: here,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        pointer_frame(&ctx, &mut app, vec![button(true), button(false)]);
+        assert!(app.arr_drag.is_none(), "a stale gesture outlived the click: {:?}", app.arr_drag);
+        let asked: Vec<_> = std::iter::from_fn(|| app.take_recorder_request()).collect();
+        assert!(
+            asked
+                .iter()
+                .any(|r| matches!(r, recorder::RecorderRequest::Locate(t) if (t - 3.0).abs() < 0.3)),
+            "the tap did not locate: {asked:?}"
+        );
     }
 
     /// **Copy, click where it should go, paste**: it lands on that row, at
