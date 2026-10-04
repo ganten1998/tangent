@@ -626,6 +626,63 @@ fn any_sound(samples: &[f32]) -> bool {
     samples.iter().any(|s| *s != 0.0)
 }
 
+/// **Where a realtime pass writes its stems until it has run whole**: a
+/// hidden folder beside `dir`, emptied of whatever a pass that never
+/// finished left in it, and made. See [`land_stems`].
+#[cfg(feature = "recorder")]
+fn open_stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
+    let stage = stems_stage(dir);
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::create_dir_all(&stage);
+    stage
+}
+
+/// The stage's name for `dir`: `export/.stems.writing` beside
+/// `export/stems`, the way a template is staged as `.<name>.writing`.
+#[cfg(feature = "recorder")]
+fn stems_stage(dir: &std::path::Path) -> std::path::PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    dir.with_file_name(format!(".{name}.writing"))
+}
+
+/// **A realtime pass's stems into place, or gone**, and how many landed.
+///
+/// Every writer is closed. When the pass `ran_whole`, a stem that sounded
+/// and closed cleanly moves from the stage into `dir`, over the last
+/// export's stem of that name, which is the export's own; a lane that never
+/// sounded has no stem, and its old one goes, as it always did (see
+/// [`StemWriter`]). A pass that did not run whole takes back everything it
+/// wrote and nothing else: `dir` is left as it was found, the last export's
+/// stems and anybody's own files in it. The pass used to write straight
+/// into `dir`, emptying each lane's old stem as it began, and a failure
+/// returned with the partial files standing there.
+#[cfg(feature = "recorder")]
+fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) -> usize {
+    let mut landed = 0;
+    for s in writers {
+        let closed = s.writer.finish().is_ok();
+        let home = s.path.file_name().map(|n| dir.join(n));
+        match home {
+            Some(home) if ran_whole && closed && s.loud => {
+                let _ = std::fs::create_dir_all(dir);
+                if std::fs::rename(&s.path, &home).is_ok() {
+                    landed += 1;
+                }
+            }
+            home => {
+                let _ = std::fs::remove_file(&s.path);
+                if let Some(home) = home.filter(|_| ran_whole && closed) {
+                    let _ = std::fs::remove_file(home);
+                }
+            }
+        }
+    }
+    // Empty now, unless a stem could not be moved: then it waits there for
+    // the next pass to clear, rather than be destroyed.
+    let _ = std::fs::remove_dir(stems_stage(dir));
+    landed
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -642,6 +699,10 @@ struct Bounce {
     /// **The engine went mid-pass, and that is what ended it** - see
     /// `tick_bounce`. Filed as a failure.
     engine_lost: bool,
+    /// Where the stems belong (`export/stems` or `export/stems-dry`): the
+    /// pass writes them beside it in `stems_stage`, and `land_stems` moves
+    /// them in only if it ran whole. `None` with no stems written.
+    stem_dir: Option<std::path::PathBuf>,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -9755,6 +9816,7 @@ impl DesktopApp {
         // The stems: one writer per USED lane — clips on it, or a kind —
         // fed live from the engine's tap so nothing is buffered whole.
         let mut stem_writers = Vec::new();
+        let mut stem_dir = None;
         if stems {
             if let (Some(e), Some(dir)) = (
                 self.recorder.engine.as_ref(),
@@ -9773,7 +9835,10 @@ impl DesktopApp {
                 // The one door, so a scratch made real by an export keeps
                 // its kit - see `finish_bounce`.
                 self.app.materialize_project_dir();
-                let _ = std::fs::create_dir_all(&dir);
+                // **Written aside, and moved in by a pass that ran whole**
+                // (`land_stems`): straight into `dir`, a pass that failed
+                // left its partial stems where the last export's had been.
+                let stage = open_stems_stage(&dir);
                 let rate = e.output().sample_rate;
                 let spec = tangent_record::wav::WavSpec {
                     sample_rate: rate,
@@ -9811,14 +9876,14 @@ impl DesktopApp {
                         .chars()
                         .map(|c| if std::path::is_separator(c) { '-' } else { c })
                         .collect();
-                    let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
-                    let _ = std::fs::remove_file(&path);
+                    let path = stage.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
                         stem_writers.push(StemWriter { lane, path: path.clone(), writer: w, loud: false });
                     }
                 }
+                stem_dir = Some(dir);
                 // The same door the offline twin arms its tap through, so the
                 // two passes cannot disagree about what a mode means. See
                 // `arm_stem_tap`.
@@ -9834,6 +9899,7 @@ impl DesktopApp {
             stem_writers,
             stem_scratch: Vec::new(),
             engine_lost: false,
+            stem_dir,
         });
     }
 
@@ -9915,18 +9981,12 @@ impl DesktopApp {
                     return;
                 };
                 let stems = b.stems;
-                let mut wrote = 0usize;
-                for s in b.stem_writers {
-                    if s.writer.finish().is_ok() {
-                        if s.loud {
-                            wrote += 1;
-                        } else {
-                            // A used lane that never sounded is not a stem.
-                            // See `StemWriter`.
-                            let _ = std::fs::remove_file(&s.path);
-                        }
-                    }
-                }
+                // Into place only for a pass that ran whole; a failed one
+                // takes back what it wrote and leaves the folder as it was.
+                let wrote = match b.stem_dir.as_deref() {
+                    Some(dir) => land_stems(b.stem_writers, dir, problem.is_none()),
+                    None => 0,
+                };
                 // **The same format pass the offline export runs**, and the
                 // same reason for holding it a frame: a copy per stem and an
                 // mp3 encode per file, all of it on this thread. The writers
@@ -23084,6 +23144,96 @@ mod tests {
         );
     }
 
+    /// **A failed export leaves the stems folder as it found it.** The
+    /// realtime pass wrote its stems straight into `export/stems/`, emptying
+    /// each lane's old stem as it began, and a pass that failed - its engine
+    /// gone, its take in trouble - returned with its partial files standing
+    /// where the last export's had been. They are written aside now and
+    /// moved in by a pass that ran whole; a failed one takes back what it
+    /// wrote and nothing else.
+    #[test]
+    fn a_failed_export_leaves_the_stems_folder_as_it_found_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-stems-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("export").join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The last export's two stems, and a file of somebody's own.
+        std::fs::write(dir.join("01-Bass.wav"), b"last bass").unwrap();
+        std::fs::write(dir.join("02-Keys.wav"), b"last keys").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        // A pass, as `start_bounce` opens it: the bass sounds, the keys never do.
+        let pass = || {
+            let stage = open_stems_stage(&dir);
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: 8_000,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let mut writers = Vec::new();
+            for (lane, name, level) in [(0, "01-Bass.wav", 0.5f32), (1, "02-Keys.wav", 0.0)] {
+                let path = stage.join(name);
+                let mut writer =
+                    tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a stem writer");
+                writer.write_interleaved(&[level; 64]).expect("a block");
+                writers.push(StemWriter { lane, path, writer, loud: level != 0.0 });
+            }
+            writers
+        };
+        let read = |name: &str| std::fs::read(dir.join(name)).ok();
+        // Failed: nothing it wrote is left, and nothing that was there is gone.
+        assert_eq!(land_stems(pass(), &dir, false), 0, "a failed pass landed stems");
+        assert_eq!(
+            read("01-Bass.wav").as_deref(),
+            Some(&b"last bass"[..]),
+            "a failed export left its partial stem where the last export's was"
+        );
+        assert_eq!(
+            read("02-Keys.wav").as_deref(),
+            Some(&b"last keys"[..]),
+            "a failed export took a stem it never replaced"
+        );
+        assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]));
+        assert!(!stems_stage(&dir).exists(), "a failed export left its stage behind");
+        // Whole: the stem that sounded takes its place, and the lane that
+        // never sounded has none, as before.
+        assert_eq!(land_stems(pass(), &dir, true), 1);
+        let bass = tangent_record::decode::decode(&dir.join("01-Bass.wav"), 8_000).expect("the new stem decodes");
+        assert_eq!(bass.frames(), 32, "the bass that landed is not this pass's");
+        assert!(read("02-Keys.wav").is_none(), "a lane that never sounded kept a stem");
+        assert_eq!(read("notes.txt").as_deref(), Some(&b"mine"[..]), "somebody's own file went with the stems");
+        assert!(!stems_stage(&dir).exists(), "the stage was left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The realtime pass stages its stems and lands them only when it ran
+    /// whole** - the wiring `a_failed_export_leaves_the_stems_folder_as_it_found_it`
+    /// stands on. A source scan, because `DesktopApp` cannot be built in a
+    /// test.
+    #[test]
+    fn the_realtime_pass_stages_its_stems_and_lands_them_only_when_it_ran_whole() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_bounce(").expect("start_bounce");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            start.contains("let stage = open_stems_stage(&dir);")
+                && start.contains("let path = stage.join(format!(")
+                && start.contains("stem_dir = Some(dir);"),
+            "the realtime pass writes its stems straight into the export's folder again"
+        );
+        let at = src.find("fn tick_bounce(&mut self").expect("tick_bounce");
+        let tick = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
+            "a pass's stems land whether or not it ran whole"
+        );
+    }
+
 
     /// **A cover asks for its band; it never spells one.**
     ///
@@ -28810,7 +28960,7 @@ mod tests {
         let stems = between("fn start_bounce(", "let rate = e.output().sample_rate;");
         let door = stems.find("self.app.materialize_project_dir();").expect("the stems road's door");
         assert!(
-            Some(door) < stems.find("let _ = std::fs::create_dir_all(&dir);"),
+            Some(door) < stems.find("let stage = open_stems_stage(&dir);"),
             "the stems road makes its folder before the door"
         );
     }
