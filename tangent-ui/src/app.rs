@@ -2479,7 +2479,9 @@ struct Moment {
     /// cannot say them either - which rows are open, armed and bypassed is
     /// session state beside the document - so the undo brought the curves
     /// back with their rows shut and a bypassed curve playing. `undo_apply`
-    /// opens them again going back and shuts them again going forward.
+    /// opens them again going back. Going forward it shuts every row the
+    /// gesture takes (`ClosedRows::takes`), one opened since the undo
+    /// included, and keeps what it shut here, for the next undo to open.
     rows_closed: Option<std::sync::Arc<ClosedRows>>,
 }
 
@@ -2498,11 +2500,27 @@ struct ClosedRows {
     open: Vec<(usize, crate::automation::AutoParam)>,
     armed: Vec<(usize, crate::automation::AutoParam)>,
     bypassed: Vec<(usize, crate::automation::AutoParam)>,
+    /// **What the gesture takes, whatever stood open at the time**: every
+    /// row on these lanes (a track's removal), and these rows (a plugin's
+    /// replace, the curves that went). A redo shuts every row they name, so
+    /// a row opened after the undo, on a curve the undo brought back, goes
+    /// with its curve again, as it would have gone at the gesture.
+    lanes: Vec<usize>,
+    curves: Vec<(usize, crate::automation::AutoParam)>,
 }
 
 impl ClosedRows {
     fn is_empty(&self) -> bool {
-        self.open.is_empty() && self.armed.is_empty() && self.bypassed.is_empty()
+        self.open.is_empty()
+            && self.armed.is_empty()
+            && self.bypassed.is_empty()
+            && self.lanes.is_empty()
+            && self.curves.is_empty()
+    }
+
+    /// Whether `row` is one the gesture takes away.
+    fn takes(&self, row: &(usize, crate::automation::AutoParam)) -> bool {
+        self.lanes.contains(&row.0) || self.curves.contains(row)
     }
 }
 
@@ -6824,7 +6842,7 @@ impl TangentApp {
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
         }
-        self.close_auto_rows(|(l, _)| *l == n);
+        self.close_auto_rows(&[n], &[]);
         self.arr_auto_nodes.retain(|(l, _, _)| *l != n);
         let gone = |aim: Option<(usize, crate::automation::AutoParam)>| aim.filter(|(l, _)| *l != n);
         self.arr_auto_focus = gone(self.arr_auto_focus);
@@ -12206,13 +12224,20 @@ impl TangentApp {
             .collect();
     }
 
-    /// **Close the automation rows `named` picks, open, armed and bypassed,
-    /// and keep them for the moment this gesture leaves**, so the undo that
-    /// brings their curves back opens them again (`Moment::rows_closed`).
-    /// For a track's removal and a plugin's replace, which take the curves
-    /// those rows draw.
-    fn close_auto_rows(&mut self, named: impl Fn(&(usize, crate::automation::AutoParam)) -> bool) {
+    /// **Close the automation rows on `lanes` and the rows `curves` name,
+    /// open, armed and bypassed, and keep them for the moment this gesture
+    /// leaves**, so the undo that brings their curves back opens them again
+    /// (`Moment::rows_closed`). For a track's removal (its lane) and a
+    /// plugin's replace (the curves that went), which take the curves those
+    /// rows draw. The lanes and curves are kept too, for the redo to shut
+    /// whatever of them stands open by then.
+    fn close_auto_rows(&mut self, lanes: &[usize], curves: &[(usize, crate::automation::AutoParam)]) {
         let kept = &mut self.rows_closed_since_moment;
+        kept.lanes.extend_from_slice(lanes);
+        kept.curves.extend_from_slice(curves);
+        let named = |row: &(usize, crate::automation::AutoParam)| {
+            lanes.contains(&row.0) || curves.contains(row)
+        };
         kept.open.extend(self.arr_auto_open.iter().filter(|r| named(r)));
         kept.armed.extend(self.arr_auto_armed.iter().filter(|r| named(r)));
         kept.bypassed.extend(self.arr_auto_bypassed.iter().filter(|r| named(r)));
@@ -12231,18 +12256,33 @@ impl TangentApp {
         self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
     }
 
-    /// The rows a moment closed, shut again with the aims that name them: a
-    /// redo across it took their curves away again, as its gesture did.
-    fn shut_auto_rows(&mut self, rows: &ClosedRows) {
+    /// The rows a moment's gesture takes, shut again with the aims that name
+    /// them: a redo across it took their curves away again, as its gesture
+    /// did. **Every row the gesture takes, not only the ones it closed**: a
+    /// row opened after the undo, on a curve the undo brought back, would
+    /// otherwise stand open (and armed) under the emptied slot. Answers what
+    /// it shut, which the moment keeps for the next undo to open.
+    fn shut_auto_rows(&mut self, rows: &ClosedRows) -> ClosedRows {
         let named = |row: &(usize, crate::automation::AutoParam)| {
-            rows.open.contains(row) || rows.armed.contains(row) || rows.bypassed.contains(row)
+            rows.takes(row)
+                || rows.open.contains(row)
+                || rows.armed.contains(row)
+                || rows.bypassed.contains(row)
+        };
+        let shut = ClosedRows {
+            open: self.arr_auto_open.iter().copied().filter(|r| named(r)).collect(),
+            armed: self.arr_auto_armed.iter().copied().filter(|r| named(r)).collect(),
+            bypassed: self.arr_auto_bypassed.iter().copied().filter(|r| named(r)).collect(),
+            lanes: rows.lanes.clone(),
+            curves: rows.curves.clone(),
         };
         self.arr_auto_open.retain(|r| !named(r));
         self.arr_auto_armed.retain(|r| !named(r));
         self.arr_auto_bypassed.retain(|r| !named(r));
         self.arr_auto_focus = self.arr_auto_focus.filter(|r| !named(r));
         self.auto_clipboard_from = self.auto_clipboard_from.filter(|r| !named(r));
-        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !shut.open.iter().any(|r| r.0 == *l));
+        shut
     }
 
     /// **Open an empty lane directly below `n`**, the rows under it shifting
@@ -16985,8 +17025,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // And the automation rows the session keeps beside the words, which
         // the words cannot put back, one crossed moment at a time: a
         // reorder's carry (see `carry_automation_rows`), and the rows its
-        // gesture closed with their curves, open again going back and shut
-        // again going forward (see `Moment::rows_closed`).
+        // gesture closed with their curves, open again going back, and every
+        // row it takes shut again going forward (see `Moment::rows_closed`).
         let crossed: Vec<usize> = if at < from {
             (at + 1..=from).rev().collect()
         } else {
@@ -17009,7 +17049,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.carry_automation_rows(&invert_order(&order));
                 }
                 if let Some(rows) = rows {
-                    self.shut_auto_rows(&rows);
+                    // What this redo shut is what the next undo opens: the
+                    // rows as they stood before it, one opened since the
+                    // last undo included.
+                    let shut = self.shut_auto_rows(&rows);
+                    if let Some(m) = self.history.get_mut(k) {
+                        m.rows_closed = Some(std::sync::Arc::new(shut));
+                    }
                 }
             }
         }
@@ -17548,16 +17594,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
         // **And the pedal, flattened by the same rule the notes were.**
         // Gluing a pedalled passage and getting back a dry one would be the
-        // same bug as gluing a repeat and losing the repeats.
-        let mut pedal: Vec<crate::arrangement::ArrPedal> = Vec::new();
-        for c in &picked {
-            pedal.extend(
-                crate::arrangement::clip_pedal_in_song_time(c)
-                    .into_iter()
-                    .map(|e| crate::arrangement::ArrPedal { at_s: e.at_s - start, ..e }),
-            );
-        }
-        pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        // same bug as gluing a repeat and losing the repeats. The clips are
+        // joined as playback joins them (`lane_pedal_in_song_time`): where
+        // two overlap, the first one's lift at its end does not cut a pedal
+        // the second still holds.
+        let pedal: Vec<crate::arrangement::ArrPedal> =
+            crate::arrangement::lane_pedal_in_song_time(&picked)
+                .into_iter()
+                .map(|e| crate::arrangement::ArrPedal { at_s: e.at_s - start, ..e })
+                .collect();
 
         let doomed: Vec<u64> = picked.iter().map(|c| c.id).collect();
         self.arrangement.clips.retain(|c| !doomed.contains(&c.id));
@@ -28474,26 +28519,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 f64,
             ),
         > = std::collections::BTreeMap::new();
-        // **In time order, not the document's.** A clip's pedal comes up at
-        // its end (`clip_pedal_in_song_time`), on the very instant the next
-        // clip presses it again when the two touch, and every sort below
-        // keeps the order it is given within an instant: in the document's
-        // order a later clip that came first there wrote its press before
-        // the earlier clip's lift, and the pedal read up under it.
-        let mut clips: Vec<&crate::arrangement::ArrClip> = self
+        let clips: Vec<&crate::arrangement::ArrClip> = self
             .arrangement
             .clips
             .iter()
             .filter(|c| c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id))
             .collect();
-        clips.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
-        for c in clips {
+        for c in &clips {
             let entry = by_lane
                 .entry(c.lane)
                 .or_insert_with(|| (Vec::new(), Vec::new(), 0.0));
             entry.0.extend(crate::arrangement::clip_notes_in_song_time(c));
-            entry.1.extend(crate::arrangement::clip_pedal_in_song_time(c));
             entry.2 = entry.2.max(c.start_s + c.len_s);
+        }
+        // **The pedal by lane, joined as playback joins it**
+        // (`lane_pedal_in_song_time`): where two clips overlap, the first
+        // one's lift at its end does not cut a pedal the second still holds,
+        // and where one presses on the instant another lets go nothing is
+        // written. One edge per pedal per instant, so the clips' order no
+        // longer matters to the sorts below; it did while each clip's lift
+        // and the next one's press were written side by side.
+        for (lane, entry) in by_lane.iter_mut() {
+            entry.1 = crate::arrangement::lane_pedal_in_song_time(
+                clips.iter().copied().filter(|c| c.lane == *lane),
+            );
         }
         if by_lane.is_empty() {
             // The selection went away between the row and the answer — a
@@ -32450,7 +32499,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // recorded, so a refused tap leaves nothing in `tap_times`. See
         // `RecorderState::tempo_held`: a take's count-in, or an export. The
         // Export dialog's tempo arrives by its own road and is held there
-        // (`hold_dialog_tempo`).
+        // (`hold_dialog_tempo`), and Reset Devices and Folders, which puts
+        // the tempo back, waits for it (`reset_settings`).
         if self.recorder.tempo_held()
             && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
         {
@@ -33406,7 +33456,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.automation = Automation::from_curves(curves);
         if !gone.is_empty() {
             let named = |row: &(usize, AutoParam)| gone.contains(row);
-            self.close_auto_rows(named);
+            self.close_auto_rows(&[], &gone);
             self.arr_auto_focus = self.arr_auto_focus.filter(|row| !named(row));
             self.auto_clipboard_from = self.auto_clipboard_from.filter(|row| !named(row));
             // Rows closed, slots renumbered: the choices that name slots go.
@@ -35401,6 +35451,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // while a take counts in or an export runs: see `session_held`. The
         // template scope is refused by `ask_before` below.
         if scope == crate::settings::ResetScope::Everything && self.session_held() {
+            return;
+        }
+        // **Devices and Folders puts the tempo back**, so it waits while the
+        // tempo is held (`RecorderState::tempo_held`), as every tempo control
+        // does. `take_devices` takes `record_export`, whose tempo the host
+        // pushes to the engine every frame, so the click was retimed under a
+        // take's count-in or an export. Refused rather than reset around the
+        // tempo: the scope also puts back the signature and the count-in,
+        // which time a count too (a 6/8 beat is half a 4/4 one), and the
+        // engine takes a new signature whenever no take is running - under
+        // the arrangement's record count, say. And refused before the backup
+        // below, so the copy an earlier reset's Undo puts back is not
+        // rewritten for a reset that never happened.
+        if scope == crate::settings::ResetScope::Devices && self.recorder.tempo_held() {
+            let why = if self.recorder.exporting {
+                "Devices and Folders wait for the export to end - their reset puts the tempo back, and the export is playing at it."
+            } else {
+                "Devices and Folders wait for the count-in's downbeat - their reset puts the tempo back, and the count is clicking at it."
+            };
+            self.notify(crate::notify::Kind::Info, why);
             return;
         }
         // **The template scope touches no setting**, so it takes none of the
@@ -56621,15 +56691,18 @@ mod tests {
         );
     }
 
-    /// **The exported pedal comes up where a clip ends, and the next clip
-    /// presses it again on the instant the two share.** Playback reads a
-    /// clip's pedal only inside the clip, so after it the pedal is up. The
-    /// export stated no lift at a clip's end, so a pedal held to the end of
-    /// the last clip stayed down for the rest of the file. And the lift now
-    /// stated there falls on the same instant as the next clip's press when
-    /// two clips touch, so the clips are written in time order: in the
-    /// document's, a later clip that came first there had its press written
-    /// before the earlier clip's lift, and the pedal read up under it.
+    /// **The exported pedal comes up where a clip ends, and stays down across
+    /// the instant two clips share when the next one holds it.** Playback
+    /// reads a clip's pedal only inside the clip, so after it the pedal is
+    /// up. The export stated no lift at a clip's end, so a pedal held to the
+    /// end of the last clip stayed down for the rest of the file. And where
+    /// two clips touch, the lift fell on the same instant as the next clip's
+    /// press: while the two were written side by side, the document's order
+    /// decided which came first, and a later clip listed first had its press
+    /// written before the earlier clip's lift, so the pedal read up under
+    /// it. The lane's pedal is joined as playback joins it now
+    /// (`lane_pedal_in_song_time`), which holds it across the seam whatever
+    /// the order.
     #[test]
     fn the_exported_pedal_comes_up_where_a_clip_ends() {
         use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
@@ -56683,6 +56756,86 @@ mod tests {
             got.pedal
         );
         assert_eq!(damper(2.5), 0, "the pedal stayed down past the last clip's end: {:?}", got.pedal);
+    }
+
+    /// **Glue and the MIDI export hold the pedal where an overlapping clip
+    /// holds it, at the higher of the two levels, as playback does.** The
+    /// engine reads a lane's pedal as the highest level among the clips the
+    /// playhead stands inside (`Renderer::clip_pedal_level`). Both roads
+    /// laid each clip's own edges side by side instead, so the first clip's
+    /// lift at its end cut the damper the second still held, and the
+    /// second's half pedal, pressed while the first held it down, lowered
+    /// it under the first.
+    #[test]
+    fn glue_and_midi_export_hold_the_pedal_an_overlapping_clip_holds() {
+        use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
+        let fixture = || {
+            let (_, mut app) = headless(Caps::DESKTOP);
+            let note = ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false };
+            // Down a quarter of a second in, and never lifted.
+            app.arrangement.clips.push(ArrClip {
+                id: 1,
+                lane: 3,
+                kind: ClipKind::Midi,
+                start_s: 0.0,
+                len_s: 2.0,
+                notes: vec![note.clone()],
+                pedal: vec![ArrPedal { at_s: 0.25, cc: 64, value: 127 }],
+                ..Default::default()
+            });
+            // Over its second half: a half pedal from its own start, held.
+            app.arrangement.clips.push(ArrClip {
+                id: 2,
+                lane: 3,
+                kind: ClipKind::Midi,
+                start_s: 1.0,
+                len_s: 2.0,
+                notes: vec![note],
+                pedal: vec![ArrPedal { at_s: 0.0, cc: 64, value: 40 }],
+                ..Default::default()
+            });
+            app.arr_multi = vec![1, 2];
+            app
+        };
+        // What playback holds: the first clip's 127 from 0.25, still 127
+        // where the two overlap, the second's 40 once the first has ended,
+        // and up past the second.
+        let heard = [(0.1, 0), (0.5, 127), (1.5, 127), (2.5, 40), (3.5, 0)];
+
+        let mut app = fixture();
+        app.arr_glue_selection();
+        assert_eq!(app.arrangement.clips.len(), 1, "the two were not welded");
+        // The weld read as the engine reads a clip: its own schedule, inside
+        // the clip, and up outside it.
+        let glued = app.arrangement.clips[0].clone();
+        let edges = crate::arrangement::clip_pedal_in_song_time(&glued);
+        let damper = |t: f64| {
+            if t < glued.start_s || t >= glued.start_s + glued.len_s {
+                return 0;
+            }
+            edges.iter().filter(|e| e.cc == 64 && e.at_s <= t + 1.0e-9).last().map_or(0, |e| e.value)
+        };
+        for (t, want) in heard {
+            assert_eq!(damper(t), want, "the glued clip's damper at {t} s: {edges:?}");
+        }
+
+        let mut app = fixture();
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request().expect("no save panel was asked for");
+        let dir = export_dir("pedal-overlap");
+        let path = dir.join("part.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+        let got = crate::smf_read::read(&std::fs::read(&path).expect("the file")).expect("not an SMF");
+        let damper = |t: f64| {
+            got.pedal
+                .iter()
+                .filter(|e| e.cc == 64 && e.at_s <= t + 1.0e-3)
+                .last()
+                .map_or(0, |e| e.value)
+        };
+        for (t, want) in heard {
+            assert_eq!(damper(t), want, "the exported damper at {t} s: {:?}", got.pedal);
+        }
     }
 
     /// **The clip menu's rows keep their meanings when Export MIDI appears.**
@@ -69530,6 +69683,77 @@ mod tests {").expect("the tests module")];
         );
     }
 
+    /// **Reset Devices and Folders waits while the tempo is held.** The
+    /// scope puts the take settings back with the devices (`take_devices`):
+    /// `record_export`, whose tempo the click and every count play at, the
+    /// signature and the count-in. It switches no session, so the session
+    /// holds above never asked about it, and nothing asked `tempo_held`:
+    /// the host pushes the tempo to the engine every frame, so a reset
+    /// during a take's count-in retimed the click under the take (F-TK-09's
+    /// family). Refused now under every count the tempo holds for (the
+    /// take's pre-roll, a count in its file, the arrangement's record
+    /// count) and under an export, before anything is reset or the Undo
+    /// copy is rewritten, with a note; with nothing holding the tempo it
+    /// goes ahead as before.
+    #[test]
+    fn a_devices_reset_waits_while_the_tempo_is_held() {
+        let (ctx, mut app) = recorder_app();
+        let fresh = Settings::first_launch();
+        app.settings.record_export.tempo_bpm = 97.0;
+        app.settings.record_time_signature = "3/4".to_owned();
+        app.settings.record_audio_device = Some("Scarlett 18i20".to_owned());
+        assert_ne!(fresh.record_export.tempo_bpm, 97.0, "the reset would not move the fixture's tempo");
+        assert_ne!(fresh.record_time_signature, "3/4", "the reset would not move the fixture's signature");
+        let _ = std::fs::remove_file(Settings::backup_path());
+        for (label, state, counting, exporting) in [
+            ("a take's pre-roll", recorder::RecordState::CountIn { beat: 1, of: 4 }, true, false),
+            ("a count in a take's file", recorder::RecordState::Rolling, true, false),
+            ("the arrangement's record count", recorder::RecordState::Idle, true, false),
+            ("a realtime export", recorder::RecordState::Rolling, false, true),
+            // Its take stopped, its files not landed yet.
+            ("an export filing itself", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.take_counting = counting;
+            app.recorder.exporting = exporting;
+            app.messages.clear();
+            app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Devices));
+            run_frame(&ctx, &mut app);
+            assert_eq!(app.tempo_bpm(), 97.0, "Reset Devices and Folders moved the held tempo under {label}");
+            assert_eq!(
+                app.settings.record_time_signature, "3/4",
+                "Reset Devices and Folders moved the signature under {label}"
+            );
+            assert_eq!(
+                app.settings.record_audio_device.as_deref(),
+                Some("Scarlett 18i20"),
+                "a refused reset still forgot the interface under {label}"
+            );
+            assert!(!app.said().notes().is_empty(), "the refusal under {label} said nothing");
+            assert!(
+                !matches!(app.open_dialog(), Some(Dialog::Confirm { .. })),
+                "a refused reset reported itself done under {label}"
+            );
+            assert!(
+                !Settings::backup_path().exists(),
+                "a refused reset rewrote the copy an earlier reset's Undo puts back, under {label}"
+            );
+        }
+        // Nothing holds the tempo: the reset goes ahead, tempo and all.
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.take_counting = false;
+        app.recorder.exporting = false;
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Devices));
+        run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.tempo_bpm(),
+            fresh.record_export.tempo_bpm,
+            "with nothing holding the tempo the reset did not put it back"
+        );
+        assert_eq!(app.settings.record_audio_device, fresh.record_audio_device, "the reset forgot nothing");
+        let _ = std::fs::remove_file(Settings::backup_path());
+    }
+
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
     ///
     /// The chord the owner asked for — "Ctrl/CMD + S to save should summon a
@@ -73197,6 +73421,83 @@ mod folder_tests {
         a.redo();
         assert!(!a.arr_auto_is_open(3, freq), "the redo left the EQ's row open over the compressor's knob");
         assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
+    }
+
+    /// **A redo closes every row its gesture takes away, a row opened after
+    /// the undo included.** The moment kept only the rows that stood open
+    /// when the track was removed or the plugin replaced, so a row opened
+    /// after the undo, on a curve the undo had brought back, stayed open and
+    /// armed after the redo: under the emptied slot, for the next track made
+    /// there to write into, or over the newcomer's knob of the same id. The
+    /// moment keeps what its gesture takes now (every row of a removed lane,
+    /// the rows of a replaced plugin's curves), the redo shuts all of it, and
+    /// the undo after the redo opens what the redo shut.
+    #[test]
+    fn a_redo_closes_a_row_opened_after_the_undo() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        // A track's REMOVAL, with Mute's row open and Gain's curve drawn
+        // under a shut row.
+        let mut a = app();
+        a.add_bare_track(3);
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            a.arr_toggle_automation_param(3, p);
+            a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
+        }
+        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_save_edits();
+        assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "fixture: Gain's row is open at the removal");
+        a.remove_channel(3);
+        a.undo();
+        assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "fixture: the undo brought no curve back");
+        // Opened after the undo, on the curve it brought back, and armed:
+        // session state, so the redo is still there to take.
+        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_auto_armed.insert((3, AutoParam::Gain));
+        a.redo();
+        assert!(
+            a.arrangement.automation.get(3, AutoParam::Gain).is_none(),
+            "fixture: the redo did not take the track away again"
+        );
+        assert!(
+            !a.arr_auto_is_open(3, AutoParam::Gain),
+            "the redo left a row opened after the undo standing under the empty slot"
+        );
+        assert!(
+            !a.arr_auto_armed.contains(&(3, AutoParam::Gain)),
+            "the redo left that row's arm for the next track made there"
+        );
+        a.undo();
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            assert!(a.arr_auto_is_open(3, p), "the undo after the redo brought {p:?}'s row back shut");
+        }
+        assert!(a.arr_auto_armed.contains(&(3, AutoParam::Gain)), "the undo after the redo dropped the arm");
+
+        // A plugin's REPLACE, with the EQ's frequency row open and a second
+        // curve of its under a shut row.
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        let gain = AutoParam::Plugin { bay: 0, id: 5 };
+        for p in [freq, gain] {
+            a.arrangement.automation.set(Curve::sanitised(
+                3,
+                p,
+                vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+            ));
+        }
+        a.arr_auto_open.insert((3, freq));
+        a.arr_save_edits();
+        a.set_insert(3, 0, Some("@tangent-comp"));
+        a.undo();
+        assert!(a.arrangement.automation.get(3, gain).is_some(), "fixture: the undo put the EQ back without its curve");
+        a.arr_toggle_automation_param(3, gain);
+        a.redo();
+        assert_eq!(a.insert(3, 0), Some("@tangent-comp"), "fixture: the redo did not seat the compressor again");
+        assert!(
+            !a.arr_auto_is_open(3, gain),
+            "the redo left the EQ's row, opened after the undo, open over the compressor's knob"
+        );
     }
 
     /// **A curve outlives its plugin and never attaches to the next one.**
