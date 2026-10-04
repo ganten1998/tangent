@@ -1455,7 +1455,8 @@ pub struct TangentApp {
     /// on a seat.
     sampler_info: HashMap<usize, crate::ports::SamplerInfo>,
     /// **Samples chosen but not yet handed over**, oldest first: the SEAT,
-    /// the BAY, and the file. The face raises a path, this holds it, and the
+    /// the BAY, and the file as the bay is to store it (`media/<name>` once
+    /// it is in the project). The face raises a path, this holds it, and the
     /// host drains it with `take_sampler_load`. A queue and not a slot: two
     /// windows can be open on two samplers, and dropping one of two loads is
     /// a load that silently did not happen.
@@ -9798,7 +9799,12 @@ impl TangentApp {
     ///
     /// One `is_dir` per call, not per pad: the callers ask once and fan out
     /// over a hundred and twenty-eight slots.
-    fn kit_doc(&self) -> Option<std::path::PathBuf> {
+    ///
+    /// **The sampler's file resolves against it too**: the host reads a
+    /// sampler bay's `media/<name>` here (`desktop::sampler_file`), so the
+    /// one sample a sampler plays and the kit's can never disagree about
+    /// where a scratch's media is.
+    pub fn kit_doc(&self) -> Option<std::path::PathBuf> {
         Some(media_doc(self.project_doc()?, self.media_source.as_deref()))
     }
 
@@ -29289,14 +29295,45 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **The next sample a face asked to load** — seat, bay and file, oldest
     /// first, taken off the queue as it is read. `None` when nothing is
-    /// waiting.
+    /// waiting. The file is what the bay is to store: `media/<name>`,
+    /// relative to the project it was copied into, or the path as given when
+    /// no project is open (see `sample_into_project`).
     pub fn take_sampler_load(&mut self) -> Option<(usize, usize, std::path::PathBuf)> {
         self.sampler_load.pop_front()
     }
 
+    /// **Bring a file the sampler is about to play INTO the project, and
+    /// answer what its bay stores**: `media/<name>`, relative, as a pad stores
+    /// its sample.
+    ///
+    /// The bay used to store the path it was handed, verbatim. A file from a
+    /// library played only for as long as nobody moved the library, and a
+    /// take dragged out of a session nobody had saved yet was bound as
+    /// `.../Untitled/media/take.wav`, which the first save renames away
+    /// (`save_project_first`): the sampler came back missing whenever the
+    /// project was opened. Copied through the one door every import and pad
+    /// load uses (`copy_into_media`: a name another file has taken gets a
+    /// number, nothing the project has is written over, and a file already in
+    /// its `media/` is not copied again), the sample travels with the folder,
+    /// and the host reads it against `kit_doc`.
+    ///
+    /// **Real first**, as `drumpad_load` makes it, so a fresh session's
+    /// template media comes across before `kit_doc` turns to the project.
+    /// With no project open there is nowhere to copy to, and the file is
+    /// answered as given, which is what every bay stored before. `None` when
+    /// the copy failed; the caller says so.
+    fn sample_into_project(&self, file: &std::path::Path) -> Option<std::path::PathBuf> {
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return Some(file.to_path_buf());
+        };
+        self.materialize_project_dir();
+        copy_into_media(&doc, file).map(std::path::PathBuf::from)
+    }
+
     /// Put a load on the queue. The one door: the browser row, the drop and
     /// the OS file drag all arrive here, because they differ only in how the
-    /// path was found.
+    /// path was found. `path` is what the bay is to store - see
+    /// [`Self::sample_into_project`].
     fn queue_sampler_load(&mut self, lane: usize, bay: usize, path: std::path::PathBuf) {
         self.sampler_load.push_back((lane, bay, path));
         // The file may have landed in the folder the browser is standing in
@@ -36007,7 +36044,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // this frame instead of waiting on a decode the host
                     // does a frame or more from now.
                     self.audition_media(&file);
-                    self.queue_sampler_load(seat, bay, file);
+                    // **Into the project, and the bay stores where it
+                    // landed** - see [`Self::sample_into_project`].
+                    match self.sample_into_project(&file) {
+                        Some(stored) => self.queue_sampler_load(seat, bay, stored),
+                        None => self.notify(
+                            crate::notify::Kind::Error,
+                            format!(
+                                "{name} could not be copied into the project, \
+                                 so the sampler did not load it."
+                            ),
+                        ),
+                    }
                 } else {
                     self.notify(
                         crate::notify::Kind::Error,
@@ -78291,6 +78339,164 @@ mod sampler_road_tests {
             got.0,
             template.join("media").join("Loop.wav"),
             "the drag carried a file in a folder that does not exist"
+        );
+    }
+
+    /// **A template's clip dropped on the sampler binds the project's own
+    /// copy, never the template's file.** The drag carries the file the
+    /// timeline plays, which in a fresh session is still the template's (the
+    /// test above), and the bay stored it verbatim: the sampler went on
+    /// playing the stencil's file by its absolute path in every project saved
+    /// from that session. The drop makes the session real, which brings the
+    /// clip's audio across (`materialize_project_dir`), and the bay stores
+    /// that copy, relative.
+    #[test]
+    fn a_template_clip_dropped_on_the_sampler_binds_the_projects_copy() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-drop-template-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        std::fs::write(template.join("media").join("Loop.wav"), b"RIFFxxxxWAVE").expect("loop");
+        let mut doc = Arrangement::default();
+        doc.add_clip(a_clip(ClipKind::Audio, "media/Loop.wav"));
+        doc.save_to(&template.join(DOC_NAME));
+
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
+        let scratch = root.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        let id = app.arrangement.clips[0].id;
+        a_drag_in_flight(&ctx);
+        app.arm_clip_drag(&ctx, id);
+        let dragged = egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx)
+            .expect("the clip published nothing")
+            .0
+            .clone();
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: dragged.to_string_lossy().into_owned(),
+        });
+        let stored = app.take_sampler_load().map(|(_, _, p)| p);
+        let copied = scratch.join("media").join("Loop.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            stored,
+            Some(std::path::PathBuf::from("media/Loop.wav")),
+            "the sampler was bound to the template's own file"
+        );
+        assert!(copied, "the drop did not bring the clip's audio into the project");
+    }
+
+    /// **A sample the sampler is given lives in the project, and is still
+    /// there after the first save moves the folder and the project is
+    /// opened again.**
+    ///
+    /// The bay stored the path it was handed, verbatim. A take makes a
+    /// scratch real, so a take dragged onto the sampler before the session
+    /// had a name was bound as `.../Untitled/media/take.wav`, and the first
+    /// save MOVES that folder to the chosen name (`save_project_first`): the
+    /// sampler named a file that was gone, and came back missing whenever the
+    /// project was opened. A file from a library was bound where it lay, so
+    /// the project played it only for as long as nobody moved the library.
+    ///
+    /// The file comes INTO the project's `media/` now, through the copy every
+    /// import and pad load makes (`copy_into_media`), and a session nobody has
+    /// written yet is made real for it first; a file already there is not
+    /// copied again; and the bay stores `media/<name>`, relative, which the
+    /// host reads against the project wherever it is (`kit_doc`, by the pads'
+    /// own rule).
+    #[test]
+    fn a_sample_lives_in_the_project_and_survives_the_first_save() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sampler-into-project-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let projects = root.join("Projects");
+        let template = projects.join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        Arrangement::default().save_to(&template.join(DOC_NAME));
+        // A kit in the template, whose sample has to come across when the
+        // sampler is what makes the scratch real.
+        std::fs::write(template.join("media").join("Kick.wav"), b"RIFFkickWAVE").expect("a kit sample");
+        let mut kit = crate::drumpad::DrumpadDoc::default();
+        kit.pads[36].path = "media/Kick.wav".to_owned();
+        kit.save_beside(&template.join(DOC_NAME));
+        let library = root.join("Library");
+        std::fs::create_dir_all(&library).expect("a library");
+        std::fs::write(library.join("Upright.wav"), b"RIFFuprtWAVE").expect("a library sample");
+
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        let scratch = projects.join("Untitled");
+        app.adopt_template(&template, &scratch);
+
+        // A file out of the library, into a session nobody has written yet.
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: library.join("Upright.wav").to_string_lossy().into_owned(),
+        });
+        let (_, _, upright) = app.take_sampler_load().expect("the library file was not queued");
+        // A take: written into the scratch, which the take makes real, and
+        // dragged out of the arrangement as the timeline plays it.
+        app.materialize_project_dir();
+        std::fs::write(scratch.join("media").join("take.wav"), b"RIFFtakeWAVE").expect("a take");
+        let id = app.arrangement.add_clip(a_clip(ClipKind::Audio, "media/take.wav"));
+        a_drag_in_flight(&ctx);
+        app.arm_clip_drag(&ctx, id);
+        let dragged = egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx)
+            .expect("the take published nothing")
+            .0
+            .clone();
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: dragged.to_string_lossy().into_owned(),
+        });
+        let (_, _, take) = app.take_sampler_load().expect("the take was not queued");
+        let mut in_media: Vec<String> = std::fs::read_dir(scratch.join("media"))
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        in_media.sort();
+
+        // The first save moves the scratch to its name, and the project is
+        // opened again: the host reads each bay's file against it.
+        let song = projects.join("Song");
+        assert!(app.save_project_first(&song), "the first save was refused");
+        app.open_project(&crate::arrangement::doc_in(&song));
+        let doc = app.kit_doc().expect("the project is open");
+        let heard = [&take, &upright].map(|p| {
+            let file = crate::drumpad::resolve(&doc, &p.to_string_lossy());
+            let there = file.starts_with(&song) && file.is_file();
+            (file, there)
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        for (file, there) in &heard {
+            assert!(
+                *there,
+                "the sampler's sample is not in the project after its first save: {}",
+                file.display()
+            );
+        }
+        assert_eq!(
+            [upright, take],
+            [std::path::PathBuf::from("media/Upright.wav"), std::path::PathBuf::from("media/take.wav")],
+            "the bay was not handed the project's own copy, relative"
+        );
+        assert!(
+            in_media.iter().any(|f| f == "Kick.wav"),
+            "the sampler made the scratch real without its template's kit sample: {in_media:?}"
+        );
+        assert_eq!(
+            in_media,
+            ["Kick.wav", "Upright.wav", "take.wav"],
+            "a file already in the project was copied again"
         );
     }
 

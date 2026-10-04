@@ -2107,9 +2107,10 @@ pub enum DialogAction {
     /// END, this enum's law.
     ///
     /// Desk terms, like [`Self::SetInsertIr`] beside it — the app converts
-    /// to a seat and raises the load on the sampler's own road. A path and
-    /// nothing else: the face found where the file is, and the host owns
-    /// every byte that moves.
+    /// to a seat, copies the file into the project's `media/` (the bay
+    /// stores that copy, relative: `TangentApp::sample_into_project`) and
+    /// raises the load on the sampler's own road. A path and nothing else:
+    /// the face found where the file is, and never moves a byte of it.
     PickSample {
         strip: usize,
         slot: usize,
