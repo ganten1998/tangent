@@ -1571,6 +1571,24 @@ mod tests {
         );
     }
 
+    /// **The metronome chord is described as it behaves.** Cmd/Ctrl+M opens
+    /// the panel in the MIDDLE of the timeline - the owner's call, since a
+    /// panel that opens wherever the hand happens to be has to be found -
+    /// and the card went on saying "at the pointer" after the centring
+    /// shipped.
+    #[test]
+    fn the_metronome_chord_is_described_as_it_behaves() {
+        let rows = card_rows(Gates::default(), HelpView::Arrange);
+        let (_, said) = rows
+            .iter()
+            .find(|(k, _)| *k == "C-M")
+            .expect("no C-M row on the arrangement's card");
+        assert!(
+            !said.contains("pointer"),
+            "the card says Cmd+M opens at the pointer; it opens in the middle of the timeline: {said}"
+        );
+    }
+
     /// **F6 is listed, and it tells the reader-mode truth.** In
     /// accessibility mode egui takes Tab to walk the controls — that is
     /// what a screen-reader user presses it for — so a card whose only

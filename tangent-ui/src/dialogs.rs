@@ -2738,6 +2738,13 @@ const AUDIO_W: f32 = 430.0;
 /// string the panel controls.
 const MAKER_MAX: usize = 46;
 
+/// **What "the system's own" is under ASIO**, said under Setup's OUTPUT row
+/// while ASIO is the system running. ASIO has no default device: cpal opens
+/// the first driver in Windows' list that answers (`resolve_output` skips
+/// one with no hardware), which can be a wrapper such as ASIO4ALL - and the
+/// chip that reads as "whatever the OS uses" was lit over it.
+const ASIO_OWN_OUTPUT: &str = "under ASIO, the system's own is the first driver that answers";
+
 /// `s`, cut to `max` characters with an ellipsis when it was longer.
 ///
 /// Counted in CHARACTERS and not bytes: a maker name with an accent in it
@@ -7985,7 +7992,24 @@ fn show_on(
                                             // **Double click puts it back.**
                                             // On the knob itself, which is
                                             // where the hand already is.
-                                            if resp.double_clicked() {
+                                            //
+                                            // **Read off the pointer, not the
+                                            // slider**: egui's `Slider` senses
+                                            // DRAG only, so its own
+                                            // `double_clicked()` is never true
+                                            // and this never fired. Each press
+                                            // of the double is a drag the knob
+                                            // follows, and the second one's
+                                            // release - `drag_stopped`, on THIS
+                                            // knob - is where the pointer says
+                                            // the click was the second of two.
+                                            let double = resp.drag_stopped()
+                                                && ui.input(|i| {
+                                                    i.pointer.button_double_clicked(
+                                                        egui::PointerButton::Primary,
+                                                    )
+                                                });
+                                            if double {
                                                 v = *default;
                                             }
                                             let resp = resp.on_hover_text(format!(
@@ -7995,7 +8019,7 @@ fn show_on(
                                             // go, a reset, or a step from the
                                             // keyboard, which no drag frames.
                                             let done = resp.drag_stopped()
-                                                || resp.double_clicked()
+                                                || double
                                                 || (resp.changed() && !resp.dragged());
                                             if resp.changed() || done {
                                                 *cur = v;
@@ -10055,8 +10079,18 @@ fn show_on(
                                         *output = None;
                                         action = Some(DialogAction::SetAudioOutput(None));
                                     }
-                                    for name in outputs.iter() {
-                                        let on = output.as_deref() == Some(name.as_str());
+                                    // **The chip the OPEN would pick**, by
+                                    // its own rule (exact, then a case-blind
+                                    // substring): an exact match here alone
+                                    // left a renamed device playing with no
+                                    // chip lit. A name that matches nothing
+                                    // lights nothing - the setting still
+                                    // names it, and the stand-in is said.
+                                    let lit = output.as_deref().and_then(|want| {
+                                        crate::ports::match_output_name(outputs, want)
+                                    });
+                                    for (i, name) in outputs.iter().enumerate() {
+                                        let on = lit == Some(i);
                                         if ui.selectable_label(on, name).clicked() && !on {
                                             *output = Some(name.clone());
                                             action =
@@ -10066,6 +10100,17 @@ fn show_on(
                                         }
                                     }
                                 });
+                                // **And under ASIO, said where it is pressed.**
+                                // The comment above is no use to the person
+                                // at the panel, who saw "the system's own"
+                                // lit and believed it was their interface.
+                                if system.as_deref() == Some("ASIO") {
+                                    ui.label(
+                                        RichText::new(ASIO_OWN_OUTPUT)
+                                            .font(plain(10.0))
+                                            .color(dim),
+                                    );
+                                }
                             }
                             ui.add_space(10.0);
 
@@ -15715,6 +15760,8 @@ at: None,
             "REPORTS".to_owned(),
             "Say what each take produced".to_owned(),
             "a take with a PROBLEM says so either way".to_owned(),
+            // The OUTPUT row's line under ASIO, small print at 10.
+            ASIO_OWN_OUTPUT.to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -15729,7 +15776,7 @@ at: None,
                         // The output-path block: its heading is bold at 11
                         // and everything under it is small print at 10.
                         15 => (11.0, fonts::courier_bold()),
-                        14 | 16..=18 | 21 => (10.0, fonts::courier()),
+                        14 | 16..=18 | 21 | 22 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(
@@ -15875,6 +15922,126 @@ at: None,
             "a list a system press left behind does not say when the new one comes"
         );
         assert!(!bare.says("none reported"), "a system not yet asked reads as one with no outputs");
+    }
+
+    /// **The lit OUTPUT chip is the device that opens.** The open finds the
+    /// setting's name exactly and then as a case-blind substring
+    /// (`ports::match_output_name`), and the row lit a chip only on an exact
+    /// match: a "Komplete Audio 6" saved before the box was renamed opened
+    /// the "Komplete Audio 6 MK2" with nothing lit, so the panel said no
+    /// output was chosen while one played. The row lights by the open's own
+    /// rule now.
+    ///
+    /// A lit chip is told by the fill behind its word: a selected label
+    /// paints one and an unselected one does not (the theme gives both the
+    /// same ink).
+    #[test]
+    fn the_output_row_lights_the_device_that_opens() {
+        let fills_under = |output: Option<&str>, word: &str| -> usize {
+            let mut slot = Slot::new(Dialog::AudioSetup {
+                status: crate::recorder::AudioStatus::default(),
+                buffer: None,
+                ahead: 0.0,
+                rate: None,
+                systems: vec!["WASAPI".to_owned()],
+                system: Some("WASAPI".to_owned()),
+                outputs: vec![
+                    "Speakers (Realtek High Definition Audio)".to_owned(),
+                    "Komplete Audio 6 MK2".to_owned(),
+                ],
+                output: output.map(str::to_owned),
+                outputs_stale: false,
+                rates: Vec::new(),
+                input_channels: 0,
+                exposed: Vec::new(),
+                take_summary: true,
+                alias: String::new(),
+                output_path: crate::ports::OutputPath::default(),
+            });
+            let _ = slot.settle();
+            let face = slot.face;
+            let dialog = &mut slot.dialog;
+            let out = slot.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                    time: Some(slot.clock + 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, dialog, face, Slot::placement());
+                },
+            );
+            let mut texts: Vec<(Rect, String)> = Vec::new();
+            let mut fills: Vec<Rect> = Vec::new();
+            fn walk(s: &egui::epaint::Shape, texts: &mut Vec<(Rect, String)>, fills: &mut Vec<Rect>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => texts.push((
+                        Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        t.galley.text().to_owned(),
+                    )),
+                    egui::epaint::Shape::Rect(r) if r.fill.a() > 0 => fills.push(r.rect),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts, fills)),
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                walk(&c.shape, &mut texts, &mut fills);
+            }
+            let at = texts
+                .iter()
+                .find(|(_, t)| t == word)
+                .unwrap_or_else(|| panic!("nothing on screen says {word:?}"))
+                .0
+                .center();
+            fills.iter().filter(|r| r.contains(at)).count()
+        };
+        let lit = fills_under(Some("Komplete Audio 6 MK2"), "Komplete Audio 6 MK2");
+        let unlit = fills_under(None, "Komplete Audio 6 MK2");
+        assert!(lit > unlit, "the fixture cannot tell a lit chip from an unlit one ({lit} fills against {unlit})");
+        for saved in ["Komplete Audio 6", "komplete audio 6 mk2"] {
+            assert_eq!(
+                fills_under(Some(saved), "Komplete Audio 6 MK2"),
+                lit,
+                "a saved {saved:?} opens the Komplete Audio 6 MK2, and its chip is not lit"
+            );
+            assert_eq!(
+                fills_under(Some(saved), "the system's own"),
+                fills_under(Some("Komplete Audio 6 MK2"), "the system's own"),
+                "a saved {saved:?} lit the system's own"
+            );
+        }
+    }
+
+    /// **Under ASIO the row says what "the system's own" is.** ASIO has no
+    /// default device - cpal opens the first driver in Windows' list that
+    /// answers - so the chip that reads as "whatever the OS uses" is, there,
+    /// ASIO4ALL or FL Studio ASIO as often as the interface: the Komplete
+    /// Audio 6 owner saw it lit and believed he had chosen his box. Said
+    /// under the row while ASIO is the system running, and not otherwise.
+    #[test]
+    fn under_asio_the_output_row_says_what_the_systems_own_is() {
+        let says_it = |system: &str| {
+            let mut slot = Slot::new(Dialog::AudioSetup {
+                status: crate::recorder::AudioStatus::default(),
+                buffer: None,
+                ahead: 0.0,
+                rate: None,
+                systems: vec!["ASIO".to_owned(), "WASAPI".to_owned()],
+                system: Some(system.to_owned()),
+                outputs: vec!["ASIO4ALL v2".to_owned(), "Komplete Audio 6 MK2".to_owned()],
+                output: None,
+                outputs_stale: false,
+                rates: Vec::new(),
+                input_channels: 0,
+                exposed: Vec::new(),
+                take_summary: true,
+                alias: String::new(),
+                output_path: crate::ports::OutputPath::default(),
+            });
+            slot.says(ASIO_OWN_OUTPUT)
+        };
+        assert!(says_it("ASIO"), "under ASIO the row does not say what the system's own is");
+        assert!(!says_it("WASAPI"), "the ASIO line is drawn under a system that has a default");
     }
 
     /// **The buffer chip and the readout above it cannot disagree about who
@@ -21550,6 +21717,103 @@ at: None,
             "a keyboard step on the knob did not end its gesture: {}",
             say(&step)
         );
+    }
+
+    /// **A double click puts a Keys knob back**, as its hover line says.
+    /// egui's `Slider` senses DRAG only, so the `double_clicked()` the panel
+    /// asked it was always false and the double click did nothing but jump
+    /// the knob to the pointer twice. The second release of a double click
+    /// lands the knob on the bench's own value, and says `done` - one undo
+    /// moment, wave one's rule for the reset.
+    #[test]
+    fn a_double_click_puts_a_keys_knob_back() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        };
+        let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut dialog = Some(Dialog::KeysPatch {
+            slot: 0,
+            selected: 0,
+            params: [0.5; KEYS_PARAMS],
+        });
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut action = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show(ctx, &mut dialog, face, placement);
+                },
+            );
+            action
+        };
+        let _ = frame(Vec::new());
+        let _ = frame(Vec::new());
+        // The knobs, found as `a_keys_knob_reports_the_end_of_its_gesture`
+        // finds them: drag-only widgets of a slider's size.
+        let knobs: Vec<Rect> = ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| {
+                    w.sense.senses_drag()
+                        && !w.sense.senses_click()
+                        && (10.0..40.0).contains(&w.rect.height())
+                        && (60.0..300.0).contains(&w.rect.width())
+                })
+                .map(|w| w.rect)
+                .collect()
+        });
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut tried = false;
+        for r in knobs {
+            // Far from the middle, so the clicks' own jump is never the
+            // bench's value by accident.
+            let at = r.lerp_inside(Vec2::new(0.95, 0.5));
+            let first = frame(vec![egui::Event::PointerMoved(at), button(at, true)]);
+            let Some(DialogAction::SetKeysParam { knob, .. }) = first else {
+                continue;
+            };
+            let default = KEYS_PARAM_SPECS[0][knob].2;
+            let _ = frame(vec![button(at, false)]);
+            let _ = frame(vec![button(at, true)]);
+            let second = frame(vec![button(at, false)]);
+            match second {
+                Some(DialogAction::SetKeysParam { knob: k, value, done, .. }) => {
+                    assert_eq!(k, knob, "the reset landed on another knob");
+                    assert!(
+                        (value - default).abs() < 1.0e-6,
+                        "a double click left the knob at {value}, not the bench's {default}"
+                    );
+                    assert!(done, "the double click's reset did not end the gesture");
+                }
+                Some(_) => panic!("the double click asked for something else"),
+                None => panic!("the double click's second release said nothing"),
+            }
+            tried = true;
+            break;
+        }
+        assert!(tried, "no drag-only widget in the panel moved a knob");
     }
 
     /// **The classification is the only switch.** A plugin dialog goes

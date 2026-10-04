@@ -2113,7 +2113,25 @@ impl Layout {
         }
         self.fill_vari(cell);
         self.fill_vari_label();
+        self.unseat_an_undrawable_vari();
         self.centre_lufs_between_the_word_and_the_master();
+    }
+
+    /// **A pitch dial that cannot be drawn is not seated.** `fill_vari`
+    /// seats on `knob_fits` - a knob's face - while the painter draws the
+    /// dial only when `vari_face` finds room, and that also keeps the PITCH
+    /// CONT word's whole line above it: a cell between the two floors was a
+    /// live drag target over blank panel. Asked once the word's strip is
+    /// known, with the very pair `draw_varispeed` and the right-click
+    /// (`on_knob_circle`) ask. No window the app opens reaches such a cell
+    /// today; `Layout::new` takes any rect, and this keeps the rule the
+    /// layout's rather than the window's. (The road taken when the master is
+    /// refused seats no dial at all: `vari_cell` has no foot to stand it on.)
+    fn unseat_an_undrawable_vari(&mut self) {
+        if self.vari.is_positive() && vari_face(self.vari, self.vari_label).is_none() {
+            self.vari = Rect::NOTHING;
+            self.vari_label = Rect::NOTHING;
+        }
     }
 
     /// **Put the loudness meter midway between the PITCH CONT text and the
@@ -2547,8 +2565,8 @@ pub enum Hit {
     PickAudio,
     /// Step the count-in through `COUNT_IN_CHOICES` - off, 1, 2, 4 BARS - and
     /// back round to off. A length off that list (the metronome panel's 3 or
-    /// 5-8 bars) starts the cycle over at off. Stepped in
-    /// `TangentApp::apply_recorder_hit`; see also [`next_count_in`].
+    /// 5-8 bars) steps to the next choice above it: 3 to 4, and 5-8 round to
+    /// off. Stepped by [`next_count_in`], in `TangentApp::apply_recorder_hit`.
     CycleCountIn,
     Export,
     /// Whether the click is also recorded into the file. Lives in the
@@ -2715,7 +2733,7 @@ impl Hit {
             Hit::Capture => "Capture the session — video, audio, MIDI — apart from the arrangement",
             Hit::ProjectMenu => "Project — new, open, save, save as, template",
             Hit::Pause => "Pause — hold the playhead here; Stop goes home",
-            Hit::OpenSetup => "Take settings",
+            Hit::OpenSetup => "Settings - audio and media",
             Hit::CloseSetup => "Done",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
@@ -3239,7 +3257,11 @@ fn name_for(
             Hit::Pause => Node::button(id("pause"), r, "Pause"),
             Hit::Capture => Node::button(id("capture"), r, "Record a take"),
             Hit::ProjectMenu => Node::button(id("project"), r, "Project menu"),
-            Hit::OpenSetup => Node::button(id("setup"), r, "Take settings"),
+            // **SETTINGS, not the take's.** The take tier moved under the
+            // cassette; the cog opens AUDIO and MEDIA, and a screen reader
+            // announcing "Take settings" sent people to the one panel with no
+            // take rows in it.
+            Hit::OpenSetup => Node::button(id("setup"), r, "Settings - audio and media"),
             // Disabled while the tempo is held - see `RecorderState::tempo_held`.
             Hit::TapTempo => Node::button(id("tap"), r, "Tap tempo").enabled(!view.tempo_held),
             Hit::Export => Node::button(id("export"), r, "Export"),
@@ -3490,18 +3512,21 @@ pub fn timeline_fraction(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Opti
 
 /// The next count-in length in the cycle, in BARS (`COUNT_IN_CHOICES`).
 ///
-/// Meant as the one place the chip's cycle is decided, so that the control's
-/// label and the effect of clicking it cannot disagree - but only a test
-/// calls it today: the chip's own arm in `TangentApp::apply_recorder_hit`
-/// repeats the same walk. An unknown value (a hand-edited file, or a length
-/// the metronome panel set off this list) lands on the first choice rather
-/// than sticking.
+/// The one place the chip's cycle is decided: the chip's arm in
+/// `TangentApp::apply_recorder_hit` steps through it, so the control's label
+/// and the effect of clicking it cannot disagree.
+///
+/// **The next choice ABOVE the length shown, not the one after it in the
+/// list.** A length off the list - the metronome panel's COUNT row steps a
+/// bar at a time, and a hand-edited file can hold anything - used to start
+/// the cycle over at off, so 3 bars went to OFF at one press. It steps to 4
+/// now; past the last choice it wraps round to off, as 4 itself does.
 pub fn next_count_in(current: u32) -> u32 {
-    let i = COUNT_IN_CHOICES
+    COUNT_IN_CHOICES
         .iter()
-        .position(|&c| c == current)
-        .map_or(0, |i| i + 1);
-    COUNT_IN_CHOICES[i % COUNT_IN_CHOICES.len()]
+        .copied()
+        .find(|&c| c > current)
+        .unwrap_or(COUNT_IN_CHOICES[0])
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────
@@ -5063,8 +5088,9 @@ fn typing_for(view: &RecorderView<'_>, field: NumField) -> Option<String> {
 /// The caret inside a caption+value box, after `typed_chars` characters of the
 /// value.
 ///
-/// Shared by the take name and the tempo. They looked identical when they were
-/// two copies, which is exactly when two copies start to drift.
+/// Shared by the take name and both SIG fields, the TAKE tier's and the AUDIO
+/// tier's. They looked identical when they were copies, which is exactly when
+/// copies start to drift: the AUDIO tier's SIG drew no caret at all.
 fn draw_caption_caret(
     painter: &Painter,
     r: Rect,
@@ -8676,6 +8702,99 @@ mod tests {
         }
     }
 
+    /// **Every SIG field shows its caret.** The signature is typed into the
+    /// TAKE panel's SIG and into the AUDIO tier's, which the cog's panel and
+    /// the red button's RECORDING panel show; only the TAKE panel's drew a
+    /// caret, so in the other two the arrow keys moved one nobody could see.
+    #[test]
+    fn every_sig_field_shows_its_caret() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
+        let edit = crate::recorder::NumEdit::prefilled(NumField::Meter, "7/8".to_owned());
+        let view = RecorderView { editing: Some(&edit), ..RecorderView::empty() };
+        let carets_in = |shape: SetupShape, row: fn(&SetupLayout) -> Rect| -> usize {
+            let r = row(&SetupLayout::new(screen, anchor, shape));
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                |ctx| {
+                    let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                    draw_setup(&painter, screen, anchor, &view, &Settings::default(), shape);
+                },
+            );
+            fn count(s: &egui::Shape, row: Rect) -> usize {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().map(|s| count(s, row)).sum(),
+                    egui::Shape::LineSegment { points, .. } => {
+                        usize::from(row.contains(points[0].lerp(points[1], 0.5)))
+                    }
+                    _ => 0,
+                }
+            }
+            out.shapes.iter().map(|c| count(&c.shape, r)).sum()
+        };
+        assert!(carets_in(SetupShape::Take, |l| l.time_sig) > 0, "the fixture draws no caret even in the TAKE panel");
+        assert!(carets_in(SetupShape::Rolling, |l| l.audio_sig) > 0, "the RECORDING panel's SIG takes typing with no caret");
+        assert!(carets_in(SetupShape::Machine, |l| l.audio_sig) > 0, "the cog's SIG takes typing with no caret");
+    }
+
+    /// **Under a take the rows a press cannot reach look it.**
+    /// `setup_hit_test` refuses every row of the panel's `targets()` but DONE
+    /// while a take writes, and the cassette's TAKE panel still opens then -
+    /// with NAME, FOLDER, COUNT-IN, SIG, EXPORT and the rest drawn live,
+    /// swallowing every press. Their words go to the faint ink; DONE and the
+    /// two rows that stay live ("Count-in into take", "Hide elapsed time")
+    /// keep the panel's own.
+    #[test]
+    fn under_a_take_the_refused_rows_are_drawn_refused() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
+        let s = Settings::default();
+        let p = palette(&s);
+        let l = SetupLayout::new(screen, anchor, SetupShape::Take);
+        // The colour each of these words is painted in, inside its row.
+        let inks = |state: RecordState| -> Vec<(&'static str, Option<Color32>)> {
+            let view = RecorderView { state, take_name: "nocturne", ..RecorderView::empty() };
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                |ctx| {
+                    let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                    draw_setup(&painter, screen, anchor, &view, &s, SetupShape::Take);
+                },
+            );
+            fn walk(shape: &egui::Shape, row: Rect, word: &str, out: &mut Option<Color32>) {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, row, word, out)),
+                    egui::Shape::Text(t) if t.galley.text() == word && row.contains(t.visual_bounding_rect().center()) => {
+                        *out = t.galley.job.sections.first().map(|s| s.format.color);
+                    }
+                    _ => {}
+                }
+            }
+            [("nocturne", l.name), ("DONE", l.close), ("Hide elapsed time", l.hide_elapsed)]
+                .into_iter()
+                .map(|(word, row)| {
+                    let mut ink = None;
+                    for c in &out.shapes {
+                        walk(&c.shape, row, word, &mut ink);
+                    }
+                    (word, ink)
+                })
+                .collect()
+        };
+        for (word, ink) in inks(RecordState::Idle) {
+            assert_eq!(ink, Some(p.ink), "at rest {word:?} is not drawn live");
+        }
+        let rolling = inks(RecordState::Rolling);
+        assert_eq!(rolling[0].1, Some(p.faint), "under a take the refused NAME is drawn live");
+        for (word, ink) in &rolling[1..] {
+            assert_eq!(*ink, Some(p.ink), "under a take {word:?}, which stays live, was dimmed");
+        }
+    }
+
     /// **The PLUGINS row still reads after the resync button took its right
     /// end**, at every window size the card is drawn at.
     ///
@@ -8987,6 +9106,30 @@ mod tests {
         assert_eq!(before, ids.len(), "two controls in the band share an id");
     }
 
+    /// **The cog says what it opens.** It opens SETTINGS - the audio and
+    /// media tiers - since the take's own rows moved under the cassette, and
+    /// a screen reader still announced it as "Take settings": a name that
+    /// sends somebody to the one panel that has no take rows in it.
+    #[test]
+    fn the_cog_is_named_for_the_panel_it_opens() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0)));
+        let nodes = a11y_nodes(rect, &furnished());
+        let cog = nodes
+            .iter()
+            .find(|n| n.id == egui::Id::new(("band", "setup")))
+            .expect("the cog has no node");
+        assert!(
+            cog.label.starts_with("Settings") && !cog.label.to_lowercase().contains("take"),
+            "the cog is announced as {:?}",
+            cog.label
+        );
+        assert!(
+            !Hit::OpenSetup.label().to_lowercase().contains("take"),
+            "the cog's own label still says {:?}",
+            Hit::OpenSetup.label()
+        );
+    }
+
     /// The names survive every state the band has, and every size.
     ///
     /// A node built from a rect that collapsed at a small size would put a
@@ -9086,6 +9229,48 @@ mod tests {
         for d in [DETACHED_DEFAULT, DETACHED_MIN] {
             let r = Rect::from_min_size(Pos2::ZERO, d);
             assert!(cog_fits(Layout::new(r, &idle()).setup), "the detached window at {d:?} has no cog");
+        }
+    }
+
+    /// **The pitch dial is never a drag target without a picture either.**
+    /// It was seated on `knob_fits` (a knob's face) and painted only when
+    /// `vari_face` - which reserves the PITCH CONT word's whole line above
+    /// the dial - found room, so a cell between the two floors was seated,
+    /// pressable and blank: a drag there changed the varispeed with nothing
+    /// on screen. The band's own widths are swept from well below the
+    /// window's floor, because `app::fit_bands` letterboxes the band
+    /// narrower than that whenever a window manager hands the window a pane
+    /// shorter than its natural stack; none of them failed. The short, wide
+    /// rects below did (760 x 80 seated a blank dial): no window the app
+    /// opens is that shape, but `Layout::new` takes any rect, and the rule
+    /// is the layout's.
+    #[test]
+    fn the_pitch_dial_is_never_seated_where_it_is_not_drawn() {
+        let mut rects: Vec<Rect> = Vec::new();
+        let mut w = 200.0_f32;
+        while w <= 2600.0 {
+            rects.push(band(w));
+            w += 0.5;
+        }
+        let mut dw = 400.0_f32;
+        while dw <= 1400.0 {
+            let mut dh = 60.0_f32;
+            while dh <= 800.0 {
+                rects.push(Rect::from_min_size(Pos2::ZERO, Vec2::new(dw, dh)));
+                dh += 4.0;
+            }
+            dw += 20.0;
+        }
+        for r in rects {
+            for view in [idle(), rolling()] {
+                let l = Layout::new(r, &view);
+                assert!(
+                    !l.vari.is_positive() || vari_face(l.vari, l.vari_label).is_some(),
+                    "at {r:?} ({:?}) the pitch dial is seated at {:?} - a live drag target - but not drawn",
+                    view.state,
+                    l.vari
+                );
+            }
         }
     }
 
@@ -11373,6 +11558,9 @@ mod tests {
         // A value a hand-edited settings file could hold lands somewhere real
         // rather than sticking.
         assert_eq!(next_count_in(97), COUNT_IN_CHOICES[0]);
+        // And a length the metronome panel steps to, off the list, steps ON
+        // to the next choice above it rather than starting over at off.
+        assert_eq!(next_count_in(3), 4, "3 bars stepped back to off");
         // And the label says BARS, because that is what the choices are now
         // that there is a time signature to count them in. It said beats, and
         // went on saying beats after the setting became bars — so the cell
@@ -12103,11 +12291,11 @@ const SETUP_ROLLING_ROWS: usize = 1;
 /// **Each shape hangs off the control that opened it**
 /// (`TangentApp::setup_anchor`): `Machine` off the cog, or the cassette when
 /// the layout has unseated the cog (mid-take, or a band too small to draw
-/// it); `Take` off the cassette; `Rolling` off the red button. An unseated
-/// control's rect is `Rect::NOTHING`, and a panel hung off it is NaN - not
-/// drawn, still open, and eating the next press - so a shape whose control
-/// can be unseated has to fall back to a seated one or close. (`Rolling` does
-/// not yet: the red button is unseated under a realtime export.)
+/// it); `Take` off the cassette; `Rolling` off the red button, or the
+/// cassette while a realtime export has unseated it. An unseated control's
+/// rect is `Rect::NOTHING`, and a panel hung off it is NaN - not drawn,
+/// still open, and eating the next press - so a shape whose control can be
+/// unseated has to fall back to a seated one or close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SetupShape {
     /// The cog's panel: the machine and where things are kept.
@@ -14013,6 +14201,17 @@ pub fn draw_setup(
         return;
     }
     let p = palette(s);
+    // **Refused rows look refused.** While a take writes, `setup_hit_test`
+    // refuses every row of `targets()` but DONE - each one decides how the
+    // file being written was going to be written - and the cassette's TAKE
+    // panel opens mid-take anyway, because two of its rows still work there
+    // ("Count-in into take", and "Hide elapsed time", which hides the clock
+    // live). The refused rows were drawn live and swallowed every press.
+    // `rows` is the palette they are drawn in: their words in the faint ink
+    // under a take, the panel's own otherwise. DONE and the two live rows
+    // keep `p`.
+    let refused = Palette { ink: p.faint, ..p };
+    let rows = if view.state.is_active() { &refused } else { &p };
 
     // A scrim over the whole window. It is what says the panel is modal, and
     // it is what makes a dialog drawn in the app's own ink read as being IN
@@ -14088,7 +14287,7 @@ pub fn draw_setup(
     // Not required and not unique: the timestamp guarantees that. Type
     // "nocturne" once, press record five times, and get five adjacent folders
     // with no overwrite dialog ever.
-    control(painter, l.name, &p);
+    control(painter, l.name, rows);
     {
         let empty = view.take_name.is_empty();
         let shown = if empty { "(optional)" } else { view.take_name };
@@ -14097,8 +14296,8 @@ pub fn draw_setup(
             l.name,
             "NAME",
             shown,
-            if empty { p.faint } else { p.ink },
-            &p,
+            if empty { p.faint } else { rows.ink },
+            rows,
         );
         if view.name_focused {
             draw_caption_caret(
@@ -14107,7 +14306,7 @@ pub fn draw_setup(
                 "NAME",
                 shown,
                 view.take_name.chars().count(),
-                &p,
+                rows,
             );
         }
     }
@@ -14121,7 +14320,7 @@ pub fn draw_setup(
     // half of a small panel, and the path ran straight under the word. A
     // reserved zone rather than a clip, so the path shrinks to fit the room it
     // really has instead of being cut off mid-directory.
-    control(painter, l.dest, &p);
+    control(painter, l.dest, rows);
     if l.dest.is_positive() {
         let size = fit_text(l.dest, "Choose...", l.dest.height() * 0.45);
         let gap = if size >= MIN_TEXT {
@@ -14144,11 +14343,11 @@ pub fn draw_setup(
             l.dest.min,
             Pos2::new(l.dest.right() - gap, l.dest.bottom()),
         );
-        label_text(painter, value, "FOLDER", view.dest, p.ink, &p);
+        label_text(painter, value, "FOLDER", view.dest, rows.ink, rows);
     }
     // SHOW rather than OPEN, for the reason the tick beside Export has: nothing
     // is opened, a folder is shown.
-    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], &p);
+    draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], rows);
 
     // **The PROJECT tier's three folders**, drawn exactly as the take's is —
     // a box carrying the word and the path, with a Choose... at its right
@@ -14160,7 +14359,7 @@ pub fn draw_setup(
         (l.preset_dest, l.preset_reveal, "PRESETS", view.preset_dest),
         (l.irs_dest, l.irs_reveal, "IRS", view.irs_dest),
     ] {
-        control(painter, box_, &p);
+        control(painter, box_, rows);
         if box_.is_positive() {
             let size = fit_text(box_, "Choose...", box_.height() * 0.45);
             let gap = if size >= MIN_TEXT {
@@ -14183,9 +14382,9 @@ pub fn draw_setup(
                 box_.min,
                 Pos2::new(box_.right() - gap, box_.bottom()),
             );
-            label_text(painter, value, word, path, p.ink, &p);
+            label_text(painter, value, word, path, rows.ink, rows);
         }
-        draw_word_button(painter, show, &["SHOW FOLDER", "SHOW"], &p);
+        draw_word_button(painter, show, &["SHOW FOLDER", "SHOW"], rows);
     }
 
     text_line(painter, l.folder, view.folder_preview, p.faint, false);
@@ -14204,8 +14403,8 @@ pub fn draw_setup(
         l.count_in,
         "COUNT-IN",
         &count_in_text(view.count_in_bars),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     // The AUDIO tier's own pair — the same two settings, standing where
     // the ARRANGEMENT's rules read as the arrangement's: the red button
@@ -14215,21 +14414,27 @@ pub fn draw_setup(
         l.audio_count_in,
         "COUNT-IN",
         &count_in_text(view.count_in_bars),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
             .clone()
             .unwrap_or_else(|| view.time_signature.label());
-        labelled(painter, l.audio_sig, "SIG", &shown, p.ink, &p);
+        labelled(painter, l.audio_sig, "SIG", &shown, rows.ink, rows);
+        // The same caret the TAKE tier's SIG draws: this is the copy the
+        // cog's panel and the red button's show, and the arrows moved a
+        // caret here that nobody could see.
+        if let Some(typed) = typing {
+            draw_caption_caret(painter, l.audio_sig, "SIG", &shown, typed.chars().count(), rows);
+        }
     }
     // The two doors the cog carries now: the Project dialog and the
     // plugin folders — the menu's rows, reachable without the menu.
-    labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", p.ink, &p);
-    labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", p.ink, &p);
-    draw_resync(painter, l.plugin_rescan, &p);
+    labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", rows.ink, rows);
+    labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", rows.ink, rows);
+    draw_resync(painter, l.plugin_rescan, rows);
     // A readout as well as a way in, like AUDIO SETUP: whether the master is
     // going out over ReaStream right now.
     labelled(
@@ -14237,17 +14442,17 @@ pub fn draw_setup(
         l.stream_row,
         "STREAM",
         if s.reastream_enabled { "To OBS: on" } else { "To OBS: off" },
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
             .clone()
             .unwrap_or_else(|| view.time_signature.label());
-        labelled(painter, l.time_sig, "SIG", &shown, p.ink, &p);
+        labelled(painter, l.time_sig, "SIG", &shown, rows.ink, rows);
         if let Some(typed) = typing {
-            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), &p);
+            draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), rows);
         }
     }
     labelled(
@@ -14255,23 +14460,25 @@ pub fn draw_setup(
         l.export,
         "EXPORT",
         &export_summary(&s.record_export),
-        p.ink,
-        &p,
+        rows.ink,
+        rows,
     );
 
     // The four yes-or-no questions. Each is worded as the STATE it is in, not
     // as the action that changes it, because a tick already says which way it
     // is set and a row that says both is a row you have to read twice.
-    for (r, cap, on) in [
-        (l.open_when_done, "Show when done", s.record_open_when_done),
-        (l.click_in_take, "Click into takes", s.metronome_in_take),
-        (l.count_in_in_take, "Count-in into take", s.record_count_in_in_take),
-        (l.hide_elapsed, "Hide elapsed time", s.record_hide_elapsed),
+    //
+    // Two of them stay live under a take, and keep the panel's ink.
+    for (r, cap, on, ink) in [
+        (l.open_when_done, "Show when done", s.record_open_when_done, rows),
+        (l.click_in_take, "Click into takes", s.metronome_in_take, rows),
+        (l.count_in_in_take, "Count-in into take", s.record_count_in_in_take, &p),
+        (l.hide_elapsed, "Hide elapsed time", s.record_hide_elapsed, &p),
         // Session state, not a setting: monitoring is off at every launch by
         // construction, which is why it reads from the VIEW.
-        (l.hear_input, "Hear the input", view.input_monitor),
+        (l.hear_input, "Hear the input", view.input_monitor, rows),
     ] {
-        draw_tick(painter, r, cap, on, &p);
+        draw_tick(painter, r, cap, on, ink);
     }
 
     // **Setup**, showing the input it is about. The caption is a question the
@@ -14283,7 +14490,7 @@ pub fn draw_setup(
     //
     // Not `labelled`: a device name is as long as its driver makes it, and a
     // long one drew nothing at all there. See `DEVICE_FLOOR`.
-    draw_device_row(painter, l.audio, "AUDIO SETUP", view.audio.text(), p.ink, &p);
+    draw_device_row(painter, l.audio, "AUDIO SETUP", view.audio.text(), rows.ink, rows);
 }
 
 

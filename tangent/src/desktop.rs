@@ -3118,6 +3118,31 @@ fn fallback_wanted(chosen: Option<&str>) -> bool {
     chosen == Some("ASIO")
 }
 
+/// **What the ASIO fallback says, by what the open said.**
+///
+/// It asked "is the interface plugged in?" whatever had happened. Right when
+/// the interface is gone; wrong when it is plugged in and its driver refused
+/// the stream - a buffer, a rate, a format (`instrument::driver_refusal`) -
+/// where the user checked a cable that was fine while the way back was a
+/// setting. A refusal is named with the driver's own reason, and pointed at
+/// Setup: a changed buffer or rate reopens on the chosen system first
+/// (`open_audio_path_now`). The plug watch stays on for both, and costs a
+/// refusal nothing: it fires only when the list of outputs changes.
+#[cfg(feature = "recorder")]
+fn asio_fallback_toast(err: &str, stand_in: &str) -> String {
+    match crate::instrument::driver_refusal(err) {
+        Some(reason) => format!(
+            "The ASIO driver would not play: {}. Using {stand_in} through the system's \
+             own audio; change the buffer or the rate in Setup and ASIO is tried again.",
+            reason.trim_end_matches('.')
+        ),
+        None => format!(
+            "ASIO has no working output - is the interface plugged in? Using {stand_in} \
+             through the system's own audio until it is back."
+        ),
+    }
+}
+
 /// **Whether the hardware the engine is waiting for is back**, as a pure
 /// rule over what the platform default host can see.
 ///
@@ -4831,6 +4856,9 @@ impl DesktopApp {
         // Read BEFORE the state borrow, like everything else here: the app is
         // borrowed mutably for the rest of this function.
         let alias = self.app.input_alias().trim().to_owned();
+        // And the box it names: a short name applies to that one interface.
+        // See `devices::alias_for_open`.
+        let alias_for = self.app.input_alias_for().map(str::to_owned);
         // **The scope's tap, drained dry once a frame** — the speakers' mix
         // without the click, straight to the widget. `dt` is the audio time
         // the batch spans, which is what the auto-gain release wants.
@@ -5126,8 +5154,12 @@ impl DesktopApp {
         }
         // Through the one decision that names it - see `band_device_name`:
         // the owner's short name, a readable USB name, never a raw uid.
-        state.audio_name =
-            crate::devices::band_device_name(open_name.as_deref(), audio_uid.as_deref(), &alias);
+        state.audio_name = crate::devices::band_device_name(
+            open_name.as_deref(),
+            audio_uid.as_deref(),
+            &alias,
+            alias_for.as_deref(),
+        );
         // The playhead and the audition, as plain data. The rate is the
         // engine's own; with no engine the transport answers from its last
         // known truth, which is the whole reason it owns the number.
@@ -5195,6 +5227,7 @@ impl DesktopApp {
                         Some(device.as_str()),
                         audio_uid.as_deref(),
                         &alias,
+                        alias_for.as_deref(),
                     ) {
                         Some(a) => a.to_owned(),
                         None => crate::devices::device_display_name(&device),
@@ -14499,6 +14532,8 @@ impl DesktopApp {
                      this session instead; the setting stays ASIO and the interface is \
                      watched for"
                 );
+                // Kept for the toast: `started` is opened again below.
+                let why = e.clone();
                 tangent_record::audio::set_system(None);
                 // **And the output choice does NOT travel to the fallback.**
                 // The name came from the system that has just been set aside
@@ -14513,16 +14548,12 @@ impl DesktopApp {
                     rate,
                 );
                 match &started {
-                    Ok(e) => {
+                    Ok(stand_in) => {
                         self.recorder.fallback = chosen.clone();
                         if !already_standing_in {
                             self.app.notify(
                                 Kind::Error,
-                                format!(
-                                    "ASIO has no working output - is the interface plugged in? \
-                                     Using {} through the system's own audio until it is back.",
-                                    e.output().device
-                                ),
+                                asio_fallback_toast(&why, &stand_in.output().device),
                             );
                         }
                     }
@@ -26922,6 +26953,44 @@ mod tests {
         assert!(
             decl.contains("set_aside"),
             "the set-aside open asks the platform default for an ASIO name: `{decl}`"
+        );
+    }
+
+    /// **The ASIO fallback blames the cable only when there is no device.**
+    /// It said "is the interface plugged in?" for every failure, so an
+    /// interface that was plugged in, with a driver that turned down the
+    /// buffer or the rate, sent its user to check a cable that was fine. A
+    /// refusal is named with the driver's reason and pointed at Setup. The
+    /// errors are made by the open's own builders, so the wording cannot
+    /// drift from what the open writes.
+    #[test]
+    fn the_asio_fallback_toast_names_a_refusal_instead_of_the_cable() {
+        let refused = crate::instrument::stream_build_error(cpal::BuildStreamError::BackendSpecific {
+            err: cpal::BackendSpecificError { description: "Invalid buffer size.".into() },
+        });
+        let said = asio_fallback_toast(&refused, "Speakers (Realtek(R) Audio)");
+        assert!(!said.contains("plugged in"), "a driver's refusal is blamed on the cable: {said}");
+        assert!(said.contains("Invalid buffer size"), "the toast does not name the driver's reason: {said}");
+        assert!(said.contains("Setup"), "the toast does not say where the way back is: {said}");
+        assert!(said.contains("Speakers (Realtek(R) Audio)"), "the toast does not name the stand-in: {said}");
+        for gone in [
+            crate::instrument::stream_build_error(cpal::BuildStreamError::DeviceNotAvailable),
+            "no audio output on this machine reports a working config".to_owned(),
+        ] {
+            let said = asio_fallback_toast(&gone, "Speakers (Realtek(R) Audio)");
+            assert!(said.contains("plugged in"), "an absent interface is not asked about: {said}");
+        }
+        // And the fallback says it through this, with the open's own error:
+        // `DesktopApp` cannot be built in a test, so its call is read.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let engine = {
+            let a = src.find("fn start_engine(&mut self").expect("`start_engine` is gone");
+            &src[a..a + src[a..].find("\n    fn ").expect("its end")]
+        };
+        assert!(
+            engine.contains("asio_fallback_toast(&why, "),
+            "the ASIO fallback no longer words its toast by what the open said"
         );
     }
 
