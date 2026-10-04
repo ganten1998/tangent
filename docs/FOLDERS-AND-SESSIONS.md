@@ -18,7 +18,9 @@ a third flag (`strip_folder_shut`). Consequences, all deliberate:
   chose its stems by the folders at its press (a folder that collects
   children writes a stem of its bus): grouping moves a lane
   (`lane_order_held`), and the other two would move children onto another
-  bus mid-render (`folders_held`); each says why.
+  bus mid-render (`folders_held`); each says why. Removing a folder track,
+  which hands its children up, is refused there too, as every Remove Track
+  is under an export or an arrangement record (`tracks_held`).
 - **No input selector, no record arm, no theory note.** A folder cannot
   record and cannot carry its own MIDI. In the arrangement the second
   rack takes the input selector's band (three bays on three); in the
@@ -141,6 +143,15 @@ Related invariants that keep this working:
   its downbeat there. New's
   reclaim treats a document holding clips as work, as the sweep and the
   discard do, so a scratch Open wrote back with a take is never reclaimed.
+- **A take counting in, or a realtime export, holds the session.** New,
+  Open, Reset Template and Reset Everything are refused with a note while
+  one does (`session_held`, asked by `ask_before` and by Reset Everything
+  before it resets anything, and again by the host's `switch_project`,
+  since Open's panel can be answered under a count). A take rolls on
+  through a switch, count and all, but the incoming desk's tempo and
+  signature retimed the engine's click under its count; an export plays
+  this project into this project's folder. The arrangement's count alone
+  does not hold the session: the switch calls that record off.
 - **One door makes a scratch real**: `materialize_project_dir`, which brings
   every lane's kit samples and writes the kit sidecar, and brings the files
   the document's own clips and frozen lanes stand on out of the template

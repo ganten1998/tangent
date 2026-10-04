@@ -6664,6 +6664,12 @@ impl TangentApp {
     /// slot in place, so no index moves under the loop. The selection is
     /// emptied afterwards: the tracks it named are gone.
     fn remove_selected_channels(&mut self, n: usize) {
+        // Not under an export or an arrangement record - see `tracks_held`.
+        // Every road comes through here: the Track menu, the strip's ×,
+        // Delete in both views and the mixer's cut.
+        if self.tracks_held() {
+            return;
+        }
         let mut all = self.selection_partners(n);
         all.push(n);
         all.sort_unstable_by(|a, b| b.cmp(a));
@@ -6693,6 +6699,11 @@ impl TangentApp {
     /// curves, and the open, armed and bypassed rows. The pedal seats keep
     /// their plugins and flags on purpose (see the note at the end).
     fn remove_channel(&mut self, n: usize) {
+        // The backstop only: every gesture asks `tracks_held`, through
+        // `remove_selected_channels`, before it changes anything.
+        if self.recorder.exporting || self.recorder.arr_recording {
+            return;
+        }
         // **ONE moment for the whole removal.** A track is clips, six bays,
         // a sidechain table and a bypass table, and `arr_save_edits` and
         // `set_insert` each commit their own - so deleting a track with
@@ -11733,6 +11744,31 @@ impl TangentApp {
         self.recorder.exporting
     }
 
+    /// **Whether the tracks stay on the desk, saying so when they do.**
+    /// Remove Track empties a row in place - clips, kind, bays and routes,
+    /// and a folder track hands its children up - so under a realtime export
+    /// it takes a lane's sound and a folder's bus out of the render halfway
+    /// through, with the undo that could put them back refused until the
+    /// export ends. Under an arrangement record it would delete a lane the
+    /// record is writing, whose take then lands on the emptied row at Stop;
+    /// and the record captures its audio by input PICK, numbered in desk
+    /// order over the bound audio tracks at its press, so removing even an
+    /// unrelated bound track above a recorded one hands the record the next
+    /// track's input. Asked by `remove_selected_channels`, the one door
+    /// every road to a removal goes through.
+    fn tracks_held(&mut self) -> bool {
+        let held = self.recorder.exporting || self.recorder.arr_recording;
+        if held {
+            let why = if self.recorder.exporting {
+                "No track is removed while an export runs - it is writing every one."
+            } else {
+                "No track is removed while the arrangement records - it records each track by its row and input."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+        }
+        held
+    }
+
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
     /// Everything a channel is follows it: kind, input, icon, colour, name,
     /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
@@ -16503,14 +16539,47 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         !self.arrangement.named && !self.project_dirty_exact()
     }
 
+    /// **Whether the session holds, saying so when it does: a take counts
+    /// in, or a realtime export runs.** A take is capture only and rolls on
+    /// through a switch, count and all, but the incoming desk brings its own
+    /// tempo and signature (`apply_desk_snapshot`), and the engine's click
+    /// reads the tempo every callback: the count a take saved something
+    /// from (its pre-roll's wall clock, the head latched at its press) was
+    /// retimed under it, which is what the tempo hold is for. An export
+    /// plays this project into this project's folder. The arrangement's
+    /// count alone does not hold the session: the switch calls that record
+    /// off (the host's `call_off_arr_count`). Asked by `ask_before` for New,
+    /// Open and Reset Template, by Reset Everything, and by the host's Open,
+    /// whose panel can be answered under a count.
+    pub fn session_held(&mut self) -> bool {
+        let take_counting = self.recorder.state.is_active() && self.recorder.tempo_held();
+        let held = self.recorder.exporting || take_counting;
+        if held {
+            let why = if self.recorder.exporting {
+                "This project stays open while an export runs - it is playing it."
+            } else {
+                "This project stays open while a take counts in - open another after its downbeat."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+        }
+        held
+    }
+
     /// **Ask before losing anything.** Returns whether the caller should
-    /// stop and wait for the answer.
+    /// stop and wait for the answer - or stop outright, for a switch the
+    /// session refuses while a take counts in or an export runs
+    /// (`session_held`).
     ///
     /// With the autosave gone, this is the only thing standing between an
     /// afternoon's work and a keystroke — so it is one function, and New,
     /// Open and Quit all go through it rather than each growing their own
     /// version of the question.
     fn ask_before(&mut self, next: AfterSave) -> bool {
+        // Refused before anything is asked, so no question is answered for
+        // nothing. Quitting replaces no session.
+        if next != AfterSave::Quit && self.session_held() {
+            return true;
+        }
         // A fresh question; an earlier "Don't Save" answered a different one.
         self.outgoing_discarded = false;
         // **The EXACT comparison, and it stays exact.** This is the one
@@ -16611,7 +16680,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// moment, so the question asked when New was pressed (none at all, on a
     /// clean session) never covered it. `true` when the prompt is up and the
     /// New must wait; its Save or Discard raises New again, as the menu's
-    /// does.
+    /// does. `true` as well, with no prompt, when a take counts in or an
+    /// export runs: the session holds (`session_held`).
     pub fn ask_before_new(&mut self) -> bool {
         self.ask_before(AfterSave::New)
     }
@@ -16620,7 +16690,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `ask_before_new`: the host finishes a running arrangement record in
     /// the session it was recorded in before the reset replaces it, and the
     /// take reached the document after the question. `true` when the prompt
-    /// is up; its Save or Discard carries on with the reset.
+    /// is up, its Save or Discard carrying on with the reset, or when the
+    /// session holds (`session_held`).
     pub fn ask_before_reset_template(&mut self) -> bool {
         self.ask_before(AfterSave::ResetTemplate)
     }
@@ -35325,6 +35396,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Private, and reached only from [`Dialog::Confirm`]'s button.
     fn reset_settings(&mut self, ctx: &egui::Context, scope: crate::settings::ResetScope) {
+        // **Everything replaces the session too** - it raises New once the
+        // settings are back - so it is refused before it resets anything
+        // while a take counts in or an export runs: see `session_held`. The
+        // template scope is refused by `ask_before` below.
+        if scope == crate::settings::ResetScope::Everything && self.session_held() {
+            return;
+        }
         // **The template scope touches no setting**, so it takes none of the
         // road below — no backup, no font reload, no window resize. It is a
         // file on disk in the user's Projects folder and only the host can
@@ -48019,6 +48097,112 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// **No track is removed under a realtime export or an arrangement
+    /// record.** Remove Track empties a row in place - its clips, its kind,
+    /// its six bays, its routes - and a folder track first hands its
+    /// children up. Under an export that took a lane's sound, and a folder's
+    /// bus, out of the render halfway through, and the undo that could have
+    /// put them back is refused until the export ends. Under an arrangement
+    /// record it deleted a lane the record may be writing, whose take then
+    /// landed on the emptied row at Stop - and the record captures its
+    /// inputs by pick index, which removing even an unrelated bound audio
+    /// track above a recorded one renumbers. Every road - the Track menu,
+    /// the strip's ×, Delete on the arrangement and on the mixer, the
+    /// mixer's cut - goes through `remove_selected_channels`, which refuses
+    /// under either now and says why. With neither running, each road still
+    /// removes its track.
+    #[test]
+    fn no_track_is_removed_under_an_export_or_an_arrangement_record() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let root = project_scratch("tracks-held");
+        let (ctx, mut app) = headless_with(
+            Caps::DESKTOP,
+            Settings { show_welcome: false, ..Settings::default() },
+        );
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.keytoggle_enabled = false;
+        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+        app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+        // A folder over one track, and four more tracks for the other roads.
+        for ch in 4..=9 {
+            app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+        }
+        app.settings.strip_is_folder[4] = true;
+        app.settings.strip_in_folder[5] = true;
+        assert_eq!(app.folder_of(5), Some(4), "the fixture's folder");
+        let _ = run_frame(&ctx, &mut app);
+        let frame_with = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let delete = |pressed: bool| egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Each road, aimed at its own track; a key is let go again, so the
+        // next press is a fresh one.
+        let remove_by = |road: &str, ctx: &egui::Context, app: &mut TangentApp, lane: usize| {
+            app.selected_channel = Some(lane);
+            app.selected_tracks = vec![lane];
+            app.arrangement_open = road == "Delete on the arrangement";
+            app.mixer_open = road.ends_with("mixer") || road == "the mixer's cut";
+            match road {
+                "the Track menu" => app.apply_dialog_action(DialogAction::TrackRemove(lane)),
+                "the strip's ×" => app.apply_mixer_hit(Hit::Remove(Column(lane)), 0.0),
+                "the mixer's cut" => frame_with(ctx, app, vec![egui::Event::Cut]),
+                _ => {
+                    frame_with(ctx, app, vec![delete(true)]);
+                    frame_with(ctx, app, vec![delete(false)]);
+                }
+            }
+        };
+        let roads = [
+            ("the Track menu", 9usize),
+            ("the strip's ×", 4),
+            ("Delete on the arrangement", 8),
+            ("Delete on the mixer", 7),
+            ("the mixer's cut", 6),
+        ];
+        let used = |app: &TangentApp| (0..recorder::CHANNELS).map(|n| app.channel_used(n)).collect::<Vec<_>>();
+        for (exporting, arr) in [(true, false), (false, true)] {
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            let held = format!("export={exporting} record={arr}");
+            let before = (used(&app), app.folder_parents());
+            for (road, lane) in roads {
+                remove_by(road, &ctx, &mut app, lane);
+                assert_eq!(
+                    (used(&app), app.folder_parents()),
+                    before,
+                    "{road} removed the track on row {} under {held}",
+                    lane + 1
+                );
+            }
+            assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            // And the removal itself refuses, for a road yet to be written.
+            app.remove_channel(9);
+            assert_eq!((used(&app), app.folder_parents()), before, "remove_channel went ahead under {held}");
+        }
+        app.recorder.exporting = false;
+        app.recorder.arr_recording = false;
+        for (road, lane) in roads {
+            remove_by(road, &ctx, &mut app, lane);
+            assert!(!app.channel_used(lane), "{road} no longer removes a track");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Cmd+C and Cmd+V carry a whole TRACK when no clip is selected.**
@@ -69275,6 +69459,75 @@ mod tests {").expect("the tests module")];
         );
         assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **No road replaces the session while a take counts in or an export
+    /// runs.** A take is capture only and rolls on through a session
+    /// switch, count and all - but the incoming document's desk carries its
+    /// own tempo and signature, and `apply_desk_snapshot` applied them under
+    /// the count the tempo hold exists for: the engine's click reads the
+    /// tempo every callback, so it was retimed under the take, away from the
+    /// downbeat its pre-roll counts to on the wall clock and its head was
+    /// measured against. An export plays THIS project, into this project's
+    /// folder. New, Open, Reset Template and Reset Everything refuse now,
+    /// from the menu and from the Project window, and say why. The
+    /// arrangement's count alone holds the tempo but not the session: the
+    /// host calls that record off.
+    #[test]
+    fn the_session_stays_while_a_take_counts_in_or_an_export_runs() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.record_export.tempo_bpm = 97.0;
+        app.undo_reset();
+        assert!(!app.project_dirty_exact(), "the fixture has unsaved work, so New would ask instead");
+        for (label, state, counting, exporting) in [
+            ("a take's pre-roll", recorder::RecordState::CountIn { beat: 1, of: 4 }, true, false),
+            ("a count in a take's file", recorder::RecordState::Rolling, true, false),
+            ("a realtime export", recorder::RecordState::Rolling, false, true),
+            // Its take stopped, its files not landed yet.
+            ("an export filing itself", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.take_counting = counting;
+            app.recorder.exporting = exporting;
+            app.messages.clear();
+            for window in [false, true] {
+                let road = if window { "the Project window" } else { "the menu" };
+                if window {
+                    app.apply_dialog_action(DialogAction::ProjectNew);
+                } else {
+                    app.apply_menu_action(&ctx, MenuAction::NewProject);
+                }
+                assert_eq!(app.take_project_request(), None, "New from {road} replaced the session under {label}");
+                if window {
+                    app.apply_dialog_action(DialogAction::ProjectOpen);
+                } else {
+                    app.apply_menu_action(&ctx, MenuAction::OpenProject);
+                }
+                assert!(app.take_file_request().is_none(), "Open from {road} asked for a project under {label}");
+            }
+            for scope in [crate::settings::ResetScope::Template, crate::settings::ResetScope::Everything] {
+                app.apply_dialog_action(DialogAction::ResetTo(scope));
+                run_frame(&ctx, &mut app);
+                assert_eq!(
+                    app.take_project_request(),
+                    None,
+                    "{scope:?} replaced the session under {label}"
+                );
+            }
+            assert_eq!(app.tempo_bpm(), 97.0, "the held tempo moved under {label}");
+            assert!(!app.said().notes().is_empty(), "the refusals under {label} said nothing");
+            // Quitting replaces no session, and is not held.
+            assert!(!app.intercept_quit(), "{label} held the window open");
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.take_counting = true;
+        app.recorder.exporting = false;
+        app.apply_menu_action(&ctx, MenuAction::NewProject);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::New),
+            "the arrangement's count alone held the session the host calls it off from"
+        );
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
