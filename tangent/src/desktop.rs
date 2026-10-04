@@ -16677,23 +16677,32 @@ fn mirror_sidecars(from: &std::path::Path, to: &std::path::Path) {
 /// `TangentApp::set_sampler_media`).
 #[cfg(feature = "recorder")]
 fn sampler_media_on_shelf(dir: &std::path::Path) -> Vec<String> {
+    use std::io::Read;
     let sampler = crate::builtin_fx::SAMPLER_PATH;
     let Some(spec) = crate::builtin_fx::spec_for(sampler) else {
         return Vec::new();
     };
     let mut named = Vec::new();
     for (seat, bay) in shelf_sidecars(dir) {
-        let Ok(raw) = std::fs::read(dir.join(sidecar_name(seat, bay))) else {
+        let Ok(mut file) = std::fs::File::open(dir.join(sidecar_name(seat, bay))) else {
             continue;
         };
-        let Some(split) = raw.iter().position(|b| *b == 0) else {
+        // **The owner first, and the rest only for a sampler's.** Another
+        // plugin's state can run to megabytes (a noise print, a library's
+        // patch), and every adoption of a template walks the shelf.
+        let mut owner = vec![0u8; sampler.len() + 1];
+        let ours = file.read_exact(&mut owner).is_ok()
+            && owner[..sampler.len()] == *sampler.as_bytes()
+            && owner[sampler.len()] == 0;
+        if !ours {
             continue;
-        };
-        if &raw[..split] != sampler.as_bytes() {
+        }
+        let mut state = Vec::new();
+        if file.read_to_end(&mut state).is_err() {
             continue;
         }
         named.extend(
-            crate::builtin_fx::extra_from_state(spec, &raw[split + 1..])
+            crate::builtin_fx::extra_from_state(spec, &state)
                 .into_iter()
                 .filter(|(symbol, path)| symbol == "sample_path" && !path.is_empty())
                 .map(|(_, path)| path),
