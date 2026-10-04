@@ -7542,7 +7542,9 @@ impl DesktopApp {
     /// face's `extra` handed straight through — the sampler's loaded sample,
     /// the convolver's impulse. Without it a sampler patch reopens with the
     /// right envelope over silence, which is the fault the sampler's own
-    /// lane found and the convolver has been quietly carrying.
+    /// lane found and the convolver has been quietly carrying. The sampler's
+    /// file is written ABSOLUTE (`preset_state_for_disk`): its bay stores it
+    /// relative to its own project, and a preset has to play in any.
     fn save_unit_preset(
         &mut self,
         unit: &str,
@@ -7561,7 +7563,7 @@ impl DesktopApp {
             unit: unit.to_owned(),
             name: name.trim().to_owned(),
             values: values.to_vec(),
-            state: state.to_vec(),
+            state: preset_state_for_disk(unit, state, self.app.kit_doc().as_deref()),
             extra: Default::default(),
         };
         let tmp = path.with_extension("tangentpreset.tmp");
@@ -7572,7 +7574,9 @@ impl DesktopApp {
 
     /// Read a preset back and hand it to the app as plain data. The unit
     /// check is the owner rule `write_insert_state` keeps for plugin state:
-    /// a file that names a different unit moves nothing, out loud.
+    /// a file that names a different unit moves nothing, out loud. A sampler
+    /// preset's file rides along (`preset_sample`), for the app to copy into
+    /// this project and bind after the knobs.
     fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
         let parsed = std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -7602,6 +7606,7 @@ impl DesktopApp {
             unit: unit.to_owned(),
             name,
             values: p.values,
+            sample: preset_sample(unit, &p.state),
         });
     }
 
@@ -16828,6 +16833,49 @@ fn preset_delete_target(
         .then_some(canon)
 }
 
+/// **A preset names the sampler's file ABSOLUTELY**, so it plays in any
+/// project: the bay stores its sample relative to its project
+/// (`media/<name>`, see `sampler_file`), and a preset written with that
+/// path would name a file in whichever project loaded it. `state` is the
+/// face's extras as the save road hands them over; a sampler's
+/// `sample_path` is resolved against `doc` (`kit_doc`, as the desk reads
+/// it), and everything else, an absolute path included, is written as it
+/// stands.
+#[cfg(feature = "recorder")]
+fn preset_state_for_disk(
+    unit: &str,
+    state: &[(String, String)],
+    doc: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    state
+        .iter()
+        .map(|(symbol, path)| {
+            if unit == crate::builtin_fx::SAMPLER_PATH && symbol == "sample_path" && !path.is_empty() {
+                let file = sampler_file(path, doc);
+                (symbol.clone(), file.to_string_lossy().into_owned())
+            } else {
+                (symbol.clone(), path.clone())
+            }
+        })
+        .collect()
+}
+
+/// **The file a sampler preset plays**, as the preset names it (absolute,
+/// since `preset_state_for_disk`), for the app to copy into the project the
+/// preset is loaded in and bind on the bay that asked. Empty for any other
+/// unit, and for a preset saved with nothing loaded.
+#[cfg(feature = "recorder")]
+fn preset_sample(unit: &str, state: &[(String, String)]) -> String {
+    if unit != crate::builtin_fx::SAMPLER_PATH {
+        return String::new();
+    }
+    state
+        .iter()
+        .find(|(symbol, _)| symbol == "sample_path")
+        .map(|(_, path)| path.clone())
+        .unwrap_or_default()
+}
+
 /// **The longest impulse response the IR bay will take, in seconds.**
 ///
 /// Twenty, and the number is not invented here — it is the one the rest of
@@ -25775,6 +25823,81 @@ mod tests {
         let again = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(again, files.len(), "a second seeding added files");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A sampler preset names its sample by an absolute path, so it plays
+    /// in any project it is loaded in.**
+    ///
+    /// The bay stores its sample relative to its own project
+    /// (`media/kick.wav`), and the save road wrote the face's extras
+    /// verbatim, so a preset saved that way would name a file in whichever
+    /// project loaded it; and loading a preset handed the app its knobs and
+    /// never its file. `preset_state_for_disk` writes the sampler's file
+    /// against the project it was saved in, through the preset file's own
+    /// round trip, and `preset_sample` reads it back for the app to bring
+    /// into the project that loads it (the app's half is
+    /// `a_sampler_preset_brings_its_sample_into_the_project_it_is_loaded_in`).
+    /// A path already absolute and another unit's state are written as they
+    /// stand. That the save and the load call them is a source scan.
+    #[test]
+    fn a_sampler_preset_names_its_sample_wherever_it_is_loaded() {
+        let sampler = crate::builtin_fx::SAMPLER_PATH;
+        let song = std::env::temp_dir().join("Song A");
+        let doc = tangent_ui::arrangement::doc_in(&song);
+        let state = |path: &str| {
+            vec![
+                ("sample_path".to_owned(), path.to_owned()),
+                ("sample_name".to_owned(), "kick.wav".to_owned()),
+                ("root_key".to_owned(), "48".to_owned()),
+            ]
+        };
+        // Saved in project A, as the face pushes its extras, and read back
+        // through the file.
+        let preset = tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: sampler.to_owned(),
+            name: "Room Kick".to_owned(),
+            values: vec![("vol".to_owned(), 0.75)],
+            state: preset_state_for_disk(sampler, &state("media/kick.wav"), Some(&doc)),
+            extra: Default::default(),
+        };
+        let back = tangent_ui::preset::Preset::from_json(&preset.to_json()).expect("a preset");
+        assert_eq!(
+            preset_sample(sampler, &back.state),
+            song.join("media").join("kick.wav").to_string_lossy(),
+            "the preset does not name its sample where it can be found from another project"
+        );
+        assert!(
+            back.state.contains(&("root_key".to_owned(), "48".to_owned())),
+            "the rest of the sampler's state did not ride along: {:?}",
+            back.state
+        );
+        // A path already absolute, and another unit's state, as they stand.
+        let own = std::env::temp_dir().join("Library").join("kick.wav");
+        let own = own.to_string_lossy();
+        assert_eq!(preset_state_for_disk(sampler, &state(&own), Some(&doc)), state(&own));
+        let ir = vec![("ir_path".to_owned(), "media/Room.wav".to_owned())];
+        assert_eq!(preset_state_for_disk(crate::builtin_fx::IR_PATH, &ir, Some(&doc)), ir);
+        assert_eq!(preset_sample(crate::builtin_fx::IR_PATH, &ir), "", "an impulse read as a sample");
+        assert_eq!(preset_sample(sampler, &state("")), "", "an empty sampler named a file");
+
+        // And the preset road's two ends call them, which a `DesktopApp`
+        // cannot be built to show: a source scan.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} is still called that"));
+            &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+        };
+        assert!(
+            body("fn save_unit_preset(")
+                .contains("state: preset_state_for_disk(unit, state, self.app.kit_doc().as_deref()),"),
+            "a saved preset no longer names the sampler's file absolutely"
+        );
+        assert!(
+            body("fn load_unit_preset(").contains("sample: preset_sample(unit, &p.state),"),
+            "a loaded preset no longer hands the app its sample"
+        );
     }
 
     /// **The sampler's reload keeps the four promises the drumpad's does**,

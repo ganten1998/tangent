@@ -191,6 +191,11 @@ Related invariants that keep this working:
   and hands the list to the app (`set_sampler_media`); making a scratch
   real, Save As Template from a scratch and Duplicate of one copy those
   files with the kit's samples, by the same rules (`copy_sampler_media`).
+  A sampler preset names its file by its absolute path
+  (`preset_state_for_disk`), so it plays in any project; loading one copies
+  the file into the project's `media/` and binds the copy, a frame after
+  the preset's knobs (`preset_sample`), since binding rebuilds the bay from
+  the state it writes. Loading a preset used to restore the knobs alone.
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
   from the Open panel is ADOPTED the same way (`open_project`), into the

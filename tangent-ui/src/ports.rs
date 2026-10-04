@@ -1041,6 +1041,11 @@ pub struct PresetLoaded {
     pub unit: String,
     pub name: String,
     pub values: Vec<(String, f64)>,
+    /// **The file a sampler preset plays**, absolute as the preset names it
+    /// so that it works in any project; empty for every other unit and for a
+    /// preset saved with nothing loaded. The app copies it into the project
+    /// and binds the copy on the bay that asked, after the knobs.
+    pub sample: String,
 }
 
 /// A source of MIDI the app picks for itself.
