@@ -3885,7 +3885,13 @@ impl Arrangement {
                         })
                     })
                     .collect();
-                Some(Curve::sanitised(lane, param, points))
+                let mut curve = Curve::sanitised(lane, param, points);
+                // Whose a plugin curve kept through an unload is - see
+                // `Curve::tenant`. Absent on every other curve.
+                if let Some(t) = o.get("tenant").and_then(Value::as_str) {
+                    curve.tenant = t.to_owned();
+                }
+                Some(curve)
             })
             .collect();
         Automation::from_curves(curves)
@@ -4165,6 +4171,10 @@ impl Arrangement {
                             let mut o = Map::new();
                             o.insert("lane".into(), Value::Number((c.lane as u64).into()));
                             o.insert("param".into(), Value::String(c.param.key().to_owned()));
+                            // Only on a curve that is waiting for its plugin.
+                            if !c.tenant.is_empty() {
+                                o.insert("tenant".into(), Value::String(c.tenant.clone()));
+                            }
                             o.insert(
                                 "points".into(),
                                 Value::Array(
@@ -4423,6 +4433,14 @@ impl Arrangement {
                         f.u64(u64::from(bay));
                         f.u64(u64::from(id));
                     }
+                }
+                // The tenant under the writer's own condition: written only
+                // when there is one, so a tag word says which.
+                if c.tenant.is_empty() {
+                    f.u64(0);
+                } else {
+                    f.u64(1);
+                    f.str(&c.tenant);
                 }
                 f.len(c.points().len());
                 for p in c.points() {
@@ -5541,15 +5559,20 @@ mod tests {
                     },
                 ],
             ),
-            crate::automation::Curve::sanitised(
-                2,
-                crate::automation::AutoParam::Plugin { bay: 1, id: 77 },
-                vec![crate::automation::Point {
-                    at_s: 2.0,
-                    value: 0.25,
-                    shape: crate::automation::Shape::Linear,
-                }],
-            ),
+            {
+                let mut kept = crate::automation::Curve::sanitised(
+                    2,
+                    crate::automation::AutoParam::Plugin { bay: 1, id: 77 },
+                    vec![crate::automation::Point {
+                        at_s: 2.0,
+                        value: 0.25,
+                        shape: crate::automation::Shape::Linear,
+                    }],
+                );
+                // Waiting for its plugin to come back - see `Curve::tenant`.
+                kept.tenant = "@tangent-eq".into();
+                kept
+            },
         ]);
         a.markers.push(ArrMarker { at_s: 12.5, name: "Verse".into() });
         a.extra.insert("song_of_the_future".into(), Value::from(9));
@@ -6143,6 +6166,16 @@ mod tests {
             );
             let mut all = a.automation.curves().to_vec();
             all[1] = curve;
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("whose plugin a kept curve waits for", |a| {
+            let mut all = a.automation.curves().to_vec();
+            all[1].tenant = "@tangent-comp".into();
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("a kept curve's plugin coming back", |a| {
+            let mut all = a.automation.curves().to_vec();
+            all[1].tenant.clear();
             a.automation = crate::automation::Automation::from_curves(all);
         });
         moves_both("automation going away", |a| {

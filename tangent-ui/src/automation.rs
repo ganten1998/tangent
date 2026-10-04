@@ -254,6 +254,20 @@ pub struct Curve {
     /// curve with no points is not written down at all — see
     /// [`Automation::set`].
     points: Vec<Point>,
+    /// **Whose a plugin curve is, once that plugin has left its bay**: the
+    /// path of the tenant it was drawn for. Empty for every desk curve, and
+    /// for a plugin curve while its plugin is still seated - the bay's
+    /// tenant says whose it is then.
+    ///
+    /// A plugin curve names a bay and the plugin's OWN parameter id, and
+    /// ids are small numbers every plugin reuses: the EQ's band-1 frequency
+    /// and the compressor's attack are both id 2. So a curve kept through
+    /// its plugin's unload (it is somebody's work, and the plugin may come
+    /// back) has to remember whose it is, or the next plugin put in the bay
+    /// plays it on its own knobs. `TangentApp::set_insert` keeps the rule:
+    /// marked when the bay empties, played again when its own plugin comes
+    /// back, let go when another arrives.
+    pub tenant: String,
 }
 
 impl Curve {
@@ -319,7 +333,7 @@ impl Curve {
         // so a curve with one node at bar 40 already holds that value from
         // the beginning of the song. The node was only ever a drawing of a
         // rule the maths already followed.
-        Self { lane, param, points: kept }
+        Self { lane, param, points: kept, tenant: String::new() }
     }
 
     pub fn points(&self) -> &[Point] {
@@ -427,9 +441,12 @@ impl Curve {
     /// Replace every point at once, **keeping the given order among points
     /// that share an instant** — which is how a drag lands a node exactly on
     /// its neighbour's time and makes a step rather than a replacement. The
-    /// same sanitising a file gets: see [`Curve::sanitised`].
+    /// same sanitising a file gets: see [`Curve::sanitised`]. Whose the
+    /// curve is ([`Curve::tenant`]) stays as it was.
     pub fn set_points(&mut self, points: Vec<Point>) {
+        let tenant = std::mem::take(&mut self.tenant);
         *self = Self::sanitised(self.lane, self.param, points);
+        self.tenant = tenant;
     }
 
     /// Take the point nearest `seconds` out, if one is within `reach`.
