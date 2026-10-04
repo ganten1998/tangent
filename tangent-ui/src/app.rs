@@ -2144,7 +2144,8 @@ const HEADER_GRIP_DEAD: f32 = 8.0;
 /// departure and the old departure is gone. Gone from the release on: a node
 /// only carried past is rebuilt from this anchor next frame and takes nothing
 /// with it. At zero a run keeps only its last point, so a node dropped on the
-/// base replaces it.
+/// base replaces it. The base itself never leaves zero: carried, alone or in
+/// a group, it moves in value only (see `TangentApp::arr_drag_auto_point`).
 #[derive(Debug, Clone)]
 struct AutoDragFrom {
     /// The node under the hand, `(lane, param, index)` into the anchor, and
@@ -16028,17 +16029,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let Some(p) = out.get_mut(k) else {
                     continue;
                 };
+                // **The base moves in value only.** The node at a lane's very
+                // start is its level, and only there does nothing delete it
+                // (`arr_take_auto_node`): carried in time, a sideways wobble
+                // with the magnet off walked it off zero and out of that
+                // protection.
+                let base = k == 0 && p.at_s <= 1.0e-9;
                 if (*c_lane, *c_param, k) == from.lead {
                     // The node under the hand goes exactly where the hand
                     // is, not to "where it was plus the step": the same
                     // number by another sum is a different float, and a
                     // node meant to land on its neighbour's grid line would
                     // miss it by an ulp.
-                    p.at_s = at_s;
+                    p.at_s = if base { 0.0 } else { at_s };
                     p.value = value;
                     lead_pt = Some(*p);
                 } else {
-                    p.at_s = (p.at_s + dt).max(0.0);
+                    p.at_s = if base { 0.0 } else { (p.at_s + dt).max(0.0) };
                     p.value = (p.value + dv).clamp(0.0, 1.0);
                 }
                 moved.push(*p);
@@ -60888,6 +60895,22 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(auto_nodes(&app)[0], (0.0, 0.5), "the base moved: {:?}", auto_nodes(&app));
         assert_eq!(app.history.len(), moments, "a click left an undo step");
+    }
+
+    /// **Dragging the base keeps it at zero, however the hand wobbles.**
+    /// The base moves in value only. Carried with a sideways wobble and the
+    /// magnet off, it walked off the song's start, out of its own
+    /// protection, and became a node a Delete could take.
+    #[test]
+    fn dragging_the_base_up_keeps_it_at_zero() {
+        let (ctx, mut app) = auto_bench("autobasewobble");
+        app.settings.arr_snap = false;
+        let _ = run_frame(&ctx, &mut app);
+        let at = auto_at(&app, 0.0, 0.5) + Vec2::new(2.0, 0.0);
+        drag_through(&ctx, &mut app, at, &[at + Vec2::new(3.0, -20.0)]);
+        let got = auto_nodes(&app);
+        assert_eq!(got[0].0, 0.0, "the base walked off zero: {got:?}");
+        assert!(got[0].1 > 0.55, "fixture: the drag did not lift the base: {got:?}");
     }
 
     /// **The row's dial writes the node it reads.** The dial reads the
