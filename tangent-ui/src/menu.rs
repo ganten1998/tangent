@@ -60,14 +60,11 @@ pub enum MenuAction {
     SaveThemeAs,
     ToggleKeytoggle,
     ToggleNotePreference,
-    ToggleKeyNoteNames,
     ToggleFretNoteNames,
     ToggleChordDetection,
     ToggleChordStrip,
     /// Cycle the built-in UI typeface (Courier Prime <-> Terminess).
     CycleFont,
-    DetachChordWindow,
-    AttachChordWindow,
     TeachChordName,
     ManageTaughtChords,
     /// D-UI-9: correct the current reading, training the learned re-ranker.
@@ -84,26 +81,16 @@ pub enum MenuAction {
     ToggleGuitarIntervals,
     /// Show or hide the camera pane beside the theory band.
     ToggleCameraPane,
-    /// The take's destination and devices, which moved out of the band.
-    ChooseFolder,
-    RevealFolder,
-    ToggleOpenWhenDone,
-    PickCamera,
-    PickAudio,
     /// Step to the next clef preset.
     CycleClef,
     /// Set the staves outright, by key.
     SetStaffSet(&'static str),
-    /// Add or remove one clef from the user's own stack.
-    ToggleCustomClef(&'static str),
     /// Choose THE stave — exclusive, one at a time: "grand" or a single
     /// clef's key. The multi-staff stack is a later feature; see the
     /// "Stave" category.
     SetStave(&'static str),
     /// The key signature, as a count of sharps (positive) or flats (negative).
     SetStaffKey(i32),
-    /// Letter names inside the noteheads.
-    ToggleNoteNames,
     /// A fresh, empty project beside the others, opened immediately.
     NewProject,
     /// Raise the picker for a `project.tangent` to open.
@@ -139,17 +126,6 @@ pub enum MenuAction {
     /// collapsed band without having to remember which number is which.
     /// D-UI-17: whether the theory band follows live playing or stays put.
     ToggleTheoryFollowsMidi,
-    /// D-UI-16: pop the guitar view into its own window, and put it back.
-    DetachFretboard,
-    AttachFretboard,
-    /// D-UI-17: pop the theory band into its own window, and put it back.
-    ///
-    /// The third detachable surface, and it follows the other two exactly so
-    /// there is one set of habits rather than three — including that
-    /// `Caps::detachable` gates it, because a plugin has no window to pop it
-    /// into.
-    DetachTheory,
-    AttachTheory,
     /// §5: show and hide the Recorder band.
     ///
     /// This row is the ONLY way the feature is reachable. `show_recorder`
@@ -162,39 +138,6 @@ pub enum MenuAction {
     /// is what `ToggleFretboard` already means; the app does the closing, so
     /// the contract lives in the action name.
     ToggleRecorder,
-    /// §5: pop the Recorder band into its own window, and put it back.
-    ///
-    /// The fourth detachable surface and the one with the best reason to be on
-    /// a second monitor — a big framing view of the camera while the piano
-    /// stays where it was. Gated on `caps.detachable` like the other three.
-    DetachRecorder,
-    AttachRecorder,
-    /// §5: open the Export dialog and its composition selector.
-    ///
-    /// A dialog rather than a window, so on its own it would survive a plugin
-    /// for the same reason "Teach Chord Name..." does. It does not, because it
-    /// configures a take that a plugin may not capture or write in the first
-    /// place — the whole category goes, not this row.
-    ShowExportDialog,
-    /// What the audio path is doing: both rates, both buffers, the round trip.
-    ShowAudioStatus,
-    /// §5: pre-roll countdown in seconds; one of `recorder::PREROLL_CHOICES`.
-    /// Count-in length in beats (0 / 4 / 8).
-    SetCountIn(u32),
-    /// The take's time signature. Drives the click's accent, how long a bar of
-    /// count-in is, and the `.mid`'s meta event.
-    SetTimeSignature(crate::recorder::TimeSignature),
-    /// Write the count-in into the take rather than before it.
-    ToggleCountInInTake,
-    /// The click.
-    ToggleMetronome,
-    /// Whether the click is mixed into the FILE as well as the monitors.
-    ToggleMetronomeInTake,
-    /// §5: hide the running clock while recording.
-    ///
-    /// After a blinking light, a running timer is the most-cited performance
-    /// distraction in the piano forums, and no competitor offers the switch.
-    ToggleHideElapsed,
     /// Draw the menu and the dialogs in the canvas, so a screen reader can
     /// reach them. See `Settings::screen_reader_mode`.
     ToggleScreenReaderMode,
@@ -910,7 +853,8 @@ const SUBMENU_ID: &str = "ivory-menu-sub";
 ///
 /// **Detach is gone too, and that one is a pivot rather than a tidy-up.** Four
 /// surfaces could be popped into their own window; all four are now in the box
-/// or filling the screen (`Z`). See `MenuAction::DetachChordWindow`.
+/// or filling the screen (`Z`), and the actions that popped them out went with
+/// their rows.
 ///
 /// Two rules still shape what follows, and both are the type's, not a
 /// preference: a submenu holds items and not more submenus (`Entry::Submenu`),
@@ -3204,7 +3148,6 @@ mod tests {
             (MenuAction::CycleFont, KeyAction::CycleFont),
             (MenuAction::ToggleKeytoggle, KeyAction::ToggleKeytoggle),
             (MenuAction::ToggleNotePreference, KeyAction::ToggleNotePreference),
-            (MenuAction::ToggleNoteNames, KeyAction::ToggleNoteNames),
             (
                 MenuAction::ToggleTheoryView(crate::theory_panel::View::Circle),
                 KeyAction::ToggleTheoryElement(1),
@@ -3235,6 +3178,78 @@ mod tests {
                 "{kept:?} has no key and left the menu anyway"
             );
         }
+    }
+
+    /// **Every action this menu can carry is built somewhere.** An action no
+    /// row and no key builds is an arm of `apply_menu_action` nothing can
+    /// reach, and those arms rot unseen: `ToggleMetronome`, `SetCountIn`,
+    /// `SetTimeSignature` and twenty-one more outlived the rows that built them,
+    /// and committed no undo moment while the live roads to the same
+    /// settings had learned to. Read out of the source, because a variant
+    /// nothing builds cannot be named by a test without being built: each
+    /// variant must appear as `MenuAction::Variant` somewhere other than the
+    /// head of a match arm, in the code of this file or of the app, comments
+    /// and tests cut away.
+    #[test]
+    fn every_menu_action_is_built_somewhere() {
+        fn code(src: &str) -> String {
+            src[..src.find("\nmod tests {").unwrap_or(src.len())]
+                .lines()
+                .map(|l| l.find("//").map_or(l, |c| &l[..c]))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let menu = code(include_str!("menu.rs"));
+        let app = code(include_str!("app.rs"));
+        let body = {
+            let at = menu.find("pub enum MenuAction {").expect("the enum");
+            let rest = &menu[at..];
+            &rest[..rest.find("\n}").expect("the enum's end")]
+        };
+        let variants: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let name = l.strip_prefix("    ")?;
+                let end = name.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(name.len());
+                let name = &name[..end];
+                name.starts_with(|c: char| c.is_ascii_uppercase()).then_some(name)
+            })
+            .collect();
+        assert!(variants.len() > 30, "the scan found only {} variants", variants.len());
+        // Past the name, the payload's parentheses, then what follows: an arm
+        // head goes on to `=>` or `|`; anything else builds the action.
+        let built = |src: &str, needle: &str| {
+            src.match_indices(needle).any(|(at, _)| {
+                let mut rest = &src[at + needle.len()..];
+                if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                    return false;
+                }
+                if rest.starts_with('(') {
+                    let mut depth = 0;
+                    for (i, c) in rest.char_indices() {
+                        depth += match c {
+                            '(' => 1,
+                            ')' => -1,
+                            _ => 0,
+                        };
+                        if depth == 0 {
+                            rest = &rest[i + 1..];
+                            break;
+                        }
+                    }
+                }
+                let rest = rest.trim_start();
+                !(rest.starts_with("=>") || rest.starts_with('|'))
+            })
+        };
+        let dead: Vec<&str> = variants
+            .into_iter()
+            .filter(|v| {
+                let needle = format!("MenuAction::{v}");
+                !built(&menu, &needle) && !built(&app, &needle)
+            })
+            .collect();
+        assert!(dead.is_empty(), "built nowhere, so their arms are dead: {dead:?}");
     }
 
     /// The four blocks that can be empty must take their separators with them.
@@ -3520,18 +3535,12 @@ mod tests {
     /// Asserted over `fullest()` and every `Caps`, because each pair used to be
     /// gated differently and a row that comes back under one host only is a row
     /// nobody would find until a user did.
+    ///
+    /// The actions themselves are gone (`every_menu_action_is_built_somewhere`
+    /// keeps a dead one from lingering), so what is left to hold is the words:
+    /// no row offers to pop a surface out or put one back.
     #[test]
     fn nothing_can_be_detached_any_more() {
-        let detach = [
-            MenuAction::DetachChordWindow,
-            MenuAction::AttachChordWindow,
-            MenuAction::DetachFretboard,
-            MenuAction::AttachFretboard,
-            MenuAction::DetachTheory,
-            MenuAction::AttachTheory,
-            MenuAction::DetachRecorder,
-            MenuAction::AttachRecorder,
-        ];
         // Detached in the settings as well as attached: the rows renamed
         // themselves, so half of them only ever appeared in one of the states.
         for detached in [false, true] {
@@ -3544,11 +3553,10 @@ mod tests {
                     recorder_detached: detached,
                     ..fullest()
                 };
-                for a in &detach {
-                    assert_eq!(
-                        find(v.clone(), a.clone()),
-                        None,
-                        "{a:?} survived at caps={caps:?} detached={detached}"
+                for (label, ..) in all_rows(v) {
+                    assert!(
+                        !label.to_lowercase().contains("attach"),
+                        "{label:?} survived at caps={caps:?} detached={detached}"
                     );
                 }
             }
@@ -3655,46 +3663,21 @@ mod tests {
             metronome_on: true,
             ..view()
         };
-        // Detach/Attach Theory joins the list for exactly the reason the other
-        // two detach pairs are on it: it needs a second OS window, and a plugin
-        // editor is handed one window by the host and gets no more.
-        //
         // `EditCustomTuning` is deliberately NOT here. It raises a dialog, and
         // dialogs are drawn in the canvas when `caps.child_windows` is false —
         // the same road "Teach Chord Name..." takes, which this test asserts
         // survives a few lines down.
         //
-        // EVERY recorder action is here, including the two that raise no window
-        // and open no device by themselves (`ShowExportDialog`, `SetPreRoll`,
-        // `ToggleHideElapsed`). They are forbidden by what they are ABOUT: each
-        // one configures a capture a plugin may not perform, so a row offering
-        // it is a promise the editor cannot keep. Listing only the obvious
-        // three is precisely how a plugin row for a camera slips through.
-        let mut forbidden = vec![
+        // EVERY recorder action is here. It is forbidden by what it is ABOUT:
+        // a capture a plugin may not perform, so a row offering it is a
+        // promise the editor cannot keep. The detach pairs, the take's own
+        // rows, the click and the count-in that stood here went with their
+        // rows (`every_menu_action_is_built_somewhere`).
+        let forbidden = [
             MenuAction::SelectMidiInput,
             MenuAction::ToggleBorderless,
-            MenuAction::DetachChordWindow,
-            MenuAction::AttachChordWindow,
-            MenuAction::DetachFretboard,
-            MenuAction::AttachFretboard,
-            MenuAction::DetachTheory,
-            MenuAction::AttachTheory,
             MenuAction::ToggleRecorder,
-            MenuAction::DetachRecorder,
-            MenuAction::AttachRecorder,
-            MenuAction::ShowExportDialog,
-            MenuAction::ToggleHideElapsed,
-            // The instrument rows. Loading one runs third-party code inside
-            // the process and opens a device; the editor opens a native window;
-            // and the click writes to an output stream. None of the three is
-            // anything a VST3 editor may do inside its host.
-            MenuAction::ToggleMetronome,
-            MenuAction::ToggleMetronomeInTake,
         ];
-        // Built from the table rather than spelled out, so a fourth count-in
-        // choice cannot be added to `COUNT_IN_CHOICES` and quietly arrive in a
-        // plugin unlisted here.
-        forbidden.extend(crate::recorder::COUNT_IN_CHOICES.map(MenuAction::SetCountIn));
         for (label, action, _) in all_rows(v.clone()) {
             assert!(
                 !forbidden.contains(&action),
@@ -4268,14 +4251,7 @@ mod tests {
                     .any(|n| n == "Recorder" || n == "Count-in"),
                 "a Recorder hover survived {caps:?}"
             );
-            for gone in [
-                MenuAction::ToggleRecorder,
-                MenuAction::DetachRecorder,
-                MenuAction::AttachRecorder,
-                MenuAction::ShowExportDialog,
-                MenuAction::ToggleHideElapsed,
-                MenuAction::SetCountIn(3),
-            ] {
+            for gone in [MenuAction::ToggleRecorder] {
                 assert_eq!(
                     find(v.clone(), gone.clone()),
                     None,
