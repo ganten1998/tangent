@@ -10079,7 +10079,7 @@ impl DesktopApp {
     // ── the FULL-SPEED export ──────────────────────────────────────────────
 
     /// Where an export lands: the spec's directory, or the project's own
-    /// `export/` folder.
+    /// folder under the Exports root (`TangentApp::export_home`).
     fn export_out_dir(
         &self,
         spec: &tangent_ui::ports::ProjectExportSpec,
@@ -10094,16 +10094,10 @@ impl DesktopApp {
         // "where are my exports" a per-project answer. They go under one
         // roof now — see `Settings::media_root` — with a subfolder per
         // project, because two projects both writing `master.wav` into one
-        // folder is one of them overwriting the other.
-        let name = self
-            .app
-            .project_doc()
-            .and_then(|d| d.file_stem().map(|s| s.to_string_lossy().into_owned()))
-            .filter(|s| !s.is_empty());
-        Some(match name {
-            Some(n) => self.app.export_root().join(n),
-            None => self.app.export_root(),
-        })
+        // folder is one of them overwriting the other. Named for the
+        // project's FOLDER: named for the document's stem, it was `project`
+        // for every project, and one room held them all.
+        Some(self.app.export_home())
     }
 
     /// Start a full-speed export: an OFFLINE engine, furnished exactly like
@@ -11226,7 +11220,9 @@ impl DesktopApp {
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 // Raised, not pushed: from here until the files land this is
                 // a thing that is HAPPENING, and the render below can run for
-                // minutes. Both passes lower it when they report.
+                // minutes. Both passes lower it when they report. It names
+                // the folder the files will land in, as the dialog did.
+                let to = self.export_out_dir(&spec).unwrap_or_default();
                 self.app.notify_raise(
                     EXPORT_RUNNING,
                     Kind::Info,
@@ -11238,11 +11234,7 @@ impl DesktopApp {
                         "full-speed"
                     },
                     spec.source_label(),
-                    if spec.dir.trim().is_empty() {
-                        "project/export"
-                    } else {
-                        spec.dir.trim()
-                    },
+                    to.display(),
                     ),
                 );
                 if spec.realtime {
@@ -22909,6 +22901,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("the pass's take latches the last press's facts: no `{needle}`"));
             assert!(set < toggles, "`{needle}` comes after the take has already latched");
         }
+    }
+
+    /// **An export's room is named for its project, not its document.**
+    /// Every document is `<project>/project.tan`, so a room named for the
+    /// document's file stem was `Exports/project/` for every project, and
+    /// each project's `mix.wav` replaced the last one's. The host asks the
+    /// app's `export_home`, which `each_projects_exports_land_in_a_folder_of_its_own`
+    /// drives; this pins that it asks, and names no stem of its own. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn an_export_room_is_named_for_its_project_not_its_document() {
+        // The premise: every document is `<project>/project.tan`.
+        assert_eq!(
+            std::path::Path::new(tangent_ui::arrangement::DOC_NAME)
+                .file_stem()
+                .and_then(|s| s.to_str()),
+            Some("project")
+        );
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn export_out_dir(").expect("export_out_dir");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("self.app.export_home()") && !body.contains(".file_stem()"),
+            "export_out_dir names the room after the document's stem - `project` for \
+             every project - so every project's exports share one folder"
+        );
     }
 
     /// **A press writes a head only for a count that clicks.** With the
