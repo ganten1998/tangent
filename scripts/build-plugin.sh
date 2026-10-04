@@ -160,10 +160,11 @@ build_linux() {
   #
   #   pkg-config has not been configured to support cross-compilation
   #
-  # That is the same class of blocker as ALSA for the standalone
-  # (docs/RELEASE.md, "Cross-build blocker"), and the same answer applies:
-  # build it on Linux. `scripts/build-linux-remote.sh` does that in one
-  # command and brings the result back.
+  # That is the class of blocker ALSA was for the standalone, which
+  # build-cross.sh now gets past with a fetched ALSA sysroot (docs/RELEASE.md,
+  # "Cross-building"). Nothing fetches an X11 sysroot, so the answer here is
+  # still to build it on Linux. `scripts/build-linux-remote.sh` does that in
+  # one command and brings the result back.
   if [ "$(uname -s)" != "Linux" ]; then
     cat >&2 <<'MSG'
 The Linux plugin cannot be cross-built from macOS: baseview links X11 and the
