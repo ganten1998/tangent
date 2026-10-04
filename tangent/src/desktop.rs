@@ -16526,16 +16526,20 @@ fn unique_ir_stem(dir: &std::path::Path, stem: &str) -> String {
 /// neither on disk in `media` nor named by any clip in the document (`named`
 /// holds the clips' `path`s, `media/<file>`). A clip whose file went missing
 /// still names it, and a weld written there would bring that clip back to
-/// life playing the new audio.
+/// life playing the new audio. **In any case**, because the disk compares
+/// that way: APFS and NTFS answer `Take-glued-1.wav` to `take-glued-1.wav`.
 #[cfg(feature = "recorder")]
 fn glue_file_name(
     media: &std::path::Path,
     stem: &str,
     named: &std::collections::HashSet<&str>,
 ) -> String {
+    let named: std::collections::HashSet<String> = named.iter().map(|n| n.to_lowercase()).collect();
     (1..10_000)
         .map(|n| format!("{stem}-glued-{n}.wav"))
-        .find(|cand| !media.join(cand).exists() && !named.contains(format!("media/{cand}").as_str()))
+        .find(|cand| {
+            !media.join(cand).exists() && !named.contains(&format!("media/{cand}").to_lowercase())
+        })
         .unwrap_or_else(|| format!("{stem}-glued.wav"))
 }
 
@@ -25887,6 +25891,26 @@ mod tests {
             "a name a missing clip still holds was reused"
         );
         let _ = std::fs::remove_dir_all(&media);
+    }
+
+    /// **Nor a name a missing clip holds in another case.** APFS and NTFS
+    /// answer a name in any case, so a clip whose missing file is
+    /// `media/Take-glued-1.wav` woke up playing a weld written as
+    /// `take-glued-1.wav`, while the exact-match check called that name free.
+    #[test]
+    fn a_glued_name_is_not_one_a_missing_clip_holds_in_another_case() {
+        let media = std::env::temp_dir().join(format!(
+            "tangent-glue-case-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&media);
+        std::fs::create_dir_all(&media).unwrap();
+        let named: std::collections::HashSet<&str> = ["media/Take-glued-1.wav"].into_iter().collect();
+        let got = glue_file_name(&media, "take", &named);
+        let _ = std::fs::remove_dir_all(&media);
+        assert_ne!(got, "take-glued-1.wav", "a name a missing clip holds in another case was reused");
+        assert_eq!(got, "take-glued-2.wav");
     }
 
     /// **A file stem every system can write.** A clip or an export named with
