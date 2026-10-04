@@ -28419,19 +28419,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Only the first: everything after it is a shape somebody drew, and a
     /// dial that dragged the whole curve with it would be a dial that
     /// silently flattens an evening's work.
+    ///
+    /// **The first BY INDEX**, the node `auto_base` reads. It was put back
+    /// at the first node's time, and `Curve::put` at an instant holding a
+    /// step replaces the step's SECOND point: with the curve's first instant
+    /// a step, the dial showed one level and moved the other.
     fn auto_set_base(&mut self, lane: usize, param: crate::automation::AutoParam, v: f64) {
-        let at = self
+        let v = v.clamp(0.0, 1.0);
+        let Some(mut pts) = self
             .arrangement
             .automation
             .get(lane, param)
-            .and_then(|c| c.points().first())
-            .map(|p| (p.at_s, p.shape));
-        let Some((at_s, shape)) = at else {
+            .map(|c| c.points().to_vec())
+        else {
             return;
         };
-        self.arrangement.automation.entry(lane, param).put(
-            crate::automation::Point { at_s, value: v.clamp(0.0, 1.0), shape },
-        );
+        match pts.first_mut() {
+            // A value that is not a number writes nothing: the sanitising
+            // in `set_points` would drop the base along with it.
+            Some(first) if v.is_finite() => first.value = v,
+            _ => return,
+        }
+        self.arrangement.automation.entry(lane, param).set_points(pts);
     }
 
     /// **Where a control is standing right now**, normalised — the level an
@@ -60825,6 +60834,25 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(auto_nodes(&app)[0], (0.0, 0.5), "the base moved: {:?}", auto_nodes(&app));
         assert_eq!(app.history.len(), moments, "a click left an undo step");
+    }
+
+    /// **The row's dial writes the node it reads.** The dial reads the
+    /// base, the curve's first node, and wrote through `put`, which at an
+    /// instant holding a step replaces the SECOND point: with the curve's
+    /// first instant a step, the dial showed one level and moved another.
+    #[test]
+    fn the_dial_writes_the_node_it_reads() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let (_ctx, mut app) = auto_bench("autodialstep");
+        let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
+        app.arrangement.automation.set(Curve::sanitised(
+            0,
+            AutoParam::Gain,
+            vec![pt(2.0, 0.3), pt(2.0, 0.7), pt(6.0, 0.6)],
+        ));
+        app.auto_set_base(0, AutoParam::Gain, 0.9);
+        assert_eq!(app.auto_base(0, AutoParam::Gain), 0.9, "{:?}", auto_nodes(&app));
+        assert_eq!(auto_nodes(&app)[1], (2.0, 0.7), "the step's departure moved with the dial");
     }
 
     /// **Opening or closing a row lets the node choice go.** The choice names
