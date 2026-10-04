@@ -5341,7 +5341,7 @@ impl Settings {
         // keep (the app asks the window for that size on the spot). Missed
         // when the pair was added because the partition test could only see
         // fields the WRITER emits, and an optional one that is `None` at
-        // first launch is never written — it compares the structs as well
+        // first launch is never written; it compares the structs as well
         // now, which is what catches this. The position is forgotten here
         // too, but the window does not move, and the geometry write-back
         // records where it stands again once the resize lands.

@@ -387,7 +387,7 @@ pub trait AudioSetup: Send {
 
 /// The index of the output whose name a caller asked for: exact first, then the
 /// loose substring a human would type. Pure, so it can be tested without a sound
-/// card — cpal has no stable device identifier on any backend, `name()` is the
+/// card: cpal has no stable device identifier on any backend, `name()` is the
 /// only identity method there is (`tangent-record`'s `audio.rs` documents the dig
 /// through the backends), so a name and a substring are all a caller has.
 ///
