@@ -2081,7 +2081,8 @@ struct Shared {
     /// The transport is moving. A LEVEL, and correctly so — "should I be
     /// moving" genuinely is a level; only the seek was ever an event wearing a
     /// level's clothes. Safe to re-assert every frame, because nothing keys
-    /// off its edges any more.
+    /// off its edges any more. Read by `run_transport` alone, once a chunk:
+    /// the racks read what it latched (`transport_rolling`).
     rolling: AtomicBool,
     /// **How long a grain is, in FRAMES; zero is off.** See
     /// [`Engine::set_grain_ms`], which is where the milliseconds become
@@ -2108,6 +2109,12 @@ struct Shared {
     /// is the block a rack is rendering, so a rack with no span of its own is
     /// handed the pair as it stands. See `rack_transport`.
     transport_anchor: AtomicU64,
+    /// **Whether that chunk ROLLS**: the level `run_transport` latched for
+    /// it, published with the anchor and read by `rack_transport` in place
+    /// of `rolling`, the host's level, which can move while the chunk
+    /// renders. Read live, a Play or a Stop landing mid-chunk gave every
+    /// rack after it the other answer for that chunk.
+    transport_rolling: AtomicBool,
     /// **Where that frame is in the MUSIC, and how fast the music is going
     /// there** - the beat as the tempo map reckons it, and the map's
     /// instantaneous tempo, both as `f64` bits.
@@ -3193,6 +3200,7 @@ impl Shared {
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
             transport_anchor: AtomicU64::new(0),
+            transport_rolling: AtomicBool::new(false),
             transport_beat: AtomicU64::new(0.0f64.to_bits()),
             // The same seed `Arp::new` had, so a rack that runs before the
             // first `run_transport` is no worse off than it was.
@@ -6936,7 +6944,9 @@ fn run_extra_rack(
 /// `run_transport` publishes ONE anchor per chunk: `transport_anchor`, the
 /// chunk's FIRST frame (taken before the advance and the loop wrap), and the
 /// tempo map's beat (`TempoMap::beat_at_seconds`) and instantaneous tempo
-/// (`TempoMap::bpm_at_beat`) at that frame.
+/// (`TempoMap::bpm_at_beat`) at that frame, and whether the chunk rolls
+/// (`transport_rolling`, the level it latched). That level was read live
+/// here, so a Play or a Stop landing mid-chunk told a rack the other answer.
 ///
 /// `pos` is the span's own first frame, or `u64::MAX` for a caller that has
 /// none. The sentinel is handed the anchor as it stands, which is exactly the
@@ -6954,7 +6964,7 @@ fn run_extra_rack(
 /// loads for the sentinel, five for a lane, read once so every bay in the
 /// rack sees one block.
 fn rack_transport(shared: &Shared, pos: u64) -> crate::analog::arp::Transport {
-    let rolling = shared.rolling.load(Ordering::Relaxed);
+    let rolling = shared.transport_rolling.load(Ordering::Relaxed);
     let beat = f64::from_bits(shared.transport_beat.load(Ordering::Relaxed));
     let bpm = f64::from_bits(shared.transport_bpm.load(Ordering::Relaxed));
     let beat = if pos == u64::MAX {
@@ -11964,6 +11974,8 @@ impl Renderer {
         // the next block's beat, and in the block that wraps a loop a lane at
         // its own frame was walked back the whole loop from the head.
         self.shared.transport_anchor.store(at, Ordering::Relaxed);
+        // And whether it moves, as latched here: see `transport_rolling`.
+        self.shared.transport_rolling.store(rolling, Ordering::Relaxed);
         let secs = at as f64 / self.rate.max(1.0);
         let beat = self.maps.tempo.beat_at_seconds(secs);
         self.shared
@@ -34310,7 +34322,7 @@ mod sampler_road {
     fn a_racks_beat_is_the_published_one_walked_to_the_spans_own_frame() {
         let shared = Shared::new();
         shared.rate.store(48_000, Ordering::Relaxed);
-        shared.rolling.store(true, Ordering::Relaxed);
+        shared.transport_rolling.store(true, Ordering::Relaxed);
         shared.transport_anchor.store(48_000, Ordering::Relaxed);
         shared.transport_beat.store(4.0f64.to_bits(), Ordering::Relaxed);
         shared.transport_bpm.store(90.0f64.to_bits(), Ordering::Relaxed);
@@ -34342,7 +34354,7 @@ mod sampler_road {
 
         // Stopped, a rack still gets the tempo - that is what an arp
         // free-runs at while a patch is auditioned.
-        shared.rolling.store(false, Ordering::Relaxed);
+        shared.transport_rolling.store(false, Ordering::Relaxed);
         let t = rack_transport(&shared, u64::MAX);
         assert!(!t.playing);
         assert!((t.bpm - 90.0).abs() < 1.0e-9, "stopped, the tempo is {}", t.bpm);
@@ -34590,6 +34602,42 @@ mod sampler_road {
                 tempo.bpm_at_beat(want)
             );
         }
+    }
+
+    /// **A rack is told whether ITS chunk rolls, not what the host has
+    /// asked for since.** `run_transport` latches the level once a chunk and
+    /// publishes the anchor for it, but `rack_transport` read the host's
+    /// level live, so a Play or a Stop landing while a chunk rendered gave
+    /// every rack after it the other answer for that chunk: an arp put on
+    /// the song's grid in a chunk that did not move, or left free-running in
+    /// one that did. Here the host's store lands between a chunk and the
+    /// rack's read, as it can between `run_transport` and a rack.
+    #[test]
+    fn a_rack_is_told_whether_its_own_chunk_rolls() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        e.set_transport(1, 48_000);
+        let mut out = vec![0.0f32; 2 * 512];
+        e.render_offline(&mut out);
+        e.set_rolling(true);
+        assert!(
+            !rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a parked chunk was told the song is playing"
+        );
+        e.render_offline(&mut out);
+        assert!(
+            rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a rolling chunk was told the song is stopped"
+        );
+        e.set_rolling(false);
+        assert!(
+            rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a rolling chunk was told the song has stopped"
+        );
+        e.render_offline(&mut out);
+        assert!(
+            !rack_transport(&e.shared, u64::MAX).playing,
+            "a rack in a stopped chunk was told the song is playing"
+        );
     }
 
     /// **The displaced file is freed on the HOST thread, and this measures
