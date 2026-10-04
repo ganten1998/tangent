@@ -1254,28 +1254,45 @@ pub struct Manifest {
     /// `T0` in the recorder's monotonic timebase, so a log line can be lined up
     /// against the manifest without going through the wall clock.
     pub t0_monotonic_ns: Nanos,
-    /// Where the PLAYHEAD stood at this take's frame 0, in seconds.
+    /// Where the PLAYHEAD stood at this take's frame 0, in seconds - or, for
+    /// a take with its count in the file whose song was started on that
+    /// count's downbeat, where the song started from.
     ///
     /// **Irrecoverable if not written now**: a take recorded at a playhead of
     /// 1:24 can only be placed on a lane afterwards if somebody wrote down
     /// where the playhead was, and nothing else did. Zero for every take made
     /// before locate existed, which is also where those takes belong.
     ///
-    /// **It places frame 0 only when [`timeline_rolling`] is true.** A take
-    /// is capture only: it does not roll the transport, and the song under
-    /// it can be started, stopped, located or looped at any point. A take
-    /// begun over a stopped song has no single place on the timeline, and
-    /// this is then just where the playhead was waiting.
+    /// **It places the take only when [`timeline_rolling`] is true**, and
+    /// then together with [`head_seconds`]: the point `head_seconds` into the
+    /// file is the song at this position, so frame 0 lies that much earlier
+    /// (frame 0 itself, for a take with no head). A take is capture only: it
+    /// does not roll the transport, and the song under it can be started,
+    /// stopped, located or looped at any point. A take begun over a stopped
+    /// song that nothing started on its downbeat has no single place on the
+    /// timeline, and this is then just where the playhead was waiting.
     ///
     /// [`timeline_rolling`]: Manifest::timeline_rolling
+    /// [`head_seconds`]: Manifest::head_seconds
     pub timeline_start_seconds: f64,
-    /// Whether the transport was ROLLING at frame 0. See
-    /// [`timeline_start_seconds`](Manifest::timeline_start_seconds).
+    /// Whether the song ROLLED from
+    /// [`timeline_start_seconds`](Manifest::timeline_start_seconds) at the
+    /// take's musical downbeat, `head_seconds` into the file: for a take
+    /// with no head, whether the transport was rolling at frame 0.
     ///
-    /// True as well for a take that waited out its count-in before its file
-    /// opened, when Play was pressed during that count: the song starts on
-    /// the downbeat the take begins on, from where the playhead waited - the
-    /// press decides it, so two identical presses write the same answer.
+    /// True as well when the song was started on the downbeat of the
+    /// count-in the take counted - by Play pressed during the count, or by
+    /// the arrangement record beginning on it - from where the playhead
+    /// waited, so two identical presses write the same answer. For a take
+    /// that waited out its count before its file opened, that downbeat is
+    /// frame 0; for one with its count IN the file it is `head_seconds` in,
+    /// after a frame 0 over a stopped song.
+    ///
+    /// **No key was added for that second case**, which manifests wrote
+    /// `false` before the fact was carried: an older manifest with a head and
+    /// `false` may still be a take whose song started on its downbeat. A
+    /// reader that places takes by the rule on `timeline_start_seconds`
+    /// reads both kinds.
     pub timeline_rolling: bool,
     /// How long the head of the FILE runs before the musical downbeat, in
     /// seconds. Zero unless the count-in was recorded into the take.
@@ -1287,11 +1304,11 @@ pub struct Manifest {
     /// bar-scale error, not a millisecond one — and the setting it derives
     /// from can be flipped tomorrow, so it cannot be reconstructed.
     ///
-    /// With `timeline_rolling` false (every take whose count is in the file -
-    /// a count only runs over a stopped song) this is still the offset of the
-    /// music from frame 0; whether the song was STARTED from
-    /// `timeline_start_seconds` at that offset (Play during the count) is a
-    /// separate fact the manifest does not yet carry.
+    /// Whether the song was STARTED from `timeline_start_seconds` at that
+    /// offset - Play pressed during the count, or the arrangement record
+    /// beginning on its downbeat - is `timeline_rolling`. With it false (a
+    /// count only runs over a stopped song, and nothing started the song on
+    /// the downbeat) this is still the offset of the music from frame 0.
     pub head_seconds: f64,
     /// The desk's mute and solo masks as the take began, by desk index.
     ///

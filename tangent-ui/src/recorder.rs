@@ -1967,8 +1967,8 @@ pub struct RecorderState {
     pub count_beat: Option<u32>,
     /// **Play was pressed during a count-in and waits on its downbeat**, when
     /// the song starts. The host's fact; the band lights the Play triangle
-    /// for it, and Pause takes it back. Nothing showed it, so the triangle
-    /// stayed dark over a song about to start.
+    /// for it, and Pause takes it back, as Space does. Nothing showed it, so
+    /// the triangle stayed dark over a song about to start.
     pub play_pending: bool,
 }
 
@@ -2466,7 +2466,9 @@ pub enum RecorderRequest {
     /// PAUSE: hold the playhead where it stands. Ignored while the
     /// arrangement records or an export plays - a pause mid-record would let
     /// the capture run past the playhead. Not while a take runs: a take films
-    /// whatever the transport does.
+    /// whatever the transport does. A Play still waiting on a count-in's
+    /// downbeat is taken back instead - by the band's Pause, and by Space
+    /// while one waits (`RecorderState::play_pending`).
     Pause,
     /// Put out every clip latch: the user has seen it.
     DismissClip,

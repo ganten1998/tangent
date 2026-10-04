@@ -1761,6 +1761,21 @@ impl Session {
         self.take_facts.1 = rolling;
     }
 
+    /// **The song started on the downbeat this take was counting toward**,
+    /// from `from_s` on the timeline - Play pressed during the count, or the
+    /// arrangement record beginning on its downbeat, rolled the transport
+    /// there. A take whose count goes INTO its file is writing from the
+    /// press, over a stopped song, so `begin` latched a transport standing
+    /// still; the song then started `head_seconds` into the file and nothing
+    /// wrote it down. This amends the latched placement of a take that is
+    /// writing; see `Manifest::timeline_rolling` for how the facts combine.
+    pub fn song_started_at_head(&mut self, from_s: f64) {
+        if matches!(self.state, RecordState::Rolling) {
+            self.manifest_facts.0 = from_s;
+            self.manifest_facts.1 = true;
+        }
+    }
+
     /// **The count-in began earlier than the press** - it is the
     /// arrangement's, and this take joined it. Counted from there, the take
     /// begins on the same downbeat the arrangement record does; counted from
@@ -4321,6 +4336,43 @@ mod tests {
         let folder = s.last_summary().expect("a summary").folder.clone();
         let json = std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json");
         assert!(json.contains("\"timeline_rolling\": false"), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A take with its count in the file says so when the song started on
+    /// that count's downbeat.** It writes from the press, over a stopped
+    /// song, so `begin` latched a transport standing still - and a Play
+    /// pressed during the count started the song on the downbeat,
+    /// `head_seconds` into the file, with `timeline_rolling` still saying
+    /// false and the manifest's own doc saying the fact was not carried.
+    /// The song's start amends the placement: rolling, from where the song
+    /// started (a locate during the count moves it), the head kept.
+    #[test]
+    fn a_song_started_on_the_downbeat_of_a_count_in_the_file_places_the_take() {
+        let dir = std::env::temp_dir().join(format!("tangent-take-head-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = session();
+        let manifest = |s: &Session| {
+            let folder = s.last_summary().expect("a summary").folder.clone();
+            std::fs::read_to_string(dir.join(&folder).join("take.json")).expect("take.json")
+        };
+        // The press: two seconds of count into the file, the song parked at
+        // 12 s; a locate during the count put it at 20 s; then the downbeat.
+        s.set_take_facts(12.0, false, 2.0, 0, 0);
+        s.toggle(&dir, Some("in-file"), 0, ExportSpec::default());
+        s.song_started_at_head(20.0);
+        s.stop();
+        let json = manifest(&s);
+        assert!(json.contains("\"timeline_rolling\": true"), "the song's start on the downbeat is lost: {json}");
+        assert!(json.contains("\"timeline_start_seconds\": 20"), "not placed where the song started: {json}");
+        assert!(json.contains("\"head_seconds\": 2"), "the head went with it: {json}");
+        // A take whose song nobody started on its downbeat stays still.
+        s.set_take_facts(12.0, false, 2.0, 0, 0);
+        s.toggle(&dir, Some("still"), 0, ExportSpec::default());
+        s.stop();
+        let json = manifest(&s);
+        assert!(json.contains("\"timeline_rolling\": false"), "{json}");
+        assert!(json.contains("\"timeline_start_seconds\": 12"), "{json}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

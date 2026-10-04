@@ -11749,6 +11749,25 @@ impl TangentApp {
         held
     }
 
+    /// **Whether the folders hold their shape, saying so when they do.** A
+    /// realtime export chose its stems by the folders at its press - a
+    /// folder that collects children writes a stem of its bus - and the
+    /// engine folds by the same table (`folder_parents`), so a folder made
+    /// or dissolved under one moves its children onto another bus
+    /// mid-render, and the undo that could put it back waits for the export
+    /// to end. Asked by Cmd/Ctrl+F's two single-row branches, which move no
+    /// lane and so are not `lane_order_held`'s. An arrangement record binds
+    /// no bus and is not asked about.
+    fn folders_held(&mut self) -> bool {
+        if self.recorder.exporting {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Folders keep their shape while an export runs - it writes each folder's bus.",
+            );
+        }
+        self.recorder.exporting
+    }
+
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
     /// Everything a channel is follows it: kind, input, icon, colour, name,
     /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
@@ -16563,6 +16582,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// does.
     pub fn ask_before_new(&mut self) -> bool {
         self.ask_before(AfterSave::New)
+    }
+
+    /// **Ask Reset Template's question again**, for the same reason as
+    /// `ask_before_new`: the host finishes a running arrangement record in
+    /// the session it was recorded in before the reset replaces it, and the
+    /// take reached the document after the question. `true` when the prompt
+    /// is up; its Save or Discard carries on with the reset.
+    pub fn ask_before_reset_template(&mut self) -> bool {
+        self.ask_before(AfterSave::ResetTemplate)
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -30016,6 +30044,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the children and the row goes back to being a track.
         if sel.len() < 2 {
             if let Some(f) = self.selected_channel.filter(|n| self.is_folder(*n)) {
+                // Not under an export, which writes this folder's bus - see
+                // `folders_held`.
+                if self.folders_held() {
+                    return false;
+                }
                 self.toggle_folder(f);
                 return true;
             }
@@ -30028,6 +30061,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             else {
                 return false;
             };
+            // Not under an export either: an empty row left inside a group
+            // takes the members below it into a folder of its own.
+            if self.folders_held() {
+                return false;
+            }
             self.set_is_folder(n, true);
             // A folder is a ROW, so it has to exist as one: without this it
             // is a flag on a slot nothing draws.
@@ -34478,6 +34516,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // returns the playhead to the EDIT CURSOR.
                 if self.recorder.arr_recording || self.recorder.playing {
                     self.request_recorder(recorder::RecorderRequest::Stop);
+                } else if self.recorder.play_pending {
+                    // **A Play waiting on a count's downbeat is taken back**,
+                    // as the band's Pause takes it back: the band lights it
+                    // as rolling, and Space sent Play again over it. The
+                    // count goes on.
+                    self.request_recorder(recorder::RecorderRequest::Pause);
                 } else if self.mixer_open || self.arrangement_open {
                     // **And on the desk's surfaces, Space is PLAY too** —
                     // idle, it rolls from the edit cursor; rolling, the arm
@@ -35803,8 +35847,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // **Space, from a window that owns the input while it is up.**
             //
             // The same body the main window's own Space runs, so the one key
-            // means the one thing wherever it is pressed: rolling stops,
-            // idle rolls from the edit cursor. A take in progress is not a
+            // means the one thing wherever it is pressed: rolling stops, a
+            // Play waiting on a count's downbeat is taken back, idle rolls
+            // from the edit cursor. A take in progress is not a
             // reason to refuse - it cannot be reached from here, because
             // `Stop` does not end a take (only the cassette does).
             DialogAction::Transport => {
@@ -35824,6 +35869,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if self.settings.show_recorder && !self.recorder.exporting {
                     if self.recorder.arr_recording || self.recorder.playing {
                         self.request_recorder(recorder::RecorderRequest::Stop);
+                    } else if self.recorder.play_pending {
+                        self.request_recorder(recorder::RecorderRequest::Pause);
                     } else if self.mixer_open || self.arrangement_open {
                         self.request_recorder(recorder::RecorderRequest::Play);
                     }
@@ -47529,6 +47576,73 @@ mod tests {
             app.eject_from_folder(9);
             assert_eq!(lanes(&app), before, "a drag home ejected a middle child under {held}");
             assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// **A folder keeps its shape while an export runs.** The export chose
+    /// its stems by the folders at its press - a folder that collects
+    /// children writes a stem of its bus - and the engine folds by the same
+    /// table (`folder_parents`), so Cmd/Ctrl+F on a folder mid-render took
+    /// its bus, fader and bays and all, off its children halfway through the
+    /// master, and left the bus's stem silent from there on. On an empty row
+    /// left inside a group it made a folder that took the members below it
+    /// onto a bus of its own. Neither moves a lane, so `lane_order_held` let
+    /// both through, and the undo that could have put them back is refused
+    /// until the export ends. They refuse now, and say why. An arrangement
+    /// record binds no bus - it records each track by its row - so a folder
+    /// still dissolves under one.
+    #[test]
+    fn cmd_f_never_reshapes_a_folder_under_an_export() {
+        for (exporting, arr) in [(true, false), (false, true)] {
+            let root = project_scratch("folder-held");
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            app.bootstrap_project(&root.join("Projects"));
+            app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+            app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+            // A folder over two tracks with an empty row between them, the
+            // row a removed member leaves indented.
+            for ch in [8usize, 9, 11] {
+                app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+            }
+            app.settings.strip_is_folder[8] = true;
+            for ch in [9, 10, 11] {
+                app.settings.strip_in_folder[ch] = true;
+            }
+            assert!(!app.channel_used(10), "the fixture's empty row is in use");
+            assert_eq!(app.folder_of(11), Some(8), "the fixture's folder");
+            let folds = app.folder_parents();
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            let held = format!("export={exporting} record={arr}");
+            if exporting {
+                app.selected_tracks = vec![10];
+                app.selected_channel = Some(10);
+                assert!(!app.make_folder(), "Cmd/Ctrl+F says it made a folder under {held}");
+                assert_eq!(
+                    app.folder_parents(),
+                    folds,
+                    "Cmd/Ctrl+F on an empty row made a folder under {held}, moving the rows below it onto its bus"
+                );
+            }
+            app.selected_tracks = vec![8];
+            app.selected_channel = Some(8);
+            let dissolved = app.make_folder();
+            if exporting {
+                assert!(!dissolved, "Cmd/Ctrl+F says it dissolved a folder under {held}");
+                assert_eq!(
+                    app.folder_parents(),
+                    folds,
+                    "Cmd/Ctrl+F dissolved a folder under {held}, moving its bus mid-render"
+                );
+                assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            } else {
+                assert!(
+                    dissolved && !app.is_folder(8) && app.folder_of(11).is_none(),
+                    "a folder no longer dissolves under {held}, which binds no bus"
+                );
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -62725,6 +62839,47 @@ mod tests {
         );
     }
 
+    /// **Space takes back a Play waiting on a count-in's downbeat**, as the
+    /// band's Pause does. Play pressed during a count waits for its downbeat
+    /// (the host's `play_on_go`), and the band lights the Play triangle for
+    /// it as for a rolling song - but Space read only `playing`, which a
+    /// waiting Play is not, so it sent Play again and changed nothing: only
+    /// the Pause button could take it back. It is the transport's state, so
+    /// Space takes it back wherever it is pressed, as it stops a rolling
+    /// song wherever it is pressed, and from a window that forwards the key;
+    /// the count itself goes on.
+    #[test]
+    fn space_takes_back_a_play_waiting_on_a_count_ins_downbeat() {
+        let (ctx, mut app) = recorder_app();
+        app.settings.show_recorder = true;
+        // A count is running - a take's or the red button's, the band is
+        // told the same - and a Play waits on its downbeat.
+        app.recorder.take_counting = true;
+        app.recorder.play_pending = true;
+        for (view, arrangement) in [("the arrangement", true), ("the piano view", false)] {
+            app.arrangement_open = arrangement;
+            while app.take_recorder_request().is_some() {}
+            assert_eq!(
+                space(&ctx, &mut app),
+                Some(recorder::RecorderRequest::Pause),
+                "Space on {view} pressed Play again over a Play waiting on the downbeat"
+            );
+            while app.take_recorder_request().is_some() {}
+            app.apply_dialog_action(DialogAction::Transport);
+            assert_eq!(
+                app.take_recorder_request(),
+                Some(recorder::RecorderRequest::Pause),
+                "a forwarded Space on {view} pressed Play again over a waiting Play"
+            );
+        }
+        // With nothing waiting, Space on the desk plays from the count, as it
+        // always did: it is the press that makes the Play wait.
+        app.arrangement_open = true;
+        app.recorder.play_pending = false;
+        while app.take_recorder_request().is_some() {}
+        assert_eq!(space(&ctx, &mut app), Some(recorder::RecorderRequest::Play));
+    }
+
     /// A plugin drains nothing, so a request it can never honour must not be
     /// recorded at all — otherwise the first thing draining would do, whenever
     /// somebody added it, is start an arrangement record nobody asked for.
@@ -68380,6 +68535,45 @@ mod tests {").expect("the tests module")];
             Some(crate::ports::ProjectRequest::ResetTemplate),
             "a clean session was asked about nothing"
         );
+    }
+
+    /// **Reset Template asks again about a take it finished.** The host ends
+    /// an arrangement record still running when the reset arrives, in the
+    /// session it was recorded in, so the take's clips reach the document
+    /// after the question that let the reset go ahead - none at all, on a
+    /// clean session. `ask_before_reset_template` is the second question,
+    /// and its answer carries on with the RESET: a New in its place would
+    /// stand the session on the old template instead of the rebuilt one.
+    #[test]
+    fn reset_template_asks_again_about_a_take_it_finished() {
+        let root = project_scratch("reset-take");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.undo_reset();
+        assert!(!app.ask_before_reset_template(), "a clean session was asked about nothing");
+        // The take the host has just landed.
+        app.set_channel_kind(0, Some(recorder::ChannelKind::Midi));
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
+            lane: 0,
+            start_s: 0.0,
+            len_s: 2.0,
+            path: None,
+            notes: vec![crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 90, muted: false }],
+        }]);
+        assert!(
+            app.ask_before_reset_template(),
+            "the reset went ahead over a take nobody was asked about"
+        );
+        assert!(matches!(app.open_dialog(), Some(Dialog::SaveChanges { .. })), "no prompt is up");
+        app.apply_dialog_action(DialogAction::SaveChangesDiscard);
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::ResetTemplate),
+            "the answer did not carry on with the reset"
+        );
+        assert!(app.take_outgoing_discarded(), "the host is not told the session was discarded");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
