@@ -33000,6 +33000,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self.settings.input_alias
     }
 
+    /// The interface that short name was given to, as the band names it, or
+    /// `None` for one from before that was kept. See
+    /// `Settings::input_alias_for`.
+    pub fn input_alias_for(&self) -> Option<&str> {
+        self.settings.input_alias_for.as_deref()
+    }
+
     /// The inputs open BESIDE the first, as the host's own opaque uids.
     ///
     /// Input 2 upward, in strip order. The host drops any that name a
@@ -36016,6 +36023,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // Saved on every keystroke, like every other Setup control: the
             // panel has no OK button, so there is no later moment to save at.
             DialogAction::SetInputAlias(name) => {
+                // **And the interface it is being given to**: the input the
+                // panel names while it is typed, by the name it shows. A
+                // short name is ONE box's, and a bare string followed the
+                // system's default input onto whatever it became - see
+                // `Settings::input_alias_for`. Nothing open, nothing to tie
+                // it to; cleared, nothing to remember.
+                self.settings.input_alias_for = if name.trim().is_empty() {
+                    None
+                } else {
+                    self.audio_status.input.as_ref().map(|(device, _)| device.clone())
+                };
                 self.settings.input_alias = name;
                 self.save_settings();
             }
@@ -43829,6 +43847,31 @@ mod tests {
             ),
             _ => panic!("Setup did not open"),
         }
+    }
+
+    /// **A short name is given to the input Setup is showing, and says so.**
+    /// It was a bare string, so with nothing chosen it applied to whatever
+    /// the default input became: unplug the interface and the laptop's
+    /// microphone was "solo". The name the Setup panel shows the input
+    /// under (`AudioStatus::input`) goes with it now, and the host applies
+    /// the short name to that device alone (`devices::alias_for_open`).
+    #[test]
+    fn a_short_name_is_tied_to_the_input_it_is_typed_for() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_audio_status(recorder::AudioStatus {
+            input: Some(("Focusrite Scarlett Solo USB".to_owned(), recorder::StreamStats::default())),
+            ..recorder::AudioStatus::default()
+        });
+        app.apply_dialog_action(DialogAction::SetInputAlias("solo".to_owned()));
+        assert_eq!(app.input_alias(), "solo");
+        assert_eq!(
+            app.input_alias_for(),
+            Some("Focusrite Scarlett Solo USB"),
+            "the short name does not say which interface it was given to"
+        );
+        // Cleared, it names nothing and remembers no box.
+        app.apply_dialog_action(DialogAction::SetInputAlias(String::new()));
+        assert_eq!(app.input_alias_for(), None, "an empty short name kept a box");
     }
 
     /// **Q on a TRACK selects that track's clips.**
