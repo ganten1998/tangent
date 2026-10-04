@@ -65,13 +65,14 @@ intact while recording takes"). The two machines share ONE count-in in the
 engine, which is the one place they touch: a take pressed during the red
 button's count joins it from where it began, the red button pressed during
 a take's count joins that one, and Play during either starts the song on
-the downbeat. The realtime EXPORT is the one take that owns the transport
-and the lane order; those refusals key on `exporting` (the host's
-`bounce`), not on the take state. Every road to the lane order refuses
-under an export or an arrangement record, which both bind lane indices at
-their press: the lane drags (a move, a snap into a folder, a drag home that
-ejects a track), Insert Track, Paste Track Below and Cmd/Ctrl+F grouping
-each ask `lane_order_held` before they change anything, and it says why.
+the downbeat (Pause or Space takes a waiting Play back, and the count goes
+on). The realtime EXPORT is the one take that owns the transport and the
+lane order; those refusals key on `exporting` (the host's `bounce`), not on
+the take state. Every road to the lane order refuses under an export or an
+arrangement record, which both bind lane indices at their press: the lane
+drags (a move, a snap into a folder, a drag home that ejects a track),
+Insert Track, Paste Track Below and Cmd/Ctrl+F grouping each ask
+`lane_order_held` before they change anything, and it says why.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 
