@@ -683,6 +683,87 @@ fn land_stems(writers: Vec<StemWriter>, dir: &std::path::Path, ran_whole: bool) 
     landed
 }
 
+/// **Where a full-speed export waits until every file it wrote has
+/// closed**: a hidden folder in the export's own folder, the way the
+/// realtime pass stages its stems (`stems_stage`). See [`land_export`].
+#[cfg(feature = "recorder")]
+fn export_stage(out_dir: &std::path::Path) -> std::path::PathBuf {
+    out_dir.join(".export.writing")
+}
+
+/// The stage, emptied of whatever a pass that never finished left in it,
+/// and made. A file waits there under the name and in the folder it lands
+/// in - the master at the top, each stem in its stems folder - so landing
+/// it is one rename.
+#[cfg(feature = "recorder")]
+fn open_export_stage(out_dir: &std::path::Path) -> std::path::PathBuf {
+    let stage = export_stage(out_dir);
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::create_dir_all(&stage);
+    stage
+}
+
+/// **A full-speed export's files into place, or gone**: where each one that
+/// landed is now and how many lanes never sounded, or what failed the pass.
+///
+/// `files` is what the pass wrote into `stage`, the master and every stem,
+/// each with whether anything reached it and how its writer closed. **One
+/// file that did not close fails the pass**, as it always has, and a failed
+/// pass takes back everything it wrote and nothing else: `out_dir` is left
+/// as it was found, the last export's files of these names and anybody's
+/// own in it. A pass that closed every file moves each one that sounded to
+/// its place in `out_dir`, over the last export's file of that name; a lane
+/// that never sounded has no stem, and its old one goes, as it always did
+/// (see [`StemWriter`]). The pass used to write straight into `out_dir`,
+/// emptying each old file as it began, and a writer that failed left the
+/// partial files standing where the last export's had been.
+#[cfg(feature = "recorder")]
+fn land_export(
+    stage: &std::path::Path,
+    out_dir: &std::path::Path,
+    files: Vec<(std::path::PathBuf, bool, std::io::Result<()>)>,
+) -> Result<(Vec<std::path::PathBuf>, usize), String> {
+    let problem = files
+        .iter()
+        .find_map(|(_, _, closed)| closed.as_ref().err().map(ToString::to_string));
+    let mut landed = Vec::new();
+    let mut silent = 0usize;
+    for (path, loud, _) in files {
+        let home = path.strip_prefix(stage).ok().map(|rel| out_dir.join(rel));
+        match home {
+            Some(home) if problem.is_none() && loud => {
+                if let Some(dir) = home.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if std::fs::rename(&path, &home).is_ok() {
+                    landed.push(home);
+                }
+            }
+            home => {
+                let _ = std::fs::remove_file(&path);
+                if problem.is_none() {
+                    silent += 1;
+                    if let Some(home) = home {
+                        let _ = std::fs::remove_file(home);
+                    }
+                }
+            }
+        }
+    }
+    // Empty now, unless a file could not be moved: then it waits there for
+    // the next pass to clear, rather than be destroyed.
+    if let Ok(dirs) = std::fs::read_dir(stage) {
+        for dir in dirs.flatten() {
+            let _ = std::fs::remove_dir(dir.path());
+        }
+    }
+    let _ = std::fs::remove_dir(stage);
+    match problem {
+        Some(p) => Err(p),
+        None => Ok((landed, silent)),
+    }
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -10635,14 +10716,23 @@ impl DesktopApp {
         };
         let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), wav_spec);
         let stem_name = sanitize_file_stem(&spec.name);
+        // **Written aside, and moved in only by a pass whose every file
+        // closed** (`land_export`): written in place, over the last export's
+        // files of these names, a writer that failed left its partial files
+        // standing where those had been. A freeze writes a new file of its
+        // own and opens none.
+        let stage = match freeze {
+            None => open_export_stage(&out_dir),
+            Some(_) => export_stage(&out_dir),
+        };
         let master = if spec.master {
-            let path = out_dir.join(format!("{stem_name}.wav"));
-            let _ = std::fs::remove_file(&path);
+            let path = stage.join(format!("{stem_name}.wav"));
             match tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                 Ok(w) => Some((path, w)),
                 Err(err) => {
+                    let _ = std::fs::remove_dir(&stage);
                     self.app.notify(Kind::Error, format!("export: {err}"));
-                    return;
+                    refuse!();
                 }
             }
         } else {
@@ -10666,7 +10756,7 @@ impl DesktopApp {
             }
             freeze_job = Some(FreezeJob { lane, rel_path: format!("media/{name}"), skip: None });
         } else if spec.stems {
-            let dir = out_dir.join(spec.stems_folder());
+            let dir = stage.join(spec.stems_folder());
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 self.app
                     .notify(Kind::Error, format!("export: stems dir: {e}"));
@@ -10690,7 +10780,6 @@ impl DesktopApp {
                     .map(|c| if std::path::is_separator(c) { '-' } else { c })
                     .collect();
                 let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
-                let _ = std::fs::remove_file(&path);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                     stems.push(StemWriter { lane, path, writer: w, loud: false });
                 }
@@ -10914,7 +11003,7 @@ impl DesktopApp {
         let Some(b) = self.recorder.offline_bounce.take() else {
             return;
         };
-        // ── done: close the files, then the format pass ──
+        // ── done: close the files, land them, then the format pass ──
         let OfflineBounce {
             spec,
             master,
@@ -10922,40 +11011,22 @@ impl DesktopApp {
             out_dir,
             ..
         } = b;
-        let mut problem: Option<String> = None;
-        let mut master_path = None;
-        if let Some((path, w)) = master {
-            if let Err(e) = w.finish() {
-                problem = Some(e.to_string());
+        // **Every file closed first, and moved into place only if every one
+        // did** (`land_export`): a failed pass takes back what it wrote and
+        // leaves the folder as it was. A used lane that never sounded is not
+        // a stem (see `StemWriter`); the count goes in the notice below so
+        // the folder's contents and the message agree.
+        let mut files: Vec<_> = master.into_iter().map(|(path, w)| (path, true, w.finish())).collect();
+        files.extend(stems.into_iter().map(|s| (s.path, s.loud, s.writer.finish())));
+        let (paths, silent) = match land_export(&export_stage(&out_dir), &out_dir, files) {
+            Ok(landed) => landed,
+            Err(p) => {
+                self.app.notify_lower(EXPORT_RUNNING);
+                self.app.notify(Kind::Error, format!("export failed: {p}"));
+                self.app.set_export_progress(None);
+                return;
             }
-            master_path = Some(path);
-        }
-        let mut stem_paths = Vec::new();
-        let mut silent = 0usize;
-        for s in stems {
-            if let Err(e) = s.writer.finish() {
-                problem = Some(e.to_string());
-            }
-            if s.loud {
-                stem_paths.push(s.path);
-            } else {
-                // A used lane that never sounded is not a stem. See
-                // `StemWriter`; the count goes in the notice below so the
-                // folder's contents and the message agree.
-                let _ = std::fs::remove_file(&s.path);
-                silent += 1;
-            }
-        }
-        if let Some(p) = problem {
-            self.app.notify_lower(EXPORT_RUNNING);
-            self.app.notify(Kind::Error, format!("export failed: {p}"));
-            self.app.set_export_progress(None);
-            return;
-        }
-        let mut paths = stem_paths;
-        if let Some(m) = master_path {
-            paths.push(m);
-        }
+        };
         if let Err(e) = deliver_formats(&paths, &spec) {
             self.app.notify_lower(EXPORT_RUNNING);
             self.app.notify(Kind::Error, format!("export: {e}"));
@@ -23260,6 +23331,123 @@ mod tests {
         assert!(
             tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
             "a pass's stems land whether or not it ran whole"
+        );
+    }
+
+    /// **A failed full-speed export leaves its folder as it found it.** The
+    /// full-speed pass wrote its master and stems straight into the export's
+    /// folder, emptying the last export's files of those names as it began,
+    /// and when a writer would not close, `write_export` said "export
+    /// failed" and returned with the partial files standing where the last
+    /// export's had been. It writes aside now and lands only when every file
+    /// closed; a failed pass takes back what it wrote and nothing else.
+    #[test]
+    fn a_failed_full_speed_export_leaves_its_folder_as_it_found_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-full-speed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let out_dir = root.join("Exports").join("Song");
+        let stems = out_dir.join(tangent_ui::ports::stems_folder_name(false));
+        std::fs::create_dir_all(&stems).unwrap();
+        // The last export of these names, and a file of somebody's own.
+        std::fs::write(out_dir.join("Mix.wav"), b"last mix").unwrap();
+        std::fs::write(stems.join("01-Bass.wav"), b"last bass").unwrap();
+        std::fs::write(stems.join("02-Keys.wav"), b"last keys").unwrap();
+        std::fs::write(out_dir.join("notes.txt"), b"mine").unwrap();
+        // A pass, as `start_offline_render` opens it and `write_export`
+        // closes it: the master and the bass sound, the keys never do, and
+        // the bass's writer does not close when the disk is `full`.
+        let pass = |full: bool| {
+            let stage = open_export_stage(&out_dir);
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: 8_000,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let stems = stage.join(tangent_ui::ports::stems_folder_name(false));
+            std::fs::create_dir_all(&stems).unwrap();
+            let mut files = Vec::new();
+            for (path, level, fails) in [
+                (stage.join("Mix.wav"), 0.5f32, false),
+                (stems.join("01-Bass.wav"), 0.5, full),
+                (stems.join("02-Keys.wav"), 0.0, false),
+            ] {
+                let mut writer =
+                    tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("a writer");
+                writer.write_interleaved(&[level; 64]).expect("a block");
+                let closed = writer.finish();
+                let closed = if fails { Err(std::io::Error::other("the disk is full")) } else { closed };
+                files.push((path, level != 0.0, closed));
+            }
+            (stage, files)
+        };
+        let read = |path: std::path::PathBuf| std::fs::read(path).ok();
+        // Failed: nothing it wrote is left, and nothing that was there is gone.
+        let (stage, files) = pass(true);
+        assert_eq!(land_export(&stage, &out_dir, files), Err("the disk is full".to_owned()));
+        assert!(
+            read(out_dir.join("Mix.wav")).as_deref() == Some(&b"last mix"[..]),
+            "a failed export left its partial master where the last export's was"
+        );
+        assert!(
+            read(stems.join("01-Bass.wav")).as_deref() == Some(&b"last bass"[..]),
+            "a failed export left its partial stem where the last export's was"
+        );
+        assert!(
+            read(stems.join("02-Keys.wav")).as_deref() == Some(&b"last keys"[..]),
+            "a failed export took a stem it never replaced"
+        );
+        assert!(read(out_dir.join("notes.txt")).as_deref() == Some(&b"mine"[..]), "somebody's own file went");
+        assert!(!stage.exists(), "a failed export left its stage behind");
+        // Whole: the master and the stem that sounded take their places, and
+        // the lane that never sounded has no stem, as before.
+        let (stage, files) = pass(false);
+        let (landed, silent) = land_export(&stage, &out_dir, files).expect("a whole pass lands");
+        assert_eq!(landed, vec![out_dir.join("Mix.wav"), stems.join("01-Bass.wav")]);
+        assert_eq!(silent, 1, "the lane that never sounded was not counted");
+        let mix = tangent_record::decode::decode(&out_dir.join("Mix.wav"), 8_000).expect("the new master decodes");
+        assert_eq!(mix.frames(), 32, "the master that landed is not this pass's");
+        assert!(read(stems.join("02-Keys.wav")).is_none(), "a lane that never sounded kept a stem");
+        assert!(
+            read(out_dir.join("notes.txt")).as_deref() == Some(&b"mine"[..]),
+            "somebody's own file went with the export"
+        );
+        assert!(!stage.exists(), "the stage was left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The full-speed pass writes aside, and lands only a pass whose every
+    /// file closed** - the wiring `a_failed_full_speed_export_leaves_its_folder_as_it_found_it`
+    /// stands on. And a master that cannot even be opened takes the standing
+    /// "Exporting..." down with it, as every other refusal there does. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
+    #[test]
+    fn the_full_speed_pass_stages_its_files_and_lands_them_only_when_every_one_closed() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn start_offline_render(").expect("start_offline_render");
+        let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            start.contains("None => open_export_stage(&out_dir),")
+                && start.contains("let path = stage.join(format!(\"{stem_name}.wav\"));")
+                && start.contains("let dir = stage.join(spec.stems_folder());"),
+            "the full-speed pass writes straight into the export's folder again"
+        );
+        let master = &start[start.find("let master = if spec.master {").expect("the master")..];
+        let master = &master[..master.find("let mut stems = Vec::new();").expect("the stems")];
+        assert!(
+            master.contains("refuse!();") && !master.contains("return;"),
+            "a master that cannot be opened leaves \"Exporting...\" standing"
+        );
+        let at = src.find("fn write_export(&mut self)").expect("write_export");
+        let write = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        assert!(
+            write.contains("land_export(&export_stage(&out_dir), &out_dir, files)"),
+            "the full-speed pass lands its files whether or not every one closed"
         );
     }
 
