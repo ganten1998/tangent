@@ -26503,7 +26503,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // algorithm.
                             //
                             // Snapshot at the press — every tick scales from
-                            // these originals.
+                            // these originals. Every clip of the set is
+                            // measured first, not only the one under the
+                            // hand: one still on the whole-file sentinel
+                            // would scale from zero to a 0.05 s sliver.
+                            let set: Vec<u64> = self
+                                .arrangement
+                                .clips
+                                .iter()
+                                .filter(|c| c.id == id || self.arr_multi.contains(&c.id))
+                                .map(|c| c.id)
+                                .collect();
+                            for member in set {
+                                self.arr_resolve_len(member);
+                            }
                             let orig: Vec<crate::arrangement::ArrClip> = self
                                 .arrangement
                                 .clips
@@ -57695,6 +57708,84 @@ mod tests {
         assert_eq!(pedal, vec![1.0, 3.0], "the pedal stayed behind the notes it holds");
         assert!((ac.stretch - 2.0).abs() < 1e-9, "the audio did not take the ratio");
         assert!((ac.loop_s - 4.0).abs() < 1e-9, "the audio loop is {} while its audio doubled", ac.loop_s);
+    }
+
+    /// **A stretch carries every clip of the set from its measured length.**
+    ///
+    /// An audio clip still on the whole-file sentinel (`len_s == 0`) is
+    /// measured the moment a hand lands on it, but only the clip under the
+    /// hand was: the set's other members were snapshotted at zero, and the
+    /// stretch's `0 * k` floored them to 0.05 s - a whole take reduced to a
+    /// sliver by stretching its neighbour. Driven through the real
+    /// shift-press on an edge, where the snapshot is taken.
+    #[test]
+    fn a_stretch_carries_an_unmeasured_clip_of_the_set_from_its_file_length() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.settings.arr_snap = false;
+        let audio = |lane: usize, len_s: f64| crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            path: format!("media/{lane}.wav"),
+            lane,
+            start_s: 1.0,
+            len_s,
+            ..Default::default()
+        };
+        let a = app.arrangement.add_clip(audio(0, 2.0));
+        let b = app.arrangement.add_clip(audio(1, 0.0));
+        app.set_clip_infos(vec![crate::ports::ClipInfo {
+            id: b,
+            wave: Vec::new(),
+            file_s: 3.0,
+            wave_from_s: 0.0,
+            wave_span_s: 0.0,
+            peaks: None,
+        }]);
+        app.arr_selected = Some(a);
+        app.arr_multi = vec![a, b];
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        let r = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let c = clips.iter().find(|c| c.id == a).expect("the clip has a view");
+            crate::arrangement_panel::clip_rect(rect, &view, c)
+        };
+        let shifted = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    modifiers: egui::Modifiers::SHIFT,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        // A's right edge (3 s) out to 5 s: twice as long from the set's start.
+        let from = Pos2::new(r.right() - 2.0, r.center().y);
+        let to = Pos2::new(from.x + r.width(), from.y);
+        shifted(&ctx, &mut app, vec![egui::Event::PointerMoved(from), button(from, true)]);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::Stretch { .. })),
+            "fixture: the shift-press on the edge did not stretch"
+        );
+        shifted(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        shifted(&ctx, &mut app, vec![button(to, false)]);
+        let len = |id: u64| app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip").len_s;
+        let k = len(a) / 2.0;
+        assert!(k > 1.5, "fixture: the grabbed clip did not stretch: {}", len(a));
+        assert!(
+            (len(b) - 3.0 * k).abs() < 1e-6,
+            "the unmeasured clip of the set came out {} s long, not its 3 s file times {k}",
+            len(b)
+        );
     }
 
     /// **Seven notes into the space of four.** The editor's shift-drag
