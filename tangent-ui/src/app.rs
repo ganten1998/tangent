@@ -28227,12 +28227,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 f64,
             ),
         > = std::collections::BTreeMap::new();
-        for c in self
+        // **In time order, not the document's.** A clip's pedal comes up at
+        // its end (`clip_pedal_in_song_time`), on the very instant the next
+        // clip presses it again when the two touch, and every sort below
+        // keeps the order it is given within an instant: in the document's
+        // order a later clip that came first there wrote its press before
+        // the earlier clip's lift, and the pedal read up under it.
+        let mut clips: Vec<&crate::arrangement::ArrClip> = self
             .arrangement
             .clips
             .iter()
             .filter(|c| c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id))
-        {
+            .collect();
+        clips.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+        for c in clips {
             let entry = by_lane
                 .entry(c.lane)
                 .or_insert_with(|| (Vec::new(), Vec::new(), 0.0));
@@ -55930,6 +55938,70 @@ mod tests {
             ends.iter().all(|e| *e == want),
             "the tail after the last clip was cropped: {ends:?} should be {want}"
         );
+    }
+
+    /// **The exported pedal comes up where a clip ends, and the next clip
+    /// presses it again on the instant the two share.** Playback reads a
+    /// clip's pedal only inside the clip, so after it the pedal is up. The
+    /// export stated no lift at a clip's end, so a pedal held to the end of
+    /// the last clip stayed down for the rest of the file. And the lift now
+    /// stated there falls on the same instant as the next clip's press when
+    /// two clips touch, so the clips are written in time order: in the
+    /// document's, a later clip that came first there had its press written
+    /// before the earlier clip's lift, and the pedal read up under it.
+    #[test]
+    fn the_exported_pedal_comes_up_where_a_clip_ends() {
+        use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let note = ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false };
+        // The later clip, first in the document: its damper is down from its
+        // own start.
+        app.arrangement.clips.push(ArrClip {
+            id: 2,
+            lane: 3,
+            kind: ClipKind::Midi,
+            start_s: 1.0,
+            len_s: 1.0,
+            notes: vec![note.clone()],
+            pedal: vec![ArrPedal { at_s: 0.0, cc: 64, value: 127 }],
+            ..Default::default()
+        });
+        // The earlier one, back to back with it: down a quarter of the way
+        // in, and never lifted.
+        app.arrangement.clips.push(ArrClip {
+            id: 1,
+            lane: 3,
+            kind: ClipKind::Midi,
+            start_s: 0.0,
+            len_s: 1.0,
+            notes: vec![note],
+            pedal: vec![ArrPedal { at_s: 0.25, cc: 64, value: 127 }],
+            ..Default::default()
+        });
+        app.arr_multi = vec![1, 2];
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request().expect("no save panel was asked for");
+        let dir = export_dir("pedal-lift");
+        let path = dir.join("part.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+        let got = crate::smf_read::read(&std::fs::read(&path).expect("the file")).expect("not an SMF");
+        // Where the damper stands at `t`: the last edge at or before it,
+        // which is how the engine reads a level.
+        let damper = |t: f64| {
+            got.pedal
+                .iter()
+                .filter(|e| e.cc == 64 && e.at_s <= t + 1.0e-3)
+                .last()
+                .map_or(0, |e| e.value)
+        };
+        assert_eq!(damper(0.5), 127, "the first clip's pedal never went down: {:?}", got.pedal);
+        assert_eq!(
+            damper(1.5),
+            127,
+            "the pedal read up under the second clip, which holds it from its start: {:?}",
+            got.pedal
+        );
+        assert_eq!(damper(2.5), 0, "the pedal stayed down past the last clip's end: {:?}", got.pedal);
     }
 
     /// **The clip menu's rows keep their meanings when Export MIDI appears.**

@@ -1059,6 +1059,15 @@ pub fn first_heard_shift_s(clip: &ArrClip, at_s: f64) -> Option<f64> {
 /// The result is sorted and free of no-op repeats: a restatement equal to the
 /// level already standing is dropped, so a pedal held across four passes is
 /// one edge and not four.
+///
+/// **And it ends where the clip does.** The engine reads a clip's pedal only
+/// inside the clip, so an edge at or past its end is not written, looped or
+/// not, and a pedal still down there is lifted at `start_s + len_s`. Without
+/// the lift, a glue or a MIDI export held the pedal down past the clip, for
+/// the rest of an exported file when nothing else lifted it; and without the
+/// skip, a lift or a press a right trim hides was written as if heard. A
+/// consumer that joins several clips has to keep them in time order, so the
+/// next clip's press on the instant one ends lands after that clip's lift.
 pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
     if clip.pedal.is_empty() {
         return Vec::new();
@@ -1106,12 +1115,10 @@ pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
             if at <= pass_start + 1.0e-9 {
                 continue;
             }
-            // Past the end of a LOOP an edge is a repeat's partial, and goes
-            // as the notes twin's note does. Past the end of a clip that
-            // does not loop it is kept, where a note is not: the engine lets
-            // the pedal go at the clip's end and this list states no lift
-            // there, so dropping the edge would hold a pedal down for good.
-            if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
+            // **At or past the clip's end, looped or not**, the notes
+            // twin's rule: the engine reads a clip's pedal only inside it.
+            // The lift stated at the end, below, is what comes after.
+            if at >= clip.len_s - 1.0e-9 {
                 continue;
             }
             if e.value == standing[slot(e.cc)] {
@@ -1123,6 +1130,19 @@ pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
                 cc: e.cc,
                 value: e.value,
             });
+        }
+    }
+    // **And the pedal comes up at the clip's end**, where playback lets it
+    // go: whatever stands down there is lifted on the clip's last instant.
+    if clip.len_s.is_finite() && clip.len_s > 0.0 {
+        for cc in [64_u8, 66, 67] {
+            if standing[slot(cc)] != 0 {
+                out.push(ArrPedal {
+                    at_s: clip.start_s + clip.len_s,
+                    cc,
+                    value: 0,
+                });
+            }
         }
     }
     out.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
@@ -5311,7 +5331,8 @@ mod tests {
     /// nothing said otherwise.
     ///
     /// And a level that has not changed is not restated — a pedal held
-    /// across four passes is one edge, not four.
+    /// across four passes is one press, not four, and one lift at the
+    /// clip's end.
     #[test]
     fn each_pass_of_a_loop_opens_with_the_pedal_it_inherits() {
         let clip = ArrClip {
@@ -5326,7 +5347,7 @@ mod tests {
         let at: Vec<f64> = out.iter().map(|e| e.at_s).collect();
         assert_eq!(
             at,
-            vec![10.5],
+            vec![10.5, 13.0],
             "the pedal was restated on a pass that already held it: {out:?}"
         );
 
@@ -5341,6 +5362,55 @@ mod tests {
             vec![(10.5, 127), (10.75, 0), (11.5, 127), (11.75, 0), (12.5, 127), (12.75, 0)],
             "{out:?}"
         );
+    }
+
+    /// **The pedal comes up where the clip ends, as playback lets it go.**
+    /// The engine reads a clip's pedal only inside the clip, so at its end
+    /// the pedal is up whatever the clip's last edge said. The flattened
+    /// list stated no lift there, and dropped an edge past the end only on
+    /// a loop: a loop whose pedal is down at its end held it down past the
+    /// clip in a glue or a MIDI export (for the rest of an exported file,
+    /// when nothing lifted it), and on a clip that does not loop a lift a
+    /// right trim hides came up late, and a press it hides was written as
+    /// if it were heard.
+    #[test]
+    fn the_pedal_comes_up_where_the_clip_ends() {
+        let p = |at_s: f64, cc: u8, value: u8| ArrPedal { at_s, cc, value };
+        let edges = |clip: &ArrClip| -> Vec<(f64, u8, u8)> {
+            clip_pedal_in_song_time(clip).iter().map(|e| (e.at_s, e.cc, e.value)).collect()
+        };
+        // A loop whose damper goes down halfway through and never comes up.
+        let held = ArrClip {
+            kind: ClipKind::Midi,
+            pedal: vec![p(0.5, 64, 127)],
+            start_s: 10.0,
+            len_s: 3.0,
+            loop_s: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            edges(&held),
+            vec![(10.5, 64, 127), (13.0, 64, 0)],
+            "a loop held its pedal down past its end"
+        );
+        // No loop, trimmed on the right to two seconds: the damper's lift at
+        // 2.5 is hidden, so it comes up at the clip's end, and the
+        // sostenuto pressed at 2.75 is never heard and never written.
+        let trimmed = ArrClip {
+            kind: ClipKind::Midi,
+            pedal: vec![p(0.5, 64, 127), p(2.5, 64, 0), p(2.75, 66, 127)],
+            start_s: 10.0,
+            len_s: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            edges(&trimmed),
+            vec![(10.5, 64, 127), (12.0, 64, 0)],
+            "the edges a right trim hides were written instead of a lift at the clip's end"
+        );
+        // A pedal already up at the end states nothing more.
+        let lifted = ArrClip { pedal: vec![p(0.5, 64, 127), p(1.5, 64, 0)], ..trimmed.clone() };
+        assert_eq!(edges(&lifted), vec![(10.5, 64, 127), (11.5, 64, 0)]);
     }
 
     /// Garbage is an empty document, never a panic and never a half-read.
