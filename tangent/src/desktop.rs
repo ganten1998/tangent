@@ -546,6 +546,15 @@ struct Recorder {
     /// on purpose, and nothing clicks over a song on the wrong grid. Pause
     /// takes it back, and the band shows it waiting (`play_pending`).
     play_on_go: bool,
+    /// **A take counted on the count whose downbeat has just come** - its
+    /// own, or one it joined - so a song started on that downbeat started at
+    /// the take's head: `head_seconds` into a file with the count in it, or
+    /// at the first frame of a pre-roll. Raised at the downbeat's handover
+    /// from `take_count_pending`, which the handover clears, and dropped once
+    /// the arrangement record that begins on the same downbeat has had its
+    /// turn: no later start of the song is the take's. See
+    /// `song_started_on_take_downbeat`.
+    take_downbeat: bool,
     /// How long the next take's file will run before the music, decided at
     /// the cassette's press from what the press actually did - see
     /// `Manifest::head_seconds`. It was recomputed every frame from the
@@ -5539,12 +5548,15 @@ impl DesktopApp {
                 self.recorder.armed_downbeat = Some(downbeat);
                 self.recorder.session.arm_at(downbeat);
             }
-            // Whoever started it, the count is over.
+            // Whoever started it, the count is over - and a take that was
+            // counting on it hears of a song started on it (`take_downbeat`).
+            self.recorder.take_downbeat |= self.recorder.take_count_pending;
             self.recorder.take_count_pending = false;
             self.recorder.count_from = None;
             // And the song comes in on it, if Play was pressed during it.
             if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {
                 self.recorder.transport.toggle_play();
+                self.song_started_on_take_downbeat();
             }
         }
         // The count-in, which is the one thing here that animates with no input
@@ -6298,8 +6310,16 @@ impl DesktopApp {
         {
             self.recorder.arr_rec_wait = false;
             self.recorder.count_from = None;
+            let still = !self.recorder.transport.playing();
             self.start_arr_record();
+            // The record rolls the song on its downbeat, which may be a
+            // take's too.
+            if still && self.recorder.transport.playing() {
+                self.song_started_on_take_downbeat();
+            }
         }
+        // Every start of the song a take's downbeat can see has had its turn.
+        self.recorder.take_downbeat = false;
         if !self.recorder.session.is_recording() {
             if let Some(folder) = self
                 .recorder
@@ -9785,6 +9805,22 @@ impl DesktopApp {
                 e.cancel_count_in();
             }
         }
+    }
+
+    /// **The song has just started on the downbeat a take was counting on**
+    /// (`take_downbeat`): the take is told where from, so its manifest
+    /// places it - see `Session::song_started_at_head`. Called by the two
+    /// starts a downbeat makes, a Play that waited on it and the arrangement
+    /// record beginning on it; a song started on any other downbeat, or by
+    /// hand later, places no take.
+    fn song_started_on_take_downbeat(&mut self) {
+        if !self.recorder.take_downbeat {
+            return;
+        }
+        let engine = self.recorder.engine.as_ref();
+        let rate = engine.map_or(0.0, |e| f64::from(e.output().sample_rate));
+        let from_s = self.recorder.transport.position_s(engine, rate);
+        self.recorder.session.song_started_at_head(from_s);
     }
 
     /// Start an export: the whole arrangement, played from the top through
@@ -15941,7 +15977,9 @@ fn press_wait_and_head(
 /// pre-roll whose wall clock ended on the handover's frame latched a
 /// stopped transport and one that ended a frame later a rolling one - two
 /// identical presses, two different manifests. A take with its count in
-/// the file (`pre_roll` false) began at its press, before the song.
+/// the file (`pre_roll` false) began at its press, before the song: a song
+/// started on its downbeat reaches it later, through
+/// `song_started_on_take_downbeat`.
 #[cfg(feature = "recorder")]
 fn take_rolls_from_frame_0(playing: bool, play_on_go: bool, pre_roll: bool) -> bool {
     playing || (play_on_go && pre_roll)
@@ -19555,6 +19593,7 @@ impl DesktopApp {
                 take_count_pending: false,
                 count_from: None,
                 play_on_go: false,
+                take_downbeat: false,
                 take_head_s: 0.0,
                 pending_delivery: None,
                 session: crate::record::Session::new(tap, timebase),
@@ -23164,7 +23203,8 @@ mod tests {
     /// came out false when the two landed on one frame and true when the
     /// handover was a frame earlier, so two identical presses wrote two
     /// different manifests. A take whose count is in the file began at the
-    /// press, before the song, and stays false.
+    /// press, before the song, so its first frame stays still: the song
+    /// started on its downbeat reaches it later (the test below).
     #[test]
     fn a_pre_roll_take_under_a_waiting_play_rolls_from_its_first_frame() {
         // (rolling now, a Play waiting, counting a pre-roll) -> the answer
@@ -23183,6 +23223,61 @@ mod tests {
             facts.contains("let rolling = take_rolls_from_frame_0(")
                 && facts.contains("self.recorder.play_on_go"),
             "the facts say the song is still when a Play waits on the downbeat the take begins on"
+        );
+    }
+
+    /// **A song started on a take's downbeat reaches the take.** A take with
+    /// its count in the file writes from the press over a stopped song, and
+    /// the song that a Play pressed during the count - or the arrangement
+    /// record beginning on the downbeat - started `head_seconds` into it was
+    /// never told to the session: `timeline_rolling` said false. Both starts
+    /// tell it now, and only for a take that counted on that count: the
+    /// handover raises `take_downbeat` from `take_count_pending` before it
+    /// clears that, and it is dropped after the arrangement's go, so a song
+    /// started on a count no take was counting on, or by hand later, places
+    /// nothing. The session's half is
+    /// `record::tests::a_song_started_on_the_downbeat_of_a_count_in_the_file_places_the_take`;
+    /// this is a scan of the wiring.
+    #[test]
+    fn a_song_started_on_a_takes_downbeat_reaches_its_manifest() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let go = "if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {";
+        let at = src.find(go).expect("the handover's Play-on-go");
+        let handover = &src[src[..at].rfind("// Whoever started it, the count is over").expect("the handover")..];
+        let raised = handover.find("self.recorder.take_downbeat |= self.recorder.take_count_pending;");
+        let cleared = handover.find("self.recorder.take_count_pending = false;").expect("the handover clears the count");
+        assert!(
+            raised.is_some_and(|r| r < cleared),
+            "the handover forgets which take counted on the downbeat before a song started on it can be told"
+        );
+        let after_go = &handover[handover.find(go).expect("checked above")..];
+        let told = after_go.find("self.song_started_on_take_downbeat();");
+        let closes = after_go.find("\n            }\n").expect("the Play-on-go block's end");
+        assert!(
+            told.is_some_and(|t| t < closes),
+            "a Play that waited on a take's downbeat starts the song and the take is never told"
+        );
+        let reader = &src[src.find("// The arrangement's count-in reaching its downbeat: begin.").expect("the arrangement's go")..];
+        let reader = &reader[..reader.find("if !self.recorder.session.is_recording() {").expect("the reader's end")];
+        let begins = reader.find("self.start_arr_record();").expect("the arrangement's go begins the record");
+        let told = reader.find("self.song_started_on_take_downbeat();");
+        let dropped = reader.find("self.recorder.take_downbeat = false;");
+        assert!(
+            told.is_some_and(|t| begins < t && dropped.is_some_and(|d| t < d)),
+            "the record that rolls the song on a take's downbeat leaves the take unaware, or the \
+             downbeat's take outlives the arrangement's go"
+        );
+        let tell = squash(
+            &src[src.find("fn song_started_on_take_downbeat(&mut self)").expect("the teller")..]
+                .split("\n    }\n")
+                .next()
+                .unwrap_or_default(),
+        );
+        assert!(
+            tell.contains("if !self.recorder.take_downbeat { return; }")
+                && tell.contains("self.recorder.session.song_started_at_head(from_s);"),
+            "a song started on a downbeat no take counted on places the take"
         );
     }
 
