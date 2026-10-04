@@ -10058,16 +10058,34 @@ fn show_on(
                             // that appeared on one platform only is a row
                             // nobody finds.
                             ui.label(RichText::new("OUTPUT").font(bold(11.0)).color(t.text));
-                            if outputs.is_empty() {
+                            if outputs.is_empty() && *outputs_stale {
                                 ui.label(
-                                    RichText::new(if *outputs_stale {
-                                        "the new system's outputs are listed when Setup next opens"
-                                    } else {
-                                        "none reported"
-                                    })
+                                    RichText::new(
+                                        "the new system's outputs are listed when Setup next opens",
+                                    )
                                     .font(plain(11.0))
                                     .color(dim),
                                 );
+                            } else if outputs.is_empty() {
+                                // **The way back stays when nothing is
+                                // listed.** An empty list is also a list that
+                                // could not be read, and an output chosen by
+                                // hand must not be stranded by it: "the
+                                // system's own" is the one press that undoes
+                                // that choice. See `AudioSetup::outputs`.
+                                ui.horizontal_wrapped(|ui| {
+                                    let on = output.is_none();
+                                    if ui.selectable_label(on, "the system's own").clicked() && !on
+                                    {
+                                        *output = None;
+                                        action = Some(DialogAction::SetAudioOutput(None));
+                                    }
+                                    ui.label(
+                                        RichText::new("none reported")
+                                            .font(plain(11.0))
+                                            .color(dim),
+                                    );
+                                });
                             } else {
                                 ui.horizontal_wrapped(|ui| {
                                     // **"The system's own" is a real row**,
@@ -15929,6 +15947,43 @@ at: None,
             "a list a system press left behind does not say when the new one comes"
         );
         assert!(!bare.says("none reported"), "a system not yet asked reads as one with no outputs");
+    }
+
+    /// **A list that could not be read still has the way back.** When the
+    /// outputs cannot be enumerated the host hands over an empty list, and
+    /// the row said "none reported" and nothing else: an output chosen by
+    /// hand stayed chosen, and the one control that undoes that choice, "the
+    /// system's own", was not drawn (`devices::Setup::outputs` promised it
+    /// was). Now it is, beside the words.
+    #[test]
+    fn an_output_list_that_could_not_be_read_still_offers_the_systems_own() {
+        let mut slot = Slot::new(Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus::default(),
+            buffer: None,
+            ahead: 0.0,
+            rate: None,
+            systems: vec!["WASAPI".to_owned(), "ASIO".to_owned()],
+            system: Some("WASAPI".to_owned()),
+            outputs: Vec::new(),
+            output: Some("Komplete Audio 6 MK2".to_owned()),
+            outputs_stale: false,
+            rates: Vec::new(),
+            input_channels: 0,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        });
+        slot.settle();
+        assert!(slot.says("none reported"), "an empty output list said nothing");
+        assert!(slot.says("the system's own"), "an unreadable list left no way back to the default");
+        match slot.click("the system's own") {
+            Some(DialogAction::SetAudioOutput(None)) => {}
+            other => panic!(
+                "pressing the system's own asked for {:?}",
+                other.map(|a| std::mem::discriminant(&a))
+            ),
+        }
     }
 
     /// **The lit OUTPUT chip is the device that opens.** The open finds the

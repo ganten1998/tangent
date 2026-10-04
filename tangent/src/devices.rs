@@ -659,8 +659,8 @@ impl tangent_ui::ports::AudioSetup for Setup {
     }
 
     /// Empty on failure, which the panel renders as "the system's own" and
-    /// nothing else - the same answer `rates` gives, and the honest one: a
-    /// host that cannot be enumerated has no names to offer.
+    /// "none reported" beside it - the same answer `rates` gives, and the
+    /// honest one: a host that cannot be enumerated has no names to offer.
     fn outputs(&self) -> Vec<String> {
         tangent_record::audio::output_device_names().unwrap_or_default()
     }
