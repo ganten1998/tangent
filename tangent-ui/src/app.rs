@@ -32450,7 +32450,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // recorded, so a refused tap leaves nothing in `tap_times`. See
         // `RecorderState::tempo_held`: a take's count-in, or an export. The
         // Export dialog's tempo arrives by its own road and is held there
-        // (`hold_dialog_tempo`).
+        // (`hold_dialog_tempo`), and Reset Devices and Folders, which puts
+        // the tempo back, waits for it (`reset_settings`).
         if self.recorder.tempo_held()
             && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
         {
@@ -35401,6 +35402,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // while a take counts in or an export runs: see `session_held`. The
         // template scope is refused by `ask_before` below.
         if scope == crate::settings::ResetScope::Everything && self.session_held() {
+            return;
+        }
+        // **Devices and Folders puts the tempo back**, so it waits while the
+        // tempo is held (`RecorderState::tempo_held`), as every tempo control
+        // does. `take_devices` takes `record_export`, whose tempo the host
+        // pushes to the engine every frame, so the click was retimed under a
+        // take's count-in or an export. Refused rather than reset around the
+        // tempo: the scope also puts back the signature and the count-in,
+        // which time a count too (a 6/8 beat is half a 4/4 one), and the
+        // engine takes a new signature whenever no take is running - under
+        // the arrangement's record count, say. And refused before the backup
+        // below, so the copy an earlier reset's Undo puts back is not
+        // rewritten for a reset that never happened.
+        if scope == crate::settings::ResetScope::Devices && self.recorder.tempo_held() {
+            let why = if self.recorder.exporting {
+                "Devices and Folders wait for the export to end - their reset puts the tempo back, and the export is playing at it."
+            } else {
+                "Devices and Folders wait for the count-in's downbeat - their reset puts the tempo back, and the count is clicking at it."
+            };
+            self.notify(crate::notify::Kind::Info, why);
             return;
         }
         // **The template scope touches no setting**, so it takes none of the
@@ -69528,6 +69549,77 @@ mod tests {").expect("the tests module")];
             Some(crate::ports::ProjectRequest::New),
             "the arrangement's count alone held the session the host calls it off from"
         );
+    }
+
+    /// **Reset Devices and Folders waits while the tempo is held.** The
+    /// scope puts the take settings back with the devices (`take_devices`):
+    /// `record_export`, whose tempo the click and every count play at, the
+    /// signature and the count-in. It switches no session, so the session
+    /// holds above never asked about it, and nothing asked `tempo_held`:
+    /// the host pushes the tempo to the engine every frame, so a reset
+    /// during a take's count-in retimed the click under the take (F-TK-09's
+    /// family). Refused now under every count the tempo holds for (the
+    /// take's pre-roll, a count in its file, the arrangement's record
+    /// count) and under an export, before anything is reset or the Undo
+    /// copy is rewritten, with a note; with nothing holding the tempo it
+    /// goes ahead as before.
+    #[test]
+    fn a_devices_reset_waits_while_the_tempo_is_held() {
+        let (ctx, mut app) = recorder_app();
+        let fresh = Settings::first_launch();
+        app.settings.record_export.tempo_bpm = 97.0;
+        app.settings.record_time_signature = "3/4".to_owned();
+        app.settings.record_audio_device = Some("Scarlett 18i20".to_owned());
+        assert_ne!(fresh.record_export.tempo_bpm, 97.0, "the reset would not move the fixture's tempo");
+        assert_ne!(fresh.record_time_signature, "3/4", "the reset would not move the fixture's signature");
+        let _ = std::fs::remove_file(Settings::backup_path());
+        for (label, state, counting, exporting) in [
+            ("a take's pre-roll", recorder::RecordState::CountIn { beat: 1, of: 4 }, true, false),
+            ("a count in a take's file", recorder::RecordState::Rolling, true, false),
+            ("the arrangement's record count", recorder::RecordState::Idle, true, false),
+            ("a realtime export", recorder::RecordState::Rolling, false, true),
+            // Its take stopped, its files not landed yet.
+            ("an export filing itself", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.take_counting = counting;
+            app.recorder.exporting = exporting;
+            app.messages.clear();
+            app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Devices));
+            run_frame(&ctx, &mut app);
+            assert_eq!(app.tempo_bpm(), 97.0, "Reset Devices and Folders moved the held tempo under {label}");
+            assert_eq!(
+                app.settings.record_time_signature, "3/4",
+                "Reset Devices and Folders moved the signature under {label}"
+            );
+            assert_eq!(
+                app.settings.record_audio_device.as_deref(),
+                Some("Scarlett 18i20"),
+                "a refused reset still forgot the interface under {label}"
+            );
+            assert!(!app.said().notes().is_empty(), "the refusal under {label} said nothing");
+            assert!(
+                !matches!(app.open_dialog(), Some(Dialog::Confirm { .. })),
+                "a refused reset reported itself done under {label}"
+            );
+            assert!(
+                !Settings::backup_path().exists(),
+                "a refused reset rewrote the copy an earlier reset's Undo puts back, under {label}"
+            );
+        }
+        // Nothing holds the tempo: the reset goes ahead, tempo and all.
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.take_counting = false;
+        app.recorder.exporting = false;
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Devices));
+        run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.tempo_bpm(),
+            fresh.record_export.tempo_bpm,
+            "with nothing holding the tempo the reset did not put it back"
+        );
+        assert_eq!(app.settings.record_audio_device, fresh.record_audio_device, "the reset forgot nothing");
+        let _ = std::fs::remove_file(Settings::backup_path());
     }
 
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**

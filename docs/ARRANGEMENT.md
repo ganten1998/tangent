@@ -84,6 +84,10 @@ record captures by. And no road replaces the session while a take counts
 in or an export runs (`session_held`): a take rolls on through New and
 Open, but the incoming desk's tempo would retime the click under its
 count, and an export plays this project into this project's folder.
+Settings > Reset > Devices and Folders, which puts the tempo, the signature
+and the count-in back with the devices, waits while the tempo is held (a
+take's count-in, the arrangement's record count, or an export) for the
+same reason.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 
