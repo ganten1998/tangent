@@ -1066,8 +1066,9 @@ pub fn first_heard_shift_s(clip: &ArrClip, at_s: f64) -> Option<f64> {
 /// the lift, a glue or a MIDI export held the pedal down past the clip, for
 /// the rest of an exported file when nothing else lifted it; and without the
 /// skip, a lift or a press a right trim hides was written as if heard. A
-/// consumer that joins several clips has to keep them in time order, so the
-/// next clip's press on the instant one ends lands after that clip's lift.
+/// consumer that joins several clips of a lane joins them through
+/// [`lane_pedal_in_song_time`], which reads overlapping clips as playback
+/// does: this clip's lift is not the lane's while another clip holds it.
 pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
     if clip.pedal.is_empty() {
         return Vec::new();
@@ -1146,6 +1147,78 @@ pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
         }
     }
     out.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+    out
+}
+
+/// **A lane's pedal, its clips joined the way playback joins them**: at
+/// every instant each pedal stands at the HIGHEST level among the clips the
+/// instant falls inside, and up outside them all.
+///
+/// That is the engine's rule (`Renderer::clip_pedal_level`, which reads each
+/// clip's schedule from [`clip_pedal_in_song_time`]), written down as the
+/// edges where the level moves. Glue and the MIDI export join a lane's clips
+/// through this. They used to lay each clip's own edges side by side, which
+/// is the same thing until two clips overlap: then the first clip's lift at
+/// its end cut a pedal the second still held, and a lower level the second
+/// pressed under a held pedal lowered it. Where the clips do not overlap it
+/// gives what each clip gives alone, its lift at its end included; where one
+/// clip presses on the instant the one before it lets go, playback sends
+/// nothing, and nothing is written.
+///
+/// `clips` is the caller's one lane, in any order. The result is sorted and
+/// free of edges that change nothing.
+pub fn lane_pedal_in_song_time<'a>(clips: impl IntoIterator<Item = &'a ArrClip>) -> Vec<ArrPedal> {
+    const CCS: [u8; 3] = [64, 66, 67];
+    // Each pedalled clip's span and its own schedule; a clip with no pedal
+    // holds nothing, so it moves nothing.
+    let lists: Vec<(f64, f64, Vec<ArrPedal>)> = clips
+        .into_iter()
+        .filter(|c| !c.pedal.is_empty())
+        .map(|c| (c.start_s, c.start_s + c.len_s, clip_pedal_in_song_time(c)))
+        .collect();
+    // The instants the level can move at: every edge, and each clip's two
+    // ends. One instant within the schedule's own tolerance, so a clip that
+    // ends a rounding before the next begins is one move and not two.
+    let mut times: Vec<f64> = lists
+        .iter()
+        .flat_map(|(start, end, list)| {
+            [*start, *end].into_iter().chain(list.iter().map(|e| e.at_s))
+        })
+        .filter(|t| t.is_finite())
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|later, kept| (*later - *kept).abs() <= 1.0e-9);
+    // Where each clip's own schedule stands as the walk goes, and how far
+    // into it the walk has read: one pass over every list, not a search per
+    // instant.
+    let mut read = vec![0_usize; lists.len()];
+    let mut held = vec![[0_u8; 3]; lists.len()];
+    let mut standing = [0_u8; 3];
+    let mut out: Vec<ArrPedal> = Vec::new();
+    for t in times {
+        let mut level = [0_u8; 3];
+        for (i, (start, end, list)) in lists.iter().enumerate() {
+            while let Some(e) = list.get(read[i]).filter(|e| e.at_s <= t + 1.0e-9) {
+                if let Some(slot) = CCS.iter().position(|cc| *cc == e.cc) {
+                    held[i][slot] = e.value;
+                }
+                read[i] += 1;
+            }
+            // Read only inside the clip, as the engine reads it: from its
+            // start, and not at its end, where its own lift lands.
+            if t >= start - 1.0e-9 && t < end - 1.0e-9 {
+                for (lv, h) in level.iter_mut().zip(held[i]) {
+                    *lv = (*lv).max(h);
+                }
+            }
+        }
+        for (slot, cc) in CCS.into_iter().enumerate() {
+            if level[slot] != standing[slot] {
+                standing[slot] = level[slot];
+                out.push(ArrPedal { at_s: t, cc, value: level[slot] });
+            }
+        }
+    }
     out
 }
 
@@ -5411,6 +5484,63 @@ mod tests {
         // A pedal already up at the end states nothing more.
         let lifted = ArrClip { pedal: vec![p(0.5, 64, 127), p(1.5, 64, 0)], ..trimmed.clone() };
         assert_eq!(edges(&lifted), vec![(10.5, 64, 127), (11.5, 64, 0)]);
+    }
+
+    /// **A lane's clips hold the pedal as playback combines them: at the
+    /// higher level where they overlap, and up only where none holds it.**
+    /// The engine reads a lane's pedal as the highest level among the clips
+    /// the playhead stands inside (`Renderer::clip_pedal_level`). Glue and
+    /// the MIDI export laid each clip's own edges side by side instead, so
+    /// one clip's lift at its end cut a pedal an overlapping clip still
+    /// held, and a lower level pressed under a held one lowered it. Where
+    /// the clips do not overlap, each still lets the pedal up at its own
+    /// end, and the clips' order does not matter.
+    #[test]
+    fn overlapping_clips_hold_the_pedal_at_the_higher_level() {
+        let p = |at_s: f64, cc: u8, value: u8| ArrPedal { at_s, cc, value };
+        let clip = |start_s: f64, len_s: f64, pedal: Vec<ArrPedal>| ArrClip {
+            kind: ClipKind::Midi,
+            start_s,
+            len_s,
+            pedal,
+            ..Default::default()
+        };
+        let edges = |clips: &[ArrClip]| -> Vec<(f64, u8, u8)> {
+            lane_pedal_in_song_time(clips).iter().map(|e| (e.at_s, e.cc, e.value)).collect()
+        };
+        // The first holds the damper to its end; the second, over its second
+        // half, holds a half pedal from its own start and a sostenuto.
+        let first = clip(0.0, 2.0, vec![p(0.25, 64, 127)]);
+        let over = clip(1.0, 2.0, vec![p(0.0, 64, 40), p(0.5, 66, 100)]);
+        assert_eq!(
+            edges(&[over, first.clone()]),
+            vec![(0.25, 64, 127), (1.5, 66, 100), (2.0, 64, 40), (3.0, 64, 0), (3.0, 66, 0)],
+            "the damper did not stand at the higher level where the clips overlap"
+        );
+        // A clip inside a held one, with a lower press and a lift of its
+        // own, moves nothing.
+        let held = clip(0.0, 4.0, vec![p(0.0, 64, 127)]);
+        let inside = clip(1.0, 1.0, vec![p(0.5, 64, 100), p(0.75, 64, 0)]);
+        assert_eq!(
+            edges(&[held, inside]),
+            vec![(0.0, 64, 127), (4.0, 64, 0)],
+            "a clip inside a held pedal lowered or lifted it"
+        );
+        // Back to back, the second pressing on the instant the first lets
+        // go: playback sends nothing there, so nothing is written there.
+        let short = clip(0.0, 1.0, vec![p(0.25, 64, 127)]);
+        let next = clip(1.0, 1.0, vec![p(0.0, 64, 127)]);
+        assert_eq!(
+            edges(&[next, short.clone()]),
+            vec![(0.25, 64, 127), (2.0, 64, 0)],
+            "a lift and a press were written where playback holds the pedal"
+        );
+        // Apart: each lets the pedal up at its own end, as one clip does.
+        let later = clip(2.0, 1.0, vec![p(0.25, 64, 127)]);
+        assert_eq!(
+            edges(&[later, short]),
+            vec![(0.25, 64, 127), (1.0, 64, 0), (2.25, 64, 127), (3.0, 64, 0)]
+        );
     }
 
     /// Garbage is an empty document, never a panic and never a half-read.

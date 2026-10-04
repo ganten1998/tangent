@@ -17548,16 +17548,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
         // **And the pedal, flattened by the same rule the notes were.**
         // Gluing a pedalled passage and getting back a dry one would be the
-        // same bug as gluing a repeat and losing the repeats.
-        let mut pedal: Vec<crate::arrangement::ArrPedal> = Vec::new();
-        for c in &picked {
-            pedal.extend(
-                crate::arrangement::clip_pedal_in_song_time(c)
-                    .into_iter()
-                    .map(|e| crate::arrangement::ArrPedal { at_s: e.at_s - start, ..e }),
-            );
-        }
-        pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        // same bug as gluing a repeat and losing the repeats. The clips are
+        // joined as playback joins them (`lane_pedal_in_song_time`): where
+        // two overlap, the first one's lift at its end does not cut a pedal
+        // the second still holds.
+        let pedal: Vec<crate::arrangement::ArrPedal> =
+            crate::arrangement::lane_pedal_in_song_time(&picked)
+                .into_iter()
+                .map(|e| crate::arrangement::ArrPedal { at_s: e.at_s - start, ..e })
+                .collect();
 
         let doomed: Vec<u64> = picked.iter().map(|c| c.id).collect();
         self.arrangement.clips.retain(|c| !doomed.contains(&c.id));
@@ -28474,26 +28473,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 f64,
             ),
         > = std::collections::BTreeMap::new();
-        // **In time order, not the document's.** A clip's pedal comes up at
-        // its end (`clip_pedal_in_song_time`), on the very instant the next
-        // clip presses it again when the two touch, and every sort below
-        // keeps the order it is given within an instant: in the document's
-        // order a later clip that came first there wrote its press before
-        // the earlier clip's lift, and the pedal read up under it.
-        let mut clips: Vec<&crate::arrangement::ArrClip> = self
+        let clips: Vec<&crate::arrangement::ArrClip> = self
             .arrangement
             .clips
             .iter()
             .filter(|c| c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id))
             .collect();
-        clips.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
-        for c in clips {
+        for c in &clips {
             let entry = by_lane
                 .entry(c.lane)
                 .or_insert_with(|| (Vec::new(), Vec::new(), 0.0));
             entry.0.extend(crate::arrangement::clip_notes_in_song_time(c));
-            entry.1.extend(crate::arrangement::clip_pedal_in_song_time(c));
             entry.2 = entry.2.max(c.start_s + c.len_s);
+        }
+        // **The pedal by lane, joined as playback joins it**
+        // (`lane_pedal_in_song_time`): where two clips overlap, the first
+        // one's lift at its end does not cut a pedal the second still holds,
+        // and where one presses on the instant another lets go nothing is
+        // written. One edge per pedal per instant, so the clips' order no
+        // longer matters to the sorts below; it did while each clip's lift
+        // and the next one's press were written side by side.
+        for (lane, entry) in by_lane.iter_mut() {
+            entry.1 = crate::arrangement::lane_pedal_in_song_time(
+                clips.iter().copied().filter(|c| c.lane == *lane),
+            );
         }
         if by_lane.is_empty() {
             // The selection went away between the row and the answer — a
@@ -56642,15 +56645,18 @@ mod tests {
         );
     }
 
-    /// **The exported pedal comes up where a clip ends, and the next clip
-    /// presses it again on the instant the two share.** Playback reads a
-    /// clip's pedal only inside the clip, so after it the pedal is up. The
-    /// export stated no lift at a clip's end, so a pedal held to the end of
-    /// the last clip stayed down for the rest of the file. And the lift now
-    /// stated there falls on the same instant as the next clip's press when
-    /// two clips touch, so the clips are written in time order: in the
-    /// document's, a later clip that came first there had its press written
-    /// before the earlier clip's lift, and the pedal read up under it.
+    /// **The exported pedal comes up where a clip ends, and stays down across
+    /// the instant two clips share when the next one holds it.** Playback
+    /// reads a clip's pedal only inside the clip, so after it the pedal is
+    /// up. The export stated no lift at a clip's end, so a pedal held to the
+    /// end of the last clip stayed down for the rest of the file. And where
+    /// two clips touch, the lift fell on the same instant as the next clip's
+    /// press: while the two were written side by side, the document's order
+    /// decided which came first, and a later clip listed first had its press
+    /// written before the earlier clip's lift, so the pedal read up under
+    /// it. The lane's pedal is joined as playback joins it now
+    /// (`lane_pedal_in_song_time`), which holds it across the seam whatever
+    /// the order.
     #[test]
     fn the_exported_pedal_comes_up_where_a_clip_ends() {
         use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
@@ -56704,6 +56710,86 @@ mod tests {
             got.pedal
         );
         assert_eq!(damper(2.5), 0, "the pedal stayed down past the last clip's end: {:?}", got.pedal);
+    }
+
+    /// **Glue and the MIDI export hold the pedal where an overlapping clip
+    /// holds it, at the higher of the two levels, as playback does.** The
+    /// engine reads a lane's pedal as the highest level among the clips the
+    /// playhead stands inside (`Renderer::clip_pedal_level`). Both roads
+    /// laid each clip's own edges side by side instead, so the first clip's
+    /// lift at its end cut the damper the second still held, and the
+    /// second's half pedal, pressed while the first held it down, lowered
+    /// it under the first.
+    #[test]
+    fn glue_and_midi_export_hold_the_pedal_an_overlapping_clip_holds() {
+        use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
+        let fixture = || {
+            let (_, mut app) = headless(Caps::DESKTOP);
+            let note = ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false };
+            // Down a quarter of a second in, and never lifted.
+            app.arrangement.clips.push(ArrClip {
+                id: 1,
+                lane: 3,
+                kind: ClipKind::Midi,
+                start_s: 0.0,
+                len_s: 2.0,
+                notes: vec![note.clone()],
+                pedal: vec![ArrPedal { at_s: 0.25, cc: 64, value: 127 }],
+                ..Default::default()
+            });
+            // Over its second half: a half pedal from its own start, held.
+            app.arrangement.clips.push(ArrClip {
+                id: 2,
+                lane: 3,
+                kind: ClipKind::Midi,
+                start_s: 1.0,
+                len_s: 2.0,
+                notes: vec![note],
+                pedal: vec![ArrPedal { at_s: 0.0, cc: 64, value: 40 }],
+                ..Default::default()
+            });
+            app.arr_multi = vec![1, 2];
+            app
+        };
+        // What playback holds: the first clip's 127 from 0.25, still 127
+        // where the two overlap, the second's 40 once the first has ended,
+        // and up past the second.
+        let heard = [(0.1, 0), (0.5, 127), (1.5, 127), (2.5, 40), (3.5, 0)];
+
+        let mut app = fixture();
+        app.arr_glue_selection();
+        assert_eq!(app.arrangement.clips.len(), 1, "the two were not welded");
+        // The weld read as the engine reads a clip: its own schedule, inside
+        // the clip, and up outside it.
+        let glued = app.arrangement.clips[0].clone();
+        let edges = crate::arrangement::clip_pedal_in_song_time(&glued);
+        let damper = |t: f64| {
+            if t < glued.start_s || t >= glued.start_s + glued.len_s {
+                return 0;
+            }
+            edges.iter().filter(|e| e.cc == 64 && e.at_s <= t + 1.0e-9).last().map_or(0, |e| e.value)
+        };
+        for (t, want) in heard {
+            assert_eq!(damper(t), want, "the glued clip's damper at {t} s: {edges:?}");
+        }
+
+        let mut app = fixture();
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request().expect("no save panel was asked for");
+        let dir = export_dir("pedal-overlap");
+        let path = dir.join("part.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+        let got = crate::smf_read::read(&std::fs::read(&path).expect("the file")).expect("not an SMF");
+        let damper = |t: f64| {
+            got.pedal
+                .iter()
+                .filter(|e| e.cc == 64 && e.at_s <= t + 1.0e-3)
+                .last()
+                .map_or(0, |e| e.value)
+        };
+        for (t, want) in heard {
+            assert_eq!(damper(t), want, "the exported damper at {t} s: {:?}", got.pedal);
+        }
     }
 
     /// **The clip menu's rows keep their meanings when Export MIDI appears.**
