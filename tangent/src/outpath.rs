@@ -124,6 +124,9 @@ pub use mac::probe;
 
 /// See `mac::device_id`. Off macOS there is no HAL to ask, so nothing can
 /// be resolved and `rtwork` finds no workgroup, which is the same answer.
+/// Only the engine reads it, and Minimal has no engine, so there the
+/// re-export goes unused.
+#[cfg_attr(not(feature = "recorder"), allow(unused_imports))]
 #[cfg(target_os = "macos")]
 pub(crate) use mac::device_id;
 
