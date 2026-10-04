@@ -16060,6 +16060,7 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// `state/` and saved mark are left alone: Save As Template used to save a
 /// real folder's session first and copy that, writing an experiment into
 /// the project and clearing its asterisk.
+#[cfg(feature = "recorder")]
 fn build_template(
     app: &TangentApp,
     real: Option<&std::path::Path>,
