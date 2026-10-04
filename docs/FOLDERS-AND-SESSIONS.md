@@ -156,7 +156,8 @@ Related invariants that keep this working:
   every lane's kit samples and writes the kit sidecar, and brings the files
   the document's own clips and frozen lanes stand on out of the template
   too (`copy_doc_media`; `write_template_into` carries them the same way,
-  so a template re-saved from a scratch keeps them). Imports, pad loads,
+  so a template re-saved from a scratch keeps them), and the samplers'
+  files (`copy_sampler_media`, below). Imports, pad loads,
   sampler loads, arrangement takes with audio, freezes, glues and realtime
   exports go through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
@@ -184,7 +185,12 @@ Related invariants that keep this working:
   does, is read where it names. The bay used to store the path it was
   handed, so a take dragged out of an unsaved session went missing at the
   first save, and a template's clip dropped on it played the template's
-  own file.
+  own file. A template's sampler file is named only in its `state/`
+  sidecar, so the host reads what a shelf's samplers name whenever it
+  adopts one (`copy_states_from_shelf`, through `sampler_media_on_shelf`)
+  and hands the list to the app (`set_sampler_media`); making a scratch
+  real, Save As Template from a scratch and Duplicate of one copy those
+  files with the kit's samples, by the same rules (`copy_sampler_media`).
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
   from the Open panel is ADOPTED the same way (`open_project`), into the
