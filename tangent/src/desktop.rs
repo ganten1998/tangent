@@ -16682,7 +16682,6 @@ fn render_placed_span(
     Ok(())
 }
 
-#[cfg(feature = "recorder")]
 /// A file stem the filesystem will take: separators out, trimmed, never
 /// empty.
 ///
