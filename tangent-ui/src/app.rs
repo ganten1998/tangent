@@ -21366,7 +21366,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 on: false,
             });
         }
-        self.drumpad_grab = None;
+        // A knob let go by the closing (Esc, with the hand still on it) ends
+        // as its release would: one moment, and the sidecar written.
+        if self.drumpad_grab.take().is_some_and(|g| g.moved) {
+            self.drumpad_edited();
+        }
         self.drumpad_move = None;
         self.pad_menu = None;
         self.pad_trim_drag = None;
@@ -21956,7 +21960,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 return;
             }
             if self.pad_menu.take().is_some() {
-                self.pad_trim_drag = None;
+                // A trim handle let go by the same Esc lands as its release
+                // would: one moment, and the sidecar written.
+                if self.pad_trim_drag.take().is_some() {
+                    self.drumpad_edited();
+                }
                 return;
             }
             self.close_drumpad();
@@ -24974,6 +24982,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The timeline's gesture ends where it stands and keeps what it
+    /// did**: the drag and everything it carries stand down, and the moment
+    /// it owes is committed. What only its release would have done (a lane
+    /// landing, a drawn item, a locate) is not guessed at. For a release
+    /// nobody saw (the top of `arrangement_input`) and for a view switch
+    /// that takes the timeline from under the hand
+    /// (`end_drags_for_a_view_switch`).
+    fn end_arr_gesture(&mut self) {
+        self.arr_drag = None;
+        self.arr_tempo_drag = None;
+        self.arr_tempo_drag_from = None;
+        self.arr_auto_drag_from = None;
+        self.arr_auto_hot = None;
+        self.arr_move_orig.clear();
+        self.arr_stretch_orig.clear();
+        self.arr_band = None;
+        self.arr_pending = None;
+        if std::mem::take(&mut self.arr_gesture_dirty) {
+            self.arr_save_edits();
+        }
+    }
+
     fn arrangement_input(&mut self, ctx: &egui::Context) {
         // **A release nobody saw still ends the gesture.** A dialog raised
         // mid-drag, a menu, a view that closed under the hand: every early
@@ -24988,18 +25018,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if (self.arr_drag.is_some() || self.arr_gesture_dirty)
             && ctx.input(|i| !i.pointer.any_down() && !i.pointer.any_released())
         {
-            self.arr_drag = None;
-            self.arr_tempo_drag = None;
-            self.arr_tempo_drag_from = None;
-            self.arr_auto_drag_from = None;
-            self.arr_auto_hot = None;
-            self.arr_move_orig.clear();
-            self.arr_stretch_orig.clear();
-            self.arr_band = None;
-            self.arr_pending = None;
-            if std::mem::take(&mut self.arr_gesture_dirty) {
-                self.arr_save_edits();
-            }
+            self.end_arr_gesture();
         }
         // **While a take rolls, the window holds the WHOLE of it** — the
         // owner's ruling: the viewport and the growing clip scale together,
@@ -34477,7 +34496,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // and the bands under it are replaced by the desk for as long as
             // you are there, and the recorder band stays exactly where it is
             // so the transport never moves. A half-finished drag does not
-            // survive the swap, because the control it was on is gone.
+            // survive the swap, because the control it was on is gone; it
+            // ends here, a moment of its own (`end_drags_for_a_view_switch`).
             K::ToggleMixer => {
                 // **Tab CYCLES: theory, ARRANGE, mixer** — the owner's
                 // order. Three surfaces on one spot; the band never moves.
@@ -34486,10 +34506,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     (false, true) => (true, false),
                     (true, _) => (false, false),
                 };
+                self.end_drags_for_a_view_switch();
                 self.arrangement_open = arrangement;
                 self.mixer_open = mixer;
-                self.mixer_grab = None;
-                self.arr_drag = None;
             }
             // A popup, not a Tab stop: it rises over whichever view is up
             // and goes away by the same key, Esc, its ×, or a press outside.
@@ -37970,6 +37989,25 @@ impl TangentApp {
         }
     }
 
+    /// **A view switch ends the drags on the surfaces it takes away**, each
+    /// with the moment its release would have committed: the mixer's fader
+    /// and the timeline's gesture. Called by Tab and Shift+1/2/3 BEFORE the
+    /// flags move.
+    ///
+    /// The hand is still down, so neither quiet-frame sweep sees these end,
+    /// and the grab used to be dropped bare: the fader's change, or the
+    /// carry's, then went into the switch's own moment (`commit_view_change`
+    /// at the end of the frame), and one Ctrl+Z put back the view and the
+    /// drag together.
+    fn end_drags_for_a_view_switch(&mut self) {
+        if self.mixer_grab.take().is_some() {
+            self.undo_commit();
+        }
+        if self.arr_drag.is_some() || self.arr_gesture_dirty {
+            self.end_arr_gesture();
+        }
+    }
+
     /// **A change to the arrangement's grid or window, or to the editor's
     /// feel, is a moment.**
     ///
@@ -39586,9 +39624,10 @@ impl TangentApp {
             .then(|| band_at(recorder_h, (target.y - recorder_h).max(0.0)))
             .filter(Rect::is_positive);
         self.mixer_rect = mixer_rect;
-        if mixer_rect.is_none() {
-            // The control being dragged is not on screen any more.
-            self.mixer_grab = None;
+        if mixer_rect.is_none() && self.mixer_grab.take().is_some() {
+            // The control being dragged is not on screen any more, so its
+            // drag ends here, with the moment its release would have taken.
+            self.undo_commit();
         }
         // The ARRANGEMENT takes the same spot on its turn of the Tab cycle.
         let arrangement_rect = self
@@ -41177,10 +41216,9 @@ impl TangentApp {
                 }
             });
             if let Some((mixer, arrangement)) = view_key {
+                self.end_drags_for_a_view_switch();
                 self.mixer_open = mixer;
                 self.arrangement_open = arrangement;
-                self.mixer_grab = None;
-                self.arr_drag = None;
             }
         }
         if !input_menu_owns && !self.band_popup_owns() {
@@ -43217,6 +43255,187 @@ mod tests {
         let_go_under_a_gate(&ctx, &mut app, at);
         assert!(app.drumpad_grab.is_none(), "the lost release left the drum pad's knob standing");
         assert_eq!(app.hist_at, before + 1, "the knob's drag left {} moments", app.hist_at - before);
+    }
+
+    /// **A drag that a view switch ends is a moment of its own**, taken
+    /// where the switch ended it.
+    ///
+    /// Tab, Shift+1/2/3 and the mixer going away let go of the fader's grab
+    /// without the commit its release owes, and Esc putting the drum pads
+    /// away did the same to a knob's. The drag's change then rode the next
+    /// moment back: the view switch's own, so one Ctrl+Z put the fader back
+    /// together with the view, and the drum pad's knob went back with
+    /// whatever was done next. The hand is still down in every case here,
+    /// so the quiet-frame sweep cannot be what ends the drag.
+    #[test]
+    fn a_drag_that_a_view_switch_ends_is_a_moment_of_its_own() {
+        // The MIXER's fader, pulled, and ended by each key off the mixer.
+        let mixer_with_a_pulled_fader = || {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = false;
+            app.mixer_open = true;
+            let _ = run_frame(&ctx, &mut app);
+            let rect = app.mixer_rect.expect("the mixer did not open");
+            let (at, hit) = {
+                let view = app.mixer_view();
+                let f = crate::mixer_panel::Layout::new(rect, &view).strips[0].fader;
+                let hit = crate::mixer_panel::hit_test(rect, &view, f.center())
+                    .expect("nothing at all is at the fader's centre");
+                (f.center(), hit)
+            };
+            app.apply_mixer_hit(hit, 0.5);
+            app.undo_commit();
+            app.commit_view_change();
+            let before = app.hist_at;
+            press(&ctx, &mut app, at);
+            move_to(&ctx, &mut app, at - Vec2::new(0.0, 12.0));
+            assert!(app.mixer_grab.is_some(), "fixture: the press did not grab the fader");
+            let pulled = app.mixer_value(hit);
+            assert!(pulled > 0.5 + 1e-3, "fixture: the fader did not follow the hand");
+            (ctx, app, at, hit, before, pulled)
+        };
+        for (road, key, mods) in [
+            ("Tab", egui::Key::Tab, egui::Modifiers::NONE),
+            ("Shift+1", egui::Key::Num1, egui::Modifiers::SHIFT),
+            ("Shift+2", egui::Key::Num2, egui::Modifiers::SHIFT),
+        ] {
+            let (ctx, mut app, at, hit, before, pulled) = mixer_with_a_pulled_fader();
+            key_with(&ctx, &mut app, key, mods);
+            assert!(!app.mixer_open, "fixture: {road} left the mixer up");
+            assert!(app.mixer_grab.is_none(), "{road} left the fader's drag standing");
+            assert_eq!(
+                app.hist_at,
+                before + 2,
+                "{road} and the fader it let go of made {} moments, not one each",
+                app.hist_at - before
+            );
+            release(&ctx, &mut app, at);
+            let _ = run_frame(&ctx, &mut app);
+            assert_eq!(app.hist_at, before + 2, "the release after {road} pushed another moment");
+            app.undo();
+            assert!(app.mixer_open, "one Ctrl+Z after {road} did not bring the mixer back");
+            assert!(
+                (app.mixer_value(hit) - pulled).abs() < 1e-6,
+                "one Ctrl+Z after {road} put the fader back with the view"
+            );
+            app.undo();
+            assert!(
+                (app.mixer_value(hit) - 0.5).abs() < 1e-6,
+                "the fader's own step back did not put it back"
+            );
+        }
+        // The mixer going away under the hand with no key at all: a window
+        // too short to give it any room. The view never changed, so before
+        // the fader's drag was simply lost into the next moment.
+        let (ctx, mut app, at, hit, before, pulled) = mixer_with_a_pulled_fader();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 90.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        assert!(app.mixer_rect.is_none(), "fixture: the short window still drew the mixer");
+        assert!(app.mixer_grab.is_none(), "the mixer went and left the fader's drag standing");
+        assert_eq!(app.hist_at, before + 1, "the fader the mixer let go of left {} moments", app.hist_at - before);
+        release(&ctx, &mut app, at);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.hist_at, before + 1, "the release pushed another moment");
+        app.undo();
+        assert!(
+            (app.mixer_value(hit) - 0.5).abs() < 1e-6,
+            "one Ctrl+Z did not put back the fader pulled to {pulled}"
+        );
+
+        // A DRUM PAD's knob, turned, and the pads put away by Esc.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.drumpad_rect.expect("the drum pads did not lay out");
+        // A pad with a sample in it: an empty pad has no knobs to turn.
+        let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.undo_commit();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let param = crate::drumpad_panel::Param::Gain;
+        let was = app.drumpad_get(param);
+        let knob = crate::drumpad_panel::Layout::new(rect).knob_of(param);
+        let at = Pos2::new(knob.center().x, knob.top() + knob.height() * 0.8);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, at - Vec2::new(40.0, 0.0));
+        assert!(app.drumpad_grab.is_some_and(|g| g.moved), "fixture: the knob was not grabbed");
+        let turned = app.drumpad_get(param);
+        assert!((turned - was).abs() > 1e-3, "fixture: the knob did not turn");
+        key_with(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!app.drumpad_open, "fixture: Esc left the drum pads up");
+        assert_eq!(app.hist_at, before + 1, "the knob Esc let go of left {} moments", app.hist_at - before);
+        release(&ctx, &mut app, at);
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(app.hist_at, before + 1, "the release pushed another moment");
+        app.undo();
+        assert!((app.drumpad_get(param) - was).abs() < 1e-6, "one Ctrl+Z did not put the knob back");
+
+        // The pad menu's TRIM handle, dragged, and the menu put away by Esc.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.drumpad_rect.expect("the drum pads did not lay out");
+        let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.pad_menu = Some(sel);
+        app.undo_commit();
+        let _ = run_frame(&ctx, &mut app);
+        let before = app.hist_at;
+        let slot = app.pad_menu_slot().expect("the menu's pad is not on the page shown");
+        let menu = pad_menu_rect(crate::drumpad_panel::Layout::new(rect).pads[slot], rect);
+        let wave = pad_menu_wave(menu);
+        let end = app.drumpad().pads[sel].params.trim_end;
+        let at = Pos2::new(wave.left() + wave.width() * end - 1.0, wave.center().y);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, wave.center());
+        assert_eq!(app.pad_trim_drag, Some(true), "fixture: the press took no trim handle");
+        let trimmed = app.drumpad().pads[sel].params.trim_end;
+        assert!((trimmed - end).abs() > 1e-3, "fixture: the handle did not follow the hand");
+        key_with(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.pad_menu.is_none(), "fixture: Esc left the pad menu up");
+        assert_eq!(app.hist_at, before + 1, "the trim Esc let go of left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.drumpad().pads[sel].params.trim_end - end).abs() < 1e-6,
+            "one Ctrl+Z did not put the trim back"
+        );
+
+        // A CLIP carried on the timeline, and Tab with the hand still down.
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let at = arr_clip_centre(&app, rect, id);
+        press(&ctx, &mut app, at);
+        move_to(&ctx, &mut app, at + Vec2::new(30.0, 0.0));
+        move_to(&ctx, &mut app, at + Vec2::new(60.0, 0.0));
+        let carried = app.arrangement.clips[0].start_s;
+        assert!(carried > 2.0 + 1e-3, "fixture: the clip did not ride the hand");
+        key_with(&ctx, &mut app, egui::Key::Tab, egui::Modifiers::NONE);
+        assert!(app.mixer_open, "fixture: Tab from the timeline did not land on the mixer");
+        release(&ctx, &mut app, at + Vec2::new(60.0, 0.0));
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(
+            app.hist_at,
+            before + 2,
+            "Tab and the carry it let go of made {} moments, not one each",
+            app.hist_at - before
+        );
+        app.undo();
+        assert!(app.arrangement_open, "one Ctrl+Z after Tab did not bring the timeline back");
+        assert!(
+            (app.arrangement.clips[0].start_s - carried).abs() < 1e-9,
+            "one Ctrl+Z after Tab put the clip back with the view"
+        );
     }
 
     /// **The frame's own commit waits for every drag in flight, not only
