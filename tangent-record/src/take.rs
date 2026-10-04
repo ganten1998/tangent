@@ -1264,12 +1264,12 @@ pub struct Manifest {
     /// before locate existed, which is also where those takes belong.
     ///
     /// **It places the take only when [`timeline_rolling`] is true**, and
-    /// then together with [`head_seconds`]: the file `head_seconds` in is the
-    /// song at this position, so frame 0 lies that much earlier (frame 0
-    /// itself, for a take with no head). A take is capture only: it does not
-    /// roll the transport, and the song under it can be started, stopped,
-    /// located or looped at any point. A take begun over a stopped song whose
-    /// song was not started on its downbeat has no single place on the
+    /// then together with [`head_seconds`]: the point `head_seconds` into the
+    /// file is the song at this position, so frame 0 lies that much earlier
+    /// (frame 0 itself, for a take with no head). A take is capture only: it
+    /// does not roll the transport, and the song under it can be started,
+    /// stopped, located or looped at any point. A take begun over a stopped
+    /// song that nothing started on its downbeat has no single place on the
     /// timeline, and this is then just where the playhead was waiting.
     ///
     /// [`timeline_rolling`]: Manifest::timeline_rolling

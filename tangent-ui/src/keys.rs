@@ -61,7 +61,8 @@ pub enum KeyAction {
     /// idle it sounds the lit chord instead of playing, and over a rolling
     /// song it both stops the song and sounds the chord. It never reaches a take
     /// (`RecorderRequest::Stop` does not end one), and it is refused under a
-    /// realtime export, which the band's own Stop cuts short.
+    /// realtime export, which the band's own Stop cuts short. A Play still
+    /// waiting on a count-in's downbeat it takes back, as Pause does.
     StopRecording,
     /// Raise the recorder band, or put it away.
     ///
