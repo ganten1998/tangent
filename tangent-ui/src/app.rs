@@ -14827,19 +14827,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         Some(want)
     }
 
-    /// **Open the A menu for a track**, built from what its bays hold right    /// **Open the A menu for a track**, built from what its bays hold right
-    /// now.
-    ///
-    /// Built at OPEN rather than kept: a plugin loaded or unloaded while the
-    /// menu is up would leave a list describing a desk that no longer exists,
-    /// and rebuilding is a handful of strings.
-    /// **× on an automation row: stop showing it.**
-    ///
-    /// The same thing as un-ticking the parameter in the A menu, put where
-    /// the hand already is. The CURVE is untouched — closing a row is about
-    /// what is on screen, and a lane that deleted its automation because
-    /// somebody tidied the view would be unforgivable.
-    /// Aim the keyboard at one automation row. See `arr_auto_sel`.
     /// **Would a track dropped here attach to a folder, and to which one?**
     ///
     /// The bottom strip of a FOLDER's row attaches to that folder — and so
@@ -14876,6 +14863,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         Some((at, edge))
     }
 
+    /// Aim the keyboard at one automation row. See `arr_auto_sel`.
     fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
         self.arr_auto_sel = Some((lane, slot));
         // One subject at a time: a Delete that might mean a clip OR a curve
@@ -15213,6 +15201,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         out
     }
 
+    /// **× on an automation row: stop showing it.**
+    ///
+    /// The same thing as un-ticking the parameter in the A menu, put where
+    /// the hand already is. The CURVE is untouched: closing a row is about
+    /// what is on screen, and a lane that deleted its automation because
+    /// somebody tidied the view would be unforgivable.
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
         if let Some(param) = self.arr_auto_param_at(lane, slot) {
             self.arr_auto_open.remove(&(lane, param));
@@ -15287,6 +15281,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             })
     }
 
+    /// **Open the A menu for a track**, built from what its bays hold right
+    /// now.
+    ///
+    /// Built at OPEN rather than kept: a plugin loaded or unloaded while the
+    /// menu is up would leave a list describing a desk that no longer exists,
+    /// and rebuilding is a handful of strings.
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
         let master = lane == crate::arrangement_panel::MASTER_LANE;
@@ -25965,7 +25965,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
                             self.arr_tempo_drag_from = Some(self.live_tempo_map());
-            self.arr_tempo_drag_from = Some(self.live_tempo_map());
                             self.arr_drag = Some(ArrDrag::TempoPoint(i));
                         }
                     }
@@ -33000,15 +32999,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **A bay that changes tenant loses its bypass**, and this is the
         // one place that can know it did.
         //
-        // Every road into a bay ends here — the picker, the FX menu's
-        // Replace, alt-click, the track delete, a carried copy landing
-        // (`Desktop::copy_insert`), a project load. A flag left behind by any
+        // Every road that seats or empties one bay ends here: the picker, the
+        // FX menu's Replace, alt-click, the track delete, a carried copy
+        // landing (`Desktop::copy_insert`), a move or a swap
+        // (`trade_inserts`). A flag left behind by any
         // of them would come back on with the NEXT plugin, which would then
         // be loaded, drawn, named on its chip and silent for no reason
         // anybody could see. That is the worst failure this feature has
         // available to it, so it is closed at the single writer rather than
         // at six call sites, one of which somebody would later add a seventh
         // beside.
+        //
+        // A whole desk never comes here: an open, an undo and a redo land it
+        // through `apply_desk_snapshot`, which writes the bays directly.
         //
         // Only when the path really MOVES: the reconcile and the settings
         // reader both rewrite bays with what is already in them, and a
