@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The release gate: every command docs/RELEASE.md gate 1 names, plus the
-# Minimal build and the lint policy under the clippy driver, stopping at the
-# first failure so release.sh can refuse on a single exit code.
+# Minimal build, the crate firewall and the lint policy under the clippy
+# driver, stopping at the first failure so release.sh can refuse on a single
+# exit code.
 #
 # Three test suites, not one, because `cargo test --workspace` alone misses two
 # things (docs/RELEASE.md gate 1):
@@ -81,6 +82,15 @@ if ! cargo check -q -p tangent --no-default-features 2>/dev/null; then
   echo "the Minimal build (no features) does not compile" >&2
   exit 1
 fi
+
+echo "==> scripts/check-firewall.sh  (the shared crates cannot reach the host)"
+# **The rest of check-firewall.sh is part of the gate too.** What
+# `tangent-ui` and `tangent-core` may depend on and call, which way the crates
+# depend on each other, and the fulfilment image's COPY lines were checked
+# only when somebody ran it by hand, which is how its Minimal stage could fail
+# for weeks unseen (the leg above). NO_MINIMAL=1 skips that stage here: the
+# leg above has just checked the same configuration, and shows the errors.
+NO_MINIMAL=1 scripts/check-firewall.sh
 
 echo "==> cargo clippy  (the Cargo.toml lint policy only — no broad groups)"
 # **Our five packages by name, not --workspace.**
