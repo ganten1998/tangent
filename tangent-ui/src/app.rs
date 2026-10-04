@@ -6465,13 +6465,13 @@ impl TangentApp {
                     // it touches ONE lane, where a plain press carries the
                     // whole strip selection with it. See the guard in
                     // `apply_mixer_hit`.
+                    // **Through `switch_next`**, the rule lifted out of here
+                    // for the mute and the solo: a copy kept beside it is
+                    // where the next change to the gesture lands in one
+                    // place only. Exact in a `u32`, since `n < CHANNELS`.
                     let live = self.armed_mask();
-                    let only_this = live == 1 << n;
-                    let next = if self.alt_down {
-                        if only_this { 0 } else { 1 << n }
-                    } else {
-                        live ^ (1 << n)
-                    };
+                    let next = u32::try_from(Self::switch_next(u64::from(live), n, self.alt_down))
+                        .unwrap_or(live);
                     self.set_armed_mask(next);
                 }
                 return;
@@ -52380,6 +52380,32 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
         assert_eq!(app.armed_mask(), 0, "alt+arm could not undo itself");
         app.alt_down = false;
+    }
+
+    /// **The arm shares the switches' rule rather than keeping a copy.**
+    /// `switch_next` was lifted out of the arm so the mute and the solo
+    /// could share it "rather than growing their own copy", and the arm
+    /// went on computing the same thing inline beside it. Identical today;
+    /// the next change to the arm's gesture - the owner has changed it three
+    /// times - would land in one copy, and the arm would stop matching the
+    /// mute and the solo. A source scan, because behaviour cannot tell two
+    /// identical copies apart: `arms_stack_by_hand_and_never_by_accident`
+    /// and `a_mute_and_a_solo_take_the_arms_modifiers` pin the gestures.
+    #[test]
+    fn the_arm_shares_the_switch_rule_with_the_mute_and_the_solo() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let arm = {
+            let a = src
+                .find("            H::Arm(i) => {")
+                .expect("the arm's arm in apply_mixer_hit_one is gone");
+            let b = src[a..].find("\n                return;\n            }").expect("its end");
+            &src[a..a + b]
+        };
+        assert!(
+            arm.contains("Self::switch_next("),
+            "the arm keeps its own copy of the switch rule instead of `switch_next`"
+        );
     }
 
     /// **Alt on an arm ignores the SELECTION**, which every other control on
