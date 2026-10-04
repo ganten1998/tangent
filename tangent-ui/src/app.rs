@@ -8893,8 +8893,8 @@ impl TangentApp {
     // Four fields and two methods, the same two the theory window has. The
     // one difference worth noting is that this popout has a REASON beyond
     // taste: a second monitor holding a big framing view of the camera while
-    // the piano stays where it is. Nothing pops it out any more; a window a
-    // saved settings file left out is still put back.
+    // the piano stays where it is. Nothing pops it out any more (and `new`
+    // clears the flag on the way in), so what is left is the way back.
 
     fn reattach_recorder(&mut self) {
         if self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
@@ -63210,8 +63210,8 @@ mod tests {
     fn hiding_the_recorder_takes_its_window_with_it() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.show_recorder = true;
-        // The band out in its own window, as a saved settings file can leave
-        // it (nothing pops it out any more).
+        // The band out in its own window, set by hand: nothing pops it out
+        // any more, and `new` clears the flag on the way in.
         app.settings.recorder_detached = true;
         app.recorder_window_visible = true;
 
