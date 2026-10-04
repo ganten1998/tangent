@@ -10082,9 +10082,9 @@ fn show_on(
                                     // chip lit. A name that matches nothing
                                     // lights nothing - the setting still
                                     // names it, and the stand-in is said.
-                                    let lit = output
-                                        .as_deref()
-                                        .and_then(|want| crate::ports::match_output_name(outputs, want));
+                                    let lit = output.as_deref().and_then(|want| {
+                                        crate::ports::match_output_name(outputs, want)
+                                    });
                                     for (i, name) in outputs.iter().enumerate() {
                                         let on = lit == Some(i);
                                         if ui.selectable_label(on, name).clicked() && !on {

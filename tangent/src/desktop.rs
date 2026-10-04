@@ -5074,13 +5074,12 @@ impl DesktopApp {
         }
         // Through the one decision that names it - see `band_device_name`:
         // the owner's short name, a readable USB name, never a raw uid.
-        state.audio_name =
-            crate::devices::band_device_name(
-                open_name.as_deref(),
-                audio_uid.as_deref(),
-                &alias,
-                alias_for.as_deref(),
-            );
+        state.audio_name = crate::devices::band_device_name(
+            open_name.as_deref(),
+            audio_uid.as_deref(),
+            &alias,
+            alias_for.as_deref(),
+        );
         // The playhead and the audition, as plain data. The rate is the
         // engine's own; with no engine the transport answers from its last
         // known truth, which is the whole reason it owns the number.
