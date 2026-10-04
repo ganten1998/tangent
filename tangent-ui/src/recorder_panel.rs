@@ -14464,7 +14464,8 @@ pub fn draw_setup(
         rows,
     );
 
-    // The four yes-or-no questions. Each is worded as the STATE it is in, not
+    // The five yes-or-no questions: the take tier's four, and "Hear the input"
+    // on the AUDIO row. Each is worded as the STATE it is in, not
     // as the action that changes it, because a tick already says which way it
     // is set and a row that says both is a row you have to read twice.
     //
