@@ -79,11 +79,12 @@ pub fn rate_index(v: f32) -> usize {
 pub struct Transport {
     pub bpm: f64,
     pub playing: bool,
-    /// The playhead at the block's first sample, in beats. Not exact
-    /// everywhere yet: the engine (`instrument::rack_transport`) hands a rack
-    /// with no span of its own the beat at the END of its block, and walks a
-    /// lane's from that anchor in a straight line, which a tempo change or a
-    /// loop wrap between the two throws off.
+    /// The playhead at the block's first sample, in beats. The engine
+    /// (`instrument::rack_transport`) hands a rack with no span of its own
+    /// the tempo map's beat at the first frame of the block it renders, and
+    /// walks a rendered-ahead lane's from that frame across its own grain in
+    /// a straight line, so only a tempo change inside that grain is still
+    /// off, by a frame or so on a ramp.
     pub beat: f64,
 }
 
