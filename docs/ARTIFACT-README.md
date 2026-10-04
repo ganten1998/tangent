@@ -184,9 +184,9 @@ Learning" in the menu silences learning without erasing anything.
 Settings
 --------
 
-Colors, dark mode, window size (50%–200%), borderless mode, flats versus sharps,
-and the detachable chord display all live in the right-click menu, and save
-themselves the moment you change them. "Reset Settings to Default" puts
+Colors, dark mode, window size (50%–200%), borderless mode and flats versus
+sharps all live in the right-click menu, and save themselves the moment you
+change them. "Reset Settings to Default" puts
 everything back.
 
 Tangent keeps two files, at the same path on every platform:

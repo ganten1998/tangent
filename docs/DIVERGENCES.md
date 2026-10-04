@@ -233,7 +233,8 @@ renderings of every affected row.
 ## UI parity exceptions
 
 - **D-UI-1**: `detached_chord_height` persisted value is honored (Python
-  overwrote it with 50 on init); values ≤ 0 fall back to 50.
+  overwrote it with 50 on init); values ≤ 0 fall back to 50. **Moot since
+  2026-10-04:** the key is no longer read (see the note under D-UI-11).
 - **D-UI-2**: single-instance via lock file — same dialog + exit UX; a
   crashed instance never blocks relaunch.
 - **D-UI-3**: no busy-loop rendering; repaint scheduled on MIDI/timer
@@ -333,6 +334,11 @@ tester session on 2.2.0; the report and its screenshots are the rationale.
   not a size any user chose. A restored position is clamped to the monitor, and
   a window restored entirely off-screen is recentred on the first frame that
   knows the monitor size.
+  **2026-10-04:** nothing has detached since 4.82.0, and round five of the
+  2026-10-02 audit removed the detached windows, so the `detached_chord_*`
+  keys and `settings::DETACHED_DEFAULT` are gone; a file that still carries
+  the keys keeps them, unread. `window_x`/`window_y` and the tiling-WM guard
+  below stay, for the main window.
   **Tiling window managers are detected and excluded.** Under AeroSpace, yabai
   or i3 the size we ask for is simply overruled, and recording the result as a
   user preference is worse than recording nothing, because the tiled geometry
@@ -440,6 +446,8 @@ detached chord window does not gain a fretboard.
   reattach, right-click anywhere for the menu, drag anywhere when borderless —
   so there is one set of habits rather than two. While it is out, the attached
   band disappears and the main window shrinks by exactly its height.
+  **2026-10-04:** gone with the chord window's (see the note under D-UI-11),
+  and `fretboard_win_w/h/x/y` with it.
 - Geometry is remembered in `fretboard_win_w/h/x/y`, absent until the window
   has been placed, and it carries the same tiling-WM guard as D-UI-11: a size
   the window manager imposed inside `WM_GRACE` is not recorded as a preference.

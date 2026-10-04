@@ -250,7 +250,7 @@ impl Geom {
     /// The ceiling matters as much as the ratio. A flat minimum radius is what
     /// made a small window worse rather than better: at 3pt of string spacing
     /// a 2pt floor is a 4pt dot, which overlaps its neighbours outright. The
-    /// popped-out window can be dragged down to 90pt tall, so this is
+    /// main window's floor makes a neck under 60pt tall, so this is
     /// reachable, not theoretical.
     /// How big a fingering dot is.
     ///
@@ -1148,118 +1148,6 @@ pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
         0.0,
         Stroke::new(1.0_f32, c),
         StrokeKind::Inside,
-    );
-}
-
-/// Default size for the popped-out neck when nothing has been remembered.
-///
-/// Wider than it is tall by a lot, because a neck is: 22 frets across six
-/// strings only reads if the frets have room. Deliberately NOT the attached
-/// band's proportions, for the same reason the detached chord window is not
-/// the piano's (D-UI-10) — in its own window it should be legible, not a
-/// slice of the main one.
-pub const DETACHED_DEFAULT: Vec2 = Vec2::new(880.0, 190.0);
-
-pub fn viewport_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("ivory-fretboard-window")
-}
-
-/// Outline for the popped-out window. The neck fills the whole surface and is
-/// dark in two woods out of three, so on a dark desktop the window would have
-/// no edge at all. One neutral grey reads against both.
-pub const BORDER_COLOR: Color32 = Color32::from_gray(0x5A);
-
-#[derive(Default)]
-pub struct DetachedOutcome {
-    pub close_requested: bool,
-    pub inner_size: Option<Vec2>,
-    pub outer_pos: Option<Pos2>,
-    /// Right-click position in monitor coordinates, for the context menu.
-    pub context_menu_at: Option<Pos2>,
-}
-
-/// The neck in its own window. Mirrors `chord_strip::show_detached_window`
-/// exactly — same close-to-reattach, same right-click-anywhere menu, same
-/// borderless drag-anywhere — so the two popouts behave identically and there
-/// is only one set of habits to learn.
-#[allow(clippy::too_many_arguments)]
-/// `main_focused` decides the window LEVEL. A detached window is a piece of
-/// the same app, so it rises and falls WITH the piano rather than being left
-/// wherever the window stack last put it — which is what "the children don't
-/// follow" looks like: focus the piano and its own readouts stay buried under
-/// whatever you were doing before.
-///
-/// By level rather than by raising: always-on-top while we are frontmost is
-/// exactly "above our own window", and dropping to Normal when we are not
-/// means it never floats over other applications.
-pub fn show_detached_window(
-    ctx: &egui::Context,
-    builder_size: Vec2,
-    builder_pos: Option<Pos2>,
-    borderless: bool,
-    main_focused: bool,
-    voicing: &Voicing,
-    spec: &FretboardSpec,
-    s: &Settings,
-    wood: Wood,
-    barre: Option<Barre>,
-) -> DetachedOutcome {
-    let mut outcome = DetachedOutcome::default();
-    let mut builder = egui::ViewportBuilder::default()
-        .with_title("Tangent")
-        .with_inner_size(builder_size)
-        .with_min_inner_size([320.0, 90.0])
-        .with_resizable(true)
-        .with_decorations(!borderless)
-        .with_window_level(if main_focused {
-            egui::viewport::WindowLevel::AlwaysOnTop
-        } else {
-            egui::viewport::WindowLevel::Normal
-        });
-    if let Some(pos) = builder_pos {
-        builder = builder.with_position(pos);
-    }
-
-    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
-        crate::shell::viewport_ui(vp, |ui| {
-            let rect = ui.max_rect();
-            draw(ui.painter(), rect, voicing, spec, s, wood, barre, None);
-            painter_border(ui.painter(), rect);
-
-            let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
-                (
-                    i.viewport().close_requested(),
-                    i.viewport().inner_rect,
-                    i.viewport().outer_rect,
-                    i.pointer.primary_pressed(),
-                    i.pointer.secondary_clicked(),
-                    i.pointer.interact_pos(),
-                )
-            });
-
-            outcome.close_requested = close;
-            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
-            outcome.outer_pos = outer_rect.map(|r| r.min);
-
-            if secondary {
-                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
-                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
-                }
-            }
-            if borderless && pressed && !secondary {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-        });
-    });
-    outcome
-}
-
-fn painter_border(painter: &Painter, rect: Rect) {
-    painter.rect_stroke(
-        rect.shrink(0.5),
-        0.0,
-        Stroke::new(1.0_f32, BORDER_COLOR),
-        StrokeKind::Middle,
     );
 }
 

@@ -146,6 +146,9 @@ ivory/
   fires `InnerSize(main_width, last_known_height)` when |Δw| > 5px.
   Min size 300×100; title "Ivory". A first-milestone spike confirms a
   second glow viewport renders cleanly on macOS before the full build-out.
+  **Gone (2026-10-04):** nothing has detached since 4.82.0, and round five of
+  the 2026-10-02 audit removed this window, the other three popouts, their
+  settings keys and `Caps::detachable`.
 - **Piano / chord strip**: exact spec geometry (52 whites, 0.7/0.65
   ratios, boundary-centered blacks, int truncation, 1px separators,
   background fill kept — sub-pixel slivers are part of the look, dark mode
