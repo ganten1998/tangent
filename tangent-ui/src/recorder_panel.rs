@@ -3338,7 +3338,9 @@ fn name_for(
                 Node::toggle(id("hideelapsed"), r, "Hide the elapsed time", view.hide_elapsed)
             }
             Hit::NameField => Node::readout(id("name"), r, "Take name", view.take_name.to_owned()),
-            Hit::CloseSetup => Node::button(id("closesetup"), r, "Close the take settings"),
+            // **Whichever settings panel is open**: the cog's, the cassette's
+            // or the red button's. "The take settings" was the cog's old name.
+            Hit::CloseSetup => Node::button(id("closesetup"), r, "Close the settings"),
             Hit::PluginFolders => Node::button(id("pluginfolders"), r, "Add a plugin folder"),
             Hit::RescanPlugins => Node::button(id("pluginrescan"), r, "Rescan for plugins"),
             Hit::StreamToObs => Node::button(id("obs"), r, "Stream to OBS"),
@@ -9127,6 +9129,25 @@ mod tests {
             !Hit::OpenSetup.label().to_lowercase().contains("take"),
             "the cog's own label still says {:?}",
             Hit::OpenSetup.label()
+        );
+    }
+
+    /// **DONE says what it closes.** It closes whichever settings panel is
+    /// open - the cog's audio and media, the cassette's take, the red
+    /// button's recording - and its node still read "Close the take
+    /// settings", the name the cog lost for the same reason. No band target
+    /// carries it (the panels' own targets have no nodes yet), so the name
+    /// is asked of `name_for` itself, ready for the day they do.
+    #[test]
+    fn done_is_named_for_every_panel_it_closes() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0)));
+        let id = |k: &str| egui::Id::new(("band", k));
+        let done = name_for(Produces::Fixed(Hit::CloseSetup), rect, &furnished(), &id)
+            .expect("DONE has no name");
+        assert!(
+            done.label.starts_with("Close") && !done.label.to_lowercase().contains("take"),
+            "DONE is announced as {:?}",
+            done.label
         );
     }
 
