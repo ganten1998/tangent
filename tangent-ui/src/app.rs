@@ -27179,12 +27179,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the wrench on its header opens. The owner asked for a key for it.
             // Not select-all here: the MIDI editor keeps that chord for its
             // notes, and this block stands down while the editor is open.
+            //
+            // **A TRACK only**, like the Delete beside it. An empty slot's
+            // header has no wrench, and a row ticked from the chord seeded a
+            // curve on a slot with no track, for the next track made there.
             if ctx.input(|i| {
                 (i.modifiers.command || i.modifiers.ctrl)
                     && !i.modifiers.shift
                     && i.key_pressed(egui::Key::A)
             }) {
-                if let Some(n) = self.selected_channel {
+                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
                     self.arr_open_automation_menu(n);
                 }
             }
@@ -61056,6 +61060,21 @@ mod tests {
             matches!(app.dialog, Some(Dialog::Automation { .. })),
             "Cmd+A did not open the automation lanes: {:?}",
             app.dialog.as_ref().map(|_| "another dialog")
+        );
+    }
+
+    /// **Cmd+A on an EMPTY slot opens nothing.** Its header has no A to
+    /// press, and a row ticked from the chord seeded a curve on a slot with
+    /// no track, which the next track made there then inherited.
+    #[test]
+    fn cmd_a_on_an_empty_slot_opens_nothing() {
+        let (ctx, mut app) = auto_bench("autocmdaempty");
+        let empty = (0..recorder::CHANNELS).find(|n| !app.channel_used(*n)).expect("an empty slot");
+        app.selected_channel = Some(empty);
+        key_with(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
+        assert!(
+            !matches!(app.dialog, Some(Dialog::Automation { .. })),
+            "Cmd+A opened the automation lanes of an empty slot"
         );
     }
 
