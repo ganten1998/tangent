@@ -17790,6 +17790,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             );
             return;
         }
+        // **Said, where no host will measure.** `request_recorder` drops
+        // what a host cannot take - a build with no recorder, the plugin -
+        // and the key did nothing and said nothing, as glue's did.
+        if !self.caps.capture_devices {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Normalising audio needs the audio engine, which this build does not have.",
+            );
+            return;
+        }
         self.request_recorder(recorder::RecorderRequest::NormalizeClips(ids));
     }
 
@@ -59186,6 +59196,31 @@ mod tests {
         assert_eq!(app.arrangement.clips[0].gain, 64.0);
         app.reset_clip_gain(audio);
         assert_eq!(app.arrangement.clips[0].gain, 1.0);
+    }
+
+    /// **Where no host will measure, normalise says so.** The peak is the
+    /// host's to measure, and `request_recorder` drops a request a host
+    /// cannot take - a build with no recorder, or the plugin - so
+    /// Ctrl/Cmd+Shift+N on an audio clip did nothing and said nothing:
+    /// the shape glue's Cmd+G had before it learned to answer.
+    #[test]
+    fn normalise_says_why_where_the_host_cannot_measure() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (_ctx, mut app) = headless(Caps::MINIMAL);
+        let audio = app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Audio,
+            path: "a.wav".into(),
+            len_s: 4.0,
+            ..Default::default()
+        });
+        app.arr_selected = Some(audio);
+        let before = app.messages.len();
+        app.arr_normalize_selection();
+        assert!(app.take_recorder_request().is_none(), "a request nobody drains was queued");
+        assert!(
+            app.messages.len() > before,
+            "Ctrl/Cmd+Shift+N on an audio clip did nothing and said nothing"
+        );
     }
 
     /// **A track is carried by its NAME as well as by its number.**
