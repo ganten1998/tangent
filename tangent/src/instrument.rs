@@ -32313,7 +32313,10 @@ mod tests {
         assert_eq!(Rack::latency(&shared, 1), 0, "a frozen seat still reported latency");
         assert_eq!(Rack::latency(&shared, 0), 0);
         // The rack's early-out sits before the bay loop, on the same mask.
-        let src = include_str!("instrument.rs");
+        // Production only: cut at the tests module, or a renamed `run_rack`
+        // finds this test's own literal and the scan passes over nothing.
+        let whole = include_str!("instrument.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         let at = src.find("fn run_rack(").expect("run_rack");
         let end = src[at..].find("\n}\n").map_or(src.len(), |n| at + n);
         let body = &src[at..end];
