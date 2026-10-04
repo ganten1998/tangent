@@ -3219,6 +3219,10 @@ const GLUE_NEEDS: &str = "Glue needs two or more clips on one track, or one that
      repeats - pull a clip's edge past its first pass and glue welds the \
      repeats into it.";
 
+/// **Why glue said no to a frozen track**, for both roads through it: the
+/// lane plays its render, and its clips are what thawing has to find.
+const GLUE_FROZEN: &str = "That track is frozen - unfreeze it to glue its clips.";
+
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
 ///
 /// Counted rather than timestamped: "Untitled 3" is a name a person can say
@@ -10883,12 +10887,11 @@ impl TangentApp {
         // **The arrangement's grid and window**, the timeline's half of what
         // `feel` is for the editor. Clamped on the way in exactly as the
         // settings reader clamps them, or a document could hand the app a
-        // number its own file could never hold. (Not yet for the grid: this
-        // clamps it to -7, where the settings reader and every gesture stop
-        // at -6.)
+        // number its own file could never hold: the grid stops at -6, where
+        // the settings reader and every gesture do.
         if let Some(v) = d.view.as_ref() {
             self.settings.arr_snap = v.snap;
-            self.settings.arr_grid_exp = v.grid_exp.clamp(-7, 3);
+            self.settings.arr_grid_exp = v.grid_exp.clamp(-6, 3);
             self.settings.arr_tempo_lane = v.tempo_lane;
             self.settings.arr_master_row = v.master_row;
             // **Zero is AUTO** for these two: the app derives the width and
@@ -17100,11 +17103,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// this answered it - with a request to the host, or with a refusal that
     /// says why. `false` leaves the selection to the MIDI road.
     ///
-    /// The count, track and kind rules are MIDI glue's, so on those the two
-    /// cannot come to different opinions: two or more clips, or one that
-    /// shows more than one pass; one track; one kind. Audio also refuses a
-    /// frozen track, whose clips are not what it plays; the MIDI road has no
-    /// such refusal yet.
+    /// The rules are MIDI glue's, so the two cannot come to different
+    /// opinions: two or more clips, or one that shows more than one pass;
+    /// one track; one kind; and not a frozen track, whose clips are not what
+    /// it plays.
     fn arr_glue_audio(&mut self, ids: &[u64]) -> bool {
         let picked: Vec<&crate::arrangement::ArrClip> =
             self.arrangement.clips.iter().filter(|c| ids.contains(&c.id)).collect();
@@ -17134,9 +17136,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return true;
         }
         if self.lane_frozen(lane).is_some() {
+            self.notify(crate::notify::Kind::Info, GLUE_FROZEN);
+            return true;
+        }
+        // **Said, where no host will weld.** `request_recorder` drops what
+        // a host cannot take - a build with no recorder, the plugin - and
+        // the key did nothing and said nothing.
+        if !self.caps.capture_devices {
             self.notify(
                 crate::notify::Kind::Info,
-                "That track is frozen - unfreeze it to glue its clips.",
+                "Gluing audio needs the audio engine, which this build does not have.",
             );
             return true;
         }
@@ -17227,11 +17236,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and quietly gluing the ones that happen to share a lane would be a
     /// command that does something other than what was asked.
     ///
-    /// **Audio glues too**, by the same rules plus one (audio refuses a
-    /// frozen track, which this MIDI road does not yet) - the owner: "Audio
-    /// clips don't glue". Welding audio means RENDERING, so it is the host's
-    /// to do (see `RecorderRequest::GlueAudio`); this side decides whether
-    /// the selection can be glued at all and says why not in the same words.
+    /// **Audio glues too**, by the same rules, a frozen track refused on
+    /// both roads - the owner: "Audio clips don't glue". Welding audio means
+    /// RENDERING, so it is the host's to do (see `RecorderRequest::GlueAudio`);
+    /// this side decides whether the selection can be glued at all and says
+    /// why not in the same words.
     fn arr_glue_selection(&mut self) {
         let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
         if let Some(one) = self.arr_selected {
@@ -17284,6 +17293,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 crate::notify::Kind::Info,
                 "Glue works on one track at a time.",
             );
+            return;
+        }
+        // **Nor on a frozen track**, the audio road's rule: the lane plays
+        // its render, and its clips are what thawing has to find - the
+        // reason Delete leaves them too.
+        if self.lane_frozen(lane).is_some() {
+            self.notify(crate::notify::Kind::Info, GLUE_FROZEN);
             return;
         }
         picked.sort_by(|a, b| {
@@ -32527,9 +32543,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.project_root()
     }
 
-    /// Where an EXPORT lands when the dialog does not name a folder.
+    /// The root an EXPORT lands under when the dialog does not name a
+    /// folder: in a folder of each project's own (`export_home`).
     pub fn export_root(&self) -> std::path::PathBuf {
         self.settings.export_root()
+    }
+
+    /// **Where an export lands when the dialog names no folder**: a folder
+    /// of the project's own under [`Self::export_root`], named for the
+    /// project's FOLDER. It was named for the document's file stem, and
+    /// every document is `<project>/project.tan`, so every project exported
+    /// into one `Exports/project/` and each `mix.wav` replaced the last
+    /// project's. With no project, the root itself. The host's
+    /// `export_out_dir` and the Export dialog's DIRECTORY row both ask here,
+    /// so the row says where the file will land.
+    pub fn export_home(&self) -> std::path::PathBuf {
+        match self.project_name() {
+            name if name.is_empty() => self.export_root(),
+            name => self.export_root().join(name),
+        }
     }
 
     /// Where saved PRESETS live, resolved. The host scans and writes under
@@ -36142,6 +36174,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = Some(Dialog::ExportProject {
                     spec,
                     sel: self.time_sel.filter(|(a, b)| b > a),
+                    home: self.export_home().display().to_string(),
                 });
             }
             DialogAction::ProjectExportRun(spec) => {
@@ -46683,6 +46716,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A document's timeline grid lands on a rung the timeline has.** The
+    /// settings reader and every gesture stop the arrangement's grid at -6,
+    /// the finest line `arr_grid_s` draws, but the document's reader and
+    /// `apply_desk_snapshot` let -7 through - the MIDI editor's floor - so a
+    /// hand-edited document set a grid the snap and the grid seconds read
+    /// two ways, and that the settings file then read back as -6. Both roads
+    /// in: the reader alone, and a desk handed straight to the apply, as an
+    /// undo moment arrives.
+    #[test]
+    fn a_documents_grid_lands_on_a_rung_the_timeline_has() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let mut desk = app.desk_snapshot();
+        desk.view.as_mut().expect("the live desk always says").grid_exp = -7;
+        let text = crate::arrangement::Arrangement::default().to_json_with_desk(Some(&desk));
+        let read = crate::arrangement::Arrangement::from_json(&text);
+        assert_eq!(
+            read.desk.and_then(|d| d.view).map(|v| v.grid_exp),
+            Some(-6),
+            "the document's reader kept a grid the timeline has no line for"
+        );
+        app.apply_desk_snapshot(&desk);
+        assert_eq!(
+            app.settings.arr_grid_exp, -6,
+            "a document set a grid the settings reader and every gesture refuse"
+        );
+    }
+
     /// **A note written with the pen UP reaches the engine.**
     ///
     /// The editor hands its clip over on release, and only when a DRAG was
@@ -51462,6 +51522,42 @@ mod tests {
         assert_ne!(app.project_name(), "Nocturne");
         assert!(app.arrangement().clips.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Each project's exports land in a folder of its own**, named for the
+    /// project's folder. The room was named for the document's file stem,
+    /// and every document is `<project>/project.tan`, so every project
+    /// exported into one `Exports/project/` and each `mix.wav` replaced the
+    /// last project's. The Export dialog's DIRECTORY row says which folder,
+    /// before anything is written.
+    #[test]
+    fn each_projects_exports_land_in_a_folder_of_its_own() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let root = app.export_root();
+        let doc_in = |folder: &str| {
+            std::path::Path::new("songs").join(folder).join(crate::arrangement::DOC_NAME)
+        };
+        app.project_doc = doc_in("Nocturne");
+        let nocturne = app.export_home();
+        app.project_doc = doc_in("Bossa");
+        let bossa = app.export_home();
+        assert_ne!(nocturne, bossa, "two projects export into one folder, each over the other's files");
+        assert_eq!(nocturne, root.join("Nocturne"));
+        assert_eq!(bossa, root.join("Bossa"));
+        // No project at all: the root itself.
+        app.project_doc = std::path::PathBuf::new();
+        assert_eq!(app.export_home(), root);
+        // The dialog's DIRECTORY row says where, before anything is written.
+        app.project_doc = doc_in("Nocturne");
+        app.apply_dialog_action(DialogAction::ProjectExportOpen);
+        match &app.dialog {
+            Some(Dialog::ExportProject { home, .. }) => assert_eq!(
+                *home,
+                nocturne.display().to_string(),
+                "the Export dialog does not say where the export lands"
+            ),
+            _ => panic!("the Export dialog did not open"),
+        }
     }
 
     /// **An unsaved session's Save is the panel, and its first save MOVES
@@ -58744,6 +58840,23 @@ mod tests {
         );
     }
 
+    /// **Where no host will weld, Cmd+G on audio says so.** Glue hands audio
+    /// to the host, and `request_recorder` drops a request a host cannot
+    /// take - a build with no recorder, or the plugin - so the key did
+    /// nothing and said nothing, where an audio selection used to get the
+    /// MIDI road's refusal at least.
+    #[test]
+    fn audio_glue_says_why_where_the_host_cannot_weld() {
+        use crate::arrangement::ClipKind;
+        let (_ctx, mut app) = headless(Caps::MINIMAL);
+        let a = glue_part(&mut app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
+        let b = glue_part(&mut app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
+        app.arr_multi.extend([a, b]);
+        let before = app.messages.len();
+        app.arr_glue_selection();
+        assert!(app.messages.len() > before, "Cmd+G on audio did nothing and said nothing");
+    }
+
     /// **Glue says no to audio in the same places it does to MIDI**, and to a
     /// frozen track, whose clips are not what it plays - and in every case
     /// it asks the host for nothing.
@@ -58786,6 +58899,30 @@ mod tests {
                 len_s: 8.0,
             });
         }));
+    }
+
+    /// **MIDI glue refuses a frozen track, as audio glue does.** A frozen
+    /// lane plays its render, and its clips are what thawing has to find -
+    /// Delete leaves them for that reason - but the MIDI road welded them
+    /// all the same, while its doc and the audio road's said the two roads
+    /// kept one set of rules. Refused in the audio road's own words.
+    #[test]
+    fn midi_glue_refuses_a_frozen_track_as_audio_glue_does() {
+        use crate::arrangement::ClipKind;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let a = glue_part(&mut app, ClipKind::Midi, 3, 0.0, 2.0, 2.0);
+        let b = glue_part(&mut app, ClipKind::Midi, 3, 4.0, 2.0, 2.0);
+        app.arr_multi.extend([a, b]);
+        app.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
+            lane: 3,
+            path: "media/frozen-04.wav".into(),
+            len_s: 8.0,
+        });
+        let before = app.arrangement.clips.clone();
+        let said = app.messages.len();
+        app.arr_glue_selection();
+        assert_eq!(app.arrangement.clips, before, "MIDI glue welded clips on a frozen track");
+        assert!(app.messages.len() > said, "the refusal did not say why");
     }
 
     /// **The host's weld lands as one plain loop in its sources' place**, and

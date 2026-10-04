@@ -109,6 +109,10 @@ pub enum Dialog {
     ExportProject {
         spec: crate::ports::ProjectExportSpec,
         sel: Option<(f64, f64)>,
+        /// Where the export lands when DIRECTORY names no folder - the
+        /// project's own under the Exports root (`TangentApp::export_home`) -
+        /// shown in that row in place of a placeholder.
+        home: String,
     },
     /// Choose a camera or an audio input for the recorder.
     ///
@@ -10676,7 +10680,7 @@ fn show_on(
                 },
             )
         }
-        Dialog::ExportProject { spec, sel } => {
+        Dialog::ExportProject { spec, sel, home } => {
             let sel = *sel;
             let t = theme(face);
             show_dialog_viewport(
@@ -10910,7 +10914,7 @@ fn show_on(
                                     ),
                                 );
                                 let shown = if spec.dir.is_empty() {
-                                    "(project's export folder)"
+                                    home.as_str()
                                 } else {
                                     spec.dir.as_str()
                                 };
@@ -16455,6 +16459,7 @@ at: None,
         let mut dialog = Some(Dialog::ExportProject {
             spec: crate::ports::ProjectExportSpec::default(),
             sel: Some((0.0, 4.0)),
+            home: "/Users/someone/Documents/Tangent Media/Exports/Nocturne".to_owned(),
         });
         let placement = Placement {
             at: None,
@@ -16699,6 +16704,7 @@ at: None,
         let mut dialog = Some(Dialog::ExportProject {
             spec: crate::ports::ProjectExportSpec::default(),
             sel: None,
+            home: String::new(),
         });
         let (bare, with) = frame_with_and_without_cover("Preparing export", |ctx| {
             let _ = show(ctx, &mut dialog, FALLBACK_FACE, cover_placement());
