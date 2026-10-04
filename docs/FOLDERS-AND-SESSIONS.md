@@ -14,7 +14,11 @@ a third flag (`strip_folder_shut`). Consequences, all deliberate:
 - **Made and unmade by Cmd/Ctrl+F alone.** Multi-selection groups into a
   new folder; an empty selected slot becomes an empty folder; a selected
   folder dissolves. There is no toggle box anywhere — the arrangement's
-  was retired.
+  was retired. None of the three happens under a realtime export, which
+  chose its stems by the folders at its press (a folder that collects
+  children writes a stem of its bus): grouping moves a lane
+  (`lane_order_held`), and the other two would move children onto another
+  bus mid-render (`folders_held`); each says why.
 - **No input selector, no record arm, no theory note.** A folder cannot
   record and cannot carry its own MIDI. In the arrangement the second
   rack takes the input selector's band (three bays on three); in the
