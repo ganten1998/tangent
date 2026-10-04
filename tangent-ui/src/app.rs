@@ -34927,13 +34927,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the sequence does not leave four arrows banked.
             self.license.relock_cheat();
             self.konami = keys::Konami::default();
-            // **And the window goes back to 100% on screen, not just in the
-            // file.** `Settings::reset` already puts `window_size_percent`
+        }
+        // **And the window goes back to 100% on screen, not just in the
+        // file** - after Everything, and after Layout, which is the scope
+        // that owns the window's size and says so in its confirmation.
+        if matches!(scope, R::Layout | R::Everything) {
+            // `Settings::reset` already puts `window_size_percent`
             // back; nothing asked for the resize, so the desk stayed
             // whatever size it had been dragged or stepped to and the reset
             // looked like it had half worked. The owner: "Reset everything
             // should set the window size to 100% immediately after
-            // resetting."
+            // resetting." Layout said the same in its confirmation and asked
+            // nothing either - and the geometry write-back then wrote the
+            // live size straight back over the reset one.
             //
             // The same two slots `MenuAction::SetSizePercent` uses, and for
             // the same reason: a host that owns the window has to be asked,
@@ -35027,20 +35033,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::fonts::install(ctx, font, custom.as_deref());
         self.rebuild_voicing();
         self.request_natural_size();
-        // **And the window goes back too - after the one reset that moved
-        // it.** Everything resizes it to 100% on the spot now, so an Undo
-        // that restored the settings alone would leave a window whose size
-        // the file no longer names - and the geometry write-back would then
-        // overwrite the restored size with the reset one. The size it had,
-        // or the size its restored percent asks for, through the same two
-        // slots the reset used.
+        // **And the window goes back too - after the two resets that moved
+        // it.** Layout and Everything resize it to 100% on the spot now, so
+        // an Undo that restored the settings alone would leave a window
+        // whose size the file no longer names - and the geometry write-back
+        // would then overwrite the restored size with the reset one. The
+        // size it had, or the size its restored percent asks for, through
+        // the same two slots the reset used.
         //
-        // **Only there.** No other scope touches the window (Layout resets
-        // the remembered geometry, not the window on screen), and a size
+        // **Only there.** No other scope touches the window, and a size
         // request is honoured wherever the window is: undoing a Colours
         // reset took a full-screen desk out of full screen and brought a
         // maximised one down.
-        if scope == crate::settings::ResetScope::Everything {
+        if matches!(
+            scope,
+            crate::settings::ResetScope::Layout | crate::settings::ResetScope::Everything
+        ) {
             let size = self
                 .settings
                 .window_size_for_use()
@@ -61982,13 +61990,13 @@ mod tests {
     /// leaves full screen and a maximised one comes down, so undoing a
     /// COLOURS reset - which never touched the window - took the desk out
     /// of full screen. The receipt's Undo now carries the scope it undoes,
-    /// and only a scope whose reset resized the window (Everything) has its
-    /// undo put the size back.
+    /// and only a scope whose reset resized the window (Layout and
+    /// Everything) has its undo put the size back.
     #[test]
     fn undoing_a_reset_asks_the_window_for_a_size_only_if_the_reset_did() {
         use crate::settings::ResetScope as R;
         let _ = std::fs::remove_file(Settings::backup_path());
-        for (scope, sized) in [(R::Colours, false), (R::Everything, true)] {
+        for (scope, sized) in [(R::Colours, false), (R::Layout, true), (R::Everything, true)] {
             let mut s = Settings::first_launch();
             s.theme_name = "Rhodes".into();
             let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
@@ -67278,6 +67286,32 @@ mod tests {").expect("the tests module")];
             "a plugin's host still has to be asked"
         );
         assert_eq!(plugin.pending_window_size, None);
+    }
+
+    /// **Reset Layout puts the DESKTOP window back to its opening size on
+    /// the spot**, as its confirmation says it does. It took the remembered
+    /// size and percentage out of the file and asked nothing of the window,
+    /// so the desk stayed the size it had been dragged to - and the
+    /// geometry write-back, armed by the next size or position change (the
+    /// aspect snap after the bands this reset changes, say), wrote the live
+    /// size straight back over the reset one. The Everything reset's own
+    /// "looked like it had half worked", on the narrower scope.
+    #[test]
+    fn reset_layout_puts_the_desktop_window_back_on_screen() {
+        let (ctx, mut app) = headless_with_band(Caps { persist_global_settings: false, ..Caps::DESKTOP });
+        app.settings.window_size_percent = 125;
+        app.settings.window_w = Some(1700);
+        app.settings.window_h = Some(1040);
+        app.pending_window_size = None;
+        let _ = app.take_pending_resize();
+        app.reset_settings(&ctx, crate::settings::ResetScope::Layout);
+        assert_eq!(app.settings.window_w, None, "the fixture's reset did not take the remembered size");
+        assert_eq!(
+            app.pending_window_size,
+            Some(initial_window_size(&app.settings)),
+            "Reset Layout says it puts the window back to its opening size, and asked the window for nothing"
+        );
+        assert_eq!(app.take_pending_resize(), None, "the desktop request went to the plugin's slot");
     }
 
     /// **Reset Everything never hands New a session to write back.** The

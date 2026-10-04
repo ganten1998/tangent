@@ -2343,10 +2343,15 @@ impl ResetScope {
                  Tangent came, and lets the channels take their colours from \
                  the theme again."
             }
+            // **Its opening SIZE, and not its position.** The size is asked
+            // of the window on the spot (`TangentApp::reset_settings`); a
+            // position there is nothing to ask for - a fresh install opens
+            // wherever the system puts a new window - and the window stays
+            // where it is on screen, so the sentence no longer promises it.
             ResetScope::Layout => {
-                "This puts the window back to its opening size and position, \
-                 shows the bands a fresh install shows, and re-attaches \
-                 anything you have detached."
+                "This puts the window back to its opening size, shows the \
+                 bands a fresh install shows, and re-attaches anything you \
+                 have detached."
             }
             ResetScope::Playing => {
                 "This puts the tuning, capo, key, note names, grids, snap, \
@@ -5317,11 +5322,14 @@ impl Settings {
         self.window_x = fresh.window_x;
         self.window_y = fresh.window_y;
         // The SIZE as well as the position, or "puts the window back to its
-        // opening size and position" is a sentence the dialog says and the
-        // reset does not keep. Missed when the pair was added because the
-        // partition test could only see fields the WRITER emits, and an
-        // optional one that is `None` at first launch is never written — it
-        // compares the structs as well now, which is what catches this.
+        // opening size" is a sentence the dialog says and the reset does not
+        // keep (the app asks the window for that size on the spot). Missed
+        // when the pair was added because the partition test could only see
+        // fields the WRITER emits, and an optional one that is `None` at
+        // first launch is never written — it compares the structs as well
+        // now, which is what catches this. The position is forgotten here
+        // too, but the window does not move, and the geometry write-back
+        // records where it stands again once the resize lands.
         self.window_w = fresh.window_w;
         self.window_h = fresh.window_h;
         self.chord_window_detached = fresh.chord_window_detached;
