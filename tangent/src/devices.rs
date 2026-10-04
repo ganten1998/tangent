@@ -231,13 +231,31 @@ pub fn device_display_name(name: &str) -> String {
 /// that is unplugged does not leave nothing open: the session falls back to
 /// the default input (the laptop's microphone), and a short name applied to
 /// whatever is open then called the built-in mic "solo" while it recorded.
-/// So the alias applies only when nothing was chosen (the open device IS the
-/// one in use) or the chosen uid names the open device.
-pub fn alias_for_open<'a>(open: Option<&str>, uid: Option<&str>, alias: &'a str) -> Option<&'a str> {
+///
+/// **So the short name carries the interface it was given to**
+/// (`given_to`, `Settings::input_alias_for`): the device the Setup panel
+/// named, by `device_display_name`, when the name was typed. It applies to
+/// that device and to nothing else - chosen or not, which is the case the
+/// old rule missed: with NOTHING chosen it applied to whatever the system's
+/// default input was, so unplugging the interface moved "solo" onto the
+/// laptop's microphone all the same.
+///
+/// A short name typed before that was kept (`given_to` is `None`) keeps the
+/// old rule: it applies when nothing was chosen, or when the chosen uid
+/// names the open device. Typing it again ties it to its interface.
+pub fn alias_for_open<'a>(
+    open: Option<&str>,
+    uid: Option<&str>,
+    alias: &'a str,
+    given_to: Option<&str>,
+) -> Option<&'a str> {
     let alias = alias.trim();
     let open = open?;
     if alias.is_empty() {
         return None;
+    }
+    if let Some(given) = given_to {
+        return (device_display_name(open) == given).then_some(alias);
     }
     let chosen = match uid {
         None => return Some(alias),
@@ -258,11 +276,16 @@ pub fn alias_for_open<'a>(open: Option<&str>, uid: Option<&str>, alias: &'a str)
 /// 4. With nothing open, the CHOSEN device, spelled as the picker spells it -
 ///    never the raw settings uid, whose `pw:` prefix and unit-separator
 ///    channel suffix are this module's private grammar.
-pub fn band_device_name(open: Option<&str>, uid: Option<&str>, alias: &str) -> Option<String> {
+pub fn band_device_name(
+    open: Option<&str>,
+    uid: Option<&str>,
+    alias: &str,
+    alias_for: Option<&str>,
+) -> Option<String> {
     if open.is_none() && uid.is_none() {
         return None;
     }
-    if let Some(alias) = alias_for_open(open, uid, alias) {
+    if let Some(alias) = alias_for_open(open, uid, alias, alias_for) {
         return Some(alias.to_owned());
     }
     if let Some(name) = open {
@@ -1095,48 +1118,50 @@ mod tests {
     fn the_band_names_the_interface_not_its_pipewire_node() {
         let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
         assert_eq!(
-            band_device_name(Some(node), None, "").as_deref(),
+            band_device_name(Some(node), None, "", None).as_deref(),
             Some("Focusrite Scarlett Solo USB")
         );
-        // The owner's own short name wins, trimmed, as it does on the strips.
-        assert_eq!(band_device_name(Some(node), None, "  solo ").as_deref(), Some("solo"));
+        // The owner's own short name wins, trimmed, as it does on the strips
+        // (one typed before short names were tied to their interface: see
+        // `a_short_name_names_only_the_interface_it_was_given_to`).
+        assert_eq!(band_device_name(Some(node), None, "  solo ", None).as_deref(), Some("solo"));
         // Not open: the chosen device, never the uid's private grammar.
         let uid = channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(0, 1));
-        let missing = band_device_name(None, Some(&uid), "").expect("a chosen device has a name");
+        let missing = band_device_name(None, Some(&uid), "", None).expect("a chosen device has a name");
         assert_eq!(missing, "Focusrite Scarlett Solo USB");
         assert!(!missing.contains(CHANNEL_SEP) && !missing.starts_with(PIPEWIRE_UID));
         // macOS / Windows names pass through; a cpal key is spelled as the
         // picker spells it.
-        assert_eq!(band_device_name(Some("Scarlett 2i2 USB"), None, "").as_deref(), Some("Scarlett 2i2 USB"));
+        assert_eq!(band_device_name(Some("Scarlett 2i2 USB"), None, "", None).as_deref(), Some("Scarlett 2i2 USB"));
         assert_eq!(
-            band_device_name(None, Some("Scarlett 2i2 USB#1"), "").as_deref(),
+            band_device_name(None, Some("Scarlett 2i2 USB#1"), "", None).as_deref(),
             Some("Scarlett 2i2 USB (2)")
         );
         // A PCI node is a bus address, and is left alone.
         let pci = "alsa_input.pci-0000_00_1f.3.analog-stereo";
-        assert_eq!(band_device_name(Some(pci), None, "").as_deref(), Some(pci));
+        assert_eq!(band_device_name(Some(pci), None, "", None).as_deref(), Some(pci));
         // A card with no serial keeps every word of its model.
         assert_eq!(
-            band_device_name(Some("alsa_input.usb-BEHRINGER_UMC204HD_192k-00.analog-stereo"), None, "")
+            band_device_name(Some("alsa_input.usb-BEHRINGER_UMC204HD_192k-00.analog-stereo"), None, "", None)
                 .as_deref(),
             Some("BEHRINGER UMC204HD 192k")
         );
         // Nothing chosen is nothing, whatever the alias says.
-        assert_eq!(band_device_name(None, None, "x"), None);
+        assert_eq!(band_device_name(None, None, "x", None), None);
         // The chosen interface unplugged: the session fell back to the laptop
         // mic, and the short name must not be pinned on it.
         assert_eq!(
-            band_device_name(Some("MacBook Pro Microphone"), Some("Scarlett Solo USB"), "solo").as_deref(),
+            band_device_name(Some("MacBook Pro Microphone"), Some("Scarlett Solo USB"), "solo", None).as_deref(),
             Some("MacBook Pro Microphone")
         );
         assert_eq!(
-            band_device_name(Some("Scarlett Solo USB"), Some("Scarlett Solo USB"), "solo").as_deref(),
+            band_device_name(Some("Scarlett Solo USB"), Some("Scarlett Solo USB"), "solo", None).as_deref(),
             Some("solo"),
             "the short name names the interface it was given to"
         );
-        assert_eq!(band_device_name(Some(node), Some(&uid), "solo").as_deref(), Some("solo"));
+        assert_eq!(band_device_name(Some(node), Some(&uid), "solo", None).as_deref(), Some("solo"));
         // Chosen and not open at all: the chosen device, not its short name.
-        assert_eq!(band_device_name(None, Some(&uid), "solo").as_deref(), Some("Focusrite Scarlett Solo USB"));
+        assert_eq!(band_device_name(None, Some(&uid), "solo", None).as_deref(), Some("Focusrite Scarlett Solo USB"));
         // WirePlumber's duplicate suffix does not eat the profile's digit.
         assert_eq!(
             device_display_name(&format!("{node}.2")),
@@ -1145,6 +1170,36 @@ mod tests {
         // A USB node without an interface number is passed through whole.
         let odd = "alsa_input.usb-Some_Thing.analog-stereo";
         assert_eq!(device_display_name(odd), odd);
+    }
+
+    /// **A short name names the interface it was given to, and nothing
+    /// else.** With nothing chosen the session records from the system's
+    /// default input, and the short name applied to whatever that was - so
+    /// unplugging the interface moved "solo" onto the laptop's microphone,
+    /// the very failure the rule for a chosen interface exists to prevent.
+    /// The name now carries the device it was typed for.
+    #[test]
+    fn a_short_name_names_only_the_interface_it_was_given_to() {
+        let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
+        let given = Some("Focusrite Scarlett Solo USB");
+        // Nothing chosen, the interface open: its short name.
+        assert_eq!(band_device_name(Some(node), None, "solo", given).as_deref(), Some("solo"));
+        // Nothing chosen, the interface unplugged: the default input now open
+        // is the laptop's microphone, and it keeps its own name.
+        assert_eq!(
+            band_device_name(Some("MacBook Pro Microphone"), None, "solo", given).as_deref(),
+            Some("MacBook Pro Microphone"),
+            "the short name followed the default input onto another device"
+        );
+        // Another interface CHOSEN is not the one the name was given to.
+        assert_eq!(
+            band_device_name(Some("Scarlett 2i2 USB"), Some("Scarlett 2i2 USB"), "solo", given).as_deref(),
+            Some("Scarlett 2i2 USB"),
+            "the short name went with the choice to another interface"
+        );
+        // The strips ask the same rule.
+        assert_eq!(alias_for_open(Some("MacBook Pro Microphone"), None, "solo", given), None);
+        assert_eq!(alias_for_open(Some(node), None, " solo ", given), Some("solo"));
     }
 
     fn a_device(uid: &str, name: &str) -> DeviceInfo {

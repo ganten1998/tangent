@@ -6478,13 +6478,13 @@ impl TangentApp {
                     // it touches ONE lane, where a plain press carries the
                     // whole strip selection with it. See the guard in
                     // `apply_mixer_hit`.
+                    // **Through `switch_next`**, the rule lifted out of here
+                    // for the mute and the solo: a copy kept beside it is
+                    // where the next change to the gesture lands in one
+                    // place only. Exact in a `u32`, since `n < CHANNELS`.
                     let live = self.armed_mask();
-                    let only_this = live == 1 << n;
-                    let next = if self.alt_down {
-                        if only_this { 0 } else { 1 << n }
-                    } else {
-                        live ^ (1 << n)
-                    };
+                    let next = u32::try_from(Self::switch_next(u64::from(live), n, self.alt_down))
+                        .unwrap_or(live);
                     self.set_armed_mask(next);
                 }
                 return;
@@ -8103,6 +8103,13 @@ impl TangentApp {
 
         // Right-click (or ctrl-click on macOS, Qt default) opens the menu.
         if resp.secondary_clicked() || (resp.clicked() && ctrl_as_context) {
+            // **Not under the open setup panel**, which is modal: the left
+            // button's presses all go to it (below), and this branch ran
+            // first with no word about it, so a right-click under the scrim
+            // opened an effect's panel on top of it, or the band's menu.
+            if self.setup_open {
+                return;
+            }
             // **Not over the mixer, which is its own surface.**
             //
             // A right-click there means "paint this channel" and opens the
@@ -18436,9 +18443,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// painted in one place and hit-tested in another: every press landed on
     /// whatever the cog's geometry said was there, which is why its Done
     /// button did nothing at all. One function now, and both roads call it.
-    /// Each shape answers its own control, and `Machine` falls back to the
-    /// cassette when the cog is unseated. `Rolling` has no fallback, and the
-    /// red button is unseated under a realtime export (see `SetupShape`).
+    /// Every shape answers a SEATED control - see `SetupShape`: `Machine`
+    /// falls back to the cassette when the cog is unseated, and `Rolling`
+    /// when the red button is (a realtime export).
     fn setup_anchor(
         &self,
         band: Rect,
@@ -18458,7 +18465,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             recorder_panel::SetupShape::Take => recorder_panel::capture_rect(band, view),
-            recorder_panel::SetupShape::Rolling => recorder_panel::record_rect(band, view),
+            // **The cog's treatment, for the red button.** A realtime export
+            // unseats it (`fill_rolling`), and a RECORDING panel left open
+            // into one hung off `Rect::NOTHING`: NaN, undrawn, owning every
+            // surface under it and spending the next press - the band's
+            // Stop, as often as not - on closing itself.
+            recorder_panel::SetupShape::Rolling => {
+                let record = recorder_panel::record_rect(band, view);
+                if record.is_positive() {
+                    record
+                } else {
+                    recorder_panel::capture_rect(band, view)
+                }
+            }
         }
     }
 
@@ -18597,12 +18616,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             // **Bars, clamped at nothing.** Zero is off and there is no
             // negative count-in; eight bars is already longer than anybody
-            // waits through twice.
+            // waits through twice. Through `set_count_in_bars`, the chip's
+            // road, which keeps the legacy beats key in step and commits:
+            // writing the bars here alone left `CountIn::beats` behind.
             Some(MetHit::CountIn(d)) => {
-                self.settings.record_count_in_bars =
-                    (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
-                self.save_settings();
-                self.undo_commit();
+                let bars = (self.settings.record_count_in_bars + i64::from(d)).clamp(0, 8);
+                self.set_count_in_bars(bars as u32);
             }
             Some(MetHit::CountInInTake) => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
@@ -31482,7 +31501,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .and_then(|s| s.active_system())
                 .or_else(|| self.settings.audio_system().map(str::to_owned)),
             outputs,
-            output: self.settings.audio_output_device.clone(),
+            // What the ENGINE reads, not the raw setting: a blank one is the
+            // system's own there, and handed over raw it lit no chip at all.
+            output: self.audio_output_device(),
             outputs_stale: false,
             rates,
             exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
@@ -31894,7 +31915,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         // A field being typed into owns every key; so does an open dialog.
-        if self.text_entry_active() || self.dialog_blocks_keys(ctx) {
+        //
+        // **And so does a band popup** - the setup panel, an effect's
+        // parameters, the pitch range - whose scrim says the window is
+        // waiting on it. The pointer obeyed that and the keyboard did not:
+        // in reader mode a Tab to the cassette and Enter started a take
+        // under the open panel, and the Project node led on to a realtime
+        // export. Every focused node is under the scrim, the desk's and the
+        // timeline's as much as the band's, so the guard is not the band's.
+        if self.text_entry_active() || self.dialog_blocks_keys(ctx) || self.band_popup_owns() {
             return;
         }
         let Some(gesture) = ctx.input(crate::a11y::Gesture::read) else {
@@ -32248,13 +32277,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // the band no longer reads. So the control cycled a number
                 // nothing displayed, and the band appeared not to react to
                 // clicks at all.
-                let choices = recorder::COUNT_IN_CHOICES;
-                let now = self.settings.count_in_bars();
-                let next = choices
-                    .iter()
-                    .position(|c| *c == now)
-                    .map_or(choices[0], |i| choices[(i + 1) % choices.len()]);
-                self.set_count_in_bars(next);
+                //
+                // **Stepped by `next_count_in`**, not by a walk of its own:
+                // this arm's copy started a length off the list (the
+                // metronome panel's 3 or 5-8 bars) over at OFF.
+                self.set_count_in_bars(recorder_panel::next_count_in(
+                    self.settings.count_in_bars(),
+                ));
             }
             Hit::Export => self.open_export_dialog(),
             // The knobs write to settings and are pushed to the engine after
@@ -33301,6 +33330,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self.settings.input_alias
     }
 
+    /// The interface that short name was given to, as the band names it, or
+    /// `None` for one from before that was kept. See
+    /// `Settings::input_alias_for`.
+    pub fn input_alias_for(&self) -> Option<&str> {
+        self.settings.input_alias_for.as_deref()
+    }
+
     /// The inputs open BESIDE the first, as the host's own opaque uids.
     ///
     /// Input 2 upward, in strip order. The host drops any that name a
@@ -34036,9 +34072,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **Set the count-in, in bars, and keep the legacy beats key in step**,
     /// as one moment: `CountIn::bars` and `CountIn::beats` are both hashed.
-    /// The setup panel's COUNT-IN chip comes through here; the metronome
-    /// panel's COUNT row still writes the bars on its own and leaves the
-    /// beats behind.
+    /// Every road that sets the count-in comes through here - the setup
+    /// panel's chip and the metronome panel's COUNT row - so the legacy
+    /// beats key and the moment cannot differ by road.
     ///
     /// **Meant to be the one place**, because two roads once disagreed: the
     /// band cycled the legacy BEATS key while the display read bars, so
@@ -34050,9 +34086,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_count_in_beats =
             i64::from(self.settings.time_signature().beats_in(bars));
         self.save_settings();
-        // Both callers are single presses (the setup panel's count-in chip,
-        // and the menu's `SetCountIn` arm, which no menu row builds today),
-        // so one moment each. `CountIn::bars` is hashed.
+        // Every caller is a single press (the setup panel's count-in chip,
+        // the metronome panel's COUNT row, and the menu's `SetCountIn` arm,
+        // which no menu row builds today), so one moment each.
+        // `CountIn::bars` is hashed.
         self.undo_commit();
     }
 
@@ -35229,13 +35266,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the sequence does not leave four arrows banked.
             self.license.relock_cheat();
             self.konami = keys::Konami::default();
-            // **And the window goes back to 100% on screen, not just in the
-            // file.** `Settings::reset` already puts `window_size_percent`
+        }
+        // **And the window goes back to 100% on screen, not just in the
+        // file** - after Everything, and after Layout, which is the scope
+        // that owns the window's size and says so in its confirmation.
+        if matches!(scope, R::Layout | R::Everything) {
+            // `Settings::reset` already puts `window_size_percent`
             // back; nothing asked for the resize, so the desk stayed
             // whatever size it had been dragged or stepped to and the reset
             // looked like it had half worked. The owner: "Reset everything
             // should set the window size to 100% immediately after
-            // resetting."
+            // resetting." Layout said the same in its confirmation and asked
+            // nothing either - and the geometry write-back then wrote the
+            // live size straight back over the reset one.
             //
             // The same two slots `MenuAction::SetSizePercent` uses, and for
             // the same reason: a host that owns the window has to be asked,
@@ -35329,20 +35372,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::fonts::install(ctx, font, custom.as_deref());
         self.rebuild_voicing();
         self.request_natural_size();
-        // **And the window goes back too - after the one reset that moved
-        // it.** Everything resizes it to 100% on the spot now, so an Undo
-        // that restored the settings alone would leave a window whose size
-        // the file no longer names - and the geometry write-back would then
-        // overwrite the restored size with the reset one. The size it had,
-        // or the size its restored percent asks for, through the same two
-        // slots the reset used.
+        // **And the window goes back too - after the two resets that moved
+        // it.** Layout and Everything resize it to 100% on the spot now, so
+        // an Undo that restored the settings alone would leave a window
+        // whose size the file no longer names - and the geometry write-back
+        // would then overwrite the restored size with the reset one. The
+        // size it had, or the size its restored percent asks for, through
+        // the same two slots the reset used.
         //
-        // **Only there.** No other scope touches the window (Layout resets
-        // the remembered geometry, not the window on screen), and a size
+        // **Only there.** No other scope touches the window, and a size
         // request is honoured wherever the window is: undoing a Colours
         // reset took a full-screen desk out of full screen and brought a
         // maximised one down.
-        if scope == crate::settings::ResetScope::Everything {
+        if matches!(
+            scope,
+            crate::settings::ResetScope::Layout | crate::settings::ResetScope::Everything
+        ) {
             let size = self
                 .settings
                 .window_size_for_use()
@@ -36313,6 +36358,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // Saved on every keystroke, like every other Setup control: the
             // panel has no OK button, so there is no later moment to save at.
             DialogAction::SetInputAlias(name) => {
+                // **And the interface it is being given to**: the input the
+                // panel names while it is typed, by the name it shows. A
+                // short name is ONE box's, and a bare string followed the
+                // system's default input onto whatever it became - see
+                // `Settings::input_alias_for`. Nothing open, nothing to tie
+                // it to; cleared, nothing to remember.
+                self.settings.input_alias_for = if name.trim().is_empty() {
+                    None
+                } else {
+                    self.audio_status.input.as_ref().map(|(device, _)| device.clone())
+                };
                 self.settings.input_alias = name;
                 self.save_settings();
             }
@@ -44245,6 +44301,52 @@ mod tests {
             }
             _ => panic!("Setup closed"),
         }
+    }
+
+    /// **Setup opens on the output the engine opens.** A blank setting is
+    /// the system's own to the engine (`audio_output_device` reads it so),
+    /// and the panel was handed the raw setting instead: whitespace lit no
+    /// chip at all, "the system's own" included, while the system's own
+    /// played.
+    #[test]
+    fn a_blank_output_setting_opens_setup_on_the_systems_own() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_output_device = Some("   ".to_owned());
+        assert_eq!(app.audio_output_device(), None, "the fixture's setting opens a named output");
+        app.open_audio_setup();
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { output, .. }) => assert_eq!(
+                output.as_deref(),
+                None,
+                "a blank setting plays the system's own, and Setup lit neither it nor anything else"
+            ),
+            _ => panic!("Setup did not open"),
+        }
+    }
+
+    /// **A short name is given to the input Setup is showing, and says so.**
+    /// It was a bare string, so with nothing chosen it applied to whatever
+    /// the default input became: unplug the interface and the laptop's
+    /// microphone was "solo". The name the Setup panel shows the input
+    /// under (`AudioStatus::input`) goes with it now, and the host applies
+    /// the short name to that device alone (`devices::alias_for_open`).
+    #[test]
+    fn a_short_name_is_tied_to_the_input_it_is_typed_for() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_audio_status(recorder::AudioStatus {
+            input: Some(("Focusrite Scarlett Solo USB".to_owned(), recorder::StreamStats::default())),
+            ..recorder::AudioStatus::default()
+        });
+        app.apply_dialog_action(DialogAction::SetInputAlias("solo".to_owned()));
+        assert_eq!(app.input_alias(), "solo");
+        assert_eq!(
+            app.input_alias_for(),
+            Some("Focusrite Scarlett Solo USB"),
+            "the short name does not say which interface it was given to"
+        );
+        // Cleared, it names nothing and remembers no box.
+        app.apply_dialog_action(DialogAction::SetInputAlias(String::new()));
+        assert_eq!(app.input_alias_for(), None, "an empty short name kept a box");
     }
 
     /// **Q on a TRACK selects that track's clips.**
@@ -52882,6 +52984,32 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
         assert_eq!(app.armed_mask(), 0, "alt+arm could not undo itself");
         app.alt_down = false;
+    }
+
+    /// **The arm shares the switches' rule rather than keeping a copy.**
+    /// `switch_next` was lifted out of the arm so the mute and the solo
+    /// could share it "rather than growing their own copy", and the arm
+    /// went on computing the same thing inline beside it. Identical today;
+    /// the next change to the arm's gesture - the owner has changed it three
+    /// times - would land in one copy, and the arm would stop matching the
+    /// mute and the solo. A source scan, because behaviour cannot tell two
+    /// identical copies apart: `arms_stack_by_hand_and_never_by_accident`
+    /// and `a_mute_and_a_solo_take_the_arms_modifiers` pin the gestures.
+    #[test]
+    fn the_arm_shares_the_switch_rule_with_the_mute_and_the_solo() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let arm = {
+            let a = src
+                .find("            H::Arm(i) => {")
+                .expect("the arm's arm in apply_mixer_hit_one is gone");
+            let b = src[a..].find("\n                return;\n            }").expect("its end");
+            &src[a..a + b]
+        };
+        assert!(
+            arm.contains("Self::switch_next("),
+            "the arm keeps its own copy of the switch rule instead of `switch_next`"
+        );
     }
 
     /// **Alt on an arm ignores the SELECTION**, which every other control on
@@ -62808,13 +62936,13 @@ mod tests {
     /// leaves full screen and a maximised one comes down, so undoing a
     /// COLOURS reset - which never touched the window - took the desk out
     /// of full screen. The receipt's Undo now carries the scope it undoes,
-    /// and only a scope whose reset resized the window (Everything) has its
-    /// undo put the size back.
+    /// and only a scope whose reset resized the window (Layout and
+    /// Everything) has its undo put the size back.
     #[test]
     fn undoing_a_reset_asks_the_window_for_a_size_only_if_the_reset_did() {
         use crate::settings::ResetScope as R;
         let _ = std::fs::remove_file(Settings::backup_path());
-        for (scope, sized) in [(R::Colours, false), (R::Everything, true)] {
+        for (scope, sized) in [(R::Colours, false), (R::Layout, true), (R::Everything, true)] {
             let mut s = Settings::first_launch();
             s.theme_name = "Rhodes".into();
             let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
@@ -68106,6 +68234,32 @@ mod tests {").expect("the tests module")];
         assert_eq!(plugin.pending_window_size, None);
     }
 
+    /// **Reset Layout puts the DESKTOP window back to its opening size on
+    /// the spot**, as its confirmation says it does. It took the remembered
+    /// size and percentage out of the file and asked nothing of the window,
+    /// so the desk stayed the size it had been dragged to - and the
+    /// geometry write-back, armed by the next size or position change (the
+    /// aspect snap after the bands this reset changes, say), wrote the live
+    /// size straight back over the reset one. The Everything reset's own
+    /// "looked like it had half worked", on the narrower scope.
+    #[test]
+    fn reset_layout_puts_the_desktop_window_back_on_screen() {
+        let (ctx, mut app) = headless_with_band(Caps { persist_global_settings: false, ..Caps::DESKTOP });
+        app.settings.window_size_percent = 125;
+        app.settings.window_w = Some(1700);
+        app.settings.window_h = Some(1040);
+        app.pending_window_size = None;
+        let _ = app.take_pending_resize();
+        app.reset_settings(&ctx, crate::settings::ResetScope::Layout);
+        assert_eq!(app.settings.window_w, None, "the fixture's reset did not take the remembered size");
+        assert_eq!(
+            app.pending_window_size,
+            Some(initial_window_size(&app.settings)),
+            "Reset Layout says it puts the window back to its opening size, and asked the window for nothing"
+        );
+        assert_eq!(app.take_pending_resize(), None, "the desktop request went to the plugin's slot");
+    }
+
     /// **Reset Everything never hands New a session to write back.** The
     /// reset empties the desk and then opens a fresh session through New,
     /// and New's save-back writes the outgoing document when it is dirty and
@@ -68696,6 +68850,63 @@ mod tests {").expect("the tests module")];
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A count-in set in the metronome panel steps ON at the setup panel's
+    /// chip, and the legacy beats key follows either road.**
+    ///
+    /// The two count-in controls step differently: the metronome panel's
+    /// COUNT row a bar at a time over 0..=8, the chip through
+    /// `COUNT_IN_CHOICES` (off, 1, 2, 4). The chip read any length off its
+    /// list as unknown and started again at off, so 3 bars set in the panel
+    /// went to OFF at one press of the chip - and the panel wrote the bars
+    /// alone, leaving `record_count_in_beats` (hashed as `CountIn::beats`)
+    /// at the old length. Both roads go through `set_count_in_bars` now, and
+    /// the chip steps to the next choice ABOVE the length it shows.
+    #[test]
+    fn a_count_in_set_in_the_metronome_panel_steps_on_at_the_chip() {
+        use crate::recorder_panel::MetHit;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_count_in_bars(2);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        app.met_menu = Some(());
+        app.met_at = Some(screen.center());
+        let anchor = app.met_anchor(screen);
+        let panel = recorder_panel::met_popup_rect(screen, anchor);
+        let mut plus = None;
+        let mut y = panel.top();
+        'find: while y <= panel.bottom() {
+            let mut x = panel.left();
+            while x <= panel.right() {
+                let p = Pos2::new(x, y);
+                if recorder_panel::met_hit_test(screen, anchor, p) == Some(MetHit::CountIn(1)) {
+                    plus = Some(p);
+                    break 'find;
+                }
+                x += 2.0;
+            }
+            y += 2.0;
+        }
+        assert!(app.met_menu_press(screen, plus.expect("the panel has no COUNT +"), true));
+        assert_eq!(app.settings.count_in_bars(), 3, "COUNT + did not step");
+        assert_eq!(
+            app.settings.record_count_in_beats,
+            i64::from(app.time_signature().beats_in(3)),
+            "the metronome panel left the legacy beats key (hashed as CountIn::beats) behind"
+        );
+        // The setup panel's chip - the TAKE, RECORDING and SETTINGS shapes
+        // all press this.
+        app.apply_recorder_hit(recorder_panel::Hit::CycleCountIn);
+        assert_eq!(
+            app.settings.count_in_bars(),
+            4,
+            "a 3-bar count stepped to {} at the chip",
+            app.settings.count_in_bars()
+        );
+        // Past the last choice the chip wraps round to off, as it does from 4.
+        app.set_count_in_bars(6);
+        app.apply_recorder_hit(recorder_panel::Hit::CycleCountIn);
+        assert_eq!(app.settings.count_in_bars(), 0, "a 6-bar count did not wrap round to off");
+    }
+
     /// **The DONE press is spent on DONE.** The take panel hangs below the
     /// band, so its title bar and DONE sit over the arrangement's ruler; the
     /// press that closed the panel used to go on to the ruler under it in
@@ -68877,6 +69088,111 @@ mod tests {").expect("the tests module")];
         assert!(
             !open(recorder::RecordState::Rolling),
             "the red button's panel of refused rows opened under a take"
+        );
+    }
+
+    /// **An open RECORDING panel hangs off a control that is drawn, an
+    /// export included.** It hangs off the red button, and a realtime export
+    /// unseats the red button (`Rect::NOTHING`): a panel hung off nothing is
+    /// NaN - not drawn, still open, still owning every surface under it -
+    /// and the next press, typically the band's Stop meant to cut the export
+    /// short, was spent closing it. It falls back to the cassette, as the
+    /// cog's panel already did.
+    #[test]
+    fn an_open_recording_panel_always_hangs_somewhere_it_is_drawn() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Rolling;
+        // A realtime export has started with the panel up.
+        app.recorder.state = recorder::RecordState::Rolling;
+        app.recorder.exporting = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let band = app.last_band;
+        assert!(band.is_positive(), "the band is not laid out");
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let panel = {
+            let view = app.recorder_layout_view();
+            recorder_panel::setup_popup_rect(screen, app.setup_anchor(band, &view), app.setup_shape)
+        };
+        assert!(
+            !app.setup_open || panel.is_positive(),
+            "the RECORDING panel is open and hung off nothing: {panel:?} - undrawn, and it eats the next press"
+        );
+    }
+
+    /// **The open setup panel is modal to the keyboard too.** Its scrim
+    /// says the window is waiting on it, and the pointer obeys; but the
+    /// band's keyboard nodes stayed live under it, so in reader mode a Tab
+    /// to the cassette and Enter started a take with the panel up - or
+    /// reached the Project dialog and from there a realtime export.
+    #[test]
+    fn a_focused_band_control_waits_behind_the_open_setup_panel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.screen_reader_mode = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        while app.take_recorder_request().is_some() {}
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Rolling;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("band", "capture"))));
+        // Enter, not Space: Enter is bound to nothing, so only the keyboard
+        // node's road can act on it.
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.setup_open, "the fixture's panel closed, so nothing here was behind it");
+        assert_eq!(
+            app.take_recorder_request(),
+            None,
+            "a focused band control fired under the open setup panel"
+        );
+    }
+
+    /// **And modal to the right button.** The right-click branch ran before
+    /// the panel's own press handling with no word about it, so a
+    /// right-click on a knob under the scrim opened that effect's panel on
+    /// top of the setup panel, and anywhere else the band's menu.
+    #[test]
+    fn a_right_click_reaches_nothing_behind_the_open_setup_panel() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let at = knob_cell(&app, recorder_panel::Hit::SetFx(recorder_panel::Fx::Reverb, 0.5)).center();
+        let right_click = |ctx: &egui::Context, app: &mut TangentApp| {
+            pointer_frame(
+                ctx,
+                app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        };
+        right_click(&ctx, &mut app);
+        assert!(app.fx_open.is_some(), "the fixture's right-click opens no effect panel at all");
+        app.fx_open = None;
+        app.setup_open = true;
+        app.setup_shape = recorder_panel::SetupShape::Machine;
+        right_click(&ctx, &mut app);
+        assert!(
+            app.fx_open.is_none() && !app.vari_open && app.menu_state.is_none(),
+            "a right-click reached the band through the open setup panel"
         );
     }
 
