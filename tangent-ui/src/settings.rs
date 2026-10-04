@@ -5876,11 +5876,14 @@ impl Settings {
         true
     }
 
-    /// Count-in length, clamped to what the UI can actually offer.
+    /// Count-in length in BEATS: [`Settings::count_in_bars`] at the take's
+    /// time signature, so the clamp is on the bars, not on this.
     ///
-    /// Sanitised at the point of use, like the tuning and the capo: a file from
-    /// a later build with a 12-beat count-in keeps its 12 in the file and
-    /// counts in with the nearest thing this build has.
+    /// Sanitised at the point of use, like the tuning and the capo: a file
+    /// from a later build with a 12-bar count-in keeps its 12 in the file and
+    /// counts in for 8, the longest this build offers. The legacy
+    /// `record_count_in_beats` key is not read here at all, and is written
+    /// back as this number (see its own doc).
     pub fn count_in_beats(&self) -> u32 {
         self.time_signature().beats_in(self.count_in_bars())
     }
