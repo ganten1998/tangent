@@ -261,22 +261,27 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   of a folder during an export or an arrangement recording.** These moved
   track rows under a running export or recording, so stems and recorded
   clips landed on the wrong tracks. They are refused now with a note
-  saying why, as dragging tracks already was.
+  saying why, as dragging tracks already was, and during a realtime
+  export Cmd/Ctrl+F no longer makes or dissolves a folder, which took its
+  bus off its tracks halfway through the file.
 
 - **The count-in holds together.** A take started during a count-in the
   red button had joined began at once, mid-count, with no head in its
   take.json; it begins on the downbeat. Stop and the red button silenced
   a count-in that a take was recording into its file; they no longer do.
-  Pause takes back a Play pressed during a count-in, and the Play button
-  lights while it waits for the downbeat. A tempo typed into the Export
-  dialog no longer changes the tempo during a count-in.
+  Pause or Space takes back a Play pressed during a count-in, and the Play
+  button lights while it waits for the downbeat. A tempo typed into the
+  Export dialog no longer changes the tempo during a count-in.
 
 - **take.json says where a take really began.** For a take whose song
   starts on its count-in's downbeat, `timeline_rolling` came out true or
   false by chance. A realtime export's take.json carried the previous
   take's count-in head and the playhead from before the export moved to
   its start, and a take with its count-in recorded into it, started with
-  no audio engine, claimed a head for a count that never sounded.
+  no audio engine, claimed a head for a count that never sounded. And for
+  a take with its count-in recorded into it, `timeline_rolling` now says
+  whether the song started on the count's downbeat, with
+  `timeline_start_seconds` where it started, `head_seconds` into the file.
 
 - **Pressing the cassette just as a realtime export finishes no longer
   turns the new take into the export.** That take was filed as the
@@ -291,7 +296,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   straight to the master, so with the bus turned down it played at minus
   the difference, and with the bus muted at full level, inverted; on a
   track inside a folder it was heard through the folder's send to the
-  effects bus. A plugin on the bus it is routed to is still not fully
+  effects bus. An armed input on a folder track itself was turned down
+  twice by the folder's fader, and flipping the folder's polarity flipped
+  it back; it plays at the folder's level now, and stays out of the
+  speakers too. A plugin on the bus it is routed to is still not fully
   removed (the speakers hear what that plugin changes), as with a plugin
   on a folder.
 
@@ -302,10 +310,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **The Analog's arpeggiator keeps its step at the end of a loop that has a
   tempo change in it.** Just before each wrap it was given a beat measured
   back from the start of the loop, so it fired a stray step or dropped
-  one, and an arp on a track being monitored live ran a buffer early.
+  one, and an arp on a track being monitored live ran a buffer early. It
+  is told the song started or stopped in the buffer where it did, not a
+  buffer before or after.
 
-- **Stopping no longer, now and then, plays a moment from the start point
-  and leaves the playhead a little past it.**
+- **Starting and stopping no longer, now and then, play a moment from the
+  wrong place.** Stopping could play a moment from the start point and
+  leave the playhead a little past it, and playing from a new place could
+  first play a moment from where the playhead had been.
 
 - **A new Denoise bay on the Bank kernel cuts as soon as it finishes
   learning.** It faded its reduction in over about a quarter of a second,
@@ -316,7 +328,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   switch or a toolbar button could jump the clip to the pointer; a mixer
   fader went on following the pointer after a dialog that appeared
   mid-drag had closed. Every drag now ends at its release, as one undo
-  step, even when a dialog hid the release.
+  step, even when a dialog hid the release; and a drag that Tab, Shift+1,
+  2 or 3, or Esc cuts short is its own step, where a drum pad knob or a
+  pad's trim handle let go by Esc had none.
 
 - **Undoing a reset no longer takes the window out of full screen.**
   Undoing any reset asked the window for a size, which left full screen
@@ -443,6 +457,90 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Double-clicking a knob in the Keys panel puts it back to the sound's
   own value**, as its tooltip always said; it jumped the knob to the
   pointer instead.
+
+- **A full-speed export and a freeze play the tracks the sampler plays.** A
+  MIDI track played by the built-in sampler came out of a full-speed
+  export, its stems and a freeze as silence; the export now loads each
+  sampler's file as the desk does.
+
+- **A failed export leaves its folder as it found it.** When a file of a
+  full-speed export could not be finished (on a full disk, say), the export
+  said it had failed but left its partial files where the last export's
+  had been. It now writes aside and puts the files in place only once every
+  one is finished, and an export whose file could not even be created no
+  longer leaves "Exporting..." on screen. A refused or failed realtime
+  export no longer hijacks the next one, which delivered into the old
+  Export dialog's folder; the dialog's realtime export delivers only the
+  stems it wrote; and each export says once where its files went.
+
+- **MIDI export and glue write what a MIDI clip plays.** Notes hidden past
+  the end of a trimmed clip that does not loop were written into the
+  exported file, and gluing that clip made them sound; a note ringing past
+  a clip's end was written at its full length, though playback stops it at
+  the clip's end; and a clip's sustain pedal stayed down after the clip,
+  for the rest of the file when nothing lifted it. All three now match
+  playback.
+
+- **A recording still counting in when you start a new project, open
+  another or quit no longer begins in the next one.** It began on its
+  downbeat in the new session, on its armed tracks, with the tempo and
+  undo locked until then; leaving a session now calls the count off, as
+  pressing the red button again does. Resetting the default template ends
+  a running recording first, in the session it was made in, which then
+  asks about saving it, as New does.
+
+- **Undoing a track's removal or a plugin's replacement brings its
+  automation rows back as they were.** The curves came back with their
+  rows closed, their arms gone and a bypassed curve playing; the rows now
+  reopen as before, and Redo closes them again. A row kept for a plugin
+  you took out is named for that plugin, for example "EQ (unloaded):
+  parameter 2", rather than "bay 1 parameter 2".
+
+- **After a tempo or meter change, the MIDI editor's nudge, duplicate and
+  resize move a note by the grid step where the note is**, not where the
+  playhead is, and a note drawn with the magnet off is that step long, so
+  notes stay on the lines. The arrange view's arrow keys and the LCD's bar
+  and beat drags walk the song's own bars and beats there too.
+
+- **Stretching a selection by a clip's edge no longer shrinks an untouched
+  audio clip in it to a sliver.** A clip of the selection not touched since
+  it was dropped came out a twentieth of a second long.
+
+- **Setup's OUTPUT row always offers "the system's own".** When Tangent
+  could not list the outputs, the row said "none reported" with nothing to
+  press.
+
+- **Normalising says why where it cannot.** In a build without the audio
+  engine, and in the plugin, Cmd/Ctrl+Shift+N on an audio clip did nothing
+  and said nothing.
+
+- **The quantize message counts the clip's own attacks.** "Quantized N of M
+  attacks" counted every attack in the take's whole file, so a split or
+  trimmed clip was told of hits it does not play.
+
+- **On macOS, waiting for a lost audio output to come back costs next to
+  nothing.** While the output was down, Tangent checked for it every two
+  seconds by building a CoreAudio output unit, about 20 ms of work each
+  time; it reads the device's properties instead.
+
+- **The arrangement's shortcut card names the right button's clip
+  gestures**: a right-click on a clip opens its menu, and a right-drag
+  across a lane's empty room chooses the clips it crosses.
+
+- **Tracks can no longer be removed during a realtime export or an
+  arrangement recording.** Removing a track mid-export took its clips and
+  plugins out of the file halfway through, and a folder's bus off its
+  tracks, with undo unavailable until the export ended; during a recording
+  it could delete the track being recorded, or make the recording capture
+  another track's input. Remove Track, Delete, the strip's close button
+  and Cut now refuse with a note saying why.
+
+- **New, Open and the template resets wait for a take's count-in, or an
+  export, to finish.** Starting a new project or opening another while a
+  take was counting in applied that project's tempo under the count, so
+  the click sped up or slowed down under the take; during a realtime
+  export it replaced the project being exported. They are refused now
+  with a note saying why; quitting is not affected.
 
 ### Added
 
@@ -928,7 +1026,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   put the setting back. Choosing the amp took eight, one per pedal of the
   board it arrives wearing, each leaving the newest pedal switched on; it
   is one now, and redoing past it no longer seeds the board again or
-  throws the rest of the redo away.
+  throws the rest of the redo away. Double-clicking a Keys knob or an
+  effect panel's slider to put it back is one step too, where one Ctrl+Z
+  used to stop at the value the first click had jumped it to.
 
 - **Undoing a Paste FX, a bay swap or a delete brings the plugin back with
   the settings it was playing at.** It came back at its settings from the
@@ -1297,7 +1397,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   count joins that one, and Play during either starts the song on the
   downbeat. A take's `take.json` records whether the song was rolling when
   it began (`timeline_rolling`), which says whether
-  `timeline_start_seconds` places its first frame.
+  `timeline_start_seconds` places its first frame; for a take with its
+  count-in recorded into it, whether the song started on the count's
+  downbeat, `head_seconds` into the file.
 
 - **The take's settings are on the cassette.** Right-click it for the TAKE
   panel: the take's name and folder, count-in, signature and export, and
