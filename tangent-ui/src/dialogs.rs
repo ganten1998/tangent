@@ -7981,7 +7981,24 @@ fn show_on(
                                             // **Double click puts it back.**
                                             // On the knob itself, which is
                                             // where the hand already is.
-                                            if resp.double_clicked() {
+                                            //
+                                            // **Read off the pointer, not the
+                                            // slider**: egui's `Slider` senses
+                                            // DRAG only, so its own
+                                            // `double_clicked()` is never true
+                                            // and this never fired. Each press
+                                            // of the double is a drag the knob
+                                            // follows, and the second one's
+                                            // release - `drag_stopped`, on THIS
+                                            // knob - is where the pointer says
+                                            // the click was the second of two.
+                                            let double = resp.drag_stopped()
+                                                && ui.input(|i| {
+                                                    i.pointer.button_double_clicked(
+                                                        egui::PointerButton::Primary,
+                                                    )
+                                                });
+                                            if double {
                                                 v = *default;
                                             }
                                             let resp = resp.on_hover_text(format!(
@@ -7991,7 +8008,7 @@ fn show_on(
                                             // go, a reset, or a step from the
                                             // keyboard, which no drag frames.
                                             let done = resp.drag_stopped()
-                                                || resp.double_clicked()
+                                                || double
                                                 || (resp.changed() && !resp.dragged());
                                             if resp.changed() || done {
                                                 *cur = v;
@@ -21544,6 +21561,103 @@ at: None,
             "a keyboard step on the knob did not end its gesture: {}",
             say(&step)
         );
+    }
+
+    /// **A double click puts a Keys knob back**, as its hover line says.
+    /// egui's `Slider` senses DRAG only, so the `double_clicked()` the panel
+    /// asked it was always false and the double click did nothing but jump
+    /// the knob to the pointer twice. The second release of a double click
+    /// lands the knob on the bench's own value, and says `done` - one undo
+    /// moment, wave one's rule for the reset.
+    #[test]
+    fn a_double_click_puts_a_keys_knob_back() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        };
+        let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut dialog = Some(Dialog::KeysPatch {
+            slot: 0,
+            selected: 0,
+            params: [0.5; KEYS_PARAMS],
+        });
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut action = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show(ctx, &mut dialog, face, placement);
+                },
+            );
+            action
+        };
+        let _ = frame(Vec::new());
+        let _ = frame(Vec::new());
+        // The knobs, found as `a_keys_knob_reports_the_end_of_its_gesture`
+        // finds them: drag-only widgets of a slider's size.
+        let knobs: Vec<Rect> = ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| {
+                    w.sense.senses_drag()
+                        && !w.sense.senses_click()
+                        && (10.0..40.0).contains(&w.rect.height())
+                        && (60.0..300.0).contains(&w.rect.width())
+                })
+                .map(|w| w.rect)
+                .collect()
+        });
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut tried = false;
+        for r in knobs {
+            // Far from the middle, so the clicks' own jump is never the
+            // bench's value by accident.
+            let at = r.lerp_inside(Vec2::new(0.95, 0.5));
+            let first = frame(vec![egui::Event::PointerMoved(at), button(at, true)]);
+            let Some(DialogAction::SetKeysParam { knob, .. }) = first else {
+                continue;
+            };
+            let default = KEYS_PARAM_SPECS[0][knob].2;
+            let _ = frame(vec![button(at, false)]);
+            let _ = frame(vec![button(at, true)]);
+            let second = frame(vec![button(at, false)]);
+            match second {
+                Some(DialogAction::SetKeysParam { knob: k, value, done, .. }) => {
+                    assert_eq!(k, knob, "the reset landed on another knob");
+                    assert!(
+                        (value - default).abs() < 1.0e-6,
+                        "a double click left the knob at {value}, not the bench's {default}"
+                    );
+                    assert!(done, "the double click's reset did not end the gesture");
+                }
+                Some(_) => panic!("the double click asked for something else"),
+                None => panic!("the double click's second release said nothing"),
+            }
+            tried = true;
+            break;
+        }
+        assert!(tried, "no drag-only widget in the panel moved a knob");
     }
 
     /// **The classification is the only switch.** A plugin dialog goes
