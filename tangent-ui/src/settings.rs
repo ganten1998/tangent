@@ -1108,9 +1108,13 @@ pub struct Settings {
     /// independently. Overloading them is how choosing no input and choosing
     /// what to record could not both be expressed.
     pub record_input_off: bool,
-    /// Count-in length in BEATS, at the take's tempo. Clamped to
-    /// [`recorder::COUNT_IN_CHOICES`](crate::recorder::COUNT_IN_CHOICES) on
-    /// read.
+    /// Count-in length in BEATS, at the take's tempo: the legacy key, from
+    /// before the count-in was counted in bars, and nothing counts in by it
+    /// now. It is read as the file has it, unclamped, turned into
+    /// `record_count_in_bars` once for a file that has no bars key
+    /// (`convert_count_in_to_bars`), and kept in step with the bars and the
+    /// signature by the app's `set_count_in_bars` and `set_time_signature`,
+    /// so a build that reads beats still counts in for about as long.
     ///
     /// Beats rather than seconds because a count-in is a musical instruction
     /// and the click is playing beats — a countdown in seconds beside a click
