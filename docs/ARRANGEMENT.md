@@ -77,7 +77,10 @@ move, a snap into a folder, a drag home that ejects a track), Insert Track,
 Paste Track Below and Cmd/Ctrl+F grouping each ask `lane_order_held` before
 they change anything, and it says why. Under an export Cmd/Ctrl+F makes and
 dissolves no folder either (`folders_held`): the export chose its stems by
-the folders at its press.
+the folders at its press. No track is removed under an export or an
+arrangement record, by any road (`tracks_held`): a removal empties a row
+the export or the record is writing, and renumbers the input picks the
+record captures by.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 

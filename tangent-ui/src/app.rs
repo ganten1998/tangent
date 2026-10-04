@@ -6621,6 +6621,12 @@ impl TangentApp {
     /// slot in place, so no index moves under the loop. The selection is
     /// emptied afterwards: the tracks it named are gone.
     fn remove_selected_channels(&mut self, n: usize) {
+        // Not under an export or an arrangement record - see `tracks_held`.
+        // Every road comes through here: the Track menu, the strip's ×,
+        // Delete in both views and the mixer's cut.
+        if self.tracks_held() {
+            return;
+        }
         let mut all = self.selection_partners(n);
         all.push(n);
         all.sort_unstable_by(|a, b| b.cmp(a));
@@ -6650,6 +6656,11 @@ impl TangentApp {
     /// curves, and the open, armed and bypassed rows. The pedal seats keep
     /// their plugins and flags on purpose (see the note at the end).
     fn remove_channel(&mut self, n: usize) {
+        // The backstop only: every gesture asks `tracks_held`, through
+        // `remove_selected_channels`, before it changes anything.
+        if self.recorder.exporting || self.recorder.arr_recording {
+            return;
+        }
         // **ONE moment for the whole removal.** A track is clips, six bays,
         // a sidechain table and a bypass table, and `arr_save_edits` and
         // `set_insert` each commit their own - so deleting a track with
@@ -11766,6 +11777,31 @@ impl TangentApp {
             );
         }
         self.recorder.exporting
+    }
+
+    /// **Whether the tracks stay on the desk, saying so when they do.**
+    /// Remove Track empties a row in place - clips, kind, bays and routes,
+    /// and a folder track hands its children up - so under a realtime export
+    /// it takes a lane's sound and a folder's bus out of the render halfway
+    /// through, with the undo that could put them back refused until the
+    /// export ends. Under an arrangement record it would delete a lane the
+    /// record is writing, whose take then lands on the emptied row at Stop;
+    /// and the record captures its audio by input PICK, numbered in desk
+    /// order over the bound audio tracks at its press, so removing even an
+    /// unrelated bound track above a recorded one hands the record the next
+    /// track's input. Asked by `remove_selected_channels`, the one door
+    /// every road to a removal goes through.
+    fn tracks_held(&mut self) -> bool {
+        let held = self.recorder.exporting || self.recorder.arr_recording;
+        if held {
+            let why = if self.recorder.exporting {
+                "No track is removed while an export runs - it is writing every one."
+            } else {
+                "No track is removed while the arrangement records - it records each track by its row and input."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+        }
+        held
     }
 
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
@@ -47631,6 +47667,112 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// **No track is removed under a realtime export or an arrangement
+    /// record.** Remove Track empties a row in place - its clips, its kind,
+    /// its six bays, its routes - and a folder track first hands its
+    /// children up. Under an export that took a lane's sound, and a folder's
+    /// bus, out of the render halfway through, and the undo that could have
+    /// put them back is refused until the export ends. Under an arrangement
+    /// record it deleted a lane the record may be writing, whose take then
+    /// landed on the emptied row at Stop - and the record captures its
+    /// inputs by pick index, which removing even an unrelated bound audio
+    /// track above a recorded one renumbers. Every road - the Track menu,
+    /// the strip's ×, Delete on the arrangement and on the mixer, the
+    /// mixer's cut - goes through `remove_selected_channels`, which refuses
+    /// under either now and says why. With neither running, each road still
+    /// removes its track.
+    #[test]
+    fn no_track_is_removed_under_an_export_or_an_arrangement_record() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let root = project_scratch("tracks-held");
+        let (ctx, mut app) = headless_with(
+            Caps::DESKTOP,
+            Settings { show_welcome: false, ..Settings::default() },
+        );
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.keytoggle_enabled = false;
+        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+        app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+        // A folder over one track, and four more tracks for the other roads.
+        for ch in 4..=9 {
+            app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+        }
+        app.settings.strip_is_folder[4] = true;
+        app.settings.strip_in_folder[5] = true;
+        assert_eq!(app.folder_of(5), Some(4), "the fixture's folder");
+        let _ = run_frame(&ctx, &mut app);
+        let frame_with = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let delete = |pressed: bool| egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Each road, aimed at its own track; a key is let go again, so the
+        // next press is a fresh one.
+        let remove_by = |road: &str, ctx: &egui::Context, app: &mut TangentApp, lane: usize| {
+            app.selected_channel = Some(lane);
+            app.selected_tracks = vec![lane];
+            app.arrangement_open = road == "Delete on the arrangement";
+            app.mixer_open = road.ends_with("mixer") || road == "the mixer's cut";
+            match road {
+                "the Track menu" => app.apply_dialog_action(DialogAction::TrackRemove(lane)),
+                "the strip's ×" => app.apply_mixer_hit(Hit::Remove(Column(lane)), 0.0),
+                "the mixer's cut" => frame_with(ctx, app, vec![egui::Event::Cut]),
+                _ => {
+                    frame_with(ctx, app, vec![delete(true)]);
+                    frame_with(ctx, app, vec![delete(false)]);
+                }
+            }
+        };
+        let roads = [
+            ("the Track menu", 9usize),
+            ("the strip's ×", 4),
+            ("Delete on the arrangement", 8),
+            ("Delete on the mixer", 7),
+            ("the mixer's cut", 6),
+        ];
+        let used = |app: &TangentApp| (0..recorder::CHANNELS).map(|n| app.channel_used(n)).collect::<Vec<_>>();
+        for (exporting, arr) in [(true, false), (false, true)] {
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            let held = format!("export={exporting} record={arr}");
+            let before = (used(&app), app.folder_parents());
+            for (road, lane) in roads {
+                remove_by(road, &ctx, &mut app, lane);
+                assert_eq!(
+                    (used(&app), app.folder_parents()),
+                    before,
+                    "{road} removed the track on row {} under {held}",
+                    lane + 1
+                );
+            }
+            assert!(!app.said().notes().is_empty(), "the refusals under {held} said nothing");
+            // And the removal itself refuses, for a road yet to be written.
+            app.remove_channel(9);
+            assert_eq!((used(&app), app.folder_parents()), before, "remove_channel went ahead under {held}");
+        }
+        app.recorder.exporting = false;
+        app.recorder.arr_recording = false;
+        for (road, lane) in roads {
+            remove_by(road, &ctx, &mut app, lane);
+            assert!(!app.channel_used(lane), "{road} no longer removes a track");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Cmd+C and Cmd+V carry a whole TRACK when no clip is selected.**
