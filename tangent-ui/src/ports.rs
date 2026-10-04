@@ -147,9 +147,9 @@ pub struct ProjectExportSpec {
 /// A free function as well as the method above because the REALTIME pass
 /// does not hold a spec — it is handed the two bools and writes its files
 /// as it goes, while the spec only reappears at the finish to say where they
-/// are copied. Both ends must produce the same name or the copy reads an
-/// empty directory and the export lands with no stems in it and no error, so
-/// there is exactly one place the name is spelled.
+/// are copied. Both ends must produce the same name or the copies are filed
+/// under the other mode's folder, so there is exactly one place the name is
+/// spelled.
 pub fn stems_folder_name(dry: bool) -> &'static str {
     if dry {
         "stems-dry"
