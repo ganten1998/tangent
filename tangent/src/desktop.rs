@@ -11919,7 +11919,7 @@ impl DesktopApp {
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
     /// project has no state for loses its global sidecar too — the last
     /// session's reverb tail must not leak into this one's fresh plugin.
-    fn copy_states_from_project(&self) {
+    fn copy_states_from_project(&mut self) {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
@@ -11933,8 +11933,16 @@ impl DesktopApp {
     /// which clears every live sidecar. That is the behaviour New depends on -
     /// a template with no `state/` folder is a session that starts with every
     /// plugin at its defaults.
-    fn copy_states_from_shelf(&self, dir: &std::path::Path) {
+    ///
+    /// **And the app is told which files the shelf's samplers name**
+    /// (`sampler_media_on_shelf`): a sampler keeps its file in its bay's
+    /// state, so a template's sampler file is named nowhere the app can read,
+    /// and making the scratch real, Save As Template and Duplicate of one
+    /// need it to bring it across with the template's other media. Every
+    /// adoption of a template comes through here.
+    fn copy_states_from_shelf(&mut self, dir: &std::path::Path) {
         mirror_sidecars(dir, &global_state_dir());
+        self.app.set_sampler_media(sampler_media_on_shelf(dir));
     }
 
     /// **Clear the Untitled litter.** Every folder directly under the
@@ -16650,6 +16658,43 @@ fn mirror_sidecars(from: &std::path::Path, to: &std::path::Path) {
         sidecar_fs_call();
         let _ = std::fs::remove_file(to.join(sidecar_name(seat, bay)));
     }
+}
+
+/// **The files a shelf's samplers name, as their bays store them**: the
+/// `sample_path` of every sidecar on `dir` the sampler owns, read by the
+/// unit's own reader (`extra_from_state`). Empty for a shelf that does not
+/// exist, and a sampler with nothing loaded names nothing.
+///
+/// For the app's roads that bring a template's media across (making a
+/// scratch real, Save As Template and Duplicate of one): a sampler keeps its
+/// file in its bay's state, which the app never reads, so the host hands the
+/// list over whenever it adopts a shelf (`copy_states_from_shelf`, through
+/// `TangentApp::set_sampler_media`).
+#[cfg(feature = "recorder")]
+fn sampler_media_on_shelf(dir: &std::path::Path) -> Vec<String> {
+    let sampler = crate::builtin_fx::SAMPLER_PATH;
+    let Some(spec) = crate::builtin_fx::spec_for(sampler) else {
+        return Vec::new();
+    };
+    let mut named = Vec::new();
+    for (seat, bay) in shelf_sidecars(dir) {
+        let Ok(raw) = std::fs::read(dir.join(sidecar_name(seat, bay))) else {
+            continue;
+        };
+        let Some(split) = raw.iter().position(|b| *b == 0) else {
+            continue;
+        };
+        if &raw[..split] != sampler.as_bytes() {
+            continue;
+        }
+        named.extend(
+            crate::builtin_fx::extra_from_state(spec, &raw[split + 1..])
+                .into_iter()
+                .filter(|(symbol, path)| symbol == "sample_path" && !path.is_empty())
+                .map(|(_, path)| path),
+        );
+    }
+    named
 }
 
 /// The preset drawer drum KITS live in, under `Presets/`. Kits keep their
@@ -26026,6 +26071,71 @@ mod tests {
             read_legacy,
             [Some(file.clone()), Some(file.clone()), Some(file)],
             "a sample stored absolute was read somewhere else"
+        );
+    }
+
+    /// **What a template's samplers name is read off its shelf, for the app
+    /// to bring across.**
+    ///
+    /// A sampler keeps its file in its bay's state, which only the host
+    /// reads, so a template whose sampler plays `media/Pad.wav` named the
+    /// file nowhere the app could see, and making a scratch real, Save As
+    /// Template from one and Duplicate of one all left it behind. Adopting a
+    /// shelf (`copy_states_from_shelf`, which every adoption of a template
+    /// calls) now reads each sampler sidecar's `sample_path` and hands the
+    /// list to the app (`set_sampler_media`). Another unit's file, a sampler
+    /// with nothing loaded and a shelf that does not exist name nothing. The
+    /// hand-over is a source scan, since a `DesktopApp` cannot be built.
+    #[test]
+    fn the_files_a_shelfs_samplers_name_are_read_off_the_shelf() {
+        // The walk counts its calls (`sidecar_fs_call`), and the probe that
+        // measures them must not count this test's.
+        let _lock = sidecar_walk_probe::SIDECAR_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shelf = std::env::temp_dir().join(format!(
+            "tangent-sampler-shelf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&shelf);
+        std::fs::create_dir_all(&shelf).expect("a scratch shelf");
+        // A sidecar as `write_insert_state` writes one: the owner, a NUL, the
+        // unit's state text.
+        let write = |seat: usize, bay: usize, unit: &str, extra: &[(&str, &str)]| {
+            let spec = crate::builtin_fx::spec_for(unit).expect("a built-in unit");
+            let extra: Vec<(String, String)> =
+                extra.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+            let mut blob = unit.as_bytes().to_vec();
+            blob.push(0);
+            blob.extend_from_slice(
+                crate::builtin_fx::state_text(spec, &spec.defaults(), &extra).as_bytes(),
+            );
+            std::fs::write(shelf.join(sidecar_name(seat, bay)), blob).expect("a sidecar");
+        };
+        let sampler = crate::builtin_fx::SAMPLER_PATH;
+        write(2, 0, sampler, &[("sample_path", "media/Pad.wav"), ("sample_name", "Pad.wav"), ("root_key", "60")]);
+        write(5, 1, sampler, &[("sample_path", "/Samples/Own.wav"), ("sample_name", "Own.wav"), ("root_key", "48")]);
+        write(6, 0, sampler, &[("sample_path", ""), ("sample_name", ""), ("root_key", "60")]);
+        write(7, 0, crate::builtin_fx::IR_PATH, &[("ir_path", "media/Room.wav")]);
+        let mut named = sampler_media_on_shelf(&shelf);
+        named.sort();
+        let none = sampler_media_on_shelf(&shelf.join("no shelf here"));
+        let _ = std::fs::remove_dir_all(&shelf);
+        assert_eq!(
+            named,
+            ["/Samples/Own.wav", "media/Pad.wav"],
+            "the shelf's samplers were not read as their bays store them"
+        );
+        assert!(none.is_empty(), "a shelf that does not exist named {none:?}");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn copy_states_from_shelf(").expect("copy_states_from_shelf");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("self.app.set_sampler_media(sampler_media_on_shelf(dir));"),
+            "adopting a shelf no longer tells the app what its samplers name"
         );
     }
 
