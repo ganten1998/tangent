@@ -496,8 +496,9 @@ pub enum FaceAction {
     ///
     /// A PATH and nothing else, the [`Self::PickIr`] bargain exactly: the
     /// face never opens a file, so what leaves here is where the file is
-    /// and the wish, and the host owns every byte that moves. It is raised
-    /// by all three of the sampler's doors — a press on a browser row, an
+    /// and the wish, and the app and host own every byte that moves (the
+    /// app copies the file into the project). It is raised by all three of
+    /// the sampler's doors — a press on a browser row, an
     /// in-app drag dropped on the window (a clip out of the arrangement, or
     /// a row out of either explorer), and an OS file drop — because they
     /// differ only in how the path was found.

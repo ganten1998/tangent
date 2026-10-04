@@ -7733,6 +7733,13 @@ impl DesktopApp {
     /// over, which made every one of the three refusals below reachable for a
     /// perfectly good sampler seated one bay down.
     ///
+    /// **`path` is what the bay STORES**: `media/<name>`, relative to the
+    /// project, for the copy the app made of the file it was given
+    /// (`TangentApp::sample_into_project`), or the path as given when no
+    /// project is open. Written verbatim and read back against the project
+    /// (`sampler_file`), so the sample moves with the folder; an absolute
+    /// path that a project saved before still names is read as it stands.
+    ///
     /// An empty `path` empties the bay. Unlike the IR's road there is no
     /// separate clearing function, because there is no reason to refuse one:
     /// the IR refuses a path that is not a file so an undecoded sentinel can
@@ -10871,7 +10878,7 @@ impl DesktopApp {
         // Their bays were seated above, file names and all; their audio
         // lives outside the bay and has to be handed over, or a lane the
         // sampler plays renders silent. See `mirror_sampler_samples`.
-        mirror_sampler_samples(&mut e, rate);
+        mirror_sampler_samples(&mut e, rate, self.app.kit_doc().as_deref());
         // The chips' answer, through the one place either road turns a spec
         // into the engine's two atomics. See `arm_stem_tap`.
         arm_stem_tap(&e, spec.stems, spec.stems_dry);
@@ -13141,7 +13148,7 @@ impl DesktopApp {
         let Some(e) = self.recorder.engine.as_ref() else {
             return Vec::new();
         };
-        Self::sampler_bays_of(e)
+        Self::sampler_bays_of(e, self.app.kit_doc().as_deref())
     }
 
     /// The walk itself, over an engine and nothing else.
@@ -13153,9 +13160,13 @@ impl DesktopApp {
     /// bay is a bay this can see. `a_bound_bay_is_a_bay_the_host_can_hear`
     /// asks exactly that, and it is the test whose absence let the sampler
     /// ship silent.
+    ///
+    /// `doc` is the document the session's media is read from, for a file
+    /// stored relative to the project - see [`sampler_file`].
     #[cfg(feature = "recorder")]
     fn sampler_bays_of(
         e: &crate::instrument::Engine,
+        doc: Option<&std::path::Path>,
     ) -> Vec<(usize, Option<std::path::PathBuf>, u8)> {
         let bays = tangent_ui::recorder::INSERTS;
         let mut out = Vec::new();
@@ -13183,11 +13194,7 @@ impl DesktopApp {
                     .ok()
                     .filter(|k| *k <= 127)
                     .unwrap_or(crate::instrument::SAMPLER_ROOT_KEY);
-                out.push((
-                    lane,
-                    (!path.is_empty()).then(|| std::path::PathBuf::from(path)),
-                    root,
-                ));
+                out.push((lane, (!path.is_empty()).then(|| sampler_file(path, doc)), root));
                 break;
             }
         }
@@ -17484,6 +17491,26 @@ fn furnish_mirror_bay(
         .map(|_| ())
 }
 
+/// **Where a sampler bay's stored file is on disk.**
+///
+/// The sampler copies the file it is given into the project's `media/`
+/// (`TangentApp::sample_into_project`) and its bay stores `media/<name>`,
+/// relative, as a pad stores its sample - so a first save that moves an
+/// Untitled scratch to its name, a Duplicate, or a project folder moved on
+/// disk takes the sample with it. It is read against `doc`, the document
+/// the session's media is read from (`TangentApp::kit_doc`: the template's
+/// while a scratch is not real yet, the project's own from then on), by the
+/// pads' own rule (`drumpad::resolve`). A path stored ABSOLUTE is itself:
+/// every project saved before the sampler copied its file names one, and it
+/// loads exactly as it always did.
+#[cfg(feature = "recorder")]
+fn sampler_file(stored: &str, doc: Option<&std::path::Path>) -> std::path::PathBuf {
+    match doc {
+        Some(doc) => tangent_ui::drumpad::resolve(doc, stored),
+        None => std::path::PathBuf::from(stored),
+    }
+}
+
 /// **Hand a MIRROR engine its samplers' audio**: each sampler bay's file,
 /// read out of the mirror's own bays (`sampler_bays_of`), decoded at the
 /// mirror's `rate` and handed over the way `reload_sampler` hands the live
@@ -17496,10 +17523,16 @@ fn furnish_mirror_bay(
 /// Called after the bays are seated, on this thread: the decode is here, and
 /// the hand-off crosses the engine's own ring, so the audio thread neither
 /// decodes nor frees a file. A file that will not decode leaves its lane
-/// silent, as the live reload does.
+/// silent, as the live reload does. `doc` is what the desk's own reader
+/// resolves a file stored relative to the project against (`kit_doc`), so
+/// the export reads the file the desk plays.
 #[cfg(feature = "recorder")]
-fn mirror_sampler_samples(mirror: &mut crate::instrument::Engine, rate: u32) {
-    for (lane, path, root_key) in DesktopApp::sampler_bays_of(mirror) {
+fn mirror_sampler_samples(
+    mirror: &mut crate::instrument::Engine,
+    rate: u32,
+    doc: Option<&std::path::Path>,
+) {
+    for (lane, path, root_key) in DesktopApp::sampler_bays_of(mirror, doc) {
         let Some(path) = path else { continue };
         let Ok(clip) = tangent_record::decode::decode(&path, rate) else {
             continue;
@@ -25798,7 +25831,7 @@ mod tests {
             .expect("the sampler must load")
             .expect("a load reports what it seated");
         assert!(
-            DesktopApp::sampler_bays_of(&e)
+            DesktopApp::sampler_bays_of(&e, None)
                 .iter()
                 .any(|(lane, path, _)| *lane == LANE && path.is_none()),
             "a seated bay with nothing in it has to be REPORTED, or emptying \
@@ -25824,7 +25857,7 @@ mod tests {
 
         // **The host can now answer "what file does this lane want".** This
         // is the assertion that fails on the code that shipped.
-        let bays = DesktopApp::sampler_bays_of(&e);
+        let bays = DesktopApp::sampler_bays_of(&e, None);
         assert_eq!(
             bays.iter()
                 .find(|(lane, ..)| *lane == LANE)
@@ -25870,6 +25903,130 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         assert!(peak > 0.005, "a bound sampler in bay {BAY} made no sound: {peak}");
+    }
+
+    /// **A sampler's file stored relative to its project is read from that
+    /// project, wherever the project is now; one stored absolute is read
+    /// where it names.**
+    ///
+    /// The sampler copies the file it is given into the project's `media/`
+    /// and its bay stores `media/<name>`, as a pad stores its sample, so the
+    /// sample moves with the folder: the first save that renames an Untitled
+    /// scratch, a Duplicate, a project moved on disk. Read verbatim, that
+    /// path named a file in whatever folder the app was started from. Both
+    /// readers walk the same bays, the desk's (`sampler_bays`, through
+    /// `sampler_bays_of`) and an export's or a freeze's mirror
+    /// (`mirror_sampler_samples`), and the mirror has to play the file the
+    /// desk plays. A path stored ABSOLUTE, which every project saved before
+    /// names, is itself whatever the document: those projects load exactly
+    /// as they did.
+    #[test]
+    fn a_samplers_file_is_read_from_the_project_its_bay_was_saved_in() {
+        use crate::instrument::{ClipNote, Engine, PlacedMidi};
+        use std::sync::Arc;
+        use tangent_record::audio::Timebase;
+        const LANE: usize = 2;
+        const BAY: usize = 0;
+        const RATE: u32 = 48_000;
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sampler-relative-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // The project as a first save leaves it: named, its sample in its own
+        // `media/`. A real file, because the mirror decodes it for itself.
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).expect("the project's media");
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: RATE,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let mut writer =
+            tangent_record::wav::WavWriter::create(&song.join("media").join("take.wav"), spec, &bext)
+                .expect("the sample");
+        writer.write_interleaved(&vec![0.6f32; RATE as usize * 2]).expect("its audio");
+        writer.finish().expect("closed");
+
+        // A sampler bound the way `bind_insert_sample` binds one: the ledger.
+        let bound = |stored: &str| -> Engine {
+            let mut e = Engine::offline(RATE, Timebase::new()).expect("offline");
+            e.load_insert(LANE, BAY, Some(std::path::Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+                .expect("the sampler must load")
+                .expect("a load reports what it seated");
+            let extra = vec![
+                ("sample_path".to_owned(), stored.to_owned()),
+                ("sample_name".to_owned(), "take.wav".to_owned()),
+                ("root_key".to_owned(), crate::instrument::SAMPLER_ROOT_KEY.to_string()),
+            ];
+            assert!(e.set_builtin_extra(LANE, BAY, extra), "the engine refused the bind");
+            e
+        };
+        let read = |e: &Engine, doc: Option<&std::path::Path>| {
+            DesktopApp::sampler_bays_of(e, doc)
+                .into_iter()
+                .find(|(lane, ..)| *lane == LANE)
+                .and_then(|(_, path, _)| path)
+        };
+        let desk = bound("media/take.wav");
+        let doc = tangent_ui::arrangement::doc_in(&song);
+        assert_eq!(
+            read(&desk, Some(&doc)),
+            Some(song.join("media").join("take.wav")),
+            "a sample stored relative was not read from its project"
+        );
+        // The folder moves on disk, and the sample goes with it.
+        let moved = root.join("Moved");
+        std::fs::rename(&song, &moved).expect("the project moved");
+        let doc = tangent_ui::arrangement::doc_in(&moved);
+        let file = moved.join("media").join("take.wav");
+        assert_eq!(read(&desk, Some(&doc)), Some(file.clone()), "the sample stayed behind");
+
+        // An export's mirror, seated as `start_offline_render` seats it, reads
+        // the same file and plays it.
+        let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
+        furnish_mirror_bay(&mut mirror, Some(&desk), LANE, BAY, crate::builtin_fx::SAMPLER_PATH)
+            .expect("the mirror seats the sampler");
+        mirror_sampler_samples(&mut mirror, RATE, Some(&doc));
+        mirror.set_channel_gain(LANE, 0.5);
+        mirror.set_master_gain(1.0);
+        mirror.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: LANE,
+            start: 0,
+            len: u64::from(RATE) * 2,
+            notes: Arc::new(vec![ClipNote {
+                at: 0,
+                dur: u64::from(RATE),
+                key: crate::instrument::SAMPLER_ROOT_KEY,
+                vel: 110,
+            }]),
+        }]);
+        mirror.set_transport(1, 0);
+        mirror.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            mirror.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+
+        // **A project saved before names its file absolute**, and it is read
+        // exactly there, whatever the document.
+        let legacy = file.to_string_lossy().into_owned();
+        let old = bound(&legacy);
+        let elsewhere = tangent_ui::arrangement::doc_in(&root.join("Elsewhere"));
+        let read_legacy = [Some(doc.as_path()), Some(elsewhere.as_path()), None].map(|d| read(&old, d));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(peak > 0.005, "the export rendered a relative sample's lane silent: {peak}");
+        assert_eq!(
+            read_legacy,
+            [Some(file.clone()), Some(file.clone()), Some(file)],
+            "a sample stored absolute was read somewhere else"
+        );
     }
 
     /// **An export plays a lane the sampler plays, as the desk does.** A
@@ -25936,7 +26093,7 @@ mod tests {
         let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
         furnish_mirror_bay(&mut mirror, Some(&live), LANE, BAY, crate::builtin_fx::SAMPLER_PATH)
             .expect("the mirror seats the sampler");
-        mirror_sampler_samples(&mut mirror, RATE);
+        mirror_sampler_samples(&mut mirror, RATE, None);
 
         // One note on the lane in each, and listen.
         let play = |e: &mut Engine| -> Vec<f32> {
@@ -25992,7 +26149,7 @@ mod tests {
         let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         let seated = start.find("furnish_mirror_bay(&mut e,").expect("the rack seats");
         let handed = start
-            .find("mirror_sampler_samples(&mut e, rate);")
+            .find("mirror_sampler_samples(&mut e, rate, self.app.kit_doc().as_deref());")
             .expect("the export never hands its mirror the samplers' audio");
         assert!(seated < handed, "the samplers' audio is handed over before their bays are seated");
     }
@@ -26048,6 +26205,13 @@ mod tests {
             walk.contains("read(\"root_key\")"),
             "the walk stopped reading the root key, so every sample plays at \
              middle C whatever the face was told"
+        );
+        // **And the desk reads a file stored relative to the project against
+        // the document the session's media is read from**, as the export's
+        // mirror does (`the_export_hands_its_mirror_the_samplers_audio_after_seating_their_bays`).
+        assert!(
+            walk.contains("Self::sampler_bays_of(e, self.app.kit_doc().as_deref())"),
+            "the desk's reader no longer resolves a sampler's file against kit_doc"
         );
     }
 
