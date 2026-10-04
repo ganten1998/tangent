@@ -13683,14 +13683,13 @@ impl DesktopApp {
             self.displaced_states
                 .remove(&(to_strip, to_bay, bundle.clone()));
         }
-        // **ONE moment for the drag.** `set_insert` commits its own, so
-        // filling the destination and clearing the source left two - and
-        // one Ctrl+Z landed on the halfway state, the same plugin in BOTH
-        // bays, which is a desk nobody made and cannot make by hand.
-        self.app.begin_one_moment();
-        self.app.set_insert(to_strip, to_bay, Some(&bundle));
-        self.app.set_insert(from_strip, from_bay, None);
-        self.app.commit_undo_moment();
+        // **ONE moment for the drag**, through the app's trade. `set_insert`
+        // commits its own, so filling the destination and clearing the
+        // source left two - and one Ctrl+Z landed on the halfway state, the
+        // same plugin in BOTH bays, which is a desk nobody made and cannot
+        // make by hand. And the plugin's automation goes with it: see
+        // `TangentApp::trade_inserts`.
+        self.app.trade_inserts((from_strip, from_bay), (to_strip, to_bay));
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
     }
 
@@ -13823,11 +13822,9 @@ impl DesktopApp {
             });
         // One moment, for the reason `move_insert` states: the halfway
         // state of a TRADE is worse still - `b` in both bays and `a` gone
-        // from the project entirely.
-        self.app.begin_one_moment();
-        self.app.set_insert(a_strip, a_bay, Some(&b));
-        self.app.set_insert(b_strip, b_bay, Some(&a));
-        self.app.commit_undo_moment();
+        // from the project entirely. Each unit's automation trades with it
+        // (`TangentApp::trade_inserts`).
+        self.app.trade_inserts((a_strip, a_bay), (b_strip, b_bay));
         // The window follows its unit across the trade. One flag, so with
         // both up the one that was picked up wins — it is the one the hand
         // is thinking about.
@@ -26689,6 +26686,30 @@ mod tests {
             body("fn after_frame(&mut self").contains("permute_displaced(&mut self.displaced_states, &full);"),
             "a reorder leaves the shelf at the seats its rows moved away from"
         );
+    }
+
+    /// **A moved or swapped plugin takes its automation along.** Both roads
+    /// change two bays' tenants, and a bay that changes tenant lets go of
+    /// the curves its last plugin left (they would ride the newcomer's
+    /// knobs), so writing the bays here one `set_insert` at a time dropped
+    /// both units' automation. The app's `trade_inserts` carries the curves
+    /// with their plugins, in one moment. A source scan, because
+    /// `DesktopApp` cannot be built in a test; the app's
+    /// `a_moved_or_swapped_plugin_takes_its_curves_along` drives the trade.
+    #[test]
+    fn a_moved_or_swapped_plugin_trades_its_bays_through_the_app() {
+        let whole = include_str!("desktop.rs");
+        let scan = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        for road in ["fn move_insert(", "fn swap_inserts("] {
+            let at = scan.find(road).unwrap_or_else(|| panic!("`{road}` is gone"));
+            let rest = &scan[at..];
+            let body = &rest[..rest.find("\n    fn ").unwrap_or(rest.len())];
+            assert!(body.contains("self.app.trade_inserts("), "`{road}` no longer trades through the app");
+            assert!(
+                !body.contains("self.app.set_insert("),
+                "`{road}` writes a bay itself, and the plugin's curves are let go instead of carried"
+            );
+        }
     }
 
     /// **The reconcile asks the tenant it tears down for its settings

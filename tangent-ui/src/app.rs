@@ -12081,8 +12081,13 @@ impl TangentApp {
                 .curves()
                 .iter()
                 .map(|c| {
-                    let lane = if c.lane < CHANNELS { inv[c.lane] } else { c.lane };
-                    crate::automation::Curve::sanitised(lane, c.param, c.points().to_vec())
+                    // The curve itself, re-laned: a plugin curve waiting
+                    // for its plugin keeps the mark of whose it is.
+                    let mut c = c.clone();
+                    if c.lane < CHANNELS {
+                        c.lane = inv[c.lane];
+                    }
+                    c
                 })
                 .collect();
             self.arrangement.automation =
@@ -12533,8 +12538,12 @@ impl TangentApp {
         if !copy.automation.is_empty() || curves.iter().any(|c| c.lane == into) {
             let mut kept: Vec<crate::automation::Curve> =
                 curves.iter().filter(|c| c.lane != into).cloned().collect();
+            // Each curve itself, re-laned - a waiting curve keeps the mark
+            // of whose it is (`Curve::tenant`).
             kept.extend(copy.automation.iter().map(|c| {
-                crate::automation::Curve::sanitised(into, c.param, c.points().to_vec())
+                let mut c = c.clone();
+                c.lane = into;
+                c
             }));
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
@@ -15240,6 +15249,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         } else {
             (recorder::MASTER_EXTRA_SEAT, bay - recorder::INSERTS)
         }
+    }
+
+    /// **The bay a plugin curve drives**, `(seat, bay)` as [`Self::insert`]
+    /// takes it, or `None` for a desk parameter: the master's bay numbers
+    /// through `master_bay`, a channel's through `seat_bay` - the rule
+    /// `auto_param_label` and `auto_resting` resolve by.
+    fn auto_param_bay(lane: usize, param: crate::automation::AutoParam) -> Option<(usize, usize)> {
+        let bay = param.bay()?;
+        Some(if lane == crate::arrangement_panel::MASTER_LANE {
+            Self::master_bay(bay)
+        } else {
+            recorder::seat_bay(lane, bay)
+        })
+    }
+
+    /// **The automation address of a bay**, `(lane, bay number)`: the
+    /// inverse of [`Self::auto_param_bay`], found by asking it, so the two
+    /// cannot disagree. `None` for a bay no lane's curves can drive (a
+    /// bus's, a drum pad's, a pedal's).
+    fn auto_address_of(seat: usize, bay: usize) -> Option<(usize, u8)> {
+        (0..=crate::arrangement_panel::MASTER_LANE)
+            .flat_map(|lane| (0..recorder::INSERTS * 2).map(move |b| (lane, b as u8)))
+            .find(|&(lane, b)| {
+                Self::auto_param_bay(lane, crate::automation::AutoParam::Plugin { bay: b, id: 0 })
+                    == Some((seat, bay))
+            })
     }
 
     fn arr_open_automation_menu(&mut self, lane: usize) {
@@ -32566,13 +32601,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Owned rather than borrowed because it is a different set from the
     /// document's. The host already clones this to compare against what it
     /// last pushed, so nothing is copied that was not copied before.
+    ///
+    /// **Nor a curve waiting for its plugin** (`Curve::tenant`): its bay is
+    /// empty, and if something else ever stood there it would be the wrong
+    /// plugin to play it on.
     pub fn engine_automation(&self) -> crate::automation::Automation {
-        if self.arr_auto_bypassed.is_empty() {
+        let waiting = |c: &crate::automation::Curve| !c.tenant.is_empty();
+        if self.arr_auto_bypassed.is_empty()
+            && !self.arrangement.automation.curves().iter().any(waiting)
+        {
             return self.arrangement.automation.clone();
         }
         let mut out = crate::automation::Automation::default();
         for c in self.arrangement.automation.curves() {
-            if !self.arr_auto_bypassed.contains(&(c.lane, c.param)) {
+            if !self.arr_auto_bypassed.contains(&(c.lane, c.param)) && !waiting(c) {
                 out.set(c.clone());
             }
         }
@@ -32916,11 +32958,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .strip_inserts
             .get(at)
             .is_some_and(|cell| cell.as_str() != path.unwrap_or_default());
+        let leaving = self.settings.strip_inserts.get(at).cloned().unwrap_or_default();
         if let Some(cell) = self.settings.strip_inserts.get_mut(at) {
             *cell = path.unwrap_or_default().to_owned();
         }
         if changed {
             self.settings.insert_bypass.drop_bay(strip, slot);
+            // **And its plugin curves are settled**, here for the bypass's
+            // reason: their ids are the old tenant's, and on another plugin
+            // they ride whatever knob shares the number.
+            self.settle_bay_curves(strip, slot, &leaving, path.unwrap_or_default());
         }
         // **An amp seated here arrives wearing its board** - in this same
         // moment, before the commit below. See `seed_amp_board`.
@@ -32929,6 +32976,146 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.save_settings();
         self.undo_commit();
+    }
+
+    /// **What a bay's plugin curves become when it changes tenant**, from
+    /// `leaving` to `arriving` (either may be empty). A curve's owner is the
+    /// plugin it is marked for ([`crate::automation::Curve::tenant`]), else
+    /// the one leaving:
+    ///
+    /// - the bay emptied: the curve stays, marked with its owner. It is
+    ///   somebody's work and the plugin may come back.
+    /// - its owner arrived: it plays again, the mark gone.
+    /// - another plugin arrived: it goes, in the moment that seated the
+    ///   newcomer, and its rows with it. Its parameter ids are the
+    ///   newcomer's too - the EQ's band-1 frequency and the compressor's
+    ///   attack are both id 2 - so kept, it rode the newcomer's knob and
+    ///   that knob's face followed it and refused the hand. One undo puts
+    ///   the old plugin back WITH its curves.
+    ///
+    /// A curve with no owner on record (left on an empty bay by a build
+    /// that kept none) stays as it is. Keeping a replaced plugin's curves
+    /// for its return was the road not taken: every row, choice, set and
+    /// the engine know a curve by `(lane, param)`, so a dormant curve would
+    /// share its key with the newcomer's same-id knob.
+    fn settle_bay_curves(&mut self, seat: usize, bay: usize, leaving: &str, arriving: &str) {
+        use crate::automation::{AutoParam, Automation};
+        if !self
+            .arrangement
+            .automation
+            .curves()
+            .iter()
+            .any(|c| Self::auto_param_bay(c.lane, c.param) == Some((seat, bay)))
+        {
+            return;
+        }
+        let mut gone: Vec<(usize, AutoParam)> = Vec::new();
+        let mut curves = self.arrangement.automation.curves().to_vec();
+        curves.retain_mut(|c| {
+            if Self::auto_param_bay(c.lane, c.param) != Some((seat, bay)) {
+                return true;
+            }
+            let owner = if c.tenant.is_empty() { leaving } else { c.tenant.as_str() }.to_owned();
+            if arriving.is_empty() {
+                c.tenant = owner;
+            } else if owner == arriving {
+                c.tenant.clear();
+            } else if !owner.is_empty() {
+                gone.push((c.lane, c.param));
+                return false;
+            }
+            true
+        });
+        self.arrangement.automation = Automation::from_curves(curves);
+        if !gone.is_empty() {
+            let named = |row: &(usize, AutoParam)| gone.contains(row);
+            self.arr_auto_open.retain(|row| !named(row));
+            self.arr_auto_armed.retain(|row| !named(row));
+            self.arr_auto_bypassed.retain(|row| !named(row));
+            self.arr_auto_focus = self.arr_auto_focus.filter(|row| !named(row));
+            self.auto_clipboard_from = self.auto_clipboard_from.filter(|row| !named(row));
+            // Rows closed, slots renumbered: the choices that name slots go.
+            self.arr_end_node_drag();
+            self.arr_auto_nodes.clear();
+            self.arr_auto_sel = None;
+            self.arr_auto_hot = None;
+        }
+        self.arr_save_edits();
+    }
+
+    /// **Two bays trade tenants, and each plugin takes its automation
+    /// along**: the desk's move (one bay empty) and swap, as ONE moment.
+    ///
+    /// Written one `set_insert` at a time, each bay changes tenant and lets
+    /// go of the curves the plugin leaving it drew (see
+    /// `settle_bay_curves`), so a swap dropped both units' automation. Here
+    /// the curves come off both bays first, the tenants trade, and each
+    /// curve goes back on the bay its plugin landed in, with its rows. A
+    /// bay no curve can address (a bus's) cannot carry one, so a curve
+    /// arriving there goes, as at any change of tenant; undo brings it back.
+    pub fn trade_inserts(&mut self, a: (usize, usize), b: (usize, usize)) {
+        use crate::automation::{AutoParam, Automation};
+        if a == b {
+            return;
+        }
+        let pa = self.insert(a.0, a.1).map(str::to_owned);
+        let pb = self.insert(b.0, b.1).map(str::to_owned);
+        let (at_a, at_b) = (Self::auto_address_of(a.0, a.1), Self::auto_address_of(b.0, b.1));
+        // Where a curve or a row at `(lane, param)` goes: across, if it rides
+        // one of the two bays (nowhere, if that side has no address), and
+        // where it was otherwise.
+        let across = |lane: usize, param: AutoParam| -> Option<(usize, AutoParam)> {
+            let AutoParam::Plugin { bay, id } = param else {
+                return Some((lane, param));
+            };
+            let to = if at_a == Some((lane, bay)) {
+                at_b
+            } else if at_b == Some((lane, bay)) {
+                at_a
+            } else {
+                return Some((lane, param));
+            };
+            to.map(|(lane, bay)| (lane, AutoParam::Plugin { bay, id }))
+        };
+        self.begin_one_moment();
+        let (stay, carried): (Vec<_>, Vec<_>) = self
+            .arrangement
+            .automation
+            .curves()
+            .iter()
+            .cloned()
+            .partition(|c| across(c.lane, c.param) == Some((c.lane, c.param)));
+        if !carried.is_empty() {
+            self.arrangement.automation = Automation::from_curves(stay);
+        }
+        self.set_insert(a.0, a.1, pb.as_deref());
+        self.set_insert(b.0, b.1, pa.as_deref());
+        if !carried.is_empty() {
+            let mut all = self.arrangement.automation.curves().to_vec();
+            for mut c in carried {
+                if let Some((lane, param)) = across(c.lane, c.param) {
+                    c.lane = lane;
+                    c.param = param;
+                    all.push(c);
+                }
+            }
+            self.arrangement.automation = Automation::from_curves(all);
+            self.arr_save_edits();
+        }
+        let carry = |rows: &HashSet<(usize, AutoParam)>| -> HashSet<(usize, AutoParam)> {
+            rows.iter().filter_map(|&(lane, param)| across(lane, param)).collect()
+        };
+        self.arr_auto_open = carry(&self.arr_auto_open);
+        self.arr_auto_armed = carry(&self.arr_auto_armed);
+        self.arr_auto_bypassed = carry(&self.arr_auto_bypassed);
+        self.arr_auto_focus = self.arr_auto_focus.and_then(|(l, p)| across(l, p));
+        self.auto_clipboard_from = self.auto_clipboard_from.and_then(|(l, p)| across(l, p));
+        // The rows renumbered: the choices that name slots go.
+        self.arr_end_node_drag();
+        self.arr_auto_nodes.clear();
+        self.arr_auto_sel = None;
+        self.arr_auto_hot = None;
+        self.commit_undo_moment();
     }
 
     /// Which channel's board an amp seated in rack `seat` should seed, and
@@ -71239,6 +71426,110 @@ mod folder_tests {
         assert_eq!(pasted.value_at(2.0), Some(0.2), "the pasted curve is not the copied one");
         assert!(a.arrangement.automation.get(5, AutoParam::Pan).is_none(), "a stranger's curve plays under the copy");
         assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "the copy took the source's curve");
+    }
+
+    /// **A new tenant does not play the old one's curves.** A plugin curve
+    /// names a bay and the plugin's own parameter id, and the built-in units
+    /// reuse small ids: the EQ's band-1 frequency and the compressor's
+    /// attack are both id 2. Replacing the EQ left its frequency ride
+    /// driving the attack, the compressor's face following it and refusing
+    /// the hand. The replace now takes the bay's curves in its own moment,
+    /// so one undo puts the EQ back WITH them.
+    #[test]
+    fn a_new_tenant_does_not_play_the_old_ones_curves() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![
+                Point { at_s: 0.0, value: 0.2, shape: Shape::Linear },
+                Point { at_s: 4.0, value: 0.9, shape: Shape::Linear },
+            ],
+        ));
+        a.arr_auto_open.insert((3, freq));
+        a.arr_auto_bypassed.insert((3, freq));
+        a.arr_save_edits();
+        a.set_insert(3, 0, Some("@tangent-comp"));
+        assert!(
+            a.arrangement.automation.get(3, freq).is_none(),
+            "the EQ's frequency curve now rides the compressor's attack"
+        );
+        assert!(!a.arr_auto_is_open(3, freq), "the EQ's row stayed open over the compressor's knob");
+        assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the EQ's bypass stayed for the compressor's knob");
+        a.undo();
+        assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
+        assert!(a.arrangement.automation.get(3, freq).is_some(), "the undo put the EQ back without its curve");
+    }
+
+    /// **A curve outlives its plugin and never attaches to the next one.**
+    /// Taking a plugin out keeps its curves (they are somebody's work, and
+    /// the plugin may come back), and they remember whose they are: the
+    /// SAME plugin put back plays them again, and another one put there
+    /// lets them go in that moment instead of riding its knobs.
+    #[test]
+    fn a_curve_kept_through_an_unload_waits_for_its_own_plugin() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+        ));
+        a.arr_save_edits();
+        a.set_insert(3, 0, None);
+        assert!(a.arrangement.automation.get(3, freq).is_some(), "an unload took the curve");
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        assert_eq!(a.engine_automation().value_at(3, freq, 1.0), Some(0.2), "its own plugin came back to no curve");
+        a.set_insert(3, 0, None);
+        a.set_insert(3, 0, Some("@tangent-comp"));
+        assert!(
+            a.arrangement.automation.get(3, freq).is_none(),
+            "the EQ's curve, kept through the unload, now rides the compressor's attack"
+        );
+    }
+
+    /// **A plugin carried to another bay takes its automation along**, and
+    /// two that trade places trade their curves - the desk's move and swap,
+    /// which changed both bays' tenants and so would otherwise have let
+    /// both units' curves go. One moment, like the carry.
+    #[test]
+    fn a_moved_or_swapped_plugin_takes_its_curves_along() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        a.set_insert(3, 1, Some("@tangent-comp"));
+        let at = |bay: u8, id: u32| AutoParam::Plugin { bay, id };
+        let level = |a: &TangentApp, bay: u8, id: u32| a.arrangement.automation.value_at(3, at(bay, id), 0.0);
+        for (bay, id, v) in [(0u8, 2u32, 0.2), (1, 5, 0.7)] {
+            a.arrangement.automation.set(Curve::sanitised(
+                3,
+                at(bay, id),
+                vec![Point { at_s: 0.0, value: v, shape: Shape::Linear }],
+            ));
+            a.arr_auto_open.insert((3, at(bay, id)));
+        }
+        a.arr_save_edits();
+        let before = a.hist_at;
+        a.trade_inserts((3, 0), (3, 1));
+        assert_eq!((a.insert(3, 0), a.insert(3, 1)), (Some("@tangent-comp"), Some("@tangent-eq")));
+        assert_eq!(level(&a, 1, 2), Some(0.2), "the EQ's curve did not follow it to bay 2");
+        assert_eq!(level(&a, 0, 5), Some(0.7), "the compressor's curve did not follow it to bay 1");
+        assert_eq!((level(&a, 0, 2), level(&a, 1, 5)), (None, None), "a curve stayed behind on the bay");
+        assert!(a.arr_auto_is_open(3, at(1, 2)) && !a.arr_auto_is_open(3, at(0, 2)), "the row did not follow its curve");
+        assert_eq!(a.hist_at, before + 1, "the swap left {} moments", a.hist_at - before);
+        // A move into an empty bay is the same trade with nobody coming back.
+        a.trade_inserts((3, 1), (3, 2));
+        assert_eq!((a.insert(3, 1), a.insert(3, 2)), (None, Some("@tangent-eq")));
+        assert_eq!(level(&a, 2, 2), Some(0.2), "the EQ's curve did not follow it into the empty bay");
+        assert_eq!(level(&a, 1, 2), None, "the EQ's curve stayed on the bay it left");
     }
 
     /// **A removed track leaves no pan, polarity, icon or kit for the next
