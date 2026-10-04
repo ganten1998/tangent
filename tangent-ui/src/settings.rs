@@ -1410,6 +1410,16 @@ pub struct Settings {
     /// shortening is the half that is the same on every channel of it: call it
     /// "x" and the strips read "x - 3", "x - 4/5".
     pub input_alias: String,
+    /// **The interface `input_alias` was given to**, by the name the Setup
+    /// panel showed it under when the short name was typed (the host's
+    /// `devices::device_display_name`), or `None` for a short name from
+    /// before this was kept.
+    ///
+    /// A short name names ONE box. With nothing chosen the session records
+    /// from the system's default input, and a bare string applied to
+    /// whatever that was: unplug the interface and the laptop's microphone
+    /// was called "solo" while it recorded. See `devices::alias_for_open`.
+    pub input_alias_for: Option<String>,
     /// The effect in each of the desk's insert slots, as bundle paths.
     ///
     /// **Flat, `strip * INSERTS + slot`**, with the master last — the same
@@ -2137,6 +2147,7 @@ impl Default for Settings {
                 v
             },
             input_alias: String::new(),
+            input_alias_for: None,
             strip_muted: 0,
             // Nothing written down: the app resolves the shipped rule once.
             // See the field.
@@ -3219,6 +3230,7 @@ impl Settings {
                 .take(LEGACY_MAX_STRIPS + 1)
                 .collect();
         }
+        take_opt_str(&mut map, "input_alias_for", &mut s.input_alias_for);
         if let Some(Value::String(v)) = map.shift_remove("input_alias") {
             s.input_alias = v;
         }
@@ -4570,6 +4582,9 @@ impl Settings {
             ),
         );
         map.insert("input_alias".into(), Value::String(self.input_alias.clone()));
+        if let Some(d) = &self.input_alias_for {
+            map.insert("input_alias_for".into(), Value::String(d.clone()));
+        }
         map.insert(
             "strip_colors_v2".into(),
             Value::Array(self.strip_colors.iter().map(|c| Value::from(*c)).collect()),
@@ -5450,6 +5465,7 @@ impl Settings {
         self.strip_to_theory = fresh.strip_to_theory.clone();
         self.master_mono = fresh.master_mono;
         self.input_alias = fresh.input_alias.clone();
+        self.input_alias_for = fresh.input_alias_for.clone();
         self.routes = fresh.routes.clone();
         // The key edges are desk topology like the routes, and a wiped desk
         // keeping them would key tracks that no longer exist.
@@ -6499,15 +6515,22 @@ mod tests {
         s.strip_names[0] = "Rhodes".to_owned();
         s.strip_names[crate::recorder::STRIPS] = "OUT".to_owned();
         s.input_alias = "x".to_owned();
+        s.input_alias_for = Some("Scarlett 18i20 USB".to_owned());
         let back = Settings::from_json(&s.to_json());
         assert_eq!(back.strip_names[0], "Rhodes");
         assert_eq!(back.strip_names[crate::recorder::STRIPS], "OUT");
         assert_eq!(back.input_alias, "x", "the interface's short name was lost");
+        assert_eq!(
+            back.input_alias_for.as_deref(),
+            Some("Scarlett 18i20 USB"),
+            "the interface the short name was given to was lost"
+        );
         // A file that has never named anything comes back with nothing to
         // say, rather than with a row of empty strings pretending to be names.
         let fresh = Settings::from_json("{}");
         assert!(fresh.strip_names.iter().all(String::is_empty));
         assert!(fresh.input_alias.is_empty());
+        assert_eq!(fresh.input_alias_for, None);
     }
 
     /// **The desk grew four input columns where there had been one.**
