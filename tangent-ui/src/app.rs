@@ -1119,6 +1119,10 @@ pub struct TangentApp {
     /// its words, and the row: what a double-click's reset takes the place
     /// of. See `undo_commit_double_click`.
     click_moment: Option<(ClickRow, std::sync::Arc<Vec<u64>>)>,
+    /// **The automation rows closed since the standing moment**, waiting,
+    /// like `perm_since_moment`, for the commit that keeps them in
+    /// `Moment::rows_closed`. Filled by `close_auto_rows`.
+    rows_closed_since_moment: ClosedRows,
     /// The marquee'd SET of clips, beside the single selection — the
     /// right-drag band fills it, Delete empties it with the clips.
     arr_multi: Vec<u64>,
@@ -2470,6 +2474,13 @@ struct Moment {
     /// sends the host this order's inverse on the way back and the order
     /// itself on the way forward, through the door a reorder uses.
     perm: Option<std::sync::Arc<Vec<usize>>>,
+    /// **The automation rows the gesture that made this moment closed with
+    /// their curves**: a track's removal, a plugin's replace. The words
+    /// cannot say them either - which rows are open, armed and bypassed is
+    /// session state beside the document - so the undo brought the curves
+    /// back with their rows shut and a bypassed curve playing. `undo_apply`
+    /// opens them again going back and shuts them again going forward.
+    rows_closed: Option<std::sync::Arc<ClosedRows>>,
 }
 
 impl Moment {
@@ -2477,6 +2488,21 @@ impl Moment {
     /// for both? The question every exact caller asks.
     fn same_text(&self, other: &Self) -> bool {
         self.words == other.words
+    }
+}
+
+/// **Automation rows closed with their curves**, by the set each stood in -
+/// see `Moment::rows_closed`.
+#[derive(Clone, Debug, Default)]
+struct ClosedRows {
+    open: Vec<(usize, crate::automation::AutoParam)>,
+    armed: Vec<(usize, crate::automation::AutoParam)>,
+    bypassed: Vec<(usize, crate::automation::AutoParam)>,
+}
+
+impl ClosedRows {
+    fn is_empty(&self) -> bool {
+        self.open.is_empty() && self.armed.is_empty() && self.bypassed.is_empty()
     }
 }
 
@@ -4291,6 +4317,7 @@ impl TangentApp {
             desk_state_perm: None,
             perm_since_moment: None,
             click_moment: None,
+            rows_closed_since_moment: ClosedRows::default(),
             arr_multi: Vec::new(),
             arr_sel_seen: (None, Vec::new()),
             arr_band: None,
@@ -6786,9 +6813,7 @@ impl TangentApp {
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
         }
-        self.arr_auto_open.retain(|(l, _)| *l != n);
-        self.arr_auto_armed.retain(|(l, _)| *l != n);
-        self.arr_auto_bypassed.retain(|(l, _)| *l != n);
+        self.close_auto_rows(|(l, _)| *l == n);
         self.arr_auto_nodes.retain(|(l, _, _)| *l != n);
         let gone = |aim: Option<(usize, crate::automation::AutoParam)>| aim.filter(|(l, _)| *l != n);
         self.arr_auto_focus = gone(self.arr_auto_focus);
@@ -12197,6 +12222,45 @@ impl TangentApp {
         self.auto_clipboard_from = self.auto_clipboard_from.map(|(l, p)| (to(l), p));
     }
 
+    /// **Close the automation rows `named` picks, open, armed and bypassed,
+    /// and keep them for the moment this gesture leaves**, so the undo that
+    /// brings their curves back opens them again (`Moment::rows_closed`).
+    /// For a track's removal and a plugin's replace, which take the curves
+    /// those rows draw.
+    fn close_auto_rows(&mut self, named: impl Fn(&(usize, crate::automation::AutoParam)) -> bool) {
+        let kept = &mut self.rows_closed_since_moment;
+        kept.open.extend(self.arr_auto_open.iter().filter(|r| named(r)));
+        kept.armed.extend(self.arr_auto_armed.iter().filter(|r| named(r)));
+        kept.bypassed.extend(self.arr_auto_bypassed.iter().filter(|r| named(r)));
+        self.arr_auto_open.retain(|r| !named(r));
+        self.arr_auto_armed.retain(|r| !named(r));
+        self.arr_auto_bypassed.retain(|r| !named(r));
+    }
+
+    /// The rows a moment closed, open again: an undo back across it brought
+    /// their curves back. See `Moment::rows_closed`. A row chosen on one of
+    /// their lanes goes, since its slot now counts other rows.
+    fn reopen_auto_rows(&mut self, rows: &ClosedRows) {
+        self.arr_auto_open.extend(rows.open.iter().copied());
+        self.arr_auto_armed.extend(rows.armed.iter().copied());
+        self.arr_auto_bypassed.extend(rows.bypassed.iter().copied());
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
+    }
+
+    /// The rows a moment closed, shut again with the aims that name them: a
+    /// redo across it took their curves away again, as its gesture did.
+    fn shut_auto_rows(&mut self, rows: &ClosedRows) {
+        let named = |row: &(usize, crate::automation::AutoParam)| {
+            rows.open.contains(row) || rows.armed.contains(row) || rows.bypassed.contains(row)
+        };
+        self.arr_auto_open.retain(|r| !named(r));
+        self.arr_auto_armed.retain(|r| !named(r));
+        self.arr_auto_bypassed.retain(|r| !named(r));
+        self.arr_auto_focus = self.arr_auto_focus.filter(|r| !named(r));
+        self.auto_clipboard_from = self.auto_clipboard_from.filter(|r| !named(r));
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
+    }
+
     /// **Open an empty lane directly below `n`**, the rows under it shifting
     /// down a place, and answer where the hole landed.
     ///
@@ -16627,6 +16691,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             mark,
             // Attached where a moment is KEPT - see `undo_commit_moment`.
             perm: None,
+            rows_closed: None,
         }
     }
 
@@ -16766,10 +16831,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // word (two empty lanes trading places) must not ride into the
             // NEXT gesture's moment and be undone with it.
             self.perm_since_moment = None;
+            self.rows_closed_since_moment = ClosedRows::default();
             return;
         }
-        // The reorders this gesture made ride in the moment they made.
+        // The reorders this gesture made ride in the moment they made, and
+        // so do the automation rows it closed.
         state.perm = self.perm_since_moment.take().map(std::sync::Arc::new);
+        let closed = std::mem::take(&mut self.rows_closed_since_moment);
+        state.rows_closed = (!closed.is_empty()).then(|| std::sync::Arc::new(closed));
         self.history.truncate(self.hist_at.saturating_add(1));
         self.history.push(state);
         // New work since "Don't Save": nobody has been asked about THIS.
@@ -16802,15 +16871,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// reset at the second release made a second moment: one Ctrl+Z after
     /// a double-click landed on a value nobody chose. The reset takes that
     /// moment's place instead, but only while it is still the moment stood
-    /// on, is this row's, and carries no reorder; anything else between the
-    /// two clicks leaves the reset a moment of its own.
+    /// on, is this row's, and carries no reorder and no closed rows;
+    /// anything else between the two clicks leaves the reset a moment of
+    /// its own.
     fn undo_commit_double_click(&mut self, row: ClickRow) {
         if let Some((clicked, words)) = self.click_moment.take() {
             let first_click_on_top = clicked == row
                 && self.undo_hold == 0
                 && self.hist_at > 0
                 && self.history.get(self.hist_at).is_some_and(|m| {
-                    std::sync::Arc::ptr_eq(&m.words, &words) && m.perm.is_none()
+                    std::sync::Arc::ptr_eq(&m.words, &words)
+                        && m.perm.is_none()
+                        && m.rows_closed.is_none()
                 });
             if first_click_on_top {
                 self.history.truncate(self.hist_at);
@@ -16833,6 +16905,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.hist_at = 0;
         // Moment zero has no moment before it to have been carried from.
         self.perm_since_moment = None;
+        self.rows_closed_since_moment = ClosedRows::default();
         self.undo_commit_moment(state);
     }
 
@@ -16860,9 +16933,37 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let carry = steps.into_iter().reduce(|first, then| compose_orders(&first, &then));
         if let Some(order) = carry {
             self.send_desk_perm(&order);
-            // And the automation rows the session keeps beside the words,
-            // which the words cannot put back - see `carry_automation_rows`.
-            self.carry_automation_rows(&invert_order(&order));
+        }
+        // And the automation rows the session keeps beside the words, which
+        // the words cannot put back, one crossed moment at a time: a
+        // reorder's carry (see `carry_automation_rows`), and the rows its
+        // gesture closed with their curves, open again going back and shut
+        // again going forward (see `Moment::rows_closed`).
+        let crossed: Vec<usize> = if at < from {
+            (at + 1..=from).rev().collect()
+        } else {
+            (from + 1..=at).collect()
+        };
+        for k in crossed {
+            let Some(m) = self.history.get(k) else {
+                continue;
+            };
+            let (perm, rows) = (m.perm.clone(), m.rows_closed.clone());
+            if at < from {
+                if let Some(rows) = rows {
+                    self.reopen_auto_rows(&rows);
+                }
+                if let Some(order) = perm {
+                    self.carry_automation_rows(&order);
+                }
+            } else {
+                if let Some(order) = perm {
+                    self.carry_automation_rows(&invert_order(&order));
+                }
+                if let Some(rows) = rows {
+                    self.shut_auto_rows(&rows);
+                }
+            }
         }
         // The document moves, so an earlier "Don't Save" no longer covers it.
         self.outgoing_discarded = false;
@@ -33130,7 +33231,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///   newcomer's too - the EQ's band-1 frequency and the compressor's
     ///   attack are both id 2 - so kept, it rode the newcomer's knob and
     ///   that knob's face followed it and refused the hand. One undo puts
-    ///   the old plugin back WITH its curves.
+    ///   the old plugin back WITH its curves, and their rows as they were
+    ///   (`Moment::rows_closed`).
     ///
     /// A curve with no owner on record (left on an empty bay by a build
     /// that kept none) stays as it is. Keeping a replaced plugin's curves
@@ -33168,9 +33270,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.automation = Automation::from_curves(curves);
         if !gone.is_empty() {
             let named = |row: &(usize, AutoParam)| gone.contains(row);
-            self.arr_auto_open.retain(|row| !named(row));
-            self.arr_auto_armed.retain(|row| !named(row));
-            self.arr_auto_bypassed.retain(|row| !named(row));
+            self.close_auto_rows(named);
             self.arr_auto_focus = self.arr_auto_focus.filter(|row| !named(row));
             self.auto_clipboard_from = self.auto_clipboard_from.filter(|row| !named(row));
             // Rows closed, slots renumbered: the choices that name slots go.
@@ -72305,6 +72405,69 @@ mod folder_tests {
         a.undo();
         assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
         assert!(a.arrangement.automation.get(3, freq).is_some(), "the undo put the EQ back without its curve");
+    }
+
+    /// **An undo that brings curves back brings their rows back as they
+    /// were**: open, armed and bypassed.
+    ///
+    /// A track's removal and a plugin's replace close the rows of the curves
+    /// they take, and the rows are session state beside the words. So the
+    /// undo put the curves back with their rows shut, their arms gone and a
+    /// bypassed curve PLAYING. The moment that closed them keeps them now,
+    /// as a reorder's keeps its order (`Moment::rows_closed`), and the redo
+    /// closes them again.
+    #[test]
+    fn an_undo_that_brings_curves_back_brings_their_rows_back() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        // A track's REMOVAL.
+        let mut a = app();
+        a.add_bare_track(3);
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            a.arr_toggle_automation_param(3, p);
+            a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
+        }
+        a.arr_auto_armed.insert((3, AutoParam::Mute));
+        a.arr_auto_bypassed.insert((3, AutoParam::Gain));
+        a.arr_save_edits();
+        a.remove_channel(3);
+        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "fixture: the removal left its row open");
+        a.undo();
+        assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "fixture: the undo brought no curve back");
+        for p in [AutoParam::Mute, AutoParam::Gain] {
+            assert!(a.arr_auto_is_open(3, p), "the undo brought {p:?}'s curve back with its row shut");
+        }
+        assert!(a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the undo left the row disarmed");
+        assert!(
+            a.engine_automation().get(3, AutoParam::Gain).is_none(),
+            "the undo brought a bypassed curve back playing"
+        );
+        a.redo();
+        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "the redo left a row open under the empty slot");
+        assert!(!a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the redo left the arm for the next track");
+        assert!(!a.arr_auto_bypassed.contains(&(3, AutoParam::Gain)), "the redo left the bypass behind");
+
+        // A plugin's REPLACE.
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+        ));
+        a.arr_auto_open.insert((3, freq));
+        a.arr_auto_bypassed.insert((3, freq));
+        a.arr_save_edits();
+        a.set_insert(3, 0, Some("@tangent-comp"));
+        assert!(!a.arr_auto_is_open(3, freq), "fixture: the replace left the EQ's row open");
+        a.undo();
+        assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
+        assert!(a.arr_auto_is_open(3, freq), "the undo put the EQ's curve back with its row shut");
+        assert!(a.engine_automation().get(3, freq).is_none(), "the undo brought the EQ's bypassed curve back playing");
+        a.redo();
+        assert!(!a.arr_auto_is_open(3, freq), "the redo left the EQ's row open over the compressor's knob");
+        assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
     }
 
     /// **A curve outlives its plugin and never attaches to the next one.**
