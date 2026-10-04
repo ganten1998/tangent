@@ -32499,8 +32499,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // recorded, so a refused tap leaves nothing in `tap_times`. See
         // `RecorderState::tempo_held`: a take's count-in, or an export. The
         // Export dialog's tempo arrives by its own road and is held there
-        // (`hold_dialog_tempo`), and Reset Devices and Folders, which puts
-        // the tempo back, waits for it (`reset_settings`).
+        // (`hold_dialog_tempo`), and Reset Devices and Folders and a reset's
+        // Undo, which put the tempo back, wait for it (`reset_settings`,
+        // `undo_the_reset`).
         if self.recorder.tempo_held()
             && matches!(hit, Hit::SetTempo(_) | Hit::TapTempo | Hit::Type(recorder::NumField::Tempo))
         {
@@ -35678,6 +35679,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Put the settings back to the copy taken just before the last reset,
     /// which was of `scope`.
     fn undo_the_reset(&mut self, ctx: &egui::Context, scope: crate::settings::ResetScope) {
+        // **The copy puts every setting back, the tempo and the signature
+        // too**, so it waits while the tempo is held, as the Devices reset
+        // does (`reset_settings`): put back under a take's count-in or an
+        // export, the copy's tempo retimed the click or the export. And the
+        // box that reported the reset comes back, its Undo with it, because
+        // that box is the one road to the copy. The copy itself is only read
+        // here, never removed, so it is still on disk for the next press.
+        if self.recorder.tempo_held() {
+            let why = if self.recorder.exporting {
+                "Undo waits for the export to end - it puts every setting back, the tempo too, and the export is playing at this one."
+            } else {
+                "Undo waits for the count-in's downbeat - it puts every setting back, the tempo too, and the count is clicking at this one."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+            self.report_the_reset(scope, true);
+            return;
+        }
         let Some(back) = Settings::load_backup() else {
             return;
         };
@@ -69751,6 +69769,82 @@ mod tests {").expect("the tests module")];
             "with nothing holding the tempo the reset did not put it back"
         );
         assert_eq!(app.settings.record_audio_device, fresh.record_audio_device, "the reset forgot nothing");
+        let _ = std::fs::remove_file(Settings::backup_path());
+    }
+
+    /// **A reset's Undo waits while the tempo is held, and keeps its box.**
+    /// The Undo puts the whole copy back (`undo_the_reset`), the tempo and
+    /// the signature included, and asked nothing of `tempo_held`: pressed
+    /// during a take's count-in, the arrangement's record count or an
+    /// export, it retimed the click or the export, as the reset itself did
+    /// (`a_devices_reset_waits_while_the_tempo_is_held`). It is refused under
+    /// each of them now, with a note; and since the box that reports a reset
+    /// is the one road to its Undo, the box comes back with it and the copy
+    /// stays on disk. With nothing holding the tempo, the box's Undo puts
+    /// everything back as before.
+    #[test]
+    fn a_resets_undo_waits_while_the_tempo_is_held_and_keeps_its_box() {
+        let (ctx, mut app) = recorder_app();
+        let fresh = Settings::first_launch();
+        app.settings.record_export.tempo_bpm = 97.0;
+        app.settings.record_time_signature = "3/4".to_owned();
+        let _ = std::fs::remove_file(Settings::backup_path());
+        // The reset, with nothing held: the fresh install's tempo and
+        // signature, and a box offering the way back.
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Devices));
+        run_frame(&ctx, &mut app);
+        assert_eq!(app.tempo_bpm(), fresh.record_export.tempo_bpm, "fixture: the reset did not put the tempo back");
+        let undo = |app: &TangentApp| match app.open_dialog() {
+            Some(Dialog::Confirm { choices, .. }) => choices
+                .iter()
+                .find(|c| matches!(c.action, DialogAction::UndoReset(crate::settings::ResetScope::Devices)))
+                .map(|c| c.action.clone()),
+            _ => None,
+        };
+        assert!(undo(&app).is_some(), "fixture: the reset's box offers no Undo");
+        for (label, state, counting, exporting) in [
+            ("a take's pre-roll", recorder::RecordState::CountIn { beat: 1, of: 4 }, true, false),
+            ("a count in a take's file", recorder::RecordState::Rolling, true, false),
+            ("the arrangement's record count", recorder::RecordState::Idle, true, false),
+            ("a realtime export", recorder::RecordState::Rolling, false, true),
+            // Its take stopped, its files not landed yet.
+            ("an export filing itself", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.take_counting = counting;
+            app.recorder.exporting = exporting;
+            app.messages.clear();
+            let press = undo(&app).expect("the box offering the Undo");
+            app.apply_dialog_action(press);
+            run_frame(&ctx, &mut app);
+            assert_eq!(
+                app.tempo_bpm(),
+                fresh.record_export.tempo_bpm,
+                "the reset's Undo moved the held tempo under {label}"
+            );
+            assert_eq!(
+                app.settings.record_time_signature, fresh.record_time_signature,
+                "the reset's Undo moved the signature under {label}"
+            );
+            assert!(!app.said().notes().is_empty(), "the refused Undo under {label} said nothing");
+            assert!(
+                undo(&app).is_some(),
+                "the refused Undo under {label} took its box, the one road to the Undo, with it"
+            );
+            assert!(
+                Settings::backup_path().exists(),
+                "the refused Undo under {label} lost the copy it puts back"
+            );
+        }
+        // Nothing holds the tempo: the box's Undo puts everything back.
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.take_counting = false;
+        app.recorder.exporting = false;
+        let press = undo(&app).expect("the box offering the Undo");
+        app.apply_dialog_action(press);
+        run_frame(&ctx, &mut app);
+        assert_eq!(app.tempo_bpm(), 97.0, "with nothing holding the tempo the Undo did not put it back");
+        assert_eq!(app.settings.record_time_signature, "3/4", "the Undo did not put the signature back");
         let _ = std::fs::remove_file(Settings::backup_path());
     }
 
