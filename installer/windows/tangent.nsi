@@ -69,11 +69,11 @@ VIAddVersionKey "LegalCopyright" "MIT"
 ; **The installer and uninstaller wear the app's own logo**, not NSIS's
 ; default. The caller passes the icon (`-DICON=…/assets/tangent.ico`); the
 ; same `assets/tangent.ico` build.rs embeds into `tangent.exe`, so the setup,
-; the app and the Add/Remove entry are one mark. The fallback below names a
-; file the staged payload does not carry (it holds no `.ico` at all), so a
-; build without `-DICON` cannot find its icon.
+; the app and the Add/Remove entry are one mark. There is no fallback to name:
+; the staged payload holds no `.ico` at all, so a build without `-DICON` stops
+; here and says why, rather than deep inside MUI2 over a file that never existed.
 !ifndef ICON
-  !define ICON "${SRCDIR}/app/ivory.ico"
+  !error "ICON not defined (build-installer.sh passes -DICON)"
 !endif
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
