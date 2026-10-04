@@ -3819,7 +3819,8 @@ fn warped_clip_audio(
 }
 
 /// **The warp map one quantize would write**, and only the map: a caller
-/// that reports how many attacks it found counts its own `found`.
+/// that reports how many attacks there were counts them in the same window
+/// with [`played_attacks`].
 ///
 /// Its own function because TWO callers need it and they must not disagree:
 /// the Apply, which writes it onto the clip, and the PREVIEW, which turns
@@ -3873,14 +3874,7 @@ fn quantize_map(
     let r = heard_ratio(clip);
     let start_s = clip.start_s;
     // The played window, in the frames `from` and `to` count.
-    let offset = (clip.offset_s * rate / r).max(0.0).round();
-    let len_s = clip.play_len_s(file_s * r);
-    let played_s = if clip.loop_s > 1.0e-6 {
-        clip.loop_s.min(len_s)
-    } else {
-        len_s
-    };
-    let end = offset + played_s.max(0.0) * rate / r;
+    let (offset, end) = played_frames(clip, rate, file_s);
     let inside = |f: f64| f >= offset && f < end;
     let mut map: Vec<(u64, u64)> = Vec::with_capacity(found.len());
     for t in found {
@@ -3904,6 +3898,39 @@ fn quantize_map(
         map.clear();
     }
     map
+}
+
+/// **The frames of a decode at `rate` that `clip` PLAYS**, `(from, to)`:
+/// from its trim, for its length or one pass of its loop (every pass
+/// replays that same span), in the frames of the warp's render (see
+/// [`heard_ratio`]). The window [`quantize_map`] anchors in, and the one
+/// the quantize's receipt counts attacks in ([`played_attacks`]).
+#[cfg(feature = "recorder")]
+fn played_frames(clip: &tangent_ui::arrangement::ArrClip, rate: f64, file_s: f64) -> (f64, f64) {
+    let r = heard_ratio(clip);
+    let offset = (clip.offset_s * rate / r).max(0.0).round();
+    let len_s = clip.play_len_s(file_s * r);
+    let played_s = if clip.loop_s > 1.0e-6 {
+        clip.loop_s.min(len_s)
+    } else {
+        len_s
+    };
+    (offset, offset + played_s.max(0.0) * rate / r)
+}
+
+/// **How many of `found` the clip plays**: the attacks inside its played
+/// window ([`played_frames`]), which is what "quantized N of M attacks"
+/// counts. The detector reads the whole file, and the receipt counted all
+/// of it, so a trimmed or split clip was told of attacks it never plays.
+#[cfg(feature = "recorder")]
+fn played_attacks(
+    found: &[crate::transient::Transient],
+    rate: u32,
+    file_s: f64,
+    clip: &tangent_ui::arrangement::ArrClip,
+) -> usize {
+    let (from, to) = played_frames(clip, f64::from(rate.max(1)), file_s);
+    found.iter().filter(|t| (from..to).contains(&(t.at as f64))).count()
 }
 
 /// **Heard seconds per second of the warp's render**: the clip's stretch as
@@ -13458,10 +13485,13 @@ impl DesktopApp {
         let files = self.asked_files(ask);
         let found = self.attacks_of(&path, &decoded, ask.sensitivity, &files);
         let map = quantize_map(&found, decoded.rate, decoded.seconds(), clip, &q);
+        // What the receipt counts: the attacks the clip PLAYS, not every
+        // one in its file. See `played_attacks`.
+        let played = played_attacks(&found, decoded.rate, decoded.seconds(), clip);
         // Nothing to quantize - fewer than two pairs, which `quantize_map`
         // answers with no map at all - keeps the map the clip already has.
         if map.is_empty() {
-            return (0, found.len());
+            return (0, played);
         }
         let moved = map.iter().filter(|&&(f, t)| f != t).count();
         // The FIT travels with the map, because the render is made from the
@@ -13470,7 +13500,7 @@ impl DesktopApp {
         // map is frames of this decode: a reader at another rate rescales
         // it (`warp_anchors`) rather than applying it to other audio.
         self.app.set_clip_warp_with_fit(id, map, ask.fit.clone(), decoded.rate);
-        (moved, found.len())
+        (moved, played)
     }
 
     /// Bring each clip up so its loudest point sits just under full scale.
@@ -27928,6 +27958,55 @@ mod tests {
             quantize_map(&two, 48_000, 2.0, &clip, &q),
             vec![(25_440, 24_000), (72_960, 72_000)],
             "two attacks were not quantized"
+        );
+    }
+
+    /// **The quantize's receipt counts the attacks the clip plays.** The
+    /// detector reads the whole FILE, and "quantized N of M attacks" counted
+    /// every attack in it: the right half of a split take was told of the
+    /// left half's hits, and a clip that plays none of the file's attacks
+    /// heard how many the file had instead of "no attacks found". The count
+    /// is taken in the window `quantize_map` anchors in. Its use in
+    /// `quantize_clip` is a source scan, because `DesktopApp` cannot be
+    /// built in a test.
+    #[test]
+    fn the_quantize_receipt_counts_only_the_attacks_the_clip_plays() {
+        use crate::transient::Transient;
+        // The right half of a 16 s take split at 8 s, its end trimmed at
+        // 11.9 s of the file - `an_attack_the_trim_hides_is_not_pulled_onto_the_clip_start`'s clip.
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            start_s: 8.0,
+            offset_s: 8.0,
+            len_s: 3.9,
+            loop_s: 3.9,
+            ..Default::default()
+        };
+        // Two attacks in the trim, the clip's own two, and one past its end.
+        let found: Vec<Transient> = [480usize, 48_000, 384_144, 396_480, 572_160]
+            .iter()
+            .map(|&at| Transient { at, strength: 10.0 })
+            .collect();
+        assert_eq!(
+            played_attacks(&found, 48_000, 16.0, &clip),
+            2,
+            "the receipt counted attacks the clip does not play"
+        );
+        // Untrimmed, every attack in the file is the clip's.
+        let whole = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            len_s: 16.0,
+            ..Default::default()
+        };
+        assert_eq!(played_attacks(&found, 48_000, 16.0, &whole), 5);
+        let src = include_str!("desktop.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("    fn quantize_clip(").expect("quantize_clip");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("played_attacks(&found, decoded.rate, decoded.seconds(),")
+                && !body.contains("found.len()"),
+            "the quantize's receipt counts every attack in the file again"
         );
     }
 
