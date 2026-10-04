@@ -71,6 +71,11 @@ pub struct Preset {
     /// Append-only by symbol, exactly as [`Self::values`] is: a key this
     /// build does not know is a newer build's state and is carried, not
     /// dropped, so a round trip through an older Tangent is lossless.
+    ///
+    /// **The sampler's file is written ABSOLUTE.** Its bay stores it
+    /// relative to its own project (`media/<name>`), and a preset has to
+    /// play in any project; loading one copies the file into the project
+    /// that loads it and binds that copy.
     pub state: Vec<(String, String)>,
     /// Top-level keys this build does not know, preserved verbatim — the
     /// same courtesy the settings file and the drumpad sidecar extend.

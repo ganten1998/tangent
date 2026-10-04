@@ -1434,6 +1434,13 @@ pub struct TangentApp {
     /// A preset the host has read back for a face to apply, latched until
     /// [`TangentApp::take_preset_loaded`] drains it.
     preset_loaded: Option<crate::ports::PresetLoaded>,
+    /// **A sampler preset's file, held one frame behind its knobs**: the
+    /// seat, the bay and the file the preset names. Binding a sample rebuilds
+    /// the bay from the state written as it binds (`bind_insert_sample`'s
+    /// reload), and the host binds a frame's samples before that frame's knob
+    /// asks reach the engine; held back a frame, the knobs are in the engine
+    /// when the state is written, and survive the rebuild.
+    preset_sample: Option<(usize, usize, std::path::PathBuf)>,
     /// The host's scan of the IRs shelf — every capture under `IRs/`, one
     /// level deep. Pushed like the preset rows; the app never opens the
     /// folder itself.
@@ -4421,6 +4428,7 @@ impl TangentApp {
             staged: vec![None; dialogs::CARTRIDGE_VOICES],
             preset_rows: HashMap::new(),
             preset_loaded: None,
+            preset_sample: None,
             ir_rows: Vec::new(),
             ir_scan_gen: 0,
             sampler_info: HashMap::new(),
@@ -41924,6 +41932,28 @@ impl TangentApp {
         // the pushed data and the tap ring before it draws; land a loaded
         // preset on it as a run of ordinary knob asks; and remember which
         // bay it watched, so closing it can take the tap down.
+        //
+        // **A sampler preset's file, a frame behind its knobs** - see
+        // `preset_sample`. Into the project and onto the bay that asked, as a
+        // pick from the browser goes (`sample_into_project`).
+        if let Some((seat, bay, file)) = self.preset_sample.take() {
+            match self.sample_into_project(&file) {
+                Some(stored) => self.queue_sampler_load(seat, bay, stored),
+                None => {
+                    let name = file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file.to_string_lossy().into_owned());
+                    self.notify(
+                        crate::notify::Kind::Error,
+                        format!(
+                            "{name}, the sample this preset plays, could not be \
+                             copied into the project, so the preset loaded without it."
+                        ),
+                    );
+                }
+            }
+        }
         if let Some(loaded) = self.take_preset_loaded() {
             // **The preset lands on the face that ASKED**, which with two
             // faces open is a question worth answering out loud. The file
@@ -41968,6 +41998,17 @@ impl TangentApp {
                     .unwrap_or_default();
                 for (id, v) in asks {
                     self.set_insert_param(seat, bay, id, v);
+                }
+                // **And a sampler's file**, which the preset names absolutely
+                // and the bay will store as this project's own copy - held a
+                // frame behind the knobs it was saved with (`preset_sample`).
+                let sampler = self
+                    .builtin_face(seat, bay)
+                    .is_some_and(|f| f.path == crate::faces_sampler::SAMPLER_PATH);
+                if sampler && !loaded.sample.is_empty() {
+                    self.preset_sample =
+                        Some((seat, bay, std::path::PathBuf::from(&loaded.sample)));
+                    ctx.request_repaint();
                 }
             }
         }
@@ -51837,10 +51878,104 @@ mod tests {
             unit: "keys:0".to_owned(),
             name: "Glassy".to_owned(),
             values: vec![("bell".to_owned(), 0.9)],
+            sample: String::new(),
         };
         app.set_preset_loaded(loaded.clone());
         assert_eq!(app.take_preset_loaded(), Some(loaded));
         assert_eq!(app.take_preset_loaded(), None, "a load answers once");
+    }
+
+    /// **A sampler preset brings its sample into the project it is loaded
+    /// in, and binds the copy, a frame after its knobs.**
+    ///
+    /// The preset names its file absolutely (the host's half is `desktop`'s
+    /// `a_sampler_preset_names_its_sample_wherever_it_is_loaded`), and loading
+    /// one turned the knobs and never loaded the file: a sampler patch came
+    /// back with its envelope over whatever the bay happened to hold. The file
+    /// now comes into this project's `media/` and the bay is bound to the
+    /// copy, relative, as a pick from the browser is (`sample_into_project`).
+    /// One frame after the knobs, because the host binds a frame's samples
+    /// before that frame's knob asks reach the engine, and the bind rebuilds
+    /// the bay from the state it writes: bound in the same frame, the preset's
+    /// knobs would be lost to the rebuild.
+    #[test]
+    fn a_sampler_preset_brings_its_sample_into_the_project_it_is_loaded_in() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-preset-sample-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // The project the preset was saved in names its sample there.
+        let saved_in = root.join("Song A").join("media").join("kick.wav");
+        std::fs::create_dir_all(root.join("Song A").join("media")).expect("song A");
+        std::fs::write(&saved_in, b"RIFFkickWAVE").expect("the preset's sample");
+        // The project it is loaded in.
+        let song = root.join("Song B");
+        std::fs::create_dir_all(song.join("media")).expect("song B");
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.project_doc = crate::arrangement::doc_in(&song);
+        let (strip, slot) = (2, 0);
+        let (seat, bay) = recorder::seat_bay(strip, slot);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            params: vec![crate::ports::BuiltinFaceParam {
+                id: 0,
+                symbol: "vol".to_owned(),
+                name: "Volume".to_owned(),
+                units: String::new(),
+                default: 0.5,
+                reading: "0.0 dB".to_owned(),
+                choices: Vec::new(),
+                steps: 0,
+                value: 0.5,
+            }],
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { strip, slot, live: Box::default() });
+        app.set_preset_loaded(crate::ports::PresetLoaded {
+            unit: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            name: "Room Kick".to_owned(),
+            values: vec![("vol".to_owned(), 0.25)],
+            sample: saved_in.to_string_lossy().into_owned(),
+        });
+        let drain = |app: &mut TangentApp, first: Option<recorder::RecorderRequest>| {
+            let mut asked: Vec<recorder::RecorderRequest> = first.into_iter().collect();
+            while let Some(r) = app.take_recorder_request() {
+                asked.push(r);
+            }
+            asked
+        };
+        // The frame the preset lands on: its knobs, and not its file yet.
+        let first = run_frame(&ctx, &mut app);
+        let knobs = drain(&mut app, first);
+        let early = app.take_sampler_load();
+        // The next frame: its file, copied into this project, bound relative.
+        let second = run_frame(&ctx, &mut app);
+        let _ = drain(&mut app, second);
+        let bound = app.take_sampler_load();
+        let copied = song.join("media").join("kick.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            early, None,
+            "the sample was bound in the frame its knobs went out, so the bay's rebuild would lose them"
+        );
+        assert_eq!(
+            bound,
+            Some((seat, bay, std::path::PathBuf::from("media/kick.wav"))),
+            "the preset's sample was not bound to this project's own copy"
+        );
+        assert!(copied, "the preset's sample was not copied into the project it was loaded in");
+        assert!(
+            knobs.iter().any(|r| matches!(
+                r,
+                recorder::RecorderRequest::SetInsertParam { strip: s, slot: b, value, .. }
+                    if *s == seat && *b == bay && (*value - 0.25).abs() < 1e-6
+            )),
+            "the preset's knobs did not go out: {knobs:?}"
+        );
     }
 
     /// **What was picked is what somebody wants to look at now.** Choosing a
