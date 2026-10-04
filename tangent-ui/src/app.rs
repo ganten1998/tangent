@@ -1115,6 +1115,10 @@ pub struct TangentApp {
     /// Track's shift and the track that lands in the gap are one moment
     /// carrying one permutation.
     perm_since_moment: Option<Vec<usize>>,
+    /// **The moment the last click on a jump-to-the-pointer row left**, by
+    /// its words, and the row: what a double-click's reset takes the place
+    /// of. See `undo_commit_double_click`.
+    click_moment: Option<(ClickRow, std::sync::Arc<Vec<u64>>)>,
     /// The marquee'd SET of clips, beside the single selection — the
     /// right-drag band fills it, Delete empties it with the clips.
     arr_multi: Vec<u64>,
@@ -3923,6 +3927,17 @@ struct DrumpadGrab {
     on_number: bool,
 }
 
+/// **Which jump-to-the-pointer row a click landed on**, so a double-click's
+/// reset takes the place of its own first click's moment and no other row's
+/// (`TangentApp::undo_commit_double_click`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickRow {
+    /// A row of the band's effect panel, by its parameter key.
+    Fx(&'static str),
+    /// A knob of the Keys panel: the strip's slot and the knob.
+    Keys(usize, usize),
+}
+
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
 use crate::recorder_panel::KNOB_TRAVEL;
 
@@ -4275,6 +4290,7 @@ impl TangentApp {
             mixer_reorder: None,
             desk_state_perm: None,
             perm_since_moment: None,
+            click_moment: None,
             arr_multi: Vec::new(),
             arr_sel_seen: (None, Vec::new()),
             arr_band: None,
@@ -8385,16 +8401,19 @@ impl TangentApp {
                 // panel chrome cannot reset by accident.
                 if let Some(key) = self.fx_drag {
                     let double = self.primary_paired;
-                    if double {
-                        self.settings.effect_params.shift_remove(key);
-                        self.save_settings();
-                    }
                     // **The drag's one moment, at the release** - and the
-                    // double-click reset's, which lands here too. The rack's
+                    // double-click reset's, which lands here too and takes
+                    // the place of its first click's jump. The rack's
                     // parameters are hashed, and the row saved per frame and
                     // committed nothing, so a turned decay rode the next
                     // gesture's step back.
-                    self.undo_commit();
+                    if double {
+                        self.settings.effect_params.shift_remove(key);
+                        self.save_settings();
+                        self.undo_commit_double_click(ClickRow::Fx(key));
+                    } else {
+                        self.undo_commit_click(ClickRow::Fx(key));
+                    }
                 }
                 self.fx_drag = None;
             }
@@ -16687,6 +16706,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * a DRAG marks `arr_gesture_dirty` (or its own surface's grab) and
     ///   commits once at its release, so a release an early return can
     ///   swallow must still end the gesture;
+    /// * a DOUBLE-CLICK that resets a row its presses jump to the pointer
+    ///   takes the place of its first click's moment
+    ///   (`undo_commit_double_click`);
     /// * a held KEY, which repeats, commits once when it comes up (the
     ///   transpose's `transpose_owed`);
     /// * a BATCH of committing writers is held with `begin_one_moment` and
@@ -16759,6 +16781,43 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.history.drain(..overflow);
         }
         self.hist_at = self.history.len() - 1;
+    }
+
+    /// **The commit at a click's release on a row that jumps to the
+    /// pointer**, remembering the moment it left: the click may turn out to
+    /// be the first of a double, and nothing can know that yet.
+    fn undo_commit_click(&mut self, row: ClickRow) {
+        let top = |s: &Self| s.history.get(s.hist_at).map(|m| std::sync::Arc::clone(&m.words));
+        let was = top(self);
+        self.undo_commit();
+        self.click_moment = top(self)
+            .filter(|now| !was.as_ref().is_some_and(|w| std::sync::Arc::ptr_eq(w, now)))
+            .map(|now| (row, now));
+    }
+
+    /// **A double-click's reset is one step back with its first click.**
+    ///
+    /// Each press on such a row jumps it to the pointer, so the first click
+    /// committed its jump at its release (`undo_commit_click`), and the
+    /// reset at the second release made a second moment: one Ctrl+Z after
+    /// a double-click landed on a value nobody chose. The reset takes that
+    /// moment's place instead, but only while it is still the moment stood
+    /// on, is this row's, and carries no reorder; anything else between the
+    /// two clicks leaves the reset a moment of its own.
+    fn undo_commit_double_click(&mut self, row: ClickRow) {
+        if let Some((clicked, words)) = self.click_moment.take() {
+            let first_click_on_top = clicked == row
+                && self.undo_hold == 0
+                && self.hist_at > 0
+                && self.history.get(self.hist_at).is_some_and(|m| {
+                    std::sync::Arc::ptr_eq(&m.words, &words) && m.perm.is_none()
+                });
+            if first_click_on_top {
+                self.history.truncate(self.hist_at);
+                self.hist_at -= 1;
+            }
+        }
+        self.undo_commit();
     }
 
     /// A fresh project starts a fresh line of time.
@@ -36607,14 +36666,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             }
-            DialogAction::SetKeysParam { slot, knob, value, done } => {
+            DialogAction::SetKeysParam { slot, knob, value, done, double } => {
                 self.set_keys_param_of(slot, knob, value);
                 // **The knob's one moment, when the hand lets go.** It moves
                 // the sound on every frame of the drag, and the knobs are
                 // hashed (`keys_params`): it committed nothing, so a turned
-                // Hammer rode the next gesture's step back.
-                if done {
-                    self.undo_commit();
+                // Hammer rode the next gesture's step back. A double-click's
+                // reset takes the place of its first click's jump.
+                if done && double {
+                    self.undo_commit_double_click(ClickRow::Keys(slot, knob));
+                } else if done {
+                    self.undo_commit_click(ClickRow::Keys(slot, knob));
                 }
             }
             DialogAction::ResetKeysParams { slot } => {
@@ -44039,10 +44101,17 @@ mod tests {
                 knob: 1,
                 value: f32::from(f) * 0.08,
                 done: false,
+                double: false,
             });
         }
         assert_eq!(app.hist_at, before, "the knob pushed {} moments mid-drag", app.hist_at - before);
-        app.apply_dialog_action(DialogAction::SetKeysParam { slot: 3, knob: 1, value: 0.8, done: true });
+        app.apply_dialog_action(DialogAction::SetKeysParam {
+            slot: 3,
+            knob: 1,
+            value: 0.8,
+            done: true,
+            double: false,
+        });
         assert_eq!(app.hist_at, before + 1, "the knob's release left {} moments", app.hist_at - before);
         // One step back puts the knob where the hand found it.
         app.undo();
@@ -44050,6 +44119,55 @@ mod tests {
             (app.keys_param_of(3, 1) - was).abs() < 1.0e-6,
             "one Ctrl+Z left the knob at {} rather than {was}",
             app.keys_param_of(3, 1)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A double-click on a Keys knob is one step back**, to where the knob
+    /// stood before the first click.
+    ///
+    /// The knob jumps to the pointer on each press, and the first click's
+    /// release said `done` and committed that jump before anything could
+    /// know a second click was coming; the reset at the second release
+    /// committed again, so one Ctrl+Z after a double-click left the knob at
+    /// the first click's jump. The panel marks the reset
+    /// (`SetKeysParam::double`) and it takes the first click's place - but
+    /// never another knob's moment.
+    #[test]
+    fn a_double_click_on_a_keys_knob_is_one_step_back() {
+        let root = project_scratch("keysdouble");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let knob = |app: &mut TangentApp, knob: usize, value: f32, done: bool, double: bool| {
+            app.apply_dialog_action(DialogAction::SetKeysParam { slot: 3, knob, value, done, double });
+        };
+        knob(&mut app, 1, 0.2, true, false);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        // The first click: its press jumps the knob, its release ends it.
+        knob(&mut app, 1, 0.95, false, false);
+        knob(&mut app, 1, 0.95, true, false);
+        // The second click's release: the bench's own value.
+        knob(&mut app, 1, 0.5, true, true);
+        assert_eq!(app.hist_at, before + 1, "the double-click left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.keys_param_of(3, 1) - 0.2).abs() < 1.0e-6,
+            "one Ctrl+Z after the double-click left the knob at {}, not 0.2",
+            app.keys_param_of(3, 1)
+        );
+
+        // A reset on another knob takes nothing from this knob's click.
+        app.redo();
+        let before = app.hist_at;
+        knob(&mut app, 1, 0.9, true, false);
+        knob(&mut app, 2, 0.33, true, true);
+        assert_eq!(app.hist_at, before + 2, "a click and another knob's reset left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.keys_param_of(3, 1) - 0.9).abs() < 1.0e-6,
+            "undoing the other knob's reset took this knob's click with it"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -61007,6 +61125,58 @@ mod tests {
             "one Ctrl+Z did not put the dragged depth back"
         );
         assert_ne!(app.choice_key("delay_division"), was, "one Ctrl+Z also undid the pick");
+    }
+
+    /// **A double-click on an effect row is one step back**, to where the
+    /// row stood before the first click.
+    ///
+    /// Each press on a row jumps it to the pointer, and the first click's
+    /// release committed that jump before anything could know a second
+    /// click was coming; the second release then put the row back and
+    /// committed again. So one Ctrl+Z after a double-click landed on the
+    /// first click's jump, a value nobody chose. The reset now takes that
+    /// moment's place - and only that one: two clicks too far apart in time
+    /// are two gestures, and stay two steps.
+    #[test]
+    fn a_double_click_on_an_effect_row_is_one_step_back() {
+        let (ctx, mut app) = headless_with_fx(Caps::DESKTOP);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let fx = recorder_panel::Fx::Chorus;
+        app.set_effect_param("chorus_depth", 0.3);
+        app.fx_open = Some(fx);
+        let _ = run_frame(&ctx, &mut app);
+        app.arr_save_edits();
+        app.commit_view_change();
+        let before = app.hist_at;
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.9);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        let jumped = app.effect_param("chorus_depth");
+        assert!((jumped - 0.3).abs() > 0.2, "fixture: the first click did not jump the row");
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        assert!(
+            !app.settings.effect_params.contains_key("chorus_depth"),
+            "fixture: the double-click did not put the row back"
+        );
+        assert_eq!(app.hist_at, before + 1, "the double-click left {} moments", app.hist_at - before);
+        app.undo();
+        assert!(
+            (app.effect_param("chorus_depth") - 0.3).abs() < 1.0e-6,
+            "one Ctrl+Z after the double-click left the row at {}, the first click's {jumped}",
+            app.effect_param("chorus_depth")
+        );
+
+        // Two clicks half a second apart are not a double: two steps.
+        let before = app.hist_at;
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.8);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        let _ = hold_frame(&ctx, &mut app, 0.5);
+        let at = row_probe(screen, app.fx_anchor(fx), fx, "chorus_depth", 0.1);
+        press(&ctx, &mut app, at);
+        release(&ctx, &mut app, at);
+        assert_eq!(app.hist_at, before + 2, "two separate clicks left {} moments", app.hist_at - before);
     }
 
     /// A named parameter steps through its list and wraps.

@@ -1857,11 +1857,17 @@ pub enum DialogAction {
     /// app takes the knob's one undo moment. Only this window can know it:
     /// on the desktop the panel is its own viewport, and the main frame
     /// cannot see the pointer let go inside it.
+    ///
+    /// `double` marks the reset a double-click lands, at its second
+    /// release. The first click jumped the knob to the pointer and already
+    /// said `done`, so the app lets the reset take that click's moment
+    /// rather than make a second one (`undo_commit_double_click`).
     SetKeysParam {
         slot: usize,
         knob: usize,
         value: f32,
         done: bool,
+        double: bool,
     },
     /// **Initialise the sound**: every knob of the strip's current patch back
     /// to the value the bench signed off. The other sound is untouched.
@@ -8028,6 +8034,7 @@ fn show_on(
                                                     knob,
                                                     value: v,
                                                     done,
+                                                    double,
                                                 });
                                             }
                                             ui.label(
@@ -21724,7 +21731,9 @@ at: None,
     /// asked it was always false and the double click did nothing but jump
     /// the knob to the pointer twice. The second release of a double click
     /// lands the knob on the bench's own value, and says `done` - one undo
-    /// moment, wave one's rule for the reset.
+    /// moment, wave one's rule for the reset - and `double`, so the app lets
+    /// it take the place of the first click's jump (the app's half is
+    /// `a_double_click_on_a_keys_knob_is_one_step_back`).
     #[test]
     fn a_double_click_puts_a_keys_knob_back() {
         let ctx = egui::Context::default();
@@ -21795,17 +21804,23 @@ at: None,
                 continue;
             };
             let default = KEYS_PARAM_SPECS[0][knob].2;
-            let _ = frame(vec![button(at, false)]);
+            let first_up = frame(vec![button(at, false)]);
+            assert!(
+                matches!(first_up, Some(DialogAction::SetKeysParam { done: true, double: false, .. })),
+                "the first click's release was not a plain end of a gesture"
+            );
             let _ = frame(vec![button(at, true)]);
             let second = frame(vec![button(at, false)]);
             match second {
-                Some(DialogAction::SetKeysParam { knob: k, value, done, .. }) => {
+                Some(DialogAction::SetKeysParam { knob: k, value, done, double, .. }) => {
                     assert_eq!(k, knob, "the reset landed on another knob");
                     assert!(
                         (value - default).abs() < 1.0e-6,
                         "a double click left the knob at {value}, not the bench's {default}"
                     );
                     assert!(done, "the double click's reset did not end the gesture");
+                    // So the app can let it take the first click's moment.
+                    assert!(double, "the double click's reset did not say it was one");
                 }
                 Some(_) => panic!("the double click asked for something else"),
                 None => panic!("the double click's second release said nothing"),
