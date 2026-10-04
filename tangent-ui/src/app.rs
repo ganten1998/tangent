@@ -14021,13 +14021,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
     }
 
-    /// One bar in seconds, from the band's own tempo and signature.
     /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
     /// a bar, a beat, or a hundredth of one. Start PANS the viewport, End
     /// moves its far edge, Length zooms around its centre.
     fn lcd_adjust(&mut self, row: u8, part: u8, steps: f64) {
-        let bar = self.arr_bar_s();
-        let beat = bar / f64::from(self.time_signature().beats.max(1));
+        // A bar and a beat where the row moves - the window's start, its far
+        // edge, its centre or the playhead - on the song's maps.
+        let (s, l) = self.arr_window_now();
+        let at = match row {
+            0 => s,
+            1 => s + l,
+            3 => self.recorder.position_s,
+            _ => s + l * 0.5,
+        };
+        let bar = self.arr_bar_s(at);
+        let beats = {
+            let (tempo, meter) = (self.live_tempo_map(), self.live_meter_map());
+            meter.sig_at_bar(meter.bar_beat_at_quarter(tempo.beat_at_seconds(at.max(0.0))).0).beats
+        };
+        let beat = bar / f64::from(beats.max(1));
         let unit = match part {
             0 => bar,
             1 => beat,
@@ -14041,7 +14053,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.request_recorder(recorder::RecorderRequest::Locate(to));
             return;
         }
-        let (s, l) = self.arr_window_now();
         match row {
             0 => self.arr_steer(s + d, l),
             1 => self.arr_steer(s, (l + d).max(0.25)),
@@ -14052,22 +14063,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    fn arr_bar_s(&self) -> f64 {
-        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
-        let sig = self.time_signature();
-        f64::from(sig.beats) * (60.0 / bpm) * (4.0 / f64::from(sig.unit))
+    /// One bar in seconds where `at` stands: the bar the ruler draws there,
+    /// on the song's tempo and meter maps, from `at`.
+    fn arr_bar_s(&self, at: f64) -> f64 {
+        self.arr_rung_s(0, at)
     }
 
-    /// The grid in seconds: one rung of `grid_quarters`, the note value the
-    /// ruler draws, so an arrow step is one drawn line. It was the bar times
-    /// `2^exp`, which in 3/4, 6/8 and 7/8 is no line at all, and the magnet
-    /// after the step skipped lines. At the dial's tempo and signature, not
-    /// the maps', as `arr_bar_s` is.
-    fn arr_grid_s(&self) -> f64 {
-        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
-        let sig = self.time_signature();
-        let exp = self.settings.arr_grid_exp.clamp(-6, 3) as i8;
-        crate::arrangement_panel::grid_quarters(exp, sig.beats, sig.unit) * (60.0 / bpm)
+    /// The grid in seconds where `at` stands: one rung of `grid_quarters`,
+    /// the note value the ruler draws in that bar's signature, so an arrow
+    /// step is one drawn line. It was the bar times `2^exp`, which in 3/4,
+    /// 6/8 and 7/8 is no line at all, and the magnet after the step skipped
+    /// lines. On the song's maps, as `arr_bar_s` is.
+    fn arr_grid_s(&self, at: f64) -> f64 {
+        self.arr_rung_s(self.settings.arr_grid_exp.clamp(-6, 3) as i8, at)
+    }
+
+    /// **One step of rung `exp` where `at` stands** (a bar at zero), in
+    /// seconds: the straight grid `quantize::Grid` walks on the song's maps,
+    /// which is the arrangement magnet's walk (`snap_quarter`). Both lengths
+    /// above came from the tempo dial and the settings' signature, so past a
+    /// tempo or meter change a step was a length the song does not have
+    /// there.
+    fn arr_rung_s(&self, exp: i8, at: f64) -> f64 {
+        crate::quantize::Grid::new(self.live_tempo_map(), self.live_meter_map(), exp, false, None)
+            .map_or(0.0, |g| g.step_at(at.max(0.0)))
     }
 
     /// **The playhead walks the grid on the arrow keys**, in the arrange
@@ -14078,8 +14097,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// step is rounded to the nearest line, which from a line IS the next
     /// line, and from between two lines is the nearer of the two ahead.
     fn arr_step_playhead(&mut self, dir: f64, by_bar: bool) {
-        let step = if by_bar { self.arr_bar_s() } else { self.arr_grid_s() }.max(0.01);
-        let to = (self.playhead_s() + dir.signum() * step).max(0.0);
+        let at = self.playhead_s();
+        let step = if by_bar { self.arr_bar_s(at) } else { self.arr_grid_s(at) }.max(0.01);
+        let to = (at + dir.signum() * step).max(0.0);
         let to = self.arr_snap_t(to);
         self.locate(to);
     }
@@ -19514,7 +19534,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let dur = if view.snap_on {
                 (crate::midi_editor::snap_next_t(&view, t0) - t0).max(0.02)
             } else {
-                crate::midi_editor::grid_step_s(&view).max(0.05)
+                crate::midi_editor::grid_step_at(&view, t0).max(0.05)
             };
             (dur, (clip.start_s, clip.start_s + clip.len_s, clip.offset_s))
         };
@@ -20343,26 +20363,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let step = {
+        // **The step where each note stands**: across a tempo change inside
+        // the part the two sides' steps differ, and a copy one playhead's
+        // step later left the lines on the other side.
+        let steps: Vec<f64> = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
             let view = self.midi_edit_view(st, clip);
-            let g = crate::midi_editor::grid_step_s(&view).max(0.05);
-            // A swung phrase copied one straight step later lands its long
-            // notes in the short slots: the copy moves by the PAIR.
-            if view.snap_on && view.swing && !view.triplet {
-                g * 2.0
-            } else {
-                g
-            }
+            let pair = view.snap_on && view.swing && !view.triplet;
+            sel.iter()
+                .map(|&i| {
+                    let at = clip
+                        .notes
+                        .get(i)
+                        .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                    let g = crate::midi_editor::grid_step_at(&view, at).max(0.05);
+                    // A swung phrase copied one straight step later lands its
+                    // long notes in the short slots: the copy moves by the PAIR.
+                    if pair { g * 2.0 } else { g }
+                })
+                .collect()
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let end = clip.offset_s + clip.len_s;
         let mut fresh = Vec::new();
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             let Some(n) = clip.notes.get(i) else { continue };
             let mut c = n.clone();
             c.at_s += step;
@@ -20490,7 +20518,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let (step, walked) = {
+        let (steps, walked) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
@@ -20520,7 +20548,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .collect::<Vec<f64>>()
                 });
             (
-                crate::midi_editor::grid_step_s(&view).max(0.01),
+                // The step where each note stands - see `me_duplicate`.
+                sel.iter()
+                    .map(|&i| {
+                        let at = clip
+                            .notes
+                            .get(i)
+                            .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                        crate::midi_editor::grid_step_at(&view, at).max(0.01)
+                    })
+                    .collect::<Vec<f64>>(),
                 walked,
             )
         };
@@ -20539,18 +20576,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_save_edits();
             return;
         }
-        let dt = steps_t * step;
-        // The set's clamps, exactly as a drag's.
-        let mut dt_all = dt;
+        // The set's clamps, exactly as a drag's: every note travels the same
+        // SHARE of its own step, cut down at the first wall, so the set stops
+        // as one. With one step for all - one tempo - it is the uniform
+        // clamp it was.
+        let mut share = steps_t;
         let mut dk_all = dk;
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             let Some(n) = clip.notes.get(i) else { continue };
-            dt_all = dt_all.clamp(-n.at_s + clip.offset_s, (end - n.dur_s.max(0.05) - n.at_s).max(0.0));
+            share = (share * step)
+                .clamp(-n.at_s + clip.offset_s, (end - n.dur_s.max(0.05) - n.at_s).max(0.0))
+                / step;
             dk_all = dk_all.clamp(-i32::from(n.key), 127 - i32::from(n.key));
         }
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&steps) {
             if let Some(n) = clip.notes.get_mut(i) {
-                n.at_s += dt_all;
+                n.at_s += share * step;
                 n.key = (i32::from(n.key) + dk_all).clamp(0, 127) as u8;
             }
         }
@@ -20769,9 +20810,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// left and right arrows, the owner's "Shift+Left/Right arrow = elongate
     /// note".
     ///
-    /// Every selected note by the same amount rather than to the same length,
-    /// so a chord of unequal notes keeps its shape. A note can never be
-    /// shortened out of existence or lengthened past its clip's end.
+    /// Every selected note by the same amount rather than to the same length
+    /// (the grid step where it starts), so a chord of unequal notes keeps
+    /// its shape. A note can never be shortened out of existence or
+    /// lengthened past its clip's end.
     fn me_resize_selection(&mut self, steps: f64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -20780,17 +20822,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.is_empty() {
             return;
         }
-        let step = {
+        // The step where each note starts - see `me_duplicate`. A chord
+        // shares its start, so it keeps its shape.
+        let note_steps: Vec<f64> = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
-            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.01)
+            let view = self.midi_edit_view(st, clip);
+            sel.iter()
+                .map(|&i| {
+                    let at = clip
+                        .notes
+                        .get(i)
+                        .map_or(clip.start_s, |n| clip.start_s + (n.at_s - clip.offset_s));
+                    crate::midi_editor::grid_step_at(&view, at).max(0.01)
+                })
+                .collect()
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let end = clip.offset_s + clip.len_s;
-        for &i in &sel {
+        for (&i, &step) in sel.iter().zip(&note_steps) {
             if let Some(n) = clip.notes.get_mut(i) {
                 let room = (end - n.at_s).max(ME_MIN_DUR_S);
                 n.dur_s = (n.dur_s + steps * step).clamp(ME_MIN_DUR_S, room);
@@ -21021,7 +21074,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// before the fourth arrived, and four copies of `0.08` is how a rail
     /// and a fit come to disagree about where the clip ends.
     fn me_clip_pad_s(&self, clip: &crate::arrangement::ArrClip) -> f64 {
-        (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5)
+        (clip.len_s * 0.08).max(self.arr_bar_s(clip.start_s) * 0.5)
     }
 
     /// **The navigator's world**, `(start, len)` in absolute seconds: the
@@ -24774,14 +24827,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
                 MeDrag::Create { i } => {
+                    // One step where the note being drawn starts.
                     let step = self
                         .midi_edit
                         .as_ref()
                         .and_then(|st| {
                             let clip =
                                 self.arrangement.clips.iter().find(|c| c.id == st.id)?;
+                            let at = clip.start_s + (clip.notes.get(i)?.at_s - clip.offset_s);
                             let view = self.midi_edit_view(st, clip);
-                            Some(crate::midi_editor::grid_step_s(&view))
+                            Some(crate::midi_editor::grid_step_at(&view, at))
                         })
                         .unwrap_or(0.05)
                         .max(0.05);
@@ -27247,7 +27302,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The MIDI item the shift-drag drew, taken into the document —
             // and the lane with it, if it was nobody's yet.
             if let Some((lane, t0, t1)) = self.arr_pending.take() {
-                let min_len = (self.arr_grid_s() * 0.5).max(0.05);
+                let min_len = (self.arr_grid_s(t0) * 0.5).max(0.05);
                 if t1 - t0 >= min_len {
                     if self.channel_kind(lane).is_none() {
                         // Drawing a MIDI item on a bare lane makes it a
@@ -50178,6 +50233,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A uniform step in the MIDI editor is the step where the note is.**
+    ///
+    /// A duplicate, a straight-grid nudge, a resize, a note drawn with the
+    /// magnet off and the length a note being drawn is held to all moved by
+    /// one grid step - the step at the PLAYHEAD. With 120 changing to 90
+    /// inside a part and the playhead before the change, a note after it
+    /// moved by the 120's eighth (a quarter second) on a grid whose eighths
+    /// there are a third of one, and left the lines. Each asks the grid
+    /// where the note stands now.
+    #[test]
+    fn the_editors_uniform_steps_are_the_step_where_the_note_is() {
+        let root = project_scratch("me-note-step");
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+        app.bootstrap_project(&root.join("Projects"));
+        app.dialog = None;
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.midi_snap = true;
+        app.settings.midi_swing = false;
+        app.settings.midi_triplet = false;
+        app.settings.midi_grid_exp = -3;
+        // 120 for four bars, then 90: eighths of 0.25 s, then of 1/3 s.
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 90.0, ramp: false },
+        ]);
+        let eighth = 1.0 / 3.0;
+        let beat = |app: &TangentApp, b: f64| app.live_tempo_map().seconds_at_beat(b);
+        // A part from 6 s to 14 s, a note on beat 18 (9 + 1/3 s), after the
+        // change; the playhead at 6.5 s, before it.
+        let at = beat(&app, 18.0);
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote { at_s: at - 6.0, dur_s: 0.2, key: 60, vel: 100, muted: false }],
+            lane: 1, start_s: 6.0, len_s: 8.0, name: "MIDI".to_owned(), ..Default::default()
+        });
+        app.arrangement_open = true;
+        app.open_midi_editor(id);
+        app.recorder.position_s = 6.5;
+        let note = |app: &TangentApp, i: usize| {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part");
+            (6.0 + c.notes[i].at_s, c.notes[i].dur_s)
+        };
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        app.me_nudge(1.0, 0);
+        assert!((note(&app, 0).0 - beat(&app, 18.5)).abs() < 1e-9, "a nudge moved the note to {}", note(&app, 0).0);
+        app.me_nudge(-1.0, 0);
+        assert!((note(&app, 0).0 - at).abs() < 1e-9, "the nudge back left it at {}", note(&app, 0).0);
+        app.me_resize_selection(1.0);
+        assert!((note(&app, 0).1 - (0.2 + eighth)).abs() < 1e-9, "a resize made it {} long", note(&app, 0).1);
+        app.me_resize_selection(-1.0);
+        assert!((note(&app, 0).1 - 0.2).abs() < 1e-9, "the resize back made it {} long", note(&app, 0).1);
+        app.me_duplicate();
+        assert!((note(&app, 1).0 - beat(&app, 18.5)).abs() < 1e-9, "the duplicate landed at {}", note(&app, 1).0);
+        // A note drawn with the magnet off is one step long where it starts.
+        app.settings.midi_snap = false;
+        app.me_create_note(11.1, 64);
+        assert!((note(&app, 2).1 - eighth).abs() < 1e-9, "a note drawn with the magnet off ran {}", note(&app, 2).1);
+        // The length a note being DRAWN is held to: the pen down on beat 22
+        // (12 s), then pulled back over its own head.
+        app.settings.midi_snap = true;
+        app.settings.midi_draw_mode = true;
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.view_start_s = 11.5;
+            st.view_len_s = 2.5;
+            st.selected.clear();
+            st.drag = None;
+        }
+        let _ = run_frame(&ctx, &mut app);
+        assert!(app.dialog.is_none(), "fixture: a dialog stands over the editor");
+        let rect = app.midi_edit_rect.expect("the editor drew nowhere");
+        let (down, back) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let v = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            let y = l.roll.center().y;
+            let x = |t: f64| crate::midi_editor::x_of(&l, &v, t);
+            (Pos2::new(x(12.05), y), Pos2::new(x(11.95), y))
+        };
+        let count = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part").notes.len();
+        press(&ctx, &mut app, down);
+        move_to(&ctx, &mut app, back);
+        let drawn = app.arrangement.clips.iter().find(|c| c.id == id).expect("the part").notes.clone();
+        assert_eq!(drawn.len(), count + 1, "fixture: the pen drew no note");
+        let held = drawn[count].dur_s;
+        assert!((held - eighth).abs() < 1e-9, "a note pulled back while drawn was held to {held}");
+        release(&ctx, &mut app, back);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The loop bar stands where the loop turns over**, on a part trimmed
     /// from its front too. The passes count from the clip's source origin,
     /// `start - offset`, and the bar counted from the clip's head, so on a
@@ -50277,8 +50424,8 @@ mod tests {
         let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.arr_snap = true;
         app.settings.arr_grid_exp = -2;
-        let grid = app.arr_grid_s();
-        let bar = app.arr_bar_s();
+        let grid = app.arr_grid_s(0.0);
+        let bar = app.arr_bar_s(0.0);
         app.locate(0.0);
         while app.take_recorder_request().is_some() {}
 
@@ -50329,6 +50476,45 @@ mod tests {
                     app.playhead_s()
                 );
             }
+        }
+    }
+
+    /// **The arrange view's arrows walk the song's grid and bars past a
+    /// change, not the dial's.** A press stepped by `arr_grid_s` and
+    /// `arr_bar_s`, the tempo dial's and the settings' signature's, so after
+    /// a tempo or meter change it walked a length the song does not have
+    /// there: with the magnet off the head left the lines. Both follow the
+    /// maps now, where the head stands, as the magnet does.
+    #[test]
+    fn the_arrange_views_arrows_walk_the_songs_grid_past_a_change() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.arr_grid_exp = -2; // a quarter in 4/4
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.settings.record_time_signature = "4/4".to_owned();
+        // 120 for four bars, then 80; 4/4, then 3/4 from bar 6 (beat 24).
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 80.0, ramp: false },
+        ]);
+        app.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint { at_bar: 0, sig: recorder::TimeSignature { beats: 4, unit: 4 } },
+            crate::tempo::MeterPoint { at_bar: 6, sig: recorder::TimeSignature { beats: 3, unit: 4 } },
+        ]);
+        let at_beat = |app: &TangentApp, b: f64| app.live_tempo_map().seconds_at_beat(b);
+        for (what, from, by_bar, to) in [
+            ("a grid step from beat 17", 17.0, false, 18.0),
+            ("a bar from bar 4's line", 16.0, true, 20.0),
+            ("a bar from bar 6's line, in 3/4", 24.0, true, 27.0),
+        ] {
+            app.locate(at_beat(&app, from));
+            app.arr_step_playhead(1.0, by_bar);
+            let want = at_beat(&app, to);
+            assert!(
+                (app.playhead_s() - want).abs() < 1.0e-9,
+                "{what} went to {}, not beat {to} at {want}",
+                app.playhead_s()
+            );
         }
     }
 
@@ -68027,7 +68213,7 @@ mod tests {").expect("the tests module")];
             (st.view_start_s, st.view_len_s)
         };
         let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
-        let pad = (clip.len_s * 0.08).max(app.arr_bar_s() * 0.5);
+        let pad = (clip.len_s * 0.08).max(app.arr_bar_s(clip.start_s) * 0.5);
         let wall = clip.start_s + clip.len_s + pad;
         assert!(
             start + len <= wall + 1.0e-6,
