@@ -16602,9 +16602,7 @@ impl Engine {
                     Arc::clone(&shared),
                     Arc::clone(&fault),
                 )?;
-                stream
-                    .play()
-                    .map_err(|e| format!("{name}: could not start the output stream ({e})"))?;
+                stream.play().map_err(|e| stream_play_error(&name, e))?;
                 // The device outlives the stream on purpose: ASIO's input
                 // must open through this same object. See `out_device_obj`.
                 (Some(stream), Some(device), None)
@@ -20286,7 +20284,50 @@ where
             },
             None,
         )
-        .map_err(|e| format!("could not open the output stream ({e})"))
+        .map_err(stream_build_error)
+}
+
+/// **What a driver that is THERE says when it will not play**, written into
+/// the open's error ahead of its reason - see [`driver_refusal`].
+const DRIVER_REFUSED: &str = "the driver refused it: ";
+
+/// The open's error for a stream that would not build.
+///
+/// **Gone, or there and saying no.** `DeviceNotAvailable` is the first: the
+/// interface unplugged, or a driver registered for hardware that is not
+/// attached. Every other failure is the second - a buffer, a rate, a format
+/// or a channel count the driver turned down (the vendored ASIO host hands
+/// its driver's own reason up as `BackendSpecific`) - and says so, because
+/// the ASIO fallback asked "is the interface plugged in?" of both.
+pub(crate) fn stream_build_error(e: cpal::BuildStreamError) -> String {
+    let reason = match e {
+        cpal::BuildStreamError::DeviceNotAvailable => {
+            return format!("could not open the output stream ({e})");
+        }
+        // The driver's own words, without cpal's "a backend-specific error
+        // has occurred" in front of them.
+        cpal::BuildStreamError::BackendSpecific { err } => err.description,
+        other => other.to_string(),
+    };
+    format!("could not open the output stream - {DRIVER_REFUSED}{reason}")
+}
+
+/// As [`stream_build_error`], for a stream that built and would not start.
+fn stream_play_error(name: &str, e: cpal::PlayStreamError) -> String {
+    let reason = match e {
+        cpal::PlayStreamError::DeviceNotAvailable => {
+            return format!("{name}: could not start the output stream ({e})");
+        }
+        cpal::PlayStreamError::BackendSpecific { err } => err.description,
+    };
+    format!("{name}: could not start the output stream - {DRIVER_REFUSED}{reason}")
+}
+
+/// **The driver's reason, when the open failed on a device that is there.**
+/// `None` when there was nothing to ask: no device by that name, none live,
+/// or one that went away (see [`stream_build_error`]).
+pub(crate) fn driver_refusal(err: &str) -> Option<&str> {
+    err.find(DRIVER_REFUSED).map(|at| err[at + DRIVER_REFUSED.len()..].trim())
 }
 
 /// How far ahead of the callback the audio it is writing will be heard.
@@ -21197,6 +21238,47 @@ mod tests {
             "Focusrite USB ASIO".to_string(),
         ];
         assert_eq!(match_output_name(&names, "MOTU"), None);
+    }
+
+    /// **A driver that refuses the stream is told from one that is not
+    /// there.** The ASIO fallback asked "is the interface plugged in?" of
+    /// every failure, and an interface that is plugged in but whose driver
+    /// turned down the buffer, the rate or the format got the same question
+    /// and a watch for a plug that never comes. The open's error now carries
+    /// which it was, and the driver's own reason with a refusal.
+    #[test]
+    fn a_driver_that_refuses_the_stream_is_told_from_one_that_is_gone() {
+        let refused = [
+            stream_build_error(cpal::BuildStreamError::StreamConfigNotSupported),
+            stream_build_error(cpal::BuildStreamError::InvalidArgument),
+            stream_build_error(cpal::BuildStreamError::BackendSpecific {
+                err: cpal::BackendSpecificError { description: "Invalid buffer size".into() },
+            }),
+            stream_play_error(
+                "Komplete Audio 6",
+                cpal::PlayStreamError::BackendSpecific {
+                    err: cpal::BackendSpecificError { description: "ASE_HWMalfunction".into() },
+                },
+            ),
+        ];
+        for err in &refused {
+            assert!(driver_refusal(err).is_some(), "a refusal reads as an absence: {err}");
+        }
+        assert_eq!(
+            driver_refusal(&refused[2]),
+            Some("Invalid buffer size"),
+            "the driver's own reason is not what the refusal carries"
+        );
+        let gone = [
+            stream_build_error(cpal::BuildStreamError::DeviceNotAvailable),
+            stream_play_error("Komplete Audio 6", cpal::PlayStreamError::DeviceNotAvailable),
+            // `resolve_output`'s own failures: nothing there to refuse.
+            "no audio output matching \"Komplete Audio 6\"; this machine has ASIO4ALL v2".to_owned(),
+            "no audio output on this machine reports a working config".to_owned(),
+        ];
+        for err in &gone {
+            assert_eq!(driver_refusal(err), None, "an absence reads as a refusal: {err}");
+        }
     }
 
     // ── raw MIDI to a VST3 note ────────────────────────────────────────────
