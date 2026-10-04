@@ -16582,8 +16582,11 @@ fn render_placed_span(
 /// **Every system's filesystem, not only this one's.** A project is a folder
 /// that travels, and Windows refuses `< > : " | ? *` and control characters
 /// where macOS and Linux shrug; a clip or an export named with any of them
-/// wrote here and failed there. And Windows drops a trailing dot, so a stem
-/// ending in one names a different file than the one written.
+/// wrote here and failed there. And Windows drops trailing dots and spaces,
+/// so a stem ending in either names a different file than the one written:
+/// every one goes, not one pass of each. And it keeps CON, NUL, COM1 and
+/// the rest for devices, so such a stem gets a `_` in front
+/// ([`is_windows_device_name`]).
 #[cfg(feature = "recorder")]
 fn sanitize_file_stem(name: &str) -> String {
     let s: String = name
@@ -16599,12 +16602,32 @@ fn sanitize_file_stem(name: &str) -> String {
             }
         })
         .collect();
-    let s = s.trim().trim_end_matches('.').trim();
+    let s = s.trim().trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if s.is_empty() {
         "mix".to_owned()
+    } else if is_windows_device_name(s) {
+        format!("_{s}")
     } else {
         s.to_owned()
     }
+}
+
+/// **A name Windows keeps for a device**: CON, PRN, AUX, NUL, COM0-9 and
+/// LPT0-9 (and COM or LPT with a superscript one, two or three), in any
+/// case, judged on what comes before the first dot, as Windows judges it -
+/// `nul.tar.gz` is NUL. Such a file is the device on a Windows machine, and
+/// the project's folder travels there.
+#[cfg(feature = "recorder")]
+fn is_windows_device_name(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let digit = base.strip_prefix("COM").or_else(|| base.strip_prefix("LPT"));
+    digit.is_some_and(|d| {
+        let mut c = d.chars();
+        matches!((c.next(), c.next()), (Some(n), None) if n.is_ascii_digit() || matches!(n, '¹' | '²' | '³'))
+    })
 }
 
 // ── the browser's three verbs, host-side ────────────────────────────────────
@@ -25923,6 +25946,27 @@ mod tests {
         assert_eq!(sanitize_file_stem("tab\tbell\u{7}"), "tab-bell-");
         assert_eq!(sanitize_file_stem("ends with a dot."), "ends with a dot");
         assert_eq!(sanitize_file_stem("  ...  "), "mix");
+    }
+
+    /// **Every trailing dot goes, and no device name survives.** One pass of
+    /// dots between two trims left "take. ." as "take." and ". ." as "."
+    /// (a weld written as the hidden `.-glued-1.wav`), and "con" passed:
+    /// exported as `con.wav`, it is the console on Windows, not a file.
+    #[test]
+    fn a_file_stem_loses_every_trailing_dot_and_no_device_name_survives() {
+        assert_eq!(sanitize_file_stem("take. ."), "take");
+        assert_eq!(sanitize_file_stem(". ."), "mix");
+        for dev in ["con", "PRN", "aux", "NUL", "com1", "LPT9", "nul.backup"] {
+            assert_ne!(
+                sanitize_file_stem(dev).to_ascii_uppercase(),
+                dev.to_ascii_uppercase(),
+                "{dev} is a Windows device name"
+            );
+        }
+        // A name that only begins like one is nobody's device.
+        for name in ["console", "com10", "lpt", "auxiliary"] {
+            assert_eq!(sanitize_file_stem(name), name);
+        }
     }
 
     /// **A staged template takes the shelf's place, and a failure leaves one
