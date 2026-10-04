@@ -1453,8 +1453,9 @@ struct ClipAudio {
     audio: Decoded,
     /// `Some(ratio)` while a render is owed: `audio` is then drawn at
     /// `1/ratio` of the clip's time and measured `ratio` times as long (see
-    /// `clip_picture`). The warp's projected length over the file's while
-    /// the warp is out, the stretch while it is.
+    /// `clip_picture`). The warp's projected length over the file's, times
+    /// the stretch it holds back, while the warp is out; the stretch while
+    /// it is.
     stand_in: Option<f64>,
     /// The warp render the clip names, when it has a map.
     warp_key: Option<StretchKey>,
@@ -1514,8 +1515,17 @@ fn clip_audio(
                     } else {
                         out as f64 / src as f64
                     };
+                    // **Times the stretch it holds back** (below): once both
+                    // are made, the clip is heard at the two together. Stood
+                    // in at the warp alone, a stretched take was drawn and
+                    // measured short by its stretch until the warp landed.
+                    // Not past the ceiling, where that stretch is never made.
+                    let held = match stretch_key(clip, path) {
+                        Some(_) if !stretch_over_ceiling(out, clip.stretch) => clip.stretch,
+                        _ => 1.0,
+                    };
                     warp_owed = Some((anchors, mode, fit));
-                    (decoded.clone(), Some(ratio))
+                    (decoded.clone(), Some(ratio * held))
                 }
             }
         }
@@ -24319,12 +24329,12 @@ mod tests {
         assert!(landed.warp_owed.is_none() && landed.stretch.is_none());
 
         // Warped and stretched, with the warp still out: the stretch is held
-        // back and the file stands in at the warp's length.
+        // back, and the file stands in at the length the two will make.
         let both = tangent_ui::arrangement::ArrClip { stretch: 2.0, ..warped.clone() };
         cache.clear();
         let held = clip_audio(&both, path, &file, &cache);
         assert!(held.stretch.is_none(), "a stretch was asked for while its warp was still out");
-        assert_eq!(held.stand_in, Some(ratio));
+        assert_eq!(held.stand_in, Some(ratio * 2.0), "a pending warp stood in at its own ratio, short by the stretch");
 
         // The warp in, the stretch owed: the warp render stands in at the stretch.
         cache.insert(key, render.clone());
@@ -24341,6 +24351,51 @@ mod tests {
         assert!(Arc::ptr_eq(&done.audio.clip, &stretched.clip), "the clip does not play its stretch of the warp");
         assert_eq!(done.stand_in, None);
         assert!(!done.stretch_owed);
+    }
+
+    /// **A stretched clip whose warp is pending stands in at both.** The
+    /// stretch waits for the warp, which it is made from, and the stand-in
+    /// carried the warp's ratio alone: on every open, quantize Apply or undo
+    /// of one, a take stretched to 2.0 was drawn at half its length inside
+    /// its box, and an open-ended one measured half as long, until the warp
+    /// landed. A stretch past the ceiling is never made, so there the warp
+    /// stands in alone. The long decode is zeroed pages nothing reads.
+    #[test]
+    fn a_pending_warp_on_a_stretched_clip_stands_in_at_both() {
+        let rate = 8_000u32;
+        let path = std::path::Path::new("a.wav");
+        let cache: std::collections::HashMap<StretchKey, Decoded> = std::collections::HashMap::new();
+        let take = |frames: usize| Decoded {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.0; frames * 2],
+                rate,
+                source: path.to_path_buf(),
+            }),
+            peaks: tangent_ui::peaks::Peaks::build(&[], 2, rate).shared(),
+        };
+        let quantized = |stretch: f64| tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            path: "a.wav".to_owned(),
+            warp: vec![(0, 0), (8_000, 10_000)],
+            stretch,
+            ..Default::default()
+        };
+        let warp_ratio = |file: &Decoded, clip: &tangent_ui::arrangement::ArrClip| {
+            let (_, anchors, _, _) = warp_plan(clip, path, rate).expect("a warped clip has a plan");
+            crate::warp::projected_frames(file.clip.frames(), &anchors) as f64 / file.clip.frames() as f64
+        };
+        let (file, doubled) = (take(16_000), quantized(2.0));
+        assert_eq!(
+            clip_audio(&doubled, path, &file, &cache).stand_in,
+            Some(warp_ratio(&file, &doubled) * 2.0),
+            "a pending warp stood in at its own ratio, short by the stretch"
+        );
+        let (long, quadrupled) = (take(tangent_record::decode::MAX_FRAMES / 4 + 1), quantized(4.0));
+        assert_eq!(
+            clip_audio(&quadrupled, path, &long, &cache).stand_in,
+            Some(warp_ratio(&long, &quadrupled)),
+            "a stretch the ceiling refuses was stood in for"
+        );
     }
 
     /// **The lengths a reload measured go over in ONE call, and an empty
