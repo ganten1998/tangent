@@ -28930,7 +28930,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it is the only place that knows how. A parameter whose plugin has
     /// since been unloaded still gets a name, because a curve outlives the
     /// plugin that made it and a lane labelled with nothing is a lane
-    /// somebody deletes by mistake.
+    /// somebody deletes by mistake: the plugin it is kept for
+    /// (`Curve::tenant`), or failing that its address.
     pub fn auto_param_label(
         &self,
         lane: usize,
@@ -28960,7 +28961,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // can be found and removed.
                 None => format!("{} (gone: {id})", fx.name),
             },
-            None => param.label(),
+            // **A curve kept for its plugin names it**, and says it is out:
+            // the bay is empty, so there is no list to read the title from.
+            None => match self.arrangement.automation.get(lane, param) {
+                Some(c) if !c.tenant.is_empty() => {
+                    format!("{} (unloaded): parameter {id}", insert_chip_name(&c.tenant))
+                }
+                _ => param.label(),
+            },
         }
     }
 
@@ -72498,6 +72506,40 @@ mod folder_tests {
             a.arrangement.automation.get(3, freq).is_none(),
             "the EQ's curve, kept through the unload, now rides the compressor's attack"
         );
+    }
+
+    /// **A curve kept for its plugin is named for that plugin.** With the
+    /// bay empty there is no parameter list to read a title from, so its row
+    /// fell back to the address, "bay 1 parameter 2", on a curve that
+    /// remembers whose it is (`Curve::tenant`). It names the plugin now, and
+    /// says the plugin is out.
+    #[test]
+    fn a_curve_kept_for_its_plugin_is_named_for_it() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let mut a = app();
+        a.add_bare_track(3);
+        a.set_insert(3, 0, Some("@tangent-eq"));
+        let freq = AutoParam::Plugin { bay: 0, id: 2 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            freq,
+            vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
+        ));
+        a.arr_save_edits();
+        a.set_insert(3, 0, None);
+        assert_eq!(
+            a.auto_param_label(3, freq),
+            format!("{} (unloaded): parameter 2", insert_chip_name("@tangent-eq")),
+            "the curve kept for the EQ is not named for it"
+        );
+        // A curve nobody is on record for keeps the address.
+        let other = AutoParam::Plugin { bay: 1, id: 7 };
+        a.arrangement.automation.set(Curve::sanitised(
+            3,
+            other,
+            vec![Point { at_s: 0.0, value: 0.5, shape: Shape::Linear }],
+        ));
+        assert_eq!(a.auto_param_label(3, other), other.label());
     }
 
     /// **A plugin carried to another bay takes its automation along**, and
