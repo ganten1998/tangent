@@ -7561,7 +7561,8 @@ impl DesktopApp {
     /// check is the owner rule `write_insert_state` keeps for plugin state:
     /// a file that names a different unit moves nothing, out loud. A sampler
     /// preset's file rides along (`preset_sample`), for the app to copy into
-    /// this project and bind after the knobs.
+    /// this project and bind after the knobs, and so does a convolver
+    /// preset's impulse (`preset_impulse`), which the app binds where it is.
     fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
         let parsed = std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -7592,6 +7593,7 @@ impl DesktopApp {
             name,
             values: p.values,
             sample: preset_sample(unit, &p.state),
+            impulse: preset_impulse(unit, &p.state),
         });
     }
 
@@ -16828,6 +16830,31 @@ fn preset_sample(unit: &str, state: &[(String, String)]) -> String {
         .unwrap_or_default()
 }
 
+/// **The impulse a convolver preset plays**, for the app to bind on the bay
+/// that asked (`SetInsertIr`, after the knobs). Only a plain ABSOLUTE path is
+/// handed on: the IR road decodes asks out of that same field
+/// (`dialogs::ir_ask` - delete a file, paste one, raise the chooser), a
+/// preset is a file that can come from anybody, and a delete arriving that
+/// way would run without the confirmation every delete is promised. A value
+/// shaped like an ask (`ir_is_sentinel`), or a relative path nothing could
+/// resolve, is handed on as nothing. No absolute path can begin with the
+/// asks' unit separator, so the second test already covers the first; the
+/// first is kept to state the rule as a rule, as `ir_bindable` keeps it.
+/// Empty for any other unit.
+#[cfg(feature = "recorder")]
+fn preset_impulse(unit: &str, state: &[(String, String)]) -> String {
+    if unit != crate::builtin_fx::IR_PATH {
+        return String::new();
+    }
+    state
+        .iter()
+        .find(|(symbol, _)| symbol == "ir_path")
+        .map(|(_, path)| path.as_str())
+        .filter(|path| !ir_is_sentinel(path) && std::path::Path::new(path).is_absolute())
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
 /// **The longest impulse response the IR bay will take, in seconds.**
 ///
 /// Twenty, and the number is not invented here — it is the one the rest of
@@ -25838,6 +25865,57 @@ mod tests {
         );
     }
 
+    /// **A convolver preset hands on the impulse it plays, and never one of
+    /// the IR road's asks.**
+    ///
+    /// The save road always wrote the impulse into the preset (the face's
+    /// extras carry `ir_path`, absolute), and loading one turned the knobs and
+    /// left the bay playing whatever it held. The load now hands the file on
+    /// (`preset_impulse`) for the app to bind after the knobs. Only a plain
+    /// absolute path: `SetInsertIr` decodes asks out of the same field, and a
+    /// preset shaped like the delete ask would have removed an impulse with
+    /// none of the confirmation a delete is promised. A relative path and
+    /// another unit's state hand on nothing. That the load calls it is a
+    /// source scan.
+    #[test]
+    fn a_convolver_preset_hands_on_its_impulse_and_never_an_ask() {
+        let ir = crate::builtin_fx::IR_PATH;
+        let plate = std::env::temp_dir().join("IRs").join("Plate.wav");
+        let plate = plate.to_string_lossy().into_owned();
+        let state = |path: &str| vec![("ir_path".to_owned(), path.to_owned())];
+        // Saved through the preset road, and read back through the file.
+        let preset = tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: ir.to_owned(),
+            name: "Plate".to_owned(),
+            values: vec![("mix".to_owned(), 0.4)],
+            state: preset_state_for_disk(ir, &state(&plate), None),
+            extra: Default::default(),
+        };
+        let back = tangent_ui::preset::Preset::from_json(&preset.to_json()).expect("a preset");
+        assert_eq!(preset_impulse(ir, &back.state), plate, "the preset's impulse was not handed on");
+        // Never an ask, and never a path nothing could resolve.
+        let delete = tangent_ui::dialogs::ir_delete_ask(&plate);
+        assert_eq!(preset_impulse(ir, &state(&delete)), "", "a preset shaped like a delete ask was handed on");
+        assert_eq!(
+            preset_impulse(ir, &state(tangent_ui::dialogs::IR_BROWSE)),
+            "",
+            "a preset shaped like the chooser's ask was handed on"
+        );
+        assert_eq!(preset_impulse(ir, &state("IRs/Plate.wav")), "", "a relative impulse was handed on");
+        let sample = vec![("sample_path".to_owned(), plate.clone())];
+        assert_eq!(preset_impulse(crate::builtin_fx::SAMPLER_PATH, &sample), "", "a sample read as an impulse");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn load_unit_preset(").expect("load_unit_preset");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("impulse: preset_impulse(unit, &p.state),"),
+            "a loaded preset no longer hands the app its impulse"
+        );
+    }
+
     /// **The sampler's reload keeps the four promises the drumpad's does**,
     /// checked in the source because the behaviours they name are each one
     /// line and each of them was a defect somewhere else first.
@@ -26197,6 +26275,81 @@ mod tests {
         assert!(
             body.contains("self.app.set_sampler_media(sampler_media_on_shelf(dir));"),
             "adopting a shelf no longer tells the app what its samplers name"
+        );
+    }
+
+    /// **A sample loaded onto the sampler during a session rides into a
+    /// template saved from it, into every session made from that template,
+    /// and into a Duplicate.**
+    ///
+    /// The list the app copies a template's sampler files by
+    /// (`sampler_media`) is read off a shelf only when one is adopted, so a
+    /// sample bound later never joins it, and `write_template_into` copies
+    /// only what is listed. It does not have to: loading a sample makes the
+    /// session's folder real first (`sample_into_project`), and Save As
+    /// Template copies a real folder whole before it writes the session over
+    /// it (`build_template`), so the file is in the template; the template's
+    /// own `state/` names it, and the next adoption reads it off that shelf.
+    /// Duplicate copies a real folder's `media/`. Driven through the app's
+    /// own load and the host's own build, as the Template arm builds.
+    #[test]
+    fn a_sample_loaded_during_a_session_rides_into_its_template_and_duplicate() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sampler-tpl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("the template");
+        tangent_ui::arrangement::Arrangement::default().save_to(&tangent_ui::arrangement::doc_in(&template));
+        let library = root.join("Library");
+        std::fs::create_dir_all(&library).expect("a library");
+        std::fs::write(library.join("New.wav"), b"RIFFnew.WAVE").expect("a library sample");
+
+        // A fresh session, and a sample loaded onto its sampler.
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let scratch = root.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: library.join("New.wav").to_string_lossy().into_owned(),
+        });
+        let (_, _, stored) = app.take_sampler_load().expect("the load was not queued");
+        // What `bind_insert_sample` writes on the live shelf for it.
+        let shelf = root.join("shelf");
+        std::fs::create_dir_all(&shelf).expect("a shelf");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::SAMPLER_PATH).expect("the sampler");
+        let extra = vec![("sample_path".to_owned(), stored.to_string_lossy().into_owned())];
+        let mut blob = crate::builtin_fx::SAMPLER_PATH.as_bytes().to_vec();
+        blob.push(0);
+        blob.extend_from_slice(crate::builtin_fx::state_text(spec, &spec.defaults(), &extra).as_bytes());
+        std::fs::write(shelf.join(sidecar_name(0, 0)), blob).expect("the sampler's sidecar");
+
+        // Save As Template, built as the Template arm builds it.
+        let stage = root.join("Templates").join(".Rig.writing");
+        let real = scratch.is_dir();
+        build_template(&app, Some(scratch.as_path()).filter(|_| real), &stage, &shelf).expect("the template");
+        let templated = stage.join("media").join("New.wav").is_file();
+        // A session made from that template: the host reads the shelf it adopts.
+        let mut next = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let later = root.join("Untitled 2");
+        next.adopt_template(&stage, &later);
+        next.set_sampler_media(sampler_media_on_shelf(&stage.join("state")));
+        next.materialize_project_dir();
+        let carried = later.join("media").join("New.wav").is_file();
+        // And a Duplicate of the session the sample was loaded in.
+        let duplicated = app.save_project_as(&root.join("Copy"))
+            && root.join("Copy").join("media").join("New.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stored, std::path::PathBuf::from("media/New.wav"), "fixture: the load was not relative");
+        assert!(real, "fixture: loading a sample did not make the session real");
+        assert_eq!(
+            [templated, carried, duplicated],
+            [true, true, true],
+            "[Save As Template, a session from it, Duplicate]: the loaded sample was left behind"
         );
     }
 

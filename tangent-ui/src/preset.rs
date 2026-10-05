@@ -75,7 +75,11 @@ pub struct Preset {
     /// **The sampler's file is written ABSOLUTE.** Its bay stores it
     /// relative to its own project (`media/<name>`), and a preset has to
     /// play in any project; loading one copies the file into the project
-    /// that loads it and binds that copy.
+    /// that loads it and binds that copy (an audio file only: a preset can
+    /// come from anybody). The convolver's impulse is written as its bay
+    /// names it, an absolute path into the IR library, and loading the
+    /// preset binds it there again; a value shaped like one of the IR road's
+    /// asks is never handed on.
     pub state: Vec<(String, String)>,
     /// Top-level keys this build does not know, preserved verbatim — the
     /// same courtesy the settings file and the drumpad sidecar extend.
