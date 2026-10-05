@@ -793,6 +793,93 @@ fn deliver_stems(landed: &[std::path::PathBuf], dst_dir: &std::path::Path) -> Ve
         .collect()
 }
 
+/// **What is running, as far as starting a pass goes**: the facts
+/// [`pass_refusal`] decides on, read off the recorder by
+/// `DesktopApp::running`.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Copy, Debug, Default)]
+struct Running {
+    /// The realtime export (`bounce`).
+    realtime: bool,
+    /// A full-speed render (`offline_bounce`): an export, or a freeze when
+    /// `freezing` is set too.
+    full_speed: bool,
+    freezing: bool,
+    /// A take on the take machine (`session.is_recording()`), a realtime
+    /// export's own included.
+    take: bool,
+    /// The arrangement record (`arr_rec`).
+    arr_record: bool,
+    /// A count-in a recording begins on (`arr_rec_wait`,
+    /// `take_count_pending`).
+    counting: bool,
+}
+
+/// The pass a press asks for.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NewPass {
+    /// The Export dialog with Realtime on: the live engine plays the span.
+    Realtime,
+    /// The Export dialog's default: a render on an engine of its own.
+    FullSpeed,
+    /// A track's freeze, rendered the full-speed way.
+    Freeze,
+}
+
+/// **Whether a new pass may start now, and what is said when it may not.**
+///
+/// One pass at a time. The realtime export, the full-speed export and the
+/// freeze report under one standing message (`EXPORT_RUNNING`), so a second
+/// pass beside the first takes the first one's message down when either
+/// ends, and the realtime pass never asked about a full-speed render: it
+/// ran beside one. A take or an arrangement record holds all three, as it
+/// always has, and a count-in holds the realtime pass, which would begin
+/// inside the recording the count starts.
+///
+/// Asked BEFORE anything is raised (`DesktopApp::refuse_new_pass`). The
+/// refusals used to come after the Export arm had raised its own text over
+/// the running pass's, and then lowered it: the running export lost its
+/// message and the second press said nothing.
+#[cfg(feature = "recorder")]
+fn pass_refusal(now: Running, asked: NewPass) -> Option<&'static str> {
+    let freeze = asked == NewPass::Freeze;
+    if now.realtime || (now.full_speed && !now.freezing) {
+        return Some(if freeze {
+            "No track freezes while an export runs - freeze it once the export has finished."
+        } else {
+            "An export is already running - start the next one once it has finished."
+        });
+    }
+    if now.full_speed {
+        return Some(if freeze {
+            "A track is already freezing - freeze the next one once it has finished."
+        } else {
+            "No export starts while a track freezes - export once the freeze has finished."
+        });
+    }
+    if now.take {
+        return Some(if freeze {
+            "No track freezes while a take records - freeze it once the take has ended."
+        } else {
+            "No export starts while a take records - export once the take has ended."
+        });
+    }
+    if now.arr_record {
+        return Some(if freeze {
+            "No track freezes while the arrangement records - freeze it once the record has ended."
+        } else {
+            "No export starts while the arrangement records - export once the record has ended."
+        });
+    }
+    if now.counting && asked == NewPass::Realtime {
+        return Some(
+            "A realtime export waits for the count-in - it would start inside the recording the count begins.",
+        );
+    }
+    None
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -6570,7 +6657,12 @@ impl DesktopApp {
                     if self.recorder.bounce.is_some() {
                         // An export is playing the arrangement into a file;
                         // recording into it at the same time is refused, as
-                        // an export is refused over a record.
+                        // an export is refused over a record - and says so,
+                        // where the press did nothing and said nothing.
+                        self.app.notify(
+                            Kind::Info,
+                            "Nothing records while an export runs - it is playing the song into a file.",
+                        );
                     } else if self.recorder.arr_rec_wait {
                         // Pressed again mid-count: the count stops, nothing
                         // records - unless a take is counting on the same
@@ -6621,7 +6713,13 @@ impl DesktopApp {
                 // that ENDS the export is the arm below's, as ever.
                 R::Capture
                     if self.recorder.bounce.is_some()
-                        && !self.recorder.session.is_recording() => {}
+                        && !self.recorder.session.is_recording() =>
+                {
+                    self.app.notify(
+                        Kind::Info,
+                        "No take starts while an export writes its files - press again in a moment.",
+                    );
+                }
                 R::Capture => {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
@@ -9981,6 +10079,41 @@ impl DesktopApp {
         self.recorder.session.song_started_at_head(from_s);
     }
 
+    /// What runs now, for [`pass_refusal`].
+    fn running(&self) -> Running {
+        Running {
+            realtime: self.recorder.bounce.is_some(),
+            full_speed: self.recorder.offline_bounce.is_some(),
+            freezing: self.recorder.offline_bounce.as_ref().is_some_and(|b| b.freeze.is_some()),
+            take: self.recorder.session.is_recording(),
+            arr_record: self.recorder.arr_rec.is_some(),
+            counting: self.recorder.arr_rec_wait || self.recorder.take_count_pending,
+        }
+    }
+
+    /// **Refuse a pass `req` asks for while it cannot start, saying why**,
+    /// and answer whether it was refused. Nothing is raised, lowered or
+    /// covered for a refused press, so a running pass keeps its message and
+    /// its progress. Asked by the intake before its overlay, and again by
+    /// `run_project_request` where the pass would start, since a pass can
+    /// begin between the two. See [`pass_refusal`].
+    fn refuse_new_pass(&mut self, req: &tangent_ui::ports::ProjectRequest) -> bool {
+        use tangent_ui::ports::ProjectRequest as Q;
+        let asked = match req {
+            Q::Export(spec) if spec.realtime => NewPass::Realtime,
+            Q::Export(_) => NewPass::FullSpeed,
+            Q::Freeze(_) => NewPass::Freeze,
+            _ => return false,
+        };
+        match pass_refusal(self.running(), asked) {
+            Some(why) => {
+                self.app.notify(Kind::Info, why);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Start the Export dialog's realtime export: the whole arrangement (or
     /// the span `delivery` names), played through the real engine - racks,
     /// limiter, master - into an audio-only take the finish stages in the
@@ -10013,16 +10146,14 @@ impl DesktopApp {
                 return;
             }};
         }
-        // A count-in running is a recording about to start: the red button's
-        // would begin an arrangement record inside the export on its
+        // **Refused, and said, before anything was raised**
+        // (`refuse_new_pass`, which every road here asks first). This is the
+        // backstop, and it lowers nothing: a message standing now is the
+        // running pass's. A count-in is a recording about to start: the red
+        // button's would begin an arrangement record inside the export on its
         // downbeat, and a take's would begin a take on the same machine.
-        if self.recorder.bounce.is_some()
-            || self.recorder.session.is_recording()
-            || self.recorder.arr_rec.is_some()
-            || self.recorder.arr_rec_wait
-            || self.recorder.take_count_pending
-        {
-            refuse!();
+        if pass_refusal(self.running(), NewPass::Realtime).is_some() {
+            return;
         }
         if self.recorder.engine.is_none() {
             self.app
@@ -10465,12 +10596,11 @@ impl DesktopApp {
                 return;
             }};
         }
-        if self.recorder.offline_bounce.is_some()
-            || self.recorder.bounce.is_some()
-            || self.recorder.session.is_recording()
-            || self.recorder.arr_rec.is_some()
-        {
-            refuse!();
+        // The backstop to `refuse_new_pass`, as in `start_bounce`: it lowers
+        // nothing, since a message standing now is the running pass's.
+        let asked = if freeze.is_some() { NewPass::Freeze } else { NewPass::FullSpeed };
+        if pass_refusal(self.running(), asked).is_some() {
+            return;
         }
         // The whole project, or the arrange view's TIME SELECTION.
         let (from_s, span) = match spec.span {
@@ -11254,6 +11384,11 @@ impl DesktopApp {
         let Some(req) = self.app.take_project_request() else {
             return;
         };
+        // A pass that cannot start says so here, before the overlay covers
+        // anything for it - see `refuse_new_pass`.
+        if self.refuse_new_pass(&req) {
+            return;
+        }
         use tangent_ui::ports::ProjectRequest as Q;
         let (label, detail) = match &req {
             Q::Save => ("Saving project", None),
@@ -11311,6 +11446,13 @@ impl DesktopApp {
     /// Run whatever project action the app asked for. The host runs these
     /// whole because it owns the plugin states and the shelf.
     fn run_project_request(&mut self, ctx: &egui::Context, req: tangent_ui::ports::ProjectRequest) {
+        // **Asked again where the pass would start.** The intake asked a
+        // frame or more ago, before its overlay reached the screen, and a
+        // pass begun in between owns the standing message now: the Export
+        // arm below raises its own over it. See `refuse_new_pass`.
+        if self.refuse_new_pass(&req) {
+            return;
+        }
         match req {
             // **Put the stencil back, and keep the kit.**
             //
@@ -23142,10 +23284,12 @@ mod tests {
             src.contains("if std::mem::take(&mut self.recorder.play_on_go) && !self.recorder.transport.playing() {"),
             "a deferred Play never starts on the downbeat"
         );
-        // An export is refused while either recording's count is running.
-        let bounce = arm("        if self.recorder.bounce.is_some()\n            || self.recorder.session.is_recording()", "            refuse!();");
+        // An export is refused while either recording's count is running:
+        // `pass_refusal` holds a realtime pass under `counting`
+        // (`a_pass_pressed_while_another_runs_is_refused_up_front_and_says_why`),
+        // and this is what fills it.
         assert!(
-            bounce.contains("|| self.recorder.arr_rec_wait") && bounce.contains("|| self.recorder.take_count_pending"),
+            src.contains("counting: self.recorder.arr_rec_wait || self.recorder.take_count_pending,"),
             "an export can start under a count whose downbeat then records into it"
         );
         // Every count a take saved, or could join, holds the band's tempo.
@@ -23252,6 +23396,28 @@ mod tests {
         );
         let arm = src.find("R::Capture => {").expect("the cassette's arm");
         assert!(guard < arm, "the guard comes after the arm it guards, so it never runs");
+    }
+
+    /// **A recording refused under an export says why.** The red button
+    /// pressed during a realtime export, and the cassette pressed while an
+    /// export writes its files, were refused without a word, so the press
+    /// looked lost. Both say why now. A source scan, because the arms need a
+    /// `DesktopApp` and an engine.
+    #[test]
+    fn a_recording_refused_under_an_export_says_why() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let toggle = &src[src.find("                R::Toggle => {").expect("the red button's arm")..];
+        let refused = &toggle[..toggle.find("} else if self.recorder.arr_rec_wait {").expect("the refusal's end")];
+        assert!(
+            refused.contains("if self.recorder.bounce.is_some() {") && refused.contains(".notify("),
+            "the red button refused under an export says nothing"
+        );
+        let guard = &src[src
+            .find("R::Capture\n                    if self.recorder.bounce.is_some()")
+            .expect("the cassette's guard")..];
+        let guard = &guard[..guard.find("                R::Capture => {").expect("the cassette's arm")];
+        assert!(guard.contains(".notify("), "the cassette refused while an export writes its files says nothing");
     }
 
     /// **Pause takes back a Play still waiting on a count's downbeat, and
@@ -23699,6 +23865,91 @@ mod tests {
                 && src.contains("self.finish_bounce(&folder, problem, &landed, delivery);"),
             "the finish is not handed the pass's own delivery"
         );
+    }
+
+    /// **A pass pressed while another runs is refused before anything is
+    /// raised, and says why.** The Export arm raised `EXPORT_RUNNING` with
+    /// its own text before the pass could refuse, and the refusal lowered
+    /// it: an Export pressed during an export or a freeze replaced the
+    /// running pass's "Exporting..." (or "Freezing...") and then took it
+    /// down, and said nothing. A freeze pressed during one lowered it too.
+    /// And the realtime pass never asked about a full-speed render, so a
+    /// realtime export pressed during one, or during a freeze, ran beside
+    /// it. Every refusal now has a note, comes before any raise, and leaves
+    /// the running pass's message and progress alone. The words are driven;
+    /// the wiring is a source scan, because `DesktopApp` cannot be built in
+    /// a test.
+    #[test]
+    fn a_pass_pressed_while_another_runs_is_refused_up_front_and_says_why() {
+        use NewPass::{Freeze, FullSpeed, Realtime};
+        let idle = Running::default();
+        for asked in [Realtime, FullSpeed, Freeze] {
+            assert_eq!(pass_refusal(idle, asked), None, "{asked:?} was refused with nothing running");
+        }
+        // A realtime export is a take on the take machine too.
+        let passes = [
+            (Running { realtime: true, take: true, ..idle }, "a realtime export"),
+            (Running { full_speed: true, ..idle }, "a full-speed export"),
+            (Running { full_speed: true, freezing: true, ..idle }, "a freeze"),
+        ];
+        let records = [
+            (Running { take: true, ..idle }, "a take"),
+            (Running { arr_record: true, ..idle }, "an arrangement record"),
+        ];
+        for (now, what) in passes.into_iter().chain(records) {
+            for asked in [Realtime, FullSpeed, Freeze] {
+                let said = pass_refusal(now, asked).unwrap_or_else(|| panic!("{asked:?} started during {what}"));
+                assert!(!said.is_empty(), "{asked:?} pressed during {what} was refused without a word");
+            }
+        }
+        for (now, what) in &passes[..2] {
+            for asked in [Realtime, FullSpeed] {
+                let said = pass_refusal(*now, asked).unwrap_or_default();
+                assert!(said.contains("already running"), "{asked:?} during {what} does not say an export runs: {said:?}");
+            }
+        }
+        // A count-in holds the realtime pass alone, as it always has: the
+        // recording it begins plays on the live engine.
+        let counting = Running { counting: true, ..idle };
+        assert!(pass_refusal(counting, Realtime).is_some_and(|s| !s.is_empty()), "a realtime export started under a count-in");
+        assert_eq!(pass_refusal(counting, FullSpeed), None, "a full-speed export now waits on a count-in");
+        assert_eq!(pass_refusal(counting, Freeze), None, "a freeze now waits on a count-in");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body_of = |f: &str| {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            &src[at..at + src[at..].find("\n    fn ").expect("its end")]
+        };
+        let run = body_of("fn run_project_request(");
+        let asked = run
+            .find("self.refuse_new_pass(&req)")
+            .expect("run_project_request starts a pass without asking whether another runs");
+        for start in ["notify_raise(", "self.start_bounce(", "self.start_offline_bounce(", "self.start_freeze("] {
+            let at = run.find(start).unwrap_or_else(|| panic!("run_project_request no longer reaches `{start}`"));
+            assert!(asked < at, "run_project_request reaches `{start}` before it asks whether a pass runs");
+        }
+        let intake = body_of("fn take_project_request(");
+        let asked = intake
+            .find("self.refuse_new_pass(&req)")
+            .expect("the intake covers a refused pass with the overlay first");
+        let covered = intake.find("self.announce(").expect("the intake's overlay");
+        assert!(asked < covered, "the intake covers a refused pass with the overlay first");
+        for (starter, asked) in [
+            ("fn start_bounce(", "pass_refusal(self.running(), NewPass::Realtime)"),
+            ("fn start_offline_render(", "pass_refusal(self.running(), asked)"),
+        ] {
+            let body = body_of(starter);
+            let backstop = body.find(asked).unwrap_or_else(|| panic!("`{starter}` has no backstop"));
+            let raised = body.find("notify_raise(").unwrap_or(body.len());
+            assert!(backstop < raised, "`{starter}` raises before its backstop");
+            let refusal = &body[backstop..];
+            let refusal = &refusal[..refusal.find("\n        }\n").expect("the backstop's end")];
+            assert!(
+                !refusal.contains("refuse!()") && !refusal.contains("notify_lower("),
+                "`{starter}` takes a running pass's message down when it refuses"
+            );
+        }
     }
 
     /// **A failed full-speed export leaves its folder as it found it.** The
