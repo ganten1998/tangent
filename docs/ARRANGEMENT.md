@@ -87,7 +87,9 @@ count, and an export plays this project into this project's folder.
 Settings > Reset > Devices and Folders, which puts the tempo, the signature
 and the count-in back with the devices, waits while the tempo is held (a
 take's count-in, the arrangement's record count, or an export) for the
-same reason.
+same reason. So does the Undo a reset's box offers, whatever the scope,
+since it puts every setting back, the tempo included; the box comes back
+with its Undo, so it can be pressed once the hold ends.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 
@@ -339,6 +341,10 @@ channels play back their clips and nothing else. "Ready to play" and
     `export/track.wav`) or per-lane stems in ONE pass (`stems_on` +
     `stem_scratch` tap in all three folds → per-used-lane WAVs at
     `export/stems/NN-name.wav`). The drum bus is not yet a stem.
+    (Superseded 4.52.0: the Export dialog replaced both rows. Its realtime
+    pass stages the take at `export/track.wav` and delivers into the
+    folder and shapes the dialog names; the rows' last code went
+    2026-10-04.)
   - **The band is one LCD**: the whole box is the REAPER-style cluster —
     bars|beats|thousandths + min:sec left, Start/End/Length of the
     TIMELINE (the viewport, accurate with no clips) right, every part a
