@@ -71173,6 +71173,11 @@ mod tests {").expect("the tests module")];
     fn an_edge_hold_asks_for_a_fast_frame() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        // **The decoration nudge is put out first**, as in the top-edge carry
+        // test: its 50 ms frames are the window's, and a frame that lands in
+        // its last few milliseconds asks for one at once. Forced there, the
+        // drag in the middle read 0 ns, as fast as the edge.
+        app.decor_nudge_until = None;
         let grab = me_note_centre(&app, rect, id);
         press(&ctx, &mut app, grab);
         let roll = crate::midi_editor::Layout::new(rect).roll;
@@ -71187,10 +71192,10 @@ mod tests {").expect("the tests module")];
         );
         // The same drag, the same stillness, in the middle of the roll: the
         // ask goes away again. Compared against the EDGE's answer rather than
-        // against `GUI_TICK`, because the band's own animation is already
-        // asking for a frame every 33 ms in this fixture — the claim being
-        // pinned is that the edge asks for a faster frame than the same drag
-        // in the middle does, not that the app is otherwise idle.
+        // against `GUI_TICK`, because the claim being pinned is that the edge
+        // asks for a faster frame than the same drag in the middle does, not
+        // that the app is otherwise idle. (The 33 ms this fixture used to ask
+        // for was the decoration nudge, put out above.)
         move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.center().y));
         hold_frame(&ctx, &mut app, 1.0 / 60.0);
         let in_middle = hold_frame(&ctx, &mut app, 1.0 / 60.0);
