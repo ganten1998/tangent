@@ -49,8 +49,9 @@ Nothing is written at launch or New. The template is adopted IN MEMORY
 (`adopt_template`), aimed at a prospective folder that does not exist.
 The folder MATERIALISES at the first thing worth keeping, always through
 `materialize_project_dir` (the one door, below): a Save (the first save
-moves it to the chosen name), a kit edit or pad load, an import, an
-arrangement take with audio, a freeze, a glue, or a realtime export pass
+moves it to the chosen name), a kit edit or pad load, a sample loaded into
+the sampler, an import, an arrangement take with audio, a freeze, a glue,
+or a realtime export pass
 (its staging copy lands in the project's `export/`); a MIDI-only take
 makes no folder. Renaming before that repoints alone, so the folder is
 born under the chosen name; any of those writers makes `Untitled` real
@@ -156,9 +157,10 @@ Related invariants that keep this working:
   every lane's kit samples and writes the kit sidecar, and brings the files
   the document's own clips and frozen lanes stand on out of the template
   too (`copy_doc_media`; `write_template_into` carries them the same way,
-  so a template re-saved from a scratch keeps them). Imports, pad loads,
-  arrangement takes with audio, freezes, glues and realtime exports go
-  through it first; a
+  so a template re-saved from a scratch keeps them), and the samplers'
+  files (`copy_sampler_media`, below). Imports, pad loads,
+  sampler loads, arrangement takes with audio, freezes, glues and realtime
+  exports go through it first; a
   MIDI-only take makes no folder, and an UNDO never does (it writes the kit
   only into a folder that is already real). BEFORE it is real the
   scratch's media is read out of the template: the kit through `kit_doc`,
@@ -171,6 +173,30 @@ Related invariants that keep this working:
   folder, so a template's own audio was silent in every fresh session, and
   stayed silent after the folder was made because the refusal was
   remembered.
+- **The sampler's sample lives in the project** (2026-10-04). A file given
+  to the sampler (a browser row, a clip dragged out of the arrangement, an
+  OS file drop) is copied into the project's `media/` through
+  `copy_into_media`, as a pad load is, after a scratch is made real
+  (`sample_into_project`), and the bay stores the copy as `media/<name>`,
+  relative, in its state (`sample_path`, which a save mirrors into
+  `state/`). The host reads it against `kit_doc` (`desktop::sampler_file`),
+  the desk and an export's mirror alike, so the sample moves with the
+  folder: a first save that renames a scratch, a Duplicate, a project moved
+  on disk. A bay that names an absolute path, as every project saved before
+  does, is read where it names. The bay used to store the path it was
+  handed, so a take dragged out of an unsaved session went missing at the
+  first save, and a template's clip dropped on it played the template's
+  own file. A template's sampler file is named only in its `state/`
+  sidecar, so the host reads what a shelf's samplers name whenever it
+  adopts one (`copy_states_from_shelf`, through `sampler_media_on_shelf`)
+  and hands the list to the app (`set_sampler_media`); making a scratch
+  real, Save As Template from a scratch and Duplicate of one copy those
+  files with the kit's samples, by the same rules (`copy_sampler_media`).
+  A sampler preset names its file by its absolute path
+  (`preset_state_for_disk`), so it plays in any project; loading one copies
+  the file into the project's `media/` and binds the copy, a frame after
+  the preset's knobs (`preset_sample`), since binding rebuilds the bay from
+  the state it writes. Loading a preset used to restore the knobs alone.
 - **The template's kit is adopted, not the last project's**: `adopt_template`
   loads the kit beside the template once it has repointed. A template opened
   from the Open panel is ADOPTED the same way (`open_project`), into the
