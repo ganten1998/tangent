@@ -26269,6 +26269,81 @@ mod tests {
         );
     }
 
+    /// **A sample loaded onto the sampler during a session rides into a
+    /// template saved from it, into every session made from that template,
+    /// and into a Duplicate.**
+    ///
+    /// The list the app copies a template's sampler files by
+    /// (`sampler_media`) is read off a shelf only when one is adopted, so a
+    /// sample bound later never joins it, and `write_template_into` copies
+    /// only what is listed. It does not have to: loading a sample makes the
+    /// session's folder real first (`sample_into_project`), and Save As
+    /// Template copies a real folder whole before it writes the session over
+    /// it (`build_template`), so the file is in the template; the template's
+    /// own `state/` names it, and the next adoption reads it off that shelf.
+    /// Duplicate copies a real folder's `media/`. Driven through the app's
+    /// own load and the host's own build, as the Template arm builds.
+    #[test]
+    fn a_sample_loaded_during_a_session_rides_into_its_template_and_duplicate() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-sampler-tpl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("the template");
+        tangent_ui::arrangement::Arrangement::default().save_to(&tangent_ui::arrangement::doc_in(&template));
+        let library = root.join("Library");
+        std::fs::create_dir_all(&library).expect("a library");
+        std::fs::write(library.join("New.wav"), b"RIFFnew.WAVE").expect("a library sample");
+
+        // A fresh session, and a sample loaded onto its sampler.
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let scratch = root.join("Untitled");
+        app.adopt_template(&template, &scratch);
+        app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: library.join("New.wav").to_string_lossy().into_owned(),
+        });
+        let (_, _, stored) = app.take_sampler_load().expect("the load was not queued");
+        // What `bind_insert_sample` writes on the live shelf for it.
+        let shelf = root.join("shelf");
+        std::fs::create_dir_all(&shelf).expect("a shelf");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::SAMPLER_PATH).expect("the sampler");
+        let extra = vec![("sample_path".to_owned(), stored.to_string_lossy().into_owned())];
+        let mut blob = crate::builtin_fx::SAMPLER_PATH.as_bytes().to_vec();
+        blob.push(0);
+        blob.extend_from_slice(crate::builtin_fx::state_text(spec, &spec.defaults(), &extra).as_bytes());
+        std::fs::write(shelf.join(sidecar_name(0, 0)), blob).expect("the sampler's sidecar");
+
+        // Save As Template, built as the Template arm builds it.
+        let stage = root.join("Templates").join(".Rig.writing");
+        let real = scratch.is_dir();
+        build_template(&app, Some(scratch.as_path()).filter(|_| real), &stage, &shelf).expect("the template");
+        let templated = stage.join("media").join("New.wav").is_file();
+        // A session made from that template: the host reads the shelf it adopts.
+        let mut next = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let later = root.join("Untitled 2");
+        next.adopt_template(&stage, &later);
+        next.set_sampler_media(sampler_media_on_shelf(&stage.join("state")));
+        next.materialize_project_dir();
+        let carried = later.join("media").join("New.wav").is_file();
+        // And a Duplicate of the session the sample was loaded in.
+        let duplicated = app.save_project_as(&root.join("Copy"))
+            && root.join("Copy").join("media").join("New.wav").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stored, std::path::PathBuf::from("media/New.wav"), "fixture: the load was not relative");
+        assert!(real, "fixture: loading a sample did not make the session real");
+        assert_eq!(
+            [templated, carried, duplicated],
+            [true, true, true],
+            "[Save As Template, a session from it, Duplicate]: the loaded sample was left behind"
+        );
+    }
+
     /// **An export plays a lane the sampler plays, as the desk does.** A
     /// sampler's audio is not in its bay's state: the bay names its file
     /// (`sample_path`), and `reload_sampler` decodes it and hands it to the
