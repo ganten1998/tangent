@@ -71080,6 +71080,16 @@ mod tests {").expect("the tests module")];
             app.add_bare_track(n);
         }
         let _ = run_frame(&ctx, &mut app);
+        // **The decoration nudge is the window's, not the carry's, and it is
+        // put out by hand before anything is measured**, as the heart test
+        // does. The first frame sends the window its decorations and arms
+        // `decor_nudge_until` for 1.2 s: a frame every 50 ms while it runs,
+        // and through `animation_due` one at the moment it runs out. Idle,
+        // the frame below is measured 0.7 s in and the nudge's 33 ms passes;
+        // on a busy machine it can land in the nudge's last few milliseconds,
+        // where that deadline's ask collapses to nothing, and the carry took
+        // the blame for "pinning the app at 0ns".
+        app.decor_nudge_until = None;
         let rect = app.mixer_rect.expect("the mixer drew nowhere");
         let (grab, region) = {
             let view = app.mixer_view();
@@ -71098,6 +71108,14 @@ mod tests {").expect("the tests module")];
         );
         let was = app.mixer_scroll_px;
         hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        // And nothing else on the app's own ledger is owed a frame, so what
+        // the frame below asks for is the carry's alone.
+        assert_eq!(
+            app.animation_due(Instant::now()),
+            None,
+            "something besides the carry is owed a frame, and the frame below \
+             would measure it"
+        );
         let delay = hold_frame(&ctx, &mut app, 1.0 / 60.0);
         assert_eq!(app.mixer_scroll_px, was, "the desk moved sideways for a hand \
              held against its TOP edge");
