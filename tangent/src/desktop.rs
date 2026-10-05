@@ -3890,9 +3890,11 @@ fn frozen_lane_clip(z: &tangent_ui::arrangement::FrozenLane) -> tangent_ui::arra
 
 /// **What the export's own engine plays**: every clip of `doc` placed at
 /// `rate`, the audio decoded with a cache of the export's own so the live
-/// engine's cache never learns a wrong-rate clip, and read where `doc_path`
-/// (the app's `clip_doc`) says the files are: an export of a fresh session
-/// reads its template's clips out of the template.
+/// engine's cache never learns a wrong-rate clip, and read where `resolve`
+/// says the files are. The caller resolves against `clip_doc`, so an export
+/// of a fresh session reads its template's clips out of the template, and
+/// `every_road_that_reads_a_clips_file_resolves_it_through_clip_doc` follows
+/// that resolve where it stands.
 ///
 /// **And a frozen lane as the desk plays it** (`reload_clips`): its clips
 /// and MIDI withheld, and its rendered file (`frozen_lane_clip`) placed in
@@ -3907,9 +3909,9 @@ fn frozen_lane_clip(z: &tangent_ui::arrangement::FrozenLane) -> tangent_ui::arra
 #[cfg(feature = "recorder")]
 fn export_clip_placement(
     doc: &tangent_ui::arrangement::Arrangement,
-    doc_path: &std::path::Path,
     frozen: &[tangent_ui::arrangement::FrozenLane],
     rate: u32,
+    resolve: impl Fn(&str) -> std::path::PathBuf,
 ) -> (Vec<crate::instrument::Placed>, Vec<crate::instrument::PlacedMidi>, Vec<String>) {
     let is_frozen = |lane: usize| frozen.iter().any(|z| z.lane == lane);
     let mut unread: Vec<String> = Vec::new();
@@ -3944,7 +3946,7 @@ fn export_clip_placement(
             }
             continue;
         }
-        let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
+        let path = resolve(&clip.path);
         let decoded = match cache.get(&path) {
             Some(c) => Arc::clone(c),
             None => match tangent_record::decode::decode(&path, rate) {
@@ -3978,7 +3980,7 @@ fn export_clip_placement(
     }
     // **A frozen lane plays its rendered self**, as `reload_clips` places it.
     for z in frozen {
-        let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &z.path);
+        let path = resolve(&z.path);
         let decoded = match cache.get(&path) {
             Some(c) => Arc::clone(c),
             None => match tangent_record::decode::decode(&path, rate) {
@@ -11000,7 +11002,9 @@ impl DesktopApp {
         // ── the clips, at the EXPORT rate - see `export_clip_placement` ──
         if let Some(doc_path) = self.app.clip_doc() {
             let (placed, midi_placed, unread) =
-                export_clip_placement(self.app.arrangement(), &doc_path, self.app.frozen_lanes(), rate);
+                export_clip_placement(self.app.arrangement(), self.app.frozen_lanes(), rate, |rel| {
+                    tangent_ui::arrangement::Arrangement::resolve(&doc_path, rel)
+                });
             for why in unread {
                 self.app.notify(Kind::Error, format!("export: {why}"));
             }
@@ -26282,7 +26286,8 @@ mod tests {
             ..Default::default()
         });
         let frozen = vec![FrozenLane { lane: LANE, path: "media/frozen-03.wav".to_owned(), len_s: 0.5 }];
-        let (placed, midi, unread) = export_clip_placement(&doc, &doc_path, &frozen, RATE);
+        let at = |rel: &str| Arrangement::resolve(&doc_path, rel);
+        let (placed, midi, unread) = export_clip_placement(&doc, &frozen, RATE, at);
 
         // Rendered as the export renders it, the mask as `publish_routes` gives it.
         let mut e = Engine::offline(RATE, Timebase::new()).expect("offline");
@@ -26315,7 +26320,7 @@ mod tests {
 
         // A frozen file that cannot be read: the lane is silent, as live.
         let gone = vec![FrozenLane { lane: LANE, path: "media/gone.wav".to_owned(), len_s: 0.5 }];
-        let (placed, _, unread) = export_clip_placement(&doc, &doc_path, &gone, RATE);
+        let (placed, _, unread) = export_clip_placement(&doc, &gone, RATE, at);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!placed.iter().any(|p| p.strip == LANE), "a lane whose frozen file is gone played its own clips");
         assert!(unread.iter().any(|w| w.contains("frozen file")), "a frozen file that is gone said nothing");
@@ -26332,7 +26337,7 @@ mod tests {
         };
         let render = body_of("fn start_offline_render(");
         assert!(
-            render.contains("export_clip_placement(self.app.arrangement(), &doc_path, self.app.frozen_lanes(), rate)"),
+            render.contains("export_clip_placement(self.app.arrangement(), self.app.frozen_lanes(), rate, |rel| {"),
             "the export does not place its clips through `export_clip_placement`, frozen lanes and all"
         );
         for strips in ["e.set_builtin_strips(builtin_lanes", "e.set_keys_strips(keys_lanes"] {
