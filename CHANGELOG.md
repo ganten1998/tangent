@@ -468,10 +468,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   said it had failed but left its partial files where the last export's
   had been. It now writes aside and puts the files in place only once every
   one is finished, and an export whose file could not even be created no
-  longer leaves "Exporting..." on screen. A refused or failed realtime
-  export no longer hijacks the next one, which delivered into the old
-  Export dialog's folder; the dialog's realtime export delivers only the
-  stems it wrote; and each export says once where its files went.
+  longer leaves "Exporting..." on screen. The dialog's realtime export
+  delivers only the stems it wrote, and each export says once where its
+  files went.
 
 - **MIDI export and glue write what a MIDI clip plays.** Notes hidden past
   the end of a trimmed clip that does not loop were written into the
@@ -479,7 +478,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a clip's end was written at its full length, though playback stops it at
   the clip's end; and a clip's sustain pedal stayed down after the clip,
   for the rest of the file when nothing lifted it. All three now match
-  playback.
+  playback, and so does the pedal where two clips on one track overlap:
+  it stands at the higher of the two clips' levels and comes up only where
+  neither holds it, where a half pedal in one used to lower a full pedal
+  the other was holding.
 
 - **A recording still counting in when you start a new project, open
   another or quit no longer begins in the next one.** It began on its
@@ -492,7 +494,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Undoing a track's removal or a plugin's replacement brings its
   automation rows back as they were.** The curves came back with their
   rows closed, their arms gone and a bypassed curve playing; the rows now
-  reopen as before, and Redo closes them again. A row kept for a plugin
+  reopen as before, and Redo closes them again, including a row opened
+  after the undo, which used to stay open (and armed, if it was) for the
+  next track or plugin put there to write into. A row kept for a plugin
   you took out is named for that plugin, for example "EQ (unloaded):
   parameter 2", rather than "bay 1 parameter 2".
 
@@ -533,14 +537,93 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   tracks, with undo unavailable until the export ended; during a recording
   it could delete the track being recorded, or make the recording capture
   another track's input. Remove Track, Delete, the strip's close button
-  and Cut now refuse with a note saying why.
+  and Cut now refuse with a note saying why. Thawing a frozen track,
+  adding or removing a route, changing a sidechain's key and Reset > The
+  Desk changed a realtime export's file partway through in the same way,
+  and The Desk could empty the tracks an arrangement recording captures;
+  they are refused too.
 
-- **New, Open and the template resets wait for a take's count-in, or an
-  export, to finish.** Starting a new project or opening another while a
-  take was counting in applied that project's tempo under the count, so
-  the click sped up or slowed down under the take; during a realtime
-  export it replaced the project being exported. They are refused now
-  with a note saying why; quitting is not affected.
+- **New, Open, the template resets and Reset > Devices and Folders wait
+  for a take's count-in, or an export, to finish.** Starting a new project
+  or opening another while a take was counting in applied that project's
+  tempo under the count, so the click sped up or slowed down under the
+  take; during a realtime export it replaced the project being exported.
+  Resetting Devices and Folders puts the tempo, the time signature and the
+  count-in back along with the devices, so it retimed the click, or the
+  export, the same way. They are refused now with a note saying why, and
+  so is the Undo in the box that reports a reset, which puts the tempo and
+  the signature back too; the box comes back, so its Undo can be pressed
+  once the count or the export is over. Quitting is not affected.
+
+- **A frozen track sounds right in a full-speed export.** A full-speed
+  export, its stems and a freeze of a track a frozen one feeds rendered the
+  frozen track from its own clips with its effects switched off: dry audio,
+  silence through a plugin instrument, and none of the frozen sound. They
+  now play its frozen file, as playback and the realtime export always
+  did; if that file is missing, the track is silent, as it is on the desk,
+  and the export says so.
+
+- **The sampler keeps its sample in the project.** It remembered a sample
+  by where the file lay, so a take dragged onto it before a session's first
+  save went missing once the session was saved, a template's clip dropped
+  on it kept playing the template's own file, and the sample went missing
+  when its folder or the project moved. A session started from a template
+  whose sampler plays one of the template's own files lost that file when
+  it was first saved, duplicated or saved as a template. The sampler now
+  copies its file into the project's media folder, as the drum pads do,
+  and the file travels with the project; projects saved before play the
+  files they name, as they always did.
+
+- **Loading a sampler preset loads its sample, and a Tangent IR preset its
+  impulse.** A sampler preset brought back its settings and left whatever
+  sample was loaded; it now loads the sample it was saved with, copied
+  into the project, so a preset saved in one project plays the same in any
+  other. A preset that names a file which is not audio loads its settings
+  and says so, and copies nothing. A preset for the convolution unit
+  brought back its knobs and left the impulse that was loaded; it now
+  loads the impulse it was saved with, and says so when that file is no
+  longer where the preset names it.
+
+- **A settings file from 4.81 or earlier with a band popped out opens at
+  the right size.** With no window size saved, Tangent opened the window as
+  a strip the height of the piano and then drew every band into it; it now
+  opens at the size its bands come to. The popout windows behind it, which
+  nothing could open since 4.82.0, are gone, and their settings are carried
+  along unread.
+
+- **The README.txt in every download describes the app as it is.** It sent
+  you to menu rows that are keys now (Keytoggle is K, dark mode D, sharps
+  or flats P) or that sit in categories (Chords, Window, Colors, Reset),
+  offered window sizes from 50% to 200% where there are three, gave the
+  Windows settings folder with mixed slashes, said a keyboard unplugged
+  mid-session is never picked up again (MIDI tracks hear every device and
+  pick a replugged one up on their own), and said Tangent makes no network
+  connections at all, where Stream to OBS, once you turn it on, sends to
+  the machine you name (this one, unless you change it). The readmes and
+  the font licence notes in every download name Terminess, the typeface
+  Tangent opens in, as the default.
+
+- **A second export or freeze pressed while one is running is refused and
+  says why.** A realtime export pressed during another sent the running
+  export's files to its own folder, under its own name; pressing Export
+  during an export or a freeze took the running one's "Exporting..."
+  message off the screen and said nothing, and a freeze pressed during
+  either did the same; a realtime export pressed during a full-speed export
+  or a freeze ran alongside it. Each is refused now with a note, and the
+  running one keeps its message and its progress. An export or a freeze
+  pressed during a recording or a count-in, the red button during a
+  realtime export, and the cassette while an export writes its files also
+  say why they did nothing.
+
+- **About tells the truth about the build it is in.** It gives the
+  mixer's real channel count, 32, where it said 16; it names the plugin
+  formats the build hosts, VST3 on macOS and Windows and LV2 and VST3 on
+  Linux and FreeBSD, where it said LV2/VST3 everywhere; and a build without
+  the recorder no longer claims to record or host plugins.
+
+- **The warning for an armed input that recorded nothing says where to
+  look**: the recorder band's cog, then AUDIO SETUP. It sent you to an
+  Audio Status window that does not exist, after a run of stray spaces.
 
 ### Added
 
