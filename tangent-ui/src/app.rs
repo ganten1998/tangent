@@ -42006,9 +42006,26 @@ impl TangentApp {
                     .builtin_face(seat, bay)
                     .is_some_and(|f| f.path == crate::faces_sampler::SAMPLER_PATH);
                 if sampler && !loaded.sample.is_empty() {
-                    self.preset_sample =
-                        Some((seat, bay, std::path::PathBuf::from(&loaded.sample)));
-                    ctx.request_repaint();
+                    let file = std::path::PathBuf::from(&loaded.sample);
+                    let name = file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| loaded.sample.clone());
+                    // **Audio only, as the browser's own road asks** (the
+                    // `PickSample` arm): a preset can come from anybody, and
+                    // what it names is copied into the project.
+                    if crate::drumpad_panel::is_audio_file(&name) {
+                        self.preset_sample = Some((seat, bay, file));
+                        ctx.request_repaint();
+                    } else {
+                        self.notify(
+                            crate::notify::Kind::Error,
+                            format!(
+                                "{name} is not audio the sampler can play, so the \
+                                 preset loaded without it."
+                            ),
+                        );
+                    }
                 }
                 // **And a convolver's impulse**, on the road the IR face's own
                 // shelf takes. No frame behind, unlike the sampler's file: the
@@ -52008,6 +52025,56 @@ mod tests {
             )),
             "the preset's knobs did not go out: {knobs:?}"
         );
+    }
+
+    /// **A sampler preset that names a file which is not audio copies nothing
+    /// into the project.** A preset is a file that can come from anybody, and
+    /// the road that brings its sample in copies the file it names into the
+    /// project's `media/`: a preset naming a private document put a copy of
+    /// it in the project, to travel wherever the project was shared. The
+    /// browser's own road refuses what is not audio before it copies
+    /// (`PickSample`); the preset's road asks the same now, and says so.
+    #[test]
+    fn a_sampler_preset_naming_a_file_that_is_not_audio_copies_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-preset-not-audio-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Private")).expect("a private folder");
+        let secret = root.join("Private").join("notes.txt");
+        std::fs::write(&secret, b"not a sample").expect("a private file");
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).expect("the project");
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.project_doc = crate::arrangement::doc_in(&song);
+        let (strip, slot) = (2, 0);
+        let (seat, bay) = recorder::seat_bay(strip, slot);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { strip, slot, live: Box::default() });
+        app.set_preset_loaded(crate::ports::PresetLoaded {
+            unit: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            name: "Not A Patch".to_owned(),
+            values: Vec::new(),
+            sample: secret.to_string_lossy().into_owned(),
+            impulse: String::new(),
+        });
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        while app.take_recorder_request().is_some() {}
+        let bound = app.take_sampler_load();
+        let copied = song.join("media").join("notes.txt").exists();
+        let said: String = app.said().notes().iter().map(|n| n.text.clone()).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!copied, "a preset copied a file that is not audio into the project");
+        assert_eq!(bound, None, "a file that is not audio was bound to the sampler");
+        assert!(said.contains("notes.txt"), "the refusal was silent: {said}");
     }
 
     /// **A convolver preset binds the impulse it plays, after its knobs**, on
