@@ -111,7 +111,6 @@ fn inline_hook() -> Option<&'static str> {
     HOOK.get_or_init(|| std::env::var("IVORY_INLINE").ok()).as_deref()
 }
 const DETECT_TICK: Duration = Duration::from_millis(100);
-const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
 /// Quiet period after a move or resize before window geometry is written back.
 /// Long enough that a drag is one write, short enough that a kill -9 a second
 /// later still keeps the new position.
@@ -406,8 +405,8 @@ const PACE_HOLD: Duration = Duration::from_millis(250);
 /// being the thing you look at while playing.
 const REC_OUTLINE_W: f32 = 2.0;
 
-/// How long after the detached window appears a size mismatch still counts as
-/// the window manager's doing rather than the user's. A tiling WM overrules
+/// How long after the app asks the window for a size a mismatch still counts
+/// as the window manager's doing rather than the user's. A tiling WM overrules
 /// the requested size at creation; a person reaching for the window edge takes
 /// longer than this. Size alone cannot tell the two apart, only timing can.
 const WM_GRACE: Duration = Duration::from_millis(600);
@@ -728,9 +727,6 @@ pub struct TangentApp {
     /// note: the sound it made reaches the meters a buffer later, and a
     /// window that rested on the very next frame would never see it move.
     midi_activity: bool,
-    /// Whether the main window currently has focus. Detached windows are
-    /// raised with it and dropped with it, so the app moves as one thing.
-    main_focused: bool,
 
     notes: NoteState,
     manual_notes: HashSet<u8>,
@@ -756,40 +752,6 @@ pub struct TangentApp {
     /// the panel is switched on.
     voicing: VoicingSession,
     last_voicing: Option<Instant>,
-    /// D-UI-16: the popped-out neck. Same shape of state as the detached chord
-    /// window, including the tiling-WM guard, because it has the same problem.
-    fret_window_visible: bool,
-    fret_builder_size: Vec2,
-    fret_builder_pos: Option<Pos2>,
-    fret_live_size: Option<Vec2>,
-    fret_live_pos: Option<Pos2>,
-    fret_shown_at: Option<Instant>,
-    fret_wm_managed: bool,
-    startup_fret_detach_at: Option<Instant>,
-
-    /// The theory band is on screen in its own window, and the guard that says
-    /// whether its geometry is the user's or a tiling WM's.
-    ///
-    /// One `GeometryGuard` rather than the five loose fields the fretboard
-    /// popout still uses (`fret_shown_at`, `fret_wm_managed`, `fret_live_*`).
-    /// `theory_panel` shipped the guard as a type; taking it here is what makes
-    /// the third popout cheaper than the second rather than another copy of it.
-    theory_window_visible: bool,
-    theory_builder_size: Vec2,
-    theory_builder_pos: Option<Pos2>,
-    theory_guard: Option<theory_panel::GeometryGuard>,
-    startup_theory_detach_at: Option<Instant>,
-
-    /// The Recorder band, the fourth popout. Same shape as the theory window
-    /// above it, reusing `theory_panel::GeometryGuard` rather than growing a
-    /// fourth copy of the tiling-WM dance — the guard is about window managers,
-    /// not about theory diagrams, and the module it happens to live in is an
-    /// accident of which popout was written when.
-    recorder_window_visible: bool,
-    recorder_builder_size: Vec2,
-    recorder_builder_pos: Option<Pos2>,
-    recorder_guard: Option<theory_panel::GeometryGuard>,
-    startup_recorder_detach_at: Option<Instant>,
     /// Everything the band shows, written each frame by whoever is hosting us.
     /// Inert in a plugin, where nothing ever writes to it.
     recorder: recorder::RecorderState,
@@ -1754,15 +1716,6 @@ pub struct TangentApp {
     /// keytoggle, the guitar view and the note preference on the way past.
     name_focused: bool,
 
-    /// The detached chord window is actually on screen.
-    detach_window_visible: bool,
-    /// Builder size and position, frozen per detachment session so the
-    /// per-frame builder diff never fights the user's resizes and drags.
-    detached_builder_size: Vec2,
-    detached_builder_pos: Option<Pos2>,
-    detached_live_size: Option<Vec2>,
-    detached_live_pos: Option<Pos2>,
-    startup_detach_at: Option<Instant>,
     /// Geometry is written back on a debounce rather than on every frame: a
     /// window drag would otherwise rewrite settings.json a hundred times, and
     /// waiting for a clean exit loses the position whenever the app is killed.
@@ -1845,8 +1798,8 @@ pub struct TangentApp {
     /// user had chosen it is worse than recording nothing — that is how a
     /// `detached_chord_height` of 1377 got into a settings file. Size alone
     /// cannot tell the two apart; only timing can, which is what `WM_GRACE`
-    /// already does for the detached windows. A mismatch inside the grace is
-    /// the window manager; a mismatch after it is a hand on the edge.
+    /// is for. A mismatch inside the grace is the window manager; a mismatch
+    /// after it is a hand on the edge.
     size_asked_at: Option<Instant>,
     /// The size the bands last asked the window to be, kept from `paint`
     /// so `write_geometry_now` can run the tiler guard OUTSIDE a frame —
@@ -1913,10 +1866,6 @@ pub struct TangentApp {
     offscreen_checked: bool,
     main_live_pos: Option<Pos2>,
     main_live_size: Option<Vec2>,
-    /// When the detached window last appeared, and whether the window manager
-    /// took its sizing over. See `wm_overrode_size` and `WM_GRACE`.
-    detached_shown_at: Option<Instant>,
-    detached_wm_managed: bool,
     /// What the host can see about a gesture on the MAIN window — see
     /// [`crate::host::Gesture`]. All-false where the host cannot say.
     host_gesture: crate::host::Gesture,
@@ -4077,36 +4026,9 @@ impl TangentApp {
         if settings.screen_reader_mode {
             caps.child_windows = false;
         }
-        // **Nothing is detached, ever, on any host.**
+        // **The recorder band, for a host that cannot open a device.**
         //
-        // Four surfaces — the chord readout, the neck, the theory band and the
-        // recorder — could be popped into a window of their own. They are the
-        // pivot this release makes: the app is either filling the screen (`Z`)
-        // or it is in the box, because the third arrangement was where most of
-        // what felt janky lived. A band could be on screen and in a window at
-        // once; a window could outlive the band it showed; a fullscreen main
-        // window buried its own children (see the 4.19.0 file-browser freeze).
-        //
-        // The menu rows are gone, so nothing can set these now — but the flags
-        // PERSIST, and clearing them here is what stops an upgrade stranding
-        // somebody: a settings file saying `theory_detached: true` would
-        // otherwise zero the band, put it in a window nothing opens, and offer
-        // no Attach row to undo it. That failure is not hypothetical. It is
-        // exactly what a plugin instance seeded from the desktop's file used to
-        // do, which is what this clamp was written for when it was still gated
-        // on `caps.detachable`; the gate is gone and the reason is unchanged.
-        //
-        // Cleared on the LOCAL copy only. A plugin does not write the shared
-        // file, so a desktop file edited by hand keeps whatever it says — and
-        // still opens attached, because this runs on the way in.
-        settings.chord_window_detached = false;
-        settings.fretboard_detached = false;
-        settings.theory_detached = false;
-        settings.recorder_detached = false;
-        // And the band itself, for a host that cannot open a device.
-        //
-        // Not the same question as detaching, and it has a worse failure. The
-        // band is 200 points tall; a plugin editor whose settings file says
+        // The band is 200 points tall; a plugin editor whose settings file says
         // `show_recorder: true` would lay out 200 points of transport it can
         // never populate, shrinking the piano to make room for a camera preview
         // that will never arrive. `fit_bands` cannot tell the difference
@@ -4132,14 +4054,6 @@ impl TangentApp {
 
         let (midi_tx, midi_rx) = mpsc::channel();
 
-        // Recreate the detached chord window 100ms after startup (spec §5.7).
-        let startup_detach_at = (settings.chord_window_detached
-            && settings.chord_detection_enabled)
-            .then(|| Instant::now() + DEBOUNCE_100MS);
-
-        let detached_builder_size = settings.detached_size_for_use();
-        let detached_builder_pos = settings.detached_pos_for_use();
-
         let welcome = settings.show_welcome.then(|| Dialog::Welcome {
             dont_show_again: false,
         });
@@ -4147,29 +4061,6 @@ impl TangentApp {
         let spec = settings.fretboard_spec();
         let weights = Weights::for_tuning(&spec.tuning);
         let voicing = VoicingSession::new(spec, weights);
-        let settings_fret_size = settings.fretboard_win_size();
-        let settings_fret_pos = settings.fretboard_win_pos();
-        let startup_fret_detach_at = (settings.fretboard_detached && settings.show_fretboard)
-            .then(|| Instant::now() + DEBOUNCE_100MS);
-        // Same one-shot for the theory window. Gated on the band having at
-        // least one diagram selected as well as being detached: a window
-        // restored with nothing in it is a blank rectangle the user has to
-        // close to find out what it was.
-        //
-        // **And NOT gated on there being a diagram in it.** That gate produced
-        // a state with no way out from the keyboard: a session saved detached
-        // and empty came back with no window and no band, and every 1/2/3/4/T
-        // press afterwards edited settings that nothing on screen was reading.
-        // The empty window says what it is and takes a number key; a window
-        // that never opens says nothing at all.
-        let startup_theory_detach_at = settings
-            .theory_detached
-            .then(|| Instant::now() + DEBOUNCE_100MS);
-        // And the recorder's. Gated on the band being SHOWN as well as
-        // detached, so "Hide Recorder" with the window remembered for next time
-        // does not reopen the window on its own at the next launch.
-        let startup_recorder_detach_at = (settings.recorder_detached && settings.show_recorder)
-            .then(|| Instant::now() + DEBOUNCE_100MS);
 
         // **Resolved BEFORE the literal takes `settings`, and only when the
         // file does not say.** Arming is remembered now — it rides the desk
@@ -4204,9 +4095,6 @@ impl TangentApp {
             barre_drag: None,
             demo_menu_done: false,
             midi_activity: false,
-            // Assume focused: a window that has just opened is, and the first
-            // frames report None.
-            main_focused: true,
             notes: NoteState::default(),
             manual_notes: HashSet::new(),
             manual_positions: HashMap::new(),
@@ -4215,24 +4103,6 @@ impl TangentApp {
             last_detection: None,
             voicing,
             last_voicing: None,
-            fret_window_visible: false,
-            fret_builder_size: settings_fret_size,
-            fret_builder_pos: settings_fret_pos,
-            fret_live_size: None,
-            fret_live_pos: None,
-            fret_shown_at: None,
-            fret_wm_managed: false,
-            startup_fret_detach_at,
-            theory_window_visible: false,
-            theory_builder_size: theory_panel::DETACHED_DEFAULT,
-            theory_builder_pos: None,
-            theory_guard: None,
-            startup_theory_detach_at,
-            recorder_window_visible: false,
-            recorder_builder_size: recorder_panel::DETACHED_DEFAULT,
-            recorder_builder_pos: None,
-            recorder_guard: None,
-            startup_recorder_detach_at,
             recorder: recorder::RecorderState::default(),
             recorder_request: std::collections::VecDeque::new(),
             dir_request: None,
@@ -4456,12 +4326,6 @@ impl TangentApp {
             plugin_list: Vec::new(),
             name_focused: false,
 
-            detach_window_visible: false,
-            detached_builder_size,
-            detached_builder_pos,
-            detached_live_size: None,
-            detached_live_pos: None,
-            startup_detach_at,
             geometry_save_at: None,
             menu_state: None,
             dialog: None,
@@ -4523,8 +4387,6 @@ impl TangentApp {
             offscreen_checked: false,
             main_live_pos: None,
             main_live_size: None,
-            detached_shown_at: None,
-            detached_wm_managed: false,
             host_gesture: crate::host::Gesture::default(),
             os_aspect_lock: false,
             main_wm_managed: false,
@@ -7771,17 +7633,14 @@ impl TangentApp {
             keytoggle: self.settings.keytoggle_enabled,
             prefer_flats: self.settings.prefer_flats,
             detection_enabled: self.settings.chord_detection_enabled,
-            detached: self.settings.chord_window_detached,
             notes_held: !self.display_notes().is_empty(),
             learning_on: self.detector.learning_mode(),
             supporter: self.license.is_supporter(),
             heart_on: self.settings.show_heart,
             fretboard_on: self.settings.show_fretboard,
             theory: self.settings.theory_views(),
-            theory_detached: self.settings.theory_detached,
             theory_follows_midi: self.settings.theory_follow_midi,
             wood: self.settings.fretboard_wood().key(),
-            fretboard_detached: self.settings.fretboard_detached,
             recorder_on: self.settings.show_recorder,
             camera_pane_on: self.settings.show_camera_pane,
             extra_plugin_folders: self.settings.plugin_paths.len(),
@@ -7804,7 +7663,6 @@ impl TangentApp {
                 .iter()
                 .map(|c| c.key().to_owned())
                 .collect(),
-            recorder_detached: self.settings.recorder_detached,
             count_in_beats: self.settings.count_in_beats(),
             time_signature: self.settings.time_signature(),
             count_in_bars: self.settings.count_in_bars(),
@@ -7931,12 +7789,12 @@ impl TangentApp {
     /// The heart's colour IF the chord strip is the one drawing it.
     ///
     /// `None` whenever the recorder band is in the window, because that is
-    /// where the heart lives now — the strip is the fallback for the windows
-    /// that have no band, which is a recorder turned off and a recorder torn
-    /// off into its own window alike. The condition is `recorder_h > 0.0`'s,
-    /// and it is written out rather than derived so the two cannot drift.
+    /// where the heart lives now: the strip is the fallback for a window with
+    /// no band, which is a recorder turned off. The condition is
+    /// `recorder_h > 0.0`'s, and it is written out rather than derived so the
+    /// two cannot drift.
     fn strip_heart_color(&self) -> Option<egui::Color32> {
-        let band_in_window = self.settings.show_recorder && !self.settings.recorder_detached;
+        let band_in_window = self.settings.show_recorder;
         (!band_in_window).then(|| self.heart_color(0.0)).flatten()
     }
 
@@ -8915,50 +8773,6 @@ impl TangentApp {
                 }
             }
         }
-    }
-
-    // ── The Recorder popout ────────────────────────────────────────────────
-    //
-    // Four fields and two methods, the same two the theory window has. The
-    // one difference worth noting is that this popout has a REASON beyond
-    // taste: a second monitor holding a big framing view of the camera while
-    // the piano stays where it is. Nothing pops it out any more (and `new`
-    // clears the flag on the way in), so what is left is the way back.
-
-    fn reattach_recorder(&mut self) {
-        if self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
-            self.remember_recorder_geometry();
-        }
-        self.settings.recorder_detached = false;
-        self.recorder_window_visible = false;
-        self.recorder_guard = None;
-        self.save_settings();
-        self.request_natural_size();
-    }
-
-    /// Write back the recorder popout's size and position.
-    fn remember_recorder_geometry(&mut self) -> bool {
-        let Some(g) = self.recorder_guard.as_ref() else {
-            return false;
-        };
-        let mut changed = false;
-        if let Some(size) = g.live_size() {
-            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
-            if self.settings.recorder_win_w != Some(w) || self.settings.recorder_win_h != Some(h) {
-                self.settings.recorder_win_w = Some(w);
-                self.settings.recorder_win_h = Some(h);
-                changed = true;
-            }
-        }
-        if let Some(pos) = g.live_pos() {
-            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
-            if self.settings.recorder_win_x != Some(x) || self.settings.recorder_win_y != Some(y) {
-                self.settings.recorder_win_x = Some(x);
-                self.settings.recorder_win_y = Some(y);
-                changed = true;
-            }
-        }
-        changed
     }
 
     // ── The host's side of the recorder ────────────────────────────────────
@@ -33924,9 +33738,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // something else was placing it. A resizable window makes a
         // disagreement the NORMAL case — it is what dragging an edge
         // looks like — so the question moved to timing, exactly as it
-        // already had for the detached windows. Inside `WM_GRACE` of
-        // asking, a mismatch is the tiler overruling us at creation;
-        // after it, a mismatch is a hand.
+        // already had for the popout windows of the time. Inside
+        // `WM_GRACE` of asking, a mismatch is the tiler overruling us at
+        // creation; after it, a mismatch is a hand.
         let asked_recently = self
             .size_asked_at
             .is_some_and(|t| Instant::now() < t + WM_GRACE);
@@ -33962,22 +33776,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     dirty = true;
                 }
             }
-        }
-        if self.detach_window_visible && !self.detached_wm_managed {
-            dirty |= self.remember_detached_geometry();
-        }
-        if self.fret_window_visible && !self.fret_wm_managed {
-            dirty |= self.remember_fretboard_geometry();
-        }
-        if self.theory_window_visible
-            && self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed())
-        {
-            dirty |= self.remember_theory_geometry();
-        }
-        if self.recorder_window_visible
-            && self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed())
-        {
-            dirty |= self.remember_recorder_geometry();
         }
         if dirty {
             self.save_settings();
@@ -34602,118 +34400,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
     }
 
-    fn reattach_theory(&mut self) {
-        if self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed()) {
-            self.remember_theory_geometry();
-        }
-        self.settings.theory_detached = false;
-        self.theory_window_visible = false;
-        self.theory_guard = None;
-        self.save_settings();
-    }
-
-    /// Write back the theory popout's size and position.
-    fn remember_theory_geometry(&mut self) -> bool {
-        let Some(g) = self.theory_guard.as_ref() else {
-            return false;
-        };
-        let mut changed = false;
-        if let Some(size) = g.live_size() {
-            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
-            if self.settings.theory_win_w != Some(w) || self.settings.theory_win_h != Some(h) {
-                self.settings.theory_win_w = Some(w);
-                self.settings.theory_win_h = Some(h);
-                changed = true;
-            }
-        }
-        if let Some(pos) = g.live_pos() {
-            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
-            if self.settings.theory_win_x != Some(x) || self.settings.theory_win_y != Some(y) {
-                self.settings.theory_win_x = Some(x);
-                self.settings.theory_win_y = Some(y);
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    fn reattach_fretboard(&mut self) {
-        if !self.fret_wm_managed {
-            self.remember_fretboard_geometry();
-        }
-        self.settings.fretboard_detached = false;
-        self.fret_window_visible = false;
-        self.fret_shown_at = None;
-        self.save_settings();
-    }
-
-    /// Write back the popout's size and position. Returns whether anything
-    /// actually changed, so the caller can skip a needless settings write.
-    fn remember_fretboard_geometry(&mut self) -> bool {
-        let mut dirty = false;
-        if let Some(size) = self.fret_live_size {
-            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
-            if w > 0
-                && h > 0
-                && (self.settings.fretboard_win_w, self.settings.fretboard_win_h)
-                    != (Some(w), Some(h))
-            {
-                self.settings.fretboard_win_w = Some(w);
-                self.settings.fretboard_win_h = Some(h);
-                dirty = true;
-            }
-        }
-        if let Some(pos) = self.fret_live_pos {
-            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
-            if (self.settings.fretboard_win_x, self.settings.fretboard_win_y) != (Some(x), Some(y))
-            {
-                self.settings.fretboard_win_x = Some(x);
-                self.settings.fretboard_win_y = Some(y);
-                dirty = true;
-            }
-        }
-        dirty
-    }
-
-    fn reattach_chord_window(&mut self) {
-        if !self.detached_wm_managed {
-            self.remember_detached_geometry();
-        }
-        self.detach_window_visible = false;
-        self.detached_shown_at = None;
-        self.settings.chord_window_detached = false;
-        self.save_settings();
-    }
-
-    /// Copy the detached window's live geometry into settings. Returns whether
-    /// anything actually changed, so the caller can avoid pointless writes.
-    fn remember_detached_geometry(&mut self) -> bool {
-        let mut changed = false;
-        if let Some(size) = self.detached_live_size {
-            let (w, h) = (size.x.round() as i64, size.y.round() as i64);
-            if w > 0 && self.settings.detached_chord_width != Some(w) {
-                self.settings.detached_chord_width = Some(w);
-                changed = true;
-            }
-            if h > 0 && self.settings.detached_chord_height != h {
-                self.settings.detached_chord_height = h;
-                changed = true;
-            }
-        }
-        if let Some(pos) = self.detached_live_pos {
-            let (x, y) = (pos.x.round() as i64, pos.y.round() as i64);
-            if self.settings.detached_chord_x != Some(x) {
-                self.settings.detached_chord_x = Some(x);
-                changed = true;
-            }
-            if self.settings.detached_chord_y != Some(y) {
-                self.settings.detached_chord_y = Some(y);
-                changed = true;
-            }
-        }
-        changed
-    }
-
     // ── Menu actions ───────────────────────────────────────────────────────
 
     /// A shortcut. Everything here routes through the SAME code the menu rows
@@ -35006,9 +34692,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             MenuAction::SetSizePercent(p) => {
                 self.settings.window_size_percent = p;
                 self.save_settings();
-                // The detached window deliberately does NOT follow: it is sized
-                // by the user now, not slaved to the keyboard's width.
-                //
                 // A host that owns the window has to be ASKED. The app cannot
                 // do that itself — the request goes out over the plugin API,
                 // which `tangent-ui` has never heard of — so it records what it
@@ -35207,13 +34890,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             MenuAction::ToggleFretboard => {
                 self.settings.show_fretboard = !self.settings.show_fretboard;
-                // Hiding the view hides it everywhere: leaving a popped-out
-                // neck on screen after "Hide Fretboard" would be a window with
-                // no way back to it in the menu.
-                if !self.settings.show_fretboard && self.fret_window_visible {
-                    self.reattach_fretboard();
-                    self.settings.fretboard_detached = true; // remembered for next time
-                }
                 self.save_settings();
                 // The window height follows from band_sizes() next pass.
                 self.voicing_tick(true);
@@ -35314,13 +34990,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     return;
                 }
                 self.settings.show_recorder = !self.settings.show_recorder;
-                // Hiding the band hides it everywhere, exactly as Hide
-                // Fretboard does: a popped-out recorder left on screen with the
-                // band gone is a window with no menu row that can reach it.
-                if !self.settings.show_recorder && self.recorder_window_visible {
-                    self.reattach_recorder();
-                    self.settings.recorder_detached = true; // remembered for next time
-                }
                 // Opening the BAND is what opens the audio input, not pressing
                 // Record — the meter has to be live before arming. The host
                 // reconciles that after the frame by watching this flag, so
@@ -35490,10 +35159,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         let had_custom_font = self.settings.custom_font_path.is_some();
-        let live_detached = self
-            .detach_window_visible
-            .then_some(self.detached_live_size)
-            .flatten();
 
         // **The copy comes first, and from memory.** See
         // `Settings::write_backup`: the file on disk can be one edit behind
@@ -35618,14 +35283,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
 
-        // Closing the detached window re-attaches; Python's close handler then
-        // records its live height (overwriting the freshly reset 50).
-        if self.detach_window_visible {
-            self.detach_window_visible = false;
-            if let Some(size) = live_detached {
-                self.settings.detached_chord_height = size.y.round() as i64;
-            }
-        }
         // **What the settings NOW say, not a hardcoded true.**
         //
         // This was `true` and it was harmless while a reset meant
@@ -35640,20 +35297,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.detector.set_note_preference(self.settings.prefer_flats);
         self.manual_notes.clear();
         self.manual_positions.clear();
-        self.fret_window_visible = false;
-        self.fret_shown_at = None;
-        // The theory and recorder popouts close too — the defaults just
-        // re-inlined both bands, and a window left standing drew the
-        // surface TWICE while its geometry debounce kept writing the
-        // stray window's frame into the freshly reset settings.
-        self.theory_window_visible = false;
-        self.theory_guard = None;
-        if self.recorder_window_visible {
-            self.recorder_window_visible = false;
-            self.recorder_guard = None;
-            // The band is inline again; the main window makes room.
-            self.request_natural_size();
-        }
         self.rebuild_voicing();
         if had_custom_font && self.settings.custom_font_path.is_none() {
             // The font went back with the colours — but only the scope that
@@ -35684,10 +35327,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let font = crate::fonts::FontChoice::from_key(&back.font_choice);
         let custom = back.custom_font_path.clone();
         self.settings = back;
-        // Every window the reset closed stays closed: re-opening popouts
-        // from underneath somebody is a second surprise on top of the one
-        // they just undid, and the settings that say where they go are
-        // restored either way.
         self.detector
             .set_note_preference(self.settings.prefer_flats);
         crate::fonts::install(ctx, font, custom.as_deref());
@@ -37714,7 +37353,6 @@ fn default_mixer_visible(pane: Vec2) -> usize {
 fn gate_to_caps(settings: &mut Settings, caps: &Caps) {
     if !caps.capture_devices {
         settings.show_recorder = false;
-        settings.recorder_detached = false;
         settings.show_camera_pane = false;
     }
 }
@@ -37791,23 +37429,20 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     };
     // **The strip yields to the staff.** While the staff element is anywhere
     // on screen it carries the chord name itself — winner and runners-up — and
-    // one name in two places is two places for them to disagree. The detached
-    // chord window is untouched: that one is an explicit choice.
+    // one name in two places is two places for them to disagree.
     // **The strip is a choice, not a consequence.** It used to switch itself
     // off whenever the staff was in the theory band, on the argument that two
     // places to read the chord name is one too many. That is true of the
     // DEFAULT and false as a rule: piano plus strip and nothing else is the
     // shape this app had for years, and some people want exactly that. So it
     // is a setting, off by default, and the staff no longer overrules it.
-    let chord_visible = settings.chord_detection_enabled
-        && settings.show_chord_strip
-        && !settings.chord_window_detached;
+    let chord_visible = settings.chord_detection_enabled && settings.show_chord_strip;
     let chord_h = if chord_visible {
         (50.0 * w as f64 / 1300.0).trunc() as f32
     } else {
         0.0
     };
-    let fret_h = if settings.show_fretboard && !settings.fretboard_detached {
+    let fret_h = if settings.show_fretboard {
         fretboard_panel::band_height(w, settings.fretboard_spec().tuning.strings())
     } else {
         0.0
@@ -37833,20 +37468,12 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     // deciding how much height the theory band was allowed to have.
     let _ = settings.show_camera_pane;
     let camera_w = 0.0_f32;
-    // Zero while popped out, exactly like the chord strip and the neck above.
-    // Without this the diagrams render in BOTH places at once, and the main
-    // window keeps 300pt of height for a band that is somewhere else.
-    //
     // **Measured at the width the camera pane leaves**, which is what makes any
-    // configuration of the theory window fit beside it: `band_height` is linear
+    // configuration of the theory band fit beside it: `band_height` is linear
     // in width and `cells` divides whatever rect it is handed, so three
     // diagrams in 70% of the window are three narrower diagrams rather than
     // three clipped ones.
-    let theory_h = if settings.theory_detached {
-        0.0
-    } else {
-        theory_panel::band_height(w - camera_w, &settings.theory_views())
-    };
+    let theory_h = theory_panel::band_height(w - camera_w, &settings.theory_views());
     // The ROW, which is the taller of the two things in it. With the theory
     // band off or empty the pane still needs its row, or turning the diagrams
     // off would take the camera with them.
@@ -37855,14 +37482,14 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     } else {
         0.0
     });
-    // Zero when hidden AND zero when popped out, like every band above it.
+    // Zero when hidden, like every band above it.
     //
     // There is no `caps` term here and there must not be: `TangentApp::new`
     // already forces `show_recorder` false wherever `capture_devices` is,
     // so a host that cannot record has nothing to zero. Testing caps here as
     // well would put the same rule in two places, and the two would disagree
     // the first time somebody changed one of them.
-    let recorder_h = if settings.show_recorder && !settings.recorder_detached {
+    let recorder_h = if settings.show_recorder {
         recorder_panel::band_height(w)
     } else {
         0.0
@@ -38468,39 +38095,30 @@ impl TangentApp {
         // **A take is the window.** Every band appears in the video exactly
         // when it appears on screen, in the order it appears there, and the
         // ticks in the Export dialog can only take one AWAY. What they cannot
-        // do is add one back: a band torn off into its own window is not in
-        // the window a take records, and one that is switched off is not there
-        // to record.
+        // do is add one back: a band that is switched off is not there to
+        // record.
         //
         // The recorder used to be forced off here, back when the video was an
         // arrangement of its own with the camera floated over it as an inset.
         // It is the band the camera lives in, so leaving it out was leaving
         // the performer out — and putting the camera back by a second route
-        // gave two arrangements of one picture to disagree about.
-        s.show_recorder = self.settings.show_recorder && !self.settings.recorder_detached;
-        s.recorder_detached = false;
+        // gave two arrangements of one picture to disagree about. So it is
+        // left as the window has it, and so is the chord strip.
         s.chord_detection_enabled = shows.chord && self.settings.chord_detection_enabled;
-        s.show_chord_strip =
-            self.settings.show_chord_strip && !self.settings.chord_window_detached;
-        s.chord_window_detached = false;
-        s.show_fretboard =
-            shows.fretboard && self.settings.show_fretboard && !self.settings.fretboard_detached;
-        s.fretboard_detached = false;
+        s.show_fretboard = shows.fretboard && self.settings.show_fretboard;
         // **Unticking the piano has to remove its HEIGHT, not just its ink.**
         // Every other flag here maps onto a setting that zeroes a band; the
         // piano had none, so an unticked piano left a piano-sized hole in the
         // middle of the video.
         s.show_piano = shows.piano;
-        s.theory_detached = false;
         // The theory band has no "show theory" bool — it exists exactly when
         // something is in it — so the override has to work in both directions
         // by hand.
-        // It only ever takes away: a band torn off into its own window is not
-        // in the window a take records, and one the number keys collapsed is
-        // not there to record either. The old code filled an EMPTY band with
-        // all four diagrams when the tick asked for theory, which was the
-        // video inventing a layout nobody had on screen.
-        if !shows.theory || self.settings.theory_detached {
+        // It only ever takes away: a band the number keys collapsed is not
+        // there to record. The old code filled an EMPTY band with all four
+        // diagrams when the tick asked for theory, which was the video
+        // inventing a layout nobody had on screen.
+        if !shows.theory {
             s.theory_order = String::new();
         }
         s
@@ -38623,7 +38241,7 @@ impl TangentApp {
             // the window shows, camera included, because there is only one
             // arrangement and both paths read it.
             let (theory, pane) = bands.theory_row(band_at(bands.recorder_h, bands.theory_h), s.camera_pane_left);
-            if s.theory_views().count() > 0 && !s.theory_detached {
+            if s.theory_views().count() > 0 {
                 theory_panel::draw(
                     painter,
                     theory,
@@ -38964,103 +38582,6 @@ impl TangentApp {
 
         self.process_midi_events();
 
-        // Startup restore for the popped-out neck (100ms single-shot), the
-        // same shape as the chord window's below it.
-        if let Some(t) = self.startup_fret_detach_at {
-            if Instant::now() >= t {
-                self.startup_fret_detach_at = None;
-                if self.settings.fretboard_detached && self.settings.show_fretboard {
-                    self.fret_window_visible = true;
-                    self.fret_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.fretboard_win_size(),
-            self.monitor_size,
-        );
-                    self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
-                        crate::settings::clamp_to_monitor(
-                            p,
-                            self.fret_builder_size,
-                            self.monitor_size,
-                        )
-                    });
-                    self.fret_shown_at = Some(Instant::now());
-                    self.fret_wm_managed = false;
-                }
-            }
-        }
-
-        // And the same restore for the theory window.
-        if let Some(t) = self.startup_theory_detach_at {
-            if Instant::now() >= t {
-                self.startup_theory_detach_at = None;
-                if self.settings.theory_detached && self.settings.theory_views().any() {
-                    self.theory_window_visible = true;
-                    self.theory_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.theory_win_size(),
-            self.monitor_size,
-        );
-                    self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
-                        crate::settings::clamp_to_monitor(
-                            p,
-                            self.theory_builder_size,
-                            self.monitor_size,
-                        )
-                    });
-                    self.theory_guard = Some(theory_panel::GeometryGuard::opened(
-                        self.theory_builder_size,
-                        Instant::now(),
-                    ));
-                }
-            }
-        }
-
-        // And the same restore for the Recorder window.
-        if let Some(t) = self.startup_recorder_detach_at {
-            if Instant::now() >= t {
-                self.startup_recorder_detach_at = None;
-                if self.settings.recorder_detached && self.settings.show_recorder {
-                    self.recorder_window_visible = true;
-                    self.recorder_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.recorder_win_size(),
-            self.monitor_size,
-        );
-                    self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
-                        crate::settings::clamp_to_monitor(
-                            p,
-                            self.recorder_builder_size,
-                            self.monitor_size,
-                        )
-                    });
-                    self.recorder_guard = Some(theory_panel::GeometryGuard::opened(
-                        self.recorder_builder_size,
-                        Instant::now(),
-                    ));
-                }
-            }
-        }
-
-        // Startup detach restore (100ms single-shot).
-        if let Some(t) = self.startup_detach_at {
-            if Instant::now() >= t {
-                self.startup_detach_at = None;
-                if self.settings.chord_window_detached && self.settings.chord_detection_enabled {
-                    self.detach_window_visible = true;
-                    self.detached_builder_size = crate::settings::clamp_size_to_monitor(
-            self.settings.detached_size_for_use(),
-            self.monitor_size,
-        );
-                    self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
-                        crate::settings::clamp_to_monitor(
-                            p,
-                            self.detached_builder_size,
-                            self.monitor_size,
-                        )
-                    });
-                    self.detached_shown_at = Some(Instant::now());
-                    self.detached_wm_managed = false;
-                }
-            }
-        }
-
         self.detection_tick(false);
         self.voicing_tick(false);
 
@@ -39282,15 +38803,6 @@ impl TangentApp {
         // not fail — they return the ROOT viewport's values, which are the
         // host's, so an unguarded version would quietly file the DAW's window
         // position into the user's settings file as if it were the piano's.
-        if self.caps.child_windows {
-            // Whether WE are frontmost, so the detached windows can follow.
-            // `focused` is None on the frames before the window manager has
-            // said, and treating that as "not focused" would drop the
-            // children behind on every startup.
-            if let Some(f) = ctx.input(|i| i.viewport().focused) {
-                self.main_focused = f;
-            }
-        }
         let (inner_rect, outer_rect, monitor) = if self.caps.window_sizing {
             ctx.input(|i| {
                 (
@@ -39964,9 +39476,7 @@ impl TangentApp {
             Some(row) => {
                 let (t, c) = bands.theory_row(row, self.settings.camera_pane_left);
                 (
-                    (self.settings.theory_views().count() > 0
-                        && !self.settings.theory_detached)
-                        .then_some(t),
+                    (self.settings.theory_views().count() > 0).then_some(t),
                     c.is_positive().then_some(c),
                 )
             }
@@ -40084,8 +39594,8 @@ impl TangentApp {
             }
         }
         // The row's own background FIRST, whatever is in it. The camera pane
-        // can hold this row open with the diagrams' half empty or detached, and
-        // in that case nothing else fills it — leaving the app's black backdrop
+        // can hold this row open with the diagrams' half empty, and in that
+        // case nothing else fills it, leaving the app's black backdrop
         // showing through a band-shaped hole.
         if let Some(row) = theory_row {
             ui.painter()
@@ -41639,177 +41149,6 @@ impl TangentApp {
             );
         }
 
-        // The popped-out neck. `caps.detachable` gates the DRAWING, not just
-        // the menu row: `fretboard_detached` is a persisted setting, so a
-        // settings file written by the standalone would otherwise have a
-        // plugin opening a phantom window on its first frame.
-        if self.fret_window_visible && self.caps.detachable {
-            let spec = self.settings.fretboard_spec();
-            let outcome = fretboard_panel::show_detached_window(
-                &ctx,
-                self.fret_builder_size,
-                self.fret_builder_pos,
-                self.settings.borderless_mode,
-                self.main_focused,
-                self.voicing.current(),
-                &spec,
-                &self.settings,
-                self.settings.fretboard_wood(),
-                self.barre_to_draw(),
-            );
-            // Same tiling-WM guard as the chord window: inside the grace
-            // period a size mismatch is the window manager's doing, not the
-            // user's, and this session's geometry is not ours to remember.
-            if let (Some(shown), Some(size)) = (self.fret_shown_at, outcome.inner_size) {
-                if Instant::now().duration_since(shown) < WM_GRACE {
-                    self.fret_wm_managed |= wm_overrode_size(size, self.fret_builder_size);
-                } else {
-                    self.fret_shown_at = None;
-                }
-            }
-            let moved = outcome.inner_size != self.fret_live_size
-                || (outcome.outer_pos.is_some() && outcome.outer_pos != self.fret_live_pos);
-            if let Some(size) = outcome.inner_size {
-                self.fret_live_size = Some(size);
-            }
-            if let Some(pos) = outcome.outer_pos {
-                self.fret_live_pos = Some(pos);
-            }
-            if moved && !self.fret_wm_managed {
-                self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
-            }
-            if outcome.close_requested {
-                self.reattach_fretboard(); // close-to-reattach, like the chord window
-            } else if let Some(pos) = outcome.context_menu_at {
-                if !self.dialog_blocks_pointer(&ctx) {
-                    self.open_menu_at(&ctx, pos);
-                }
-            }
-        }
-
-        // Detached theory window. Third popout, and the cheapest of the three:
-        // `theory_panel::GeometryGuard` owns the tiling-WM logic that the two
-        // above still open-code, so this block is the window plus one
-        // `observe`.
-        if self.theory_window_visible && self.caps.detachable {
-            let held = self.display_notes();
-            let outcome = theory_panel::show_detached_window(
-                &ctx,
-                self.theory_builder_size,
-                self.theory_builder_pos,
-                self.settings.borderless_mode,
-                self.main_focused,
-                &self.settings.theory_views(),
-                self.theory_input(&held),
-                &held,
-                self.staff_readout(&self.settings),
-                &self.settings,
-            );
-            if let Some(g) = self.theory_guard.as_mut() {
-                if g.observe(&outcome, Instant::now()) {
-                    self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
-                }
-            }
-            if outcome.close_requested {
-                self.reattach_theory(); // close-to-reattach, like the other two
-            } else if let Some(hit) = outcome.hit {
-                // The diagrams are inputs, and they stay inputs when popped
-                // out. The hit arrives already resolved against the WINDOW's
-                // rect, which is a different rectangle from the band's.
-                self.toggle_theory_hit(hit);
-            } else if let Some(pos) = outcome.context_menu_at {
-                if !self.dialog_blocks_pointer(&ctx) {
-                    self.open_menu_at(&ctx, pos);
-                }
-            }
-        }
-
-        // The popped-out Recorder. Its reason for existing is the best of the
-        // four: a big framing view of the camera on a second monitor while the
-        // piano stays where it is.
-        if self.recorder_window_visible && self.caps.detachable {
-            let view = self.recorder_layout_view();
-            let outcome = recorder_panel::show_detached_window(
-                &ctx,
-                self.recorder_builder_size,
-                self.recorder_builder_pos,
-                self.settings.borderless_mode,
-                self.main_focused,
-                &view,
-                &self.settings,
-            );
-            if let Some(g) = self.recorder_guard.as_mut() {
-                if g.observe_geometry(outcome.inner_size, outcome.outer_pos, Instant::now()) {
-                    self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
-                }
-            }
-            if outcome.close_requested {
-                self.reattach_recorder(); // close-to-reattach, like the other three
-            } else if let Some(hit) = outcome.hit.filter(|_| !self.dialog_blocks_pointer(&ctx)) {
-                // The hit arrives already resolved against the WINDOW's rect,
-                // which is a different rectangle from the band's.
-                //
-                // `dialog_blocks_pointer` because the main window is modal to
-                // a QUESTION (`handle_main_interaction` returns early) and the
-                // popout has to be too. Without it, clicking Export in the
-                // detached recorder while the Export dialog is already open
-                // REPLACES it with a fresh one and discards everything typed.
-                // The recorder is the only popout whose hits open dialogs,
-                // which is what makes this a bug here and not in the other two.
-                self.focus_take_name(matches!(hit, recorder_panel::Hit::NameField));
-                self.apply_recorder_hit(hit);
-            } else if let Some(pos) = outcome.context_menu_at {
-                if !self.dialog_blocks_pointer(&ctx) {
-                    self.open_menu_at(&ctx, pos);
-                }
-            }
-        }
-
-        // Detached chord window, gated for the same reason as the neck above.
-        if self.detach_window_visible && self.caps.detachable {
-            let outcome = chord_strip::show_detached_window(
-                &ctx,
-                self.detached_builder_size,
-                self.detached_builder_pos,
-                self.settings.borderless_mode,
-                self.main_focused,
-                self.current_chord.as_deref(),
-                self.settings.chord_text_color.to_color32(),
-                self.heart_color(ctx.input(|i| i.time)),
-                self.transpose_view(),
-            );
-            // A tiling WM overrules the size we asked for the moment the window
-            // appears. Inside the grace period a mismatch is therefore its
-            // doing, not the user's, and this session's geometry is not ours
-            // to remember. After it, a mismatch is a real resize.
-            if let (Some(shown), Some(size)) = (self.detached_shown_at, outcome.inner_size) {
-                if Instant::now().duration_since(shown) < WM_GRACE {
-                    self.detached_wm_managed |= wm_overrode_size(size, self.detached_builder_size);
-                } else {
-                    self.detached_shown_at = None;
-                }
-            }
-
-            let moved = outcome.inner_size != self.detached_live_size
-                || (outcome.outer_pos.is_some() && outcome.outer_pos != self.detached_live_pos);
-            if let Some(size) = outcome.inner_size {
-                self.detached_live_size = Some(size);
-            }
-            if let Some(pos) = outcome.outer_pos {
-                self.detached_live_pos = Some(pos);
-            }
-            if moved && !self.detached_wm_managed {
-                self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
-            }
-            if outcome.close_requested {
-                self.reattach_chord_window(); // close-to-reattach
-            } else if let Some(pos) = outcome.context_menu_at {
-                if !self.dialog_blocks_pointer(&ctx) {
-                    self.open_menu_at(&ctx, pos);
-                }
-            }
-        }
-
         // Debounced write-back for the faders, the route gains, the wheel
         // zooms and the held arrow key — everything a hand can repeat faster
         // than a frame (see `save_settings_soon`). Same reasoning as the
@@ -42417,9 +41756,8 @@ impl TangentApp {
     /// anyway, and the two readouts that move on time alone.
     ///
     /// The deadlines: the settings and geometry debounces (a fader drag's
-    /// write has to fire without the mouse moving again), the four startup
-    /// detach single-shots, the window-manager grace windows on the
-    /// detached windows, the uncover handshake, and the decoration nudge.
+    /// write has to fire without the mouse moving again), the uncover
+    /// handshake, and the decoration nudge.
     /// The cadences: the chord detector and the voicing solver run on a
     /// 100 ms gate while notes are held — a chord that lands one event at a
     /// time would otherwise read as its first note until the next event —
@@ -42437,13 +41775,7 @@ impl TangentApp {
         for deadline in [
             self.settings_save_at.get(),
             self.geometry_save_at,
-            self.startup_fret_detach_at,
-            self.startup_theory_detach_at,
-            self.startup_recorder_detach_at,
-            self.startup_detach_at,
             self.decor_nudge_until,
-            self.fret_shown_at.map(|t| t + WM_GRACE),
-            self.detached_shown_at.map(|t| t + WM_GRACE),
             self.uncover_asked_at
                 .filter(|_| self.pending_window_size.is_some())
                 .map(|t| t + UNCOVER_GRACE),
@@ -42486,8 +41818,7 @@ mod tests {
     /// The staff panel carries the chord readout, so while it is anywhere in
     /// the theory band the strip's height goes to zero — and comes back the
     /// moment the staff leaves, because then the strip is the only place the
-    /// name lives. The detached chord window is a third place and an explicit
-    /// choice; it wins over both.
+    /// name lives.
     #[test]
     fn the_chord_strip_is_a_choice_the_staff_does_not_overrule() {
         // `first_launch`, not `default`: bare defaults leave the band empty
@@ -63313,50 +62644,69 @@ mod tests {
         assert_eq!(app.barre_to_draw(), app.voicing.current().shape.barre);
     }
 
-    /// **No host inherits a detached band, and that now includes the desktop.**
+    /// **A settings file from a build that could detach opens with every band
+    /// in the window, and the window opens at the size those bands come to.**
     ///
-    /// The flags persist and the menu rows that cleared them are gone, so a
-    /// settings file written by any earlier build would otherwise zero a band,
-    /// put it in a window nothing opens, and offer nothing to undo it — the
-    /// exact failure this test was written for when only a plugin could hit it.
-    /// The way back used to be Reset Settings, which throws away every colour,
-    /// font and tuning too.
+    /// Nothing has detached since 4.82.0, and the popout windows are gone with
+    /// the keys that placed them. A file an older build wrote can still say
+    /// `theory_detached: true` and the rest, and a band that obeyed it would
+    /// vanish into a window nothing opens, with nothing on screen to undo it.
+    /// The app never obeyed (`new` cleared the four flags on its own copy),
+    /// but the HOST did: `main` measures the window it opens from the file
+    /// before any app exists, so it measured one without those bands and the
+    /// app then drew all of them into it. Now nothing reads the keys at all.
+    /// A plugin seeded from such a file gets the same answer, without the
+    /// recorder it never has.
     #[test]
-    fn nobody_inherits_a_detached_band() {
-        let detached = Settings {
-            chord_window_detached: true,
-            fretboard_detached: true,
-            theory_detached: true,
-            recorder_detached: true,
-            show_fretboard: true,
-            chord_detection_enabled: true,
-            // Explicitly, since 5.0: the strip is off by default and this test
-            // is about a DETACHED band having nowhere to go in a plugin, which
-            // needs a strip to be attached in the first place.
-            show_chord_strip: true,
-            show_welcome: false,
-            ..Settings::default()
-        };
-
-        let (_, plugin) = headless_with(Caps::PLUGIN, detached.clone());
-        assert!(!plugin.settings.chord_window_detached);
-        assert!(!plugin.settings.fretboard_detached);
-        let b = band_sizes(&plugin.settings);
-        assert!(
-            b.chord_h > 0.0,
-            "the chord strip vanished with nowhere to go"
+    fn a_settings_file_from_a_build_that_could_detach_opens_every_band_in_the_window() {
+        // Every band a detach could take away, showing. No staff in the
+        // theory band: a file this old is migrated (settings version 6), and
+        // the strip it showed was off whenever the staff was in the band.
+        let shown = format!(
+            r#""chord_detection_enabled": true, "show_chord_strip": true,
+               "show_fretboard": true, "show_recorder": true, "show_welcome": false,
+               "theory_order": "{}""#,
+            theory_panel::Views::of(vec![
+                theory_panel::View::Circle,
+                theory_panel::View::Tonnetz,
+                theory_panel::View::Triangles,
+            ])
+            .keys()
         );
-        assert!(b.fret_h > 0.0, "the fretboard vanished with nowhere to go");
+        let attached = Settings::from_json(&format!("{{{shown}}}"));
+        let old = Settings::from_json(&format!(
+            r#"{{{shown},
+                "chord_window_detached": true, "fretboard_detached": true,
+                "theory_detached": true, "recorder_detached": true,
+                "detached_chord_width": 640, "detached_chord_height": 180,
+                "detached_chord_x": 300, "detached_chord_y": 220,
+                "fretboard_win_w": 880, "fretboard_win_h": 190,
+                "theory_win_w": 900, "theory_win_h": 380,
+                "recorder_win_w": 720, "recorder_win_h": 400}}"#
+        ));
 
-        // And the desktop, which is the half that changed: it used to keep
-        // what it was given, because there was a window to keep it in.
-        let (_, desktop) = headless_with(Caps::DESKTOP, detached);
-        assert!(!desktop.settings.chord_window_detached);
-        assert!(!desktop.settings.fretboard_detached);
-        assert!(!desktop.settings.theory_detached);
-        assert!(!desktop.settings.recorder_detached);
-        let b = band_sizes(&desktop.settings);
-        assert!(b.chord_h > 0.0 && b.fret_h > 0.0, "a band came back to nowhere");
+        // What `main` opens the window at: the file's own answer, asked
+        // before any app has seen it.
+        assert_eq!(
+            initial_window_size(&old),
+            initial_window_size(&attached),
+            "the window opens at a size that leaves out the bands an old file \
+             had popped out"
+        );
+
+        for caps in [Caps::DESKTOP, Caps::PLUGIN] {
+            let (_, app) = headless_with(caps, old.clone());
+            let b = band_sizes(&app.settings);
+            assert!(b.chord_h > 0.0, "{caps:?}: the chord strip went to a window nothing opens");
+            assert!(b.fret_h > 0.0, "{caps:?}: the neck went to a window nothing opens");
+            assert!(b.theory_h > 0.0, "{caps:?}: the diagrams went to a window nothing opens");
+            // The recorder only where there are devices to fill it.
+            assert_eq!(
+                b.recorder_h > 0.0,
+                caps.capture_devices,
+                "{caps:?}: the recorder band"
+            );
+        }
     }
 
     /// Turning a band on must make the editor TALLER, not the picture smaller.
@@ -63658,59 +63008,8 @@ mod tests {
         }
     }
 
-    /// A plugin editor's window belongs to the DAW. Not one frame may ask to
-    /// resize it, undecorate it, retitle it, move it, or start dragging it.
-    ///
-    /// This is not a theoretical guard. `egui-baseview` HONOURS
-    /// `ViewportCommand::InnerSize` — it calls `window.resize()` — so the
-    /// fixed-size triple, left ungated, would reach into the host and resize
-    /// the editor behind its back on the first frame. `MinInnerSize` and
-    /// `MaxInnerSize` are swallowed there, which would have left exactly the
-    /// one third of the mechanism that does damage.
-    /// A popped-out band must vacate the main window, or the diagrams render in
-    /// two places at once and the main window keeps 300pt of height for
-    /// something that is somewhere else.
     #[test]
-    fn a_detached_theory_band_takes_no_height_in_the_main_window() {
-        let mut s = Settings::default();
-        s.theory_order = if true { theory_panel::Views::all().keys() } else { String::new() };
-        let attached = band_sizes_at(&s, 1300.0);
-        assert!(attached.theory_h > 0.0, "the band should be showing");
-
-        s.theory_detached = true;
-        let detached = band_sizes_at(&s, 1300.0);
-        assert_eq!(detached.theory_h, 0.0, "detached, so it is not in the stack");
-        assert_eq!(
-            detached.piano_h, attached.piano_h,
-            "detaching must not resize the piano"
-        );
-        assert!(
-            detached.total().y < attached.total().y,
-            "the window should get shorter when a band leaves it"
-        );
-    }
-
-    /// A plugin has no second window, so it must never start believing it has
-    /// one — a plugin instance is seeded from the same settings file the
-    /// desktop writes, so a user who left the theory band popped out on the
-    /// desktop would otherwise get a DAW editor with no theory band at all: the
-    /// band is zeroed by the flag, and the window it moved to cannot exist.
-    #[test]
-    fn a_plugin_never_starts_with_a_detached_theory_band() {
-        let ctx = egui::Context::default();
-        let mut s = Settings::default();
-        s.theory_order = if true { theory_panel::Views::all().keys() } else { String::new() };
-        s.theory_detached = true;
-        let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
-        assert!(
-            !app.settings.theory_detached,
-            "Caps::PLUGIN must clear it, as it already does for the chord \
-             window and the neck"
-        );
-    }
-
-    #[test]
-    fn the_recorder_band_is_only_in_the_stack_when_it_is_attached_and_shown() {
+    fn the_recorder_band_is_only_in_the_stack_when_it_is_shown() {
         let mut s = Settings::default();
         assert_eq!(
             band_sizes_at(&s, 1300.0).recorder_h,
@@ -63721,31 +63020,20 @@ mod tests {
         s.show_recorder = true;
         let shown = band_sizes_at(&s, 1300.0);
         assert!(shown.recorder_h > 0.0);
-
-        s.recorder_detached = true;
-        let detached = band_sizes_at(&s, 1300.0);
-        assert_eq!(detached.recorder_h, 0.0, "it is somewhere else");
-        assert_eq!(
-            detached.piano_h, shown.piano_h,
-            "detaching must not resize the piano"
-        );
-        assert!(detached.total().y < shown.total().y);
     }
 
-    /// The worst of the four seeding failures, because the recorder is the one
-    /// band a plugin can never populate: `capture_devices` is false there, so
-    /// there is no camera, no input and no take directory. A settings file
-    /// written by the desktop with `show_recorder: true` would otherwise cost a
-    /// DAW editor 200 points of empty transport, taken out of the piano.
+    /// The worst seeding failure, because the recorder is the one band a
+    /// plugin can never populate: `capture_devices` is false there, so there
+    /// is no camera, no input and no take directory. A settings file written
+    /// by the desktop with `show_recorder: true` would otherwise cost a DAW
+    /// editor 200 points of empty transport, taken out of the piano.
     #[test]
     fn a_plugin_never_starts_with_a_recorder_band() {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
         s.show_recorder = true;
-        s.recorder_detached = true;
         let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
         assert!(!app.settings.show_recorder, "no device, no band");
-        assert!(!app.settings.recorder_detached, "and no window for it");
         assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
     }
 
@@ -63762,27 +63050,6 @@ mod tests {
         assert!(
             app.settings.show_fretboard || !app.settings.show_fretboard,
             "and nothing else is disturbed"
-        );
-    }
-
-    /// Hiding the band must not leave its window on screen: the Attach row
-    /// lives inside the Recorder category, which is only drawn while the band
-    /// is showing, so the window would have no way back.
-    #[test]
-    fn hiding_the_recorder_takes_its_window_with_it() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
-        app.settings.show_recorder = true;
-        // The band out in its own window, set by hand: nothing pops it out
-        // any more, and `new` clears the flag on the way in.
-        app.settings.recorder_detached = true;
-        app.recorder_window_visible = true;
-
-        app.apply_menu_action(&ctx, MenuAction::ToggleRecorder);
-        assert!(!app.settings.show_recorder);
-        assert!(!app.recorder_window_visible, "the window went with it");
-        assert!(
-            app.settings.recorder_detached,
-            "but where it was is remembered, so turning it back on puts it back"
         );
     }
 
@@ -65296,6 +64563,15 @@ mod tests {
         assert_eq!(wild.transpose, crate::settings::TRANSPOSE_MAX);
     }
 
+    /// A plugin editor's window belongs to the DAW. Not one frame may ask to
+    /// resize it, undecorate it, retitle it, move it, or start dragging it.
+    ///
+    /// This is not a theoretical guard. `egui-baseview` HONOURS
+    /// `ViewportCommand::InnerSize` (it calls `window.resize()`), so the
+    /// fixed-size triple, left ungated, would reach into the host and resize
+    /// the editor behind its back on the first frame. `MinInnerSize` and
+    /// `MaxInnerSize` are swallowed there, which would have left exactly the
+    /// one third of the mechanism that does damage.
     #[test]
     fn a_plugin_frame_never_commands_the_hosts_window() {
         let (ctx, mut app) = headless(Caps::PLUGIN);
@@ -65347,9 +64623,9 @@ mod tests {
             assert!(h > 0.0, "the {name} band vanishes at the floor {min:?}");
         }
         // That the diagrams still have controls to point at is asserted where
-        // the measurement lives — `theory_panel`'s
-        // `the_main_windows_floor_leaves_the_diagrams_something_to_draw`,
-        // beside the `DETACHED_MIN` this floor's width came from.
+        // the measurement lives: `theory_panel`'s
+        // `the_main_windows_floor_leaves_the_diagrams_something_to_draw`, which
+        // says where this floor's width came from.
     }
 
     /// A dragged window ZOOMS the layout; it never stretches it.
@@ -65998,8 +65274,8 @@ mod tests {").expect("the tests module")];
     }
 
     /// Frames until the app rests, or the last delay it asked for. The
-    /// startup single-shots (the detach restores, 100 ms in) are real
-    /// deadlines and are waited out rather than assumed away.
+    /// startup deadlines are real and are waited out rather than assumed
+    /// away.
     fn settle(ctx: &egui::Context, app: &mut TangentApp) -> Duration {
         let mut asked = Duration::ZERO;
         // Three seconds of wall time: the decoration nudge armed on the
@@ -66655,20 +65931,13 @@ mod tests {").expect("the tests module")];
                 Vec2::new(w, piano_h + chord_h),
                 "window size at {pct}% with chord strip"
             );
-            // Detached or detection disabled: piano-only height.
+            // Detection disabled: piano-only height.
             let mut no_strip = s.clone();
             no_strip.chord_detection_enabled = false;
             assert_eq!(
                 initial_window_size(&no_strip),
                 Vec2::new(w, piano_h),
                 "window size at {pct}% without chord strip"
-            );
-            no_strip.chord_detection_enabled = true;
-            no_strip.chord_window_detached = true;
-            assert_eq!(
-                initial_window_size(&no_strip),
-                Vec2::new(w, piano_h),
-                "window size at {pct}% detached"
             );
         }
     }
@@ -76629,8 +75898,6 @@ mod fullscreen_proportion_tests {
         let mut s = Settings::first_launch();
         s.show_piano = true;
         s.show_fretboard = true;
-        s.fretboard_detached = false;
-        s.theory_detached = false;
         let w = 1920.0_f32;
         let windowed = band_sizes_at(&s, w);
         assert!(windowed.piano_h > 0.0 && windowed.fret_h > 0.0, "nothing to test");

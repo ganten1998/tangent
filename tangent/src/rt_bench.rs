@@ -2416,8 +2416,12 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
             first.map(|i| i / 2)
         );
     }
-    // Emptied by hand before the engines drop, all four of them, so the
-    // plugins are torn down on this thread rather than with the renderers.
+    // Emptied by hand before the engines drop, all four of them, which is
+    // belt and braces rather than a different teardown: `impl Drop for
+    // Engine` makes this same `load_insert(.., None, None)` call for every
+    // seated insert, in the same lane order and on this same thread. These
+    // engines are offline, so the retire wait is zero (`retire_deadline`)
+    // and each instance is dropped with its renderer either way.
     for lane in 0..LANES {
         let _ = one.load_insert(lane, 0, None, None);
         let _ = two.load_insert(lane, 0, None, None);
@@ -3390,8 +3394,9 @@ fn rt_bench() {
                 .map_or_else(|| bundle.to_owned(), |s| s.to_string_lossy().into_owned());
             rows.push(measure(&format!("16 lanes x {name} (VST3)"), &mut e, WARMUP, BLOCK));
         }
-        // Emptied by hand before the engine drops, so the plugin is torn down
-        // on this thread rather than with the renderer.
+        // Emptied by hand before the engine drops, belt and braces:
+        // `impl Drop for Engine` makes the same calls, and on this offline
+        // engine the plugin is dropped with the renderer either way.
         for lane in 0..16 {
             let _ = e.load_insert(lane, 0, None, None);
         }
@@ -3469,8 +3474,9 @@ fn rt_bench() {
             rows.push(measure(&format!("96 bays x {name} (VST3) @ 256 fr"), &mut e, WARMUP, 256));
             rows.push(measure(&format!("96 bays x {name} (VST3) @ 512 fr"), &mut e, WARMUP, 512));
         }
-        // Emptied by hand before the engine drops, so the plugins are torn
-        // down on this thread rather than with the renderer.
+        // Emptied by hand before the engine drops, belt and braces:
+        // `impl Drop for Engine` makes the same calls, and on this offline
+        // engine the plugins are dropped with the renderer either way.
         for lane in 0..32 {
             for bay in 0..3 {
                 let _ = e.load_insert(lane, bay, None, None);

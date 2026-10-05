@@ -1,13 +1,9 @@
 //! Chord display strip (spec §5): always-black background, #E8DCC0 text in
 //! both modes, Courier Prime Regular, font size max(12, int(0.6*h)) with a
-//! single-pass shrink when the text exceeds 95% of the width. Also hosts the
-//! detached chord window (an immediate viewport).
+//! single-pass shrink when the text exceeds 95% of the width.
 
 use crate::fonts;
-use egui::{
-    Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, ViewportBuilder, ViewportCommand,
-    ViewportId,
-};
+use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind};
 
 /// The pre-2.2 chord colour (#E8DCC0). Kept only so `Settings::reset_to_default`
 /// and the docs have a name for what the label used to be; the live colour now
@@ -456,16 +452,6 @@ mod thanks_tests {
     }
 }
 
-pub fn viewport_id() -> ViewportId {
-    ViewportId::from_hash_of("ivory-chord-window")
-}
-
-/// Outline for the detached window. The strip is always black, so on a dark
-/// desktop the window has no edge at all and bleeds into whatever is behind
-/// it. One neutral grey reads against both a dark and a light desktop, so
-/// this does not need to follow the theme.
-pub const BORDER_COLOR: Color32 = Color32::from_gray(0x5A);
-
 const MIN_FONT: i64 = 12;
 
 fn font(size: i64) -> FontId {
@@ -596,115 +582,6 @@ pub fn draw(
     // structure disappears at these sizes.
     painter.galley(pos, galley, color);
 }
-
-/// Everything the app needs to know after showing the detached window.
-#[derive(Default)]
-pub struct DetachedOutcome {
-    /// User closed the window (close-to-reattach).
-    pub close_requested: bool,
-    /// Live inner size in points, recorded every frame.
-    pub inner_size: Option<egui::Vec2>,
-    /// Live outer position in monitor coordinates, recorded every frame, so
-    /// where the user drags the window can be remembered for next time.
-    pub outer_pos: Option<Pos2>,
-    /// Right-click happened at this global (monitor-space) position.
-    pub context_menu_at: Option<Pos2>,
-}
-
-/// Show the detached chord window (spec §5.7) as an immediate viewport.
-///
-/// `builder_size` and `builder_pos` must stay constant for the lifetime of one
-/// detachment. egui diffs this builder against the previous frame's builder,
-/// not against the window's real geometry, so a value that changes every frame
-/// would fight the user's own resizes and drags.
-/// `main_focused` decides the window LEVEL. A detached window is a piece of
-/// the same app, so it rises and falls WITH the piano rather than being left
-/// wherever the window stack last put it — which is what "the children don't
-/// follow" looks like: focus the piano and its own readouts stay buried under
-/// whatever you were doing before.
-///
-/// By level rather than by raising: always-on-top while we are frontmost is
-/// exactly "above our own window", and dropping to Normal when we are not
-/// means it never floats over other applications.
-pub fn show_detached_window(
-    ctx: &egui::Context,
-    builder_size: egui::Vec2,
-    builder_pos: Option<Pos2>,
-    borderless: bool,
-    main_focused: bool,
-    chord: Option<&str>,
-    color: Color32,
-    heart: Option<Color32>,
-    transpose: Option<i32>,
-) -> DetachedOutcome {
-    let mut outcome = DetachedOutcome::default();
-    let mut builder = ViewportBuilder::default()
-        .with_title("Tangent")
-        .with_inner_size(builder_size)
-        .with_min_inner_size([220.0, 80.0])
-        .with_resizable(true)
-        .with_decorations(!borderless)
-        .with_window_level(if main_focused {
-            egui::viewport::WindowLevel::AlwaysOnTop
-        } else {
-            egui::viewport::WindowLevel::Normal
-        });
-    if let Some(p) = builder_pos {
-        builder = builder.with_position(p);
-    }
-
-    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
-        crate::shell::viewport_ui(vp, |ui| {
-            let rect = ui.max_rect();
-            // The popped-out chord view is the same instrument as the band, so
-            // it carries the same control.
-            draw(
-                ui.painter(),
-                rect,
-                chord,
-                color,
-                heart,
-                Some(BORDER_COLOR),
-                transpose,
-            );
-
-            let (close, inner_rect, outer_rect, pressed, secondary, pointer) = ui.input(|i| {
-                (
-                    i.viewport().close_requested(),
-                    i.viewport().inner_rect,
-                    i.viewport().outer_rect,
-                    i.pointer.primary_pressed(),
-                    i.pointer.secondary_clicked(),
-                    i.pointer.interact_pos(),
-                )
-            });
-
-            outcome.close_requested = close;
-            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
-            outcome.outer_pos = outer_rect.map(|r| r.min);
-
-            // Right-click anywhere opens the app context menu at the cursor.
-            if secondary {
-                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
-                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
-                }
-            }
-
-            // Borderless drag-anywhere: StartDrag from the press handler.
-            if borderless && pressed && !secondary {
-                ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-            }
-        });
-    });
-    outcome
-}
-
-// The 100ms-debounced width sync that used to live here is gone on purpose.
-// Spec §5.7 (and the Python app before it) forced the detached window's width
-// to match the main window's, re-asserting it on every size change. A chord
-// readout has no reason to inherit the keyboard's 8.6667:1 proportions, and
-// the re-assert made remembering a user-chosen width impossible: any restored
-// width was overwritten within 100ms of the next size change.
 
 #[cfg(test)]
 mod tests {

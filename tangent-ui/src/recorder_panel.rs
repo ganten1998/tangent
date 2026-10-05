@@ -60,11 +60,11 @@
 //!     the eight were.
 //!   * **width, from the destination and the preview**. [`MONITOR_W`] went from
 //!     0.28 of the body to 0.36; the preview's width cap went from 0.26 to 0.22,
-//!     which only bites in the detached window (in the band the preview is
-//!     bounded by the band's height long before it reaches either cap). The
-//!     destination is the group `docs/RECORDER-PLAN.md` §5 describes as set once
-//!     and left alone, and the preview is looked at twice a session; the slots
-//!     are touched every take.
+//!     which only ever bit in the detached window, now gone (in the band the
+//!     preview is bounded by the band's height long before it reaches either
+//!     cap). The destination is the group `docs/RECORDER-PLAN.md` §5 describes
+//!     as set once and left alone, and the preview is looked at twice a
+//!     session; the slots are touched every take.
 //!
 //! There is no in-band control for hiding the elapsed clock. There was, it was
 //! a box marked `CLOCK` with a line through it, and no one could tell what it
@@ -1325,9 +1325,10 @@ impl Layout {
         // an instrument row moved in, and a framing view you look at twice a
         // session may not crowd the controls you use every take.
         //
-        // The 0.22 cap only binds in a DETACHED window, where the band is tall
-        // for its width; in the band itself the height term is smaller than
-        // either bound long before the cap matters.
+        // The 0.22 cap only binds in a rect taller for its width than the
+        // band ever is (the detached window was one, and it is gone); in the
+        // band itself the height term is smaller than either bound long
+        // before the cap matters.
         // **Three groups now, not four.** The take's settings went to the
         // menu, so the band is what you look at (the preview and the name),
         // what you touch every take (transport, meters, faders), and what you
@@ -1671,7 +1672,7 @@ impl Layout {
             self.setup = icon(6);
             // Seated only where it can be SEEN. The floor under `side` keeps
             // that true at every width the window allows; this is what keeps
-            // it true in a detached band dragged smaller than that.
+            // it true in any rect smaller than that.
             if !cog_fits(self.setup) {
                 self.setup = Rect::NOTHING;
             }
@@ -4825,8 +4826,8 @@ fn close_x_arms(r: Rect) -> Option<([[Pos2; 2]; 2], f32)> {
 /// The longest of `choices` that draws at `nominal` without being shrunk.
 ///
 /// Ordered longest first. The last is the fallback and is shrunk to fit like any
-/// other text, so one button can say "OPEN WINDOW" in the main window and "OPEN"
-/// in a 640-point detached one without either of them being a smudge. A pure
+/// other text, so one button can say "OPEN WINDOW" in a wide band and "OPEN"
+/// in a narrow one without either of them being a smudge. A pure
 /// function of the rectangle, so the two layouts and the offscreen compositor
 /// all pick the same word.
 fn fit_label<'t>(r: Rect, choices: &[&'t str], nominal: f32) -> (&'t str, f32) {
@@ -7124,8 +7125,8 @@ pub fn knob_to_tempo(t: f32) -> f64 {
 /// checkbox is indistinguishable from a ticked one.
 ///
 /// The box is bounded by the WIDTH as well as the height. In a tall narrow slot
-/// — a detached window's click switch — a box sized off the height alone eats
-/// the whole control and the caption disappears.
+/// (the detached window's click switch was one) a box sized off the height
+/// alone eats the whole control and the caption disappears.
 fn draw_tick(painter: &Painter, r: Rect, cap: &str, on: bool, p: &Palette) {
     control(painter, r, p);
     if !r.is_positive() {
@@ -7228,187 +7229,6 @@ pub fn draw_top_edge(painter: &Painter, rect: Rect, _s: &Settings) {
         0.0,
         Stroke::new(1.0_f32, c),
         StrokeKind::Inside,
-    );
-}
-
-// ── the popped-out window ──────────────────────────────────────────────────
-//
-// The fourth detachable surface, and deliberately the same shape of code as the
-// other three (`chord_strip`, `fretboard_panel`, `theory_panel`): same
-// close-to-reattach, same right-click-anywhere menu, same borderless
-// drag-anywhere, same window level. Four popouts with four sets of habits would
-// be worse than none.
-//
-// Like the theory window and unlike the other two, this one is an INPUT: a
-// click starts a take. Everything below that differs from the chord strip — the
-// hit in the outcome, the drag that stands aside for it, the ctrl-click guard —
-// exists for that one reason.
-
-/// Default size for the popped-out recorder when nothing is remembered.
-///
-/// Not the band's proportions, for the same reason the neck's popout is not
-/// (D-UI-10): in its own window it should be legible rather than a slice of the
-/// main one. §5's reason for detaching at all is a big framing view on a second
-/// monitor, and the preview claims about a quarter of the width, so this is
-/// about as small as the window gets while the destination column still holds a
-/// device name at a readable size.
-pub const DETACHED_DEFAULT: Vec2 = Vec2::new(720.0, 400.0);
-
-/// The smallest window the band still works in.
-///
-/// **Raised from 480x270 when the monitor column arrived**, and unchanged when
-/// the three instrument slots moved into it. The binding constraint is the same
-/// as it always was — the destination column, not the preview. At 640x340 that
-/// column is ~170pt across with seven rows of ~36pt, which holds
-/// `EXPORT wav + midi` and `AUDIO Scarlett 2i2 USB` at about 11pt: it lost width
-/// to the slots and got it back in row height, because the slots also took its
-/// INSTRUMENT row away. In the same window a slot row is ~39pt tall and ~220pt
-/// across, which is `1 Pianoteq 8` at 9pt, a knob, a dB reading at 6.4pt, an
-/// `OPEN` button at 17pt and a cross. Below that the column is a stack of boxes with smudges in
-/// them, which reads as a rendering fault rather than as "too small" — the same
-/// failure `theory_panel::DETACHED_MIN` puts a floor under.
-pub const DETACHED_MIN: Vec2 = Vec2::new(640.0, 340.0);
-
-pub fn viewport_id() -> egui::ViewportId {
-    egui::ViewportId::from_hash_of("tangent-recorder-window")
-}
-
-/// Outline for the popped-out window. The band's background is near-black in
-/// dark mode and pale grey in light, so neither theme's fill separates the
-/// window from the desktop behind it. One neutral grey reads against both,
-/// exactly as it does for the other three popouts.
-pub const BORDER_COLOR: Color32 = Color32::from_gray(0x5A);
-
-/// What the app has to act on after showing the window.
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
-pub struct DetachedOutcome {
-    /// The user closed the window. Close-to-reattach: the band comes back.
-    pub close_requested: bool,
-    /// Live inner size in points, recorded every frame. Feed it to
-    /// `theory_panel::GeometryGuard::observe` rather than to settings directly.
-    pub inner_size: Option<Vec2>,
-    /// Live outer position in monitor coordinates, recorded every frame.
-    pub outer_pos: Option<Pos2>,
-    /// Right-click (or ctrl-click on macOS) happened at this monitor-space
-    /// position, for the app context menu.
-    pub context_menu_at: Option<Pos2>,
-    /// A click landed on a control. Feed it to the same handler the band's
-    /// clicks go to.
-    ///
-    /// Only the PRESS is reported here. A fader that is being dragged has to be
-    /// re-hit-tested by the app while the button is held — see [`hit_test`].
-    pub hit: Option<Hit>,
-}
-
-/// The recorder in its own window.
-///
-/// `builder_size` and `builder_pos` must stay constant for the lifetime of one
-/// detachment, exactly as for the other three windows: egui diffs this builder
-/// against the previous frame's builder rather than against the window's real
-/// geometry, so a value that changed every frame would fight the user's own
-/// resizes and drags.
-///
-/// `main_focused` decides the window LEVEL. A detached window is a piece of the
-/// same app, so it rises and falls WITH the piano rather than being left
-/// wherever the window stack last put it. By level rather than by raising:
-/// always-on-top while we are frontmost is exactly "above our own window", and
-/// dropping to Normal when we are not means it never floats over other
-/// applications.
-pub fn show_detached_window(
-    ctx: &egui::Context,
-    builder_size: Vec2,
-    builder_pos: Option<Pos2>,
-    borderless: bool,
-    main_focused: bool,
-    view: &RecorderView<'_>,
-    s: &Settings,
-) -> DetachedOutcome {
-    let mut outcome = DetachedOutcome::default();
-    let mut builder = egui::ViewportBuilder::default()
-        .with_title("Tangent")
-        .with_inner_size(builder_size)
-        .with_min_inner_size(DETACHED_MIN)
-        .with_resizable(true)
-        .with_decorations(!borderless)
-        .with_window_level(if main_focused {
-            egui::viewport::WindowLevel::AlwaysOnTop
-        } else {
-            egui::viewport::WindowLevel::Normal
-        });
-    if let Some(pos) = builder_pos {
-        builder = builder.with_position(pos);
-    }
-
-    ctx.show_viewport_immediate(viewport_id(), builder, |vp, _class| {
-        crate::shell::viewport_ui(vp, |ui| {
-            // THE WINDOW'S OWN RECT, used for both the drawing and the hit test
-            // below. The band's rect is a completely different rectangle —
-            // different width, different height, different origin — and a hit
-            // test run against it would return whatever is at that point IN THE
-            // MAIN WINDOW, which here means pressing Record because the pointer
-            // happened to be where the record button is somewhere else. Nothing
-            // in this closure may reach for a band rect, which is why none is
-            // passed in.
-            let rect = ui.max_rect();
-            draw(ui.painter(), rect, view, s);
-            painter_border(ui.painter(), rect);
-
-            let (close, inner_rect, outer_rect, pressed, secondary, pointer, ctrl) =
-                ui.input(|i| {
-                    (
-                        i.viewport().close_requested(),
-                        i.viewport().inner_rect,
-                        i.viewport().outer_rect,
-                        i.pointer.primary_pressed(),
-                        i.pointer.secondary_clicked(),
-                        i.pointer.interact_pos(),
-                        i.modifiers.ctrl,
-                    )
-                });
-
-            outcome.close_requested = close;
-            // The fallback matters in a host that reports no window geometry at
-            // all: without it the guard sees `None` forever and the window is
-            // never remembered, rather than never poisoned.
-            outcome.inner_size = inner_rect.map(|r| r.size()).or(Some(rect.size()));
-            outcome.outer_pos = outer_rect.map(|r| r.min);
-
-            // Ctrl-click IS the right-click on macOS, and this window has
-            // twenty-six click targets. Without the guard, ctrl-clicking to
-            // open the menu over the transport starts a take at the same time.
-            let ctrl_as_context = cfg!(target_os = "macos") && ctrl;
-            let menu = secondary || (pressed && ctrl_as_context);
-            if menu {
-                if let (Some(pos), Some(inner)) = (pointer, inner_rect) {
-                    outcome.context_menu_at = Some(inner.min + pos.to_vec2());
-                }
-            }
-
-            if pressed && !menu {
-                if let Some(p) = pointer {
-                    outcome.hit = hit_test(rect, view, p);
-                }
-            }
-
-            // Borderless drag-anywhere, minus the parts that are not
-            // "anywhere". With no title bar the whole window is the drag
-            // handle, so an unguarded StartDrag means pressing Record picks the
-            // window up and carries it off instead of starting the take. The
-            // press only becomes a drag when it hit nothing.
-            if borderless && pressed && !menu && outcome.hit.is_none() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-        });
-    });
-    outcome
-}
-
-fn painter_border(painter: &Painter, rect: Rect) {
-    painter.rect_stroke(
-        rect.shrink(0.5),
-        0.0,
-        Stroke::new(1.0_f32, BORDER_COLOR),
-        StrokeKind::Middle,
     );
 }
 
@@ -9219,9 +9039,8 @@ mod tests {
         }
     }
 
-    /// The cog is never a click target without a picture, in the band OR in
-    /// the detached window, which lays the same row out at a different
-    /// aspect.
+    /// The cog is never a click target without a picture, in the band or in
+    /// any other rect the row is laid out in, at any aspect.
     #[test]
     fn the_cog_is_never_pressable_where_it_is_not_drawn() {
         let mut rects: Vec<Rect> = Vec::new();
@@ -9246,10 +9065,6 @@ mod tests {
                 "at {r:?} the cog is pressable at {:?} but too small to draw",
                 l.setup
             );
-        }
-        for d in [DETACHED_DEFAULT, DETACHED_MIN] {
-            let r = Rect::from_min_size(Pos2::ZERO, d);
-            assert!(cog_fits(Layout::new(r, &idle()).setup), "the detached window at {d:?} has no cog");
         }
     }
 
@@ -10341,16 +10156,14 @@ mod tests {
     /// able to record arrangements and or play them back on command ... the
     /// main buttons need to be intact while recording takes." The take row
     /// used to keep only a steady red dot, the stop and the cassette. Every
-    /// state, the widths the other layout tests sweep and the two detached
-    /// windows; only the cassette's colour says a take is running.
+    /// state and the widths the other layout tests sweep; only the cassette's
+    /// colour says a take is running.
     #[test]
     fn the_transport_row_is_the_same_under_a_take() {
-        let mut rects: Vec<Rect> = [320.0_f32, 500.0, 560.0, 640.0, 900.0, 1300.0, 2600.0]
+        let rects: Vec<Rect> = [320.0_f32, 500.0, 560.0, 640.0, 900.0, 1300.0, 2600.0]
             .iter()
             .map(|w| band(*w))
             .collect();
-        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT));
-        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_MIN));
         for r in rects {
             let at_rest = Layout::new(r, &idle());
             for state in STATES {
@@ -10422,32 +10235,27 @@ mod tests {
     #[test]
     fn no_two_hit_regions_overlap() {
         for w in [500.0_f32, 900.0, 1300.0, 2600.0] {
-            for r in [
-                band(w),
-                Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT),
-                Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
-            ] {
-                for state in STATES {
-                    for hide in [false, true] {
-                        let v = RecorderView {
-                            position_s: 0.0,
-                            playing: false,
-                            input_monitor: false,
-                            hide_elapsed: hide,
-                            ..with_rack(state)
-                        };
-                        let t = Layout::new(r, &v).targets();
-                        for i in 0..t.len() {
-                            for j in (i + 1)..t.len() {
-                                assert!(
-                                    !t[i].0.intersects(t[j].0),
-                                    "{} and {} overlap at {w}pt in {state:?}: {:?} {:?}",
-                                    t[i].1.control().label(),
-                                    t[j].1.control().label(),
-                                    t[i].0,
-                                    t[j].0
-                                );
-                            }
+            let r = band(w);
+            for state in STATES {
+                for hide in [false, true] {
+                    let v = RecorderView {
+                        position_s: 0.0,
+                        playing: false,
+                        input_monitor: false,
+                        hide_elapsed: hide,
+                        ..with_rack(state)
+                    };
+                    let t = Layout::new(r, &v).targets();
+                    for i in 0..t.len() {
+                        for j in (i + 1)..t.len() {
+                            assert!(
+                                !t[i].0.intersects(t[j].0),
+                                "{} and {} overlap at {w}pt in {state:?}: {:?} {:?}",
+                                t[i].1.control().label(),
+                                t[j].1.control().label(),
+                                t[i].0,
+                                t[j].0
+                            );
                         }
                     }
                 }
@@ -10464,12 +10272,7 @@ mod tests {
     /// What an EMPTY slot offers is its own test.
     #[test]
     fn every_control_is_reachable_in_the_idle_layout() {
-        for r in [
-            band(1300.0),
-            band(650.0),
-            Rect::from_min_size(Pos2::new(40.0, 90.0), DETACHED_DEFAULT),
-            Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
-        ] {
+        for r in [band(1300.0), band(650.0)] {
             let v = furnished();
             let l = Layout::new(r, &v);
             for want in Hit::ALL {
@@ -10678,13 +10481,7 @@ mod tests {
     /// present somewhere.
     #[test]
     fn the_monitor_is_the_same_rectangle_before_and_during_a_take() {
-        for r in [
-            band(500.0),
-            band(1300.0),
-            band(2600.0),
-            Rect::from_min_size(Pos2::new(40.0, 90.0), DETACHED_DEFAULT),
-            Rect::from_min_size(Pos2::ZERO, DETACHED_MIN),
-        ] {
+        for r in [band(500.0), band(1300.0), band(2600.0)] {
             let at_rest = Layout::new(r, &furnished());
             let live = Layout::new(r, &furnished_rolling());
             // The timeline holds still: the playhead somebody is watching at
@@ -10961,16 +10758,13 @@ mod tests {
     }
 
     /// Every rect the band seats the cassette in, rolling (the take's own
-    /// row), at every width the window allows, plus the two detached sizes.
+    /// row), at every width the window allows.
     fn capture_rects() -> Vec<Rect> {
         let mut out = Vec::new();
         let mut w = crate::settings::MIN_WINDOW.x;
         while w <= 2600.0 {
             out.push(Layout::new(band(w), &rolling()).capture);
             w += 1.0;
-        }
-        for d in [DETACHED_DEFAULT, DETACHED_MIN] {
-            out.push(Layout::new(Rect::from_min_size(Pos2::ZERO, d), &rolling()).capture);
         }
         out.retain(|r| r.is_positive());
         out
@@ -11115,9 +10909,7 @@ mod tests {
     /// control.** It used to take the tempo knob's slot in the transport row.
     #[test]
     fn the_take_readout_lives_on_the_scope_glass_and_displaces_nothing() {
-        let mut rects: Vec<Rect> = [560.0_f32, 900.0, 1300.0, 2560.0].iter().map(|w| band(*w)).collect();
-        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_DEFAULT));
-        rects.push(Rect::from_min_size(Pos2::ZERO, DETACHED_MIN));
+        let rects: Vec<Rect> = [560.0_f32, 900.0, 1300.0, 2560.0].iter().map(|w| band(*w)).collect();
         for r in rects {
             for state in [
                 RecordState::CountIn { beat: 2, of: 4 },

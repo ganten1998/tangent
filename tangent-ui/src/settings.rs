@@ -761,8 +761,6 @@ pub struct Settings {
     /// See `app::fit_width_to_display`, which is the only reader.
     pub monitor_usable_h: i64,
     pub borderless_mode: bool,
-    pub chord_window_detached: bool,
-    pub detached_chord_height: i64,
     pub keytoggle_enabled: bool,
     /// Additive key (D-UI-5): optional path to a user font loaded at top
     /// priority in both font families. Absent from the file when None.
@@ -794,15 +792,6 @@ pub struct Settings {
     pub show_heart: bool,
     /// Index into chord_strip::HEART_COLORS. Wraps, so any stored value is safe.
     pub heart_color: i64,
-    /// Remembered detached-window width. Its presence is also the marker that
-    /// the window has been placed under the current geometry model at least
-    /// once: while it is None the stored `detached_chord_height` is ignored,
-    /// because pre-2.3 builds overwrote that key with the attached strip's
-    /// height on every detach, so a stored 50 is not a size anyone chose.
-    pub detached_chord_width: Option<i64>,
-    /// Remembered detached-window position, in monitor coordinates.
-    pub detached_chord_x: Option<i64>,
-    pub detached_chord_y: Option<i64>,
     /// Remembered main-window position, in monitor coordinates.
     pub window_x: Option<i64>,
     pub window_y: Option<i64>,
@@ -841,28 +830,6 @@ pub struct Settings {
     /// verbatim; an unknown value falls back at use, like `fretboard_wood`.
     /// Cycled by clicking the capo itself.
     pub capo_style: String,
-    /// D-UI-16: the guitar view is in its own window.
-    pub fretboard_detached: bool,
-    /// The theory band is popped into its own window.
-    ///
-    /// The third detachable surface, after the chord strip and the fretboard,
-    /// and it follows their rules exactly — including that `Caps::detachable`
-    /// forces it off at construction, so a plugin seeded from a desktop
-    /// settings file cannot start with a band it has no window to put.
-    pub theory_detached: bool,
-    /// Remembered popout geometry. Absent until the window has been placed,
-    /// exactly like the detached chord window's (D-UI-11).
-    pub fretboard_win_w: Option<i64>,
-    pub fretboard_win_h: Option<i64>,
-    pub fretboard_win_x: Option<i64>,
-    pub fretboard_win_y: Option<i64>,
-    /// The theory window's remembered geometry. Same shape and same rule as the
-    /// fretboard's: absent until the window has actually been placed, so a
-    /// tiling WM's idea of the size is never mistaken for the user's (D-UI-11).
-    pub theory_win_w: Option<i64>,
-    pub theory_win_h: Option<i64>,
-    pub theory_win_x: Option<i64>,
-    pub theory_win_y: Option<i64>,
     /// D-UI-17: which theory diagrams are showing. Three independent flags,
     /// because any combination is allowed and an enum would need a variant per
     /// combination to say so. All off by default, and deliberately so: the
@@ -957,14 +924,6 @@ pub struct Settings {
     /// this app has already been bitten by twice. Someone who wants to record
     /// turns it on once; someone who wants a chord display never sees it.
     pub show_recorder: bool,
-    /// The Recorder band is in its own window — the fourth detachable surface,
-    /// and the one with the best reason to be on a second monitor: a big
-    /// framing view of the camera while the piano stays where it was.
-    pub recorder_detached: bool,
-    pub recorder_win_w: Option<i64>,
-    pub recorder_win_h: Option<i64>,
-    pub recorder_win_x: Option<i64>,
-    pub recorder_win_y: Option<i64>,
     /// Where takes are written. Absent means the platform's videos folder with
     /// a `Tangent` subfolder — resolved at the point of use by [`record_root`],
     /// never stored as a resolved string, so moving a home directory does not
@@ -1867,11 +1826,6 @@ pub const TRANSPOSE_MAX: i64 = 127;
 /// 1e9 into a monitor path, not to second-guess a future build's fader range.
 const MAX_GAIN: f64 = 16.0;
 
-/// Default detached-window size when nothing has been remembered yet.
-/// Deliberately NOT the piano's 8.6667:1 strip: a chord readout in its own
-/// window wants to be legible, not to mirror the keyboard's proportions.
-pub const DETACHED_DEFAULT: egui::Vec2 = egui::Vec2::new(460.0, 150.0);
-
 /// **The settings text as a JSON object, or why not.**
 ///
 /// A byte-order mark in front of the text is stripped rather than refused:
@@ -1959,8 +1913,6 @@ impl Default for Settings {
             monitor_width: 0,
             monitor_usable_h: 0,
             borderless_mode: false,
-            chord_window_detached: false,
-            detached_chord_height: 50,
             keytoggle_enabled: false,
             custom_font_path: None,
             font_choice: crate::fonts::FontChoice::default().key().to_owned(),
@@ -1987,9 +1939,6 @@ impl Default for Settings {
             reastream_port: 58710,
             show_heart: true,
             heart_color: 0,
-            detached_chord_width: None,
-            detached_chord_x: None,
-            detached_chord_y: None,
             window_x: None,
             window_y: None,
             teach_apply_all_keys: true,
@@ -2002,8 +1951,6 @@ impl Default for Settings {
             capo_style: crate::fretboard_panel::CapoStyle::default()
                 .key()
                 .to_owned(),
-            fretboard_detached: false,
-            theory_detached: false,
             theory_order: String::new(),
             theory_follow_midi: true,
             staff_set: "grand".to_owned(),
@@ -2014,20 +1961,7 @@ impl Default for Settings {
             plugin_paths: Vec::new(),
             show_camera_pane: false,
             camera_pane_left: false,
-            fretboard_win_w: None,
-            fretboard_win_h: None,
-            fretboard_win_x: None,
-            fretboard_win_y: None,
-            theory_win_w: None,
-            theory_win_h: None,
-            theory_win_x: None,
-            theory_win_y: None,
             show_recorder: false,
-            recorder_detached: false,
-            recorder_win_w: None,
-            recorder_win_h: None,
-            recorder_win_x: None,
-            recorder_win_y: None,
             record_dir: None,
             project_dir: None,
             export_dir: None,
@@ -2364,9 +2298,8 @@ impl ResetScope {
             // wherever the system puts a new window - and the window stays
             // where it is on screen, so the sentence no longer promises it.
             ResetScope::Layout => {
-                "This puts the window back to its opening size, shows the \
-                 bands a fresh install shows, and re-attaches anything you \
-                 have detached."
+                "This puts the window back to its opening size and shows the \
+                 bands a fresh install shows."
             }
             ResetScope::Playing => {
                 "This puts the tuning, capo, key, note names, grids, snap, \
@@ -2826,11 +2759,15 @@ impl Settings {
         take_bool(&mut map, "show_piano_note_names", &mut s.show_piano_note_names);
         take_bool(&mut map, "show_fret_note_names", &mut s.show_fret_note_names);
         take_bool(&mut map, "borderless_mode", &mut s.borderless_mode);
-        take_bool(
-            &mut map,
-            "chord_window_detached",
-            &mut s.chord_window_detached,
-        );
+        // **The popout windows' keys are not read any more.** Nothing has
+        // detached since 4.82.0 and the windows are gone, so
+        // `chord_window_detached`, `fretboard_detached`, `theory_detached`,
+        // `recorder_detached` and the geometry that placed them
+        // (`detached_chord_*`, `fretboard_win_*`, `theory_win_*`,
+        // `recorder_win_*`) are left in `extra` like any key this build does
+        // not know, and carried through unread. A file that still says
+        // `theory_detached: true` opens with the band in the window, because
+        // nothing reads it.
         take_bool(&mut map, "keytoggle_enabled", &mut s.keytoggle_enabled);
 
         let take_color = |map: &mut Map<String, Value>, key: &str, dst: &mut Rgb| {
@@ -2927,13 +2864,6 @@ impl Settings {
                 }
             }
         }
-        if let Some(v) = map.shift_remove("detached_chord_height") {
-            if let Some(n) = v.as_i64() {
-                // D-UI-1: honored (unlike Python, which overwrote it with 50 on
-                // init); values <= 0 fall back to 50 at the point of use.
-                s.detached_chord_height = n;
-            }
-        }
         if let Some(v) = map.shift_remove("custom_font_path") {
             if let Some(p) = v.as_str() {
                 s.custom_font_path = Some(p.to_owned());
@@ -3008,13 +2938,6 @@ impl Settings {
                 }
             }
         };
-        take_opt_i64(
-            &mut map,
-            "detached_chord_width",
-            &mut s.detached_chord_width,
-        );
-        take_opt_i64(&mut map, "detached_chord_x", &mut s.detached_chord_x);
-        take_opt_i64(&mut map, "detached_chord_y", &mut s.detached_chord_y);
         take_opt_i64(&mut map, "window_x", &mut s.window_x);
         take_opt_i64(&mut map, "window_y", &mut s.window_y);
         // Absent in every file written before the window could be resized,
@@ -3095,24 +3018,9 @@ impl Settings {
                 s.fretboard_wood = t.to_owned();
             }
         }
-        take_bool(&mut map, "fretboard_detached", &mut s.fretboard_detached);
-        take_bool(&mut map, "theory_detached", &mut s.theory_detached);
-        take_opt_i64(&mut map, "fretboard_win_w", &mut s.fretboard_win_w);
-        take_opt_i64(&mut map, "fretboard_win_h", &mut s.fretboard_win_h);
-        take_opt_i64(&mut map, "fretboard_win_x", &mut s.fretboard_win_x);
-        take_opt_i64(&mut map, "fretboard_win_y", &mut s.fretboard_win_y);
-        take_opt_i64(&mut map, "theory_win_w", &mut s.theory_win_w);
-        take_opt_i64(&mut map, "theory_win_h", &mut s.theory_win_h);
-        take_opt_i64(&mut map, "theory_win_x", &mut s.theory_win_x);
-        take_opt_i64(&mut map, "theory_win_y", &mut s.theory_win_y);
 
         // ── the recorder ────────────────────────────────────────────────────
         take_bool(&mut map, "show_recorder", &mut s.show_recorder);
-        take_bool(&mut map, "recorder_detached", &mut s.recorder_detached);
-        take_opt_i64(&mut map, "recorder_win_w", &mut s.recorder_win_w);
-        take_opt_i64(&mut map, "recorder_win_h", &mut s.recorder_win_h);
-        take_opt_i64(&mut map, "recorder_win_x", &mut s.recorder_win_x);
-        take_opt_i64(&mut map, "recorder_win_y", &mut s.recorder_win_y);
         let take_opt_str = |map: &mut Map<String, Value>, key: &str, dst: &mut Option<String>| {
             if let Some(Value::String(v)) = map.shift_remove(key) {
                 // An empty string is not a path, a uid or a name. Written by
@@ -4358,14 +4266,6 @@ impl Settings {
         );
         map.insert("borderless_mode".into(), Value::Bool(self.borderless_mode));
         map.insert(
-            "chord_window_detached".into(),
-            Value::Bool(self.chord_window_detached),
-        );
-        map.insert(
-            "detached_chord_height".into(),
-            Value::Number(self.detached_chord_height.into()),
-        );
-        map.insert(
             "keytoggle_enabled".into(),
             Value::Bool(self.keytoggle_enabled),
         );
@@ -4412,19 +4312,8 @@ impl Settings {
                 map.insert(key.into(), Value::Number(n.into()));
             }
         };
-        put_opt("detached_chord_width", self.detached_chord_width);
-        put_opt("detached_chord_x", self.detached_chord_x);
-        put_opt("detached_chord_y", self.detached_chord_y);
         put_opt("window_x", self.window_x);
         put_opt("window_y", self.window_y);
-        put_opt("fretboard_win_w", self.fretboard_win_w);
-        put_opt("fretboard_win_h", self.fretboard_win_h);
-        put_opt("fretboard_win_x", self.fretboard_win_x);
-        put_opt("fretboard_win_y", self.fretboard_win_y);
-        put_opt("theory_win_w", self.theory_win_w);
-        put_opt("theory_win_h", self.theory_win_h);
-        put_opt("theory_win_x", self.theory_win_x);
-        put_opt("theory_win_y", self.theory_win_y);
         map.insert(
             "teach_apply_all_keys".into(),
             Value::Bool(self.teach_apply_all_keys),
@@ -4488,34 +4377,8 @@ impl Settings {
             "fretboard_wood".into(),
             Value::String(self.fretboard_wood.clone()),
         );
-        map.insert(
-            "fretboard_detached".into(),
-            Value::Bool(self.fretboard_detached),
-        );
-        map.insert(
-            "theory_detached".into(),
-            Value::Bool(self.theory_detached),
-        );
         // ── the recorder ────────────────────────────────────────────────────
         map.insert("show_recorder".into(), Value::Bool(self.show_recorder));
-        map.insert(
-            "recorder_detached".into(),
-            Value::Bool(self.recorder_detached),
-        );
-        // Written out longhand rather than through `put_opt` above: that
-        // closure holds a mutable borrow of `map`, and reusing it here — after
-        // the plain `map.insert` calls in between — extends the borrow across
-        // them and does not compile.
-        for (key, value) in [
-            ("recorder_win_w", self.recorder_win_w),
-            ("recorder_win_h", self.recorder_win_h),
-            ("recorder_win_x", self.recorder_win_x),
-            ("recorder_win_y", self.recorder_win_y),
-        ] {
-            if let Some(n) = value {
-                map.insert(key.into(), Value::Number(n.into()));
-            }
-        }
         // Absent when unset, like `custom_font_path` — an absent output folder
         // means "the platform's default", which is a live decision made at the
         // point of use, not a string to be frozen into the file.
@@ -5333,8 +5196,7 @@ impl Settings {
         self.velocity_quiet_color = fresh.velocity_quiet_color;
     }
 
-    /// Which bands are showing, where the windows are, how big they are, and
-    /// which of the detachable surfaces are out on their own.
+    /// Which bands are showing, where the window is, and how big it is.
     fn take_layout(&mut self, fresh: &Self) {
         self.window_size_percent = fresh.window_size_percent;
         self.borderless_mode = fresh.borderless_mode;
@@ -5351,30 +5213,10 @@ impl Settings {
         // records where it stands again once the resize lands.
         self.window_w = fresh.window_w;
         self.window_h = fresh.window_h;
-        self.chord_window_detached = fresh.chord_window_detached;
-        self.detached_chord_height = fresh.detached_chord_height;
-        self.detached_chord_width = fresh.detached_chord_width;
-        self.detached_chord_x = fresh.detached_chord_x;
-        self.detached_chord_y = fresh.detached_chord_y;
         self.show_chord_strip = fresh.show_chord_strip;
         self.show_piano = fresh.show_piano;
         self.show_fretboard = fresh.show_fretboard;
         self.show_recorder = fresh.show_recorder;
-        self.fretboard_detached = fresh.fretboard_detached;
-        self.theory_detached = fresh.theory_detached;
-        self.recorder_detached = fresh.recorder_detached;
-        self.fretboard_win_w = fresh.fretboard_win_w;
-        self.fretboard_win_h = fresh.fretboard_win_h;
-        self.fretboard_win_x = fresh.fretboard_win_x;
-        self.fretboard_win_y = fresh.fretboard_win_y;
-        self.theory_win_w = fresh.theory_win_w;
-        self.theory_win_h = fresh.theory_win_h;
-        self.theory_win_x = fresh.theory_win_x;
-        self.theory_win_y = fresh.theory_win_y;
-        self.recorder_win_w = fresh.recorder_win_w;
-        self.recorder_win_h = fresh.recorder_win_h;
-        self.recorder_win_x = fresh.recorder_win_x;
-        self.recorder_win_y = fresh.recorder_win_y;
         self.theory_order = fresh.theory_order.clone();
         self.show_camera_pane = fresh.show_camera_pane;
         self.camera_pane_left = fresh.camera_pane_left;
@@ -5558,33 +5400,6 @@ impl Settings {
     }
 
 
-    /// Height for the detached chord window (D-UI-1: <= 0 falls back to 50).
-    pub fn detached_height_for_use(&self) -> f32 {
-        if self.detached_chord_height > 0 {
-            self.detached_chord_height as f32
-        } else {
-            50.0
-        }
-    }
-
-    /// Size to open the detached chord window at: whatever the user last left
-    /// it, or `DETACHED_DEFAULT` if they have never sized it. A remembered
-    /// width is what distinguishes the two, see `detached_chord_width`.
-    pub fn detached_size_for_use(&self) -> egui::Vec2 {
-        match self.detached_chord_width {
-            Some(w) if w > 0 => egui::Vec2::new(w as f32, self.detached_height_for_use()),
-            _ => DETACHED_DEFAULT,
-        }
-    }
-
-    /// Remembered detached-window position, if both coordinates are stored.
-    pub fn detached_pos_for_use(&self) -> Option<egui::Pos2> {
-        match (self.detached_chord_x, self.detached_chord_y) {
-            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
-            _ => None,
-        }
-    }
-
     /// Remembered main-window position, if both coordinates are stored.
     /// The size the main window should open at, if the user has chosen one.
     ///
@@ -5611,51 +5426,6 @@ impl Settings {
     /// The fingerboard wood, falling back rather than rewriting the file.
     pub fn fretboard_wood(&self) -> crate::fretboard_panel::Wood {
         crate::fretboard_panel::Wood::from_key(&self.fretboard_wood)
-    }
-
-    /// Size to open the popped-out neck at: whatever the user last left it, or
-    /// the default. A remembered width is what distinguishes the two, the same
-    /// marker the detached chord window uses.
-    pub fn fretboard_win_size(&self) -> egui::Vec2 {
-        match (self.fretboard_win_w, self.fretboard_win_h) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
-            _ => crate::fretboard_panel::DETACHED_DEFAULT,
-        }
-    }
-
-    pub fn theory_win_size(&self) -> egui::Vec2 {
-        match (self.theory_win_w, self.theory_win_h) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
-            _ => crate::theory_panel::DETACHED_DEFAULT,
-        }
-    }
-
-    pub fn theory_win_pos(&self) -> Option<egui::Pos2> {
-        match (self.theory_win_x, self.theory_win_y) {
-            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
-            _ => None,
-        }
-    }
-
-    pub fn fretboard_win_pos(&self) -> Option<egui::Pos2> {
-        match (self.fretboard_win_x, self.fretboard_win_y) {
-            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
-            _ => None,
-        }
-    }
-
-    pub fn recorder_win_size(&self) -> egui::Vec2 {
-        match (self.recorder_win_w, self.recorder_win_h) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => egui::Vec2::new(w as f32, h as f32),
-            _ => crate::recorder_panel::DETACHED_DEFAULT,
-        }
-    }
-
-    pub fn recorder_win_pos(&self) -> Option<egui::Pos2> {
-        match (self.recorder_win_x, self.recorder_win_y) {
-            (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
-            _ => None,
-        }
     }
 
     /// Where takes go.
@@ -5876,11 +5646,14 @@ impl Settings {
         true
     }
 
-    /// Count-in length, clamped to what the UI can actually offer.
+    /// Count-in length in BEATS: [`Settings::count_in_bars`] at the take's
+    /// time signature, so the clamp is on the bars, not on this.
     ///
-    /// Sanitised at the point of use, like the tuning and the capo: a file from
-    /// a later build with a 12-beat count-in keeps its 12 in the file and
-    /// counts in with the nearest thing this build has.
+    /// Sanitised at the point of use, like the tuning and the capo: a file
+    /// from a later build with a 12-bar count-in keeps its 12 in the file and
+    /// counts in for 8, the longest this build offers. The legacy
+    /// `record_count_in_beats` key is not read here at all, and is written
+    /// back as this number (see its own doc).
     pub fn count_in_beats(&self) -> u32 {
         self.time_signature().beats_in(self.count_in_bars())
     }
@@ -6096,8 +5869,9 @@ impl Settings {
 /// "how small can this get" had no answer. Now that it can be dragged, a
 /// floor is the difference between a small window and a window whose panels
 /// are drawing titles over empty rectangles — which looks like a rendering
-/// fault rather than like "too small", and is the exact failure
-/// `theory_panel::DETACHED_MIN` was measured to prevent.
+/// fault rather than like "too small", and is the exact failure the popped-out
+/// theory window's floor was measured to prevent (the window is gone; the
+/// measurement stands).
 ///
 /// The width comes from there: the diagrams are the first thing to give up,
 /// and they give up at 540. The height is what the shipped band stack comes
@@ -6155,7 +5929,7 @@ pub const ASPECT_SNAP: bool = false;
 /// **A window no bigger than the screen it opens on.**
 ///
 /// The sibling of [`clamp_to_monitor`], which places a window and assumes its
-/// size is sane. A remembered size is not: detach a panel on a desktop, carry
+/// size is sane. A remembered size is not: size a dialog on a desktop, carry
 /// the laptop to a meeting, and the window that reopens is the one the desktop
 /// could hold. The position clamp then pins its top-left on screen and the
 /// rest of it hangs off the bottom, which is the same failure the main
@@ -7844,8 +7618,6 @@ mod tests {
         assert!(s.chord_detection_enabled);
         assert_eq!(s.window_size_percent, 100);
         assert!(!s.borderless_mode);
-        assert!(!s.chord_window_detached);
-        assert_eq!(s.detached_chord_height, 50);
         assert!(!s.keytoggle_enabled);
         assert!(s.custom_font_path.is_none());
         // D-UI-15: the guitar view is opt-in. Turning it on makes the window
@@ -7968,10 +7740,11 @@ mod tests {
         let out = s.to_map();
         let keys: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
         assert_eq!(keys[0], "dark_mode");
-        // 13, not 12: `show_chord_strip` went in ahead of it in 5.0. The
-        // index is not the point — that the order is DETERMINISTIC is, so a
-        // settings file does not churn its key order on every save.
-        assert_eq!(keys[15], "keytoggle_enabled");
+        // 13: `show_chord_strip` and the two note-name toggles went in ahead
+        // of it, and the popout windows' two keys came out. The index is not
+        // the point: that the order is DETERMINISTIC is, so a settings file
+        // does not churn its key order on every save.
+        assert_eq!(keys[13], "keytoggle_enabled");
         assert_eq!(*keys.last().unwrap(), "future_key");
         // custom_font_path is absent when None
         assert!(!out.contains_key("custom_font_path"));
@@ -8183,13 +7956,7 @@ mod tests {
         // A fresh install must not gain a stored position of (0, 0), which
         // would pin the window to the top-left corner forever.
         let out = Settings::default().to_map();
-        for key in [
-            "window_x",
-            "window_y",
-            "detached_chord_x",
-            "detached_chord_y",
-            "detached_chord_width",
-        ] {
+        for key in ["window_x", "window_y"] {
             assert!(!out.contains_key(key), "{key} should be absent by default");
         }
         assert_eq!(out["teach_apply_all_keys"], Value::Bool(true));
@@ -8201,36 +7968,58 @@ mod tests {
         // so they must survive rather than being treated as invalid.
         let s = Settings::from_map(map_of(
             r#"{"window_x": -1920, "window_y": -40,
-                "detached_chord_x": 300, "detached_chord_y": 220,
-                "detached_chord_width": 640, "detached_chord_height": 180,
                 "teach_apply_all_keys": false}"#,
         ));
         assert_eq!(
             s.window_pos_for_use(),
             Some(egui::Pos2::new(-1920.0, -40.0))
         );
-        assert_eq!(
-            s.detached_pos_for_use(),
-            Some(egui::Pos2::new(300.0, 220.0))
-        );
-        assert_eq!(s.detached_size_for_use(), egui::Vec2::new(640.0, 180.0));
         assert!(!s.teach_apply_all_keys);
 
         let back = Settings::from_map(s.to_map());
         assert_eq!(back.window_pos_for_use(), s.window_pos_for_use());
-        assert_eq!(back.detached_size_for_use(), s.detached_size_for_use());
         assert!(!back.teach_apply_all_keys);
     }
 
+    /// **An older build's popout keys load, reach nothing, and ride along.**
+    ///
+    /// Nothing detaches any more and nothing here remembers where a popout
+    /// window was, so the keys a build that could detach wrote are strangers
+    /// to this one. They must not stop the file loading or disturb the keys
+    /// around them, and they are kept in `extra` exactly as written, as
+    /// every key this build does not know is. A file this build writes from
+    /// scratch has none of them.
     #[test]
-    fn detached_size_ignores_a_legacy_height_with_no_remembered_width() {
-        // Pre-2.3 builds rewrote detached_chord_height to the attached strip's
-        // height on every detach, so a file carrying only that key describes a
-        // size nobody chose. It must not produce a 50px-tall sliver.
-        let s = Settings::from_map(map_of(r#"{"detached_chord_height": 50}"#));
-        assert_eq!(s.detached_chord_width, None);
-        assert_eq!(s.detached_size_for_use(), DETACHED_DEFAULT);
-        assert_eq!(s.detached_pos_for_use(), None);
+    fn an_older_builds_popout_keys_load_and_ride_along_unread() {
+        let popout = [
+            ("chord_window_detached", Value::Bool(true)),
+            ("detached_chord_height", Value::from(180)),
+            ("detached_chord_width", Value::from(640)),
+            ("detached_chord_x", Value::from(-300)),
+            ("detached_chord_y", Value::from(220)),
+            ("fretboard_detached", Value::Bool(true)),
+            ("fretboard_win_w", Value::from(880)),
+            ("theory_detached", Value::Bool(true)),
+            ("theory_win_h", Value::from(380)),
+            ("recorder_detached", Value::Bool(true)),
+            ("recorder_win_x", Value::from(40)),
+        ];
+        let mut file = map_of(r#"{"dark_mode": true, "window_x": 12}"#);
+        for (key, value) in &popout {
+            file.insert((*key).to_owned(), value.clone());
+        }
+        let s = Settings::from_map(file);
+        assert!(s.dark_mode, "a key beside them stopped reading");
+        assert_eq!(s.window_x, Some(12), "a key beside them stopped reading");
+        for (key, value) in &popout {
+            assert_eq!(s.extra.get(*key), Some(value), "{key} was not kept as written");
+        }
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.extra, s.extra, "a save changed an older build's keys");
+        let fresh = Settings::default().to_map();
+        for (key, _) in &popout {
+            assert!(!fresh.contains_key(*key), "this build still writes {key}");
+        }
     }
 
     #[test]
@@ -8299,8 +8088,7 @@ mod tests {
 
     #[test]
     fn wrong_typed_keys_fall_back_per_key() {
-        let json =
-            r#"{"dark_mode": "yes", "window_size_percent": 150, "detached_chord_height": -3}"#;
+        let json = r#"{"dark_mode": "yes", "window_size_percent": 150}"#;
         let map = match serde_json::from_str::<Value>(json).unwrap() {
             Value::Object(m) => m,
             _ => unreachable!(),
@@ -8308,8 +8096,6 @@ mod tests {
         let s = Settings::from_map(map);
         assert!(!s.dark_mode); // wrong type => default, which ships light on the theory surfaces
         assert_eq!(s.window_size_percent, 150);
-        assert_eq!(s.detached_chord_height, -3);
-        assert_eq!(s.detached_height_for_use(), 50.0); // D-UI-1 fallback
     }
     /// **A migration's numbers are frozen, and this is what says so.**
     ///
