@@ -9,7 +9,10 @@ Tangent's executable statically embeds TEN font files:
     `epaint_default_fonts` crate), which sit underneath as glyph fallback.
 
 Every one of them is covered by a licence text in this folder, except Courier
-Prime, which is covered by OFL.txt shipping next to the Courier Prime TTFs.
+Prime, which is covered by OFL.txt. That file sits beside this folder in every
+download but the Linux tarball, where it is in fonts/, next to the Courier
+Prime TTFs. The macOS app carries the TTFs beside it too; the Windows and
+FreeBSD downloads carry none loose, the fonts being inside the program.
 
 The fallback chain is load-bearing rather than decorative: none of the three
 typefaces has U+23F5, the arrow that marks a submenu in the context menu, so

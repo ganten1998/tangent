@@ -4134,6 +4134,46 @@ fn vst3_locations() -> &'static str {
     }
 }
 
+/// **What this build is, for the About card**: the tagline, and the line
+/// under it that names what it records with and what it hosts.
+///
+/// Two facts decide it, and neither is a guess:
+///
+/// * **Whether this build records and hosts plugins at all.** Both arrive
+///   with the recorder, so `Caps::capture_devices` answers for both: the
+///   same gate the menu's plugin-folder rows use. It is false in a plugin
+///   editor and in a Minimal build, which link neither the recorder nor the
+///   plugin host, and have no audio engine either; what they are is the
+///   chord display.
+/// * **Which plugin formats**, by TARGET platform. LV2 is compiled only on
+///   Linux and FreeBSD (`tangent-host`'s Cargo.toml gates `livi`, `lilv` and
+///   `lv2-sys` there; `about_lists_lv2_exactly_where_the_host_compiles_it`
+///   holds the two together) and VST3 everywhere. This line said "LV2/VST3"
+///   on every platform. `cfg!` and not a probe, as [`encoder_note`] does it:
+///   a Windows build cross-compiled on a Mac still answers for Windows.
+fn about_lines(caps: crate::host::Caps) -> (&'static str, String) {
+    if !caps.capture_devices {
+        return (
+            "A piano display with chord intelligence",
+            "Chord detection, sheet music, guitar view, theory diagrams".to_owned(),
+        );
+    }
+    let formats = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        "LV2/VST3"
+    } else {
+        "VST3"
+    };
+    (
+        "A recording DAW with chord intelligence",
+        // The channel count comes from the desk's own constant, so it cannot
+        // fall behind the desk again: it read 16 here while the desk had 32.
+        format!(
+            "Recorder, {}-channel mixer, arrangement, MIDI editor, drum machine, {formats}",
+            crate::recorder::CHANNELS
+        ),
+    )
+}
+
 impl Dialog {
     /// Open the picker on the bundles the caller found.
     ///
@@ -11618,6 +11658,7 @@ fn show_on(
         }
         Dialog::About => {
             let t = theme(face);
+            let (tagline, what) = about_lines(placement.caps);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -11639,25 +11680,10 @@ fn show_on(
                                 // described the 1.x chord monitor — "Simple
                                 // MIDI Keyboard Monitor" — and sat directly
                                 // above a 5.0 version number for the whole of
-                                // the beta run.
-                                ui.label(
-                                    RichText::new("A recording DAW with chord intelligence")
-                                        .font(bold(10.0))
-                                        .color(t.text),
-                                );
-                                // The channel count comes from the desk's
-                                // own constant, so it cannot fall behind the
-                                // desk again: it read 16 here while the desk
-                                // had 32.
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Recorder, {}-channel mixer, arrangement, MIDI editor, \
-                                         drum machine, LV2/VST3",
-                                        crate::recorder::CHANNELS
-                                    ))
-                                    .font(bold(8.0))
-                                    .color(t.text),
-                                );
+                                // the beta run. What THIS build is comes
+                                // from `about_lines`.
+                                ui.label(RichText::new(tagline).font(bold(10.0)).color(t.text));
+                                ui.label(RichText::new(what.as_str()).font(bold(8.0)).color(t.text));
                                 // The author's own site. It was still the old
                                 // shambhaline address, carried through the port
                                 // from the Python app's spec (docs/spec/
@@ -17041,6 +17067,17 @@ at: None,
     /// shapes would find a blank screen and conclude the dialog draws nothing,
     /// which is the wrong answer to the right question.
     fn run_picker(dialog: &mut Option<Dialog>) -> (String, Option<DialogAction>) {
+        run_picker_with(dialog, crate::host::Caps::PLUGIN)
+    }
+
+    /// [`run_picker`] for a host other than the plugin's. `caps` must keep
+    /// `child_windows` off, which is what draws the dialog in the canvas
+    /// where the test can read it.
+    fn run_picker_with(
+        dialog: &mut Option<Dialog>,
+        caps: crate::host::Caps,
+    ) -> (String, Option<DialogAction>) {
+        assert!(!caps.child_windows, "a dialog in its own window paints nothing here");
         let ctx = egui::Context::default();
         // The themed dialogs name Courier Prime explicitly and epaint PANICS on
         // a font family that is not bound.
@@ -17052,7 +17089,7 @@ at: None,
             raise: false,
             parent: None,
             monitor: None,
-            caps: crate::host::Caps::PLUGIN,
+            caps,
             chrome: None,
             surface: None,
         };
@@ -17568,10 +17605,18 @@ at: None,
     /// "Simple MIDI Keyboard Monitor" directly above a 5.0 version number for
     /// the whole beta run. Read as painted: the 5.0 sentence, the support
     /// address, the composed version — and no trace of the 1.x line.
+    ///
+    /// The DESKTOP's card, the one that ships: every capability the desktop
+    /// has except its own window, which is what puts the dialog in the
+    /// canvas where the test can read it.
     #[test]
     fn about_describes_the_daw_and_names_the_support_address() {
+        let desktop = crate::host::Caps {
+            child_windows: false,
+            ..crate::host::Caps::DESKTOP
+        };
         let mut dialog = Some(Dialog::About);
-        let (painted, action) = run_picker(&mut dialog);
+        let (painted, action) = run_picker_with(&mut dialog, desktop);
         assert!(action.is_none(), "About asked the app to do something");
         assert!(
             painted.contains("A recording DAW with chord intelligence"),
@@ -17589,12 +17634,87 @@ at: None,
         // from. The line said "16-channel mixer" over a 32-channel desk.
         let desk = format!("{}-channel mixer", crate::recorder::CHANNELS);
         assert!(painted.contains(&desk), "About does not say {desk:?}: {painted}");
+        // **The formats THIS platform's build hosts**, which it said were
+        // "LV2/VST3" everywhere. LV2 is compiled only on Linux and FreeBSD;
+        // `about_lists_lv2_exactly_where_the_host_compiles_it` holds that
+        // to tangent-host's own manifest.
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            assert!(painted.contains("LV2/VST3"), "LV2 is hosted here: {painted}");
+        } else {
+            assert!(painted.contains("VST3"), "VST3 is hosted here: {painted}");
+            assert!(!painted.contains("LV2"), "no LV2 host in this build: {painted}");
+        }
         // Composed from the crate version, never retyped — the assertion
         // holds across releases precisely because both sides move together.
         assert!(
             painted.contains(concat!("Version ", env!("CARGO_PKG_VERSION"))),
             "{painted}"
         );
+    }
+
+    /// **A build with no recorder claims neither recording nor hosting.** A
+    /// plugin editor and a Minimal build link neither the recorder nor the
+    /// plugin host and have no audio engine, so their card describes the
+    /// chord display. It said "Recorder ... LV2/VST3" in both.
+    #[test]
+    fn about_in_a_build_without_the_recorder_claims_neither_recording_nor_hosting() {
+        let mut dialog = Some(Dialog::About);
+        let (painted, _) = run_picker(&mut dialog);
+        assert!(
+            painted.contains("A piano display with chord intelligence"),
+            "{painted}"
+        );
+        for claim in ["recording DAW", "Recorder", "VST3", "LV2"] {
+            assert!(!painted.contains(claim), "the plugin's card says {claim:?}: {painted}");
+        }
+        assert!(painted.contains("tangentdaw@gmail.com"), "{painted}");
+        // Minimal gives up the same two capabilities, so it gets the same card.
+        assert_eq!(
+            about_lines(crate::host::Caps::MINIMAL),
+            about_lines(crate::host::Caps::PLUGIN)
+        );
+    }
+
+    /// **The card's LV2 rule is the host's own.** tangent-ui cannot depend on
+    /// tangent-host (the firewall), so `about_lines` decides by `cfg!`. This
+    /// reads the host's manifest as text and fails the day LV2 is compiled
+    /// anywhere else, or VST3 stops being compiled everywhere, so the card
+    /// cannot drift from what a build actually hosts.
+    #[test]
+    fn about_lists_lv2_exactly_where_the_host_compiles_it() {
+        let manifest = include_str!("../../tangent-host/Cargo.toml");
+        let lines: Vec<&'static str> = manifest.lines().collect();
+        // The `[section]` a dependency's line sits in.
+        let section_of = |dep: &str| -> &'static str {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("{dep} =")))
+                .unwrap_or_else(|| panic!("tangent-host no longer names {dep}"));
+            lines[..at]
+                .iter()
+                .rev()
+                .find(|l| l.trim_start().starts_with('['))
+                .copied()
+                .unwrap_or("")
+                .trim()
+        };
+        let lv2_gate =
+            r#"[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]"#;
+        for dep in ["livi", "lilv", "lv2-sys"] {
+            assert_eq!(section_of(dep), lv2_gate, "{dep} moved: About's LV2 rule must follow it");
+        }
+        assert_eq!(
+            section_of("vst3"),
+            "[dependencies]",
+            "VST3 is no longer hosted everywhere: About says it is"
+        );
+        let (_, desktop) = about_lines(crate::host::Caps::DESKTOP);
+        assert_eq!(
+            desktop.contains("LV2"),
+            cfg!(any(target_os = "linux", target_os = "freebsd")),
+            "{desktop}"
+        );
+        assert!(desktop.contains("VST3"), "{desktop}");
     }
 
     /// The key dialog asks for a key, and until 5.1 never said where one
