@@ -41,6 +41,10 @@ Windows
 
 Linux
 
+  The tarball is tangent-<version>-linux-<arch>.tar.gz, or under its
+  version-free name tangent-linux-<arch>.tar.gz; either way the folder it
+  unpacks to carries the version:
+
     tar -xzf tangent-<version>-linux-<arch>.tar.gz
     cd tangent-<version>-linux-<arch>
     ./install.sh
@@ -213,11 +217,12 @@ Privacy
 Tangent collects no data and makes no network connections, except Stream to OBS
 (behind the cog on the recorder band), which is off until you turn it on and
 then sends the master's audio over UDP to the host you give it: this machine
-(127.0.0.1) unless you change it. Your settings and your taught chords stay on
-your machine. There is no telemetry, no update check, and no account. The two
-links in the app, the author's site in the About box and the store page in
-"Support Tangent...", hand the address to your browser if you click them, and
-that is the whole of it.
+(127.0.0.1) unless you change it. A plugin you load runs inside Tangent but is
+its maker's program, so what it connects to is up to its maker. Your settings
+and your taught chords stay on your machine. There is no telemetry, no update
+check, and no account. The two links in the app, the author's site in the
+About box and the store page in "Support Tangent...", hand the address to your
+browser if you click them, and that is the whole of it.
 
 
 If something looks wrong
@@ -243,7 +248,9 @@ Licenses
 Tangent is MIT-licensed; see LICENSE. The Rust libraries it links against are
 listed in THIRD-PARTY-LICENSES. The bundled Courier Prime fonts are
 Copyright 2015 The Courier Prime Project Authors, licensed under the SIL Open
-Font License 1.1; see OFL.txt.
+Font License 1.1; see OFL.txt. The other two typefaces, Terminess Nerd Font
+Mono and JetBrains Mono, are under the same license; their license texts are
+in font-licenses/, with those of the four fallback fonts the app embeds.
 
   macOS     inside the app: right-click Tangent.app > Show Package Contents >
             Contents/Resources
