@@ -277,7 +277,8 @@ write_readme() {
 Tangent $CARGO_VERSION for FreeBSD ($ABI)
 =========================================
 
-A MIDI keyboard monitor that names what you play in real time.
+Tangent names what you play on a MIDI keyboard in real time, and records,
+mixes and arranges it too.
 
 INSTALL
 
@@ -317,7 +318,11 @@ no sound server to start. If you hear nothing, check the mixer:
 Plug in a USB MIDI keyboard and Tangent finds it -- MIDI is read straight from
 /dev/umidi, with no daemon in between.
 
-Free, offline, no telemetry, no account. MIT licensed.
+Free, no telemetry, no account. MIT licensed. Tangent makes no network
+connections except Stream to OBS, which is off until you turn it on and then
+sends the master's audio over UDP to the host you give it (127.0.0.1, this
+machine, unless you change it). A plugin you load runs inside Tangent but is
+its maker's program, so what it connects to is up to its maker.
 https://ganten.neocities.org/projects
 EOF
 }
