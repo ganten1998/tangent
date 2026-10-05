@@ -41425,9 +41425,56 @@ impl TangentApp {
                     .builtin_face(seat, bay)
                     .is_some_and(|f| f.path == crate::faces_sampler::SAMPLER_PATH);
                 if sampler && !loaded.sample.is_empty() {
-                    self.preset_sample =
-                        Some((seat, bay, std::path::PathBuf::from(&loaded.sample)));
-                    ctx.request_repaint();
+                    let file = std::path::PathBuf::from(&loaded.sample);
+                    let name = file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| loaded.sample.clone());
+                    // **Audio only, as the browser's own road asks** (the
+                    // `PickSample` arm): a preset can come from anybody, and
+                    // what it names is copied into the project.
+                    if crate::drumpad_panel::is_audio_file(&name) {
+                        self.preset_sample = Some((seat, bay, file));
+                        ctx.request_repaint();
+                    } else {
+                        self.notify(
+                            crate::notify::Kind::Error,
+                            format!(
+                                "{name} is not audio the sampler can play, so the \
+                                 preset loaded without it."
+                            ),
+                        );
+                    }
+                }
+                // **And a convolver's impulse**, on the road the IR face's own
+                // shelf takes. No frame behind, unlike the sampler's file: the
+                // knob asks above and this one travel the same request queue,
+                // so the host has turned the knobs by the time it binds the
+                // file and writes the bay's state. Only a file that is there:
+                // `SetInsertIr` decodes asks out of its path, and the host
+                // hands on nothing shaped like one (`preset_impulse`).
+                let convolver = self.builtin_face(seat, bay).is_some_and(|f| f.path == "@tangent-ir");
+                if convolver && !loaded.impulse.is_empty() {
+                    let file = std::path::Path::new(&loaded.impulse);
+                    if !loaded.impulse.starts_with('\u{1f}') && file.is_file() {
+                        self.request_recorder(recorder::RecorderRequest::SetInsertIr {
+                            strip: seat,
+                            slot: bay,
+                            path: loaded.impulse.clone(),
+                        });
+                    } else {
+                        let name = file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| loaded.impulse.clone());
+                        self.notify(
+                            crate::notify::Kind::Error,
+                            format!(
+                                "{name}, the impulse this preset plays, is not where \
+                                 the preset names it, so the preset loaded without it."
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -51290,6 +51337,7 @@ mod tests {
             name: "Glassy".to_owned(),
             values: vec![("bell".to_owned(), 0.9)],
             sample: String::new(),
+            impulse: String::new(),
         };
         app.set_preset_loaded(loaded.clone());
         assert_eq!(app.take_preset_loaded(), Some(loaded));
@@ -51351,6 +51399,7 @@ mod tests {
             name: "Room Kick".to_owned(),
             values: vec![("vol".to_owned(), 0.25)],
             sample: saved_in.to_string_lossy().into_owned(),
+            impulse: String::new(),
         });
         let drain = |app: &mut TangentApp, first: Option<recorder::RecorderRequest>| {
             let mut asked: Vec<recorder::RecorderRequest> = first.into_iter().collect();
@@ -51387,6 +51436,138 @@ mod tests {
             )),
             "the preset's knobs did not go out: {knobs:?}"
         );
+    }
+
+    /// **A sampler preset that names a file which is not audio copies nothing
+    /// into the project.** A preset is a file that can come from anybody, and
+    /// the road that brings its sample in copies the file it names into the
+    /// project's `media/`: a preset naming a private document put a copy of
+    /// it in the project, to travel wherever the project was shared. The
+    /// browser's own road refuses what is not audio before it copies
+    /// (`PickSample`); the preset's road asks the same now, and says so.
+    #[test]
+    fn a_sampler_preset_naming_a_file_that_is_not_audio_copies_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-preset-not-audio-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Private")).expect("a private folder");
+        let secret = root.join("Private").join("notes.txt");
+        std::fs::write(&secret, b"not a sample").expect("a private file");
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).expect("the project");
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.project_doc = crate::arrangement::doc_in(&song);
+        let (strip, slot) = (2, 0);
+        let (seat, bay) = recorder::seat_bay(strip, slot);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { strip, slot, live: Box::default() });
+        app.set_preset_loaded(crate::ports::PresetLoaded {
+            unit: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            name: "Not A Patch".to_owned(),
+            values: Vec::new(),
+            sample: secret.to_string_lossy().into_owned(),
+            impulse: String::new(),
+        });
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        while app.take_recorder_request().is_some() {}
+        let bound = app.take_sampler_load();
+        let copied = song.join("media").join("notes.txt").exists();
+        let said: String = app.said().notes().iter().map(|n| n.text.clone()).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!copied, "a preset copied a file that is not audio into the project");
+        assert_eq!(bound, None, "a file that is not audio was bound to the sampler");
+        assert!(said.contains("notes.txt"), "the refusal was silent: {said}");
+    }
+
+    /// **A convolver preset binds the impulse it plays, after its knobs**, on
+    /// the road the IR face's own shelf takes (`SetInsertIr`).
+    ///
+    /// Loading one turned the knobs and left the bay playing whatever impulse
+    /// it held. No frame of waiting, unlike the sampler's file: the knob asks
+    /// and the impulse travel the same request queue, so the host has turned
+    /// the knobs by the time it binds the file and writes the bay's state
+    /// (`bind_insert_ir`). The order in that queue is what this pins. An
+    /// impulse that is not where the preset names it is said, not sent.
+    #[test]
+    fn a_convolver_preset_binds_its_impulse_after_its_knobs() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-preset-impulse-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("IRs")).expect("an IR shelf");
+        let plate = root.join("IRs").join("Plate.wav");
+        std::fs::write(&plate, b"RIFFplatWAVE").expect("the preset's impulse");
+        let plate = plate.to_string_lossy().into_owned();
+        let gone = root.join("IRs").join("Gone.wav").to_string_lossy().into_owned();
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let (strip, slot) = (3, 1);
+        let (seat, bay) = recorder::seat_bay(strip, slot);
+        let knob = |id: u32, symbol: &str| crate::ports::BuiltinFaceParam {
+            id,
+            symbol: symbol.to_owned(),
+            name: symbol.to_owned(),
+            units: String::new(),
+            default: 0.5,
+            reading: String::new(),
+            choices: Vec::new(),
+            steps: 0,
+            value: 0.5,
+        };
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: "@tangent-ir".to_owned(),
+            params: vec![knob(0, "mix"), knob(1, "trim")],
+            ..Default::default()
+        });
+        app.dialog = Some(Dialog::InsertFace { strip, slot, live: Box::default() });
+        let land = |app: &mut TangentApp, impulse: &str| {
+            app.set_preset_loaded(crate::ports::PresetLoaded {
+                unit: "@tangent-ir".to_owned(),
+                name: "Plate".to_owned(),
+                values: vec![("mix".to_owned(), 0.3)],
+                sample: String::new(),
+                impulse: impulse.to_owned(),
+            });
+            let mut asked: Vec<recorder::RecorderRequest> = run_frame(&ctx, app).into_iter().collect();
+            while let Some(r) = app.take_recorder_request() {
+                asked.push(r);
+            }
+            asked
+        };
+        let asked = land(&mut app, &plate);
+        let turned = asked.iter().position(|r| {
+            matches!(r, recorder::RecorderRequest::SetInsertParam { strip: s, slot: b, id: 0, .. }
+                if *s == seat && *b == bay)
+        });
+        let bound = asked.iter().position(|r| {
+            matches!(r, recorder::RecorderRequest::SetInsertIr { strip: s, slot: b, path }
+                if *s == seat && *b == bay && *path == plate)
+        });
+        let missing = land(&mut app, &gone);
+        let sent_missing = missing
+            .iter()
+            .any(|r| matches!(r, recorder::RecorderRequest::SetInsertIr { .. }));
+        let said: String = app.said().notes().iter().map(|n| n.text.clone()).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(bound.is_some(), "the preset's impulse was never bound: {asked:?}");
+        assert!(
+            turned.is_some() && turned < bound,
+            "the impulse went out before the knobs, so the bay's state would be written without them: {asked:?}"
+        );
+        assert!(!sent_missing, "an impulse that is not there was sent to the bay");
+        assert!(said.contains("Gone"), "a preset whose impulse is missing loaded without a word: {said}");
     }
 
     /// **What was picked is what somebody wants to look at now.** Choosing a
