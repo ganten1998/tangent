@@ -2287,8 +2287,20 @@ fn the_fork_and_the_grain_are_one_sound() {
 /// gate rung is.
 #[test]
 fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
+    // **Arturia's Comp FET-76 and not the gate rung's Rev PLATE-140**,
+    // because bits can only be asked of a plugin that agrees with itself,
+    // and FET-76 does in every engine here: serial or forked, grained or
+    // not, idle or with thirty busy loops running beside it. Rev PLATE-140
+    // runs the FFTs of its convolution on two threads of its own per
+    // instance ("ConvoEngine" in a sample of this test) and a block plays
+    // whatever they have finished, so an offline render that outruns them
+    // differs from run to run, and it falls behind in a few repeatable
+    // ways: two renders that fell behind alike agree with each other and
+    // with nothing else. FabFilter Pro-R 2 differs between two instances on
+    // one thread. Either can still be named in `TANGENT_GATE_PLUGIN`, and is
+    // held to energy whenever it disagrees with itself.
     let plugin = std::env::var("TANGENT_GATE_PLUGIN")
-        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3".to_owned());
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Comp FET-76.vst3".to_owned());
     if !Path::new(&plugin).exists() {
         println!("no {plugin}: the hosted fork case is not covered here");
         return;
@@ -2315,40 +2327,44 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
         }
         Some(e)
     };
-    // **Three engines, because the plugin has to prove itself first.**
+    // **Four engines, because the plugin has to prove itself first.**
     //
-    // A hosted reverb may modulate its delay lines with a noise source, and
-    // two instances of one that does will not agree with each other however
-    // they are scheduled. Asserting bit-exactness against such a plugin
-    // measures the plugin, not the fork. So: two SERIAL engines are the
-    // control, and the fork is only held to bit-exactness where the control
-    // earned it. Rev PLATE-140 does not - it differs from itself by -26 to
-    // -30 dBFS with the first difference landing on a different frame every
-    // run, which is what nondeterminism looks like - and FabFilter Pro-R 2
-    // does.
-    //
-    // **And TWO controls, not one, which cost a flaky gate to learn.** A
-    // single control pair answers "did these two agree THIS time", and for a
-    // plugin whose tail is made of noise that is a coin toss: Rev PLATE-140
-    // usually disagrees with itself, took the energy road, and passed - and
-    // once in a while the two serial renders happened to land bit for bit,
-    // at which point the test demanded bits from a forked, grained walk that
-    // has no reason to produce them. It failed in the gate at -24.2 dBFS and
-    // then passed three times in a row on its own, which is what a test
-    // measuring the weather looks like.
-    //
-    // Agreement has to be shown TWICE before it counts as determinism.
-    let (Some(mut one), Some(mut two), Some(mut three), Some(mut many)) =
+    // Asserting bit-exactness against a plugin that does not agree with
+    // itself measures the plugin, not the fork. So each side of the
+    // comparison brings a partner of its own, two SERIAL engines and two
+    // FORKED ones, and bits are demanded only where both pairs agree.
+    // Serial controls alone say nothing about the forked engine, because
+    // whether a render keeps up with a plugin's own threads is decided
+    // engine by engine: three serial controls beside one forked engine,
+    // all four grained, on Rev PLATE-140, failed two runs in three under
+    // thirty busy loops at frame 528, the controls agreeing while the
+    // forked render alone had fallen behind.
+    let (Some(mut one), Some(mut two), Some(mut many), Some(mut many2)) =
         (build(), build(), build(), build())
     else {
         return;
     };
     one.set_offline_fanout(false);
     two.set_offline_fanout(false);
-    three.set_offline_fanout(false);
     many.set_offline_fanout(true);
-    // And the grain on top, because that is what a live session does.
-    many.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+    many2.set_offline_fanout(true);
+    // **And the grain on top, because that is what a live session does - on
+    // all four, so the fork is the only thing that differs.** The grain
+    // hands a lane's plugins one 512-frame block where the chunked walk
+    // hands them four of 128, and a hosted plugin owes nobody the same
+    // output at two block sizes. Ours give it, and
+    // `the_fork_and_the_grain_are_one_sound` holds them to it; Rev PLATE-140
+    // does not. With the grain on the forked engine alone, the bit-exact
+    // road compared block sizes rather than threads: whenever the controls
+    // agreed, which a busy gate makes likely, it failed at -26.8 dBFS from
+    // frame 144. That figure is the plugin's and it is deterministic: a
+    // grained walk on ONE thread differs from the chunked walk by exactly
+    // that, and the forked, grained walk matches it bit for bit.
+    let grain = 1000.0 * 512.0 / f64::from(RATE);
+    one.set_grain_ms(grain);
+    two.set_grain_ms(grain);
+    many.set_grain_ms(grain);
+    many2.set_grain_ms(grain);
     let n = BLOCK * 2;
     let (mut a, mut b, mut c, mut d) = (
         vec![0.0f32; n],
@@ -2356,62 +2372,68 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
         vec![0.0f32; n],
         vec![0.0f32; n],
     );
-    let (mut xs, mut ctl, mut ctl2, mut ys) =
+    let (mut xs, mut ctl, mut ys, mut ys2) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..200 {
         one.render_offline(&mut a);
         two.render_offline(&mut b);
-        three.render_offline(&mut d);
         many.render_offline(&mut c);
+        many2.render_offline(&mut d);
         xs.extend_from_slice(&a);
         ctl.extend_from_slice(&b);
-        ctl2.extend_from_slice(&d);
         ys.extend_from_slice(&c);
+        ys2.extend_from_slice(&d);
     }
     let peak = xs.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     let name = Path::new(&plugin)
         .file_stem()
         .map_or_else(|| plugin.clone(), |s| s.to_string_lossy().into_owned());
-    // **The worst of the two control pairs decides.** One agreement is luck;
-    // two is evidence. Any disagreement at all sends this down the energy
-    // road, which is the safe one - it is the bar a deterministic plugin
-    // also clears comfortably.
+    // **The worst of the two pairs decides.** Each side of the comparison
+    // has to agree with its own partner before its samples count. Any
+    // disagreement at all sends this down the energy road, which is the
+    // safe one - it is the bar a deterministic plugin also clears
+    // comfortably.
     let (control_a, _) = worst_diff(&xs, &ctl);
-    let (control_b, _) = worst_diff(&xs, &ctl2);
+    let (control_b, _) = worst_diff(&ys, &ys2);
     let control = control_a.max(control_b);
     let (worst, first) = worst_diff(&xs, &ys);
     if peak <= 0.0005 {
         println!("  {name}: silent at its defaults, so nothing was compared");
     } else if control > 0.0 {
-        // **The plugin disagrees with itself on one thread**, so samples are
-        // the wrong metric and so is the control's own worst sample: that
-        // figure swings between -26 and -41 dBFS from run to run, which
-        // makes any margin built on it either useless or a tripwire.
+        // **The plugin disagrees with itself**, so samples are the wrong
+        // metric and so is the control's own worst sample: that figure
+        // swings between -29 and -132 dBFS from run to run, which makes any
+        // margin built on it either useless or a tripwire.
         //
-        // ENERGY is the invariant that survives. A reverb modulating its
-        // delay lines with noise produces a different tail every time and
-        // the same amount of it, so the question the fork has to answer is
-        // whether the sound is as loud, not whether it is the same sound.
-        // The same bar the transition tests use.
+        // ENERGY is the invariant that survives. A plugin whose own threads
+        // fall behind the render now and then produces a different tail
+        // every time and the same amount of it, so the question the fork has
+        // to answer is whether the sound is as loud, not whether it is the
+        // same sound. The same bar the transition tests use.
         let (total, window) = energy_gap(&xs, &ys, peak * 0.001);
         let (ctl_total, _) = energy_gap(&xs, &ctl, peak * 0.001);
         println!(
-            "  {LANES} x {name} is not deterministic: two serial renders differ \
-             by {:.1} dBFS of sample and {ctl_total:.2} dB of energy, so the \
-             fork is held to energy",
+            "  {LANES} x {name} is not deterministic: two renders on one road \
+             differ by {:.1} dBFS of sample, two serial ones by {ctl_total:.2} \
+             dB of energy, so the fork is held to energy",
             dbfs(control)
         );
         assert!(
             total < 1.0 && window < 4.0,
-            "{LANES} x {name}: the forked, grained walk differs by {total:.2} dB \
-             of total energy and {window:.2} dB in the worst window, where two \
-             serial renders differ by {ctl_total:.2} dB"
+            "{LANES} x {name}: the forked walk differs by {total:.2} dB of total \
+             energy and {window:.2} dB in the worst window, where two serial \
+             renders differ by {ctl_total:.2} dB"
         );
     } else {
+        println!(
+            "  {LANES} x {name} agrees with itself, serial and forked, so the \
+             fork is held to bits"
+        );
         assert!(
             worst == 0.0,
-            "{LANES} x {name}: two serial renders agree bit for bit, but the \
-             forked, grained walk differs by {:.1} dBFS, first at frame {:?}",
+            "{LANES} x {name}: two serial renders agree bit for bit and so do \
+             two forked ones, but the forked walk differs from the serial by \
+             {:.1} dBFS, first at frame {:?}",
             dbfs(worst),
             first.map(|i| i / 2)
         );
@@ -2421,8 +2443,8 @@ fn the_fork_renders_what_the_single_walk_rendered_with_hosted_plugins() {
     for lane in 0..LANES {
         let _ = one.load_insert(lane, 0, None, None);
         let _ = two.load_insert(lane, 0, None, None);
-        let _ = three.load_insert(lane, 0, None, None);
         let _ = many.load_insert(lane, 0, None, None);
+        let _ = many2.load_insert(lane, 0, None, None);
     }
 }
 
