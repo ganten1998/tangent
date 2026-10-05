@@ -579,9 +579,24 @@ mod tests {
     }
 
     /// **What a call costs**, in release, printed so the number is on the
-    /// record whenever the bench runs. The gate is a millisecond; the
+    /// record whenever the bench runs. The gate is half a millisecond; the
     /// expectation is tens of microseconds, and anything that consumes this
     /// per key should read the printed figure before deciding when to call.
+    ///
+    /// **The cheapest of 250 single calls, per input, and the dearest of
+    /// those four.** Load only ever adds time to a call: whatever the other
+    /// threads take while the scheduler has this one stopped lands on the
+    /// call it stopped. It was the best of five 200-call MEANS, and a busy
+    /// machine stops a thread somewhere in every 40 ms window, so a full
+    /// suite read 1.0 to 1.6 ms (3 to 5 ms with sixty busy loops beside it)
+    /// for a call whose mean is 0.23 ms in a debug build alone. Most single
+    /// calls run through untouched however busy the machine is, so the
+    /// minimum is what the call costs - 93 us in a debug build, idle or
+    /// loaded - and a slower solve raises every call and the minimum with
+    /// it. **The gate halved with the measurement**, which reads two and a
+    /// half times under the old mean: a whole millisecond over the minimum
+    /// would have let a tenfold slowdown through. Per input, so a slowdown
+    /// on one shape of beam cannot hide behind the other three.
     #[test]
     fn a_call_costs_well_under_a_millisecond() {
         use std::hint::black_box;
@@ -590,18 +605,16 @@ mod tests {
         for &(b, w, t) in &inputs {
             black_box(clamped_free(b, w, t));
         }
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let t0 = Instant::now();
-            for _ in 0..50 {
-                for &(b, w, t) in &inputs {
-                    black_box(clamped_free(black_box(b), black_box(w), black_box(t)));
-                }
+        let mut best = [f64::MAX; 4];
+        for _ in 0..250 {
+            for (slot, &(b, w, t)) in best.iter_mut().zip(&inputs) {
+                let t0 = Instant::now();
+                black_box(clamped_free(black_box(b), black_box(w), black_box(t)));
+                *slot = slot.min(t0.elapsed().as_secs_f64() * 1e6);
             }
-            let per_call = t0.elapsed().as_secs_f64() * 1e6 / (50.0 * inputs.len() as f64);
-            best = best.min(per_call);
         }
-        println!("clamped_free: {best:.1} us per call (best of 5 x 200, M = {M} panels, N = {N})");
-        assert!(best < 1000.0, "clamped_free costs {best:.0} us, which is not well under a millisecond");
+        let worst = best.iter().copied().fold(0.0, f64::max);
+        println!("clamped_free: {worst:.1} us per call (the dearest input's cheapest of 250, M = {M} panels, N = {N})");
+        assert!(worst < 500.0, "clamped_free costs {worst:.0} us, which is not well under a millisecond");
     }
 }
