@@ -3883,12 +3883,28 @@ mod tests {
         // in the window between the button press and the thread noticing is
         // thrown away, which is correct (it is audio from before T0) and which
         // made the first version of this test record nothing at all.
-        std::thread::sleep(Duration::from_millis(40));
+        //
+        // **Waited for on the file, not on a clock.** `PluginWriter::begin`
+        // arms the tap and only then creates the take's .wav, so the file
+        // being there is the writer having armed. It was a 40 ms sleep, and
+        // under a full suite at background priority the writer could take
+        // longer than that to be scheduled at all: the audio landed before
+        // the arm emptied the ring, and the take came out with none of it.
+        let wav = s.take.as_ref().map(Take::wav).expect("a rolling take has a folder");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !wav.exists() {
+            assert!(Instant::now() < deadline, "the writer never began the take");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for _ in 0..4096 {
             let _ = tx.push(0.25);
             let _ = tx.push(0.25);
         }
-        std::thread::sleep(Duration::from_millis(60));
+        // And until it has taken every sample, rather than for 60 ms.
+        while tx.slots() < 1 << 16 {
+            assert!(Instant::now() < deadline, "the writer never drained the ring");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         s.stop();
 
         let summary = s.last_summary().expect("a take produces a summary");
