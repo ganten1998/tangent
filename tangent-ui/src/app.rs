@@ -11627,6 +11627,11 @@ impl TangentApp {
     /// rendered file is left in the media folder: undo can refreeze without
     /// a render, and a file nothing points at costs nothing but disk.
     pub fn unfreeze_track(&mut self, lane: usize) {
+        // Not under a realtime export, which is playing the frozen file:
+        // see `freezes_held`.
+        if self.lane_frozen(lane).is_some() && self.freezes_held() {
+            return;
+        }
         let before = self.settings.frozen_lanes.len();
         self.settings.frozen_lanes.retain(|z| z.lane != lane);
         if self.settings.frozen_lanes.len() == before {
@@ -11762,6 +11767,26 @@ impl TangentApp {
         self.recorder.exporting
     }
 
+    /// **Whether where each lane's signal goes holds still, saying so when it
+    /// does.** A route takes a lane's signal to another channel or a jack,
+    /// and a sidechain key feeds a bay from another lane, so one added,
+    /// removed or re-keyed under a realtime export moved a lane's signal
+    /// onto another destination partway through the file, with the undo
+    /// that could put it back refused until the export ends - the shape of
+    /// `folders_held`. A route's gain is a fader and rides as ever. Asked
+    /// by `AddRoute`, `RemoveRoute` and `SetInsertKeySource`, the only
+    /// roads that change either table; an arrangement record binds neither
+    /// and is not asked about.
+    fn routes_held(&mut self) -> bool {
+        if self.recorder.exporting {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Routes and sidechains stay as they are while an export runs - it is playing through them.",
+            );
+        }
+        self.recorder.exporting
+    }
+
     /// **Whether the tracks stay on the desk, saying so when they do.**
     /// Remove Track empties a row in place - clips, kind, bays and routes,
     /// and a folder track hands its children up - so under a realtime export
@@ -11785,6 +11810,28 @@ impl TangentApp {
             self.notify(crate::notify::Kind::Info, why);
         }
         held
+    }
+
+    /// **Whether the frozen tracks stay frozen, saying so when they do.** A
+    /// thaw puts a lane back on its own clips and rack in place of the file
+    /// it froze to, and the live engine takes that on the next frame (the
+    /// frozen mask, `reload_clips`), so under a realtime export the file
+    /// changed sound partway through, with the undo that could freeze it
+    /// again refused until the export ends - `tracks_held`'s shape. A freeze
+    /// is a render of its own and the host refuses it while any pass runs
+    /// (`pass_refusal`). A full-speed export or a freeze reads the frozen
+    /// state once, at its start, and needs no hold; an arrangement record
+    /// captures no frozen lane (a freeze disarms it) and is not asked about.
+    /// Asked by `unfreeze_track`, the one door every road to a thaw goes
+    /// through.
+    fn freezes_held(&mut self) -> bool {
+        if self.recorder.exporting {
+            self.notify(
+                crate::notify::Kind::Info,
+                "A frozen track stays frozen while an export runs - it is playing the frozen file.",
+            );
+        }
+        self.recorder.exporting
     }
 
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
@@ -35474,6 +35521,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.notify(crate::notify::Kind::Info, why);
             return;
         }
+        // **The Desk empties every channel in place** - kinds, inputs, bays,
+        // sends and routes - which is Remove Track for the whole desk, so it
+        // waits as Remove Track does (`tracks_held`): under a realtime
+        // export it took every lane's sound out of the render halfway, and
+        // under an arrangement record the tracks and inputs the record
+        // captures by. Refused before the backup below, as Devices is.
+        if scope == crate::settings::ResetScope::Desk
+            && (self.recorder.exporting || self.recorder.arr_recording)
+        {
+            let why = if self.recorder.exporting {
+                "The Desk waits for the export to end - its reset empties every track the export is playing."
+            } else {
+                "The Desk waits for the arrangement record to end - its reset empties the tracks and inputs the record is writing."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+            return;
+        }
         // **The template scope touches no setting**, so it takes none of the
         // road below — no backup, no font reload, no window resize. It is a
         // file on disk in the user's Projects folder and only the host can
@@ -36158,6 +36222,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::SetInsertKeySource { strip, slot, from } => {
+                // Not under a realtime export: see `routes_held`.
+                if self.routes_held() {
+                    return;
+                }
                 // A settings write and nothing else — the `SetRouteGain`
                 // pattern, not a request: the desktop publishes the whole
                 // key table beside the routes every frame, so the engine
@@ -36727,6 +36795,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = Some(self.routing_dialog(channel, Some(hardware)));
             }
             DialogAction::AddRoute { from, target } => {
+                // Not under a realtime export: see `routes_held`.
+                if self.routes_held() {
+                    return;
+                }
                 // `add` owns the no-duplicates rule; the picker greys what is
                 // taken, so a duplicate refusal means the desk changed under
                 // the open window rather than that the user did something
@@ -36784,6 +36856,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::RemoveRoute(index) => {
+                // Not under a realtime export: see `routes_held`.
+                if self.routes_held() {
+                    return;
+                }
                 // The channel is read BEFORE the removal: after it, the index
                 // names a different route or nothing at all.
                 let channel = self.settings.routes.0.get(index).map(|r| r.from);
@@ -50887,6 +50963,43 @@ mod tests {
             matches!(app.take_project_request(), Some(crate::ports::ProjectRequest::Freeze(0))),
             "Cmd/Ctrl+Shift+F on the selected track did not ask"
         );
+    }
+
+    /// **A frozen track stays frozen while a realtime export runs.** A thaw
+    /// puts the lane back on its own clips and rack in place of its frozen
+    /// file, and the live engine takes that on the next frame, so the export
+    /// changed sound partway through its file, with the undo that could
+    /// freeze the track again refused until the export ended - Remove
+    /// Track's shape (`tracks_held`). Refused now on every road (the track
+    /// menu's row, Cmd/Ctrl+Shift+F, the toggle itself), under the pass and
+    /// while it files itself, with a note; with no export the thaw works.
+    #[test]
+    fn a_frozen_track_stays_frozen_while_an_export_runs() {
+        let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
+        app.note_frozen(0, "media/frozen-01.wav".to_owned(), 3.0);
+        assert!(app.lane_frozen(0).is_some(), "fixture: the lane is not frozen");
+        app.selected_channel = Some(0);
+        for (label, state) in [
+            ("a realtime export", recorder::RecordState::Rolling),
+            ("an export filing itself", recorder::RecordState::Idle),
+        ] {
+            app.recorder.state = state;
+            app.recorder.exporting = true;
+            for road in ["the track menu", "Cmd/Ctrl+Shift+F", "the toggle"] {
+                app.messages.clear();
+                match road {
+                    "the track menu" => app.apply_dialog_action(DialogAction::TrackFreeze(0)),
+                    "Cmd/Ctrl+Shift+F" => app.freeze_selected(),
+                    _ => app.freeze_toggle(0),
+                }
+                assert!(app.lane_frozen(0).is_some(), "{road} thawed the track under {label}");
+                assert!(!app.said().notes().is_empty(), "{road} said nothing under {label}");
+            }
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.exporting = false;
+        app.apply_dialog_action(DialogAction::TrackFreeze(0));
+        assert!(app.lane_frozen(0).is_none(), "with no export the track did not thaw");
     }
 
     #[test]
@@ -65870,6 +65983,52 @@ mod tests {
         assert_eq!(app.settings_writes(), before + 1);
     }
 
+    /// **Where a lane's signal goes holds still while a realtime export
+    /// runs**: a route added or removed, and a bay's sidechain key. A route
+    /// takes a lane's signal to another channel or a jack and a key feeds a
+    /// bay from another lane, so a change under a realtime export moved a
+    /// lane's signal onto another destination partway through the file, with
+    /// the undo that could put it back refused until the export ended - the
+    /// shape of a folder made or dissolved under one (`folders_held`).
+    /// Refused now under the pass and while it files itself, with a note. A
+    /// route's GAIN is a fader and still rides. With no export they land.
+    #[test]
+    fn a_lanes_routes_and_keys_stay_put_while_an_export_runs() {
+        use crate::routing::{Route, Target};
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let jack = Target::Hardware { first: 0, stereo: true };
+        assert!(app.settings.routes.add(Route::new(0, jack)));
+        app.settings.insert_keys.set(0, 1, Some(2));
+        for (label, state) in [
+            ("a realtime export", recorder::RecordState::Rolling),
+            ("an export filing itself", recorder::RecordState::Idle),
+        ] {
+            app.recorder.state = state;
+            app.recorder.exporting = true;
+            app.messages.clear();
+            app.apply_dialog_action(DialogAction::AddRoute { from: 1, target: jack });
+            assert_eq!(app.settings.routes.0.len(), 1, "a route was added under {label}");
+            app.apply_dialog_action(DialogAction::RemoveRoute(0));
+            assert_eq!(app.settings.routes.0.len(), 1, "a route was removed under {label}");
+            app.apply_dialog_action(DialogAction::SetInsertKeySource { strip: 0, slot: 1, from: None });
+            assert_eq!(app.settings.insert_keys.get(0, 1), Some(2), "a bay's key was taken off under {label}");
+            assert!(!app.said().notes().is_empty(), "the refusals under {label} said nothing");
+            app.apply_dialog_action(DialogAction::SetRouteGain(0, 0.5));
+            assert!(
+                (app.settings.routes.0[0].gain - 0.5).abs() < 1e-6,
+                "a route's gain stopped riding under {label}"
+            );
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.exporting = false;
+        app.apply_dialog_action(DialogAction::AddRoute { from: 1, target: jack });
+        assert_eq!(app.settings.routes.0.len(), 2, "with no export the route was not added");
+        app.apply_dialog_action(DialogAction::RemoveRoute(1));
+        assert_eq!(app.settings.routes.0.len(), 1, "with no export the route was not removed");
+        app.apply_dialog_action(DialogAction::SetInsertKeySource { strip: 0, slot: 1, from: None });
+        assert_eq!(app.settings.insert_keys.get(0, 1), None, "with no export the key stayed");
+    }
+
     /// **A flick of notches over the mixer's zoom writes the settings once.**
     ///
     /// Driven through egui's own input so the whole road is the real one:
@@ -69837,6 +69996,53 @@ mod tests {").expect("the tests module")];
         run_frame(&ctx, &mut app);
         assert_eq!(app.tempo_bpm(), 97.0, "with nothing holding the tempo the Undo did not put it back");
         assert_eq!(app.settings.record_time_signature, "3/4", "the Undo did not put the signature back");
+        let _ = std::fs::remove_file(Settings::backup_path());
+    }
+
+    /// **Reset > The Desk waits while an export runs or the arrangement
+    /// records.** It empties every channel in place - kinds, inputs, bays,
+    /// sends, routes - which is Remove Track for the whole desk
+    /// (`tracks_held`): under a realtime export it took every lane's sound
+    /// out of the render halfway, with the reset's Undo held until the
+    /// export ended, and under an arrangement record it emptied the tracks
+    /// and inputs the record captures by. Refused now under the pass, while
+    /// it files itself and under the record, with a note, before anything
+    /// is reset or the Undo copy is rewritten; with neither it goes ahead.
+    #[test]
+    fn a_desk_reset_waits_while_an_export_runs_or_the_arrangement_records() {
+        let (ctx, mut app) = recorder_app();
+        app.add_bare_track(3);
+        app.set_insert(3, 0, Some("@tangent-eq"));
+        assert_eq!(app.insert(3, 0), Some("@tangent-eq"), "fixture: no plugin on the track");
+        let _ = std::fs::remove_file(Settings::backup_path());
+        for (label, state, exporting, arr) in [
+            ("a realtime export", recorder::RecordState::Rolling, true, false),
+            ("an export filing itself", recorder::RecordState::Idle, true, false),
+            ("an arrangement record", recorder::RecordState::Idle, false, true),
+        ] {
+            app.recorder.state = state;
+            app.recorder.exporting = exporting;
+            app.recorder.arr_recording = arr;
+            app.messages.clear();
+            app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Desk));
+            run_frame(&ctx, &mut app);
+            assert_eq!(app.insert(3, 0), Some("@tangent-eq"), "Reset > The Desk emptied the track under {label}");
+            assert!(!app.said().notes().is_empty(), "the refusal under {label} said nothing");
+            assert!(
+                !matches!(app.open_dialog(), Some(Dialog::Confirm { .. })),
+                "a refused reset reported itself done under {label}"
+            );
+            assert!(
+                !Settings::backup_path().exists(),
+                "a refused reset rewrote the copy an earlier reset's Undo puts back, under {label}"
+            );
+        }
+        app.recorder.state = recorder::RecordState::Idle;
+        app.recorder.exporting = false;
+        app.recorder.arr_recording = false;
+        app.apply_dialog_action(DialogAction::ResetTo(crate::settings::ResetScope::Desk));
+        run_frame(&ctx, &mut app);
+        assert_eq!(app.insert(3, 0), None, "with nothing held the desk was not reset");
         let _ = std::fs::remove_file(Settings::backup_path());
     }
 

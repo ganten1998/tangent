@@ -89,7 +89,15 @@ and the count-in back with the devices, waits while the tempo is held (a
 take's count-in, the arrangement's record count, or an export) for the
 same reason. So does the Undo a reset's box offers, whatever the scope,
 since it puts every setting back, the tempo included; the box comes back
-with its Undo, so it can be pressed once the hold ends.
+with its Undo, so it can be pressed once the hold ends. A frozen track
+stays frozen under a realtime export (`freezes_held`): a thaw puts the lane
+back on its clips and rack in place of the file the export is playing.
+Routes are not added or removed, and no bay's sidechain is re-keyed,
+under one either (`routes_held`): each moves a lane's signal onto another
+destination partway through the file, as a folder's bus does; a route's
+gain is a fader and still rides. And Settings > Reset > The Desk, which
+empties every channel in place, waits as Remove Track does, under an
+export or an arrangement record.
 
 **Clip operations, v1, with their gestures (all owner-specified):**
 
