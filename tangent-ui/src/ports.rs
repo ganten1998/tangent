@@ -1046,6 +1046,12 @@ pub struct PresetLoaded {
     /// preset saved with nothing loaded. The app copies it into the project
     /// and binds the copy on the bay that asked, after the knobs.
     pub sample: String,
+    /// **The impulse a convolver preset plays**, by the absolute path the
+    /// preset names; empty for every other unit, for a preset saved with
+    /// nothing loaded, and for anything shaped like one of the IR road's
+    /// asks rather than a file (`desktop::preset_impulse`). The app binds it
+    /// on the bay that asked, after the knobs.
+    pub impulse: String,
 }
 
 /// A source of MIDI the app picks for itself.

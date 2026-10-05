@@ -7576,7 +7576,8 @@ impl DesktopApp {
     /// check is the owner rule `write_insert_state` keeps for plugin state:
     /// a file that names a different unit moves nothing, out loud. A sampler
     /// preset's file rides along (`preset_sample`), for the app to copy into
-    /// this project and bind after the knobs.
+    /// this project and bind after the knobs, and so does a convolver
+    /// preset's impulse (`preset_impulse`), which the app binds where it is.
     fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
         let parsed = std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
@@ -7607,6 +7608,7 @@ impl DesktopApp {
             name,
             values: p.values,
             sample: preset_sample(unit, &p.state),
+            impulse: preset_impulse(unit, &p.state),
         });
     }
 
@@ -16883,6 +16885,31 @@ fn preset_sample(unit: &str, state: &[(String, String)]) -> String {
         .unwrap_or_default()
 }
 
+/// **The impulse a convolver preset plays**, for the app to bind on the bay
+/// that asked (`SetInsertIr`, after the knobs). Only a plain ABSOLUTE path is
+/// handed on: the IR road decodes asks out of that same field
+/// (`dialogs::ir_ask` - delete a file, paste one, raise the chooser), a
+/// preset is a file that can come from anybody, and a delete arriving that
+/// way would run without the confirmation every delete is promised. A value
+/// shaped like an ask (`ir_is_sentinel`), or a relative path nothing could
+/// resolve, is handed on as nothing. No absolute path can begin with the
+/// asks' unit separator, so the second test already covers the first; the
+/// first is kept to state the rule as a rule, as `ir_bindable` keeps it.
+/// Empty for any other unit.
+#[cfg(feature = "recorder")]
+fn preset_impulse(unit: &str, state: &[(String, String)]) -> String {
+    if unit != crate::builtin_fx::IR_PATH {
+        return String::new();
+    }
+    state
+        .iter()
+        .find(|(symbol, _)| symbol == "ir_path")
+        .map(|(_, path)| path.as_str())
+        .filter(|path| !ir_is_sentinel(path) && std::path::Path::new(path).is_absolute())
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
 /// **The longest impulse response the IR bay will take, in seconds.**
 ///
 /// Twenty, and the number is not invented here — it is the one the rest of
@@ -25904,6 +25931,57 @@ mod tests {
         assert!(
             body("fn load_unit_preset(").contains("sample: preset_sample(unit, &p.state),"),
             "a loaded preset no longer hands the app its sample"
+        );
+    }
+
+    /// **A convolver preset hands on the impulse it plays, and never one of
+    /// the IR road's asks.**
+    ///
+    /// The save road always wrote the impulse into the preset (the face's
+    /// extras carry `ir_path`, absolute), and loading one turned the knobs and
+    /// left the bay playing whatever it held. The load now hands the file on
+    /// (`preset_impulse`) for the app to bind after the knobs. Only a plain
+    /// absolute path: `SetInsertIr` decodes asks out of the same field, and a
+    /// preset shaped like the delete ask would have removed an impulse with
+    /// none of the confirmation a delete is promised. A relative path and
+    /// another unit's state hand on nothing. That the load calls it is a
+    /// source scan.
+    #[test]
+    fn a_convolver_preset_hands_on_its_impulse_and_never_an_ask() {
+        let ir = crate::builtin_fx::IR_PATH;
+        let plate = std::env::temp_dir().join("IRs").join("Plate.wav");
+        let plate = plate.to_string_lossy().into_owned();
+        let state = |path: &str| vec![("ir_path".to_owned(), path.to_owned())];
+        // Saved through the preset road, and read back through the file.
+        let preset = tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: ir.to_owned(),
+            name: "Plate".to_owned(),
+            values: vec![("mix".to_owned(), 0.4)],
+            state: preset_state_for_disk(ir, &state(&plate), None),
+            extra: Default::default(),
+        };
+        let back = tangent_ui::preset::Preset::from_json(&preset.to_json()).expect("a preset");
+        assert_eq!(preset_impulse(ir, &back.state), plate, "the preset's impulse was not handed on");
+        // Never an ask, and never a path nothing could resolve.
+        let delete = tangent_ui::dialogs::ir_delete_ask(&plate);
+        assert_eq!(preset_impulse(ir, &state(&delete)), "", "a preset shaped like a delete ask was handed on");
+        assert_eq!(
+            preset_impulse(ir, &state(tangent_ui::dialogs::IR_BROWSE)),
+            "",
+            "a preset shaped like the chooser's ask was handed on"
+        );
+        assert_eq!(preset_impulse(ir, &state("IRs/Plate.wav")), "", "a relative impulse was handed on");
+        let sample = vec![("sample_path".to_owned(), plate.clone())];
+        assert_eq!(preset_impulse(crate::builtin_fx::SAMPLER_PATH, &sample), "", "a sample read as an impulse");
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn load_unit_preset(").expect("load_unit_preset");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("impulse: preset_impulse(unit, &p.state),"),
+            "a loaded preset no longer hands the app its impulse"
         );
     }
 
