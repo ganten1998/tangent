@@ -1649,7 +1649,9 @@ bit-exactness against the fork - and it fails it against ITSELF, by -26 to
 is a reverb modulating its delay lines with noise. So the test renders two
 SERIAL engines as a control and only demands bits where the control earned
 them. Pro-R 2 earns them and is held to them; PLATE-140 is held to its own
-spread.
+spread. (Corrected 2026-10-04, under "And the hosted-plugin test found its
+own bar" below: not noise, and what failed bits was the grain, not the
+fork.)
 
 ## Three platforms
 
@@ -1721,6 +1723,21 @@ to run. Energy does: across five runs the two serial renders differ by
 of spread. Different tail, same amount of it, every time. That is the bar
 the fork is held to for a plugin like this, and Pro-R 2 - which is
 deterministic - is still held to bits.
+
+**Corrected 2026-10-04: not noise, and not the fork.** Rev PLATE-140 runs
+the FFTs of its convolution on two threads of its own per instance, and a
+block plays whatever they have finished by then. An offline render outruns
+them now and then, idle or busy, in a few repeatable ways; with a pause
+after every block it never does, and then the plugin agrees with itself bit
+for bit, forked or not. Pro-R 2, measured on this machine, differs between
+two instances on one thread. And the test's forked render was the only
+grained one, so whenever its serial controls agreed, which a busy machine
+makes likely, it compared 512-frame blocks with 128-frame ones and failed
+at -26.8 dBFS from frame 144: the plugin's block-size dependence, the same
+on one thread. The test now grains all four engines, gives each side a
+partner of its own (two serial, two forked), and hosts Comp FET-76 by
+default, which agrees with itself in every engine, busy or not, and so
+holds the fork to bits.
 
 ---
 
