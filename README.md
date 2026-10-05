@@ -135,8 +135,9 @@ including the Linux aarch64 tarball and checksums, are on the
   so the app looks identical on all platforms; Terminess Nerd Font Mono and
   JetBrains Mono are bundled as alternatives.
 
-The right-click context menu is the primary UI surface. Every feature above is
-reachable from it.
+The right-click context menu is the primary UI surface. Every feature above
+that is not on screen is reachable from it or from a key (hold **H** to see
+the keys).
 
 ## Pay what you can
 
@@ -162,7 +163,8 @@ machine, in `~/.config/tangent/` and wherever you save your work. Supporter
 keys are verified offline with a signature check, so no server is contacted
 then either. The one network feature is the OBS stream, which is off by
 default and, when you turn it on, sends audio to an address you choose (your
-own machine, unless you say otherwise). Nothing else ever opens a socket.
+own machine, unless you say otherwise). Nothing else ever opens a network
+connection.
 
 ## A note on the name
 
@@ -248,8 +250,8 @@ redistribute Courier New.
 
 **Terminess Nerd Font Mono** (Copyright 2020 Dimitar Toshkov Zhekov, 2023
 Tilman Blumenbach) and **JetBrains Mono** (Copyright 2020 The JetBrains Mono
-Project Authors) are bundled as optional UI typefaces, selectable from the
-context menu, both under the SIL Open Font License 1.1. Their license texts
+Project Authors) are bundled as optional UI typefaces, selectable with the
+`F` key, both under the SIL Open Font License 1.1. Their license texts
 ship in `font-licenses/`.
 
 Four more fonts come in automatically with eframe/egui's `default_fonts`
