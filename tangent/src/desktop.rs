@@ -560,10 +560,6 @@ struct Recorder {
     /// `Manifest::head_seconds`. It was recomputed every frame from the
     /// settings, which is wrong whenever the press skipped or joined a count.
     take_head_s: f64,
-    /// The realtime pass's delivery instructions, applied at the finish:
-    /// set by `start_bounce` with the pass it belongs to, and taken by
-    /// `finish_bounce` whatever road the pass leaves by.
-    pending_delivery: Option<tangent_ui::ports::ProjectExportSpec>,
 }
 
 /// One bounce: where it stops, what it writes, and whether it is waiting
@@ -797,41 +793,6 @@ fn deliver_stems(landed: &[std::path::PathBuf], dst_dir: &std::path::Path) -> Ve
         .collect()
 }
 
-/// **What a realtime pass's receipt says of its stems**: how many landed,
-/// and in which folder - `export/stems/`, or `export/stems-dry/` for a dry
-/// pass - read off the stems themselves. Nothing when none landed.
-#[cfg(feature = "recorder")]
-fn stems_receipt(landed: &[std::path::PathBuf]) -> String {
-    let folder = landed
-        .first()
-        .and_then(|stem| stem.parent()?.file_name())
-        .map(|f| f.to_string_lossy().into_owned());
-    match (landed.len(), folder) {
-        (0, _) | (_, None) => String::new(),
-        (1, Some(folder)) => format!(" + 1 stem in export/{folder}/"),
-        (n, Some(folder)) => format!(" + {n} stems in export/{folder}/"),
-    }
-}
-
-/// **What a menu pass says when its take cannot be copied into `export/`**
-/// as `name`: the file that is missing, and why. Its stems landed before
-/// that copy was tried (`land_stems`, in `tick_bounce`) and are on disk, so
-/// they are named too, read off the stems as [`stems_receipt`] reads them:
-/// "export failed" alone sent somebody to export again for files they had.
-#[cfg(feature = "recorder")]
-fn take_copy_failed(name: &str, e: &std::io::Error, landed: &[std::path::PathBuf]) -> String {
-    let folder = landed
-        .first()
-        .and_then(|stem| stem.parent()?.file_name())
-        .map(|f| f.to_string_lossy().into_owned());
-    let missing = format!("export failed: export/{name} could not be written ({e})");
-    match (landed.len(), folder) {
-        (0, _) | (_, None) => format!("export failed: {e}"),
-        (1, Some(folder)) => format!("{missing}, but its stem landed in export/{folder}/"),
-        (n, Some(folder)) => format!("{missing}, but its {n} stems landed in export/{folder}/"),
-    }
-}
-
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -850,6 +811,11 @@ struct Bounce {
     /// pass writes them beside it in `stems_stage`, and `land_stems` moves
     /// them in only if it ran whole. `None` with no stems written.
     stem_dir: Option<std::path::PathBuf>,
+    /// **What the Export dialog asked of this pass**: where and in what
+    /// shapes its files go at the finish (`finish_bounce`). The pass's own,
+    /// made with it and handed to the finish with it, so it can neither
+    /// outlive the pass nor be another pass's.
+    delivery: tangent_ui::ports::ProjectExportSpec,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -10015,40 +9981,32 @@ impl DesktopApp {
         self.recorder.session.song_started_at_head(from_s);
     }
 
-    /// Start an export: the whole arrangement, played from the top through
-    /// the real engine — racks, limiter, master — into an audio-only take
-    /// the finish copies into the project's `export/`.
+    /// Start the Export dialog's realtime export: the whole arrangement (or
+    /// the span `delivery` names), played through the real engine - racks,
+    /// limiter, master - into an audio-only take the finish stages in the
+    /// project's `export/` and delivers where and in the shapes `delivery`
+    /// asks. It is the only road here: the menu's Export Track and Export
+    /// Stems rows that bounced without a dialog went in 4.52.0.
     ///
-    /// `stems_dry` is read only when `stems` is on and says which of the two
-    /// per-lane taps the pass takes: every strip's own inserts left out, or
-    /// left in. Two bools rather than a mode enum because the offline twin
-    /// carries the same pair off `ProjectExportSpec`, and one shape for the
-    /// two paths is what stops them drifting.
-    ///
-    /// `delivery` is the Export dialog's: where and in what shapes the pass's
-    /// files go at the finish. The menu rows pass none.
+    /// `delivery.stems_dry` is read only when `delivery.stems` is on and
+    /// says which of the two per-lane taps the pass takes: every strip's own
+    /// inserts left out, or left in - the pair the offline twin reads off
+    /// the same `ProjectExportSpec`, and one shape for the two paths is what
+    /// stops them drifting.
     ///
     /// The pass does NOT store the mode: the folder it writes into and the
     /// folder `finish_bounce` delivers into are both named by
-    /// `ports::stems_folder_name`, and the spec the finish reads is the same
-    /// object this pair was taken from a line earlier. A third copy of the
-    /// answer would be a third thing that can disagree. The delivery copies
+    /// `ports::stems_folder_name`, from this one spec. A second copy of the
+    /// answer would be a second thing that can disagree. The delivery copies
     /// the stems the pass landed, handed to it, never the folder's listing.
-    fn start_bounce(
-        &mut self,
-        stems: bool,
-        stems_dry: bool,
-        span: Option<(f64, f64)>,
-        delivery: Option<tangent_ui::ports::ProjectExportSpec>,
-    ) {
+    fn start_bounce(&mut self, delivery: tangent_ui::ports::ProjectExportSpec) {
+        let (stems, stems_dry, span) = (delivery.stems, delivery.stems_dry, delivery.span);
         // **A standing message stands until somebody lowers it.** The request
         // raises `EXPORT_RUNNING` before it knows whether the pass can even
         // start, which is right — the user pressed Export and deserves to see
         // that something happened — but it makes every refusal below a road
         // out that has to take it down again, or "Exporting…" sits on the
         // desk for the rest of the session with nothing able to clear it.
-        // A lower on a key that is not raised is a no-op, so the direct
-        // Export Track / Export Stems rows pay nothing for this.
         macro_rules! refuse {
             () => {{
                 self.app.notify_lower(EXPORT_RUNNING);
@@ -10188,11 +10146,11 @@ impl DesktopApp {
                 arm_stem_tap(e, true, stems_dry);
             }
         }
-        // **The delivery is the pass's, set with it and never before**: set
-        // ahead of the refusals above, a refused Export dialog pass left it
-        // standing for the next menu export to deliver into its folder, and
-        // replaced the delivery of a pass already running.
-        self.recorder.pending_delivery = delivery;
+        // **The delivery is the pass's own**, made with it past the last
+        // refusal above. It stood beside the pass once, set ahead of those
+        // refusals, so an Export dialog pass refused behind a running one
+        // replaced that pass's delivery with its own, and the running pass's
+        // files went to the refused one's folder under its name.
         self.recorder.bounce = Some(Bounce {
             // Two seconds of tail: the reverbs' ring-out is part of the
             // track.
@@ -10202,6 +10160,7 @@ impl DesktopApp {
             stem_scratch: Vec::new(),
             engine_lost: false,
             stem_dir,
+            delivery,
         });
     }
 
@@ -10301,19 +10260,24 @@ impl DesktopApp {
                         folder,
                         problem,
                         landed,
+                        delivery: b.delivery,
                     },
                 );
             }
         }
     }
 
-    /// The pass is done: the take's WAV becomes `export/track.wav` (counted
-    /// up past what exists), and the band's status line says where.
-    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, landed: &[std::path::PathBuf]) {
-        // **The pass's delivery goes with it, whatever road it leaves by.**
-        // Taken before the first return: a failed pass left it standing, and
-        // the next menu export delivered into this dialog's folder.
-        let mut delivery = self.recorder.pending_delivery.take();
+    /// The pass is done: the take's WAV is staged as `export/track.wav`
+    /// (counted up past what exists), then delivered where and in the shapes
+    /// the Export dialog asked (`spec`, the pass's own delivery), and the
+    /// delivery's receipt says where.
+    fn finish_bounce(
+        &mut self,
+        folder: &str,
+        problem: Option<String>,
+        landed: &[std::path::PathBuf],
+        mut spec: tangent_ui::ports::ProjectExportSpec,
+    ) {
         // The reveal-when-done watcher must not open a Finder window for a
         // bounce — the export note says where the real file went.
         self.recorder.seen_take = Some(folder.to_owned());
@@ -10359,107 +10323,65 @@ impl DesktopApp {
             }
             n += 1;
         };
-        // **Whose file is `export/{name}` — and is it written yet?**
-        //
-        // Two roads reach here and they mean different things by this copy.
-        // The Export Track and Export Stems menu rows ask for exactly this
-        // file and nothing else, so the copy below IS the export and the
-        // receipt belongs to it. The Export DIALOG asks for a file of its own,
-        // under a name, a folder and a format the user chose, and this copy is
-        // only the staging step it is made from.
-        //
-        // Told apart here rather than not at all, because it used to speak for
-        // both: the `Ok` arm lowered the standing "Exporting…" and pushed
-        // "exported  export/track.wav" — an internal staging path nobody asked
-        // for and cannot find from the dialog they filled in — and it did it
-        // BEFORE the delivery below had written a single byte of the file they
-        // did ask for. A receipt is a promise that the thing is on disk; this
-        // one was neither about the right file nor true yet.
-        //
-        // So the delivery is taken FIRST, and while there is one standing the
-        // staging copy says nothing: the message that ends this pass is the
-        // delivery's own, pushed after its files exist.
-        //
-        // **The stems ride the same receipt**, the folder they landed in
-        // named off the stems themselves: a chore of its own used to add
-        // "... stems in export/stems/" after every pass, a dialog's included,
-        // and in `stems/` for dry stems too.
-        match std::fs::copy(&wav, export_dir.join(&name)) {
-            Ok(_) if delivery.is_none() => {
-                self.app.notify_lower(EXPORT_RUNNING);
-                self.app
-                    .notify(Kind::Success, format!("exported  export/{name}{}", stems_receipt(landed)));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // **A menu pass's stems are on disk by now**, so its failure
-                // says where (`take_copy_failed`). A dialog pass's stems are
-                // its delivery's to report, from the folder it chose.
-                let said = if delivery.is_none() {
-                    take_copy_failed(&name, &e, landed)
-                } else {
-                    format!("export failed: {e}")
-                };
-                self.app.notify(Kind::Error, said);
-                match delivery.as_mut() {
-                    // The dialog's master is a COPY of the file that just
-                    // failed to appear, so there is no master to deliver.
-                    // Its stems are written straight from the take and are
-                    // still worth delivering, so only the master is dropped
-                    // — and the standing message stays up until the delivery
-                    // reports on what is left.
-                    Some(spec) => spec.master = false,
-                    None => {
-                        self.app.notify_lower(EXPORT_RUNNING);
-                        return;
-                    }
-                }
+        // **`export/{name}` is a staging copy, not the export.** The Export
+        // dialog asks for a file of its own, under a name, a folder and a
+        // format the user chose, and this copy is only the step it is made
+        // from, so it says nothing: the message that ends this pass is the
+        // delivery's own, pushed after its files exist. It used to push
+        // "exported  export/track.wav", an internal path nobody asked for,
+        // before the delivery had written a byte of the file they did ask
+        // for; a receipt is a promise that the thing is on disk.
+        if let Err(e) = std::fs::copy(&wav, export_dir.join(&name)) {
+            self.app.notify(Kind::Error, format!("export failed: {e}"));
+            // The dialog's master is a COPY of the file that just failed to
+            // appear, so there is no master to deliver. Its stems are written
+            // straight from the take and are still worth delivering, so only
+            // the master is dropped, and the standing message stays up until
+            // the delivery reports on what is left.
+            spec.master = false;
+        }
+        // Deliver into the chosen folder in the chosen shapes. The engine's
+        // rate rules a realtime pass; the spec's rate only steers the
+        // offline one.
+        spec.rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(spec.rate, |e| e.output().sample_rate);
+        let Some(out_dir) = self.export_out_dir(&spec) else {
+            self.app.notify_lower(EXPORT_RUNNING);
+            return;
+        };
+        let _ = std::fs::create_dir_all(&out_dir);
+        let stem_name = sanitize_file_stem(&spec.name);
+        let mut paths = Vec::new();
+        if spec.master {
+            let dst = out_dir.join(format!("{stem_name}.wav"));
+            if std::fs::copy(export_dir.join(&name), &dst).is_ok() {
+                paths.push(dst);
             }
         }
-        // A realtime EXPORT-dialog pass: deliver into the chosen folder in
-        // the chosen shapes. The engine's rate rules a realtime pass; the
-        // spec's rate only steers the offline one.
-        if let Some(mut spec) = delivery {
-            spec.rate = self
-                .recorder
-                .engine
-                .as_ref()
-                .map_or(spec.rate, |e| e.output().sample_rate);
-            let Some(out_dir) = self.export_out_dir(&spec) else {
+        if spec.stems {
+            // **The stems this pass landed, and only those**: the folder
+            // also holds what earlier exports wrote for lanes since
+            // renamed, and anybody's own files. See `deliver_stems`.
+            paths.extend(deliver_stems(landed, &out_dir.join(spec.stems_folder())));
+        }
+        self.app.set_export_progress(None);
+        match deliver_formats_inner(&paths, &spec, true) {
+            Ok(()) => {
                 self.app.notify_lower(EXPORT_RUNNING);
-                return;
-            };
-            let _ = std::fs::create_dir_all(&out_dir);
-            let stem_name = sanitize_file_stem(&spec.name);
-            let mut paths = Vec::new();
-            if spec.master {
-                let dst = out_dir.join(format!("{stem_name}.wav"));
-                if std::fs::copy(export_dir.join(&name), &dst).is_ok() {
-                    paths.push(dst);
+                self.app
+                    .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
+                // A long export is a thing people walk away from; the
+                // first thing they want on returning is the file.
+                if spec.open_when_done {
+                    reveal(&out_dir);
                 }
             }
-            if spec.stems {
-                // **The stems this pass landed, and only those**: the folder
-                // also holds what earlier exports wrote for lanes since
-                // renamed, and anybody's own files. See `deliver_stems`.
-                paths.extend(deliver_stems(landed, &out_dir.join(spec.stems_folder())));
-            }
-            self.app.set_export_progress(None);
-            match deliver_formats_inner(&paths, &spec, true) {
-                Ok(()) => {
-                    self.app.notify_lower(EXPORT_RUNNING);
-                    self.app
-                        .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
-                    // A long export is a thing people walk away from; the
-                    // first thing they want on returning is the file.
-                    if spec.open_when_done {
-                        reveal(&out_dir);
-                    }
-                }
-                Err(e) => {
-                    self.app.notify_lower(EXPORT_RUNNING);
-                    self.app.notify(Kind::Error, format!("export: {e}"));
-                }
+            Err(e) => {
+                self.app.notify_lower(EXPORT_RUNNING);
+                self.app.notify(Kind::Error, format!("export: {e}"));
             }
         }
     }
@@ -11350,8 +11272,6 @@ impl DesktopApp {
             // `ProjectExportSpec::source_label` for why the two inline
             // matches that used to be here were merged.
             Q::Export(spec) => ("Preparing export", Some(spec.source_label().to_owned())),
-            Q::ExportTrack => ("Preparing export", Some("master".to_owned())),
-            Q::ExportStems => ("Preparing export", Some("stems".to_owned())),
             Q::Freeze(lane) => ("Preparing freeze", Some(self.app.channel_display_name(*lane).to_string())),
         };
         // **Save is the one of these that is usually instant, and it is
@@ -11626,18 +11546,10 @@ impl DesktopApp {
                     // The realtime pass: the live engine, the live rate. The
                     // spec's shaping (name, dir, formats, mono) is applied
                     // when the pass lands — see `finish_bounce`.
-                    self.start_bounce(spec.stems, spec.stems_dry, spec.span, Some(spec.clone()));
+                    self.start_bounce(spec);
                 } else {
                     self.start_offline_bounce(spec);
                 }
-            }
-            tangent_ui::ports::ProjectRequest::ExportTrack => {
-                self.start_bounce(false, false, None, None);
-            }
-            // Processed, like the dialog's own default: the files sum to the
-            // record, which is what a bare "export stems" row means.
-            tangent_ui::ports::ProjectRequest::ExportStems => {
-                self.start_bounce(true, false, None, None);
             }
             tangent_ui::ports::ProjectRequest::Freeze(lane) => {
                 self.start_freeze(lane);
@@ -19852,7 +19764,6 @@ impl DesktopApp {
                 play_on_go: false,
                 take_downbeat: false,
                 take_head_s: 0.0,
-                pending_delivery: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
@@ -21654,11 +21565,13 @@ enum Chore {
     /// a warp or stretch render, a mix and a file write, all on this thread.
     GlueAudio(Vec<u64>),
     /// The realtime pass landed: copy it out, run the format pass, say where.
-    /// `landed` is where each of its stems is now (`land_stems`).
+    /// `landed` is where each of its stems is now (`land_stems`), and
+    /// `delivery` the pass's own (`Bounce::delivery`).
     FinishBounce {
         folder: String,
         problem: Option<String>,
         landed: Vec<std::path::PathBuf>,
+        delivery: tangent_ui::ports::ProjectExportSpec,
     },
 }
 
@@ -22552,8 +22465,9 @@ impl DesktopApp {
                 folder,
                 problem,
                 landed,
+                delivery,
             } => {
-                self.finish_bounce(&folder, problem, &landed);
+                self.finish_bounce(&folder, problem, &landed, delivery);
             }
         }
     }
@@ -23708,7 +23622,7 @@ mod tests {
     fn the_realtime_delivery_copies_what_its_pass_landed() {
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("\nmod tests {").expect("this module")];
-        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let at = src.find("fn finish_bounce(").expect("finish_bounce");
         let finish = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         assert!(
             finish.contains("deliver_stems(landed, &out_dir.join(spec.stems_folder()))")
@@ -23716,33 +23630,21 @@ mod tests {
             "the realtime delivery copies the whole stems folder again"
         );
         assert!(
-            src.contains("self.finish_bounce(&folder, problem, &landed);"),
+            src.contains("self.finish_bounce(&folder, problem, &landed, delivery);"),
             "the finish is not told which stems its pass landed"
         );
     }
 
-    /// **A realtime pass's receipt names the folder its stems landed in,
-    /// and an Export dialog's pass leaves the word to its delivery.** The
+    /// **A realtime pass's chore leaves the word to its delivery.** The
     /// chore that finishes a pass added "exported  export/track + N stems in
-    /// export/stems/" after every pass whose stems landed: in `stems/` even
-    /// for dry stems, which land in `stems-dry/`; beside the delivery's own
-    /// receipt on a dialog pass, naming the staging folder `finish_bounce`
-    /// keeps quiet about there; and as a second receipt after Export Stems'
-    /// own. The pass's one receipt carries its stems now. The words are
-    /// driven; that the chore says nothing of its own is a source scan,
-    /// because `DesktopApp` cannot be built in a test.
+    /// export/stems/" after every pass whose stems landed: beside the
+    /// delivery's own receipt, naming the staging folder `finish_bounce`
+    /// keeps quiet about, and in `stems/` even for dry stems, which land in
+    /// `stems-dry/`. The delivery's receipt is the pass's one word now, and
+    /// the staging copy says nothing for it. A source scan, because
+    /// `DesktopApp` cannot be built in a test.
     #[test]
-    fn a_realtime_receipt_names_its_stems_folder_and_leaves_a_dialog_pass_to_its_delivery() {
-        let export = std::path::Path::new("/p/song/export");
-        let dry = export.join(tangent_ui::ports::stems_folder_name(true));
-        let wet = export.join(tangent_ui::ports::stems_folder_name(false));
-        assert_eq!(
-            stems_receipt(&[dry.join("01-Bass.wav"), dry.join("02-Keys.wav")]),
-            " + 2 stems in export/stems-dry/",
-            "dry stems were said to be in the processed stems' folder"
-        );
-        assert_eq!(stems_receipt(&[wet.join("01-Bass.wav")]), " + 1 stem in export/stems/");
-        assert_eq!(stems_receipt(&[]), "", "a pass with no stems spoke of them");
+    fn a_realtime_pass_leaves_its_word_to_its_delivery() {
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("\nmod tests {").expect("this module")];
         let at = src.find("fn run_chore_now(").expect("run_chore_now");
@@ -23751,102 +23653,51 @@ mod tests {
         let finish = &finish[..finish.find("\n            }\n").expect("the arm's end")];
         assert!(
             finish.contains("self.finish_bounce(") && !finish.contains(".notify("),
-            "the finish's chore pushes a receipt of its own beside the pass's"
+            "the finish's chore pushes a receipt of its own beside the delivery's"
         );
-        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
+        let at = src.find("fn finish_bounce(").expect("finish_bounce");
         let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
-        let quiet = body.find("Ok(_) if delivery.is_none() => {").expect("the staging copy's receipt");
-        let arm = &body[quiet..quiet + body[quiet..].find("Ok(_) => {}").expect("the dialog's arm")];
         assert!(
-            arm.contains("stems_receipt(landed)"),
-            "the pass's own receipt does not carry its stems"
+            !body.contains(concat!("format!(\"exported  ", "export/")),
+            "the staging copy speaks for the delivery again"
         );
     }
 
-    /// **A menu pass whose take cannot be copied into `export/` says where
-    /// its stems landed.** They land before that copy is tried (`land_stems`,
-    /// in `tick_bounce`), so they are on disk; the failure said only "export
-    /// failed: ...", which sent somebody to export again for files they had.
-    /// It names the file that is missing and the stems that landed now; with
-    /// no stems it is the sentence it was, and a dialog pass leaves its
-    /// stems to its delivery's receipt. The words are driven; that the menu
-    /// road says them is a source scan, because `DesktopApp` cannot be built
-    /// in a test.
-    #[test]
-    fn a_menu_pass_whose_take_cannot_be_copied_says_where_its_stems_landed() {
-        let wet = std::path::Path::new("/p/song/export").join(tangent_ui::ports::stems_folder_name(false));
-        let full = std::io::Error::other("no space left");
-        let said = take_copy_failed("track.wav", &full, &[wet.join("01-Bass.wav"), wet.join("02-Keys.wav")]);
-        assert!(
-            said.contains("export/track.wav") && said.contains("no space left"),
-            "the failure does not say which file failed, or why: {said:?}"
-        );
-        assert!(
-            said.contains("2 stems landed in export/stems/"),
-            "the failure does not say the stems landed, or where: {said:?}"
-        );
-        assert!(
-            take_copy_failed("track 2.wav", &full, &[wet.join("01-Bass.wav")]).contains("stem landed in export/stems/"),
-            "one stem is not said to have landed"
-        );
-        assert_eq!(
-            take_copy_failed("track.wav", &full, &[]),
-            "export failed: no space left",
-            "a pass with no stems spoke of them"
-        );
-        let whole = include_str!("desktop.rs");
-        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
-        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
-        let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
-        let arm = &body[body.find("Err(e) => {").expect("the copy's failure")..];
-        let arm = &arm[..arm.find("Some(spec) => spec.master = false").expect("the dialog's road")];
-        assert!(
-            arm.contains("take_copy_failed(&name, &e, landed)"),
-            "a menu pass whose copy failed still says only that the export failed"
-        );
-        assert!(
-            arm.contains("if delivery.is_none() {\n                    take_copy_failed("),
-            "a dialog pass's failure names the staging folder its delivery keeps quiet about"
-        );
-    }
-
-    /// **An export's delivery never outlives its pass.** The Export arm set
-    /// `pending_delivery` before `start_bounce` could refuse (a pass or a
-    /// recording already running, no audio engine, an empty timeline), and
-    /// `finish_bounce` returned on a failed pass before taking it: either
-    /// way the delivery stood after its pass, and the next Export Track or
-    /// Export Stems from the menu delivered into that dialog's folder under
-    /// its name. A dialog export refused behind a running pass also put its
-    /// own delivery in place of that pass's. The delivery is handed to
-    /// `start_bounce` now, set only past its last refusal, and taken at the
-    /// top of the finish. A source scan, because `DesktopApp` cannot be
-    /// built in a test.
+    /// **An export's delivery never outlives its pass, and no other pass
+    /// takes it.** The delivery stood beside the pass in a field of its own:
+    /// the Export arm set it before `start_bounce` could refuse, and
+    /// `finish_bounce` returned on a failed pass before taking it, so a
+    /// dialog export refused behind a running pass put its own delivery in
+    /// place of that pass's, and the running pass's files went to the
+    /// refused one's folder under its name. The delivery is the pass's own
+    /// now (`Bounce::delivery`): made past `start_bounce`'s last refusal,
+    /// handed to the finish's chore, and from there to `finish_bounce`. A
+    /// source scan, because `DesktopApp` cannot be built in a test.
     #[test]
     fn an_exports_delivery_never_outlives_its_pass() {
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("\nmod tests {").expect("this module")];
-        assert_eq!(
-            src.matches("self.recorder.pending_delivery = ").count(),
-            1,
-            "something other than a starting pass sets the delivery"
+        assert!(
+            !src.contains(concat!("pending_", "delivery")),
+            "the delivery stands beside the pass again"
         );
         let at = src.find("fn start_bounce(").expect("start_bounce");
         let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
-        let set = start
-            .find("self.recorder.pending_delivery = delivery;")
-            .expect("the pass does not take its delivery as it starts");
+        let made = start
+            .find("self.recorder.bounce = Some(Bounce {")
+            .expect("the pass is no longer made in start_bounce");
         assert!(
-            !start[set..].contains("refuse!()"),
-            "the pass can refuse after it has taken its delivery"
+            start[made..].contains("delivery,"),
+            "the pass is made without its delivery"
         );
-        let at = src.find("fn finish_bounce(&mut self").expect("finish_bounce");
-        let finish = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
-        let taken = finish
-            .find("self.recorder.pending_delivery.take()")
-            .expect("the finish never takes the delivery");
         assert!(
-            !finish[..taken].contains("return;"),
-            "a pass can end before its delivery is taken"
+            !start[made..].contains("refuse!()"),
+            "the pass can refuse after it is made"
+        );
+        assert!(
+            src.contains("delivery: b.delivery,")
+                && src.contains("self.finish_bounce(&folder, problem, &landed, delivery);"),
+            "the finish is not handed the pass's own delivery"
         );
     }
 

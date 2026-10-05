@@ -36580,14 +36580,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     purpose: crate::ports::DirPurpose::ExportDir,
                 });
             }
-            DialogAction::ProjectExportTrack => {
-                self.dialog = None;
-                self.project_request = Some(crate::ports::ProjectRequest::ExportTrack);
-            }
-            DialogAction::ProjectExportStems => {
-                self.dialog = None;
-                self.project_request = Some(crate::ports::ProjectRequest::ExportStems);
-            }
             DialogAction::SetShowTakeSummary(v) => {
                 self.settings.show_take_summary = v;
                 self.save_settings();

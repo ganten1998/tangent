@@ -1676,16 +1676,12 @@ pub enum DialogAction {
     TrackIcon(usize, u8),
     /// Choose the auto-palette every unpainted slot wears.
     TrackPalette(i64),
-    /// Bounce the arrangement to one WAV.
-    ProjectExportTrack,
     /// Open the export dialog.
     ProjectExportOpen,
     /// Run the export the dialog assembled.
     ProjectExportRun(crate::ports::ProjectExportSpec),
     /// Pick the export directory with the native chooser.
     ProjectExportBrowse,
-    /// Bounce every used lane to its own WAV.
-    ProjectExportStems,
     /// List this directory and hand the rows back. The host reads the disk;
     /// the dialog draws what it is given, the same division the plugin picker
     /// uses.

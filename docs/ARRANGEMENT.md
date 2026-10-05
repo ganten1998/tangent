@@ -341,6 +341,10 @@ channels play back their clips and nothing else. "Ready to play" and
     `export/track.wav`) or per-lane stems in ONE pass (`stems_on` +
     `stem_scratch` tap in all three folds → per-used-lane WAVs at
     `export/stems/NN-name.wav`). The drum bus is not yet a stem.
+    (Superseded 4.52.0: the Export dialog replaced both rows. Its realtime
+    pass stages the take at `export/track.wav` and delivers into the
+    folder and shapes the dialog names; the rows' last code went
+    2026-10-04.)
   - **The band is one LCD**: the whole box is the REAPER-style cluster —
     bars|beats|thousandths + min:sec left, Start/End/Length of the
     TIMELINE (the viewport, accurate with no clips) right, every part a

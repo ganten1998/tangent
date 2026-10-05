@@ -885,12 +885,6 @@ pub enum ProjectRequest {
     /// A full export by SPEC: sources, rate, formats, and whether it runs
     /// offline (default) or as a realtime pass.
     Export(ProjectExportSpec),
-    /// Bounce the arrangement to one WAV in `<project>/export/` — a real
-    /// pass through the engine, racks and limiter included.
-    ExportTrack,
-    /// The same pass, but every used lane lands in its own WAV under
-    /// `<project>/export/stems/`.
-    ExportStems,
     /// **Freeze this lane**: render it through its rack, post-insert and
     /// pre-fader, into the project's media folder, and hand the file back
     /// through `TangentApp::note_frozen`. The host does the render because

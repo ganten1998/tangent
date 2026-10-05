@@ -1318,12 +1318,13 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 row("New Project", MenuAction::NewProject),
                 row("Open Project...", MenuAction::OpenProject),
                 row("Duplicate Project As...", MenuAction::DuplicateProject),
-                // **Media IN, beside the exports that take it out.** It wants
-                // to be reachable from a right-click on the arrangement,
-                // where the lane bodies are spoken for by the selection box
-                // and only a track's own header opens a menu — so an empty
-                // desk had nowhere to ask from. No new top-level row: this is
-                // the import that belongs next to the exports.
+                // **Media IN, with the project it brings media into.** It
+                // wants to be reachable from a right-click on the
+                // arrangement, where the lane bodies are spoken for by the
+                // selection box and only a track's own header opens a menu,
+                // so an empty desk had nowhere to ask from. No new top-level
+                // row. (It once stood beside the export rows, which went to
+                // the Export dialog in 4.52.0.)
                 row("Insert Media...", MenuAction::InsertMedia),
             ],
         );
