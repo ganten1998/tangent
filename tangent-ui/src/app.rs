@@ -66037,6 +66037,13 @@ mod tests {").expect("the tests module")];
         app.settings.show_heart = true;
         app.license.unlock_cheat();
         assert!(app.license.cheated(), "the cheat marker did not take");
+        // **The first frame arms the decoration nudge, and it is put out at
+        // once**, for the reason given below: its 50 ms frames read 33.3 ms
+        // here, a third of a millisecond inside the bound, and a frame landing
+        // in its last few milliseconds read 0 ns. What is measured is the
+        // heart's own ask.
+        let _ = frame_asks_seen(&ctx, &mut app, true);
+        app.decor_nudge_until = None;
         for _ in 0..30 {
             let _ = frame_asks_seen(&ctx, &mut app, true);
         }
