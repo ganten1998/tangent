@@ -7,7 +7,8 @@ altered dominants, slash chords, rootless jazz voicings, scales and modes. It
 records, mixes and arranges what you play too, and one press writes the audio,
 the MIDI and a video of the window itself.
 
-Everything is in the right-click menu. That is the entire interface.
+What is not on screen is in the right-click menu or on a key. Hold H to see
+the keys.
 
 
 First launch
@@ -44,8 +45,8 @@ Linux
     cd tangent-<version>-linux-<arch>
     ./install.sh
 
-  That installs Tangent into your home directory, no root needed, and prints
-  how to undo it (./install.sh --uninstall). Or skip installing entirely:
+  That installs Tangent into your home directory, no root needed, and
+  ./install.sh --uninstall takes it all back out. Or skip installing entirely:
   `chmod +x tangent && ./tangent` runs it from the folder.
 
   It asks once whether you want desktop integration: the menu entry and the
@@ -81,13 +82,14 @@ Linux
   because ALSA only creates a port for hardware that is actually there.
 
   Audio out of the box goes through ALSA, which on a PipeWire desktop means
-  PipeWire, with nothing to set up. If you run a pro-audio session, Settings ->
-  Audio Setup has a second entry: JACK. Pick it and Tangent becomes an ordinary
-  client of the graph, under the name "Tangent", so its ports show up in
-  qjackctl, Carla or Patchance next to everything else and can be patched into
-  a DAW. It runs on the server's own period and sample rate, so the buffer-size
-  and sample-rate controls have nothing left to do while it is selected; the
-  Audio Status line reports what the server is actually running.
+  PipeWire, with nothing to set up. If you run a pro-audio session, Settings
+  (the cog on the recorder band) -> Audio Setup has a second entry: JACK. Pick
+  it and Tangent becomes an ordinary client of the graph, under the name
+  "Tangent", so its ports show up in qjackctl, Carla or Patchance next to
+  everything else and can be patched into a DAW. It runs on the server's own
+  period and sample rate, so the buffer-size and sample-rate controls have
+  nothing left to do while it is selected; the INPUT and OUTPUT lines at the
+  top of Audio Setup report what the server is actually running.
 
   Pick it to be part of a session, not to chase a smaller number: measured on
   the machine this was developed on, JACK was not faster than the ordinary ALSA
@@ -136,14 +138,18 @@ Linux
 Connecting a MIDI keyboard
 --------------------------
 
-Plug it in, start Tangent, play. Tangent connects on its own at startup, preferring
-ports whose names contain "USB-MIDI", then "Scarlett" or both "USB" and "MIDI",
-and otherwise simply taking the first port it finds.
+Plug it in, start Tangent, play. Tangent connects on its own at startup: the
+MIDI tracks a new session starts with listen to every device, so every keyboard
+that is plugged in is heard. A session with no MIDI track opens one port,
+preferring ports whose names contain "USB-MIDI", then "Scarlett" or both "USB"
+and "MIDI", and otherwise simply taking the first port it finds.
 
-If you connected after launching, or you have more than one device:
-right-click > "Select MIDI Input...", choose the port, click OK. Tangent does not
-reconnect by itself if a device is unplugged mid-session: plug it back in and
-pick it from that list again.
+A device plugged in after launching, or unplugged and plugged back in, is picked
+up by itself as long as a track listens to it. If one stays silent after being
+plugged straight back in, leave it out for a few seconds and plug it in again.
+To choose which devices a track listens to, select it, then right-click >
+"Select MIDI Input...", tick the ones it should hear (none ticked means every
+device) and click Done.
 
 From a terminal:
 
@@ -152,14 +158,15 @@ From a terminal:
 
 (on macOS that binary lives at /Applications/Tangent.app/Contents/MacOS/tangent)
 
-No keyboard to hand? Right-click > "Enable Keytoggle", then click keys on the
-drawn piano to hold and release notes. Chord naming behaves exactly the same.
+No keyboard to hand? Press K for Keytoggle, then click keys on the drawn piano
+to hold and release notes. Chord naming behaves exactly the same.
 
 
 When Tangent names a chord differently than you would
 ---------------------------------------------------
 
-Two menu items, and they do different things.
+Two menu items, both under Chords when you right-click the piano, and they do
+different things.
 
 "Teach Chord Name..." pins your name to the exact voicing you are holding. Type
 it, click OK, and that is what Tangent calls it from then on. Tick "Apply in all
@@ -184,27 +191,33 @@ Learning" in the menu silences learning without erasing anything.
 Settings
 --------
 
-Colors, dark mode, window size (50%–200%), borderless mode and flats versus
-sharps all live in the right-click menu, and save themselves the moment you
-change them. "Reset Settings to Default" puts
-everything back.
+Colors, window size (75%, 100% or 125%) and borderless mode live in the
+right-click menu, under Colors and Window; dark mode is the D key and flats
+versus sharps the P key. All of them save themselves the moment you change
+them. Reset, at the bottom of the menu, puts back one part at a time (colours
+and theme, layout and windows, playing and theory, the desk, devices and
+folders, the default template) or everything at once, and asks first.
 
-Tangent keeps two files, at the same path on every platform:
+Tangent keeps its settings in two files, at the same path on every platform:
 
-    ~/.config/tangent/settings.json    appearance and window preferences
+    ~/.config/tangent/settings.json    every setting, from colours to the desk
     ~/.config/tangent/overrides.json   taught chords and learned leanings
 
-On Windows that folder is C:\Users\<you>\.config/tangent\. Deleting one of these
+On Windows that folder is C:\Users\<you>\.config\tangent\. Deleting one of these
 files resets that part of Tangent and nothing else.
 
 
 Privacy
 -------
 
-Tangent makes no network connections and collects no data. Your settings and your
-taught chords stay on your machine. There is no telemetry, no update check, and
-no account. The one link in the app, the author's site in the About box,
-hands the address to your browser if you click it, and that is the whole of it.
+Tangent collects no data and makes no network connections, except Stream to OBS
+(behind the cog on the recorder band), which is off until you turn it on and
+then sends the master's audio over UDP to the host you give it: this machine
+(127.0.0.1) unless you change it. Your settings and your taught chords stay on
+your machine. There is no telemetry, no update check, and no account. The two
+links in the app, the author's site in the About box and the store page in
+"Support Tangent...", hand the address to your browser if you click them, and
+that is the whole of it.
 
 
 If something looks wrong
@@ -215,12 +228,13 @@ If something looks wrong
       window, quit the leftover process.
 
   No chord names appear
-      Chord detection may be switched off. Right-click > "Enable Chord
-      Detection".
+      Chord detection may be switched off. Right-click the piano > Chords >
+      "Enable Chord Detection".
 
   Keys never light up
-      Tangent is probably on the wrong port. Right-click > "Select MIDI
-      Input..." and pick your keyboard.
+      Tangent may not be listening to your keyboard. Right-click > "Select
+      MIDI Input..." and tick it, or untick everything, which means every
+      device.
 
 
 Licenses
@@ -238,7 +252,7 @@ Font License 1.1; see OFL.txt.
 
 THANKS
 
-  Omer, for the rounded macOS app icon.
+  Omer, for the rounded macOS app icon of the 2.x era.
   Hatsu, for extensive Windows testing and feedback.
 
 Tangent is pay-what-you-can, and nothing is a perfectly good amount. Thanks for
