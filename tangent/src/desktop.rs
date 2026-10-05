@@ -3855,6 +3855,151 @@ fn stretched_clip_audio(
     }
 }
 
+/// **A frozen lane's rendered file, as the clip that plays it**: the whole
+/// file from the timeline's start, at unity, with no trim, fade, stretch or
+/// warp. One spelling for the two engines that play it - the desk's
+/// (`reload_clips`) and an export's own (`export_clip_placement`) - so the
+/// export cannot place the file anywhere the desk does not.
+#[cfg(feature = "recorder")]
+fn frozen_lane_clip(z: &tangent_ui::arrangement::FrozenLane) -> tangent_ui::arrangement::ArrClip {
+    tangent_ui::arrangement::ArrClip {
+        kind: tangent_ui::arrangement::ClipKind::Audio,
+        notes: Vec::new(),
+        pedal: Vec::new(),
+        lane: z.lane,
+        path: z.path.clone(),
+        start_s: 0.0,
+        offset_s: 0.0,
+        len_s: 0.0,
+        loop_s: 0.0,
+        fade_in_s: 0.0,
+        fade_out_s: 0.0,
+        name: String::new(),
+        id: 0,
+        anchor: Default::default(),
+        follow_tempo: false,
+        stretch: 1.0,
+        stretch_mode: String::new(),
+        gain: 1.0,
+        extra: Default::default(),
+        warp: Vec::new(),
+        warp_fit: String::new(),
+        warp_rate: 0,
+    }
+}
+
+/// **What the export's own engine plays**: every clip of `doc` placed at
+/// `rate`, the audio decoded with a cache of the export's own so the live
+/// engine's cache never learns a wrong-rate clip, and read where `resolve`
+/// says the files are. The caller resolves against `clip_doc`, so an export
+/// of a fresh session reads its template's clips out of the template, and
+/// `every_road_that_reads_a_clips_file_resolves_it_through_clip_doc` follows
+/// that resolve where it stands.
+///
+/// **And a frozen lane as the desk plays it** (`reload_clips`): its clips
+/// and MIDI withheld, and its rendered file (`frozen_lane_clip`) placed in
+/// their stead, decoded at the export rate through the same cache. The
+/// export placed every clip and no frozen file, while `publish_routes`
+/// handed its engine the frozen mask that stands the lane's racks down: a
+/// frozen track came out of a full-speed export, its stems and a freeze as
+/// its raw clips with no inserts, silence through a hosted instrument, and
+/// without its file. A frozen file that cannot be read leaves its lane
+/// silent, as it does live, and its sentence is answered with the
+/// placement: the placed audio, the placed MIDI, and what could not be read.
+#[cfg(feature = "recorder")]
+fn export_clip_placement(
+    doc: &tangent_ui::arrangement::Arrangement,
+    frozen: &[tangent_ui::arrangement::FrozenLane],
+    rate: u32,
+    resolve: impl Fn(&str) -> std::path::PathBuf,
+) -> (Vec<crate::instrument::Placed>, Vec<crate::instrument::PlacedMidi>, Vec<String>) {
+    let is_frozen = |lane: usize| frozen.iter().any(|z| z.lane == lane);
+    let mut unread: Vec<String> = Vec::new();
+    let mut placed = Vec::new();
+    let mut midi_placed = Vec::new();
+    let mut cache: std::collections::HashMap<
+        std::path::PathBuf,
+        Arc<tangent_record::decode::Clip>,
+    > = std::collections::HashMap::new();
+    // Stretched copies, per-export like the decode cache above and for the
+    // same reason: everything in here is at the EXPORT rate. See
+    // `stretched_clip_audio`.
+    let mut stretch_cache: std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>> =
+        std::collections::HashMap::new();
+    let frames = |s: f64| frames_at(f64::from(rate), s);
+    for clip in &doc.clips {
+        // A frozen lane's clips stay on the page and off the engine; its
+        // file plays instead, placed below the loop.
+        if is_frozen(clip.lane) {
+            continue;
+        }
+        if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
+            let notes = midi_clip_notes(clip, f64::from(rate));
+            if !notes.is_empty() {
+                midi_placed.push(crate::instrument::PlacedMidi {
+                    strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
+                    start: frames(clip.start_s),
+                    len: frames(clip.len_s),
+                    notes: Arc::new(notes),
+                    pedal: Arc::new(midi_clip_pedal(clip, f64::from(rate))),
+                });
+            }
+            continue;
+        }
+        let path = resolve(&clip.path);
+        let decoded = match cache.get(&path) {
+            Some(c) => Arc::clone(c),
+            None => match tangent_record::decode::decode(&path, rate) {
+                Ok(c) => {
+                    let c = Arc::new(c);
+                    cache.insert(path.clone(), Arc::clone(&c));
+                    c
+                }
+                Err(_) => continue,
+            },
+        };
+        // **The clip's stretch, which the export used to drop** —
+        // the same divergence the gain comment below records: the
+        // live path rendered the stretched copy, the bounce the
+        // raw decode, so a stretched clip exported at the wrong
+        // speed and an open-ended one at the wrong length. The
+        // cache is per-export and at the EXPORT rate; the live
+        // `self.stretch_cache` holds live-rate audio and must not
+        // feed a file at another rate.
+        let decoded = stretched_clip_audio(clip, decoded, &path, &mut stretch_cache);
+        // **The clip's own gain, which the export used to drop.**
+        // It read `1.0` here while playback read `clip.gain`, so a
+        // clip pulled down on the timeline came back at full level
+        // in the file — the export disagreeing with what was heard.
+        placed.extend(audio_clip_passes(
+            clip,
+            &decoded,
+            f64::from(rate),
+            clip.gain as f32,
+        ));
+    }
+    // **A frozen lane plays its rendered self**, as `reload_clips` places it.
+    for z in frozen {
+        let path = resolve(&z.path);
+        let decoded = match cache.get(&path) {
+            Some(c) => Arc::clone(c),
+            None => match tangent_record::decode::decode(&path, rate) {
+                Ok(c) => {
+                    let c = Arc::new(c);
+                    cache.insert(path.clone(), Arc::clone(&c));
+                    c
+                }
+                Err(e) => {
+                    unread.push(format!("frozen file: {e}"));
+                    continue;
+                }
+            },
+        };
+        placed.extend(audio_clip_passes(&frozen_lane_clip(z), &decoded, f64::from(rate), 1.0));
+    }
+    (placed, midi_placed, unread)
+}
+
 /// **The loudest sample a clip PLAYS**: its file warped and then stretched,
 /// as [`stretched_clip_audio`] resolves it for the export and glue, over
 /// the span its passes read ([`audio_clip_passes`], the schedule playback
@@ -10776,11 +10921,14 @@ impl DesktopApp {
             None => self.app.engine_automation(),
         });
         // The built-in: rendered by the engine itself when a channel's
-        // first bay names it — the live walk's own rule.
+        // first bay names it — the live walk's own rule. **Not on a frozen
+        // lane**, as live: its file carries what the built-in played (see
+        // `export_clip_placement`, which withholds the lane's MIDI too).
+        let thawed = !frozen_lane_mask(self.app.frozen_lanes());
         let builtin_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
             .collect();
-        e.set_builtin_strips(builtin_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        e.set_builtin_strips(builtin_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)) & thawed);
         // **Every lane holding the drumpad.**
         //
         // `.find()` alone was the bug: a drum instrument loads a full
@@ -10801,7 +10949,7 @@ impl DesktopApp {
         let keys_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::KEYS_PATH))
             .collect();
-        e.set_keys_strips(keys_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        e.set_keys_strips(keys_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)) & thawed);
         for &ch in &keys_lanes {
             e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
             e.set_keys_params(ch, &self.app.keys_params_of(ch));
@@ -10871,71 +11019,14 @@ impl DesktopApp {
             };
             self.app.notify(Kind::Error, note);
         }
-        // ── the clips, decoded at the EXPORT rate with a cache of their
-        // own, so the live engine's cache never learns a wrong-rate clip ──
-        // Read where `clip_doc` says they are: an export of a fresh session
-        // reads its template's clips out of the template.
+        // ── the clips, at the EXPORT rate - see `export_clip_placement` ──
         if let Some(doc_path) = self.app.clip_doc() {
-            let doc = self.app.arrangement().clone();
-            let mut placed = Vec::new();
-            let mut midi_placed = Vec::new();
-            let mut cache: std::collections::HashMap<
-                std::path::PathBuf,
-                Arc<tangent_record::decode::Clip>,
-            > = std::collections::HashMap::new();
-            // Stretched copies, per-export like the decode cache above and
-            // for the same reason: everything in here is at the EXPORT
-            // rate. See `stretched_clip_audio`.
-            let mut stretch_cache: std::collections::HashMap<
-                (std::path::PathBuf, i64, String),
-                Arc<tangent_record::decode::Clip>,
-            > = std::collections::HashMap::new();
-            let frames = |s: f64| frames_at(f64::from(rate), s);
-            for clip in &doc.clips {
-                if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
-                    let notes = midi_clip_notes(clip, f64::from(rate));
-                    if !notes.is_empty() {
-                        midi_placed.push(crate::instrument::PlacedMidi {
-                            strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
-                            start: frames(clip.start_s),
-                            len: frames(clip.len_s),
-                            notes: Arc::new(notes),
-                            pedal: Arc::new(midi_clip_pedal(clip, f64::from(rate))),
-                        });
-                    }
-                    continue;
-                }
-                let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
-                let decoded = match cache.get(&path) {
-                    Some(c) => Arc::clone(c),
-                    None => match tangent_record::decode::decode(&path, rate) {
-                        Ok(c) => {
-                            let c = Arc::new(c);
-                            cache.insert(path.clone(), Arc::clone(&c));
-                            c
-                        }
-                        Err(_) => continue,
-                    },
-                };
-                // **The clip's stretch, which the export used to drop** —
-                // the same divergence the gain comment below records: the
-                // live path rendered the stretched copy, the bounce the
-                // raw decode, so a stretched clip exported at the wrong
-                // speed and an open-ended one at the wrong length. The
-                // cache is per-export and at the EXPORT rate; the live
-                // `self.stretch_cache` holds live-rate audio and must not
-                // feed a file at another rate.
-                let decoded = stretched_clip_audio(clip, decoded, &path, &mut stretch_cache);
-                // **The clip's own gain, which the export used to drop.**
-                // It read `1.0` here while playback read `clip.gain`, so a
-                // clip pulled down on the timeline came back at full level
-                // in the file — the export disagreeing with what was heard.
-                placed.extend(audio_clip_passes(
-                    clip,
-                    &decoded,
-                    f64::from(rate),
-                    clip.gain as f32,
-                ));
+            let (placed, midi_placed, unread) =
+                export_clip_placement(self.app.arrangement(), self.app.frozen_lanes(), rate, |rel| {
+                    tangent_ui::arrangement::Arrangement::resolve(&doc_path, rel)
+                });
+            for why in unread {
+                self.app.notify(Kind::Error, format!("export: {why}"));
             }
             e.set_clips(placed);
             e.set_midi_clips(midi_placed);
@@ -12921,30 +13012,8 @@ impl DesktopApp {
                         }
                     },
                 };
-                let whole = tangent_ui::arrangement::ArrClip {
-                    kind: tangent_ui::arrangement::ClipKind::Audio,
-                    notes: Vec::new(),
-                    pedal: Vec::new(),
-                    lane: z.lane,
-                    path: z.path.clone(),
-                    start_s: 0.0,
-                    offset_s: 0.0,
-                    len_s: 0.0,
-                    loop_s: 0.0,
-                    fade_in_s: 0.0,
-                    fade_out_s: 0.0,
-                    name: String::new(),
-                    id: 0,
-                    anchor: Default::default(),
-                    follow_tempo: false,
-                    stretch: 1.0,
-                    stretch_mode: String::new(),
-                    gain: 1.0,
-                    extra: Default::default(),
-                    warp: Vec::new(),
-                    warp_fit: String::new(),
-                    warp_rate: 0,
-                };
+                // The one spelling an export's engine plays it by too.
+                let whole = frozen_lane_clip(&z);
                 span = span.max(decoded.clip.seconds());
                 placed.extend(audio_clip_passes(&whole, &decoded.clip, f64::from(rate), 1.0));
             }
@@ -26709,6 +26778,133 @@ mod tests {
         );
         let apart = desk.iter().zip(&export).fold(0.0f32, |a, (d, x)| a.max((d - x).abs()));
         assert!(apart < 1.0e-6, "the export did not render what the desk plays: {apart} apart");
+    }
+
+    /// **An export plays a frozen lane as the desk does: its frozen file,
+    /// and nothing of its own clips.** `reload_clips` keeps a frozen lane's
+    /// clips and MIDI off the live engine and plays its rendered file in
+    /// their place. The export placed every clip and no frozen file, while
+    /// `publish_routes` handed its engine the frozen mask that stands the
+    /// lane's racks down, so a frozen track came out of a full-speed export,
+    /// its stems and a freeze as its raw clips with no inserts (silence
+    /// through a hosted instrument), and without the file. Driven through
+    /// the export's own placement (`export_clip_placement`) and rendered on
+    /// an offline engine given the mask as `publish_routes` gives it. A
+    /// frozen file that cannot be read leaves its lane silent, as live, and
+    /// says so.
+    #[test]
+    fn an_export_plays_a_frozen_lane_from_its_frozen_file() {
+        use crate::instrument::Engine;
+        use tangent_record::audio::Timebase;
+        use tangent_ui::arrangement::{ArrClip, ArrNote, Arrangement, ClipKind, FrozenLane};
+        const LANE: usize = 2;
+        const RATE: u32 = 48_000;
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-export-frozen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("media")).expect("a scratch project");
+        // Real files, because the export decodes them for itself.
+        let write = |name: &str, level: f32| {
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: RATE,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let mut w = tangent_record::wav::WavWriter::create(&dir.join("media").join(name), spec, &bext)
+                .expect("a file");
+            w.write_interleaved(&vec![level; RATE as usize]).expect("its audio");
+            w.finish().expect("closed");
+        };
+        // Half a second each: the frozen render, and the lane's own clip.
+        write("frozen-03.wav", 0.25);
+        write("raw.wav", 0.5);
+        let doc_path = dir.join("project.tan");
+        let mut doc = Arrangement::default();
+        doc.add_clip(ArrClip {
+            kind: ClipKind::Audio,
+            lane: LANE,
+            path: "media/raw.wav".to_owned(),
+            start_s: 1.0,
+            len_s: 0.5,
+            gain: 1.0,
+            ..Default::default()
+        });
+        doc.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            lane: LANE,
+            start_s: 0.0,
+            len_s: 2.0,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 1.0, key: 60, vel: 100, muted: false }],
+            ..Default::default()
+        });
+        let frozen = vec![FrozenLane { lane: LANE, path: "media/frozen-03.wav".to_owned(), len_s: 0.5 }];
+        let at = |rel: &str| Arrangement::resolve(&doc_path, rel);
+        let (placed, midi, unread) = export_clip_placement(&doc, &frozen, RATE, at);
+
+        // Rendered as the export renders it, the mask as `publish_routes` gives it.
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("offline");
+        e.set_frozen(1 << LANE);
+        e.set_channel_gain(LANE, 1.0);
+        e.set_master_gain(1.0);
+        e.set_clips(placed);
+        e.set_midi_clips(midi.clone());
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut heard = Vec::new();
+        let mut out = vec![0.0f32; 1024 * 2];
+        while heard.len() < RATE as usize * 2 * 2 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard.extend_from_slice(&out);
+        }
+        let window = |from_s: f64, to_s: f64| {
+            let (a, b) = ((from_s * f64::from(RATE)) as usize * 2, (to_s * f64::from(RATE)) as usize * 2);
+            heard[a..b].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        assert!(window(0.05, 0.45) > 0.05, "the export did not play the frozen file: {}", window(0.05, 0.45));
+        assert!(
+            window(1.05, 1.45) < 1.0e-4,
+            "the export played the frozen lane's own clip: {}",
+            window(1.05, 1.45)
+        );
+        assert!(!midi.iter().any(|m| m.strip == LANE), "the export placed the frozen lane's MIDI");
+        assert!(unread.is_empty(), "the frozen file was not read: {unread:?}");
+
+        // A frozen file that cannot be read: the lane is silent, as live.
+        let gone = vec![FrozenLane { lane: LANE, path: "media/gone.wav".to_owned(), len_s: 0.5 }];
+        let (placed, _, unread) = export_clip_placement(&doc, &gone, RATE, at);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!placed.iter().any(|p| p.strip == LANE), "a lane whose frozen file is gone played its own clips");
+        assert!(unread.iter().any(|w| w.contains("frozen file")), "a frozen file that is gone said nothing");
+
+        // The export places through the function above, keeps a frozen
+        // lane's built-ins quiet as the desk does, and the desk spells the
+        // frozen clip the same way. A source scan, because `DesktopApp`
+        // cannot be built in a test.
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let body_of = |f: &str| {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            &src[at..at + src[at..].find("\n    fn ").expect("its end")]
+        };
+        let render = body_of("fn start_offline_render(");
+        assert!(
+            render.contains("export_clip_placement(self.app.arrangement(), self.app.frozen_lanes(), rate, |rel| {"),
+            "the export does not place its clips through `export_clip_placement`, frozen lanes and all"
+        );
+        for strips in ["e.set_builtin_strips(builtin_lanes", "e.set_keys_strips(keys_lanes"] {
+            let at = render.find(strips).unwrap_or_else(|| panic!("`{strips}` is gone"));
+            let line = &render[at..at + render[at..].find('\n').expect("its end")];
+            assert!(line.ends_with("& thawed);"), "a frozen lane's {strips} runs in the export: {line}");
+        }
+        assert!(
+            body_of("fn reload_clips(").contains("let whole = frozen_lane_clip(&z);"),
+            "the desk and the export spell a frozen lane's clip two ways"
+        );
     }
 
     /// **The export hands its mirror the samplers' audio after it has
