@@ -16684,28 +16684,26 @@ fn sampler_media_on_shelf(dir: &std::path::Path) -> Vec<String> {
     };
     let mut named = Vec::new();
     for (seat, bay) in shelf_sidecars(dir) {
-        let Ok(mut file) = std::fs::File::open(dir.join(sidecar_name(seat, bay))) else {
-            continue;
-        };
-        // **The owner first, and the rest only for a sampler's.** Another
-        // plugin's state can run to megabytes (a noise print, a library's
-        // patch), and every adoption of a template walks the shelf.
+        let path = dir.join(sidecar_name(seat, bay));
+        // **The owner first, and the whole file only for a sampler's.**
+        // Another plugin's state can run to megabytes (a noise print, a
+        // library's patch), and every adoption of a template walks the shelf;
+        // a sampler's is a few lines.
         let mut owner = vec![0u8; sampler.len() + 1];
-        let ours = file.read_exact(&mut owner).is_ok()
+        let ours = std::fs::File::open(&path).is_ok_and(|mut f| f.read_exact(&mut owner).is_ok())
             && owner[..sampler.len()] == *sampler.as_bytes()
             && owner[sampler.len()] == 0;
         if !ours {
             continue;
         }
-        let mut state = Vec::new();
-        if file.read_to_end(&mut state).is_err() {
+        let Ok(raw) = std::fs::read(&path) else {
             continue;
-        }
+        };
         named.extend(
-            crate::builtin_fx::extra_from_state(spec, &state)
+            crate::builtin_fx::extra_from_state(spec, raw.get(owner.len()..).unwrap_or_default())
                 .into_iter()
-                .filter(|(symbol, path)| symbol == "sample_path" && !path.is_empty())
-                .map(|(_, path)| path),
+                .filter(|(symbol, file)| symbol == "sample_path" && !file.is_empty())
+                .map(|(_, file)| file),
         );
     }
     named
