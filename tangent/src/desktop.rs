@@ -9879,8 +9879,14 @@ impl DesktopApp {
                     if len_s >= 0.5 {
                         self.app.notify(
                             Kind::Error,
+                            // Names the window the user can actually open
+                            // (nothing on screen is called Audio Status), and
+                            // the line break is a real one now: a lost `\`
+                            // had left thirty spaces in the message.
                             format!(
-                                "channel {}: the input delivered no audio for a {:.1}s take -                              nothing was kept and the old clips stand. See Audio Status.",
+                                "channel {}: the input delivered no audio for a {:.1}s take - \
+                                 nothing was kept and the old clips stand. To see why, open \
+                                 the recorder band's cog, then AUDIO SETUP.",
                                 lane + 1,
                                 len_s
                             ),

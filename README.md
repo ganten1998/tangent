@@ -22,10 +22,9 @@ three tools in one window:
 **A teaching tool.** Everything a student needs is on screen at once and in
 one another's terms: the notes under your hands, the name of what they make,
 the notation for it, and the geometry that explains why it sounds like that.
-Put several clefs up at the same time and every staff shows every note, so a
-violist and a cellist read the same chord in their own clefs, side by side,
-off one keyboard. Teach it a chord name it does not know and it is yours from
-then on.
+Switch the staff to any of six clefs and every note is written in that clef,
+so a violist or a cellist can read the chord in their own clef, off one
+keyboard. Teach it a chord name it does not know and it is yours from then on.
 
 **A recording tool.** One press writes a `.wav`, a `.mid` and a composited
 `.mp4`, and the video **is the window**: the same panels in the same places,
@@ -43,8 +42,8 @@ track controls and plugin parameters alike, the tempo lane does ramps and
 steps, clips time-stretch from their edges, audio takes quantize as well as
 MIDI, and delay compensation understands groups. It **hosts your plugins**:
 VST3 on every platform, LV2 on Linux and FreeBSD, editor windows included,
-and a built-in tine electric piano plays whenever no instrument is loaded,
-so the app makes a sound out of the box.
+and a new session opens with the built-in Tangent DX7 armed and set to a tine
+electric piano, so the app makes a sound out of the box.
 
 It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, and on
 Linux (glibc 2.30+, ALSA, Wayland or X11). It builds and runs on FreeBSD too.
@@ -96,8 +95,8 @@ including the Linux aarch64 tarball and checksums, are on the
   your sample folders.
 - **Plugin hosting.** VST3 on macOS, Windows, Linux and FreeBSD; LV2 on Linux
   and FreeBSD; plugin editor windows everywhere. Scanning is recursive, takes
-  folders you add yourself, and rescans without a restart. A built-in tine
-  electric piano plays when no instrument is loaded.
+  folders you add yourself, and rescans without a restart. A new session's
+  second track holds the built-in Tangent DX7, on a tine electric piano patch.
 - **Stream to OBS.** A native ReaStream-compatible sender pushes the master
   over localhost UDP to the ReaStream plugin in OBS, so a lesson or a
   performance can go live without an extra audio driver.
@@ -110,10 +109,10 @@ including the Linux aarch64 tarball and checksums, are on the
 - **A theory band.** Circle of fifths, Tonnetz, harmonic triangles and a
   sheet music panel, in any combination, side by side; the number keys
   `1`-`4` choose what is up and where. The sheet music panel does six clefs,
-  all fifteen key signatures, and stacks several staves at once. The band
-  shows what you **put there** rather than what you are playing, so it holds
-  still while your hands are busy; *Follow MIDI* makes it live if you would
-  rather.
+  one at a time or as the grand staff, and all fifteen key signatures. The
+  band shows what you **put there** rather than what you are playing, so it
+  holds still while your hands are busy; *Follow MIDI* makes it live if you
+  would rather.
 - **Guitar view, both ways.** A neck under the piano that places what you hold
   where a guitarist would play it, weighing hand span, open strings and
   barres, then holds the shape steady as you add notes. Seven tunings, a
@@ -131,9 +130,9 @@ including the Linux aarch64 tarball and checksums, are on the
 - **A MIDI device picker** that auto-connects at startup, and CLI flags for
   scripted setups: `tangent -l` lists MIDI input ports, `tangent -p "<port>"`
   connects to one.
-- **Consistent typography everywhere.** Courier Prime is bundled and embedded,
-  so the app looks identical on all platforms; Terminess Nerd Font Mono and
-  JetBrains Mono are bundled as alternatives.
+- **Consistent typography everywhere.** Three typefaces are bundled and
+  embedded, so the app looks identical on all platforms: Terminess Nerd Font
+  Mono by default, and `F` cycles through it, Courier Prime and JetBrains Mono.
 
 The right-click context menu is the primary UI surface. Every feature above
 that is not on screen is reachable from it or from a key (hold **H** to see
@@ -163,8 +162,9 @@ machine, in `~/.config/tangent/` and wherever you save your work. Supporter
 keys are verified offline with a signature check, so no server is contacted
 then either. The one network feature is the OBS stream, which is off by
 default and, when you turn it on, sends audio to an address you choose (your
-own machine, unless you say otherwise). Nothing else ever opens a network
-connection.
+own machine, unless you say otherwise). Tangent itself opens no other network
+connection. A plugin you load runs inside Tangent but is its maker's program,
+so what it connects to is up to its maker.
 
 ## A note on the name
 
@@ -242,23 +242,24 @@ builds natively on a Linux machine, and `build-freebsd.sh` on FreeBSD. See
 Tangent's executable embeds ten font files, all free and libre. Every release
 artifact carries the full license text for each one.
 
-**Courier Prime** (Regular and Bold) is the UI typeface, Copyright 2015 The
-Courier Prime Project Authors, licensed under the
+**Courier Prime** (Regular and Bold) is one of the three UI typefaces,
+Copyright 2015 The Courier Prime Project Authors, licensed under the
 [SIL Open Font License 1.1](https://openfontlicense.org). Its license text
 (`OFL.txt`) ships alongside the fonts. Tangent does **not** bundle or
 redistribute Courier New.
 
 **Terminess Nerd Font Mono** (Copyright 2020 Dimitar Toshkov Zhekov, 2023
 Tilman Blumenbach) and **JetBrains Mono** (Copyright 2020 The JetBrains Mono
-Project Authors) are bundled as optional UI typefaces, selectable with the
-`F` key, both under the SIL Open Font License 1.1. Their license texts
-ship in `font-licenses/`.
+Project Authors) are the other two, both under the SIL Open Font License 1.1,
+with their license texts in `font-licenses/`. Terminess is the one a fresh
+install uses, and the `F` key steps through all three: Courier Prime,
+Terminess, JetBrains Mono.
 
 Four more fonts come in automatically with eframe/egui's `default_fonts`
 feature (the `epaint_default_fonts` crate) and serve as glyph fallback for
-anything Courier Prime does not cover. The context menu's submenu arrow (⏵),
-for instance, exists only in `emoji-icon-font`. Their license texts ship in
-the `font-licenses/` folder of every artifact:
+anything the bundled typefaces do not cover. The context menu's submenu arrow
+(⏵), for instance, exists only in `emoji-icon-font`. Their license texts ship
+in the `font-licenses/` folder of every artifact:
 
 | Font | Copyright | License | Text |
 |---|---|---|---|

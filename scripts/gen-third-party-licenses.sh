@@ -59,19 +59,19 @@ in every Tangent distribution, at the paths given below.
 
 The six Tangent bundles (embedded by tangent-ui/src/fonts.rs):
 
-  Courier Prime Regular + Bold  --  Tangent's UI typeface
+  Courier Prime Regular + Bold  --  UI typeface
       (CourierPrime-Regular.ttf, CourierPrime-Bold.ttf)
       Copyright 2015 The Courier Prime Project Authors
       (https://github.com/quoteunquoteapps/CourierPrime)
       SIL Open Font License 1.1  ->  OFL.txt
 
-  Terminess Nerd Font Mono Regular + Bold  --  optional UI typeface
+  Terminess Nerd Font Mono Regular + Bold  --  UI typeface, the default
       (TerminessNerdFontMono-Regular.ttf, TerminessNerdFontMono-Bold.ttf)
       Copyright (C) 2020 Dimitar Toshkov Zhekov
       Copyright (C) 2023 Tilman Blumenbach
       SIL Open Font License 1.1  ->  font-licenses/Terminess-OFL-1.1.txt
 
-  JetBrains Mono Regular + Bold  --  optional UI typeface
+  JetBrains Mono Regular + Bold  --  UI typeface
       (JetBrainsMono-Regular.ttf, JetBrainsMono-Bold.ttf)
       Copyright 2020 The JetBrains Mono Project Authors
       (https://github.com/JetBrains/JetBrainsMono)

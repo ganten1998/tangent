@@ -3,17 +3,17 @@ Font licences — Tangent
 
 Tangent's executable statically embeds TEN font files:
 
-  * three UI typefaces, two weights each, that Tangent chooses between —
-    Courier Prime (the default), Terminess, and JetBrains Mono; and
+  * three UI typefaces, two weights each, that Tangent chooses between:
+    Terminess (the default), Courier Prime, and JetBrains Mono; and
   * four more that arrive with eframe/egui's `default_fonts` feature (the
     `epaint_default_fonts` crate), which sit underneath as glyph fallback.
 
 Every one of them is covered by a licence text in this folder, except Courier
 Prime, which is covered by OFL.txt shipping next to the Courier Prime TTFs.
 
-The fallback chain is load-bearing rather than decorative: Courier Prime has no
-U+2191 or U+2193, and the guitar view marks an out-of-range note with those
-arrows, so on the default typeface they come from the fallback fonts.
+The fallback chain is load-bearing rather than decorative: none of the three
+typefaces has U+23F5, the arrow that marks a submenu in the context menu, so
+it always comes from emoji-icon-font, one of the four fallback fonts.
 
 The SIL Open Font License and the Ubuntu Font Licence both require the
 copyright notice to accompany the licence text. The upstream files as shipped

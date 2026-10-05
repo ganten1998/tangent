@@ -76,9 +76,10 @@ pub fn icon() -> FontFamily {
 /// [`FAMILY_ICON`] is for.
 pub const GLYPH_WRENCH: &str = "\u{f0ad}";
 
-/// A built-in UI typeface the user can pick from the menu.
+/// A built-in UI typeface. The `F` key steps through them, in `ALL`'s order.
 ///
-/// Both are bundled, so the choice always works offline and on a fresh machine.
+/// All three are bundled, so the choice always works offline and on a fresh
+/// machine.
 /// Terminess costs ~5 MB of binary (2.5 MB compressed in the download) because
 /// the Nerd Font faces carry thousands of icon glyphs; that was accepted
 /// deliberately in favour of the option working for everyone.
@@ -95,11 +96,9 @@ pub enum FontChoice {
     /// typeface under them; only an install that has never chosen gets this.
     #[default]
     Terminess,
-    /// **The one a fresh install wears**, at the owner's word — Courier Prime
-    /// was the default from the beginning and Terminess after it, and both
-    /// stay in the list: a settings file that names one keeps it, so nobody's
-    /// desk changes typeface under them. Only an install that has never
-    /// chosen gets this.
+    /// **The third face.** Terminess, above, is what a fresh install wears;
+    /// this one stays in the list like Courier Prime, and a settings file
+    /// that names it keeps it, so nobody's desk changes typeface under them.
     ///
     /// It is the largest of the three on its own em — cap 0.730 against
     /// Terminess' 0.645 and Courier Prime's 0.580 — and it was briefly the
