@@ -28,9 +28,6 @@ pub struct Caps {
     /// Anything that would have been a window has to be drawn in the canvas
     /// instead, and this is the flag that decides.
     pub child_windows: bool,
-    /// The chord readout and the fretboard may be popped into their own
-    /// windows. Requires `child_windows`; a plugin has neither.
-    pub detachable: bool,
     /// The UI may set its own size by sending viewport commands. A plugin
     /// editor may NOT: `egui-baseview` honours `ViewportCommand::InnerSize`,
     /// so an ungated one reaches into the DAW and resizes the editor behind
@@ -84,7 +81,6 @@ impl Caps {
     /// The standalone app: it can do everything.
     pub const DESKTOP: Caps = Caps {
         child_windows: true,
-        detachable: true,
         window_sizing: true,
         size_presets: true,
         midi_ports: true,
@@ -98,7 +94,6 @@ impl Caps {
     /// size, and shared config it must not fight over.
     pub const PLUGIN: Caps = Caps {
         child_windows: false,
-        detachable: false,
         window_sizing: false,
         size_presets: true,
         midi_ports: false,
@@ -124,7 +119,7 @@ impl Caps {
     ///
     /// It differs from `DESKTOP` in exactly the two capabilities whose code is
     /// absent, and in nothing else: it still owns a real window, still opens its
-    /// own MIDI device, still detaches, still raises native dialogs.
+    /// own MIDI device, still raises native dialogs.
     pub const MINIMAL: Caps = Caps {
         capture_devices: false,
         write_user_files: false,
@@ -144,24 +139,11 @@ impl Default for Caps {
 mod tests {
     use super::*;
 
-    /// Detaching opens a window, so it cannot outlive `child_windows`. Stated
-    /// as a test because the two are easy to set independently and the failure
-    /// is a plugin trying to open an OS window, which does not fail loudly.
-    #[test]
-    fn detaching_requires_being_able_to_open_a_window() {
-        for c in [Caps::DESKTOP, Caps::PLUGIN, Caps::default()] {
-            assert!(
-                !c.detachable || c.child_windows,
-                "{c:?} claims it can detach without being able to open a window"
-            );
-        }
-    }
-
     #[test]
     fn the_plugin_gives_up_everything_the_desktop_owns() {
         assert_eq!(Caps::default(), Caps::DESKTOP);
         let p = Caps::PLUGIN;
-        assert!(!p.child_windows && !p.detachable && !p.window_sizing);
+        assert!(!p.child_windows && !p.window_sizing);
         assert!(
             p.size_presets,
             "a plugin can still ASK the host for a size, and must be able to"
@@ -189,7 +171,7 @@ mod tests {
         let m = Caps::MINIMAL;
         assert!(!m.capture_devices && !m.write_user_files);
         assert!(
-            m.child_windows && m.detachable && m.window_sizing && m.midi_ports,
+            m.child_windows && m.window_sizing && m.midi_ports,
             "Minimal still owns a real window and a real MIDI device"
         );
         assert!(

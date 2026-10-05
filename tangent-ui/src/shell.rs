@@ -169,7 +169,8 @@ fn draw_chrome_bar(
     g.close = close.clicked();
     // **The PRESS, not the drag threshold.** A window that only starts to
     // follow the hand after it has travelled a few points feels stuck to
-    // the desk; the popouts learned this and they go on the press too.
+    // the desk; the borderless main window goes on the press for the same
+    // reason.
     g.grab = ui.input(|i| {
         i.pointer.primary_pressed()
             && i.pointer.interact_pos().is_some_and(|p| l.drag.contains(p))
@@ -853,7 +854,8 @@ pub fn surface(
                     // **The OS moves the window, from the press.** A
                     // borderless window has no bar its manager knows about,
                     // so the bar we drew has to say "this is one" — the same
-                    // `StartDrag` the popouts send from their own press.
+                    // `StartDrag` the borderless main window sends from its
+                    // own press.
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 let mut body = ui.new_child(egui::UiBuilder::new().max_rect(l.body));

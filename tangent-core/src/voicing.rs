@@ -1458,7 +1458,7 @@ fn shape_cost_of(
 /// Owns the memo cache, the previous shape, arrival ordinals and idle decay.
 ///
 /// The app owns exactly ONE of these and clones the resulting [`Voicing`] to
-/// the main and detached views, so the two windows cannot show different
+/// every surface that draws a neck, so no two of them can show different
 /// shapes. It carries no clock: `dt_ms` comes from the caller.
 pub struct VoicingSession {
     spec: FretboardSpec,

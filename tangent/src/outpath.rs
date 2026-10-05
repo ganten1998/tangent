@@ -58,13 +58,23 @@
 //!
 //! # Safety
 //!
-//! `AudioObjectGetPropertyData` is a blocking HAL call. It runs HERE on the UI
-//! thread, once, when the setup panel opens — never from an audio callback,
-//! where a HAL call is a deadlock (`coreaudio-rs`'s input proc doing exactly
-//! that is a wedge this project has already paid for). Every query is
-//! fallible and every failure path leaves the field at its unknown default, so
-//! a machine whose HAL is wedged gets a panel with one line missing rather
-//! than a hang.
+//! `AudioObjectGetPropertyData` is a blocking HAL call, and nothing here ever
+//! makes one from an audio callback, where a HAL call is a deadlock
+//! (`coreaudio-rs`'s input proc doing exactly that is a wedge this project has
+//! already paid for). Where each reader does run:
+//!
+//! * `probe`: the UI thread, once, when the setup panel opens.
+//! * `nominal_rate`: the rate poll's own thread, once a second
+//!   (`desktop::RatePoll`).
+//! * `output_names` and `default_output_plays`: the reprobe's thread, every
+//!   two seconds while it waits (`desktop::Reprobe`).
+//! * `device_id` and `OverloadWatch::watch`: the UI thread, when the live
+//!   engine opens. The overload listener itself is called on the HAL's own
+//!   notification thread, and only bumps a counter.
+//!
+//! Every query is fallible and every failure path leaves the field at its
+//! unknown default, so a machine whose HAL is wedged gets a panel with one
+//! line missing rather than a hang.
 
 use tangent_ui::ports::OutputPath;
 

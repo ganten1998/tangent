@@ -847,6 +847,11 @@ Anchored under the cog; click away dismisses; **Done** closes. Nothing here can 
 - **AUDIO tier**: "Setup..." row opening the **Audio Setup** dialog; **Hear the live input** tick (input monitor, session-only, never persisted); **Count-in** (cycles 0 / 4 / 8 beats); **Time signature** (click to type, e.g. "6/8"); **Stream to OBS...** (ReaStream dialog); **Project** row (Project dialog); **Add a VST3 Folder...** (plugin folder picker + rescan).
 - **TAKE tier**: **Take name** field; **Choose folder** (destination) + **Reveal** (show in file manager); folder/naming preview line + disk-time-remaining (read-only); **Count-in** and **Time signature** (take copies of the same settings); **Export...** (per-take export dialog); four ticks: **Show the take when it is finished**, **Record the click into takes**, **Record the count-in into the take**, **Hide the elapsed time**.
 
+> **2026-10-04:** the count-in is counted in bars, not beats: it cycles 0, 1, 2
+> and 4 bars at the take's time signature (`recorder::COUNT_IN_CHOICES`), and
+> it already did at `ef2ab01` (bars since 3.7.0). 0, 4 and 8 beats was the
+> choice before there were time signatures.
+
 ### 1.3 Effect parameter panels (`recorder_panel.rs` FxLayout)
 
 Opened by right-clicking an effect knob. A titled panel with subtitle, up to four parameter rows, an **x** close and a right-aligned **Reset**:
@@ -870,6 +875,10 @@ Black strip showing the detected chord name (user-settable color, auto font-fit,
 - **Transpose chevrons** top-left (when `show_transpose`): up/down a semitone; a non-zero offset is printed beside them.
 - **Supporter heart** top-right (when no recorder band is showing): click cycles color; hover raises the thanks card.
 - **Detached chord window** ("Detach Chord Window" in menu): resizable, min 220x80, remembers size/position, always-on-top while the main window is focused; right-click anywhere opens the app menu; in borderless mode click-drag anywhere moves it; closing it re-attaches.
+
+> **2026-10-04:** the menu row was already gone at `ef2ab01` (nothing has
+> detached since 4.82.0), and round five of the 2026-10-02 audit removed the
+> window itself, with the other three popouts and their settings.
 
 ### 1.6 Theory band (`theory_panel.rs`)
 
@@ -1105,6 +1114,10 @@ Enter commits; Esc abandons; clicking anywhere else **commits** (never discards)
 ## Notable persisted settings (`settings.rs`)
 
 All of the above choices persist in one settings file: theme, key/chord/recorder colors, note-name and view toggles, window size percent (50-200) and positions for all detached windows, tuning/capo/wood/capo style, theory order + follow-MIDI, staff set/key/custom stack, plugin folders, take destination/name/devices/count-in/signature, per-channel gains/pans/kinds/icons/names/inserts/sends, effect mixes and parameters, drumpad kit/page/media default folder, grid/snap/swing per view, and metronome state. "Reset Settings to Default" (menu) restores everything. Arm states are deliberately session-only (a project must never open live), as is input monitoring.
+
+> **2026-10-04:** no window can be detached (since 4.82.0), and since round five
+> of the 2026-10-02 audit the file no longer remembers the detached windows'
+> positions at all; an older file's keys are carried through unread.
 
 ---
 
