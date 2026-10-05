@@ -65881,6 +65881,13 @@ mod tests {").expect("the tests module")];
         app.settings.show_heart = true;
         app.license.unlock_cheat();
         assert!(app.license.cheated(), "the cheat marker did not take");
+        // **The first frame arms the decoration nudge, and it is put out at
+        // once**: 1.2 s of 50 ms frames, real, short, and not what is under
+        // test. They read 33.3 ms here, a third of a millisecond inside the
+        // bound, and a frame landing in the nudge's last few milliseconds
+        // read 0 ns. What is measured is the heart's own ask.
+        let _ = frame_asks_seen(&ctx, &mut app, true);
+        app.decor_nudge_until = None;
         for _ in 0..30 {
             let _ = frame_asks_seen(&ctx, &mut app, true);
         }
@@ -65894,10 +65901,9 @@ mod tests {").expect("the tests module")];
             asked > Duration::from_millis(33),
             "the heart still asks at the old cadence: {asked:?}"
         );
-        // Losing focus is a window-manager event, and the decoration nudge
-        // answers one with 1.2 s of 50 ms frames — real, short, and not
-        // what is under test. One unseen frame arms it; it is then waited
-        // out by hand rather than by the clock.
+        // Losing focus does not re-arm the nudge: only the first frame's
+        // decorations do, and it was put out above, so clearing it again
+        // here is belt and braces.
         let _ = frame_asks_seen(&ctx, &mut app, false);
         app.decor_nudge_until = None;
         let busy = (0..30)
@@ -71064,6 +71070,16 @@ mod tests {").expect("the tests module")];
             app.add_bare_track(n);
         }
         let _ = run_frame(&ctx, &mut app);
+        // **The decoration nudge is the window's, not the carry's, and it is
+        // put out by hand before anything is measured**, as the heart test
+        // does. The first frame sends the window its decorations and arms
+        // `decor_nudge_until` for 1.2 s: a frame every 50 ms while it runs,
+        // and through `animation_due` one at the moment it runs out. Idle,
+        // the frame below is measured 0.7 s in and the nudge's 33 ms passes;
+        // on a busy machine it can land in the nudge's last few milliseconds,
+        // where that deadline's ask collapses to nothing, and the carry took
+        // the blame for "pinning the app at 0ns".
+        app.decor_nudge_until = None;
         let rect = app.mixer_rect.expect("the mixer drew nowhere");
         let (grab, region) = {
             let view = app.mixer_view();
@@ -71082,6 +71098,14 @@ mod tests {").expect("the tests module")];
         );
         let was = app.mixer_scroll_px;
         hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        // And nothing else on the app's own ledger is owed a frame, so what
+        // the frame below asks for is the carry's alone.
+        assert_eq!(
+            app.animation_due(Instant::now()),
+            None,
+            "something besides the carry is owed a frame, and the frame below \
+             would measure it"
+        );
         let delay = hold_frame(&ctx, &mut app, 1.0 / 60.0);
         assert_eq!(app.mixer_scroll_px, was, "the desk moved sideways for a hand \
              held against its TOP edge");
@@ -71139,6 +71163,11 @@ mod tests {").expect("the tests module")];
     fn an_edge_hold_asks_for_a_fast_frame() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        // **The decoration nudge is put out first**, as in the top-edge carry
+        // test: its 50 ms frames are the window's, and a frame that lands in
+        // its last few milliseconds asks for one at once. Forced there, the
+        // drag in the middle read 0 ns, as fast as the edge.
+        app.decor_nudge_until = None;
         let grab = me_note_centre(&app, rect, id);
         press(&ctx, &mut app, grab);
         let roll = crate::midi_editor::Layout::new(rect).roll;
@@ -71153,10 +71182,10 @@ mod tests {").expect("the tests module")];
         );
         // The same drag, the same stillness, in the middle of the roll: the
         // ask goes away again. Compared against the EDGE's answer rather than
-        // against `GUI_TICK`, because the band's own animation is already
-        // asking for a frame every 33 ms in this fixture — the claim being
-        // pinned is that the edge asks for a faster frame than the same drag
-        // in the middle does, not that the app is otherwise idle.
+        // against `GUI_TICK`, because the claim being pinned is that the edge
+        // asks for a faster frame than the same drag in the middle does, not
+        // that the app is otherwise idle. (The 33 ms this fixture used to ask
+        // for was the decoration nudge, put out above.)
         move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.center().y));
         hold_frame(&ctx, &mut app, 1.0 / 60.0);
         let in_middle = hold_frame(&ctx, &mut app, 1.0 / 60.0);
