@@ -5399,8 +5399,6 @@ impl Settings {
         self.reastream_port = fresh.reastream_port;
     }
 
-
-    /// Remembered main-window position, if both coordinates are stored.
     /// The size the main window should open at, if the user has chosen one.
     ///
     /// **Refuses anything below the floor rather than clamping to it.** A
@@ -5416,6 +5414,7 @@ impl Settings {
         .then_some(size)
     }
 
+    /// Remembered main-window position, if both coordinates are stored.
     pub fn window_pos_for_use(&self) -> Option<egui::Pos2> {
         match (self.window_x, self.window_y) {
             (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
