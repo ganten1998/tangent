@@ -11648,11 +11648,16 @@ fn show_on(
                                         .font(bold(10.0))
                                         .color(t.text),
                                 );
+                                // The channel count comes from the desk's
+                                // own constant, so it cannot fall behind the
+                                // desk again: it read 16 here while the desk
+                                // had 32.
                                 ui.label(
-                                    RichText::new(
-                                        "Recorder, 16-channel mixer, arrangement, MIDI editor, \
+                                    RichText::new(format!(
+                                        "Recorder, {}-channel mixer, arrangement, MIDI editor, \
                                          drum machine, LV2/VST3",
-                                    )
+                                        crate::recorder::CHANNELS
+                                    ))
                                     .font(bold(8.0))
                                     .color(t.text),
                                 );
@@ -17583,6 +17588,10 @@ at: None,
             !painted.contains("Simple MIDI Keyboard Monitor"),
             "the 1.x tagline is back: {painted}"
         );
+        // The desk's real size, from the same constant the desk is built
+        // from. The line said "16-channel mixer" over a 32-channel desk.
+        let desk = format!("{}-channel mixer", crate::recorder::CHANNELS);
+        assert!(painted.contains(&desk), "About does not say {desk:?}: {painted}");
         // Composed from the crate version, never retyped — the assertion
         // holds across releases precisely because both sides move together.
         assert!(
