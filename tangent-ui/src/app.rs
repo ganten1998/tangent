@@ -66038,10 +66038,10 @@ mod tests {").expect("the tests module")];
         app.license.unlock_cheat();
         assert!(app.license.cheated(), "the cheat marker did not take");
         // **The first frame arms the decoration nudge, and it is put out at
-        // once**, for the reason given below: its 50 ms frames read 33.3 ms
-        // here, a third of a millisecond inside the bound, and a frame landing
-        // in its last few milliseconds read 0 ns. What is measured is the
-        // heart's own ask.
+        // once**: 1.2 s of 50 ms frames, real, short, and not what is under
+        // test. They read 33.3 ms here, a third of a millisecond inside the
+        // bound, and a frame landing in the nudge's last few milliseconds
+        // read 0 ns. What is measured is the heart's own ask.
         let _ = frame_asks_seen(&ctx, &mut app, true);
         app.decor_nudge_until = None;
         for _ in 0..30 {
@@ -66057,10 +66057,9 @@ mod tests {").expect("the tests module")];
             asked > Duration::from_millis(33),
             "the heart still asks at the old cadence: {asked:?}"
         );
-        // Losing focus is a window-manager event, and the decoration nudge
-        // answers one with 1.2 s of 50 ms frames — real, short, and not
-        // what is under test. One unseen frame arms it; it is then waited
-        // out by hand rather than by the clock.
+        // Losing focus does not re-arm the nudge: only the first frame's
+        // decorations do, and it was put out above, so clearing it again
+        // here is belt and braces.
         let _ = frame_asks_seen(&ctx, &mut app, false);
         app.decor_nudge_until = None;
         let busy = (0..30)
