@@ -386,7 +386,7 @@ impl Pull {
             self.frac = 0.0;
             self.begin_watch();
         } else if fill as f64 > self.ceiling() {
-            let cut = fill - target as usize;
+            let cut = fill.saturating_sub(target as usize);
             self.discard(cut);
             self.overruns = self.overruns.saturating_add(1);
             self.begin_watch();
