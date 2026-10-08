@@ -590,6 +590,20 @@ pub enum Dialog {
         /// Focus the identifier field on the first frame.
         focus: bool,
     },
+    /// **Send Tangent's master out to a second output device** — a virtual
+    /// cable OBS or Discord records from. The ReaStream dialog's sibling.
+    /// Working copies of the two settings, written through on every change
+    /// (a tick, a row) and on every way out.
+    DeviceSend {
+        enabled: bool,
+        /// The send host's outputs, snapshotted at open (see
+        /// `ports::AudioSetup::send_outputs`).
+        devices: Vec<String>,
+        /// The chosen device's name; empty = none.
+        name: String,
+        /// Refreshed every frame by the host while open.
+        status: crate::ports::DeviceSendStatus,
+    },
     /// Paste a supporter key. Stays open on failure so the message can explain
     /// what went wrong without the user losing what they pasted.
     SupporterKey {
@@ -855,6 +869,7 @@ impl Dialog {
             | Dialog::Routing { .. }
             | Dialog::SaveTheme { .. }
             | Dialog::ReaStream { .. }
+            | Dialog::DeviceSend { .. }
             | Dialog::SupporterKey { .. }
             | Dialog::ColorPick { .. }
             | Dialog::TeachChord { .. }
@@ -1721,6 +1736,9 @@ pub enum DialogAction {
         identifier: String,
         host: String,
     },
+    /// Persist the device send's settings. Also an ASK: the host retries a
+    /// send that failed or found its device missing whenever one arrives.
+    SetDeviceSend { enabled: bool, name: String },
     /// Persist the take summary's "report every take" choice.
     ///
     /// **Its tick went out with the modal box and now has a home again.** The
@@ -13164,6 +13182,145 @@ fn show_on(
             )
         }
 
+        Dialog::DeviceSend {
+            enabled,
+            devices,
+            name,
+            status,
+        } => {
+            // Light, like its sibling the OBS stream window: the two are one
+            // feature reached by two roads.
+            let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
+            let dim = t.text.gamma_multiply(0.62);
+            let lit = crate::ports::match_output_name(devices, name);
+            let closed = show_dialog_viewport(
+                ctx,
+                placement,
+                "Send to Device",
+                Vec2::new(480.0, 400.0),
+                Vec2::new(420.0, 320.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            let mut on = *enabled;
+                            if ui
+                                .checkbox(
+                                    &mut on,
+                                    RichText::new("Send master out to this device too")
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                *enabled = on;
+                                action = Some(DialogAction::SetDeviceSend {
+                                    enabled: *enabled,
+                                    name: name.clone(),
+                                });
+                            }
+                            ui.add_space(8.0);
+                            if devices.is_empty() {
+                                ui.label(
+                                    RichText::new("No output devices were found.")
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                );
+                            }
+                            let bottom_h = 116.0;
+                            let list_h = (ui.available_height() - bottom_h).max(60.0);
+                            egui::ScrollArea::vertical()
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .max_height(list_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (i, d) in devices.iter().enumerate() {
+                                        let row = RichText::new(d.as_str())
+                                            .font(bold(11.0))
+                                            .color(t.text);
+                                        if ui.selectable_label(lit == Some(i), row).clicked()
+                                            && lit != Some(i)
+                                        {
+                                            name.clone_from(d);
+                                            action = Some(DialogAction::SetDeviceSend {
+                                                enabled: *enabled,
+                                                name: name.clone(),
+                                            });
+                                        }
+                                    }
+                                    // A saved device that is not plugged in
+                                    // stays visible, so the choice is not
+                                    // silently forgotten. Lit and inert:
+                                    // there is nothing to pick until it is
+                                    // back.
+                                    if lit.is_none() && !name.is_empty() {
+                                        let _ = ui.selectable_label(
+                                            true,
+                                            RichText::new(format!("{name} (not connected)"))
+                                                .font(bold(11.0))
+                                                .color(t.text),
+                                        );
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(status.line()).font(bold(11.0)).color(t.text),
+                            );
+                            if let Some(warn) = status.rate_warning() {
+                                ui.label(RichText::new(warn).font(bold(9.5)).color(t.text));
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "Pick the cable's input end here (CABLE Input, BlackHole), \
+                                     then choose its output end as the microphone or audio \
+                                     source in OBS or Discord.",
+                                )
+                                .font(bold(9.5))
+                                .color(dim),
+                            );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::SetDeviceSend {
+                                        enabled: *enabled,
+                                        name: name.clone(),
+                                    });
+                                    result.close = true;
+                                }
+                                if status.retryable()
+                                    && ui
+                                        .add(Button::new(RichText::new("Retry").color(t.text)))
+                                        .clicked()
+                                {
+                                    action = Some(DialogAction::SetDeviceSend {
+                                        enabled: *enabled,
+                                        name: name.clone(),
+                                    });
+                                }
+                            });
+                        });
+                },
+            );
+            // Every other way out carries the working copy too.
+            if closed.close && action.is_none() {
+                action = Some(DialogAction::SetDeviceSend {
+                    enabled: *enabled,
+                    name: name.clone(),
+                });
+            }
+            closed
+        }
+
         Dialog::TeachChord {
             notes,
             note_names,
@@ -14323,6 +14480,54 @@ mod tests {
             arm.contains("result.close = true;"),
             "Done no longer closes the window"
         );
+    }
+
+    /// **The device send window, by the OBS window's rule**: its close is
+    /// bound, and every road out carries the working copy. Five senders:
+    /// the tick, a row, Done, Retry and the close; a sixth is a road that
+    /// skips something.
+    #[test]
+    fn the_device_send_window_keeps_its_choice_however_it_is_closed() {
+        let src = include_str!("dialogs.rs");
+        let arm = {
+            let at = src.find("        Dialog::DeviceSend {\n            enabled,").expect("the arm");
+            &src[at..at + src[at..].find("        Dialog::TeachChord {").expect("its end")]
+        };
+        assert!(arm.contains("let closed = show_dialog_viewport("));
+        assert!(arm.contains("if closed.close && action.is_none() {"));
+        assert_eq!(arm.matches("DialogAction::SetDeviceSend {").count(), 5);
+        assert!(!arm.contains('\u{2014}'), "an em dash in the window's copy");
+    }
+
+    /// **What the send's status line says**, and that the rate warning
+    /// appears only when the rates actually differ.
+    #[test]
+    fn the_device_send_status_warns_only_on_a_rate_mismatch() {
+        use crate::ports::DeviceSendStatus as S;
+        let same = S::Sending {
+            device: "CABLE Input".to_owned(),
+            engine_rate: 48_000,
+            device_rate: 48_000,
+        };
+        assert_eq!(same.line(), "Sending to CABLE Input.");
+        assert!(same.rate_warning().is_none());
+        let differ = S::Sending {
+            device: "CABLE Input".to_owned(),
+            engine_rate: 44_100,
+            device_rate: 48_000,
+        };
+        let warn = differ.rate_warning().expect("a mismatch is said");
+        assert!(warn.contains("44100") && warn.contains("48000"), "{warn}");
+        let failed = S::Failed {
+            device: "CABLE Input".to_owned(),
+            reason: "the device went away.".to_owned(),
+        };
+        assert!(failed.retryable() && !same.retryable());
+        for s in [S::Off, S::NoDevice, S::Waiting, same, differ.clone(), failed] {
+            let all = format!("{} {}", s.line(), s.rate_warning().unwrap_or_default());
+            assert!(!all.contains('\u{2014}'), "an em dash: {all}");
+            assert!(!all.contains(".."), "a doubled stop: {all}");
+        }
     }
 
     /// **Everything Tangent ships is a sentinel, and nothing else is.**

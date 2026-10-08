@@ -1668,6 +1668,15 @@ pub struct TangentApp {
     /// How many outputs the open device has, pushed by the host. Only the
     /// host knows; the routing picker cannot offer jacks without it.
     device_outs: usize,
+    /// What the device send is doing, pushed by the host every frame. See
+    /// [`Self::set_device_send_status`].
+    device_send_status: crate::ports::DeviceSendStatus,
+    /// **How many times the user has asked the send to go**: every
+    /// `SetDeviceSend` counts one. The host compares it with the last count
+    /// it acted on and retries a send that failed or found its device
+    /// missing; without a count, "the same settings again" would be no
+    /// change and Retry would do nothing.
+    device_send_asks: u64,
     /// Notes sounding because a gesture is holding them: the audition key, or
     /// a mouse button on a key or a fret.
     ///
@@ -4346,6 +4355,8 @@ impl TangentApp {
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
             device_outs: 2,
+            device_send_status: crate::ports::DeviceSendStatus::Off,
+            device_send_asks: 0,
             export_progress: None,
             surface_cover: None,
             route_labels: Vec::new(),
@@ -28679,6 +28690,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.device_outs = n;
     }
 
+    /// What the device send is doing. Also refreshed into an OPEN send
+    /// dialog, the way `set_audio_status` refreshes Setup.
+    pub fn set_device_send_status(&mut self, status: crate::ports::DeviceSendStatus) {
+        if let Some(Dialog::DeviceSend { status: live, .. }) = self.dialog.as_mut() {
+            if *live != status {
+                live.clone_from(&status);
+            }
+        }
+        if self.device_send_status != status {
+            self.device_send_status = status;
+        }
+    }
+
+    /// The send's dialog, on the saved settings and the outputs the send's
+    /// host offers, asked HERE and never per frame (see
+    /// `ports::AudioSetup::send_outputs`).
+    fn open_device_send(&mut self) {
+        let devices = self
+            .audio_setup
+            .as_ref()
+            .map(|s| s.send_outputs())
+            .unwrap_or_default();
+        self.dialog = Some(Dialog::DeviceSend {
+            enabled: self.settings.device_send_enabled,
+            devices,
+            name: self.settings.device_send_name.clone(),
+            status: self.device_send_status.clone(),
+        });
+    }
+
     /// Build the routing window for a channel, with the lists only the app
     /// can assemble: the device's jacks, the channels worth sending to, and
     /// what this channel already routes to.
@@ -31983,6 +32024,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self.settings.insert_keys
     }
 
+    /// Whether the master out should also go to the device send.
+    pub fn device_send_enabled(&self) -> bool {
+        self.settings.device_send_enabled
+    }
+
+    /// The device send's device, trimmed; `None` when none is chosen.
+    pub fn device_send_name(&self) -> Option<String> {
+        let n = self.settings.device_send_name.trim();
+        (!n.is_empty()).then(|| n.to_owned())
+    }
+
+    /// How many times the user has asked the send to go; see the field.
+    pub fn device_send_asks(&self) -> u64 {
+        self.device_send_asks
+    }
+
     /// Whether the master out is being streamed over ReaStream.
     pub fn reastream_enabled(&self) -> bool {
         self.settings.reastream_enabled
@@ -32511,6 +32568,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     focus: true,
                 });
             }
+            // The SEND door, beside the STREAM one: the same master out, to
+            // a device instead of over the network.
+            Hit::SendToDevice => self.open_device_send(),
             Hit::PluginFolders => {
                 // The menu's "Add a Folder...", from the cog. The pick
                 // lands through the same DirRequest door and the scan
@@ -36660,6 +36720,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let host = host.trim();
                 self.settings.reastream_host =
                     if host.is_empty() { "127.0.0.1".to_owned() } else { host.to_owned() };
+                self.save_settings();
+            }
+            DialogAction::SetDeviceSend { enabled, name } => {
+                // A machine setting: saved, never an undo step.
+                self.settings.device_send_enabled = enabled;
+                self.settings.device_send_name = name.trim().to_owned();
+                self.device_send_asks = self.device_send_asks.wrapping_add(1);
                 self.save_settings();
             }
             DialogAction::LoadPlugin { path } => {
@@ -59783,6 +59850,92 @@ mod tests {
             Some(_) => panic!("the STREAM door opened a different dialog"),
             None => panic!("the STREAM door opened nothing"),
         }
+    }
+
+    /// **The cog's SEND door opens the device send's dialog, on the saved
+    /// settings and on the SEND host's outputs**: the ones `send_outputs`
+    /// names (WASAPI's under ASIO), never `outputs`, which under ASIO is the
+    /// registry's drivers and has no cable in it. And the window's answer
+    /// lands in settings, counts as an ask, and is no undo step.
+    #[test]
+    fn the_send_door_opens_the_device_send_dialog_on_the_saved_settings() {
+        struct Asio;
+        impl crate::ports::AudioSetup for Asio {
+            fn systems(&self) -> Vec<String> {
+                vec!["ASIO".to_owned(), "WASAPI".to_owned()]
+            }
+            fn active_system(&self) -> Option<String> {
+                Some("ASIO".to_owned())
+            }
+            fn outputs(&self) -> Vec<String> {
+                vec!["Komplete Audio ASIO Driver".to_owned()]
+            }
+            fn rates(&self) -> Vec<u32> {
+                Vec::new()
+            }
+            fn input_channels(&self) -> u16 {
+                0
+            }
+            fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+                Vec::new()
+            }
+            fn set_exposed(&mut self, _: Vec<(u16, Option<u16>)>) -> Vec<String> {
+                Vec::new()
+            }
+            fn output_path(&self, _: Option<&str>) -> crate::ports::OutputPath {
+                crate::ports::OutputPath::default()
+            }
+            fn send_outputs(&self) -> Vec<String> {
+                vec![
+                    "Speakers (Realtek(R) Audio)".to_owned(),
+                    "CABLE Input (VB-Audio Virtual Cable)".to_owned(),
+                ]
+            }
+        }
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.settings.device_send_enabled = true;
+        app.settings.device_send_name = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        app.set_audio_setup(Some(Box::new(Asio)));
+        app.set_device_send_status(crate::ports::DeviceSendStatus::Waiting);
+        app.apply_recorder_hit(recorder_panel::Hit::SendToDevice);
+        match app.dialog {
+            Some(Dialog::DeviceSend {
+                enabled,
+                ref devices,
+                ref name,
+                ref status,
+            }) => {
+                assert!(enabled);
+                assert_eq!(name, "CABLE Input (VB-Audio Virtual Cable)");
+                assert_eq!(devices.len(), 2, "not the send host's list: {devices:?}");
+                assert!(
+                    !devices.iter().any(|d| d.contains("ASIO")),
+                    "the engine's ASIO drivers were offered as send devices"
+                );
+                assert_eq!(*status, crate::ports::DeviceSendStatus::Waiting);
+            }
+            Some(_) => panic!("the SEND door opened a different dialog"),
+            None => panic!("the SEND door opened nothing"),
+        }
+        // The open window follows the host's status.
+        let live = crate::ports::DeviceSendStatus::Sending {
+            device: "CABLE Input (VB-Audio Virtual Cable)".to_owned(),
+            engine_rate: 44_100,
+            device_rate: 48_000,
+        };
+        app.set_device_send_status(live.clone());
+        assert!(matches!(&app.dialog, Some(Dialog::DeviceSend { status, .. }) if *status == live));
+
+        let asks = app.device_send_asks();
+        let undo = app.history.len();
+        app.apply_dialog_action(DialogAction::SetDeviceSend {
+            enabled: false,
+            name: "  Speakers (Realtek(R) Audio) ".to_owned(),
+        });
+        assert!(!app.device_send_enabled());
+        assert_eq!(app.device_send_name().as_deref(), Some("Speakers (Realtek(R) Audio)"));
+        assert_eq!(app.device_send_asks(), asks + 1, "an answer is an ask");
+        assert_eq!(app.history.len(), undo, "a machine setting became an undo step");
     }
 
     /// **A double click puts a knob back, through the app, into settings.**

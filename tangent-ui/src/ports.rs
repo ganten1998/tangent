@@ -383,6 +383,90 @@ pub trait AudioSetup: Send {
     fn graph_floor_frames(&self) -> Option<u32> {
         None
     }
+
+    /// **Every output the DEVICE SEND can open**, by name, in the host's
+    /// order: WASAPI's on Windows WHATEVER the engine's system is (so a
+    /// virtual cable is offered while the interface plays through ASIO), the
+    /// platform default host's elsewhere. Not [`Self::outputs`], which
+    /// follows the engine's system and under ASIO is a list of drivers.
+    ///
+    /// Asked when the send's dialog OPENS and never per frame, like
+    /// [`Self::outputs`]. Empty by default: a host with no send has nothing
+    /// to offer, and the dialog says so.
+    fn send_outputs(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// **What the device send is doing**, pushed by the host every frame for the
+/// send's dialog to print. Plain data for the firewall's sake, exactly like
+/// [`OutputPath`]: the stream lives in `tangent-record`, which this crate may
+/// not see.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceSendStatus {
+    /// The setting is off.
+    #[default]
+    Off,
+    /// On, with no device chosen.
+    NoDevice,
+    /// On, and waiting for the audio engine to start.
+    Waiting,
+    /// Draining into `device`. The two rates are the engine's and the
+    /// device's; when they differ the send converts between them.
+    Sending {
+        device: String,
+        engine_rate: u32,
+        device_rate: u32,
+    },
+    /// On, and no output goes by that name. Tried again when the dialog is
+    /// closed or the engine restarts.
+    Missing { device: String },
+    /// It opened (or tried to) and stopped. Off until it is asked again.
+    Failed { device: String, reason: String },
+}
+
+impl DeviceSendStatus {
+    /// One line for the dialog. No em dashes: user-visible copy.
+    pub fn line(&self) -> String {
+        match self {
+            DeviceSendStatus::Off => "Off.".to_owned(),
+            DeviceSendStatus::NoDevice => "Pick a device to send to.".to_owned(),
+            DeviceSendStatus::Waiting => "Waiting for the audio engine to start.".to_owned(),
+            DeviceSendStatus::Sending { device, .. } => format!("Sending to {device}."),
+            DeviceSendStatus::Missing { device } => {
+                format!("{device} is not connected. Plug it in and press Retry.")
+            }
+            DeviceSendStatus::Failed { device, reason } => format!(
+                "Stopped sending to {device}: {}. Press Retry or pick another device.",
+                reason.trim_end_matches('.')
+            ),
+        }
+    }
+
+    /// **The rate warning**, when the send is converting rates. A big-ratio
+    /// conversion is a lower-quality road than the few-ppm drift trim every
+    /// send does anyway, so the user is told how to avoid it.
+    pub fn rate_warning(&self) -> Option<String> {
+        match self {
+            DeviceSendStatus::Sending {
+                device,
+                engine_rate,
+                device_rate,
+            } if engine_rate != device_rate => Some(format!(
+                "Tangent runs at {engine_rate} Hz and {device} at {device_rate} Hz, so the send \
+                 is resampled. Set both to the same rate for the cleanest copy."
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether Retry means anything.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            DeviceSendStatus::Missing { .. } | DeviceSendStatus::Failed { .. }
+        )
+    }
 }
 
 /// The index of the output whose name a caller asked for: exact first, then the
