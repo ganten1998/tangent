@@ -754,6 +754,15 @@ REDO = [
     # that is literally another palette's strip is a palette quietly
     # borrowing an identity. Two or three degrees moves the bytes and not
     # the colour anybody sees; every run below shares none with any other.
+    #
+    # **Woodblock's master search starts at 20 and Lamplight's at 340, not
+    # at 355.** From 355 Woodblock took #b0221a, 6.4 dE from Silverface's
+    # jewel; the 6 dE gate passes that, but red master space is the most
+    # crowded corner of the table and Silverface's own report holds its
+    # jewel to 7. Moving Woodblock's start sent the next free red to
+    # Lamplight, so both moved: Woodblock's master is now the ochre of the
+    # print's cartouche and Lamplight's a crimson, and no master in the
+    # batch sits within 15 dE of the jewel.
     ("Urushi", 19, [("cinnabar", 10, 0.72), ("pine", 150, 0.45), ("gold", 40, 0.60), ("ink", 225, 0.35)], (20, 0.18), 350),
     ("Paperback", 20, [("orange", 22, 0.75), ("crime", 140, 0.55), ("pelican", 220, 0.62), ("cerise", 330, 0.55)], (30, 0.10), 0),
     ("Malachite", 21, [("malachite", 158, 0.70), ("jade", 172, 0.40), ("quartz", 345, 0.45), ("azurite", 224, 0.60)], (150, 0.15), 355),
@@ -762,10 +771,10 @@ REDO = [
     ("Lapis", 24, [("ultramarine", 232, 0.75), ("cobalt", 212, 0.60), ("lapis", 248, 0.55), ("pyrite", 45, 0.55)], (230, 0.15), 5),
     ("Chartres", 25, [("ruby", 345, 0.72), ("sapphire", 219, 0.72), ("emerald", 140, 0.65), ("topaz", 40, 0.75)], (260, 0.08), 15),
     ("Overprint", 26, [("pink", 335, 0.65), ("federal", 223, 0.75), ("violet", 275, 0.55), ("teal", 180, 0.55)], (300, 0.15), 10),
-    ("Woodblock", 27, [("prussian", 200, 0.75), ("indigo", 227, 0.60), ("sky", 195, 0.40), ("seal", 14, 0.70)], (35, 0.25), 355),
+    ("Woodblock", 27, [("prussian", 200, 0.75), ("indigo", 227, 0.60), ("sky", 195, 0.40), ("seal", 14, 0.70)], (35, 0.25), 20),
     ("Toffee", 28, [("butterscotch", 34, 0.80), ("jade", 162, 0.55), ("cherry", 353, 0.65), ("rootbeer", 22, 0.50)], (40, 0.18), 5),
     ("Confetti", 29, [("mulberry", 322, 0.62), ("teal", 178, 0.62), ("cobalt", 228, 0.65), ("mustard", 48, 0.70)], (330, 0.15), 10),
-    ("Lamplight", 30, [("emerald", 150, 0.70), ("bottle", 165, 0.50), ("leather", 8, 0.55), ("brass", 42, 0.60)], (140, 0.12), 355),
+    ("Lamplight", 30, [("emerald", 150, 0.70), ("bottle", 165, 0.50), ("leather", 8, 0.55), ("brass", 42, 0.60)], (140, 0.12), 340),
     ("Mauve", 31, [("mauve", 287, 0.62), ("damson", 313, 0.55), ("mulberry", 335, 0.50), ("carbon", 230, 0.25)], (300, 0.17), 10),
 ]
 
@@ -1060,7 +1069,7 @@ REDO_PINS = {
             (0x1d, 0x67, 0x75), (0x1d, 0x2e, 0x49), (0x2b, 0x46, 0x48), (0x8c, 0x38, 0x32),
         ],
         click=(0x5b, 0x52, 0x44),
-        master=(0xb0, 0x22, 0x1a),
+        master=(0x73, 0x57, 0x1d),
     ),
     "Toffee": dict(
         slots=[
@@ -1114,7 +1123,7 @@ REDO_PINS = {
             (0x20, 0x6b, 0x39), (0x19, 0x32, 0x28), (0x69, 0x2f, 0x31), (0x6a, 0x4d, 0x2b),
         ],
         click=(0x4b, 0x55, 0x4f),
-        master=(0x91, 0x16, 0x30),
+        master=(0xa7, 0x2a, 0x53),
     ),
     "Mauve": dict(
         slots=[
