@@ -263,6 +263,12 @@ struct Recorder {
     /// setting is on. Dropped when the engine restarts so the next one hands it
     /// a fresh tap; see `reconcile_reastream`.
     reastream: Option<tangent_record::reastream::ReaStreamSender>,
+    /// The device send: the read side of this engine's send tap, and the
+    /// stream on the chosen device while one is open. Dropped with the
+    /// engine like `reastream`, so the next engine hands a fresh tap; see
+    /// `reconcile_device_send`. Holds a `!Send` cpal stream, which is why it
+    /// lives here on the UI thread beside the engine's own.
+    device_send: Option<tangent_record::devsend::DeviceSend>,
     /// What is loaded in each insert slot, flat like `Settings::strip_inserts`.
     /// Remembered whether or not the load worked, so a plugin that refuses is
     /// asked once — `load_insert` blocks for seconds on a sampler, and a
@@ -1317,6 +1323,10 @@ pub struct DesktopApp {
     /// `reconcile_reastream`.
     #[cfg(feature = "recorder")]
     reastream_pushed: Option<Option<tangent_record::reastream::ReaStreamConfig>>,
+    /// What the device send last tried to open, and how it went. See
+    /// `reconcile_device_send` and [`SendTry`].
+    #[cfg(feature = "recorder")]
+    device_send_tried: Option<SendTry>,
     /// **The desk tables the engine was last given**, so `push_monitor_settings`
     /// publishes the routing table, the sidechain-key table, the bypass table
     /// and the send/mute/solo desk on CHANGE and not every frame. See
@@ -3427,6 +3437,32 @@ impl OutputReturn {
         let plugged = listed && !self.listed;
         self.listed = listed;
         plugged
+    }
+}
+
+/// **What the device send last tried to open**, and how it went: the device,
+/// the user's ask count at the time (`TangentApp::device_send_asks`), and
+/// the status to show while it is not sending (`None` = it opened).
+#[cfg(feature = "recorder")]
+struct SendTry {
+    device: String,
+    asks: u64,
+    failed: Option<tangent_ui::ports::DeviceSendStatus>,
+}
+
+/// **Whether the device send should (re)open now**, as a pure rule.
+///
+/// An open stream reopens only for a DIFFERENT device. A closed one opens
+/// when it has never tried, when the device changed, or when the user has
+/// asked again since the last try; a send that failed is otherwise left
+/// alone, because trying a missing device every frame is sixty enumerations
+/// a second.
+#[cfg(feature = "recorder")]
+fn send_wants_open(open: bool, tried: Option<&SendTry>, want: &str, asks: u64) -> bool {
+    match tried {
+        None => true,
+        Some(t) if open => t.device != want,
+        Some(t) => t.device != want || t.asks != asks,
     }
 }
 
@@ -6082,6 +6118,8 @@ impl DesktopApp {
         self.push_quantize_marks(ctx);
         #[cfg(feature = "recorder")]
         self.reconcile_reastream();
+        #[cfg(feature = "recorder")]
+        self.reconcile_device_send();
         #[cfg(feature = "recorder")]
         self.publish_device_outs();
         // Scanning reads directories, so it belongs out here with the other
@@ -14664,6 +14702,153 @@ impl DesktopApp {
         }
     }
 
+    /// **Bring the device send in line with the engine and the setting.**
+    ///
+    /// Called every frame, beside `reconcile_reastream`, and nearly always a
+    /// no-op. The shape is that function's: the send takes the engine's
+    /// once-only tap the moment there is an engine, whether or not it is
+    /// switched on, so switching on is an open and never a re-take. What
+    /// differs is the end of the road. A UDP socket can be re-targeted; a
+    /// cpal stream cannot, so a device change closes one stream and opens
+    /// another over the SAME tap (`DeviceSend` keeps the consumer across
+    /// them).
+    ///
+    /// **A failure is the send's and never the engine's.** A device that
+    /// went away mid-stream, or one that will not open, turns the send off
+    /// for the session with a notice, and the only thing it does to the
+    /// engine is lower the push flag so the ring stops filling. It is tried
+    /// again when the user asks (any answer from the send's window counts,
+    /// which is what Retry is), when the device setting changes, and when the
+    /// engine is rebuilt; never on a timer, because listing WASAPI endpoints
+    /// activates a client on each one.
+    #[cfg(feature = "recorder")]
+    fn reconcile_device_send(&mut self) {
+        use tangent_ui::ports::DeviceSendStatus;
+        const SEND_TROUBLE: &str = "device-send";
+        let enabled = self.app.device_send_enabled();
+        let asks = self.app.device_send_asks();
+        let Some(engine) = self.recorder.engine.as_mut() else {
+            self.recorder.device_send = None;
+            self.app.set_device_send_status(if enabled {
+                DeviceSendStatus::Waiting
+            } else {
+                DeviceSendStatus::Off
+            });
+            return;
+        };
+        if self.recorder.device_send.is_none() {
+            if let Some(rx) = engine.take_device_send_tap() {
+                let out = engine.output();
+                self.recorder.device_send = Some(tangent_record::devsend::DeviceSend::new(
+                    rx,
+                    out.sample_rate,
+                    out.buffer_frames,
+                ));
+            }
+        }
+        let Some(send) = self.recorder.device_send.as_mut() else {
+            // An engine whose tap is gone with no send holding it: nothing
+            // to drain, so nothing may be pushed.
+            engine.set_device_send_on(false);
+            self.app.set_device_send_status(DeviceSendStatus::Off);
+            return;
+        };
+        // A stream that died: its device unplugged, or a backend fault.
+        if let Some(reason) = send.fault() {
+            let device = send.stats().map(|s| s.device).unwrap_or_default();
+            send.close();
+            engine.set_device_send_on(false);
+            log::warn!("device send: {device} stopped: {reason}");
+            self.app.notify_raise(
+                SEND_TROUBLE,
+                Kind::Error,
+                format!(
+                    "The send to {device} stopped ({}). It stays off until you retry it \
+                     in Send to Device.",
+                    reason.trim_end_matches('.')
+                ),
+            );
+            self.device_send_tried = Some(SendTry {
+                device: device.clone(),
+                asks,
+                failed: Some(DeviceSendStatus::Failed { device, reason }),
+            });
+        }
+        let want = enabled.then(|| self.app.device_send_name()).flatten();
+        let status = match want {
+            None => {
+                send.close();
+                self.device_send_tried = None;
+                self.app.notify_lower(SEND_TROUBLE);
+                if enabled {
+                    DeviceSendStatus::NoDevice
+                } else {
+                    DeviceSendStatus::Off
+                }
+            }
+            Some(want) => {
+                if send_wants_open(send.is_open(), self.device_send_tried.as_ref(), &want, asks) {
+                    let failed = match send.open(&want) {
+                        Ok(()) => {
+                            if let Some(st) = send.stats() {
+                                log::info!(
+                                    "device send: {} - {} ch at {} Hz, from the engine's {} Hz",
+                                    st.device,
+                                    st.channels,
+                                    st.dst_rate,
+                                    st.src_rate
+                                );
+                            }
+                            self.app.notify_lower(SEND_TROUBLE);
+                            None
+                        }
+                        Err(e) => {
+                            log::warn!("device send: {want} would not open: {e}");
+                            let (text, status) = match e {
+                                tangent_record::devsend::OpenError::Missing(_) => (
+                                    format!("Send to Device: {want} is not connected."),
+                                    DeviceSendStatus::Missing {
+                                        device: want.clone(),
+                                    },
+                                ),
+                                tangent_record::devsend::OpenError::Failed(reason) => (
+                                    format!(
+                                        "Send to Device could not open {want} ({}).",
+                                        reason.trim_end_matches('.')
+                                    ),
+                                    DeviceSendStatus::Failed {
+                                        device: want.clone(),
+                                        reason,
+                                    },
+                                ),
+                            };
+                            self.app.notify_raise(SEND_TROUBLE, Kind::Error, text);
+                            Some(status)
+                        }
+                    };
+                    self.device_send_tried = Some(SendTry {
+                        device: want.clone(),
+                        asks,
+                        failed,
+                    });
+                }
+                match (send.stats(), self.device_send_tried.as_ref()) {
+                    (Some(st), _) if send.is_open() => DeviceSendStatus::Sending {
+                        device: st.device,
+                        engine_rate: st.src_rate,
+                        device_rate: st.dst_rate,
+                    },
+                    (_, Some(SendTry { failed: Some(f), .. })) => f.clone(),
+                    _ => DeviceSendStatus::Missing { device: want },
+                }
+            }
+        };
+        // Pushed only while a stream drains: a send that is off, failed or
+        // never opened must not fill a ring nobody reads.
+        engine.set_device_send_on(send.is_open());
+        self.app.set_device_send_status(status);
+    }
+
     /// **Reopen the audio path when the INTERFACE moved, not when Tangent
     /// did.**
     ///
@@ -15126,6 +15311,12 @@ impl DesktopApp {
                 // drop it so `reconcile_reastream` takes a fresh one from this
                 // engine. Its thread stops when the socket and consumer drop.
                 self.recorder.reastream = None;
+                // The device send by the same rule: its tap came from the old
+                // engine too. Forgetting what it last tried makes the new
+                // engine try the device again, which is the retry a rebuild
+                // owes a send that found its cable missing.
+                self.recorder.device_send = None;
+                self.device_send_tried = None;
                 // **And it knows nothing about the song's musical time.** A
                 // fresh `Renderer` starts at `Maps::default()` — 120 and 4/4 —
                 // while `push_maps` is change-detected against what the LAST
@@ -20154,6 +20345,7 @@ impl DesktopApp {
                 fallback: None,
                 output_stand_in: None,
                 reastream: None,
+                device_send: None,
                 pads_retry: false,
                 sampler_retry: false,
                 inserts_loaded: vec![None; tangent_ui::recorder::INSERT_SPACE],
@@ -20238,6 +20430,8 @@ impl DesktopApp {
             displaced_states: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             reastream_pushed: None,
+            #[cfg(feature = "recorder")]
+            device_send_tried: None,
             #[cfg(feature = "recorder")]
             pushed_desk: None,
             #[cfg(feature = "recorder")]
@@ -32151,6 +32345,71 @@ mod tests {").expect("the tests module")];
             "the map invalidation drifted away from the other engine-scoped \
              resets; keep them together or the next one is forgotten too"
         );
+    }
+
+    /// **When the device send (re)opens**: an open stream only for another
+    /// device; a closed one for a first try, another device, or a fresh ask,
+    /// and NOT again for the same failed device every frame.
+    #[test]
+    fn the_device_send_retries_on_an_ask_and_never_on_a_frame() {
+        let tried = |device: &str, asks: u64| SendTry {
+            device: device.to_owned(),
+            asks,
+            failed: None,
+        };
+        assert!(send_wants_open(false, None, "CABLE Input", 0), "never tried");
+        let t = tried("CABLE Input", 3);
+        assert!(!send_wants_open(false, Some(&t), "CABLE Input", 3), "a failed try was retried unasked");
+        assert!(send_wants_open(false, Some(&t), "CABLE Input", 4), "Retry did nothing");
+        assert!(send_wants_open(false, Some(&t), "BlackHole 2ch", 3), "a new device was not tried");
+        assert!(!send_wants_open(true, Some(&t), "CABLE Input", 4), "a running send restarted on an ask");
+        assert!(send_wants_open(true, Some(&t), "BlackHole 2ch", 3), "a running send kept the old device");
+    }
+
+    /// **A rebuilt engine hands the device send a fresh tap**, and the send
+    /// tries its device again: both forgotten in `start_engine` beside the
+    /// ReaStream sender, and the per-frame reconcile actually called.
+    #[test]
+    fn a_restarted_engine_rebuilds_the_device_send() {
+        let src = include_str!("desktop.rs");
+        let start = src.find("fn start_engine").expect("the engine starter");
+        let body = {
+            let rest = &src[start..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let reastream = body.find("self.recorder.reastream = None;").expect("sibling");
+        let send = body.find("self.recorder.device_send = None;").expect("the send is never dropped");
+        let tried = body.find("self.device_send_tried = None;").expect("the send never retries");
+        assert!(reastream < send && send < tried);
+        assert!(src.contains("        self.reconcile_device_send();\n"), "nothing reconciles the send");
+    }
+
+    /// **The real road on Windows**: VB-Cable opened through WASAPI with the
+    /// process's system set to ASIO, so the send is proved to take its own
+    /// host and leave the driver guard alone. Needs VB-Audio Virtual Cable
+    /// installed; run by hand with `--ignored` on the Windows machine.
+    #[test]
+    #[cfg(all(windows, feature = "asio"))]
+    #[ignore = "needs VB-Audio Virtual Cable installed"]
+    fn the_send_opens_vb_cable_on_wasapi_while_asio_is_the_system() {
+        use cpal::traits::HostTrait;
+        tangent_record::audio::set_system(Some("ASIO"));
+        assert_eq!(tangent_record::devsend::send_host().id(), cpal::HostId::Wasapi);
+        let names = tangent_record::devsend::output_names();
+        assert!(names.iter().any(|n| n.contains("CABLE Input")), "no cable listed: {names:?}");
+        let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(tangent_record::devsend::RING_SAMPLES);
+        let mut send = tangent_record::devsend::DeviceSend::new(rx, 48_000, Some(512));
+        send.open("CABLE Input").expect("the cable would not open");
+        let block = vec![0.0f32; 1024];
+        for _ in 0..200 {
+            let _ = tx.push_entire_slice(&block);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let st = send.stats().expect("running");
+        assert!(st.callbacks > 10, "the cable never pulled: {st:?}");
+        assert!(send.fault().is_none(), "{:?}", send.fault());
+        drop(send);
+        tangent_record::audio::set_system(None);
     }
 
     /// **The overload watch is armed where an engine is BORN, not where one

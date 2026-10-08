@@ -665,6 +665,27 @@ impl tangent_ui::ports::AudioSetup for Setup {
         tangent_record::audio::output_device_names().unwrap_or_default()
     }
 
+    /// **The device send's list, never the engine's.** `outputs` follows the
+    /// chosen system, and under ASIO that is the registry's drivers, with no
+    /// virtual cable among them; the send opens on WASAPI by id whatever the
+    /// engine runs on (`tangent_record::devsend::send_host`), so its list
+    /// comes from there and touches no ASIO state.
+    ///
+    /// **macOS from the HAL's properties**, as `desktop::listed_outputs`
+    /// does and for its measured reason: cpal builds an AUHAL per device to
+    /// list outputs, about 21 ms each. The names are cpal's own, so the open
+    /// finds what was listed.
+    fn send_outputs(&self) -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::outpath::output_names()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tangent_record::devsend::output_names()
+        }
+    }
+
     /// The graph's floor, where there is a graph to ask.
     ///
     /// Read every time rather than cached: a user who edits their PipeWire
