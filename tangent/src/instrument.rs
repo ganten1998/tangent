@@ -2180,6 +2180,12 @@ struct Shared {
     /// and read once per block: when off, the callback neither packs nor pushes
     /// the send ring, so a rig that never streams pays nothing for the feature.
     reastream_on: AtomicBool,
+    /// Whether the master out is being written to the DEVICE SEND's ring
+    /// (`tangent_record::devsend`). The same rule as `reastream_on`: off by
+    /// default, read once per block, and off means nothing is pushed. The
+    /// desktop raises it only while a sink stream is actually draining, so a
+    /// send that failed or was never opened does not fill a ring nobody reads.
+    device_send_on: AtomicBool,
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
@@ -3212,6 +3218,7 @@ impl Shared {
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
             reastream_on: AtomicBool::new(false),
+            device_send_on: AtomicBool::new(false),
             pending_monitor: Mutex::new(None),
             pending_monitor_layout: Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
@@ -8353,8 +8360,16 @@ struct Renderer {
     /// The master's stereo pair onto the ReaStream send ring — the same signal
     /// the scope reads (what leaves), pushed only while streaming is on. Its own
     /// stride-2 scratch so the block is contiguous L,R for the sender to plane.
+    ///
+    /// **The device send reads this same scratch** into its own ring
+    /// (`devsend_tx`). It wants exactly this signal — the stereo master,
+    /// post-varispeed, at the device rate — so a second copy and a fourth
+    /// varispeed stream would have been the same samples computed twice.
     reastream_tx: Producer<f32>,
     reastream_scratch: Vec<f32>,
+    /// The device send's ring (see `reastream_scratch`), pushed only while
+    /// `Shared::device_send_on`. A full ring drops the block.
+    devsend_tx: Producer<f32>,
     /// One block of stems, accumulated by the three mixers and pushed once.
     stem_scratch: Vec<f32>,
     /// **The folder tree for this block**: each channel's parent, or -1.
@@ -10517,8 +10532,9 @@ impl Renderer {
     /// **Where the two clocks meet.** At rest they are the same clock and
     /// this costs one atomic load; engaged, the program is rendered at
     /// `frames × ratio` and everything that leaves — the speakers, the take,
-    /// the scope, the ReaStream send — is resampled back to the device's rate
-    /// together, from one shared phase, so they are all the same instant.
+    /// the scope, the ReaStream send and the device send — is resampled back
+    /// to the device's rate together, from one shared phase, so they are all
+    /// the same instant.
     /// **The block, timed.** A thin wrapper so the measurement covers every
     /// path out of the render, including the four early returns, without
     /// each of them having to remember.
@@ -10626,8 +10642,8 @@ impl Renderer {
         self.push_taps(dev_frames);
     }
 
-    /// Hand the take, the scope and the ReaStream send what this callback
-    /// made. `frames` is in DEVICE frames — see `render`.
+    /// Hand the take, the scope, the ReaStream send and the device send what
+    /// this callback made. `frames` is in DEVICE frames — see `render`.
     fn push_taps(&mut self, frames: usize) {
         self.push_tap(frames);
         let _ = self
@@ -10639,6 +10655,15 @@ impl Renderer {
         if self.shared.reastream_on.load(Ordering::Relaxed) {
             let _ = self
                 .reastream_tx
+                .push_entire_slice(&self.reastream_scratch[..frames * 2]);
+        }
+        // The device send, by the same rule and from the same scratch: a
+        // cable that stopped pulling costs the send its block, never this
+        // thread its deadline. `push_entire_slice` is all or nothing, so a
+        // full ring leaves no half block for the sink to read as a click.
+        if self.shared.device_send_on.load(Ordering::Relaxed) {
+            let _ = self
+                .devsend_tx
                 .push_entire_slice(&self.reastream_scratch[..frames * 2]);
         }
     }
@@ -15909,6 +15934,9 @@ pub struct Engine {
     /// The ReaStream send ring's read end, handed to the sender thread once per
     /// engine when streaming is switched on. `None` after it has been taken.
     reastream_rx: Option<Consumer<f32>>,
+    /// The device send ring's read end, handed to the desktop's
+    /// `devsend::DeviceSend` once per engine. `None` after it has been taken.
+    devsend_rx: Option<Consumer<f32>>,
     /// What is in each of them, for the desk to name.
     /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
     /// every channel is too much to carry inline through a move.
@@ -16530,6 +16558,10 @@ impl Engine {
         // The ReaStream send ring, the same generous third of a second so the
         // sender thread's scheduling jitter never starves or overruns it.
         let (reastream_tx, reastream_rx) = RingBuffer::<f32>::new(1 << 15);
+        // The device send's, larger: its target fill grows with the block
+        // (see `tangent_record::devsend::Pull::target`).
+        let (devsend_tx, devsend_rx) =
+            RingBuffer::<f32>::new(tangent_record::devsend::RING_SAMPLES);
         // **The peers, if the device will have them.** Built here, off the
         // audio thread, because a worker takes a thread stack and a
         // workgroup membership and neither belongs on a callback. Offline
@@ -16721,6 +16753,7 @@ impl Engine {
             vs_was_engaged: false,
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
+            devsend_tx,
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
             route_direct: [1.0; CHANNELS],
             route_n: 0,
@@ -16832,6 +16865,7 @@ impl Engine {
             scope_rx,
             insert_tap_rx,
             reastream_rx: Some(reastream_rx),
+            devsend_rx: Some(devsend_rx),
             inserts_loaded: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_keyable: (0..RACK_SEATS).map(|_| [false; INSERTS]).collect(),
             tap: Some(RecorderTap {
@@ -18627,6 +18661,18 @@ impl Engine {
     /// the callback; off means the send ring is neither packed nor pushed.
     pub fn set_reastream_on(&self, on: bool) {
         self.shared.reastream_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Take the device send ring's read end, once per engine. `None` if it
+    /// has already been taken. Like the ReaStream tap, taking it starts
+    /// nothing: [`Engine::set_device_send_on`] gates the push.
+    pub fn take_device_send_tap(&mut self) -> Option<Consumer<f32>> {
+        self.devsend_rx.take()
+    }
+
+    /// Switch the master-out push into the device send's ring on or off.
+    pub fn set_device_send_on(&self, on: bool) {
+        self.shared.device_send_on.store(on, Ordering::Relaxed);
     }
 
     /// Publish the desk's routing table to the audio thread.
@@ -22900,6 +22946,7 @@ mod tests {
             vs_was_engaged: false,
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
+            devsend_tx: RingBuffer::<f32>::new(1 << 15).0,
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
             route_direct: [1.0; CHANNELS],
             route_n: 0,
@@ -26922,6 +26969,45 @@ mod tests {
         assert_eq!(t.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
         assert_eq!(t.key_io.len(), TAP_CHANNELS);
         assert!(t.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
+    }
+
+    /// **The device send's tap**: the ReaStream pair, pushed only while the
+    /// flag is up, and a ring nobody drains drops whole blocks and never
+    /// holds the callback. The flag mutated to always-on, or the push moved
+    /// off the shared scratch, turns this red.
+    #[test]
+    fn the_device_send_gets_the_master_pair_only_while_on_and_drops_when_full() {
+        let (tx, _rx) = RingBuffer::<f32>::new(1 << 16);
+        let shared = Arc::new(Shared::new());
+        let mut r = test_renderer(Arc::clone(&shared), tx, 2);
+        let (dtx, mut drx) = RingBuffer::<f32>::new(1024);
+        r.devsend_tx = dtx;
+        for (i, s) in r.reastream_scratch[..256].iter_mut().enumerate() {
+            *s = i as f32;
+        }
+        r.push_taps(128);
+        assert_eq!(drx.slots(), 0, "a send that is off was pushed to");
+
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        assert!(e.take_device_send_tap().is_some(), "an engine hands its tap once");
+        assert!(e.take_device_send_tap().is_none(), "and only once");
+        e.set_device_send_on(true);
+        assert!(e.shared.device_send_on.load(Ordering::Relaxed));
+
+        shared.device_send_on.store(true, Ordering::Relaxed);
+        r.push_taps(128);
+        assert_eq!(drx.slots(), 256, "one block of 128 stereo frames");
+        for i in 0..256 {
+            assert_eq!(drx.pop().unwrap(), i as f32, "the master pair, in order");
+        }
+        // Nobody drains it now: four blocks fit, the rest are dropped whole,
+        // and the pushes return at once.
+        let t0 = Instant::now();
+        for _ in 0..1000 {
+            r.push_taps(128);
+        }
+        assert!(t0.elapsed() < Duration::from_secs(1), "a full ring held the callback");
+        assert_eq!(drx.slots(), 1024, "only whole blocks went in");
     }
 
     // ── the bypass table ────────────────────────────────────────────────────
