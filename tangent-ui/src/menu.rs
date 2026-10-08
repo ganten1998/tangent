@@ -1588,7 +1588,22 @@ impl MenuState {
         // into illegibility.
         let mut font_scale = 1.0_f32;
         if let Some(mon) = screen.map(|s| s.size()) {
-            if measured_height(&entries, row_h) > mon.y {
+            // **The tallest HOVER counts too, not just the menu.** A submenu
+            // shares the menu's rows, and `clamp_submenu` can slide one up
+            // the screen but cannot shrink it. Themes is the tall one: the
+            // factory set went to thirty-two on 2026-10-08, which with its
+            // headings is thirty-five rows (735 points at 21) before any
+            // user theme, and on a short plugin editor the bottom of the
+            // list simply was not there.
+            let tallest_sub = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Submenu { items, .. } => Some(items.len()),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0) as f32;
+            if measured_height(&entries, row_h) > mon.y || tallest_sub * row_h > mon.y {
                 // Solved, not approximated. Separators are a fixed 3 points
                 // and do not shrink, so scaling the whole height by a ratio
                 // leaves the menu a few points too tall — which is the one
@@ -1600,7 +1615,10 @@ impl MenuState {
                 let n_row = entries.len() as f32 - n_sep;
                 if n_row >= 1.0 {
                     let room = mon.y - n_sep * SEP_H;
-                    let fitted = (room / n_row).floor();
+                    let mut fitted = (room / n_row).floor();
+                    if tallest_sub >= 1.0 {
+                        fitted = fitted.min((mon.y / tallest_sub).floor());
+                    }
                     let floor = (row_h * MIN_SQUEEZE).max(MIN_ROW_H);
                     let chosen = fitted.max(floor).min(row_h);
                     font_scale = (chosen / row_h).clamp(MIN_SQUEEZE, 1.0);
@@ -3403,6 +3421,36 @@ mod tests {
             clamp_submenu(inside, Vec2::new(120.0, 260.0), 200.0, mon),
             inside
         );
+    }
+
+    /// **The Themes hover fits a short screen, all thirty-two and then
+    /// some.** The squeeze used to measure the menu and not its hovers, so a
+    /// submenu taller than the screen was slid to the top by
+    /// `clamp_submenu` and then simply ran off the bottom. Themes is the
+    /// tallest there is since the factory set went to thirty-two, and a
+    /// person with a few themes of their own makes it taller still; a
+    /// 640-point plugin editor is the short case that matters.
+    #[test]
+    fn the_themes_hover_fits_a_short_screen() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut v = view();
+        assert_eq!(v.factory_themes.len(), 32, "the fixture is the whole factory set");
+        v.user_themes = (1..=4).map(|i| format!("Mine {i}")).collect();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 640.0));
+        let m = MenuState::open(&ctx, v, Pos2::new(200.0, 100.0), Some(screen));
+        for sub in &m.subs {
+            assert!(
+                sub.size.y <= screen.height(),
+                "a {}-point hover on a {}-point screen",
+                sub.size.y,
+                screen.height()
+            );
+        }
+        // And it is a squeeze, not a scroll: still above the floor where
+        // the rows stop being readable.
+        assert!(m.row_h >= MIN_ROW_H, "rows squeezed to {}", m.row_h);
     }
 
     /// A category must be worth the hover it costs.

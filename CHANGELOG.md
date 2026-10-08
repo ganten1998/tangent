@@ -642,6 +642,10 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   unchanged, so a saved desk opens exactly as it was, and every new theme
   carries its own 32-channel palette.
 
+- **The Themes menu fits a short window.** A hover menu taller than the
+  screen now shrinks its rows to fit, as the main menu already did,
+  instead of running off the bottom of a small plugin editor.
+
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
   small one.** A new row in the audio setup panel, beside the buffer size,
   set to Auto by default. A settings file written by a development build
