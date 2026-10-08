@@ -79,6 +79,18 @@ const FILTER_S: f64 = 1.0;
 /// a session runs, so the mean is the saw-tooth's and not a phase of it.
 const WATCH_S: f64 = 2.0;
 
+/// How many of the engine's bursts the read side measures before its first
+/// prime may release; see [`Pull::block`]. Four is a few tens of
+/// milliseconds of extra silence at the start, and it is what keeps one
+/// late first callback (two bursts read as one) from setting the target.
+const BURSTS_TO_PRIME: u32 = 4;
+/// The bursts in one measuring window; see [`Pull::block`]. 32 is a second
+/// or two at the block sizes that matter, so a block that GROWS under a
+/// running send (another app taking the interface to a larger buffer) is
+/// followed within two windows, and one late sink callback in a window is
+/// outvoted by the other 31.
+const BURST_WINDOW: u32 = 32;
+
 /// The largest sink callback rendered in one pass; a larger one is done in
 /// several. Matches the engine's `MAX_CALLBACK_FRAMES`.
 const MAX_SINK_FRAMES: usize = 8192;
@@ -202,8 +214,24 @@ pub struct Pull {
     dst_rate: f64,
     /// `src_rate / dst_rate`, the ratio with no trim.
     nominal: f64,
-    /// The engine's block, in source frames, when it said (see [`Pull::target`]).
+    /// The engine's block, in source frames, as the desktop was TOLD it
+    /// (`OutputInfo::buffer_frames`, 0 when the device picked its own). A
+    /// floor under what is measured; see [`Pull::block`].
     src_block: usize,
+    /// The fill the last callback left behind; `None` until a callback has
+    /// run since the restart. The next callback's fill less this is what the
+    /// engine pushed in between: whole bursts, since `push_entire_slice` is
+    /// all or nothing.
+    last_fill: Option<usize>,
+    /// The engine's burst as MEASURED: the smallest positive growth seen,
+    /// per window (see [`Pull::block`]). 0 until one is seen.
+    burst: usize,
+    /// Positive growths seen since the send was built.
+    bursts: u32,
+    /// The window being measured: its smallest growth so far and how many
+    /// it holds.
+    win_min: usize,
+    win_n: u32,
     /// The largest sink callback seen, in device frames. Not known until the
     /// first callback; WASAPI picks its own period.
     period: usize,
@@ -229,7 +257,8 @@ pub struct Pull {
 impl Pull {
     /// The read side over `frames` (interleaved stereo at `src_rate`),
     /// writing to a device at `dst_rate`. `src_block` is the engine's buffer
-    /// when it named one.
+    /// when it named one, a floor under the burst the ring measures (see
+    /// [`Pull::block`]).
     pub fn new(frames: rtrb::Consumer<f32>, src_rate: u32, dst_rate: u32, src_block: usize) -> Self {
         let mut p = Self {
             frames,
@@ -237,6 +266,11 @@ impl Pull {
             dst_rate: 0.0,
             nominal: 1.0,
             src_block,
+            last_fill: None,
+            burst: 0,
+            bursts: 0,
+            win_min: usize::MAX,
+            win_n: 0,
             period: 0,
             hist: [[0.0; 2]; 4],
             frac: 0.0,
@@ -256,11 +290,16 @@ impl Pull {
     /// Start over for a device at `dst_rate`: whatever the ring holds is
     /// thrown away (it was queued for a stream that is gone, or while the
     /// send was off), the controller forgets its trim, and the output primes.
+    ///
+    /// **The measured burst is kept.** It is the ENGINE's, and the engine
+    /// is the same one (a new engine builds a new send); only the growth
+    /// baseline goes, because the discard below is not a pop a callback did.
     pub fn restart(&mut self, src_rate: u32, dst_rate: u32) {
         self.src_rate = f64::from(src_rate.max(1));
         self.dst_rate = f64::from(dst_rate.max(1));
         self.nominal = self.src_rate / self.dst_rate;
         self.period = 0;
+        self.last_fill = None;
         self.discard(self.frames.slots() / 2);
         self.hist = [[0.0; 2]; 4];
         self.frac = 0.0;
@@ -280,10 +319,11 @@ impl Pull {
     /// the fill a callback sees saw-tooths by a whole engine block, and a
     /// 2048-frame ASIO buffer against a 20 ms target would underrun at every
     /// beat of the two cadences. Holding twice the larger block keeps the
-    /// trough of that saw-tooth a whole sink period above empty.
+    /// trough of that saw-tooth a whole sink period above empty. The block
+    /// is [`Pull::block`], the one the ring actually receives.
     pub fn target(&self) -> f64 {
         let sink_in_src = self.period as f64 * self.nominal;
-        let block = (self.src_block as f64).max(sink_in_src);
+        let block = (self.block() as f64).max(sink_in_src);
         let cap = self.capacity_frames() as f64;
         (TARGET_FLOOR_S * self.src_rate)
             .max(2.0 * block)
@@ -317,7 +357,55 @@ impl Pull {
     /// second of backlog at 500 ppm would take half an hour.
     fn ceiling(&self) -> f64 {
         let cap = self.capacity_frames() as f64;
-        (3.0 * self.target()).min(cap - self.src_block as f64)
+        (3.0 * self.target()).min(cap - self.block() as f64)
+    }
+
+    /// **The engine's block, in source frames: the larger of what the
+    /// desktop was told and what the ring has been seen to receive.**
+    ///
+    /// Told is not enough. `OutputInfo::buffer_frames` is the size Tangent
+    /// ASKED for, and it is `None` (0 here) whenever the device picked its
+    /// own: an ASIO driver left on its panel's size, which is the default
+    /// setting. On macOS it can be smaller than what the device runs at
+    /// while another app holds the interface larger (`Shared::out_block_seen`
+    /// says so). Told 0 against a 2048-frame burst, the target fell to the
+    /// 20 ms floor and the send underran and cut at every beat of the two
+    /// cadences, choppy on the cable while the interface was fine.
+    ///
+    /// So each callback measures what arrived since the last one. Between
+    /// two callbacks the engine pushes zero or more WHOLE bursts, so the
+    /// smallest positive growth is one burst, or about one sink period's
+    /// worth when the engine's block is the smaller (and then the sink's
+    /// period sets the target anyway). The SMALLEST and not the largest: a
+    /// sink callback that runs late sees two bursts at once, and a running
+    /// max would ratchet the target, and the latency, up at every hiccup.
+    /// The smallest is taken per window of [`BURST_WINDOW`] growths, so a
+    /// block that grows under a running send is followed one window later.
+    /// Until the first window closes it is the smallest so far.
+    pub fn block(&self) -> usize {
+        self.src_block.max(self.burst)
+    }
+
+    /// One look at what the engine pushed since the last callback.
+    fn measure(&mut self, fill: usize) {
+        let Some(last) = self.last_fill else {
+            return;
+        };
+        let grew = fill.saturating_sub(last);
+        if grew == 0 {
+            return;
+        }
+        self.bursts = self.bursts.saturating_add(1);
+        self.win_min = self.win_min.min(grew);
+        self.win_n += 1;
+        if self.bursts <= BURST_WINDOW {
+            self.burst = self.win_min;
+        }
+        if self.win_n >= BURST_WINDOW {
+            self.burst = self.win_min;
+            self.win_min = usize::MAX;
+            self.win_n = 0;
+        }
     }
 
     fn capacity_frames(&self) -> usize {
@@ -370,13 +458,31 @@ impl Pull {
             out.fill(0.0);
             return;
         }
+        self.measure(self.fill());
+        self.render_frames(out, dev_ch, frames);
+        // The baseline for the next callback's measure, read AFTER this one's
+        // pops: anything that lands from here on is the engine's.
+        self.last_fill = Some(self.fill());
+    }
+
+    fn render_frames(&mut self, out: &mut [f32], dev_ch: usize, frames: usize) {
         self.period = self.period.max(frames);
         let target = self.target();
         let fill = self.fill();
         if self.priming {
-            if (fill as f64) < target {
+            // Held until the engine's burst has been measured too, or a
+            // ring told nothing of the block would prime to the 20 ms floor
+            // and release into the underrun this exists to prevent.
+            if (fill as f64) < target || self.bursts < BURSTS_TO_PRIME {
                 out.fill(0.0);
                 return;
+            }
+            // Released at the target and not above it: the measuring can
+            // hold the prime for several bursts past the target, and what
+            // piled up is old audio nobody has heard. Dropping the oldest
+            // here costs nothing, since the output was silence anyway.
+            if fill as f64 > target {
+                self.discard(fill - target as usize);
             }
             // Resume from zeros: the first frames ramp in through the
             // interpolator's history rather than repeating whatever it held
@@ -444,6 +550,11 @@ impl Pull {
 struct Live {
     /// Set by the stream's error callback on a device that went away.
     gone: AtomicBool,
+    /// Set by the stream's error callback on any other fault that is not an
+    /// xrun, BEFORE it tries to store the words in `fault`. The flag is what
+    /// says the stream is dead; the words are a courtesy. See
+    /// [`Live::report`].
+    faulted: AtomicBool,
     /// Callbacks served, so "sending" means the cable is pulling.
     callbacks: AtomicU64,
     fill: AtomicU32,
@@ -452,6 +563,55 @@ struct Live {
     overruns: AtomicU32,
     /// A stream error that is not an xrun, in words; `try_lock` only.
     fault: Mutex<Option<String>>,
+}
+
+/// The reason given when the backend's own words were lost; see
+/// [`Live::report`].
+const FAULT_UNSAID: &str = "the device reported an error";
+
+impl Live {
+    /// **What the stream's error callback does with an error.** Never
+    /// panics, never waits: this runs on the cable's thread.
+    ///
+    /// The flag first, the words second. The words go in a mutex the UI
+    /// thread also takes (to read them, several times a frame), and the
+    /// callback only ever `try_lock`s it, so an error that lands while the
+    /// UI holds it cannot store its text. cpal reports a fatal error ONCE
+    /// and its stream thread exits (WASAPI's `run_output` breaks on it), so
+    /// with nothing but the mutex a lost try was a dead stream still shown
+    /// as sending, with no notice and a Retry that did nothing. The atomic
+    /// cannot be lost; at worst the reason is [`FAULT_UNSAID`].
+    fn report(&self, err: &cpal::StreamError) {
+        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+            self.gone.store(true, Ordering::Release);
+            return;
+        }
+        if matches!(err, cpal::StreamError::BackendSpecific { err: inner }
+            if inner.description.starts_with("xrun"))
+        {
+            return;
+        }
+        if let Ok(mut slot) = self.fault.try_lock() {
+            *slot = Some(err.to_string());
+        }
+        // After the words, so a reader that sees the flag finds them there
+        // whenever the lock was had.
+        self.faulted.store(true, Ordering::Release);
+    }
+
+    /// The stream's failure, if it has had one, in words that do not name
+    /// the device: every caller already says which device it was, and
+    /// "Stopped sending to CABLE Input: CABLE Input went away" said it twice.
+    fn fault(&self) -> Option<String> {
+        if self.gone.load(Ordering::Acquire) {
+            return Some("the device went away".to_owned());
+        }
+        if !self.faulted.load(Ordering::Acquire) {
+            return None;
+        }
+        let said = self.fault.try_lock().ok().and_then(|g| g.clone());
+        Some(said.unwrap_or_else(|| FAULT_UNSAID.to_owned()))
+    }
 }
 
 /// A snapshot of a running send, for the status line.
@@ -520,7 +680,8 @@ pub struct DeviceSend {
 impl DeviceSend {
     /// The send over the engine's tap `frames` (interleaved stereo at
     /// `src_rate`), no device open yet. `src_block` is the engine's buffer
-    /// when it named one.
+    /// when it named one; `None` is fine, the read side measures the real
+    /// one (see [`Pull::block`]).
     pub fn new(frames: rtrb::Consumer<f32>, src_rate: u32, src_block: Option<u32>) -> Self {
         let block = src_block.unwrap_or(0) as usize;
         Self {
@@ -541,13 +702,10 @@ impl DeviceSend {
     }
 
     /// The open stream's failure, if it has had one: its device gone, or a
-    /// backend error that is not an xrun.
+    /// backend error that is not an xrun. In words without the device's
+    /// name; see [`Live::fault`].
     pub fn fault(&self) -> Option<String> {
-        let run = self.running.as_ref()?;
-        if run.live.gone.load(Ordering::Relaxed) {
-            return Some(format!("{} went away", run.device));
-        }
-        run.live.fault.try_lock().ok().and_then(|g| g.clone())
+        self.running.as_ref()?.live.fault()
     }
 
     /// What the open stream is doing, or `None` with none open.
@@ -732,21 +890,7 @@ where
                 fed.underruns.store(p.underruns(), Ordering::Relaxed);
                 fed.overruns.store(p.overruns(), Ordering::Relaxed);
             },
-            move |err| {
-                // Never panic, never wait: this is the cable's thread.
-                if matches!(err, cpal::StreamError::DeviceNotAvailable) {
-                    live.gone.store(true, Ordering::Relaxed);
-                    return;
-                }
-                if matches!(&err, cpal::StreamError::BackendSpecific { err: inner }
-                    if inner.description.starts_with("xrun"))
-                {
-                    return;
-                }
-                if let Ok(mut slot) = live.fault.try_lock() {
-                    *slot = Some(err.to_string());
-                }
-            },
+            move |err| live.report(&err),
             None,
         )
         .map_err(|e| e.to_string())
@@ -777,21 +921,39 @@ mod tests {
         dst_block: usize,
         seconds: f64,
     ) -> Sim {
+        simulate_told(src_rate, dst_rate, src_ppm, dst_ppm, src_block, |_| src_block, dst_block, seconds)
+    }
+
+    /// [`simulate`], with the block the desktop TELLS the pull apart from
+    /// the one the engine actually pushes, which may change over time
+    /// (`pushed` answers the block for a push at time `t`).
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_told(
+        src_rate: u32,
+        dst_rate: u32,
+        src_ppm: f64,
+        dst_ppm: f64,
+        told: usize,
+        pushed: impl Fn(f64) -> usize,
+        dst_block: usize,
+        seconds: f64,
+    ) -> Sim {
         let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
-        let mut pull = Pull::new(rx, src_rate, dst_rate, src_block);
-        let src_dt = src_block as f64 / (f64::from(src_rate) * (1.0 + src_ppm * 1e-6));
+        let mut pull = Pull::new(rx, src_rate, dst_rate, told);
+        let src_hz = f64::from(src_rate) * (1.0 + src_ppm * 1e-6);
         let dst_dt = dst_block as f64 / (f64::from(dst_rate) * (1.0 + dst_ppm * 1e-6));
-        let block: Vec<f32> = vec![0.25; src_block * 2];
+        let block: Vec<f32> = vec![0.25; MAX_SINK_FRAMES * 2];
         let mut out = vec![0.0f32; dst_block * 2];
         let (mut tp, mut tc) = (0.0f64, dst_dt * 0.37);
         let mut trace = Vec::new();
         let mut engine_drops = 0u32;
         while tc < seconds {
             if tp <= tc {
-                if tx.push_entire_slice(&block).is_err() {
+                let n = pushed(tp);
+                if tx.push_entire_slice(&block[..n * 2]).is_err() {
                     engine_drops += 1;
                 }
-                tp += src_dt;
+                tp += n as f64 / src_hz;
             } else {
                 // The fill as the controller sees it: at the callback,
                 // before it reads.
@@ -868,6 +1030,147 @@ mod tests {
         }
     }
 
+    /// **The block the ring RECEIVES, not the one the desktop was told.**
+    /// An ASIO driver left on its own panel size gives the send no block
+    /// (`buffer_frames` is `None`, told 0), and macOS can run larger than it
+    /// was asked; at 2048 frames against a 480-frame cable the 20 ms target
+    /// underran and cut at every beat of the two cadences. Measured, the
+    /// target covers the real burst twice and nothing glitches once the
+    /// prime has released. Make [`Pull::block`] answer `src_block` alone and
+    /// this goes red.
+    #[test]
+    fn the_target_follows_the_burst_the_ring_receives_when_told_wrong() {
+        let cases = [
+            // (src, dst, src ppm, dst ppm, told, pushed, dst block)
+            (48_000, 48_000, 0.0, 0.0, 0, 2048, 480),
+            (48_000, 48_000, 300.0, 0.0, 0, 2048, 480),
+            (44_100, 48_000, -300.0, 0.0, 0, 2048, 480),
+            (48_000, 48_000, 0.0, 0.0, 256, 2048, 480),
+            (48_000, 48_000, 0.0, -300.0, 0, 1024, 480),
+            (48_000, 44_100, 0.0, 0.0, 0, 4096, 441),
+        ];
+        for (src, dst, sp, dp, told, pushed, db) in cases {
+            let sim = simulate_told(src, dst, sp, dp, told, |_| pushed, db, 60.0);
+            let p = &sim.pull;
+            let at = |t: f64| sim.trace.iter().find(|s| s.0 >= t).expect("traced").3;
+            assert_eq!(p.block(), pushed, "{src}->{dst} told {told}: measured the wrong burst");
+            assert!(p.target() >= 2.0 * pushed as f64, "{src}->{dst}: target {}", p.target());
+            assert!(at(10.0) <= 1, "{src}->{dst} told {told}: {} underruns at start", at(10.0));
+            assert_eq!(
+                p.underruns(),
+                at(10.0),
+                "{src}->{dst} told {told} pushed {pushed}: underran after the prime"
+            );
+            assert_eq!(p.overruns(), 0, "{src}->{dst} told {told}: an overrun cut");
+            assert_eq!(sim.engine_drops, 0);
+        }
+    }
+
+    /// **The first callback of a stream waits to measure.** WASAPI takes its
+    /// time to start a stream, and the engine has pushed several bursts by
+    /// the first callback; told no block, the ring is already past the 20 ms
+    /// floor there, and releasing on it is an underrun the moment the real
+    /// target is learned. Drop the `BURSTS_TO_PRIME` hold and this goes red.
+    #[test]
+    fn a_first_callback_on_a_full_ring_waits_to_measure_the_burst() {
+        let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
+        let mut p = Pull::new(rx, 48_000, 48_000, 0);
+        let mut out = vec![9.0f32; 480 * 2];
+        let block = vec![0.1f32; 2048 * 2];
+        tx.push_entire_slice(&block).unwrap();
+        tx.push_entire_slice(&block).unwrap();
+        p.render(&mut out, 2);
+        assert!(p.priming(), "released on a ring it had not measured");
+        assert!(out.iter().all(|&s| s == 0.0));
+        // Then the engine's own cadence: 2048 frames every 42.7 ms against
+        // 480 every 10 ms. Not one underrun, from the very start.
+        let (mut tp, mut tc) = (0.0f64, 0.01f64);
+        while tc < 20.0 {
+            if tp <= tc {
+                tx.push_entire_slice(&block).unwrap();
+                tp += 2048.0 / 48_000.0;
+            } else {
+                p.render(&mut out, 2);
+                tc += 0.01;
+            }
+        }
+        assert!(!p.priming());
+        assert_eq!(p.underruns(), 0, "the start-up released into an underrun");
+        assert_eq!(p.overruns(), 0);
+    }
+
+    /// **A late sink callback does not ratchet the latency.** Two bursts
+    /// arrive between a pair of callbacks whenever the cable's thread runs
+    /// late; a running MAX of the growth would double the target at the
+    /// first such hiccup and keep it there.
+    #[test]
+    fn a_late_callback_reads_two_bursts_and_the_target_holds() {
+        let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
+        let mut p = Pull::new(rx, 48_000, 48_000, 0);
+        let mut out = vec![0.0f32; 480 * 2];
+        let block = vec![0.1f32; 1024 * 2];
+        for i in 0..400 {
+            tx.push_entire_slice(&block).unwrap();
+            // Every 50th callback is late by a whole burst.
+            if i % 50 == 25 {
+                tx.push_entire_slice(&block).unwrap();
+            }
+            p.render(&mut out, 2);
+            p.render(&mut out, 2);
+        }
+        assert_eq!(p.block(), 1024, "a late callback set the block");
+        assert_eq!(p.target(), 2048.0);
+    }
+
+    /// **A block that grows under a running send is followed**: another app
+    /// takes the interface from 512 to 2048 frames a minute in. The send may
+    /// glitch while the next window measures; it must not go on glitching.
+    #[test]
+    fn a_block_that_grows_mid_send_is_followed_within_a_window() {
+        let sim = simulate_told(48_000, 48_000, 0.0, 0.0, 512, |t| if t < 20.0 { 512 } else { 2048 }, 480, 60.0);
+        let p = &sim.pull;
+        let at = |t: f64| sim.trace.iter().find(|s| s.0 >= t).expect("traced").3;
+        assert_eq!(p.block(), 2048);
+        assert_eq!(p.underruns(), at(25.0), "still underrunning long after the block grew");
+        assert_eq!(sim.engine_drops, 0);
+    }
+
+    /// **A fault is never lost to the UI holding the lock.** The error
+    /// callback only `try_lock`s the words; with the UI thread reading them
+    /// at that instant, the old code stored nothing, and the dead stream read
+    /// as sending for ever. The flag survives; the words do when they can.
+    #[test]
+    fn a_fault_reported_while_the_ui_reads_is_still_a_fault() {
+        let fatal = || cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "AUDCLNT_E_DEVICE_INVALIDATED".to_owned(),
+            },
+        };
+        let live = Live::default();
+        assert_eq!(live.fault(), None);
+        {
+            let _ui = live.fault.lock().unwrap();
+            live.report(&fatal());
+        }
+        assert_eq!(live.fault().as_deref(), Some(FAULT_UNSAID), "a contended fault vanished");
+
+        let live = Live::default();
+        live.report(&fatal());
+        let said = live.fault().expect("a fault");
+        assert!(said.contains("AUDCLNT_E_DEVICE_INVALIDATED"), "{said}");
+
+        // An xrun is not a fault, and a device gone is said without its name.
+        let live = Live::default();
+        live.report(&cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "xrun: 12 frames".to_owned(),
+            },
+        });
+        assert_eq!(live.fault(), None);
+        live.report(&cpal::StreamError::DeviceNotAvailable);
+        assert_eq!(live.fault().as_deref(), Some("the device went away"));
+    }
+
     #[test]
     fn a_drift_past_the_bound_saturates_and_never_runs_away() {
         // 2000 ppm is four times what the trim may do: the fill must drift,
@@ -893,6 +1196,19 @@ mod tests {
         assert!(out.iter().all(|s| (s - 0.25).abs() < 1e-6), "{:?}", &out[..8]);
     }
 
+    /// Feed `block`-frame bursts of `v` and render one `out` after each
+    /// until the prime releases; the callbacks it took.
+    fn prime(tx: &mut rtrb::Producer<f32>, p: &mut Pull, block: usize, out: &mut [f32], ch: usize, v: f32) -> u32 {
+        for n in 1..=64 {
+            tx.push_entire_slice(&vec![v; block * 2]).unwrap();
+            p.render(out, ch);
+            if !p.priming() {
+                return n;
+            }
+        }
+        panic!("never primed: fill {} target {}", p.fill(), p.target());
+    }
+
     #[test]
     fn an_underrun_is_silence_then_a_clean_reprime() {
         let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
@@ -902,11 +1218,22 @@ mod tests {
         p.render(&mut out, 2);
         assert!(out.iter().all(|&s| s == 0.0));
         assert!(p.priming());
-        // Prime it (target = 2 × 480 at least, 20 ms = 960 here).
-        let target = p.target() as usize;
-        tx.push_entire_slice(&vec![0.5; (target + 480) * 2]).unwrap();
+        // A ring at its target (2 × 480 at least, 20 ms = 960 here) is not
+        // yet enough: the burst is measured first, and the prime holds
+        // while it is.
+        tx.push_entire_slice(&vec![0.5; 1200 * 2]).unwrap();
+        out.fill(9.0);
         p.render(&mut out, 2);
+        assert!(p.priming(), "released before the engine's burst was measured");
+        assert!(out.iter().all(|&s| s == 0.0));
+        prime(&mut tx, &mut p, 480, &mut out, 2, 0.5);
         assert!(!p.priming(), "a ring at target resumes");
+        assert!(
+            p.fill() as f64 <= p.target(),
+            "the backlog the measuring piled up was not cut at the release: fill {} target {}",
+            p.fill(),
+            p.target()
+        );
         // Let it run dry.
         while p.fill() > 480 {
             p.render(&mut out, 2);
@@ -931,8 +1258,7 @@ mod tests {
         let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
         let mut p = Pull::new(rx, 48_000, 48_000, 512);
         let mut out = vec![0.0f32; 480 * 2];
-        tx.push_entire_slice(&vec![0.1; 2000 * 2]).unwrap();
-        p.render(&mut out, 2);
+        prime(&mut tx, &mut p, 512, &mut out, 2, 0.1);
         // A second of backlog arrives while the sink is stalled.
         tx.push_entire_slice(&vec![0.1; 12_000 * 2]).unwrap();
         p.render(&mut out, 2);
@@ -975,13 +1301,20 @@ mod tests {
         let (mut tx, rx) = rtrb::RingBuffer::<f32>::new(RING_SAMPLES);
         let mut p = Pull::new(rx, 48_000, 48_000, 64);
         let mut frames = Vec::new();
-        for _ in 0..4000 {
+        for _ in 0..64 {
             frames.extend_from_slice(&[0.5f32, -0.25]);
         }
-        tx.push_entire_slice(&frames).unwrap();
         let mut out = vec![9.0f32; 64 * 4];
-        p.render(&mut out, 4);
-        p.render(&mut out, 4);
+        // Primed on the same signal, then two whole callbacks past the
+        // ramp-in from zeros.
+        while p.priming() {
+            tx.push_entire_slice(&frames).unwrap();
+            p.render(&mut out, 4);
+        }
+        for _ in 0..2 {
+            tx.push_entire_slice(&frames).unwrap();
+            p.render(&mut out, 4);
+        }
         for f in out.chunks_exact(4) {
             assert!((f[0] - 0.5).abs() < 1e-6 && (f[1] + 0.25).abs() < 1e-6);
             assert_eq!(&f[2..], &[0.0, 0.0]);
