@@ -21,6 +21,8 @@ pub mod audio;
 pub mod camera;
 pub mod clock;
 pub mod decode;
+/// The master out, onto a second output device; see the module doc.
+pub mod devsend;
 pub mod encode;
 pub mod graph;
 /// Spawning a child without putting a console window on somebody's screen.
