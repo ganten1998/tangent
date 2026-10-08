@@ -7809,11 +7809,13 @@ impl TangentApp {
     /// pick then goes near-white - an outline drawn in almost the band's own
     /// colour. The owner: "sandstone and celadon have heart border colors
     /// that are near white, and illegible -- make them dark". The edge only,
-    /// and nothing else about either theme.
+    /// and nothing else about either theme. Overprint (2026-10-08) is the
+    /// fourth light band, a pale pink wash, and takes the same edge for
+    /// the same reason rather than waiting to be photographed.
     fn heart_border(&self, fill: egui::Color32) -> egui::Color32 {
         if matches!(
             self.settings.theme_name.as_str(),
-            "Centennial" | "Sandstone" | "Celadon"
+            "Centennial" | "Sandstone" | "Celadon" | "Overprint"
         ) {
             egui::Color32::from_rgb(0x2b, 0x2b, 0x2e)
         } else {
@@ -64673,8 +64675,9 @@ mod tests {
             "the fixture's fill has to be one the measurement would edge in white"
         );
         // Sandstone and Celadon too: light bands, where the measured pick on
-        // their darkened fills was a near-white edge nobody could see.
-        for theme in ["Centennial", "Sandstone", "Celadon"] {
+        // their darkened fills was a near-white edge nobody could see. And
+        // Overprint, the light band the 2026-10-08 batch added.
+        for theme in ["Centennial", "Sandstone", "Celadon", "Overprint"] {
             assert!(
                 crate::theme::factory().iter().any(|t| t.name == theme),
                 "{theme} is not a factory theme any more - this test names it"

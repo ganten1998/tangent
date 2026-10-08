@@ -346,7 +346,8 @@ Custom key colors replace the defaults everywhere they're referenced, including 
 The Rust app paints every role above, and more, from a named theme
 (`tangent-ui/src/theme.rs`, `factory()`). The list is an index: a saved desk
 persists the theme's position as `palette_choice`, so a theme is replaced in
-its slot and never removed or reordered. Nineteen ship. The page is the
+its slot and never removed or reordered. Thirty-two ship: rows 0 to 18,
+and thirteen appended on 2026-10-08 as rows 19 to 31. The page is the
 light-mode ground and the naturals; the band is the recorder; the desk is
 the insert strips. Every theme passes the sweeps in `every_theme_*` tests
 across tangent-ui, in both modes, before it ships; the designs and the
@@ -373,6 +374,19 @@ gates they answer to are `scripts/palgen.py --themes` and `--redo`.
 | 16 | Amber | derived bone | `#2a2010` | `#201808` | `#ffb000` / `#ffe0a0` | the amber phosphor console; ground dark, `#080604` |
 | 17 | Phosphor | derived bone | `#1c2c16` | `#162212` | `#a3e048` / `#d2a36c` | the green phosphor console; ground dark, `#050705` |
 | 18 | Silverface | `#c9cdd2` | `#2a2e33` | `#1f2226` | `#1b94a6` / `#3b5a8c` | the Dual Showman's faceplate |
+| 19 | Urushi | derived bone | `#3e140c` | `#2c0e08` | `#ff6a3a` / `#f0cc80` | a black lacquer box: cinnabar, gold dust, pine; ground dark, `#0a0504` |
+| 20 | Paperback | `#f5f3ee` | `#74381a` | `#5e2c14` | `#ff8a3a` / `#5a8ae0` | a paperback shelf: burnt orange stripe, white panel, series colours |
+| 21 | Malachite | `#f3ecec` | `#00543c` | `#003e2c` | `#ff86a4` / `#2fa070` | the stone's banded emerald, set off with rose quartz |
+| 22 | Sodium | derived bone | `#241b4f` | `#1a1440` | `#ff9a2a` / `#e85ad0` | a night bus at 3 a.m.: ultraviolet sky, sodium lamps, one neon sign; ground dark, `#060409` |
+| 23 | Kiln | `#f8cfb9` | `#2a1e1a` | `#201612` | `#ff9440` / `#64907c` | a flowerpot fresh from the kiln: terracotta page, soot band, firebox glow |
+| 24 | Lapis | `#ecedf1` | `#232d6a` | `#1a2152` | `#e8b640` / `#5a80f0` | a Byzantine ceiling: ultramarine sky, gold-leaf stars |
+| 25 | Chartres | derived bone | `#222226` | `#1a1a1d` | `#5a8cff` / `#f0b83a` | a rose window: cobalt, ruby, emerald and topaz glass in black lead; ground dark, `#050505` |
+| 26 | Overprint | `#fbf7ef` | `#f9d2e0` | `#f1e9ee` | `#1e3590` / `#a8204e` | light desk, a two-colour riso zine: fluorescent pink, federal blue |
+| 27 | Woodblock | `#e9e6df` | `#004b68` | `#003a52` | `#f46a40` / `#a8cce0` | a great-wave print: Prussian blue on washi, one vermilion seal |
+| 28 | Toffee | derived bone | `#4e2d04` | `#3a2204` | `#4cc8a0` / `#f6d496` | a 1930s cast-resin radio: butterscotch cabinet, jade dial, cherry knobs; ground dark, `#0a0604` |
+| 29 | Confetti | `#f6ecbc` | `#4e1a44` | `#3c1234` | `#2cc4b8` / `#f0587a` | an 80s Memphis sideboard: butter laminate, mulberry, teal, pink and lemon |
+| 30 | Lamplight | derived bone | `#00461f` | `#003416` | `#ffe6a8` / `#6fcf9a` | a green glass desk lamp: emerald shade, brass, oxblood leather; ground dark, `#050806` |
+| 31 | Mauve | `#f6f5f2` | `#4a1e56` | `#3a1248` | `#ff6ad5` / `#f0c8e0` | a spirit-duplicator handout: aniline violet on white copy paper |
 
 Retired by name, bytes kept in the strip table: Carbon (2026-09-02), and
 Studio, Aurora, Blueprint, Porcelain, Dusk, Iris, Nocturne (2026-09-18). A

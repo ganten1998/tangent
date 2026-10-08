@@ -932,8 +932,11 @@ mod tests {
                 );
             }
         }
-        // The two that need it are the two dark-designed themes, and nobody
+        // The ones that need it are the dark-designed themes, and nobody
         // else — named, so this notices if a new theme joins them silently.
+        // Amber and Phosphor were the two; the 2026-10-08 batch added five
+        // more built the same way (a near-black light ground), in factory
+        // order, and `scripts/palgen.py`'s `LIFTED` holds the same list.
         let lifted: Vec<String> = crate::theme::factory()
             .into_iter()
             .filter(|theme| {
@@ -946,7 +949,7 @@ mod tests {
             .collect();
         assert_eq!(
             lifted,
-            ["Amber", "Phosphor"],
+            ["Amber", "Phosphor", "Urushi", "Sodium", "Chartres", "Toffee", "Lamplight"],
             "a different set of themes needs the sharps lifted now"
         );
     }
