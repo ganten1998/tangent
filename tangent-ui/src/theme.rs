@@ -507,17 +507,19 @@ impl Theme {
 
 /// Every theme that ships in the binary, Default first.
 ///
-/// **Nineteen, and they are a spread rather than variations on one idea.**
+/// **Thirty-two, and they are a spread rather than variations on one idea.**
 /// Three are the owner's own applications' palettes (Valentine, Hydra,
 /// Navi), kept faithful to what those apps look like rather than
 /// approximated; four are instrument panels the app has some claim to
-/// (Centennial, Rhodes, Silverface, Reed); the rest are materials and
-/// weather. Three desks are light (Sandstone, Centennial, Celadon), one is
-/// mid-tone (Pewter), two carry their ground dark (Phosphor, Amber) and the
-/// others are a pale page over a dark desk, with no two dark bands on one
-/// hue: wine, rose-wine, teal, navy, grey, ochre, avocado, iron-slate,
-/// forest, chocolate, verdigris, charcoal, slate, umber, green-black,
-/// slate-black.
+/// (Centennial, Rhodes, Silverface, Reed); the rest are materials, weather
+/// and objects (a lacquer box, a paperback shelf, a rose window, a
+/// woodblock print, a desk lamp). Four desks are light (Sandstone,
+/// Centennial, Celadon, Overprint); seven carry their ground dark
+/// (Amber, Phosphor, Urushi, Sodium, Chartres, Toffee, Lamplight), which
+/// is the set the piano lifts the sharps of; the others are a pale page
+/// over a dark desk. There is no mid-tone desk: Zinc began as one and
+/// could not stay one, because a mid-tone well moves the transport red
+/// (`dialogs::every_theme_dresses_the_export_window`).
 ///
 /// **The order is an index.** `factory()`'s position is what a saved desk
 /// persists as `palette_choice`, and `mixer_panel::PALETTES` is in the same
@@ -1218,6 +1220,479 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(18),
             dark: dark_of(&[("background", (0x1b, 0x1d, 0x20))]),
         },
+        // ── the 2026-10-08 batch: thirteen NEW themes, slots 19..31. ──────
+        //
+        // Appended after Silverface and nothing above moved: the menu grew
+        // from nineteen to thirty-two, and each theme's palette row points
+        // at a run appended whole to `STRIP_COLORS`. Each one was chosen
+        // against what the nineteen already covered (no saturated band
+        // between hue 20 and 60, no emerald, no ultramarine, a dark ground
+        // only in amber and green, one light desk in each of grey, sand and
+        // celadon) and named for an object rather than a mood, so the name
+        // says what the colours are. Designed and gated by
+        // `scripts/palgen.py --themes` and `--redo` BEFORE this Rust was
+        // written; the velocity pairs are `scripts/velgen.py`'s.
+        // ── Urushi: a black lacquer writing box with cinnabar trays and gold
+        // dust. Warm, glossy, and nothing like a terminal. A DARK-ground theme,
+        // the third after Amber and Phosphor, so its light ground is a
+        // near-black and the piano lifts its sharps (`keys_apart`). The band is
+        // a red you read as lacquer rather than wine: darker and more orange
+        // than Default's #61373a, at hue 36 where Default's sits at 18.
+        // Vermilion sounds, gold dust is held, and a pine trace on the scope is
+        // the one cool thing on the box. The gold is lifted from the measured
+        // #d8a84a, which sat 1.30:1 from the vermilion (a held note and a struck
+        // one barely told apart), to 1.85:1. The master is pulled cool and pink
+        // so it never reads as the vermilion beside it.
+        Theme {
+            name: "Urushi".to_owned(),
+            background: c(0x14, 0x0a, 0x08),
+            white_key: c(0x14, 0x0a, 0x08),
+            black_key: c(0x0a, 0x05, 0x04),
+            key_active: c(0xff, 0x6a, 0x3a),
+            sustain: c(0xf0, 0xcc, 0x80),
+            key_separator: c(0x3a, 0x18, 0x10),
+            text: c(0xf2, 0xd2, 0xb8),
+            theory_line: c(0x64, 0x32, 0x1f),
+            interval_text: c(0xe8, 0xa0, 0x70),
+            recorder_bg: c(0x3e, 0x14, 0x0c),
+            fx_knob: c(0xe8, 0xc0, 0x70),
+            master_knob: c(0xff, 0x4f, 0x6e),
+            varispeed: c(0xf2, 0xd2, 0xb8),
+            meter_bg: c(0x0a, 0x05, 0x04),
+            scope_draw: c(0x7f, 0xc8, 0x9a),
+            fx_strip: c(0x2c, 0x0e, 0x08),
+            input_chip: c(0xff, 0x6a, 0x3a),
+            fretboard: c(0x0a, 0x05, 0x04),
+            string: c(0x8a, 0x64, 0x50),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x6c, 0x56),
+            velocity_quiet: c(0x19, 0xb0, 0x64),
+            channel_palette: Some(19),
+            dark: dark_of(&[("background", (0x0a, 0x05, 0x04))]),
+        },
+        // ── Paperback: a shelf of mid-century paperbacks. A burnt orange
+        // cover stripe for the band, a white middle panel for the page, and the
+        // series colours down the spines. The first saturated band in the empty
+        // stretch between hue 20 and 60 (Rhodes sits there at chroma 7). The
+        // pressed key is the fiction orange, bright enough to show on the white
+        // page and on the band; a cream key would vanish on a white page. Held
+        // is the essays' blue, lifted out of the dead zone to 0.25 luminance so
+        // the note name on it reads. Green knobs for crime, and the scope a pale
+        // blue rather than cream: the browser's file rows print in the trace's
+        // colour and its folders in the band's cream ink, and a cream trace put
+        // the two 3.7 dE apart.
+        Theme {
+            name: "Paperback".to_owned(),
+            background: c(0xf5, 0xf3, 0xee),
+            white_key: c(0xf5, 0xf3, 0xee),
+            black_key: c(0x1e, 0x14, 0x0e),
+            key_active: c(0xff, 0x8a, 0x3a),
+            sustain: c(0x5a, 0x8a, 0xe0),
+            key_separator: c(0x8a, 0x5a, 0x3a),
+            text: c(0xf2, 0xe6, 0xcc),
+            theory_line: c(0xb0, 0xa8, 0x98),
+            interval_text: c(0xc0, 0x4a, 0x14),
+            recorder_bg: c(0x74, 0x38, 0x1a),
+            fx_knob: c(0x4c, 0xaa, 0x6a),
+            master_knob: c(0xff, 0x6a, 0x5a),
+            varispeed: c(0xf2, 0xe6, 0xcc),
+            meter_bg: c(0x24, 0x14, 0x0c),
+            scope_draw: c(0x9c, 0xc0, 0xf8),
+            fx_strip: c(0x5e, 0x2c, 0x14),
+            input_chip: c(0xff, 0x8a, 0x3a),
+            fretboard: c(0x24, 0x14, 0x0c),
+            string: c(0xc8, 0xb8, 0xa0),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfa, 0x75, 0x3c),
+            velocity_quiet: c(0x19, 0xb2, 0x4c),
+            channel_palette: Some(20),
+            dark: dark_of(&[("background", (0x1e, 0x14, 0x0e))]),
+        },
+        // ── Malachite: a polished slab of malachite, banded emerald rings
+        // set off with rose quartz. The first green band above chroma 20, clear
+        // of Moss (hue 135), Reed (116) and Copper's verdigris (180, chroma 13).
+        // The page is a faint rose-quartz white so it is not Celadon's
+        // green-white. Rose quartz sounds and is the first pink trace on the
+        // menu; what is held is a DEEPER malachite green, because a pale mint
+        // held key would vanish on the white page.
+        Theme {
+            name: "Malachite".to_owned(),
+            background: c(0xf3, 0xec, 0xec),
+            white_key: c(0xf3, 0xec, 0xec),
+            black_key: c(0x1a, 0x2a, 0x22),
+            key_active: c(0xff, 0x86, 0xa4),
+            sustain: c(0x2f, 0xa0, 0x70),
+            key_separator: c(0x2a, 0x5a, 0x44),
+            text: c(0xe8, 0xf4, 0xec),
+            theory_line: c(0xb0, 0xa4, 0xa6),
+            interval_text: c(0x1a, 0x6a, 0x4a),
+            recorder_bg: c(0x00, 0x54, 0x3c),
+            fx_knob: c(0xc4, 0xec, 0xd0),
+            master_knob: c(0xff, 0x70, 0x80),
+            varispeed: c(0xf0, 0xb8, 0xc8),
+            meter_bg: c(0x0c, 0x1e, 0x16),
+            scope_draw: c(0xff, 0x86, 0xa4),
+            fx_strip: c(0x00, 0x3e, 0x2c),
+            input_chip: c(0xff, 0x86, 0xa4),
+            fretboard: c(0x0c, 0x1e, 0x16),
+            string: c(0xa8, 0xc8, 0xb8),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xff, 0x70, 0x88),
+            velocity_quiet: c(0x19, 0xb4, 0x80),
+            channel_palette: Some(21),
+            dark: dark_of(&[("background", (0x1a, 0x2a, 0x22))]),
+        },
+        // ── Sodium: a city at 3 a.m. from a night bus. An ultraviolet sky
+        // for the band, sodium streetlamps for what sounds, one magenta neon sign
+        // for what is held, and the blue-green of a mercury lamp on the knobs. A
+        // DARK-ground theme like Amber and Phosphor, so the piano lifts its
+        // sharps. Not the retired Dusk (lavender page, violet band, orange key):
+        // this page is black, the band carries twice Zinc's chroma on a bluer
+        // hue, and the magenta and mercury are new. The knobs are mercury rather
+        // than lilac so it never reads as Zinc turned down.
+        Theme {
+            name: "Sodium".to_owned(),
+            background: c(0x0e, 0x0a, 0x16),
+            white_key: c(0x0e, 0x0a, 0x16),
+            black_key: c(0x06, 0x04, 0x09),
+            key_active: c(0xff, 0x9a, 0x2a),
+            sustain: c(0xe8, 0x5a, 0xd0),
+            key_separator: c(0x2c, 0x1e, 0x44),
+            text: c(0xf0, 0xc8, 0x90),
+            theory_line: c(0x4a, 0x3a, 0x6a),
+            interval_text: c(0xe8, 0xa0, 0xe0),
+            recorder_bg: c(0x24, 0x1b, 0x4f),
+            fx_knob: c(0x6a, 0xd8, 0xc8),
+            master_knob: c(0xff, 0x50, 0x40),
+            varispeed: c(0xf0, 0xc8, 0x90),
+            meter_bg: c(0x06, 0x04, 0x09),
+            scope_draw: c(0xff, 0x9a, 0x2a),
+            fx_strip: c(0x1a, 0x14, 0x40),
+            input_chip: c(0xd0, 0x70, 0xe0),
+            fretboard: c(0x06, 0x04, 0x09),
+            string: c(0x7a, 0x6a, 0x90),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xe5, 0x7c, 0x20),
+            velocity_quiet: c(0xc1, 0x7b, 0xe5),
+            channel_palette: Some(22),
+            dark: dark_of(&[("background", (0x06, 0x04, 0x09))]),
+        },
+        // ── Kiln: an unglazed flowerpot fresh from a wood-fired kiln.
+        // Terracotta paper, soot, and the glow of the firebox. The PAGE is the
+        // hero, the only warm page on the menu that is clay rather than cream,
+        // held at 0.68 luminance so it still takes the dark ink. The band is
+        // soot and deliberately carries no brick, because Paperback and Urushi
+        // already own the saturated bands between hue 40 and 55. What sounds is
+        // the firebox orange; what is held is an ash-glaze green, lifted out of
+        // the dead zone so its note name reads.
+        Theme {
+            name: "Kiln".to_owned(),
+            background: c(0xf8, 0xcf, 0xb9),
+            white_key: c(0xf8, 0xcf, 0xb9),
+            black_key: c(0x2a, 0x16, 0x12),
+            key_active: c(0xff, 0x94, 0x40),
+            sustain: c(0x64, 0x90, 0x7c),
+            key_separator: c(0x8a, 0x5a, 0x44),
+            text: c(0xf0, 0xdc, 0xc0),
+            theory_line: c(0xb8, 0x90, 0x7a),
+            interval_text: c(0x8a, 0x3a, 0x1a),
+            recorder_bg: c(0x2a, 0x1e, 0x1a),
+            fx_knob: c(0xf0, 0xdc, 0xc0),
+            master_knob: c(0xff, 0x6a, 0x50),
+            varispeed: c(0xe8, 0xa0, 0x70),
+            meter_bg: c(0x14, 0x0c, 0x0a),
+            scope_draw: c(0xff, 0x94, 0x40),
+            fx_strip: c(0x20, 0x16, 0x12),
+            input_chip: c(0xff, 0x94, 0x40),
+            fretboard: c(0x14, 0x0c, 0x0a),
+            string: c(0xc0, 0x90, 0x70),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xf5, 0x6c, 0x3b),
+            velocity_quiet: c(0x18, 0xab, 0x61),
+            channel_palette: Some(23),
+            dark: dark_of(&[("background", (0x2a, 0x16, 0x12))]),
+        },
+        // ── Lapis: a Byzantine ceiling, ground lapis lazuli for the sky and
+        // gold leaf for the stars. The band is ultramarine at hue 295, as
+        // saturated as the chroma ceiling allows (41 against 42): the most
+        // chromatic band on the menu and plainly not Navi's chroma-27 navy. Gold
+        // leaf sounds; what is held is a deeper ultramarine than a sky blue
+        // would be, because the pale #8aaaff sat 1.2:1 from the gold.
+        Theme {
+            name: "Lapis".to_owned(),
+            background: c(0xec, 0xed, 0xf1),
+            white_key: c(0xec, 0xed, 0xf1),
+            black_key: c(0x14, 0x1a, 0x40),
+            key_active: c(0xe8, 0xb6, 0x40),
+            sustain: c(0x5a, 0x80, 0xf0),
+            key_separator: c(0x2a, 0x34, 0x78),
+            text: c(0xec, 0xe8, 0xdc),
+            theory_line: c(0xa8, 0xaa, 0xbc),
+            interval_text: c(0x2a, 0x3a, 0x9a),
+            recorder_bg: c(0x23, 0x2d, 0x6a),
+            fx_knob: c(0xe8, 0xb6, 0x40),
+            master_knob: c(0xff, 0x6a, 0x5a),
+            varispeed: c(0xf4, 0xe4, 0xb0),
+            meter_bg: c(0x0c, 0x10, 0x30),
+            scope_draw: c(0xf8, 0xe8, 0xa8),
+            fx_strip: c(0x1a, 0x21, 0x52),
+            input_chip: c(0xe8, 0xb6, 0x40),
+            fretboard: c(0x0c, 0x10, 0x30),
+            string: c(0xa8, 0xac, 0xc8),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x72, 0x56),
+            velocity_quiet: c(0x70, 0x9a, 0xfe),
+            channel_palette: Some(24),
+            dark: dark_of(&[("background", (0x14, 0x1a, 0x40))]),
+        },
+        // ── Chartres: a rose window lit from behind. Cobalt, ruby, emerald
+        // and topaz glass held in black lead. A DARK-ground theme (the piano
+        // lifts its sharps) on a NEUTRAL lead-black, kept neutral on purpose so
+        // it cannot be taken for Sodium's violet-black, and a leaded-grey band
+        // no darker than 0.016: at 0.013 the varispeed dial's recess, the band
+        // darkened twice, had no room left and sat 1.17:1 where a shape wants
+        // 1.18.
+        // The glass lives in the marks and the strips, one jewel per control:
+        // cobalt sounds, topaz is held, emerald on the knobs and the scope, ruby
+        // on the marks. The master is a warm coral so it does not fight the
+        // ruby. Not Prism: that page is pale and its band is charcoal; this one
+        // is lead all the way down.
+        Theme {
+            name: "Chartres".to_owned(),
+            background: c(0x0c, 0x0c, 0x0d),
+            white_key: c(0x0c, 0x0c, 0x0d),
+            black_key: c(0x05, 0x05, 0x05),
+            key_active: c(0x5a, 0x8c, 0xff),
+            sustain: c(0xf0, 0xb8, 0x3a),
+            key_separator: c(0x2a, 0x2a, 0x2e),
+            text: c(0xe8, 0xec, 0xf0),
+            theory_line: c(0x40, 0x40, 0x46),
+            interval_text: c(0xe8, 0x57, 0x7e),
+            recorder_bg: c(0x22, 0x22, 0x26),
+            fx_knob: c(0x48, 0xd8, 0x90),
+            master_knob: c(0xff, 0x7a, 0x50),
+            varispeed: c(0xe8, 0xec, 0xf0),
+            meter_bg: c(0x05, 0x05, 0x05),
+            scope_draw: c(0x48, 0xd8, 0x90),
+            fx_strip: c(0x1a, 0x1a, 0x1d),
+            input_chip: c(0xe8, 0x57, 0x7e),
+            fretboard: c(0x05, 0x05, 0x05),
+            string: c(0x7a, 0x7a, 0x84),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x56, 0x72),
+            velocity_quiet: c(0x17, 0xa8, 0x47),
+            channel_palette: Some(25),
+            dark: dark_of(&[("background", (0x05, 0x05, 0x05))]),
+        },
+        // ── Overprint: a two-colour risograph zine. Fluorescent pink and
+        // federal blue on bright copier paper, a little out of register. The
+        // one new LIGHT desk, so every mark on the band is dark, and it joins
+        // `heart_border`'s charcoal-edge themes. The band is a pale pink ink
+        // wash at 0.72 luminance. The strip is a near-white with a pink cast at
+        // 0.83, and that is a narrow window rather than a taste: a light strip
+        // spends the export window's playhead budget, and at 0.82 its dark-mode
+        // well sat 2.95:1 from the transport red and moved the playhead; at
+        // 0.87 the playhead was safe and a floating panel's field, the strip
+        // walked 30% further toward white, sat 1.04:1 from the panel. 0.83 is
+        // 3.00:1 and 1.05:1, both floors. Not a Porcelain revival: that was a
+        // blue-grey desk with cobalt and violet marks.
+        Theme {
+            name: "Overprint".to_owned(),
+            background: c(0xfb, 0xf7, 0xef),
+            white_key: c(0xfb, 0xf7, 0xef),
+            black_key: c(0x2a, 0x1a, 0x44),
+            key_active: c(0x1e, 0x35, 0x90),
+            sustain: c(0xa8, 0x20, 0x4e),
+            key_separator: c(0xc8, 0xa8, 0xb8),
+            text: c(0x2a, 0x1a, 0x44),
+            theory_line: c(0xc8, 0xb8, 0xc0),
+            interval_text: c(0x1e, 0x35, 0x90),
+            recorder_bg: c(0xf9, 0xd2, 0xe0),
+            fx_knob: c(0x1e, 0x35, 0x90),
+            master_knob: c(0xa8, 0x2a, 0x1a),
+            varispeed: c(0x2a, 0x1a, 0x44),
+            meter_bg: c(0x2a, 0x1a, 0x44),
+            scope_draw: c(0xf9, 0xa8, 0xc8),
+            fx_strip: c(0xf1, 0xe9, 0xee),
+            input_chip: c(0x1e, 0x35, 0x90),
+            fretboard: c(0xc8, 0xa8, 0xb8),
+            string: c(0x4a, 0x3a, 0x5a),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xff, 0xa3, 0xc2),
+            velocity_quiet: c(0xa2, 0xb9, 0xfe),
+            channel_palette: Some(26),
+            dark: dark_of(&[("background", (0x2a, 0x1a, 0x44))]),
+        },
+        // ── Woodblock: a woodblock print of a great wave. Prussian blue
+        // on washi paper, and one vermilion seal in the corner. The only band in
+        // the empty arc between hue 210 and 260, and it stays clear of Navi,
+        // Storm and the retired Blueprint by being teal-side Prussian on
+        // warm-grey paper with a red-orange key. The seal sounds; the bokashi
+        // sky is what is held. The seal was lifted a step from #f0623a, which
+        // sat 2.98:1 on the band.
+        Theme {
+            name: "Woodblock".to_owned(),
+            background: c(0xe9, 0xe6, 0xdf),
+            white_key: c(0xe9, 0xe6, 0xdf),
+            black_key: c(0x0e, 0x2a, 0x3c),
+            key_active: c(0xf4, 0x6a, 0x40),
+            sustain: c(0xa8, 0xcc, 0xe0),
+            key_separator: c(0x3a, 0x64, 0x78),
+            text: c(0xec, 0xe6, 0xd8),
+            theory_line: c(0xa8, 0xa4, 0x98),
+            interval_text: c(0x13, 0x4a, 0x62),
+            recorder_bg: c(0x00, 0x4b, 0x68),
+            fx_knob: c(0xec, 0xe4, 0xd0),
+            master_knob: c(0xff, 0x5a, 0x6a),
+            varispeed: c(0xa8, 0xd8, 0xf0),
+            meter_bg: c(0x08, 0x1c, 0x28),
+            scope_draw: c(0xe8, 0xf4, 0xf8),
+            fx_strip: c(0x00, 0x3a, 0x52),
+            input_chip: c(0xf0, 0x62, 0x3a),
+            fretboard: c(0x08, 0x1c, 0x28),
+            string: c(0xa8, 0xc0, 0xcc),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xff, 0x78, 0x57),
+            velocity_quiet: c(0x21, 0xa9, 0xee),
+            channel_palette: Some(27),
+            dark: dark_of(&[("background", (0x0e, 0x2a, 0x3c))]),
+        },
+        // ── Toffee: a 1930s cast-resin radio. Butterscotch cabinet, jade
+        // dial, cherry knobs. A DARK-ground theme (the piano lifts its sharps).
+        // The band is lighter and more saturated than Amber's, about 22 dE off
+        // it, and what sounds is the JADE of the dial, not amber: that is what
+        // keeps it from being an Amber clone. The cherry master is lifted to
+        // 3:1 on the band.
+        Theme {
+            name: "Toffee".to_owned(),
+            background: c(0x16, 0x0e, 0x08),
+            white_key: c(0x16, 0x0e, 0x08),
+            black_key: c(0x0a, 0x06, 0x04),
+            key_active: c(0x4c, 0xc8, 0xa0),
+            sustain: c(0xf6, 0xd4, 0x96),
+            key_separator: c(0x3a, 0x24, 0x10),
+            text: c(0xf4, 0xe2, 0xb8),
+            theory_line: c(0x5a, 0x40, 0x20),
+            interval_text: c(0xe8, 0xb0, 0x60),
+            recorder_bg: c(0x4e, 0x2d, 0x04),
+            fx_knob: c(0xf4, 0xe2, 0xb8),
+            master_knob: c(0xff, 0x5a, 0x4a),
+            varispeed: c(0x9e, 0xe8, 0xcc),
+            meter_bg: c(0x0a, 0x06, 0x04),
+            scope_draw: c(0xf6, 0xd4, 0x96),
+            fx_strip: c(0x3a, 0x22, 0x04),
+            input_chip: c(0x4c, 0xc8, 0xa0),
+            fretboard: c(0x0a, 0x06, 0x04),
+            string: c(0x9a, 0x7a, 0x50),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x7d, 0x3d),
+            velocity_quiet: c(0x1a, 0xb7, 0x82),
+            channel_palette: Some(28),
+            dark: dark_of(&[("background", (0x0a, 0x06, 0x04))]),
+        },
+        // ── Confetti: an 80s Memphis sideboard. Butter laminate, a
+        // mulberry band, and squiggles in teal, pink and lemon. The loud one.
+        // The page is a pale butter far more chromatic than any cream here, and
+        // deliberately not blush: a blush page over a berry band is Valentine's
+        // formula. Teal sounds and pink is held (the measured #ff7a8a sat
+        // 1.14:1 from the teal and is deepened); lemon is the scope and the
+        // pitch dial, on the band only, never a key on butter.
+        Theme {
+            name: "Confetti".to_owned(),
+            background: c(0xf6, 0xec, 0xbc),
+            white_key: c(0xf6, 0xec, 0xbc),
+            black_key: c(0x2a, 0x0e, 0x24),
+            key_active: c(0x2c, 0xc4, 0xb8),
+            sustain: c(0xf0, 0x58, 0x7a),
+            key_separator: c(0x6a, 0x2a, 0x5a),
+            text: c(0xf8, 0xec, 0xd0),
+            theory_line: c(0xc0, 0xb0, 0x7a),
+            interval_text: c(0x7a, 0x1a, 0x5c),
+            recorder_bg: c(0x4e, 0x1a, 0x44),
+            fx_knob: c(0x6a, 0x8a, 0xf8),
+            master_knob: c(0xff, 0x6a, 0x50),
+            varispeed: c(0xff, 0xd2, 0x3a),
+            meter_bg: c(0x1e, 0x0a, 0x1a),
+            scope_draw: c(0xff, 0xd2, 0x3a),
+            fx_strip: c(0x3c, 0x12, 0x34),
+            input_chip: c(0x2c, 0xc4, 0xb8),
+            fretboard: c(0x1e, 0x0a, 0x1a),
+            string: c(0xc8, 0xa8, 0xb8),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x56, 0x72),
+            velocity_quiet: c(0x17, 0xa3, 0x9e),
+            channel_palette: Some(29),
+            dark: dark_of(&[("background", (0x2a, 0x0e, 0x24))]),
+        },
+        // ── Lamplight: a green glass desk lamp in a dark study. Emerald
+        // shade, brass chain, a warm pool of light on leather. A DARK-ground
+        // theme (the piano lifts its sharps). The band is emerald glass about
+        // 21 dE from Phosphor's, and every mark is WARM so it can never read as
+        // Phosphor: lamplight white sounds, a brighter glass green is held,
+        // oxblood leather on the knobs and brass on the dial and scope. The
+        // brass is lighter than a brass wants to be because #e8c070 sat 24 dE
+        // from the gain cap.
+        Theme {
+            name: "Lamplight".to_owned(),
+            background: c(0x0a, 0x12, 0x0e),
+            white_key: c(0x0a, 0x12, 0x0e),
+            black_key: c(0x05, 0x08, 0x06),
+            key_active: c(0xff, 0xe6, 0xa8),
+            sustain: c(0x6f, 0xcf, 0x9a),
+            key_separator: c(0x1a, 0x34, 0x26),
+            text: c(0xf0, 0xe2, 0xc0),
+            theory_line: c(0x2a, 0x4a, 0x36),
+            interval_text: c(0xe8, 0xc0, 0x70),
+            recorder_bg: c(0x00, 0x46, 0x1f),
+            fx_knob: c(0xe8, 0x8a, 0x74),
+            master_knob: c(0xff, 0x5a, 0x6a),
+            varispeed: c(0xf0, 0xd8, 0xa0),
+            meter_bg: c(0x05, 0x08, 0x06),
+            scope_draw: c(0xe8, 0xc0, 0x70),
+            fx_strip: c(0x00, 0x34, 0x16),
+            input_chip: c(0xe8, 0x8a, 0x74),
+            fretboard: c(0x05, 0x08, 0x06),
+            string: c(0x8a, 0x9a, 0x80),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xfe, 0x72, 0x56),
+            velocity_quiet: c(0x19, 0xb3, 0x66),
+            channel_palette: Some(30),
+            dark: dark_of(&[("background", (0x05, 0x08, 0x06))]),
+        },
+        // ── Mauve: a spirit-duplicator handout still smelling of solvent.
+        // Aniline violet ink on white copy paper; mauve is the first aniline
+        // dye and the purple of the school handout. The page is plain copy
+        // white, deliberately not lilac (Zinc's page and the retired Iris and
+        // Dusk were lilac), and the band is double Zinc's chroma on a more
+        // magenta hue. Hot magenta sounds, a smudged pink-white is held; no
+        // lilac key and no brass, which are Zinc's.
+        Theme {
+            name: "Mauve".to_owned(),
+            background: c(0xf6, 0xf5, 0xf2),
+            white_key: c(0xf6, 0xf5, 0xf2),
+            black_key: c(0x2a, 0x12, 0x36),
+            key_active: c(0xff, 0x6a, 0xd5),
+            sustain: c(0xf0, 0xc8, 0xe0),
+            key_separator: c(0x6a, 0x3a, 0x7a),
+            text: c(0xf4, 0xe8, 0xf0),
+            theory_line: c(0xb8, 0xb0, 0xbc),
+            interval_text: c(0x6a, 0x2a, 0x7a),
+            recorder_bg: c(0x4a, 0x1e, 0x56),
+            fx_knob: c(0xf0, 0xc8, 0xe0),
+            master_knob: c(0xff, 0x6a, 0x50),
+            varispeed: c(0xc8, 0xb0, 0xf8),
+            meter_bg: c(0x1e, 0x0a, 0x26),
+            scope_draw: c(0xff, 0x8a, 0xe0),
+            fx_strip: c(0x3a, 0x12, 0x48),
+            input_chip: c(0xff, 0x6a, 0xd5),
+            fretboard: c(0x1e, 0x0a, 0x26),
+            string: c(0xb8, 0xa0, 0xc0),
+            // velgen.py's solver against this theme's own roll.
+            velocity_loud: c(0xff, 0x57, 0x9d),
+            velocity_quiet: c(0x1f, 0x9e, 0xde),
+            channel_palette: Some(31),
+            dark: dark_of(&[("background", (0x2a, 0x12, 0x36))]),
+        },
     ]
 }
 
@@ -1348,7 +1823,10 @@ pub const EXAMPLE: &str = r##"{
   "_comment8": "4 Mono        5 Ochre       6 Reed        7 Sandstone",
   "_comment9": "8 Centennial  9 Zinc       10 Celadon    11 Moss",
   "_comment10": "12 Rhodes    13 Copper    14 Prism      15 Storm",
-  "_comment10b": "16 Amber     17 Phosphor  18 Silverface",
+  "_comment10b": "16 Amber     17 Phosphor  18 Silverface 19 Urushi",
+  "_comment10c": "20 Paperback 21 Malachite 22 Sodium    23 Kiln",
+  "_comment10d": "24 Lapis     25 Chartres  26 Overprint 27 Woodblock",
+  "_comment10e": "28 Toffee    29 Confetti  30 Lamplight 31 Mauve",
   "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
   "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
   "_comment13": "and the channels keep dressing for whichever theme is applied.",
@@ -1376,10 +1854,14 @@ mod tests {
     #[test]
     fn the_factory_set_is_sixteen_themes_with_default_first() {
         let f = factory();
+        // Thirty-two since the 2026-10-08 batch appended thirteen after
+        // Silverface. A count that moves is a slot that moved or a theme
+        // that went missing, and `palette_choice` is saved by slot, so the
+        // number is pinned rather than read off the list.
         assert_eq!(
             f.len(),
-            19,
-            "Default, fifteen more, the dark two, and Silverface"
+            32,
+            "Default, fifteen more, the dark two, Silverface, and the thirteen of 2026-10-08"
         );
         assert_eq!(f[0].name, "Default");
         // **Default RESTORES rather than declining to speak.** A theme that

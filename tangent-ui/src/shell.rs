@@ -35,7 +35,7 @@ pub fn viewport_ui<R>(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui) -> R)
 ///
 /// **Why the app draws these itself.** They are the windows a person works
 /// IN while the desk stays live behind them, and an OS title bar is the one
-/// thing on screen the theme cannot reach — nineteen themes on the desk and
+/// thing on screen the theme cannot reach — thirty-two themes on the desk and
 /// one grey Aqua strip over every face. A bar of our own follows the theme
 /// on the same frame the desk does, is the same bar on every platform, and
 /// is the same bar in the plugin build's canvas, where there is no OS bar
@@ -2060,8 +2060,8 @@ mod tests {
         use crate::recorder_panel::contrast_ratio;
         let themes = crate::theme::factory();
         assert!(
-            themes.len() >= 19,
-            "the sweep expects the nineteen factory themes, found {}",
+            themes.len() >= 32,
+            "the sweep expects the thirty-two factory themes, found {}",
             themes.len()
         );
         let mut bad: Vec<String> = Vec::new();
@@ -2097,7 +2097,7 @@ mod tests {
                 }
             }
         }
-        assert!(swept >= 19 * 2 * 2, "the sweep covered {swept} dressings");
+        assert!(swept >= 32 * 2 * 2, "the sweep covered {swept} dressings");
         assert!(
             bad.is_empty(),
             "the chrome is unreadable:\n  {}",
