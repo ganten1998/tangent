@@ -788,6 +788,18 @@ pub struct Settings {
     pub reastream_host: String,
     /// The receiver's UDP port. 58710 is ReaStream's default.
     pub reastream_port: i64,
+    /// **Send the master out to a second output device too** — a virtual
+    /// cable (VB-Audio "CABLE Input", BlackHole) that OBS or Discord records
+    /// from, while the interface keeps playing. The ReaStream send's
+    /// sibling, for apps that cannot host its receiver.
+    ///
+    /// A machine setting and NOT a desk field, like `audio_output_device`:
+    /// which cable this computer has is not a fact about the song, and it is
+    /// not in the undo fingerprint for the same reason. Off by default.
+    pub device_send_enabled: bool,
+    /// The send's device, by the name its host lists it under (WASAPI on
+    /// Windows, whatever the engine's system). Empty = none chosen yet.
+    pub device_send_name: String,
     /// Supporter decoration: the pixel heart on the chord view.
     pub show_heart: bool,
     /// Index into chord_strip::HEART_COLORS. Wraps, so any stored value is safe.
@@ -1937,6 +1949,8 @@ impl Default for Settings {
             reastream_identifier: "default".to_owned(),
             reastream_host: "127.0.0.1".to_owned(),
             reastream_port: 58710,
+            device_send_enabled: false,
+            device_send_name: String::new(),
             show_heart: true,
             heart_color: 0,
             window_x: None,
@@ -3689,6 +3703,15 @@ impl Settings {
         if let Some(v) = map.shift_remove("analyzer").and_then(|v| v.as_str().map(str::to_owned)) {
             s.analyzer = v;
         }
+        // The device send, which joined after the analyzer. Read at the END
+        // like it is written at the end; absent is off and unchosen.
+        take_bool(&mut map, "device_send_enabled", &mut s.device_send_enabled);
+        if let Some(v) = map
+            .shift_remove("device_send_name")
+            .and_then(|v| v.as_str().map(str::to_owned))
+        {
+            s.device_send_name = v;
+        }
         // **The per-track MIDI device sets, read at the END like they are
         // written at the end.** A sparse object keyed by channel index, the
         // `strip_inserts_tail` shape and for its reason: writing thirty-two
@@ -4990,6 +5013,18 @@ impl Settings {
         if let Some(v) = crate::recorder::write_midi_inputs(&self.channel_midi_inputs) {
             map.insert("channel_midi_inputs".into(), v);
         }
+        // **The device send**, at the END like every additive key, and only
+        // when it says something — on, or a device chosen — so a machine
+        // that never used it keeps its byte-for-byte file.
+        if self.device_send_enabled {
+            map.insert("device_send_enabled".into(), Value::Bool(true));
+        }
+        if !self.device_send_name.is_empty() {
+            map.insert(
+                "device_send_name".into(),
+                Value::String(self.device_send_name.clone()),
+            );
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -5397,6 +5432,10 @@ impl Settings {
         self.reastream_identifier = fresh.reastream_identifier.clone();
         self.reastream_host = fresh.reastream_host.clone();
         self.reastream_port = fresh.reastream_port;
+        // The device send is the same kind of fact: which cable this
+        // machine streams through.
+        self.device_send_enabled = fresh.device_send_enabled;
+        self.device_send_name = fresh.device_send_name.clone();
     }
 
     /// The size the main window should open at, if the user has chosen one.
@@ -6226,6 +6265,37 @@ mod tests {
     }
 
     #[test]
+    fn the_device_send_settings_survive_a_save_and_load() {
+        let mut s = Settings::default();
+        assert!(!s.device_send_enabled);
+        assert!(s.device_send_name.is_empty());
+        // Unused, it is not in the file at all: an untouched settings file
+        // keeps its exact bytes.
+        let map = s.to_map();
+        assert!(!map.contains_key("device_send_enabled"));
+        assert!(!map.contains_key("device_send_name"));
+
+        s.device_send_enabled = true;
+        s.device_send_name = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        let back = Settings::from_json(&s.to_json());
+        assert!(back.device_send_enabled);
+        assert_eq!(back.device_send_name, "CABLE Input (VB-Audio Virtual Cable)");
+        assert_eq!(back, s);
+
+        // A file from before the feature: not sending, nothing chosen, and
+        // everything else it says still read.
+        let old = Settings::from_json(r#"{"reastream_enabled": true}"#);
+        assert!(old.reastream_enabled);
+        assert!(!old.device_send_enabled);
+        assert!(old.device_send_name.is_empty());
+        assert!(!Settings::from_json("{}").device_send_enabled);
+        // A wrong-typed key falls back for that key alone.
+        let odd = Settings::from_json(r#"{"device_send_enabled": "yes", "device_send_name": 7}"#);
+        assert!(!odd.device_send_enabled);
+        assert!(odd.device_send_name.is_empty());
+    }
+
+    #[test]
     fn an_unstamped_file_gets_the_defaults_it_never_had_a_chance_to_see() {
         let now = Settings::default();
         for fossil in V0_RECORDER_BG {
@@ -6958,6 +7028,10 @@ mod tests {
             devices: vec!["a keyboard".to_owned()],
             channel: Some(3),
         }];
+        // The device send, by hand for the same reason: written only once
+        // it says something, so a first launch's map never shows it.
+        out.device_send_enabled = true;
+        out.device_send_name = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
         out
     }
 
@@ -7099,6 +7173,8 @@ mod tests {
             assert_eq!(s.audio_system, before.audio_system, "{scope:?}");
             assert_eq!(s.channel_gains, before.channel_gains, "{scope:?}");
             assert_eq!(s.strip_inserts, before.strip_inserts, "{scope:?}");
+            assert_eq!(s.device_send_enabled, before.device_send_enabled, "{scope:?}");
+            assert_eq!(s.device_send_name, before.device_send_name, "{scope:?}");
         }
         // And the colours scope really does move the colours.
         let mut s = every_value_moved();

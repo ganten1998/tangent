@@ -2531,6 +2531,9 @@ pub enum Hit {
     /// The cog's STREAM door: the ReaStream send settings, in the AUDIO tier
     /// by the owner's word ("move it to the settings cog in audio section").
     StreamToObs,
+    /// The cog's SEND door, the STREAM door's sibling: the master out to a
+    /// second output device (a virtual cable) instead of over the network.
+    SendToDevice,
     ToggleCountInInTake,
     ToggleHideElapsed,
     /// Hear the live input through the monitors. **Session-only, never
@@ -2684,7 +2687,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 41] = [
+    pub const ALL: [Hit; 42] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -2692,6 +2695,7 @@ impl Hit {
         Hit::Capture,
         Hit::ProjectMenu,
         Hit::StreamToObs,
+        Hit::SendToDevice,
         Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
@@ -2740,6 +2744,7 @@ impl Hit {
             Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
             Hit::RescanPlugins => "Look through the plugin folders again",
             Hit::StreamToObs => "Stream the master out to OBS over ReaStream",
+            Hit::SendToDevice => "Send the master out to a second audio device",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
             Hit::ToggleInputMonitor => "Hear the live input",
@@ -3345,6 +3350,7 @@ fn name_for(
             Hit::PluginFolders => Node::button(id("pluginfolders"), r, "Add a plugin folder"),
             Hit::RescanPlugins => Node::button(id("pluginrescan"), r, "Rescan for plugins"),
             Hit::StreamToObs => Node::button(id("obs"), r, "Stream to OBS"),
+            Hit::SendToDevice => Node::button(id("devsend"), r, "Send to device"),
             Hit::ShowAudioStatus => Node::button(id("audiostatus"), r, "Audio status"),
             // **The one control on the band a screen reader most needs to be
             // told about**, because it is the one whose engaged state is
@@ -8329,7 +8335,7 @@ mod tests {
             l.name, l.dest, l.reveal, l.folder, l.disk, l.count_in, l.time_sig,
             l.export, l.open_when_done, l.click_in_take, l.count_in_in_take,
             l.hide_elapsed, l.audio, l.hear_input, l.audio_count_in, l.audio_sig,
-            l.stream_row, l.project_row, l.plugin_folders, l.plugin_rescan,
+            l.stream_row, l.send_row, l.project_row, l.plugin_folders, l.plugin_rescan,
             l.proj_dest, l.export_dest, l.preset_dest, l.irs_dest,
             l.audio_head, l.take_head, l.project_head,
         ]
@@ -8755,6 +8761,7 @@ mod tests {
                 ("plugin folders", l.plugin_folders),
                 ("plugin rescan", l.plugin_rescan),
                 ("stream", l.stream_row),
+                ("send", l.send_row),
                 ("audio count-in", l.audio_count_in),
                 ("audio sig", l.audio_sig),
                 ("dest", l.dest),
@@ -10293,7 +10300,7 @@ mod tests {
                 // `PickAudio` joined when the microphone icon left with the
                 // input fader: the desk's audio channels pick their inputs
                 // now, and the menu keeps the row for the interface itself.
-                const IN_THE_MENU: [Hit; 17] = [
+                const IN_THE_MENU: [Hit; 18] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     // The PROJECT tier's six, which live in the cog and
@@ -10316,6 +10323,8 @@ mod tests {
                     // The STREAM door lives in the cog's AUDIO tier — the
                     // owner's placement — and nowhere in the band.
                     Hit::StreamToObs,
+                    // And its sibling, the SEND door, in the same tier.
+                    Hit::SendToDevice,
                 ];
                 // `DismissClip` is a target only while the warning is on
                 // screen, which the idle fixture is not — see
@@ -12077,10 +12086,12 @@ const SETUP_REF_ROWS: usize = 8;
 /// of these, and the panel is as tall as its own rows need at the reference
 /// pitch.
 ///
-/// **Seven, not eight.** The take tier left this panel and the count did not
-/// follow it, so the cog's panel kept a row's worth of nothing under its last
-/// control - the owner's "undesirable margin/empty space from the bottom".
-const SETUP_MACHINE_ROWS: usize = 7;
+/// **Eight, and every one of them used.** It was seven once the take tier
+/// left this panel (the count had not followed it, and the cog's panel kept
+/// a row's worth of nothing under its last control - the owner's "undesirable
+/// margin/empty space from the bottom"); the device send's SEND door is the
+/// eighth, on an AUDIO row of its own.
+const SETUP_MACHINE_ROWS: usize = 8;
 const SETUP_TAKE_ROWS: usize = 6;
 /// The red button's shape: one row of two controls - the AUDIO tier's
 /// count-in and signature - under the panel's own title, with no heading band.
@@ -12216,6 +12227,9 @@ struct SetupLayout {
     /// The STREAM door, on the count-in row's free half — the ReaStream send
     /// settings, moved here from the Project menu by the owner's word.
     stream_row: Rect,
+    /// The SEND door: the device send's settings, on the AUDIO tier's last
+    /// row, under the PROJECT door.
+    send_row: Rect,
     /// The MEDIA tier's heading - the cog's second tier - and its four folder
     /// rows: projects, exports, presets and impulse responses.
     project_head: Rect,
@@ -12265,6 +12279,7 @@ impl SetupLayout {
         plugin_folders: Rect::NOTHING,
         plugin_rescan: Rect::NOTHING,
         stream_row: Rect::NOTHING,
+        send_row: Rect::NOTHING,
     };
 
     /// Hung off `anchor` - the control that opened this shape (see
@@ -12399,6 +12414,7 @@ impl SetupLayout {
         let r6 = band(1.0, machine);
         let ra2 = band(1.0, machine);
         let ra3 = band(1.0, machine);
+        let ra4 = band(1.0, machine);
         // **The red button's one row.** It carries the AUDIO tier's own
         // count-in and signature - the same two rectangles, the same two
         // hits, moved onto a row of their own and given the whole width -
@@ -12507,6 +12523,9 @@ impl SetupLayout {
             // The AUDIO count-in row's free half, which the doors above
             // vacated for legibility; one door fits a half-row fine.
             stream_row: slice_h(ra2, 0.58, 1.00),
+            // A row of its own rather than a third tenant on a crowded one,
+            // under the PROJECT door so the two doors read as a column.
+            send_row: slice_h(ra4, 0.00, 0.48),
             project_head,
             // Laid out exactly as the take's folder row is, so the three
             // read as three answers to the same question.
@@ -12522,7 +12541,7 @@ impl SetupLayout {
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 25] {
+    fn targets(&self) -> [(Rect, Hit); 26] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
@@ -12530,6 +12549,7 @@ impl SetupLayout {
             (self.plugin_folders, Hit::PluginFolders),
             (self.plugin_rescan, Hit::RescanPlugins),
             (self.stream_row, Hit::StreamToObs),
+            (self.send_row, Hit::SendToDevice),
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
@@ -14255,6 +14275,16 @@ pub fn draw_setup(
         l.stream_row,
         "STREAM",
         if s.reastream_enabled { "To OBS: on" } else { "To OBS: off" },
+        rows.ink,
+        rows,
+    );
+    // Its sibling, read the same way: the SETTING, on or off. What the send
+    // is actually doing is in its window, which the host keeps live.
+    labelled(
+        painter,
+        l.send_row,
+        "SEND",
+        if s.device_send_enabled { "To device: on" } else { "To device: off" },
         rows.ink,
         rows,
     );
