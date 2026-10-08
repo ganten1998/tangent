@@ -2190,6 +2190,15 @@ def derived_errors(name, t):
     - the mid-tone half of `dialogs::every_theme_dresses_the_export_window`:
       a dressing whose well sits within 3:1 of the shipped red makes the
       playhead move, and that test pins how many of the seventy-six do.
+
+    And three more, ported 2026-10-08 because the thirteen new themes
+    cleared every gate here and failed them in Rust:
+
+    - `faces_sampler::the_browsers_rows_read_on_the_ground_they_are_drawn_on`'s
+      second half, files and folders 10 dE apart
+    - the rest of `every_theme_dresses_the_varispeed_dial_legibly` (the
+      recess, the slot, the detent)
+    - `recorder_panel::every_theme_makes_a_readable_panel_out_of_its_own_face`
     """
     errs = []
     p = band_palette(t)
@@ -2206,11 +2215,56 @@ def derived_errors(name, t):
         # The browser rows, on the panel under two veils.
         st = face_style(p["bg"], p["lcd"], p["lcd_face"])
         ground = media_row_ground(st["s"]["bg"], wants_light_ink(st["s"]["bg"]))
-        for what, ink in (("a file", distinct_surface_at(st["tiers"][0], ground, 4.5)),
-                          ("a folder", st["s"]["ink"])):
+        file_ink = distinct_surface_at(st["tiers"][0], ground, 4.5)
+        for what, ink in (("a file", file_ink), ("a folder", st["s"]["ink"])):
             rr = contrast(ink, ground)
             if rr < 4.5:
                 errs.append(f"browser row, {what} ({mode}) {rr:.2f}:1 < 4.5")
+        # ...and the two row inks told apart. The file ink is the scope
+        # trace walked onto the row ground, the folder ink the band's own,
+        # so a cream trace on a dark band (Paperback's first cut, 3.7 dE)
+        # prints files and folders in one colour.
+        d = de(file_ink, st["s"]["ink"])
+        if d < 10.0:
+            errs.append(f"browser rows: files and folders are one colour ({mode}, {d:.1f} dE)")
+        # The varispeed dial's recess and its parts
+        # (`recorder_panel::every_theme_dresses_the_varispeed_dial_legibly`):
+        # the recess is the band's well darkened again, and on a band as
+        # dark as Chartres' first lead-grey (0.013) there is no room left to
+        # darken it into -- 1.17:1 where a shape wants 1.18.
+        well = shade(p["well"], 0.82 if wants_light_ink(p["bg"]) else 0.94)
+        dial = surface_of(p["varispeed"])
+        for what, fg, bg, floor in (
+            ("VARI at rest", p["faint"], p["bg"], 4.5),
+            ("the reading", p["ink"], p["bg"], 4.5),
+            ("the recess", well, p["bg"], 1.18),
+            ("the slot", dial["ink"], dial["bg"], 4.5),
+            ("the face in its recess", dial["bg"], well, 1.6),
+            ("the detent at rest", p["accent"], well, 1.6),
+            ("the detent engaged", surface_of(well)["faint"], well, 3.0),
+        ):
+            rr = contrast(fg, bg)
+            if rr < floor:
+                errs.append(f"varispeed: {what} ({mode}) {rr:.2f}:1 < {floor}")
+        # A floating panel made of the desk's strip
+        # (`recorder_panel::every_theme_makes_a_readable_panel_out_of_its_own_face`):
+        # its field and its buttons have to be tellable from it. A strip
+        # near either end of the scale has nowhere to put them -- the field
+        # is the strip walked 30% further toward the end it is already at.
+        q = surface_of(panel_face(t, dark))
+        for what, fg, bg, floor in (
+            ("ink on panel", q["ink"], q["bg"], 4.5),
+            ("ink on a button", q["ink"], q["raised"], 4.5),
+            ("ink on hover", q["ink"], q["hover"], 4.5),
+            ("ink in a field", q["ink"], q["well"], 4.5),
+            ("button edge", q["edge"], q["bg"], 1.6),
+            ("button", q["raised"], q["bg"], 1.05),
+            ("field", q["well"], q["bg"], 1.05),
+            ("faint", q["faint"], q["bg"], 3.0),
+        ):
+            rr = contrast(fg, bg)
+            if rr < floor:
+                errs.append(f"panel from the strip: {what} ({mode}) {rr:.2f}:1 < {floor}")
     return errs
 
 
