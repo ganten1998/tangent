@@ -14744,6 +14744,10 @@ impl DesktopApp {
                     out.sample_rate,
                     out.buffer_frames,
                 ));
+                // A new send has no stream, whatever the last one had: what
+                // it tried belongs to the engine that is gone. `start_engine`
+                // forgets it too; this covers every other road to an engine.
+                self.device_send_tried = None;
             }
         }
         let Some(send) = self.recorder.device_send.as_mut() else {
@@ -32392,7 +32396,6 @@ mod tests {").expect("the tests module")];
     #[cfg(all(windows, feature = "asio"))]
     #[ignore = "needs VB-Audio Virtual Cable installed"]
     fn the_send_opens_vb_cable_on_wasapi_while_asio_is_the_system() {
-        use cpal::traits::HostTrait;
         tangent_record::audio::set_system(Some("ASIO"));
         assert_eq!(tangent_record::devsend::send_host().id(), cpal::HostId::Wasapi);
         let names = tangent_record::devsend::output_names();
