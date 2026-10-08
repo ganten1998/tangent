@@ -644,17 +644,22 @@ pub fn match_name(names: &[String], want: &str) -> Option<usize> {
     names.iter().position(|n| n.to_lowercase().contains(&lower))
 }
 
+/// The output `want` names, in ONE walk of the host's outputs: listing them
+/// is the expensive part (an audio client per WASAPI endpoint, an AUHAL per
+/// CoreAudio device), so the names and the devices are kept together rather
+/// than listed again to fetch the one that matched.
 fn find_output(host: &cpal::Host, want: &str) -> Option<cpal::Device> {
     if want.trim().is_empty() {
         return None;
     }
-    let names: Vec<String> = host
+    let mut found: Vec<(String, cpal::Device)> = host
         .output_devices()
         .ok()?
-        .map(|d| d.name().unwrap_or_default())
+        .map(|d| (d.name().unwrap_or_default(), d))
         .collect();
+    let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
     let i = match_name(&names, want)?;
-    host.output_devices().ok()?.nth(i)
+    Some(found.swap_remove(i).1)
 }
 
 fn build_stream(
