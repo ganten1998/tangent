@@ -384,9 +384,17 @@ pub struct RowUse {
 /// resurrect deleted tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowClass {
+    /// Nothing at all: no kind, not added, no folder flag, no clips and no
+    /// residue. Pedal-only residue still counts as Vacant.
     Vacant,
+    /// Drawn and given a lane but not counted: only the in-folder flag (the
+    /// indented plus), or residue (a chain plugin, a curve, a freeze, a kit,
+    /// a route or key end) on a row that is not a track.
     Placeholder,
+    /// A bus row. No bus kind exists before W7, so nothing is classed
+    /// here yet; the variant is the contract's.
     Bus,
+    /// A track: MIDI, AUDIO, bare added, a folder, or any row with clips.
     Counted,
 }
 

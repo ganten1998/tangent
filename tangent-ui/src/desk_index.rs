@@ -59,34 +59,13 @@ pub struct RowFacts {
 
 /// **What a row is**, for drawing, counting and the engine (section 4).
 ///
-/// MERGE-ME: W2-desk-format lands `desk_model::RowClass` with these four
-/// variants; this enum becomes a re-export of it at the wave-2 merge. It is
-/// declared here so this lane does not code against a file another lane is
-/// writing in parallel.
-///
-/// **Section 4's table has a gap, and both lanes fill it the same way.** A
-/// row with no kind that holds a curve, a kit, a freeze, a chain plugin or
-/// a route or key end is not Vacant by the table's Vacant column, and not
-/// the table's Placeholder ("only `in_folder` set"). Calling it Vacant
-/// would hide a sounding plugin or a route's end and, once vacant rows get
-/// no engine lane, drop it. So it is a Placeholder here, exactly as
-/// `desk_model::classify` rules it (`in_folder || curve || kit || frozen ||
-/// holds`), and the two classifiers agree at the swap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RowClass {
-    /// Nothing at all: no kind, not added, no folder flag, no clips and no
-    /// residue. Pedal-only residue still counts as Vacant.
-    Vacant,
-    /// Drawn and given a lane but not counted: only the in-folder flag (the
-    /// indented plus), or residue (a chain plugin, a curve, a freeze, a kit,
-    /// a route or key end) on a row that is not a track.
-    Placeholder,
-    /// A bus row. No bus kind exists before W7, so nothing is classed
-    /// here yet; the variant is the contract's.
-    Bus,
-    /// A track: MIDI, AUDIO, bare added, a folder, or any row with clips.
-    Counted,
-}
+/// One type, `desk_model::RowClass`, re-exported: this lane declared its
+/// own while W2-desk-format wrote that file in parallel, and the two were
+/// joined at the wave-2 merge. Section 4's table has a gap both lanes
+/// filled the same way: a row with no kind that holds a curve, a kit, a
+/// freeze, a chain plugin or a route or key end is a Placeholder, never
+/// Vacant, so a sounding plugin or a route's end is never hidden.
+pub use crate::desk_model::RowClass;
 
 /// The cached shape of the desk. See the module header.
 #[derive(Debug, Clone, PartialEq, Eq)]
