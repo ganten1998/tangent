@@ -225,6 +225,7 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::lane_bank::Spine;
 use crate::laneset::LaneSet;
 use crate::rtwork::{LanePool, RtPlan, Workgroup};
 use std::time::{Duration, Instant};
@@ -4941,12 +4942,15 @@ mod engine_parts {
             .and_then(|(_, rest)| rest.split_once("\n}\n"))
             .map(|(body, _)| body)
             .expect("Renderer is declared");
-        let (racks, fanout) = (
-            decl.find("racks: Vec<Rack>").expect("the rack bank"),
+        // The bank and the lanes both hold plugins now: a lane's racks moved
+        // into its box on the spine.
+        let (racks, spine, fanout) = (
+            decl.find("racks: Vec<Option<Rack>>").expect("the rack bank"),
+            decl.find("spine: Spine<Lane>").expect("the lanes"),
             decl.find("fanout: Option<LanePool>").expect("the pool"),
         );
         assert!(
-            racks < fanout,
+            racks < fanout && spine < fanout,
             "the pool now comes first, so the note below is stale rather than wrong"
         );
         let imp = src
@@ -5300,7 +5304,7 @@ mod engine_parts {
         }
         let parked = {
             let r = e.offline.as_ref().expect("a renderer");
-            !r.lane_wants[CH]
+            !r.lane_body(CH).wants
         };
         assert!(parked, "the lane never parked, so this test proves nothing");
         // The knob, turned while it sleeps.
@@ -5308,7 +5312,7 @@ mod engine_parts {
         e.render_offline(&mut out);
         let woke = {
             let r = e.offline.as_ref().expect("a renderer");
-            r.lane_wants[CH]
+            r.lane_body(CH).wants
         };
         assert!(
             woke,
@@ -5322,7 +5326,7 @@ mod engine_parts {
             e.render_offline(&mut out);
         }
         let r = e.offline.as_ref().expect("a renderer");
-        assert!(!r.lane_wants[CH], "one knob turn woke the lane permanently");
+        assert!(!r.lane_body(CH).wants, "one knob turn woke the lane permanently");
     }
 
     /// **Every way a lane can be too live to render ahead**, one at a time,
@@ -5520,77 +5524,35 @@ mod engine_parts {
         assert_eq!(m.high_ns, u64::MAX);
     }
 
-    /// **And the carve answers for every lane**, against a real engine's own
-    /// bank rather than against the arithmetic alone. The render walk splits
-    /// all thirty-two at once; `lane_seats` is the same split stated one
-    /// lane at a time, and if the two ever disagree this is what says so.
+    /// **Every seat a lane owns is in that lane's box, and nowhere else.**
+    /// The carve that used to prove this (three `split_at_mut`s of the bank)
+    /// is gone: a lane's nine racks moved into its [`Lane`] at build, and
+    /// [`seat_rack_mut`] is the one road from a seat to a rack. Asserted
+    /// against a real engine's own bank: each lane seat's rack is the one
+    /// the lane holds, the bank keeps nothing at that seat, and a seat past
+    /// the last lane is no lane's rather than lane 0's.
     #[test]
-    fn a_lane_can_be_carved_out_of_a_real_bank() {
+    fn every_lane_seat_is_found_in_its_own_lane() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let r = e.offline.as_mut().expect("an offline engine keeps its renderer");
         for ch in 0..CHANNELS {
-            assert!(
-                lane_seats(
-                    &mut r.racks,
-                    &mut r.dx7s,
-                    &mut r.keys_lanes,
-                    ch,
-                )
-                .is_some(),
-                "lane {ch}'s seats could not be carved out of a full bank"
-            );
+            let mut seats = vec![(ch, CHAIN_OWN), (folder_extra_seat(ch), CHAIN_EXTRA)];
+            seats.extend((0..AMP_PEDALS).map(|p| (amp_pedal_seat(ch, p), 2 + p)));
+            for (seat, rack) in seats {
+                assert!(r.racks[seat].is_none(), "seat {seat} is still in the bank");
+                let found = seat_rack(&r.racks, &r.spine.lanes, seat).map(|x| x as *const Rack);
+                let own = r.spine.lanes[ch].as_deref().and_then(|l| l.rack(rack)).map(|x| x as *const Rack);
+                assert!(found.is_some(), "lane {ch}'s seat {seat} found no rack");
+                assert_eq!(found, own, "seat {seat} is not lane {ch}'s rack {rack}");
+            }
         }
-        // Past the end is refused rather than folded onto lane 0.
-        assert!(
-            lane_seats(
-                &mut r.racks,
-                &mut r.dx7s,
-                &mut r.keys_lanes,
-                CHANNELS,
-            )
-            .is_none(),
-            "a channel past the last one was carved anyway"
-        );
+        // A pad, a bus and the master stay in the bank.
+        for seat in [pad_rack_index(0, 0), Strip::Fx.index(), tangent_ui::recorder::MASTER_SEAT] {
+            assert!(lane_rack_of_seat(seat).is_none(), "seat {seat} was routed to a lane");
+            assert!(r.racks[seat].is_some(), "seat {seat} lost its bank rack");
+        }
     }
-}
-
-/// **One lane's seats, carved out of the bank so the compiler can see they
-/// are its own.**
-///
-/// The render walk carves all thirty-two at once (it needs every borrow to
-/// exist before the fork uses any of them), so this is the one-lane
-/// statement of the same arithmetic, kept because it is what the
-/// disjointness test exercises and what a reader should be pointed at.
-///
-/// Three `split_at_mut`s and no unsafe. It works because `recorder.rs` lays
-/// the blocks out end to end and lane-strided: a channel's own seat is
-/// `ch`, its extra rack is `FOLDER_EXTRA_SEATS + ch`, and its board is the
-/// seven at `AMP_PEDAL_SEATS + ch * AMP_PEDALS`. Those three are ordered
-/// and never overlap, for any `ch`, which is what makes the split legal for
-/// a lane and therefore for a worker. `None` when the bank is short, which
-/// no shipped desk is and every test is entitled to be.
-#[cfg_attr(not(test), allow(dead_code))]
-fn lane_seats<'a>(
-    racks: &'a mut [Rack],
-    dx7s: &'a mut [Option<Box<crate::dx7::Dx7>>],
-    keys_lanes: &'a mut [Option<Box<crate::keys::Keys>>],
-    ch: usize,
-) -> Option<LaneSeats<'a>> {
-    let extra_at = tangent_ui::recorder::folder_extra_seat(ch);
-    let board_at = tangent_ui::recorder::amp_pedal_seat(ch, 0);
-    let pedals = tangent_ui::recorder::AMP_PEDALS;
-    if ch >= CHANNELS || board_at + pedals > racks.len() || extra_at <= ch || board_at <= extra_at {
-        return None;
-    }
-    let (low, rest) = racks.split_at_mut(extra_at);
-    let (mid, high) = rest.split_at_mut(board_at - extra_at);
-    Some(LaneSeats {
-        rack: low.get_mut(ch)?,
-        extra: mid.first_mut()?,
-        board: high.get_mut(..pedals)?,
-        dx7: dx7s.get_mut(ch)?,
-        keys: keys_lanes.get_mut(ch)?,
-    })
 }
 
 /// **Which LANE a seat belongs to, for the frozen mask.**
@@ -5995,53 +5957,6 @@ fn performance_cores() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
 }
 
-/// One lane's whole render, gathered so that the fork can hold thirty-two of
-/// them at once.
-struct LaneWork<'a> {
-    seats: LaneSeats<'a>,
-    io: LaneIo<'a>,
-    plan: LanePlan<'a>,
-}
-
-/// **Thirty-two cells, one per lane, and the reason the fork's closure can
-/// be `Sync`.**
-///
-/// The work inside is `&mut` through and through; what makes handing it to
-/// several threads sound is that each lane's job is taken out of its own
-/// cell exactly once, and `LanePool::run` gives a lane to exactly one
-/// thread. The cell is what lets the compiler stay out of an argument it
-/// cannot check, with the argument written at the `unsafe` that needs it.
-struct LaneCells<'a>([std::cell::UnsafeCell<Option<LaneWork<'a>>>; CHANNELS]);
-
-// SAFETY: `LaneWork` is `Send` (every borrow in it is to state one lane owns
-// and no other lane can name - see `lane_seats` and the disjointness test),
-// and the only access to a cell is the single `take` in the fork's closure,
-// which runs once per lane on whichever one thread claimed that lane.
-unsafe impl Sync for LaneCells<'_> {}
-// SAFETY: the same argument. The cells are handed to the pool by shared
-// reference and every one of them is emptied by exactly one thread.
-unsafe impl Send for LaneCells<'_> {}
-
-impl<'a> LaneCells<'a> {
-    /// **Lane `ch`'s work, once.** A second call for the same lane, on any
-    /// thread, answers `None`.
-    ///
-    /// A method rather than an `unsafe` block at the call site for two
-    /// reasons. It is the only place the cells are touched, so the argument
-    /// has one home; and a closure that spelled `self.0[ch]` would capture
-    /// the ARRAY rather than the wrapper under the 2021 capture rules, and
-    /// the `unsafe impl Sync` above would not reach it.
-    fn take(&self, ch: usize) -> Option<LaneWork<'a>> {
-        // SAFETY: `LanePool::run` hands each lane to exactly one thread -
-        // `claim` clears one bit with one compare-exchange, so the thread
-        // that observed it set is the only one that can have cleared it -
-        // and this is the only access to any cell. The serial path calls
-        // this the same way, one `ch` at a time on one thread.
-        unsafe { (*self.0.get(ch)?.get()).take() }
-    }
-}
-
-
 /// What `TANGENT_FANOUT` says about the lane render.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fanout {
@@ -6111,6 +6026,371 @@ struct LanePrep {
     pedal_latency: u32,
 }
 
+/// **One lane, in one box: everything its own hand reads and writes.**
+///
+/// A lane used to be a column in some forty `[_; CHANNELS]` arrays on the
+/// [`Renderer`], and the fork had to prove which column was whose: three
+/// `split_at_mut`s of the rack bank, thirty-two borrows carved before any of
+/// them was used, and a cell per lane that a worker took once. That works
+/// only while the width is a compile-time number. A [`Lane`] is the other
+/// shape (design section 7.2): the racks the lane runs (its two chains and
+/// its seven pedals), its instruments, its grain ring, its dry row, its
+/// delay lines, its note and control banks and the decide walk's state about
+/// it, all behind one pointer, so a spine of them grows by appending and a
+/// hand that holds the box can reach nothing that is another lane's.
+///
+/// **What is NOT here, on purpose:** the key snapshot, the stems and the dry
+/// stems are read by OTHER lanes (a keyed lane reads its source's last-chunk
+/// stem), so they live in the spine's desk buffers and are written only in
+/// the serial passes (design 7.1, 7.3). A scan holds `key_prev` out of this
+/// type.
+///
+/// **The claim and the generation sit outside the cell.** Every hand reads
+/// them through a shared `&Lane`; only the hand that wins the round's claim
+/// reaches into [`LaneBody`], which is what [`Lane::claimed`] states.
+pub(crate) struct Lane {
+    gen: u32,
+    claim: AtomicU64,
+    body: std::cell::UnsafeCell<LaneBody>,
+}
+
+// SAFETY: every path into `body` from a shared `&Lane` is `Lane::claimed`,
+// which its caller may only use after `lane_bank::claim_lane` answered `Some`
+// for this lane in the CURRENT round: the claim is one atomic swap, so the
+// hand that saw a different stamp is the only one that can be holding the
+// body this round, and the fork joins before any serial pass touches a lane
+// again. Serial passes reach the body through `&mut Lane` (`body_mut`) or,
+// outside a fork, `peek`. Everything inside is `Send` already.
+unsafe impl Sync for Lane {}
+
+impl crate::lane_bank::SpineLane for Lane {
+    fn gen(&self) -> u32 {
+        self.gen
+    }
+    fn claim_word(&self) -> &AtomicU64 {
+        &self.claim
+    }
+}
+
+/// **The generation every lane of a legacy desk is built at.** Generations
+/// tell a lane from the one that held its slot before it; a legacy desk is
+/// installed once, whole, so every lane is the first of its slot. Never
+/// zero, so a schedule entry that was never stamped matches no lane.
+const LEGACY_GEN: u32 = 1;
+
+/// Which of a lane's two chains: its own bays 0..2, and bays 3..5.
+const CHAIN_OWN: usize = 0;
+const CHAIN_EXTRA: usize = 1;
+
+/// The part of a [`Lane`] only its holder may touch.
+///
+/// Every field here was a `[_; CHANNELS]` column on the renderer; the WHY of
+/// each is kept with it, and none of it changed meaning by moving.
+pub(crate) struct LaneBody {
+    /// `[own, extra]`: today's seat `ch` and seat `folder_extra_seat(ch)`,
+    /// bays 0..2 and bays 3..5 of one six-bay chain.
+    chains: [Rack; 2],
+    /// The seven amp pedals, `amp_pedal_seat(ch, 0..7)`: armed by a bay
+    /// holding the amp, one board per channel, run once per chunk by
+    /// whichever pass owns the signal (see `run_pedalboard`).
+    board: [Rack; tangent_ui::recorder::AMP_PEDALS],
+    /// **The built-in DX7: one FULL instance per lane that holds the
+    /// sentinel.** One shared instance behind a mask meant two DX7 tracks
+    /// were one synth wearing two names. Built and freed on the UI thread
+    /// and arriving by `dx7_incoming`/`dx7_retiring`, because the callback
+    /// may neither allocate a synth nor drop one.
+    dx7: Option<Box<crate::dx7::Dx7>>,
+    /// **The modelled keyboard, on the DX7's terms.** With one `Keys` behind
+    /// a mask a session could not hold a piano track and an EP track at once.
+    /// About 3 MB of delay lines, so a lane without one pays the `None`.
+    keys: Option<Box<crate::keys::Keys>>,
+    /// **Where the lane's finished audio waits for the fold.** A lane writes
+    /// its own grain here and the fold is a second, serial walk over all of
+    /// them in rank order, which keeps the master's sum bit-identical to the
+    /// single walk this once was (f32 `+=` is not associative).
+    grain: LaneGrains,
+    /// The dry twin of the grain row, filled only while a dry stem is wanted.
+    /// See the dry copy in `render_lane`.
+    dry: Vec<Vec<f32>>,
+    /// **What the dry row has already paid**: the latency a bay VOICE
+    /// reports when that voice wrote the row, zero when the row is the tap's
+    /// copy of `fx_in`. `run_lane_pdc` takes it off the dry row's wait.
+    dry_paid: u32,
+    /// **This lane's notes and controls for the span it renders.** The
+    /// deciding half fills them and the render half reads them, so they must
+    /// survive until the render: filled by a swap, never a copy, so no block
+    /// allocates.
+    notes: Vec<Note>,
+    controls: Vec<Control>,
+    /// **What the decide walk decided about this lane, for the render and
+    /// the fold**: whether it is a folder (the fold owns its fader, pan and
+    /// send), whether it is armed (the meter's source), and the rest.
+    prep: LanePrep,
+    /// **The span this lane renders this chunk**, the chunk's own unless the
+    /// grain clock moved it. See `plan_grains`.
+    at: u64,
+    len: usize,
+    /// **Its audio for this chunk is already in its ring**, so the deciding
+    /// walk must not advance a thing about it: the grain that covers this
+    /// chunk told the instrument everything when it was rendered.
+    skip: bool,
+    /// The deciding walk left this lane for the render walk.
+    wants: bool,
+    /// **It rendered something to fold this chunk.** False for every way the
+    /// render walked away: parked, fed by nothing, no rack and no audio, or
+    /// an inactive instrument on a bare lane. Written by its own hand.
+    folds: bool,
+    /// **What this lane's instrument has been told, and when each of those
+    /// notes is due to end.** A model of the INSTRUMENT, not of the
+    /// playhead: a note-off is a promise made to a stateful sink, owed
+    /// because an on was sent, so it survives a clip-list swap that resets
+    /// everything else. Per lane, so a chord storm on one lane can never
+    /// withhold notes from another (it replaced one desk-wide list capped at
+    /// 256 and reached in visit order).
+    told: u128,
+    told_off: [u64; 128],
+    /// The frame an overflowed block still owes this lane, or `u64::MAX`.
+    /// Per lane: one lane's overflow used to change what every other skipped.
+    park_from: u64,
+    /// **Where the three pedals stand on the LIVE input, as a level**,
+    /// indexed by [`pedal_slot`]. A block's controls are CHANGES and say
+    /// nothing on the blocks a held pedal sends nothing, and the lane has to
+    /// combine the live level with a clip's. Per lane, since a track names
+    /// its own keyboards.
+    live_pedal: [u8; 3],
+    /// **What this lane was last TOLD its pedal was**, so an unmoved level
+    /// costs nothing and a moved one is stated once. It is also what releases
+    /// the pedal at a stop, a locate and a clip's end, with no special case:
+    /// each falls to zero, which is an edge.
+    pedal_sent: [u8; 3],
+    /// Where the fader has slewed to, advanced per frame toward its target.
+    channel_gain: f32,
+    /// **How long the lane's rack has had nothing to do**, in frames: the
+    /// park rule's counter, zeroed by any reason to be live. See
+    /// `RACK_PARK_S` and `VOICE_PARK_S`.
+    quiet: u64,
+    /// **Whether its rack put anything above [`PARK_FLOOR`] out last
+    /// block**, pre-fader: the `sounding` the park rule reads. Written by
+    /// the fold, one block behind the decision that reads it.
+    loud: bool,
+    /// **What its audition has actually been TOLD**, reconciled against
+    /// `Shared::audition` once a block. `None` where nothing was told.
+    audition_on: Option<u8>,
+    /// **It has sounded an audition and is not finished with it.** Letting go
+    /// of the key is not the end of the note: a DX7 release runs for seconds,
+    /// and without this the tail was cut dead the instant the hand lifted.
+    audition_rang: bool,
+    /// **The lane's delay compensation, clocked at CONSUMPTION** (the fold),
+    /// never by its hand: a delay line advances on every call and cannot be
+    /// rewound, so a lane rendered ahead and thrown away would shift against
+    /// the mix for good. The pads are struck rather than played and keep
+    /// their own lines on the renderer.
+    pdc: DelayLine,
+    /// **The dry tap's own compensation.** One ring carries one signal, and
+    /// the dry copy skips the lane's rack and so does not pay its `own`
+    /// frames: where the wet waits `max - own - folded` the dry waits
+    /// `max - folded`, and the two land together.
+    dry_pdc: DelayLine,
+}
+
+impl Lane {
+    /// A lane holding `chains` and `board`, every other part empty, as a
+    /// desk with nothing loaded leaves it.
+    fn new(gen: u32, chains: [Rack; 2], board: [Rack; tangent_ui::recorder::AMP_PEDALS]) -> Self {
+        Self {
+            gen,
+            claim: AtomicU64::new(0),
+            body: std::cell::UnsafeCell::new(LaneBody {
+                chains,
+                board,
+                dx7: None,
+                keys: None,
+                grain: LaneGrains::new(MAX_BLOCK as usize),
+                dry: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+                dry_paid: 0,
+                notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
+                controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+                prep: LanePrep::default(),
+                at: 0,
+                len: 0,
+                skip: false,
+                wants: false,
+                folds: false,
+                told: 0,
+                told_off: [0; 128],
+                park_from: u64::MAX,
+                live_pedal: [0; 3],
+                pedal_sent: [0; 3],
+                channel_gain: 1.0,
+                quiet: 0,
+                loud: false,
+                audition_on: None,
+                audition_rang: false,
+                pdc: DelayLine::new(),
+                dry_pdc: DelayLine::new(),
+            }),
+        }
+    }
+
+    fn body_mut(&mut self) -> &mut LaneBody {
+        self.body.get_mut()
+    }
+
+    /// **The body, read, outside a fork.** Every caller is a serial pass
+    /// (`&self` methods of the renderer, the meters, the tests); the fork's
+    /// hands use [`Self::claimed`] and nothing else, and no serial pass runs
+    /// while a fork is in flight, because the fork is one call inside
+    /// `mix_channels` that joins before it returns.
+    fn peek(&self) -> &LaneBody {
+        // SAFETY: see above: outside `render_lanes` nothing holds the body
+        // mutably except through `&mut Lane`, which this `&self` excludes.
+        unsafe { &*self.body.get() }
+    }
+
+    /// **The body, for the hand that won this round's claim.**
+    ///
+    /// # Safety
+    ///
+    /// The caller has just had `lane_bank::claim_lane` answer `Some` for this
+    /// lane in the current fork's round, and holds the result only until its
+    /// work for the lane is done.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn claimed(&self) -> &mut LaneBody {
+        // SAFETY: the caller's contract above.
+        unsafe { &mut *self.body.get() }
+    }
+
+    /// The rack at `rack` of this lane: [`CHAIN_OWN`], [`CHAIN_EXTRA`], or
+    /// pedal `p` as `2 + p`.
+    fn rack_mut(&mut self, rack: usize) -> Option<&mut Rack> {
+        let b = self.body_mut();
+        match rack {
+            0 | 1 => b.chains.get_mut(rack),
+            p => b.board.get_mut(p - 2),
+        }
+    }
+
+    fn rack(&self, rack: usize) -> Option<&Rack> {
+        let b = self.peek();
+        match rack {
+            0 | 1 => b.chains.get(rack),
+            p => b.board.get(p - 2),
+        }
+    }
+}
+
+/// Test doors onto a lane's body, by slot. A slot with no lane is a test
+/// that asked about a lane it never installed, and says so.
+#[cfg(test)]
+impl Renderer {
+    fn lane_body(&self, ch: usize) -> &LaneBody {
+        self.spine.lanes[ch].as_deref().expect("a lane at that slot").peek()
+    }
+
+    fn lane_body_mut(&mut self, ch: usize) -> &mut LaneBody {
+        self.spine.lanes[ch].as_deref_mut().expect("a lane at that slot").body_mut()
+    }
+}
+
+/// **Which lane, and which of its racks, a legacy seat is.** `None` for a
+/// seat no lane owns: a pad, a bus, the master. The rack is numbered as
+/// [`Lane::rack_mut`] takes it.
+///
+/// The engine still speaks the frozen seat map at its edges (the host's
+/// handoff rings, `Shared`'s per-seat atomics, the automation rows), so this
+/// is the one place a seat is turned into a lane's own rack.
+fn lane_rack_of_seat(seat: usize) -> Option<(usize, usize)> {
+    if seat < CHANNELS {
+        return Some((seat, CHAIN_OWN));
+    }
+    if let Some(ch) = tangent_ui::recorder::folder_extra_of(seat) {
+        return (ch < CHANNELS).then_some((ch, CHAIN_EXTRA));
+    }
+    tangent_ui::recorder::amp_pedal_of(seat)
+        .filter(|(ch, _)| *ch < CHANNELS)
+        .map(|(ch, p)| (ch, 2 + p))
+}
+
+/// **The rack at `seat`, wherever it lives**: in its lane's box for a lane
+/// seat, in the bank for every other. Two slices rather than the renderer, so
+/// a caller can hold this and another field of the renderer at once.
+fn seat_rack_mut<'a>(
+    bank: &'a mut [Option<Rack>],
+    lanes: &'a mut [Option<Box<Lane>>],
+    seat: usize,
+) -> Option<&'a mut Rack> {
+    match lane_rack_of_seat(seat) {
+        Some((ch, rack)) => lanes.get_mut(ch)?.as_deref_mut()?.rack_mut(rack),
+        None => bank.get_mut(seat)?.as_mut(),
+    }
+}
+
+/// [`seat_rack_mut`], read.
+fn seat_rack<'a>(
+    bank: &'a [Option<Rack>],
+    lanes: &'a [Option<Box<Lane>>],
+    seat: usize,
+) -> Option<&'a Rack> {
+    match lane_rack_of_seat(seat) {
+        Some((ch, rack)) => lanes.get(ch)?.as_deref()?.rack(rack),
+        None => bank.get(seat)?.as_ref(),
+    }
+}
+
+/// **Move every lane seat's rack out of a full bank and into its lane.**
+///
+/// The bank is built seat by seat, as the host's handoff rings are, so the
+/// rings pair by seat number; this then hands lane `ch` its own nine racks
+/// and leaves `None` in their places. Every lane is installed at `Slot(ch)`
+/// with generation `gen`: a desk built today is a legacy desk, row r at
+/// slot r (design section 3).
+fn spine_from_bank(bank: Vec<Rack>, gen: u32) -> (Vec<Option<Rack>>, Spine<Lane>) {
+    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+    let mut bank: Vec<Option<Rack>> = bank.into_iter().map(Some).collect();
+    let mut spine = Spine::with_capacity(CHANNELS, INPUTS);
+    for ch in 0..CHANNELS {
+        let mut take = |seat: usize| bank.get_mut(seat).and_then(Option::take);
+        let (Some(own), Some(extra)) = (take(ch), take(folder_extra_seat(ch))) else {
+            continue;
+        };
+        let pedals: Vec<Rack> = (0..AMP_PEDALS).filter_map(|p| take(amp_pedal_seat(ch, p))).collect();
+        let Ok(board) = <[Rack; AMP_PEDALS]>::try_from(pedals) else {
+            continue;
+        };
+        spine.gens[ch] = gen;
+        spine.lanes[ch] = Some(Box::new(Lane::new(gen, [own, extra], board)));
+    }
+    (bank, spine)
+}
+
+/// **One hand's scratch buffers.** A hand is one thread for the life of the
+/// pool (`LanePool::hands`), so a scratch indexed by hand is touched by one
+/// thread at a time: per HAND rather than per lane, which is what keeps a
+/// lane's own box small (design 7.3).
+struct Hands(Box<[std::cell::UnsafeCell<LaneScratch>]>);
+
+// SAFETY: `LanePool::run_list` calls its work with `hand < hands()`, and a
+// hand is one thread for the life of the pool, so no two threads ever hold
+// the same index at once; the serial walk is hand 0 on the one thread. The
+// only access is `Hands::get`, whose contract says exactly that.
+unsafe impl Sync for Hands {}
+
+impl Hands {
+    fn new(n: usize) -> Self {
+        Self((0..n.max(1)).map(|_| std::cell::UnsafeCell::new(LaneScratch::new())).collect())
+    }
+
+    /// # Safety
+    ///
+    /// `hand` is the index the pool called this thread's work with, or 0 on
+    /// the serial walk, and the reference is dropped before the work returns.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self, hand: usize) -> Option<&mut LaneScratch> {
+        // SAFETY: the caller's contract.
+        self.0.get(hand).map(|c| unsafe { &mut *c.get() })
+    }
+}
+
 /// **The buffers one lane renders through.**
 ///
 /// One set served the whole desk while the lane pass was a single walk, and
@@ -6123,7 +6403,7 @@ struct LaneIo<'a> {
     fx_in: &'a mut Vec<Vec<f32>>,
     fx_out: &'a mut Vec<Vec<f32>>,
     dry_io: &'a mut Vec<Vec<f32>>,
-    /// The latency `dry_io` has already paid - see `Renderer::lane_dry_paid`.
+    /// The latency `dry_io` has already paid - see `LaneBody::dry_paid`.
     dry_paid: &'a mut u32,
     key_io: &'a mut Vec<Vec<f32>>,
     builtin: &'a mut Vec<f32>,
@@ -6952,7 +7232,7 @@ fn render_lane(
     //
     // **And it has paid no plugin delay**, so its wait is the whole of
     // `max - folded` - until a bay voice below writes the row over and says
-    // what it paid. See `Renderer::lane_dry_paid`.
+    // what it paid. See `LaneBody::dry_paid`.
     *io.dry_paid = 0;
     if plan.stems_dry {
         let (dry, fx) = (&mut io.dry_io, &io.fx_in);
@@ -7909,34 +8189,6 @@ struct Renderer {
     /// advanced by the walk and re-sought on a jump; see the note on the
     /// `partition_point` that replaced it.
     midi_clips: Vec<PlacedMidi>,
-    /// The MIDI half of the schedule, and a cursor per clip — advanced while
-    /// Clip notes sounding right now, so their offs land on time — and land
-    /// AT ALL on a stop or a jump.
-    /// **What each lane's instrument has been told, and when each of those
-    /// notes is due to end.**
-    ///
-    /// This replaced a single desk-wide `Vec<ActiveClipNote>` with a
-    /// hard-coded cap of 256 entries. That cap was reached by visit order:
-    /// the walk runs lane 0 to lane 31, so a chord storm on a low lane
-    /// withheld notes from the HIGH ones, and under any look-ahead the visit
-    /// order becomes k blocks of lane 0 before lane 31 is reached at all,
-    /// which would starve it strictly harder. Each lane has its own budget
-    /// now and there is no pool to run out of.
-    ///
-    /// **It is a model of the INSTRUMENT, not of the playhead**, and that is
-    /// the whole reason it survives while everything else in the MIDI walk
-    /// becomes a query. A note-off is a promise made to a stateful sink: the
-    /// engine must send one because it sent an on, not because the timeline
-    /// says a note ended. The shipped code already knows this and says so by
-    /// keeping the list across a clip-list swap while resetting every cursor,
-    /// so a note from a retired schedule still gets its off. A query over the
-    /// new schedule would strand it.
-    told: [u128; CHANNELS],
-    told_off: Box<[[u64; 128]; CHANNELS]>,
-    /// The frame an overflowed block still owes this lane, or `u64::MAX`.
-    /// Per lane for the same reason as the rest: one lane's overflow used to
-    /// change what every other lane skipped.
-    park_from: [u64; CHANNELS],
     /// Per-lane note scratch for one block: the live events (armed) and the
     /// clips' both, copied — the rack takes one slice.
     lane_notes: Vec<Note>,
@@ -7948,27 +8200,6 @@ struct Renderer {
     /// — the live list, and nothing else. A recorded pedal had no door into
     /// an instrument even once the clip carried it.
     lane_controls: Vec<Control>,
-    /// Where the three pedals stand on the LIVE input, as a level rather
-    /// than as the events that got them there.
-    ///
-    /// `self.controls` is a block's worth of CHANGES, so it says nothing at
-    /// all on the ninety-nine blocks out of a hundred where a held pedal
-    /// sends nothing — which was fine while the only consumer applied edges
-    /// as they arrived, and is not fine now that a lane has to combine the
-    /// live pedal with a clip's. Indexed by [`pedal_slot`].
-    ///
-    /// **Per LANE**, since a track can name its own keyboards: one global
-    /// level would let a foot on keyboard A's damper hold the notes on the
-    /// track that only ever asked for keyboard B.
-    live_pedal: [[u8; 3]; CHANNELS],
-    /// What each lane was last TOLD its pedal was, so a level that has not
-    /// moved costs nothing and a level that has is stated exactly once.
-    ///
-    /// It is also what releases the pedal at a stop, at a locate out of a
-    /// clip, and at the end of a clip, with no special case for any of the
-    /// three: the level those all fall to is zero, which is a change, which
-    /// is an edge.
-    lane_pedal_sent: [[u8; 3]; CHANNELS],
     /// This block's pedal MOVES, as `(lane, control)` — filled by the pass
     /// that decides each lane's level and drained by the lane loop that
     /// builds `lane_controls`.
@@ -8080,44 +8311,10 @@ struct Renderer {
     /// two lanes fighting over a single one-pole smoother is a fader that
     /// jumps between two targets every block.
     pad_gain: Vec<f32>,
-    /// The built-in DX7s: one FULL instance per lane that holds the
-    /// sentinel, `None` everywhere else — the drumpad's arrangement, arrived
-    /// at for the drumpad's reason. One shared instance behind a mask meant
-    /// two DX7 tracks were one synth wearing two names: the second lane was
-    /// silent by design, and a different cartridge per track was not even
-    /// expressible. Instances are built and freed on the UI thread and travel
-    /// by `dx7_incoming`/`dx7_retiring`, the kit's swap protocol exactly,
-    /// because the callback may neither allocate a synth nor drop one.
-    dx7s: Vec<Option<Box<crate::dx7::Dx7>>>,
     dx7_incoming: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     dx7_retiring: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
-    /// The modelled keyboards, on the same per-lane terms as the DX7s above.
-    ///
-    /// This one is WHY the per-lane rework happened: with a single `Keys`
-    /// behind a mask, a session could not hold a piano track and an EP track
-    /// at once — the patch was one global number, so choosing the Rhodes on
-    /// lane 5 silently re-voiced the piano on lane 2. A `Keys` is about 3 MB
-    /// of delay lines, so lanes that do not hold one pay nothing but the
-    /// `None`.
-    keys_lanes: Vec<Option<Box<crate::keys::Keys>>>,
     keys_incoming: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
     keys_retiring: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
-    /// **What each lane's audition has actually been TOLD**, which is what
-    /// `Shared::audition` is reconciled against once a block. `None` where
-    /// the lane has been told nothing.
-    audition_on: [Option<u8>; CHANNELS],
-    /// **This lane has sounded an audition and is not finished with it.**
-    ///
-    /// Kept apart from `audition_on` because letting go of the key is not the
-    /// end of the note: a DX7 release can run for seconds, and the walk below
-    /// force-quiets any lane that is unarmed, carries no clips and has an
-    /// empty note list — which, one block after the button comes up, is
-    /// exactly this lane. Without this flag the tail was cut dead the instant
-    /// the hand lifted, on precisely the patches somebody browses a bank for.
-    audition_rang: [bool; CHANNELS],
-    /// Where each general channel's fader has slewed to. Per channel, because
-    /// the eight move independently — the same treatment every fader gets.
-    channel_gain: [f32; CHANNELS],
     /// Reverb, delay and chorus on the instrument sum. Free at rest.
     /// The effects BUS: reverb, delay and chorus, fed by the strips' sends.
     ///
@@ -8226,22 +8423,39 @@ struct Renderer {
     /// test thread first and in anything with a smaller stack after. The
     /// contents are identical; only where they live changes, and indexing a
     /// `Vec` costs the callback nothing over indexing an array.
-    racks: Vec<Rack>,
-    /// **How long each lane's rack has had nothing to do**, in frames, and
-    /// the counter the park rule reads. Zeroed the moment the lane has any
-    /// reason to be live — the transport rolling, the lane armed, a note or
-    /// a control on it, an audition — and, for a lane carrying an
-    /// instrument, whenever that instrument is sounding. See `RACK_PARK_S`
-    /// and `VOICE_PARK_S`.
-    lane_quiet: Vec<u64>,
-    /// **Whether each lane's rack put anything above [`PARK_FLOOR`] out last
-    /// block**, pre-fader — the `sounding` the park rule reads for a lane
-    /// carrying an instrument. Written by the fold, one block behind the
-    /// decision that reads it, which is the cheapest honest answer: the
-    /// block that goes quiet is rendered, and the next one is judged on it.
-    /// A parked lane does not fold and so keeps its last answer, which was
-    /// `false` or it would not have parked.
-    lane_loud: Vec<bool>,
+    ///
+    /// **`None` at every seat a lane owns**: a lane's two chains and its
+    /// seven pedals moved into its [`Lane`] box, and [`seat_rack_mut`] is the
+    /// one road from a seat number to a rack wherever it lives. What stays
+    /// here is what no lane owns: the pads, the buses, the master.
+    racks: Vec<Option<Rack>>,
+    /// **The lanes, by slot, and the desk-wide buffers every lane reads.**
+    ///
+    /// A legacy desk installs row r at slot r, every one of them at build,
+    /// so for every desk that exists today a slot, a rank and a lane index
+    /// are the same number. See [`Lane`] and `lane_bank::Spine`.
+    ///
+    /// `spine.desk` holds what no lane owns because OTHER lanes read it
+    /// (design 7.1): the block of stems (`stem_scratch`), its dry twin
+    /// (`dry_scratch`, a second buffer so a dry export cannot reach the
+    /// mix's sums), and **last chunk's finished stems** (`key_prev`), which
+    /// the sidechain keys read. A key reads the previous chunk on purpose:
+    /// the lane racks run before clips, pads, live input and sends have
+    /// landed, so a same-block key would be silently incomplete for most
+    /// sources, and asymmetric freshness would make reordering tracks change
+    /// a mix. One chunk of uniform lateness buys reorder-invariance and
+    /// determinism. All three are written only in serial passes and borrowed
+    /// only as `&` by the fork; their stride is the spine's capacity.
+    spine: Spine<Lane>,
+    /// **One scratch set per hand**, the caller's included. See [`Hands`].
+    hands: Hands,
+    /// The fork's round, bumped before every fork, never zero: the stamp a
+    /// hand swaps into a lane's claim word. See `lane_bank::claim_lane`.
+    fork_round: u64,
+    /// **The lanes the decide walk left for the render**, as the list the
+    /// pool claims from. Bought at build at the lane count, refilled in
+    /// place every chunk.
+    wanted: Vec<u32>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     /// **The peers the lane render forks onto**, or `None` where there are
@@ -8255,33 +8469,6 @@ struct Renderer {
     /// engines to disagree about threading and agree about audio. A session
     /// leaves it false and the readiness gate decides.
     fanout_any: bool,
-    /// **Each lane's own scratch, so a worker needs no index of its own.**
-    ///
-    /// `fx_out`, `key_io` and the two instrument scratches are transient
-    /// WITHIN one lane's render: a rack writes its block into `fx_out` and
-    /// `run_rack` copies it straight back. That makes them per-worker state
-    /// rather than per-lane, in principle. They are kept per LANE anyway,
-    /// because a worker that had to know which of itself it was would have
-    /// to be told, and the closure the pool calls is handed a lane number
-    /// and nothing else. Half a megabyte to make the fork's inner call take
-    /// one argument, allocated once.
-    lane_scratch: Vec<LaneScratch>,
-    /// **Each lane's own notes and controls for this chunk.**
-    ///
-    /// One pair served the whole desk while the pass was a single walk,
-    /// because a lane's list was built and consumed before the walk reached
-    /// the next one. The deciding half fills these and the render half
-    /// reads them, so every lane's list has to survive until its render:
-    /// thirty-two pairs, each at the capacity the shared pair had, filled by
-    /// a swap rather than a copy so no block allocates.
-    lane_note_bank: Vec<Vec<Note>>,
-    lane_ctl_bank: Vec<Vec<Control>>,
-    /// **What the render pass decided about each lane, for the fold.**
-    ///
-    /// The two the fold cannot re-derive cheaply: whether the lane is a
-    /// folder (which owns its own fader, pan and send at the fold) and
-    /// whether it is armed (which picks the meter's source).
-    lane_prep: [LanePrep; CHANNELS],
     /// **Which lanes had a parameter arrive for them this block.**
     ///
     /// A knob turn and a preset load reach the audio thread on `ui_params`,
@@ -8327,33 +8514,6 @@ struct Renderer {
     /// rendered grain, as a curve edit does. Sized once at the ring's own
     /// size; an edit past it is applied but not kept.
     ui_held: Vec<UiParam>,
-    /// Which lanes the deciding walk left for the render walk to do.
-    lane_wants: [bool; CHANNELS],
-    /// **The span each lane is rendering this chunk**, which is the chunk's
-    /// own span unless the grain clock moved it. See `plan_grains`.
-    lane_at: [u64; CHANNELS],
-    lane_len: [usize; CHANNELS],
-    /// **This lane's audio for this chunk is already in its ring**, so the
-    /// deciding walk must not advance a single thing about it: not its
-    /// notes, not what its instrument has been told, not its pedal. The
-    /// grain that covers this chunk did all of that when it was rendered.
-    lane_skip: [bool; CHANNELS],
-    /// Which lanes rendered something to fold this chunk. False for every
-    /// way the render walked away: parked, fed by nothing, no rack and no
-    /// audio, a bank too short, or an inactive instrument on a bare lane.
-    lane_folds: [bool; CHANNELS],
-    /// **Where each lane's finished audio waits for the fold.**
-    ///
-    /// The lane pass used to render every channel through the one `fx_in`
-    /// and fold it on the spot, which is why it could only ever be one walk:
-    /// lane 1's render overwrites lane 0's result. A lane writes its own row
-    /// here now, and the fold is a second walk over all of them in ascending
-    /// order - which is the order that keeps the master's sum bit-identical
-    /// to the single walk, because f32 addition is not associative.
-    ///
-    /// `GRAIN_SLOTS` x `TAP_CHANNELS` x `MAX_BLOCK` per lane, allocated
-    /// once: 256 KB, twice what the single row cost.
-    lane_grain: Vec<LaneGrains>,
     /// **The one span the fold is looking at**, copied out of the ring.
     ///
     /// One pair for the whole desk rather than one per lane, because the
@@ -8362,16 +8522,6 @@ struct Renderer {
     /// contiguous stream of consumed frames however the grains under it are
     /// cut.
     lane_stage: Vec<Vec<f32>>,
-    /// The dry twin of [`Self::lane_out`], filled only while a dry stem is
-    /// wanted. See the dry copy in `render_lane`.
-    lane_dry: Vec<Vec<Vec<f32>>>,
-    /// **What each lane's dry row has already paid**: the latency a bay
-    /// VOICE reports into its bay, when that voice wrote the row, and zero
-    /// when the row is the tap's copy of `fx_in`. Written by the lane's
-    /// render, read by `run_lane_pdc` at consumption, which takes it off the
-    /// dry row's wait; the two share a chunk because stems turn the grain
-    /// clock off.
-    lane_dry_paid: [u32; CHANNELS],
     fx_in: Vec<Vec<f32>>,
     fx_out: Vec<Vec<f32>>,
     /// The effects bus's own buffer, one block long, interleaved like `mix`.
@@ -8440,11 +8590,6 @@ struct Renderer {
     /// there and is silent otherwise. Not a multiplier: a volume curve is
     /// the fader's position, the way every desk means it.
     auto: AutoNow,
-    /// One compensating delay per CHANNEL. Sixteen, not one per rack seat:
-    /// the pads are struck rather than played back and are deliberately out
-    /// of the alignment — see `publish_latency` — and the master's chain
-    /// delays everything equally, so it has nothing to be aligned against.
-    pdc: Vec<DelayLine>,
     /// **The kits' own compensation lines, one per lane and one for the bare
     /// drumpad bus.**
     ///
@@ -8600,8 +8745,6 @@ struct Renderer {
     /// The device send's ring (see `reastream_scratch`), pushed only while
     /// `Shared::device_send_on`. A full ring drops the block.
     devsend_tx: Producer<f32>,
-    /// One block of stems, accumulated by the three mixers and pushed once.
-    stem_scratch: Vec<f32>,
     /// **The folder tree for this block**: each channel's parent, or -1.
     ///
     /// Read off `Shared::folder_of` once a block, because it changes when
@@ -8636,23 +8779,6 @@ struct Renderer {
     /// with the routes. Off, the whole sidechain feature costs that load and
     /// nothing else: no stems, no snapshot, no table reads.
     keys_live: bool,
-    /// **Last chunk's finished stems** — `stem_scratch`'s exact interleaved
-    /// layout, copied once per chunk after the sends pass has written the
-    /// last stem. The key is read from HERE and not from the live buffer
-    /// because the lane racks run at fixed index order before clips, pads,
-    /// live input and sends have landed: a same-block key would be silently
-    /// incomplete for every source class but "a lower-numbered lane's own
-    /// instrument", and asymmetric freshness would make reordering tracks
-    /// audibly change a mix. One chunk of uniform lateness buys
-    /// reorder-invariance and determinism instead. (The Fx bus and the
-    /// master's two seats run AFTER the copy, so they key on the CURRENT
-    /// chunk — every stem is complete by then, and fresher is simply
-    /// better there.)
-    key_prev: Vec<f32>,
-    /// Frames of `key_prev` that are real — the previous chunk's length,
-    /// which under varispeed is not always this chunk's. Reads past it get
-    /// silence, never a stale tail.
-    key_prev_frames: usize,
     /// The planar pair a bay's key is de-interleaved into — `send_io`'s
     /// shape, bought at build like every other scratch.
     key_io: Vec<Vec<f32>>,
@@ -8698,35 +8824,10 @@ struct Renderer {
     /// folder walk, and the lane pass's `has_audio`. This one decides only
     /// whether a lane is worth RENDERING, never whether it has audio at all.
     clip_under: LaneSet,
-    /// **APPENDED — the DRY stem block**, `stem_scratch`'s exact layout and
-    /// its exact indexing, filled only while a dry stems pass is running.
-    ///
-    /// A SECOND buffer rather than a mode on the first one, and that is not
-    /// a convenience. `stem_scratch` has four customers — the tap, hardware
-    /// routing, the folder fold and the sidechain keys (see `stems_wanted`)
-    /// — and three of them are part of the MIX. Writing dry audio into it
-    /// would have made "export dry stems" quietly change what a group sums,
-    /// what a send carries and what a keyed compressor hears. A hundred and
-    /// twenty-eight kilobytes buys the guarantee that the mode switch
-    /// cannot reach the master at all.
-    dry_scratch: Vec<f32>,
     /// **APPENDED — one strip's pre-rack audio**, planar, `fx_in`'s shape.
     /// Reused strip by strip the way `fx_in` itself is: the channel walk
     /// fills it, folds it and moves on before the next lane touches it.
     dry_io: Vec<Vec<f32>>,
-    /// **APPENDED — the dry tap's own compensation, one line per channel.**
-    ///
-    /// Separate from `pdc` for the reason `pad_pdc` is separate from it: one
-    /// ring carries one signal, and running a ring twice in a block is what
-    /// made a grouped track buzz. It is needed at all because the dry copy
-    /// skips the lane's rack and therefore does not pay the `own` frames of
-    /// real delay the wet copy pays — so where the wet waits
-    /// `max - own - folded`, the dry waits `max - folded`, and the two land
-    /// together. Without it, a lane carrying a lookahead limiter would come
-    /// out of a dry stems export up to a hundred and seventy milliseconds
-    /// ahead of every other lane: a flam nobody would think to blame on the
-    /// export mode.
-    dry_pdc: Vec<DelayLine>,
     /// **APPENDED — the same, for the kits.** `pad_pdc`'s sibling, by the
     /// same argument and for the same signal: a kit's dry copy skips the
     /// bus rack the wet copy pays for.
@@ -8916,7 +9017,7 @@ impl Renderer {
         let armed = self.desk.midi_on.contains(chain_strip(at));
         let notes: &[Note] = if armed { &self.notes } else { &[] };
         let controls: &[Control] = if armed { &self.controls } else { &[] };
-        let Some(rack) = self.racks.get(at) else {
+        let Some(rack) = seat_rack(&self.racks, &self.spine.lanes, at) else {
             return;
         };
         if rack.is_empty() {
@@ -8958,7 +9059,7 @@ impl Renderer {
         // bus, or one of the master's two racks — never one of the sixteen,
         // so the folder rule the three channel writers follow cannot reach
         // this call. See the note on this function.
-        let Some(rack) = self.racks.get_mut(at) else {
+        let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, at) else {
             return;
         };
         run_rack(
@@ -8979,8 +9080,8 @@ impl Renderer {
             // taken — so a keyed master or Fx-bus comp hears the CURRENT
             // chunk's finished stems. See `KeyFeed` for the one-pass rule.
             self.keys_live.then(|| KeyFeed {
-                prev: &self.key_prev,
-                prev_frames: self.key_prev_frames,
+                prev: &self.spine.desk.key_prev,
+                prev_frames: self.spine.desk.key_prev_frames,
                 io: &mut self.key_io,
             }),
         
@@ -9091,11 +9192,22 @@ impl Renderer {
         // the moment the track is released. That is the same backpressure
         // the ring already applies when the return side is full.
         let leased = &self.leased;
-        for (seat, rack) in self.racks.iter_mut().enumerate() {
-            if lane_of_seat(seat).is_some_and(|ch| leased.contains(ch)) {
+        // The bank holds no lane's rack (those seats are `None`), so it is
+        // walked whole; each lane then swaps its own nine, unless held.
+        for rack in self.racks.iter_mut().flatten() {
+            swapped += rack.swap();
+        }
+        for (ch, lane) in self.spine.lanes.iter_mut().enumerate() {
+            let Some(lane) = lane.as_deref_mut() else {
+                continue;
+            };
+            if leased.contains(ch) {
                 continue;
             }
-            swapped += rack.swap();
+            let b = lane.body_mut();
+            for rack in b.chains.iter_mut().chain(b.board.iter_mut()) {
+                swapped += rack.swap();
+            }
         }
         if swapped > 0 {
             self.shared
@@ -9114,31 +9226,12 @@ impl Renderer {
             // that can answer without walking two thousand seats — see the
             // early-out in `mix_pads`.
             self.pad_racks_live = (0..CHANNELS).any(|ch| {
-                (0..PADS).any(|i| !self.racks[pad_rack_index(ch, i)].is_empty())
+                (0..PADS).any(|i| seat_rack(&self.racks, &self.spine.lanes, pad_rack_index(ch, i)).is_some_and(|r| !r.is_empty()))
             });
         }
         swapped
     }
 
-    /// Whether lane `ch`'s own instrument still has anything sounding — a key
-    /// held, or a release that has not finished ringing.
-    ///
-    /// Asked of the INSTRUMENT rather than of the note list, for the reason
-    /// the keyboard's own force-quiet gives a few hundred lines down: a
-    /// pedalled chord, or a patch with a long release, is still making sound
-    /// long after the last note-off went in. It is how an audition knows when
-    /// it is finally done with the lane it borrowed.
-    fn lane_instrument_active(&self, ch: usize) -> bool {
-        self.dx7s
-            .get(ch)
-            .and_then(Option::as_ref)
-            .is_some_and(|d| d.active())
-            || self
-                .keys_lanes
-                .get(ch)
-                .and_then(Option::as_ref)
-                .is_some_and(|k| k.active())
-    }
 
     /// Collect the events that belong to `[block_start, block_start + frames)`.
     ///
@@ -9361,9 +9454,12 @@ impl Renderer {
                         // **Only on the lanes that heard it.** One global
                         // level let a foot on keyboard A's damper hold the
                         // notes on a track that only ever asked for keyboard B.
-                        for ch in 0..CHANNELS {
-                            if reach.reaches(self.midi_routes[ch]) {
-                                self.live_pedal[ch][slot] = event.data2 & 0x7F;
+                        for (ch, lane) in self.spine.lanes.iter_mut().enumerate() {
+                            let Some(lane) = lane.as_deref_mut() else {
+                                continue;
+                            };
+                            if self.midi_routes.get(ch).is_some_and(|r| reach.reaches(*r)) {
+                                lane.body_mut().live_pedal[slot] = event.data2 & 0x7F;
                             }
                         }
                     }
@@ -9675,11 +9771,14 @@ impl Renderer {
             let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
             if flush && self.live_sounding != 0 {
-                for d in self.dx7s.iter_mut().flatten() {
-                    d.all_notes_off();
-                }
-                for k in self.keys_lanes.iter_mut().flatten() {
-                    k.all_notes_off();
+                for lane in self.spine.lanes.iter_mut().flatten() {
+                    let b = lane.body_mut();
+                    if let Some(d) = b.dx7.as_mut() {
+                        d.all_notes_off();
+                    }
+                    if let Some(k) = b.keys.as_mut() {
+                        k.all_notes_off();
+                    }
                 }
                 for pitch in 0..128u8 {
                     if self.live_sounding & (1 << pitch) != 0
@@ -9812,12 +9911,12 @@ impl Renderer {
             self.stems_wanted =
                 self.stems_live || self.route_n > 0 || self.has_folders || self.keys_live;
             if self.stems_wanted {
-                if let Some(st) = self.stem_scratch.get_mut(..n * CHANNELS * 2) {
+                if let Some(st) = self.spine.desk.stem_scratch.get_mut(..n * CHANNELS * 2) {
                     st.fill(0.0);
                 }
             }
             if self.stems_dry {
-                if let Some(st) = self.dry_scratch.get_mut(..n * CHANNELS * 2) {
+                if let Some(st) = self.spine.desk.dry_scratch.get_mut(..n * CHANNELS * 2) {
                     st.fill(0.0);
                 }
             }
@@ -9940,9 +10039,9 @@ impl Renderer {
                     // the mono fold, the WAV — has to learn that dry stems
                     // exist. Only the fill point moved.
                     let from = if self.stems_dry {
-                        &self.dry_scratch
+                        &self.spine.desk.dry_scratch
                     } else {
-                        &self.stem_scratch
+                        &self.spine.desk.stem_scratch
                     };
                     let _ = self.stem_tx.push_entire_slice(&from[..take]);
                 }
@@ -10083,9 +10182,13 @@ impl Renderer {
             // is how a cue strip with a plugin in bay 4 and nothing in 1..3
             // would skip the block and never be processed — the same fault
             // `rack_live` had on a channel.
-            if !self.racks[Strip::Click.index()].is_empty()
-                || !self.racks[tangent_ui::recorder::bus_extra_seat(Strip::Click.index())]
-                    .is_empty()
+            if seat_rack(&self.racks, &self.spine.lanes, Strip::Click.index()).is_some_and(|r| !r.is_empty())
+                || seat_rack(
+                    &self.racks,
+                    &self.spine.lanes,
+                    tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
+                )
+                .is_some_and(|r| !r.is_empty())
             {
                 for c in 0..TAP_CHANNELS {
                     if let Some(dst) = self.fx_in.get_mut(c) {
@@ -10117,48 +10220,52 @@ impl Renderer {
                                 .get((Strip::Click.index()) * INSERTS + b)
                                 .map_or(&[][..], Vec::as_slice)
                         });
-                    run_rack(
-                        &mut self.racks[Strip::Click.index()],
-                        &mut self.fx_in,
-                        n,
-                        &mut self.fx_out,
-                        notes,
-                        controls,
-                    &seat_params,
-                        &self.shared,
-                        &self.desk.frozen,
-                        Strip::Click.index(),
-                        // The click is a cue seat, not a lane: no sample.
-                        None,
-                        // Not a key pass: the click is a cue, and nobody
-                        // keys a cue. See `KeyFeed`.
-                        None,
+                    if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, Strip::Click.index()) {
+                        run_rack(
+                            rack,
+                            &mut self.fx_in,
+                            n,
+                            &mut self.fx_out,
+                            notes,
+                            controls,
+                        &seat_params,
+                            &self.shared,
+                            &self.desk.frozen,
+                            Strip::Click.index(),
+                            // The click is a cue seat, not a lane: no sample.
+                            None,
+                            // Not a key pass: the click is a cue, and nobody
+                            // keys a cue. See `KeyFeed`.
+                            None,
                     
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                    }
                     // **NOT-A-CHANNEL:** and bays 3..5 of the same cue strip,
                     // over what bays 0..2 just left. The click wears six now
                     // (`recorder::bays_on`), seated past everything in
                     // `BUS_EXTRA_SEATS`, and six bays are one chain.
-                    run_extra_rack(
-                        &mut self.racks[tangent_ui::recorder::bus_extra_seat(Strip::Click.index())],
-                        false,
-                        &self.auto_params,
-                        &mut self.fx_in,
-                        &mut self.fx_out,
-                        &self.shared,
-                        &self.desk.frozen,
-                        tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
-                        n,
-                        notes,
-                        controls,
-                        None,
-                        None,
+                    if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, tangent_ui::recorder::bus_extra_seat(Strip::Click.index())) {
+                        run_extra_rack(
+                            rack,
+                            false,
+                            &self.auto_params,
+                            &mut self.fx_in,
+                            &mut self.fx_out,
+                            &self.shared,
+                            &self.desk.frozen,
+                            tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
+                            n,
+                            notes,
+                            controls,
+                            None,
+                            None,
                     
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                    }
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
                 // frame the take was not carrying stays absent however the
@@ -10271,8 +10378,8 @@ impl Renderer {
                         }
                         for f in 0..n {
                             let (Some(l), Some(r)) = (
-                                self.stem_scratch.get(f * CHANNELS * 2 + from * 2).copied(),
-                                self.stem_scratch
+                                self.spine.desk.stem_scratch.get(f * CHANNELS * 2 + from * 2).copied(),
+                                self.spine.desk.stem_scratch
                                     .get(f * CHANNELS * 2 + from * 2 + 1)
                                     .copied(),
                             ) else {
@@ -10339,32 +10446,34 @@ impl Renderer {
                     // Whether a group should be offerable as a send
                     // destination at all is a question for the desk, not
                     // something to answer quietly down here.
-                    if !self.racks[dest].is_empty() {
-                        run_rack(
-                            &mut self.racks[dest],
-                            &mut self.send_io,
-                            n,
-                            &mut self.fx_out,
-                            &[],
-                            &[],
-                            &seat_params,
-                            &self.shared,
-                            &self.desk.frozen,
-                            dest,
-                            // A destination CAN be one of the sixteen, so it
-                            // can hold a sampler; handed the same file the
-                            // lane pass hands it, or the bay would play one
-                            // sound on the lane and silence on the send.
-                            self.sampler_samples.get(dest).and_then(Option::as_ref),
-                            // NOT a key pass — this is the SEND-BARGAIN's
-                            // second run of a rack the lane pass already
-                            // fed; feeding it again would clock a keyed
-                            // detector at twice real time. See `KeyFeed`.
-                            None,
+                    if seat_rack(&self.racks, &self.spine.lanes, dest).is_some_and(|r| !r.is_empty()) {
+                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, dest) {
+                            run_rack(
+                                rack,
+                                &mut self.send_io,
+                                n,
+                                &mut self.fx_out,
+                                &[],
+                                &[],
+                                &seat_params,
+                                &self.shared,
+                                &self.desk.frozen,
+                                dest,
+                                // A destination CAN be one of the sixteen, so it
+                                // can hold a sampler; handed the same file the
+                                // lane pass hands it, or the bay would play one
+                                // sound on the lane and silence on the send.
+                                self.sampler_samples.get(dest).and_then(Option::as_ref),
+                                // NOT a key pass — this is the SEND-BARGAIN's
+                                // second run of a rack the lane pass already
+                                // fed; feeding it again would clock a keyed
+                                // detector at twice real time. See `KeyFeed`.
+                                None,
                         
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                        }
                     }
                     let g = self.lane_gain[dest];
                     let (pl, pr) = pan_gains(self.lane_pan(dest));
@@ -10387,10 +10496,10 @@ impl Renderer {
                         // The destination's METER shows what it is passing,
                         // and its hardware route carries it too: both read
                         // the stem, so both are told by writing it here.
-                        if let Some(v) = self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2) {
+                        if let Some(v) = self.spine.desk.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2) {
                             *v += l;
                         }
-                        if let Some(v) = self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2 + 1)
+                        if let Some(v) = self.spine.desk.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2 + 1)
                         {
                             *v += r;
                         }
@@ -10413,11 +10522,11 @@ impl Renderer {
             if self.keys_live {
                 let want = n * CHANNELS * 2;
                 if let (Some(dst), Some(src)) = (
-                    self.key_prev.get_mut(..want),
-                    self.stem_scratch.get(..want),
+                    self.spine.desk.key_prev.get_mut(..want),
+                    self.spine.desk.stem_scratch.get(..want),
                 ) {
                     dst.copy_from_slice(src);
-                    self.key_prev_frames = n;
+                    self.spine.desk.key_prev_frames = n;
                 }
             }
 
@@ -10695,8 +10804,8 @@ impl Renderer {
                         }
                         let lane_at = i * CHANNELS * 2 + from * 2;
                         let (Some(l), Some(r)) = (
-                            self.stem_scratch.get(lane_at).copied(),
-                            self.stem_scratch.get(lane_at + 1).copied(),
+                            self.spine.desk.stem_scratch.get(lane_at).copied(),
+                            self.spine.desk.stem_scratch.get(lane_at + 1).copied(),
                         ) else {
                             continue;
                         };
@@ -10773,7 +10882,12 @@ impl Renderer {
         // lane on every entry.
         {
             for (lane, cells) in self.shared.lane_sounding.chunks_exact(2).enumerate() {
-                let held = self.told.get(lane).copied().unwrap_or(0);
+                let held = self
+                    .spine
+                    .lanes
+                    .get(lane)
+                    .and_then(Option::as_deref)
+                    .map_or(0, |l| l.peek().told);
                 cells[0].store(held as u64, Ordering::Relaxed);
                 cells[1].store((held >> 64) as u64, Ordering::Relaxed);
             }
@@ -11717,53 +11831,57 @@ impl Renderer {
                     // for exactly that word within sight of every `run_rack` —
                     // and the paragraph above pushed the guard out of sight.
                     if takes_rack {
-                        run_rack(
-                        &mut self.racks[strip.index()],
-                        &mut self.fx_in,
-                        n,
-                        &mut self.fx_out,
-                        notes,
-                        controls,
-                        &seat_params,
-                        &self.shared,
-                        &self.desk.frozen,
-                        strip.index(),
-                        self.sampler_samples
-                            .get(strip.index())
-                            .and_then(Option::as_ref),
-                        // NOT a key pass: an input strip's seat is fed by
-                        // the lane pass in `mix_channels`; this is its
-                        // monitor run. See `KeyFeed`.
-                            None,
+                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, strip.index()) {
+                            run_rack(
+                            rack,
+                            &mut self.fx_in,
+                            n,
+                            &mut self.fx_out,
+                            notes,
+                            controls,
+                            &seat_params,
+                            &self.shared,
+                            &self.desk.frozen,
+                            strip.index(),
+                            self.sampler_samples
+                                .get(strip.index())
+                                .and_then(Option::as_ref),
+                            // NOT a key pass: an input strip's seat is fed by
+                            // the lane pass in `mix_channels`; this is its
+                            // monitor run. See `KeyFeed`.
+                                None,
                         
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                        }
                         // And bays 3..5, over what bays 0..2 just left — the
                         // room hears the whole chain or it hears half of it.
                         // Not a key pass either, for the same reason. Still
                         // inside the `!is_folder` arm; `run_extra_rack` holds
                         // the guard as well, so neither can drift.
-                        run_extra_rack(
-                            &mut self.racks[tangent_ui::recorder::folder_extra_seat(strip.index())],
-                            is_folder,
-                            &self.auto_params,
-                            &mut self.fx_in,
-                            &mut self.fx_out,
-                            &self.shared,
-                            &self.desk.frozen,
-                            tangent_ui::recorder::folder_extra_seat(strip.index()),
-                            n,
-                            notes,
-                            controls,
-                            self.sampler_samples
-                                .get(strip.index())
-                                .and_then(Option::as_ref),
-                            None,
+                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, tangent_ui::recorder::folder_extra_seat(strip.index())) {
+                            run_extra_rack(
+                                rack,
+                                is_folder,
+                                &self.auto_params,
+                                &mut self.fx_in,
+                                &mut self.fx_out,
+                                &self.shared,
+                                &self.desk.frozen,
+                                tangent_ui::recorder::folder_extra_seat(strip.index()),
+                                n,
+                                notes,
+                                controls,
+                                self.sampler_samples
+                                    .get(strip.index())
+                                    .and_then(Option::as_ref),
+                                None,
                         
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                        }
                     }
                 }
             }
@@ -11834,6 +11952,8 @@ impl Renderer {
                     // bounced stem is everything the lane put on the bus.
                     if self.stems_wanted {
                         if let Some(sv) = self
+                            .spine
+                            .desk
                             .stem_scratch
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
                         {
@@ -11846,6 +11966,8 @@ impl Renderer {
                         let dsrc = self.dry_io.get(c).map_or(0.0, |b| b[i])
                             * if c == 0 { pan_l } else { pan_r };
                         if let Some(sv) = self
+                            .spine
+                            .desk
                             .dry_scratch
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
                         {
@@ -11957,9 +12079,11 @@ impl Renderer {
         // see `ui_held`. `lane_skip` still holds the LAST block's plan here
         // (`plan_grains` runs later in the chunk), so what stays is exactly
         // the edits whose lane ran no rack; the rest were delivered.
-        let skipped = self.lane_skip;
+        let lanes = &self.spine.lanes;
         self.ui_held.retain(|u| {
-            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| skipped.get(ch).copied().unwrap_or(false))
+            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| {
+                lanes.get(ch).and_then(Option::as_deref).is_some_and(|l| l.peek().skip)
+            })
         });
         let held = self.ui_held.len();
         let mut next_held = 0usize;
@@ -12281,8 +12405,8 @@ impl Renderer {
             // computes a start past the span the fold is asking for, and
             // the lane renders nothing at all. The lap after a wrap came
             // out SILENT.
-            for g in &mut self.lane_grain {
-                g.clear();
+            for l in self.spine.lanes.iter_mut().flatten() {
+                l.body_mut().grain.clear();
             }
         }
         // The wrap's flush, armed on the PREVIOUS block — consumed now, when
@@ -12304,8 +12428,8 @@ impl Renderer {
         // worth: a practised two-bar loop pays one full-desk block every
         // few seconds, and `grain_ab` with `TANGENT_AB_LOOP` measures what that is.
         if wrap_from.is_some() {
-            for g in &mut self.lane_grain {
-                g.clear();
+            for l in self.spine.lanes.iter_mut().flatten() {
+                l.body_mut().grain.clear();
             }
         }
         // Only a level read between two loads of ONE generation: a locate
@@ -12605,7 +12729,7 @@ impl Renderer {
         // only on a plugin load — is the audio thread doing a full scan of
         // an empty map at block rate. `swap_plugins` sets it, because a
         // rack's contents change nowhere else.
-        let any_rack = !self.racks[Strip::Drums.index()].is_empty() || self.pad_racks_live;
+        let any_rack = seat_rack(&self.racks, &self.spine.lanes, Strip::Drums.index()).is_some_and(|r| !r.is_empty()) || self.pad_racks_live;
         if self.pad_hits.is_empty()
             && self.pad_offs.is_empty()
             && !self
@@ -12876,7 +13000,7 @@ impl Renderer {
         // A pad with an empty rack skips the copy and sums straight across.
         for i in 0..PADS {
             let rack_at = pad_rack_index(lane_ix, i);
-            let rack_live = !self.racks[rack_at].is_empty();
+            let rack_live = seat_rack(&self.racks, &self.spine.lanes, rack_at).is_some_and(|r| !r.is_empty());
             // A live rack processes even silence — its tail is its own.
             if !sounded[i] && !rack_live {
                 continue;
@@ -12908,26 +13032,28 @@ impl Renderer {
                             .get((rack_at) * INSERTS + b)
                             .map_or(&[][..], Vec::as_slice)
                     });
-                run_rack(
-                    &mut self.racks[rack_at],
-                    &mut self.pad_io,
-                    frames,
-                    &mut self.fx_out,
-                    &[],
-                    &[],
-                &seat_params,
-                    &self.shared,
-                    &self.desk.frozen,
-                    rack_at,
-                    // A pad seat is not a lane and has no sample of its own.
-                    None,
-                    // Not a key pass in v1: a pad seat is not reachable
-                    // from the key picker. See `KeyFeed`.
-                    None,
+                if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, rack_at) {
+                    run_rack(
+                        rack,
+                        &mut self.pad_io,
+                        frames,
+                        &mut self.fx_out,
+                        &[],
+                        &[],
+                    &seat_params,
+                        &self.shared,
+                        &self.desk.frozen,
+                        rack_at,
+                        // A pad seat is not a lane and has no sample of its own.
+                        None,
+                        // Not a key pass in v1: a pad seat is not reachable
+                        // from the key picker. See `KeyFeed`.
+                        None,
                 
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                }
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
                     if let Some(dst) = self.fx_in.get_mut(c) {
@@ -12990,7 +13116,7 @@ impl Renderer {
         // get the rule.
         let bus_rack = bus_strip.index();
         let folded_here = drum_lane.is_some_and(|ch| self.folder_is[ch]);
-        if !folded_here && !self.racks[bus_rack].is_empty() {
+        if !folded_here && seat_rack(&self.racks, &self.spine.lanes, bus_rack).is_some_and(|r| !r.is_empty()) {
             // **This seat's own parameter queue, not the empty one.** Every rack
             // outside the general channels used to be handed an empty queue,
             // which was true while the only writer was an automation curve —
@@ -13006,28 +13132,30 @@ impl Renderer {
                         .get((bus_rack) * INSERTS + b)
                         .map_or(&[][..], Vec::as_slice)
                 });
-            run_rack(
-                &mut self.racks[bus_rack],
-                &mut self.fx_in,
-                frames,
-                &mut self.fx_out,
-                &[],
-                &[],
-                &seat_params,
-                &self.shared,
-                &self.desk.frozen,
-                bus_rack,
-                self.sampler_samples.get(bus_rack).and_then(Option::as_ref),
-                // NOT a key pass — for a non-drum lane this is the seat's
-                // second run per chunk (the sends pass's bargain), and a
-                // pure drum lane's rack runs only here, where v1 does not
-                // feed. Keying a comp ON a drum lane waits for the same
-                // second pass folders need. See `KeyFeed`.
-                None,
+            if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, bus_rack) {
+                run_rack(
+                    rack,
+                    &mut self.fx_in,
+                    frames,
+                    &mut self.fx_out,
+                    &[],
+                    &[],
+                    &seat_params,
+                    &self.shared,
+                    &self.desk.frozen,
+                    bus_rack,
+                    self.sampler_samples.get(bus_rack).and_then(Option::as_ref),
+                    // NOT a key pass — for a non-drum lane this is the seat's
+                    // second run per chunk (the sends pass's bargain), and a
+                    // pure drum lane's rack runs only here, where v1 does not
+                    // feed. Keying a comp ON a drum lane waits for the same
+                    // second pass folders need. See `KeyFeed`.
+                    None,
             
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+            }
         }
         // **The kit waits for the slowest chain, like every other source.**
         //
@@ -13078,7 +13206,7 @@ impl Renderer {
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..want),
             self.aux.get_mut(..want),
-            self.stem_scratch.get_mut(..frames * CHANNELS * 2),
+            self.spine.desk.stem_scratch.get_mut(..frames * CHANNELS * 2),
         ) else {
             return;
         };
@@ -13121,7 +13249,7 @@ impl Renderer {
                 if let Some(ch) = drum_lane {
                     let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * bus_l;
                     let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
-                    if let Some(d) = self.dry_scratch.get_mut(..frames * CHANNELS * 2) {
+                    if let Some(d) = self.spine.desk.dry_scratch.get_mut(..frames * CHANNELS * 2) {
                         d[f * CHANNELS * 2 + ch * 2] += dl;
                         d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
                     }
@@ -13238,8 +13366,11 @@ impl Renderer {
     #[cfg(test)]
     fn sounding_notes(&self) -> Vec<(usize, u8)> {
         let mut out = Vec::new();
-        for (ch, held) in self.told.iter().enumerate() {
-            let mut held = *held;
+        for (ch, lane) in self.spine.lanes.iter().enumerate() {
+            let Some(lane) = lane.as_deref() else {
+                continue;
+            };
+            let mut held = lane.peek().told;
             while held != 0 {
                 let pitch = held.trailing_zeros();
                 held &= held - 1;
@@ -13302,10 +13433,11 @@ impl Renderer {
         free: &LaneSet,
     ) {
         // The default every lane keeps: this chunk, as it always was.
-        for ch in 0..CHANNELS {
-            self.lane_at[ch] = at;
-            self.lane_len[ch] = frames;
-            self.lane_skip[ch] = false;
+        for l in self.spine.lanes.iter_mut().flatten() {
+            let b = l.body_mut();
+            b.at = at;
+            b.len = frames;
+            b.skip = false;
         }
         // **Off, or on a desk where a grain cannot mean anything.** A
         // stopped transport re-reads one position for ever; varispeed sizes
@@ -13321,8 +13453,8 @@ impl Renderer {
         // costs one catch-up on the way back in, which is the same catch-up
         // starting the transport already pays.
         if !rolling || self.stems_live || self.varispeed_ratio().is_some() {
-            for g in &mut self.lane_grain {
-                g.clear();
+            for l in self.spine.lanes.iter_mut().flatten() {
+                l.body_mut().grain.clear();
             }
             return;
         }
@@ -13340,125 +13472,134 @@ impl Renderer {
             (b > a && at < b).then_some(b)
         };
         for ch in 0..CHANNELS {
-            let Some(g) = self.lane_grain.get(ch) else {
+            // Out of its slot while its span is decided, as in the decide
+            // walk: `grain_ok` and `clip_pedal` are the renderer's to ask.
+            let Some(mut boxed) = self.spine.lanes.get_mut(ch).and_then(Option::take) else {
                 continue;
             };
-            // Where the lane's newest grain ends, and whether the chunk is
-            // being served from it rather than from the one behind it.
-            let newest = g.newest();
-            let holds = g.covers(at, frames);
-            // **A lane that has stopped being grained still owes the fold
-            // whatever its rack has already produced**, and this is the
-            // third time the same rule has been learnt the hard way. A
-            // lane's rack is a stateful chain walking forward through the
-            // song; a reverb's delay lines and a compressor's envelope
-            // cannot be rewound, so audio the rack has already been
-            // through must be SERVED and never rendered again.
-            //
-            // Three ways in, all of them measured:
-            //
-            // - the knob turned down or off mid-roll, which the audio setup
-            //   dialog allows at any time (0.7 dBFS wrong),
-            // - a callback that arrives WIDER than the grain, which makes
-            //   `grain <= frames` true for that block alone (2.4 dBFS),
-            // - a lane leaving the eligible set because it was armed,
-            //   punched, or had a plugin face opened on it, which is what
-            //   the insert tap does (15.9 dBFS wrong, and arming a track
-            //   mid-take is not an unusual thing to do).
-            //
-            // In all three the ring is ahead of the playhead and the lane
-            // was rendering the chunk anyway. Serve while the ring can
-            // answer, then go live from where it ENDS.
-            if grain <= frames || !self.grain_ok(ch, free) {
-                if holds {
-                    self.lane_skip[ch] = true;
-                } else if let Some(end) = newest
-                    .map(|k| k.at + u64::from(k.frames))
-                    .filter(|end| *end > at && *end < at + frames as u64)
-                {
-                    self.lane_at[ch] = end;
-                    self.lane_len[ch] = (at + frames as u64 - end) as usize;
-                }
-                // A ring that is ahead of the span without covering it has
-                // a hole in it, which only a locate can leave and a locate
-                // clears the ring. The chunk is rendered whole, as it was
-                // before any of this existed.
-                continue;
-            }
-            match (holds, newest) {
-                // The ring cannot answer: render the chunk's span, widened
-                // to a grain so the next callbacks are served from it.
-                // The ring cannot answer: render on from where it ends.
+            'grain: {
+                let lane = boxed.body_mut();
+                let g = &lane.grain;
+                // Where the lane's newest grain ends, and whether the chunk is
+                // being served from it rather than from the one behind it.
+                let newest = g.newest();
+                let holds = g.covers(at, frames);
+                // **A lane that has stopped being grained still owes the fold
+                // whatever its rack has already produced**, and this is the
+                // third time the same rule has been learnt the hard way. A
+                // lane's rack is a stateful chain walking forward through the
+                // song; a reverb's delay lines and a compressor's envelope
+                // cannot be rewound, so audio the rack has already been
+                // through must be SERVED and never rendered again.
                 //
-                // **From the END of the newest grain, never from the
-                // playhead**, and that is the whole of it. A lane's rack is
-                // a stateful chain walking forward through the song, and
-                // audio it has already been through must not be handed to
-                // it again - which is the same rule that made speculation
-                // the wrong shape for this feature in the first place.
+                // Three ways in, all of them measured:
                 //
-                // Catching up from `at` looked right and was not. With a
-                // grain that is a whole number of blocks it never fires
-                // after the first chunk, so it went unseen. With a grain
-                // that is NOT - 5 ms against a 128-frame buffer is 240
-                // frames - `covers` fails on the very next chunk, because
-                // the ring ends part way through the span the fold wants;
-                // the lane then caught up from `at` and re-ran the overlap
-                // through its rack. Measured: 199 overlapping catch-ups in
-                // 200 chunks, and a plate reverb 15.7 dB wrong.
-                (false, _) => {
-                    let from = match newest {
-                        Some(k) if k.at + u64::from(k.frames) > at => {
-                            k.at + u64::from(k.frames)
-                        }
-                        // Cold, or the ring is behind the playhead after a
-                        // locate or a park: there is nothing to continue.
-                        _ => at,
-                    };
-                    // Long enough to finish the span the fold is asking
-                    // for, however little of it is left.
-                    let need = usize::try_from(
-                        at.saturating_add(frames as u64).saturating_sub(from),
-                    )
-                    .unwrap_or(frames);
-                    self.lane_at[ch] = from;
-                    // **The clip may shorten the look-ahead and never the
-                    // span the fold is owed.** The wrap is taken at BLOCK
-                    // granularity - `run_transport` folds `pos` back only
-                    // once the whole block is out - so the block that
-                    // straddles the loop end really does play up to a
-                    // block past `loop_b`, and a lane whose grain was cut
-                    // short at the boundary has to render the rest of it.
-                    // Clipping that to nothing is what made the straddling
-                    // block silent.
-                    let want = Self::to_grid(from, grain.max(need));
-                    let len = Self::clip_grain(from, want, loop_b).max(need);
-                    self.lane_len[ch] = self.clip_pedal(ch, at, frames, from, len, need);
-                }
-                // Served from the newest grain, so the older slot is free.
-                // Look ahead when this lane's phase has come up.
-                (true, Some(key)) if at >= key.at => {
-                    let into = at - key.at;
-                    let phases = Self::grain_phases(grain, frames);
-                    let phase = (ch as u64 % phases) * grain as u64 / phases;
-                    let end = key.at + u64::from(key.frames);
-                    // **And only into a slot nothing still owes the fold.**
-                    // See `LaneGrains::next_is_free`.
-                    if into >= phase && end > at && g.next_is_free(at) {
-                        self.lane_at[ch] = end;
-                        let want = Self::to_grid(end, grain);
-                        let len = Self::clip_grain(end, want, loop_b);
-                        self.lane_len[ch] = self.clip_pedal(ch, at, frames, end, len, 0);
-                    } else {
-                        self.lane_skip[ch] = true;
+                // - the knob turned down or off mid-roll, which the audio setup
+                //   dialog allows at any time (0.7 dBFS wrong),
+                // - a callback that arrives WIDER than the grain, which makes
+                //   `grain <= frames` true for that block alone (2.4 dBFS),
+                // - a lane leaving the eligible set because it was armed,
+                //   punched, or had a plugin face opened on it, which is what
+                //   the insert tap does (15.9 dBFS wrong, and arming a track
+                //   mid-take is not an unusual thing to do).
+                //
+                // In all three the ring is ahead of the playhead and the lane
+                // was rendering the chunk anyway. Serve while the ring can
+                // answer, then go live from where it ENDS.
+                if grain <= frames || !self.grain_ok(ch, free) {
+                    if holds {
+                        lane.skip = true;
+                    } else if let Some(end) = newest
+                        .map(|k| k.at + u64::from(k.frames))
+                        .filter(|end| *end > at && *end < at + frames as u64)
+                    {
+                        lane.at = end;
+                        lane.len = (at + frames as u64 - end) as usize;
                     }
+                    // A ring that is ahead of the span without covering it has
+                    // a hole in it, which only a locate can leave and a locate
+                    // clears the ring. The chunk is rendered whole, as it was
+                    // before any of this existed.
+                    break 'grain;
                 }
-                // Served from the older slot: the look-ahead is already
-                // rendered and there is nothing to do.
-                (true, _) => self.lane_skip[ch] = true,
+                match (holds, newest) {
+                    // The ring cannot answer: render the chunk's span, widened
+                    // to a grain so the next callbacks are served from it.
+                    // The ring cannot answer: render on from where it ends.
+                    //
+                    // **From the END of the newest grain, never from the
+                    // playhead**, and that is the whole of it. A lane's rack is
+                    // a stateful chain walking forward through the song, and
+                    // audio it has already been through must not be handed to
+                    // it again - which is the same rule that made speculation
+                    // the wrong shape for this feature in the first place.
+                    //
+                    // Catching up from `at` looked right and was not. With a
+                    // grain that is a whole number of blocks it never fires
+                    // after the first chunk, so it went unseen. With a grain
+                    // that is NOT - 5 ms against a 128-frame buffer is 240
+                    // frames - `covers` fails on the very next chunk, because
+                    // the ring ends part way through the span the fold wants;
+                    // the lane then caught up from `at` and re-ran the overlap
+                    // through its rack. Measured: 199 overlapping catch-ups in
+                    // 200 chunks, and a plate reverb 15.7 dB wrong.
+                    (false, _) => {
+                        let from = match newest {
+                            Some(k) if k.at + u64::from(k.frames) > at => {
+                                k.at + u64::from(k.frames)
+                            }
+                            // Cold, or the ring is behind the playhead after a
+                            // locate or a park: there is nothing to continue.
+                            _ => at,
+                        };
+                        // Long enough to finish the span the fold is asking
+                        // for, however little of it is left.
+                        let need = usize::try_from(
+                            at.saturating_add(frames as u64).saturating_sub(from),
+                        )
+                        .unwrap_or(frames);
+                        lane.at = from;
+                        // **The clip may shorten the look-ahead and never the
+                        // span the fold is owed.** The wrap is taken at BLOCK
+                        // granularity - `run_transport` folds `pos` back only
+                        // once the whole block is out - so the block that
+                        // straddles the loop end really does play up to a
+                        // block past `loop_b`, and a lane whose grain was cut
+                        // short at the boundary has to render the rest of it.
+                        // Clipping that to nothing is what made the straddling
+                        // block silent.
+                        let want = Self::to_grid(from, grain.max(need));
+                        let len = Self::clip_grain(from, want, loop_b).max(need);
+                        lane.len = self.clip_pedal(ch, at, frames, from, len, need);
+                    }
+                    // Served from the newest grain, so the older slot is free.
+                    // Look ahead when this lane's phase has come up.
+                    (true, Some(key)) if at >= key.at => {
+                        let into = at - key.at;
+                        let phases = Self::grain_phases(grain, frames);
+                        let phase = (ch as u64 % phases) * grain as u64 / phases;
+                        let end = key.at + u64::from(key.frames);
+                        // **And only into a slot nothing still owes the fold.**
+                        // See `LaneGrains::next_is_free`.
+                        if into >= phase && end > at && g.next_is_free(at) {
+                            lane.at = end;
+                            let want = Self::to_grid(end, grain);
+                            let len = Self::clip_grain(end, want, loop_b);
+                            lane.len = self.clip_pedal(ch, at, frames, end, len, 0);
+                        } else {
+                            lane.skip = true;
+                        }
+                    }
+                    // Served from the older slot: the look-ahead is already
+                    // rendered and there is nothing to do.
+                    (true, _) => lane.skip = true,
+                }
+                if lane.len == 0 {
+                    lane.skip = true;
+                }
             }
-            if self.lane_len[ch] == 0 {
-                self.lane_skip[ch] = true;
+            if let Some(cell) = self.spine.lanes.get_mut(ch) {
+                *cell = Some(boxed);
             }
         }
     }
@@ -13602,8 +13743,8 @@ impl Renderer {
         true
     }
 
-    fn run_lane_pdc(&mut self, ch: usize, frames: usize, pdc_max: u32) {
-        let prep = self.lane_prep[ch];
+    fn run_lane_pdc(&mut self, ch: usize, lane: &mut LaneBody, frames: usize, pdc_max: u32) {
+        let prep = lane.prep;
         // **One formula, folder or not: wait for what this lane's audio does
         // NOT pay on its way out.** A wait is additive, so where it is
         // inserted does not matter, only the total. A loose channel pays its
@@ -13634,9 +13775,7 @@ impl Renderer {
         // one contiguous run of frames in consumption order, which is the
         // only thing `DelayLine::run` can be handed - it advances its write
         // cursor by `frames` on every call and has no way to rewind.
-        if let Some(line) = self.pdc.get_mut(ch) {
-            line.run(&mut self.lane_stage, frames, want);
-        }
+        lane.pdc.run(&mut self.lane_stage, frames, want);
         // **And the dry copy waits `own` frames LONGER**, on a line of its
         // own, because it is the one signal here that did not pay the rack.
         //
@@ -13657,18 +13796,14 @@ impl Renderer {
         // `max - folded` once, and left that much after it. Of today's bay
         // voices only the analog reports anything (68 frames); a hosted voice
         // and the sampler report zero to their bay, so `paid` is zero for
-        // them. See `Self::lane_dry_paid`.
+        // them. See `LaneBody::dry_paid`.
         if self.stems_dry {
-            let paid = self.lane_dry_paid.get(ch).copied().unwrap_or(0);
+            let paid = lane.dry_paid;
             let dry_want = usize::try_from(
                 pdc_max.saturating_sub(prep.folder_lat).saturating_sub(paid),
             )
             .unwrap_or(0);
-            if let (Some(line), Some(row)) =
-                (self.dry_pdc.get_mut(ch), self.lane_dry.get_mut(ch))
-            {
-                line.run(row, frames, dry_want);
-            }
+            lane.dry_pdc.run(&mut lane.dry, frames, dry_want);
         }
     }
 
@@ -13755,11 +13890,16 @@ impl Renderer {
             let Ok((lane, next)) = self.dx7_incoming.pop() else {
                 break;
             };
-            if let Some(slot) = self.dx7s.get_mut(lane) {
-                let old = std::mem::replace(slot, next);
-                let _ = self.dx7_retiring.push((lane, old));
-            } else {
-                let _ = self.dx7_retiring.push((lane, next));
+            // **Into the lane's own box**, or straight back for a slot that
+            // holds no lane: never dropped here.
+            match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
+                Some(l) => {
+                    let old = std::mem::replace(&mut l.body_mut().dx7, next);
+                    let _ = self.dx7_retiring.push((lane, old));
+                }
+                None => {
+                    let _ = self.dx7_retiring.push((lane, next));
+                }
             }
         }
         while self.keys_retiring.slots() > 0 {
@@ -13773,11 +13913,14 @@ impl Renderer {
             let Ok((lane, next)) = self.keys_incoming.pop() else {
                 break;
             };
-            if let Some(slot) = self.keys_lanes.get_mut(lane) {
-                let old = std::mem::replace(slot, next);
-                let _ = self.keys_retiring.push((lane, old));
-            } else {
-                let _ = self.keys_retiring.push((lane, next));
+            match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
+                Some(l) => {
+                    let old = std::mem::replace(&mut l.body_mut().keys, next);
+                    let _ = self.keys_retiring.push((lane, old));
+                }
+                None => {
+                    let _ = self.keys_retiring.push((lane, next));
+                }
             }
         }
         // Patch changes, if any are waiting and the lock is free this block.
@@ -13791,12 +13934,16 @@ impl Renderer {
             // would drop that lane's patch on the floor. The queue is
             // already the deferral mechanism; keeping an entry is how it is
             // used as one, and `retain` allocates nothing.
-            let (leased, dx7s) = (&self.leased, &mut self.dx7s);
+            let (leased, lanes) = (&self.leased, &mut self.spine.lanes);
             g.retain(|(lane, v)| {
                 if leased.contains(*lane) {
                     return true;
                 }
-                if let Some(Some(d)) = dx7s.get_mut(*lane) {
+                if let Some(d) = lanes
+                    .get_mut(*lane)
+                    .and_then(Option::as_deref_mut)
+                    .and_then(|l| l.body_mut().dx7.as_mut())
+                {
                     d.set_voice(*v);
                 }
                 false
@@ -13816,13 +13963,17 @@ impl Renderer {
                 // A new schedule owes nothing: what stands behind the
                 // playhead now is skipped by where the search starts, not by
                 // a cursor anybody has to remember to rewind.
-                self.park_from = [u64::MAX; CHANNELS];
+                for l in self.spine.lanes.iter_mut().flatten() {
+                    l.body_mut().park_from = u64::MAX;
+                }
             }
         }
         // A jump owes nothing behind where it landed. There is no cursor to
         // rewind any more; the search starts from the block.
         if flush {
-            self.park_from = [u64::MAX; CHANNELS];
+            for l in self.spine.lanes.iter_mut().flatten() {
+                l.body_mut().park_from = u64::MAX;
+            }
         }
         // **Every lane holding a drumpad**, not the first. A drum instrument
         // loads a full instance per channel, so each of those lanes turns its
@@ -13877,11 +14028,15 @@ impl Renderer {
                     // is held, not scheduled - and there is no such thing for
                     // a span the playhead has not reached yet.
                     let held = self.shared.audition[ch].load(Ordering::Relaxed) != u32::MAX;
+                    let Some(lane) = self.spine.lanes.get(ch).and_then(Option::as_deref) else {
+                        continue;
+                    };
+                    let lane = lane.peek();
                     if self.pinned.contains(ch)
                         || self.curve_lanes.contains(ch)
                         || held
-                        || self.audition_on[ch].is_some()
-                        || self.audition_rang[ch]
+                        || lane.audition_on.is_some()
+                        || lane.audition_rang
                     {
                         continue;
                     }
@@ -13907,10 +14062,14 @@ impl Renderer {
             // instrument is being fed for the grain it is about to render,
             // which may be up to a grain ahead of the playhead. See
             // `plan_grains`; for every other lane these are the chunk's own.
-            if self.lane_skip[ch] {
+            let Some(lane) = self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) else {
+                continue;
+            };
+            let lane = lane.body_mut();
+            if lane.skip {
                 continue;
             }
-            let at = self.lane_at[ch];
+            let at = lane.at;
             let armed_here = self.desk.midi_on.contains(ch);
             // **What this lane's PEDAL is, live and recorded together.**
             //
@@ -13932,13 +14091,13 @@ impl Renderer {
             };
             let pedal_now: [u8; 3] = std::array::from_fn(|i| {
                 if armed_here {
-                    self.live_pedal[ch][i].max(clip_pedal[i])
+                    lane.live_pedal[i].max(clip_pedal[i])
                 } else {
                     clip_pedal[i]
                 }
             });
             if self.desk.keys.contains(ch) {
-                if let Some(Some(k)) = self.keys_lanes.get_mut(ch) {
+                if let Some(k) = lane.keys.as_mut() {
                     let want = self.shared.keys_patch[ch].load(Ordering::Relaxed) as usize;
                     if let Some(p) = crate::keys::Patch::ALL.get(want) {
                         k.set_patch(*p);
@@ -13964,7 +14123,7 @@ impl Renderer {
                 }
             }
             if self.desk.builtins.contains(ch) {
-                if let Some(Some(d)) = self.dx7s.get_mut(ch) {
+                if let Some(d) = lane.dx7.as_mut() {
                     d.set_pedal(pedal_now[0] >= 64);
                 }
             }
@@ -13979,15 +14138,15 @@ impl Renderer {
             // live path keeps the channel it arrived on, and those events go
             // in whole, further down.
             for (slot, cc) in PEDAL_CCS.into_iter().enumerate() {
-                if self.lane_pedal_sent[ch][slot] == pedal_now[slot] {
+                if lane.pedal_sent[slot] == pedal_now[slot] {
                     continue;
                 }
-                self.lane_pedal_sent[ch][slot] = pedal_now[slot];
+                lane.pedal_sent[slot] = pedal_now[slot];
                 #[cfg(test)]
                 if ch == 0 && std::env::var_os("TANGENT_PEDALTRACE").is_some() {
                     eprintln!(
                         "PT lane {ch} cc {cc} -> {} at frame {at} (span {} frames)",
-                        pedal_now[slot], self.lane_len[ch]
+                        pedal_now[slot], lane.len
                     );
                 }
                 if self.lane_pedal_out.len() < self.lane_pedal_out.capacity() {
@@ -14007,8 +14166,11 @@ impl Renderer {
         // read the live list and the clips while filling it.
         // Nothing renders until the deciding walk says so, and nothing
         // folds until a render says so.
-        self.lane_wants = [false; CHANNELS];
-        self.lane_folds = [false; CHANNELS];
+        for l in self.spine.lanes.iter_mut().flatten() {
+            let b = l.body_mut();
+            b.wants = false;
+            b.folds = false;
+        }
         let mut lane_notes = std::mem::take(&mut self.lane_notes);
         // Taken out of `self` for the same reason `lane_notes` is: the loop
         // below reads the live list and the block's pedal moves while it
@@ -14024,690 +14186,712 @@ impl Renderer {
         self.probe_clip_pins.clear();
         self.probe_inst_pins.clear();
         for ch in 0..CHANNELS {
-            // **Nothing at all for a lane whose ring already holds this
-            // chunk.** Not its notes, not what its instrument has been told,
-            // not its pedal: the grain that covers this chunk did all of
-            // that when it was rendered, and doing it again here would tell
-            // the instrument about the same notes twice.
-            //
-            // The two latency terms are refreshed anyway, because the FOLD
-            // reads them at consumption for every lane it sums and they
-            // must answer for the desk's compensation now.
-            if self.lane_skip[ch] {
-                self.lane_prep[ch].folder_lat = self.folder_lat[ch];
-                self.lane_prep[ch].pedal_latency = self.pedal_latency(ch);
-                self.lane_wants[ch] = false;
+            // **The lane comes OUT of its slot for its decision and goes
+            // back after it.** A pointer move each way, no allocation: it
+            // is what lets this walk hold the lane and call the renderer's
+            // own methods in one breath, which every term below does.
+            let Some(mut boxed) = self.spine.lanes.get_mut(ch).and_then(Option::take) else {
                 continue;
-            }
-            // **This lane's span.** The chunk's own unless the grain clock
-            // moved it, and every `at`, `frames` and `due_from` below is
-            // this lane's rather than the walk's from here down.
-            let (at, frames) = (self.lane_at[ch], self.lane_len[ch]);
-            let due_from = wrap_from.map_or(at, |a| a.min(at));
-            // Holding the sentinel is not enough: the INSTANCE has to have
-            // arrived. Between the bay being filled and the ring delivering,
-            // the lane is a lane with nothing loaded, exactly like a kit
-            // still decoding.
-            let is_builtin =
-                self.desk.builtins.contains(ch) && self.dx7s.get(ch).is_some_and(Option::is_some);
-            // **Either seat.** A channel with its first three bays empty and
-            // a plugin in bay 4 has a live rack; reading only seat `ch` is
-            // how such a lane skipped the whole block and its second rack
-            // never ran at all.
-            let rack_live = !self.racks[ch].is_empty()
-                || !self.racks[tangent_ui::recorder::folder_extra_seat(ch)].is_empty();
-            // An AUDIO channel's bit is set and its rack runs in
-            // `mix_monitor`, over its input — running it here too would fold
-            // its effect tails twice.
-            let armed = self.desk.midi_on.contains(ch);
+            };
+            'decide: {
+                let lane = boxed.body_mut();
+                // **Nothing at all for a lane whose ring already holds this
+                // chunk.** Not its notes, not what its instrument has been told,
+                // not its pedal: the grain that covers this chunk did all of
+                // that when it was rendered, and doing it again here would tell
+                // the instrument about the same notes twice.
+                //
+                // The two latency terms are refreshed anyway, because the FOLD
+                // reads them at consumption for every lane it sums and they
+                // must answer for the desk's compensation now.
+                if lane.skip {
+                    lane.prep.folder_lat = self.folder_lat[ch];
+                    lane.prep.pedal_latency = lane_pedal_latency(
+                        lane,
+                        self.folder_is[ch],
+                        &self.shared,
+                        &self.desk.frozen,
+                        ch,
+                    );
+                    lane.wants = false;
+                    break 'decide;
+                }
+                // **This lane's span.** The chunk's own unless the grain clock
+                // moved it, and every `at`, `frames` and `due_from` below is
+                // this lane's rather than the walk's from here down.
+                let (at, frames) = (lane.at, lane.len);
+                let due_from = wrap_from.map_or(at, |a| a.min(at));
+                // Holding the sentinel is not enough: the INSTANCE has to have
+                // arrived. Between the bay being filled and the ring delivering,
+                // the lane is a lane with nothing loaded, exactly like a kit
+                // still decoding.
+                let is_builtin =
+                    self.desk.builtins.contains(ch) && lane.dx7.is_some();
+                // **Either seat.** A channel with its first three bays empty and
+                // a plugin in bay 4 has a live rack; reading only seat `ch` is
+                // how such a lane skipped the whole block and its second rack
+                // never ran at all.
+                let rack_live =
+                    !lane.chains[CHAIN_OWN].is_empty() || !lane.chains[CHAIN_EXTRA].is_empty();
+                // An AUDIO channel's bit is set and its rack runs in
+                // `mix_monitor`, over its input — running it here too would fold
+                // its effect tails twice.
+                let armed = self.desk.midi_on.contains(ch);
 
-            // ── this lane's notes: the LIVE list while armed, the CLIPS'
-            // whenever the transport stands on them — playback does not ask
-            // the arm, which is the whole point of the arm ──
-            lane_notes.clear();
-            if armed {
-                // **This lane's OWN live notes**, not the block's. `armed`
-                // says whether the lane is listening; `note_lanes` says
-                // whether this message is one it asked for — the device it
-                // came from and the channel it arrived on, decided once per
-                // event in `collect_notes`. Copying the whole list here is
-                // what made two keyboards impossible: every armed lane heard
-                // every note, whatever its input chip claimed.
-                let route = self.midi_routes[ch];
-                for (n, m) in self.notes.iter().zip(&self.note_lanes) {
-                    if m.reaches(route) {
-                        lane_notes.push(*n);
+                // ── this lane's notes: the LIVE list while armed, the CLIPS'
+                // whenever the transport stands on them — playback does not ask
+                // the arm, which is the whole point of the arm ──
+                lane_notes.clear();
+                if armed {
+                    // **This lane's OWN live notes**, not the block's. `armed`
+                    // says whether the lane is listening; `note_lanes` says
+                    // whether this message is one it asked for — the device it
+                    // came from and the channel it arrived on, decided once per
+                    // event in `collect_notes`. Copying the whole list here is
+                    // what made two keyboards impossible: every armed lane heard
+                    // every note, whatever its input chip claimed.
+                    let route = self.midi_routes[ch];
+                    for (n, m) in self.notes.iter().zip(&self.note_lanes) {
+                        if m.reaches(route) {
+                            lane_notes.push(*n);
+                        }
                     }
                 }
-            }
-            // **This lane's controls: the live ones while armed, plus the
-            // pedal its clips moved this block.**
-            //
-            // The live events go in WHOLE rather than as the level computed
-            // earlier — they carry their own offset within the block and
-            // their own MIDI channel, and the modelled piano publishes a different
-            // parameter for each channel's CC64, so collapsing them would
-            // move the wrong piano.
-            lane_controls.clear();
-            if armed {
-                let route = self.midi_routes[ch];
-                for (c, m) in self.controls.iter().zip(&self.control_lanes) {
-                    if m.reaches(route) {
+                // **This lane's controls: the live ones while armed, plus the
+                // pedal its clips moved this block.**
+                //
+                // The live events go in WHOLE rather than as the level computed
+                // earlier — they carry their own offset within the block and
+                // their own MIDI channel, and the modelled piano publishes a different
+                // parameter for each channel's CC64, so collapsing them would
+                // move the wrong piano.
+                lane_controls.clear();
+                if armed {
+                    let route = self.midi_routes[ch];
+                    for (c, m) in self.controls.iter().zip(&self.control_lanes) {
+                        if m.reaches(route) {
+                            lane_controls.push(*c);
+                        }
+                    }
+                }
+                for (lane, c) in &self.lane_pedal_out {
+                    if usize::from(*lane) == ch
+                        && lane_controls.len() < lane_controls.capacity()
+                    {
                         lane_controls.push(*c);
                     }
                 }
-            }
-            for (lane, c) in &self.lane_pedal_out {
-                if usize::from(*lane) == ch
-                    && lane_controls.len() < lane_controls.capacity()
-                {
-                    lane_controls.push(*c);
-                }
-            }
-            if flush {
-                // The strands the jump or the stop left on THIS lane — swept
-                // as their offs are emitted, entry by entry, never wholesale:
-                // a note the jump LANDS ON registers later this same block,
-                // and a clear at the end would strand it instead.
-                let mut held = self.told[ch];
-                while held != 0 {
-                    let pitch = held.trailing_zeros();
-                    held &= held - 1;
-                    if lane_notes.len() < lane_notes.capacity() {
-                        lane_notes.push(Note {
-                            offset: 0,
-                            pitch: pitch as i16,
-                            velocity: 0.0,
-                            on: false,
-                        });
-                    }
-                    self.told[ch] &= !(1u128 << pitch);
-                }
-            }
-            let mut lane_has_clips = false;
-            if rolling {
-                let end = at + frames as u64;
-                // **This lane's own park, taken for one block.** It used to
-                // be one desk-wide bit, so a chord storm on lane 0 changed
-                // what lane 31 was willing to sound.
-                // **And the frame it still owes from.** `u64::MAX` when it
-                // owes nothing, so the `min` below leaves the ordinary block
-                // starting exactly where the playhead is.
-                let owed = std::mem::replace(&mut self.park_from[ch], u64::MAX);
-                let from = due_from.min(owed);
-                // **Offs FIRST.** Two notes on one key back to back — the
-                // owner's tied chords — put the first's off and the
-                // second's on in the same block, and ons pushed first got
-                // silenced by the off behind them: only the first chord
-                // ever sounded. The drain runs again after the walk for
-                // notes that both start and end inside this block.
-                let mut held = self.told[ch];
-                while held != 0 {
-                    let pitch = held.trailing_zeros();
-                    held &= held - 1;
-                    let due = self.told_off[ch][pitch as usize];
-                    if due >= end {
-                        continue;
-                    }
-                    if lane_notes.len() < lane_notes.capacity() {
-                        lane_notes.push(Note {
-                            offset: due.saturating_sub(at) as i32,
-                            pitch: pitch as i16,
-                            velocity: 0.0,
-                            on: false,
-                        });
-                    }
-                    self.told[ch] &= !(1u128 << pitch);
-                }
-                for idx in lane_range(self.midi_first.as_ref(), ch, self.midi_clips.len()) {
-                    if self.midi_clips[idx].strip != ch {
-                        continue;
-                    }
-                    lane_has_clips = true;
-                    let mc = &self.midi_clips[idx];
-                    // **Where this clip's block begins, FOUND rather than
-                    // remembered.** There was a cursor per clip, advanced by
-                    // the walk and reset wholesale by a locate and by a clip
-                    // list swap. It was never anything but a cache of this
-                    // one line: the notes are sorted by time, so where the
-                    // block starts is a binary search. Deleting it is what
-                    // stops a locate and a loop wrap needing to know the note
-                    // walk exists, which is the argument this file already
-                    // makes for the pedal, applied to notes.
-                    let mut cur = mc.notes.partition_point(|n| {
-                        mc.start.saturating_add(n.at) < from
-                    });
-                    while cur < mc.notes.len() {
-                        let nt = mc.notes[cur];
-                        let on_f = mc.start.saturating_add(nt.at);
-                        if on_f >= end {
-                            break;
-                        }
-                        // Past the clip's trimmed end, or inside the region a
-                        // rolling record is REPLACING: skipped, not sounded.
-                        // Behind the playhead needs no test any more; the
-                        // search above started past it.
-                        if nt.at >= mc.len || on_f >= self.punch_now[ch] {
-                            cur += 1;
-                            continue;
-                        }
-                        if lane_notes.len() >= lane_notes.capacity() {
-                            // **Withheld, not dropped.** `cur += 1` used to
-                            // run before this break, so the note it consumed
-                            // was never pushed anywhere and the stored cursor
-                            // stood past it: one clip note vanished from the
-                            // arrangement, for good, every time this fired —
-                            // where the live path parks its overflow in
-                            // `pending`. The cursor now stays ON the note and
-                            // `clip_parked` keeps the next block's walk from
-                            // fast-forwarding over it.
-                            // **The frame this lane still owes from**, and
-                            // the smallest of them if several clips park:
-                            // nothing between here and the block's end has
-                            // been delivered by this clip, so the next block
-                            // re-derives from here.
-                            //
-                            // The honest limit, and it needs an ARMED lane
-                            // with more than two hundred and fifty-six events
-                            // in one block to reach at all, because a lane
-                            // holds at most one note per pitch: a note an
-                            // EARLIER clip on this lane already delivered
-                            // this block, at a frame past this one, is
-                            // re-derived next block and re-articulates. It
-                            // used to arrive a block late instead. Neither is
-                            // silence, which is what this guard is for.
-                            self.park_from[ch] = self.park_from[ch].min(on_f);
-                            break;
-                        }
-                        cur += 1;
-                        let offset = on_f.saturating_sub(at) as i32;
-                        // **A pitch cannot start while it is already
-                        // sounding.** If this lane still holds an active clip
-                        // note on this key, its off is emitted HERE, in front
-                        // of the on, and its entry retired — rather than
-                        // being left to fall due later and switch off the
-                        // note that replaced it.
-                        //
-                        // The offs pass above catches the ordinary case,
-                        // where the old note's end is at or before this
-                        // block's end. It cannot catch an OVERLAP: two notes
-                        // of one pitch drawn across each other, or a length
-                        // that rounds a frame past the next attack. Both
-                        // sounded as a chord being choked a sample after it
-                        // spoke.
-                        let key = usize::from(nt.key);
-                        if key < 128 && self.told[ch] & (1u128 << key) != 0 {
-                            if lane_notes.len() < lane_notes.capacity() {
-                                lane_notes.push(Note {
-                                    offset,
-                                    pitch: nt.key.into(),
-                                    velocity: 0.0,
-                                    on: false,
-                                });
-                            }
-                            self.told[ch] &= !(1u128 << key);
-                        }
-                        lane_notes.push(Note {
-                            // `saturating_sub`, because a parked note's `on_f`
-                            // is behind `at` and it lands at offset 0 — late
-                            // by a block, which is the price of the park.
-                            offset,
-                            pitch: i16::from(nt.key),
-                            velocity: f32::from(nt.vel) / 127.0,
-                            on: true,
-                        });
-                        let end_rel = nt.at.saturating_add(nt.dur.max(1)).min(mc.len);
-                        if key < 128 {
-                            self.told[ch] |= 1u128 << key;
-                            self.told_off[ch][key] = mc.start.saturating_add(end_rel);
-                        }
-                    }
-                }
-                // The offs that fall due inside this block, on this lane.
-                let mut held = self.told[ch];
-                while held != 0 {
-                    let pitch = held.trailing_zeros();
-                    held &= held - 1;
-                    let due = self.told_off[ch][pitch as usize];
-                    if due >= end {
-                        continue;
-                    }
-                    if lane_notes.len() < lane_notes.capacity() {
-                        lane_notes.push(Note {
-                            offset: due.saturating_sub(at) as i32,
-                            pitch: pitch as i16,
-                            velocity: 0.0,
-                            on: false,
-                        });
-                    }
-                    self.told[ch] &= !(1u128 << pitch);
-                }
-            } else {
-                lane_has_clips = self
-                    .midi_clips
-                    .iter()
-                    .any(|m| m.strip == ch);
-            }
-
-            // ── the AUDITION, reconciled ────────────────────────────────
-            //
-            // `Shared::audition` is a LEVEL — it says what this lane is being
-            // held on, never that something happened — so the work here is a
-            // comparison and not a delivery: what the lane has been told
-            // against what it should have been told, with only the difference
-            // pushed. See the field for why that is the shape.
-            //
-            // **The pair goes in together or not at all.** A push refused for
-            // want of room used to be the "withheld, not dropped" lesson the
-            // clip walk above learned the hard way, and here it would be
-            // worse than a lost note: an OFF dropped while `audition_on` moved
-            // on is a note nothing will ever think to close again. So the room
-            // for both is checked first, and a block with no room simply
-            // leaves the level alone and reconciles on the next one — which
-            // costs a note one buffer and can strand nothing.
-            //
-            // LAST in the list on purpose, for the reason the clip walk's own
-            // "offs first" gives: a clip note ending on this very pitch this
-            // block would otherwise silence the audition a sample after it
-            // spoke.
-            let want = u8::try_from(self.shared.audition[ch].load(Ordering::Relaxed))
-                .ok()
-                .filter(|k| *k < 128);
-            if want != self.audition_on[ch] && lane_notes.len() + 2 <= lane_notes.capacity() {
-                if let Some(old) = self.audition_on[ch] {
-                    lane_notes.push(Note {
-                        offset: 0,
-                        pitch: i16::from(old),
-                        velocity: 0.0,
-                        on: false,
-                    });
-                }
-                if let Some(new) = want {
-                    lane_notes.push(Note {
-                        offset: 0,
-                        pitch: i16::from(new),
-                        velocity: f32::from(tangent_ui::recorder::AUDITION_VELOCITY) / 127.0,
-                        on: true,
-                    });
-                }
-                self.audition_on[ch] = want;
-            }
-            // **Still speaking**: the key is down, or it has been let go and
-            // the instrument has not finished with it. Either keeps the lane
-            // out of the force-quiet below and keeps it rendering, which is
-            // the whole difference between an audition that releases and one
-            // that is guillotined.
-            if want.is_some() {
-                self.audition_rang[ch] = true;
-            } else if self.audition_rang[ch] && !self.lane_instrument_active(ch) {
-                self.audition_rang[ch] = false;
-            }
-            let auditioning = self.audition_rang[ch];
-
-            // The DRUMPAD lane: every note here is a pad strike — the same
-            // sixteen one-shots the drumpad window plays, so the editor's
-            // roll and a MIDI keyboard trigger exactly what a finger does.
-            // The strikes render in `mix_pads`, on the DRUMS bus; this lane
-            // itself carries no signal, but its fader still has to advance
-            // so a later un-assignment starts at the written level.
-            let is_keys =
-                self.desk.keys.contains(ch) && self.keys_lanes.get(ch).is_some_and(Option::is_some);
-            if self.desk.drums.contains(ch) && !is_builtin && !is_keys {
-                let obey = [
-                    self.shared.pad_obey[ch][0].load(Ordering::Relaxed),
-                    self.shared.pad_obey[ch][1].load(Ordering::Relaxed),
-                ];
-                for n in &lane_notes {
-                    let Ok(key) = u8::try_from(n.pitch) else {
-                        continue;
-                    };
-                    let pad = usize::from(key.wrapping_sub(PAD_BASE));
-                    if key < PAD_BASE || pad >= PADS {
-                        continue;
-                    }
-                    if !n.on {
-                        // Pads are one-shots — unless this one OBEYS
-                        // note-offs, where the release fades the voice.
-                        if obey[pad >> 6] & (1u64 << (pad & 63)) != 0
-                            && self.pad_offs.len() < self.pad_offs.capacity()
-                        {
-                            self.pad_offs.push(PadHit {
-                                offset: n.offset,
-                                pad,
+                if flush {
+                    // The strands the jump or the stop left on THIS lane — swept
+                    // as their offs are emitted, entry by entry, never wholesale:
+                    // a note the jump LANDS ON registers later this same block,
+                    // and a clear at the end would strand it instead.
+                    let mut held = lane.told;
+                    while held != 0 {
+                        let pitch = held.trailing_zeros();
+                        held &= held - 1;
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: 0,
+                                pitch: pitch as i16,
                                 velocity: 0.0,
-                                // THIS lane's kit — the clip is on it.
-                                lane: ch,
+                                on: false,
                             });
                         }
-                        continue;
+                        lane.told &= !(1u128 << pitch);
                     }
-                    if self.pad_hits.len() == self.pad_hits.capacity() {
-                        break;
-                    }
-                    self.pad_hits.push(PadHit {
-                        offset: n.offset,
-                        pad,
-                        velocity: n.velocity,
-                        lane: ch,
-                    });
                 }
-                let target = if channel_is_heard(ch, &parents, muted, soloed) {
-                    self.lane_gain(ch)
+                let mut lane_has_clips = false;
+                if rolling {
+                    let end = at + frames as u64;
+                    // **This lane's own park, taken for one block.** It used to
+                    // be one desk-wide bit, so a chord storm on lane 0 changed
+                    // what lane 31 was willing to sound.
+                    // **And the frame it still owes from.** `u64::MAX` when it
+                    // owes nothing, so the `min` below leaves the ordinary block
+                    // starting exactly where the playhead is.
+                    let owed = std::mem::replace(&mut lane.park_from, u64::MAX);
+                    let from = due_from.min(owed);
+                    // **Offs FIRST.** Two notes on one key back to back — the
+                    // owner's tied chords — put the first's off and the
+                    // second's on in the same block, and ons pushed first got
+                    // silenced by the off behind them: only the first chord
+                    // ever sounded. The drain runs again after the walk for
+                    // notes that both start and end inside this block.
+                    let mut held = lane.told;
+                    while held != 0 {
+                        let pitch = held.trailing_zeros();
+                        held &= held - 1;
+                        let due = lane.told_off[pitch as usize];
+                        if due >= end {
+                            continue;
+                        }
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: due.saturating_sub(at) as i32,
+                                pitch: pitch as i16,
+                                velocity: 0.0,
+                                on: false,
+                            });
+                        }
+                        lane.told &= !(1u128 << pitch);
+                    }
+                    for idx in lane_range(self.midi_first.as_ref(), ch, self.midi_clips.len()) {
+                        if self.midi_clips[idx].strip != ch {
+                            continue;
+                        }
+                        lane_has_clips = true;
+                        let mc = &self.midi_clips[idx];
+                        // **Where this clip's block begins, FOUND rather than
+                        // remembered.** There was a cursor per clip, advanced by
+                        // the walk and reset wholesale by a locate and by a clip
+                        // list swap. It was never anything but a cache of this
+                        // one line: the notes are sorted by time, so where the
+                        // block starts is a binary search. Deleting it is what
+                        // stops a locate and a loop wrap needing to know the note
+                        // walk exists, which is the argument this file already
+                        // makes for the pedal, applied to notes.
+                        let mut cur = mc.notes.partition_point(|n| {
+                            mc.start.saturating_add(n.at) < from
+                        });
+                        while cur < mc.notes.len() {
+                            let nt = mc.notes[cur];
+                            let on_f = mc.start.saturating_add(nt.at);
+                            if on_f >= end {
+                                break;
+                            }
+                            // Past the clip's trimmed end, or inside the region a
+                            // rolling record is REPLACING: skipped, not sounded.
+                            // Behind the playhead needs no test any more; the
+                            // search above started past it.
+                            if nt.at >= mc.len || on_f >= self.punch_now[ch] {
+                                cur += 1;
+                                continue;
+                            }
+                            if lane_notes.len() >= lane_notes.capacity() {
+                                // **Withheld, not dropped.** `cur += 1` used to
+                                // run before this break, so the note it consumed
+                                // was never pushed anywhere and the stored cursor
+                                // stood past it: one clip note vanished from the
+                                // arrangement, for good, every time this fired —
+                                // where the live path parks its overflow in
+                                // `pending`. The cursor now stays ON the note and
+                                // `clip_parked` keeps the next block's walk from
+                                // fast-forwarding over it.
+                                // **The frame this lane still owes from**, and
+                                // the smallest of them if several clips park:
+                                // nothing between here and the block's end has
+                                // been delivered by this clip, so the next block
+                                // re-derives from here.
+                                //
+                                // The honest limit, and it needs an ARMED lane
+                                // with more than two hundred and fifty-six events
+                                // in one block to reach at all, because a lane
+                                // holds at most one note per pitch: a note an
+                                // EARLIER clip on this lane already delivered
+                                // this block, at a frame past this one, is
+                                // re-derived next block and re-articulates. It
+                                // used to arrive a block late instead. Neither is
+                                // silence, which is what this guard is for.
+                                lane.park_from = lane.park_from.min(on_f);
+                                break;
+                            }
+                            cur += 1;
+                            let offset = on_f.saturating_sub(at) as i32;
+                            // **A pitch cannot start while it is already
+                            // sounding.** If this lane still holds an active clip
+                            // note on this key, its off is emitted HERE, in front
+                            // of the on, and its entry retired — rather than
+                            // being left to fall due later and switch off the
+                            // note that replaced it.
+                            //
+                            // The offs pass above catches the ordinary case,
+                            // where the old note's end is at or before this
+                            // block's end. It cannot catch an OVERLAP: two notes
+                            // of one pitch drawn across each other, or a length
+                            // that rounds a frame past the next attack. Both
+                            // sounded as a chord being choked a sample after it
+                            // spoke.
+                            let key = usize::from(nt.key);
+                            if key < 128 && lane.told & (1u128 << key) != 0 {
+                                if lane_notes.len() < lane_notes.capacity() {
+                                    lane_notes.push(Note {
+                                        offset,
+                                        pitch: nt.key.into(),
+                                        velocity: 0.0,
+                                        on: false,
+                                    });
+                                }
+                                lane.told &= !(1u128 << key);
+                            }
+                            lane_notes.push(Note {
+                                // `saturating_sub`, because a parked note's `on_f`
+                                // is behind `at` and it lands at offset 0 — late
+                                // by a block, which is the price of the park.
+                                offset,
+                                pitch: i16::from(nt.key),
+                                velocity: f32::from(nt.vel) / 127.0,
+                                on: true,
+                            });
+                            let end_rel = nt.at.saturating_add(nt.dur.max(1)).min(mc.len);
+                            if key < 128 {
+                                lane.told |= 1u128 << key;
+                                lane.told_off[key] = mc.start.saturating_add(end_rel);
+                            }
+                        }
+                    }
+                    // The offs that fall due inside this block, on this lane.
+                    let mut held = lane.told;
+                    while held != 0 {
+                        let pitch = held.trailing_zeros();
+                        held &= held - 1;
+                        let due = lane.told_off[pitch as usize];
+                        if due >= end {
+                            continue;
+                        }
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: due.saturating_sub(at) as i32,
+                                pitch: pitch as i16,
+                                velocity: 0.0,
+                                on: false,
+                            });
+                        }
+                        lane.told &= !(1u128 << pitch);
+                    }
                 } else {
-                    0.0
-                };
-                for _ in 0..frames {
-                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                    lane_has_clips = self
+                        .midi_clips
+                        .iter()
+                        .any(|m| m.strip == ch);
                 }
-                continue;
-            }
 
-            // THIS lane's synth, fed by THIS lane's notes — live and clip
-            // both — and it goes quiet only when neither is speaking for it.
-            if is_builtin {
-                if let Some(d) = self.dx7s[ch].as_mut() {
-                    if lane_notes.is_empty()
-                        && !armed
-                        && !lane_has_clips
-                        && !auditioning
-                        && d.active()
-                    {
-                        d.all_notes_off();
-                    } else {
-                        for n in &lane_notes {
-                            let Ok(pitch) = u8::try_from(n.pitch) else {
-                                continue;
-                            };
-                            if n.on {
-                                d.note_on(pitch, n.velocity);
-                            } else {
-                                d.note_off(pitch);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // The modelled keyboard, on the same terms as the DX7 above. It
-            // goes quiet only when nothing is speaking for it AND its own
-            // tails have rung out, which is why the silence test asks the
-            // instrument rather than the note list — a pedalled chord is
-            // still sounding long after the last note-off.
-            if is_keys {
-                if let Some(k) = self.keys_lanes[ch].as_mut() {
-                    if lane_notes.is_empty()
-                        && !armed
-                        && !lane_has_clips
-                        && !auditioning
-                        && k.active()
-                    {
-                        k.all_notes_off();
-                    } else {
-                        for n in &lane_notes {
-                            let Ok(pitch) = u8::try_from(n.pitch) else {
-                                continue;
-                            };
-                            if n.on {
-                                k.note_on(pitch, n.velocity);
-                            } else {
-                                k.note_off(pitch);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // **A FOLDER's own row does none of this here.**
-            //
-            // A folder is a strip, and every part of being a strip — its
-            // rack, its delay line, its fader, its pan, its send, its meter
-            // — happens once, in `fold_folders`, over the whole group. This
-            // loop walked it like any other channel and did the lot a
-            // SECOND time: the rack ran twice per block, so a stateful
-            // plugin (a reverb, a delay, a compressor) advanced at twice
-            // real time and put out noise — the owner's "dragging track 5
-            // out of folder 3 causes it to static". The fader hit its own
-            // row twice, so a clip standing on a folder at -6 dB played at
-            // -12. And the delay line ran twice on one ring, so every block
-            // came back part group and part row.
-            //
-            // So a folder contributes its RAW row to the bus and stops.
-            let is_folder = self.folder_is[ch];
-            // A lane renders when something can SOUND on it: its own live
-            // arm, or clips standing on it — through the built-in or a rack.
-            //
-            // **`lane_has_clips` only ever counted MIDI clips**, and that is
-            // the whole of why a plugin on an audio track did nothing: a
-            // lane holding nothing but audio failed this gate, took the
-            // `continue` below, and never reached the rack call at all. Its
-            // compressor did not process silence — it did not run. So audio
-            // is a second term here, and a second escape from the clause
-            // beneath: a lane with a clip on it and an EMPTY bay still has
-            // to walk the fold, or the timeline goes silent the moment the
-            // last plugin is pulled out of the strip.
-            let has_audio = self.clip_lanes.contains(ch);
-            let feeds =
-                armed || lane_has_clips || has_audio || !lane_notes.is_empty() || auditioning;
-            // ── **the PARK**: a stopped desk stops running its effects ────
-            //
-            // Racks run for any lane that has a rack at all, every block,
-            // whatever the transport is doing. That is deliberate and the
-            // reason is written on `clip_lanes`: a per-block or rolling-only
-            // answer would cut a reverb tail in half at every gap and chop it
-            // the instant somebody pressed stop. The cost was reckoned as
-            // "plugins process silence", which was assumed to be free.
-            //
-            // It is not free when the plugin MODELS something. The owner's
-            // bass DI carries an amp simulation and a compressor; fed digital
-            // silence the amp emits the hiss and hum it exists to simulate,
-            // the compressor lifts it, its send smears it through the reverb,
-            // and a project sitting untouched with nothing armed and nothing
-            // playing put about -40 dBFS of it on the master for as long as
-            // it was open. The owner heard it three times before it had a
-            // name: "a chorusy buzz constant at around -40dB on the master
-            // meter."
-            //
-            // **A voice that is SOUNDING never parks**, which is the whole
-            // care in this. An effect fed nothing has nothing of its own to
-            // lose; an instrument may be holding a note, and a park would cut
-            // it. So the rule asks the BOX — `Hosted::voice`, decided at load
-            // from the class's own subCategories — for whether the lane
-            // carries a generator at all, and then asks the generator whether
-            // it is doing anything: its own voice count where it has one (the
-            // built-ins), and otherwise what came out of it last block. A
-            // lane that carries an instrument and has put nothing above
-            // `PARK_FLOOR` out for `VOICE_PARK_S` is stood down like any
-            // other; before that rule every instrument lane on the desk
-            // rendered every block for the life of the project.
-            //
-            // The counter is per lane and zeroed by any reason to be live, so
-            // a note played over a parked desk wakes its lane for a further
-            // full window rather than being the one note that does not
-            // sound. **A CONTROL wakes it too**: a parked lane skips its rack,
-            // and the rack is where a hosted instrument is handed its pedal
-            // and its wheel — a sustain-down that arrived while the lane was
-            // parked would otherwise be the one message it never received.
-            let holds_voice = is_builtin
-                || is_keys
-                || self.racks[ch].holds_a_voice()
-                || self.racks[tangent_ui::recorder::folder_extra_seat(ch)].holds_a_voice();
-            let sounding = self.lane_instrument_active(ch)
-                || self.lane_loud.get(ch).copied().unwrap_or(true);
-            // **What keeps a lane awake while the transport rolls.**
-            //
-            // `rolling` alone used to, which meant every lane with a rack
-            // and a clip ANYWHERE on the timeline ran its whole chain on
-            // every block of the song, over silence, for the gaps between
-            // its clips and for the whole of a part it does not play on.
-            // Muting saved 12.7% of a 48-insert desk, measured, because a
-            // plugin costs the same on silence as on signal.
-            //
-            // Four terms replace it, and each answers one of the ways this
-            // is easy to get wrong:
-            //
-            // * `clip_under` - something to play this block. By span, so a
-            //   rest inside a take is still the take playing.
-            // * `lane_loud` - the lane's own measured pre-fader output from
-            //   last block. A reverb tail, a delay repeat, an amp's hiss:
-            //   anything still making sound keeps its lane rendering until
-            //   it falls under `PARK_FLOOR`, which is -80 dBFS. That is
-            //   what stops a tail being guillotined mid-song, and it is
-            //   also why the park needs no fade: nothing audible is cut.
-            // * `receives` - a send destination. Its rack is clocked a
-            //   SECOND time by the sends pass, so parking it would change a
-            //   stateful chain's clock rate mid-song, and the lane pass is
-            //   the only pass that ever hands that seat its sidechain key.
-            // * `param_lanes` - see the field: a knob or a preset for this
-            //   lane arrived this block, and a skipped block loses it.
-            let live_now = (rolling
-                && (self.clip_under.contains(ch)
-                    || self.lane_loud.get(ch).copied().unwrap_or(true)
-                    || self.receives.contains(ch)))
-                || auditioning
-                || !lane_notes.is_empty()
-                || !lane_controls.is_empty()
-                // **A parameter waiting for this lane wakes it.** The knob
-                // and preset road is destructive: the point is popped off
-                // its ring into a queue that is cleared next block, and the
-                // only reader is inside the render. A parked lane does not
-                // defer the edit, it loses it, and the face and the saved
-                // project keep the new value while the instance keeps the
-                // old. See `param_lanes`.
-                || self.param_lanes.contains(ch)
-                || self.desk.armed.contains(ch);
-            let rate = self.rate;
-            let parked = park_lane(
-                self.lane_quiet.get_mut(ch),
-                holds_voice,
-                sounding,
-                live_now,
-                frames,
-                rate,
-            );
-            if parked || !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
-                // **The gain is advanced whether or not anything renders.** A
-                // fader moved during a rest has to have arrived by the next
-                // note, or it comes in at the old level and slides.
+                // ── the AUDITION, reconciled ────────────────────────────────
                 //
-                // A folder's is advanced by the FOLD instead, every block
-                // without exception, so advancing it here too would smooth
-                // it twice as fast and land the fader early.
-                if !is_folder {
+                // `Shared::audition` is a LEVEL — it says what this lane is being
+                // held on, never that something happened — so the work here is a
+                // comparison and not a delivery: what the lane has been told
+                // against what it should have been told, with only the difference
+                // pushed. See the field for why that is the shape.
+                //
+                // **The pair goes in together or not at all.** A push refused for
+                // want of room used to be the "withheld, not dropped" lesson the
+                // clip walk above learned the hard way, and here it would be
+                // worse than a lost note: an OFF dropped while `audition_on` moved
+                // on is a note nothing will ever think to close again. So the room
+                // for both is checked first, and a block with no room simply
+                // leaves the level alone and reconciles on the next one — which
+                // costs a note one buffer and can strand nothing.
+                //
+                // LAST in the list on purpose, for the reason the clip walk's own
+                // "offs first" gives: a clip note ending on this very pitch this
+                // block would otherwise silence the audition a sample after it
+                // spoke.
+                let want = u8::try_from(self.shared.audition[ch].load(Ordering::Relaxed))
+                    .ok()
+                    .filter(|k| *k < 128);
+                if want != lane.audition_on && lane_notes.len() + 2 <= lane_notes.capacity() {
+                    if let Some(old) = lane.audition_on {
+                        lane_notes.push(Note {
+                            offset: 0,
+                            pitch: i16::from(old),
+                            velocity: 0.0,
+                            on: false,
+                        });
+                    }
+                    if let Some(new) = want {
+                        lane_notes.push(Note {
+                            offset: 0,
+                            pitch: i16::from(new),
+                            velocity: f32::from(tangent_ui::recorder::AUDITION_VELOCITY) / 127.0,
+                            on: true,
+                        });
+                    }
+                    lane.audition_on = want;
+                }
+                // **Still speaking**: the key is down, or it has been let go and
+                // the instrument has not finished with it. Either keeps the lane
+                // out of the force-quiet below and keeps it rendering, which is
+                // the whole difference between an audition that releases and one
+                // that is guillotined.
+                if want.is_some() {
+                    lane.audition_rang = true;
+                } else if lane.audition_rang && !lane_instrument_active(lane) {
+                    lane.audition_rang = false;
+                }
+                let auditioning = lane.audition_rang;
+
+                // The DRUMPAD lane: every note here is a pad strike — the same
+                // sixteen one-shots the drumpad window plays, so the editor's
+                // roll and a MIDI keyboard trigger exactly what a finger does.
+                // The strikes render in `mix_pads`, on the DRUMS bus; this lane
+                // itself carries no signal, but its fader still has to advance
+                // so a later un-assignment starts at the written level.
+                let is_keys =
+                    self.desk.keys.contains(ch) && lane.keys.is_some();
+                if self.desk.drums.contains(ch) && !is_builtin && !is_keys {
+                    let obey = [
+                        self.shared.pad_obey[ch][0].load(Ordering::Relaxed),
+                        self.shared.pad_obey[ch][1].load(Ordering::Relaxed),
+                    ];
+                    for n in &lane_notes {
+                        let Ok(key) = u8::try_from(n.pitch) else {
+                            continue;
+                        };
+                        let pad = usize::from(key.wrapping_sub(PAD_BASE));
+                        if key < PAD_BASE || pad >= PADS {
+                            continue;
+                        }
+                        if !n.on {
+                            // Pads are one-shots — unless this one OBEYS
+                            // note-offs, where the release fades the voice.
+                            if obey[pad >> 6] & (1u64 << (pad & 63)) != 0
+                                && self.pad_offs.len() < self.pad_offs.capacity()
+                            {
+                                self.pad_offs.push(PadHit {
+                                    offset: n.offset,
+                                    pad,
+                                    velocity: 0.0,
+                                    // THIS lane's kit — the clip is on it.
+                                    lane: ch,
+                                });
+                            }
+                            continue;
+                        }
+                        if self.pad_hits.len() == self.pad_hits.capacity() {
+                            break;
+                        }
+                        self.pad_hits.push(PadHit {
+                            offset: n.offset,
+                            pad,
+                            velocity: n.velocity,
+                            lane: ch,
+                        });
+                    }
                     let target = if channel_is_heard(ch, &parents, muted, soloed) {
                         self.lane_gain(ch)
                     } else {
                         0.0
                     };
                     for _ in 0..frames {
-                        self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                        lane.channel_gain += (target - lane.channel_gain) * coeff;
+                    }
+                    break 'decide;
+                }
+
+                // THIS lane's synth, fed by THIS lane's notes — live and clip
+                // both — and it goes quiet only when neither is speaking for it.
+                if is_builtin {
+                    if let Some(d) = lane.dx7.as_mut() {
+                        if lane_notes.is_empty()
+                            && !armed
+                            && !lane_has_clips
+                            && !auditioning
+                            && d.active()
+                        {
+                            d.all_notes_off();
+                        } else {
+                            for n in &lane_notes {
+                                let Ok(pitch) = u8::try_from(n.pitch) else {
+                                    continue;
+                                };
+                                if n.on {
+                                    d.note_on(pitch, n.velocity);
+                                } else {
+                                    d.note_off(pitch);
+                                }
+                            }
+                        }
                     }
                 }
-                continue;
-            }
-            // ── and that is the end of what deciding this lane costs ──
-            //
-            // Everything above mutates state the whole desk shares: the
-            // sounding ledger keyed by pitch, the active-clip list and its
-            // cap, the pad hits and their cap, the MIDI cursors. It is one
-            // walk and stays one walk. What is recorded here is exactly what
-            // the render needs and nothing that would make it ask the desk a
-            // question.
-            let room_owns = self.room_rack.contains(ch);
-            // **Claimed only where the render would have claimed it.** The
-            // board call sat inside the `rack_live && !is_folder &&
-            // !room_owns` gate, so taking the claim for every lane here
-            // spends a FOLDER's claim in the lane pass and leaves
-            // `fold_folders` - which is where a group's board belongs - with
-            // nothing to run.
-            let board_runs = rack_live
-                && !is_folder
-                && !room_owns
-                && self.amp_board_arms(ch)
-                && self.claim_board(ch, false);
-            self.lane_prep[ch] = LanePrep {
-                is_folder,
-                armed,
-                is_builtin,
-                is_keys,
-                rack_live,
-                has_audio,
-                room_owns,
-                board_runs,
-                folder_lat: self.folder_lat[ch],
-                pedal_latency: self.pedal_latency(ch),
-            };
-            // **Banked by a swap, not a copy.** The local keeps the bank's
-            // old allocation and clears it at the top of the next lane, so
-            // thirty-two lists cost thirty-two swaps and no block allocates.
-            std::mem::swap(&mut lane_notes, &mut self.lane_note_bank[ch]);
-            std::mem::swap(&mut lane_controls, &mut self.lane_ctl_bank[ch]);
-            self.lane_wants[ch] = true;
-            // **The probe's half of the pin rule, gathered where the terms
-            // live.** Only for a lane that is actually about to render: a
-            // parked lane is neither pinned nor eligible, it costs nothing
-            // already, and counting it as eligible would report headroom
-            // that the resting-desk rule reclaimed a week ago.
-            if self.probe {
-                // `audition_rang` and not the `Shared` cell: the cell is the
-                // key-DOWN level, and the lane keeps rendering through the
-                // release tail.
-                if auditioning {
-                    self.probe_walk_pins.insert(ch);
+
+                // The modelled keyboard, on the same terms as the DX7 above. It
+                // goes quiet only when nothing is speaking for it AND its own
+                // tails have rung out, which is why the silence test asks the
+                // instrument rather than the note list — a pedalled chord is
+                // still sounding long after the last note-off.
+                if is_keys {
+                    if let Some(k) = lane.keys.as_mut() {
+                        if lane_notes.is_empty()
+                            && !armed
+                            && !lane_has_clips
+                            && !auditioning
+                            && k.active()
+                        {
+                            k.all_notes_off();
+                        } else {
+                            for n in &lane_notes {
+                                let Ok(pitch) = u8::try_from(n.pitch) else {
+                                    continue;
+                                };
+                                if n.on {
+                                    k.note_on(pitch, n.velocity);
+                                } else {
+                                    k.note_off(pitch);
+                                }
+                            }
+                        }
+                    }
                 }
-                // The built-in and Keys seats, kept apart because the fix is
-                // cheap: the arrival rings carry `(lane, T)`, so a handoff
-                // can peek the lane and leave it in the ring rather than
-                // `mem::replace`-ing a seat a worker may be inside.
-                if is_builtin || is_keys {
-                    self.probe_inst_pins.insert(ch);
-                }
-                // **Nothing is pinned by its source any more.** Audio was
-                // pinned because the desk kept one block of it for every lane
-                // at once, and MIDI because what was sounding lived in a
-                // pitch-keyed word shared with the live stream, a desk-wide
-                // list with a cap, and a cursor per clip. A lane pulls its
-                // own audio for whatever block it renders, and its notes are
-                // found by where the block is rather than by where the last
-                // one left off.
+
+                // **A FOLDER's own row does none of this here.**
                 //
-                // What is left of the MIDI state is a model of the
-                // INSTRUMENT rather than of the playhead: which pitches this
-                // lane's instrument has been told about and when each is due
-                // to end. It advances in step with the sink whichever block
-                // feeds it. Whether a RENDERED block may then be thrown away
-                // is a different question, and it is step 5's; it is not a
-                // question about whether the lane has a future to read.
-                let _ = lane_has_clips;
+                // A folder is a strip, and every part of being a strip — its
+                // rack, its delay line, its fader, its pan, its send, its meter
+                // — happens once, in `fold_folders`, over the whole group. This
+                // loop walked it like any other channel and did the lot a
+                // SECOND time: the rack ran twice per block, so a stateful
+                // plugin (a reverb, a delay, a compressor) advanced at twice
+                // real time and put out noise — the owner's "dragging track 5
+                // out of folder 3 causes it to static". The fader hit its own
+                // row twice, so a clip standing on a folder at -6 dB played at
+                // -12. And the delay line ran twice on one ring, so every block
+                // came back part group and part row.
+                //
+                // So a folder contributes its RAW row to the bus and stops.
+                let is_folder = self.folder_is[ch];
+                // A lane renders when something can SOUND on it: its own live
+                // arm, or clips standing on it — through the built-in or a rack.
+                //
+                // **`lane_has_clips` only ever counted MIDI clips**, and that is
+                // the whole of why a plugin on an audio track did nothing: a
+                // lane holding nothing but audio failed this gate, took the
+                // `continue` below, and never reached the rack call at all. Its
+                // compressor did not process silence — it did not run. So audio
+                // is a second term here, and a second escape from the clause
+                // beneath: a lane with a clip on it and an EMPTY bay still has
+                // to walk the fold, or the timeline goes silent the moment the
+                // last plugin is pulled out of the strip.
+                let has_audio = self.clip_lanes.contains(ch);
+                let feeds =
+                    armed || lane_has_clips || has_audio || !lane_notes.is_empty() || auditioning;
+                // ── **the PARK**: a stopped desk stops running its effects ────
+                //
+                // Racks run for any lane that has a rack at all, every block,
+                // whatever the transport is doing. That is deliberate and the
+                // reason is written on `clip_lanes`: a per-block or rolling-only
+                // answer would cut a reverb tail in half at every gap and chop it
+                // the instant somebody pressed stop. The cost was reckoned as
+                // "plugins process silence", which was assumed to be free.
+                //
+                // It is not free when the plugin MODELS something. The owner's
+                // bass DI carries an amp simulation and a compressor; fed digital
+                // silence the amp emits the hiss and hum it exists to simulate,
+                // the compressor lifts it, its send smears it through the reverb,
+                // and a project sitting untouched with nothing armed and nothing
+                // playing put about -40 dBFS of it on the master for as long as
+                // it was open. The owner heard it three times before it had a
+                // name: "a chorusy buzz constant at around -40dB on the master
+                // meter."
+                //
+                // **A voice that is SOUNDING never parks**, which is the whole
+                // care in this. An effect fed nothing has nothing of its own to
+                // lose; an instrument may be holding a note, and a park would cut
+                // it. So the rule asks the BOX — `Hosted::voice`, decided at load
+                // from the class's own subCategories — for whether the lane
+                // carries a generator at all, and then asks the generator whether
+                // it is doing anything: its own voice count where it has one (the
+                // built-ins), and otherwise what came out of it last block. A
+                // lane that carries an instrument and has put nothing above
+                // `PARK_FLOOR` out for `VOICE_PARK_S` is stood down like any
+                // other; before that rule every instrument lane on the desk
+                // rendered every block for the life of the project.
+                //
+                // The counter is per lane and zeroed by any reason to be live, so
+                // a note played over a parked desk wakes its lane for a further
+                // full window rather than being the one note that does not
+                // sound. **A CONTROL wakes it too**: a parked lane skips its rack,
+                // and the rack is where a hosted instrument is handed its pedal
+                // and its wheel — a sustain-down that arrived while the lane was
+                // parked would otherwise be the one message it never received.
+                let holds_voice = is_builtin
+                    || is_keys
+                    || lane.chains[CHAIN_OWN].holds_a_voice()
+                    || lane.chains[CHAIN_EXTRA].holds_a_voice();
+                let sounding = lane_instrument_active(lane) || lane.loud;
+                // **What keeps a lane awake while the transport rolls.**
+                //
+                // `rolling` alone used to, which meant every lane with a rack
+                // and a clip ANYWHERE on the timeline ran its whole chain on
+                // every block of the song, over silence, for the gaps between
+                // its clips and for the whole of a part it does not play on.
+                // Muting saved 12.7% of a 48-insert desk, measured, because a
+                // plugin costs the same on silence as on signal.
+                //
+                // Four terms replace it, and each answers one of the ways this
+                // is easy to get wrong:
+                //
+                // * `clip_under` - something to play this block. By span, so a
+                //   rest inside a take is still the take playing.
+                // * `lane_loud` - the lane's own measured pre-fader output from
+                //   last block. A reverb tail, a delay repeat, an amp's hiss:
+                //   anything still making sound keeps its lane rendering until
+                //   it falls under `PARK_FLOOR`, which is -80 dBFS. That is
+                //   what stops a tail being guillotined mid-song, and it is
+                //   also why the park needs no fade: nothing audible is cut.
+                // * `receives` - a send destination. Its rack is clocked a
+                //   SECOND time by the sends pass, so parking it would change a
+                //   stateful chain's clock rate mid-song, and the lane pass is
+                //   the only pass that ever hands that seat its sidechain key.
+                // * `param_lanes` - see the field: a knob or a preset for this
+                //   lane arrived this block, and a skipped block loses it.
+                let live_now = (rolling
+                    && (self.clip_under.contains(ch)
+                        || lane.loud
+                        || self.receives.contains(ch)))
+                    || auditioning
+                    || !lane_notes.is_empty()
+                    || !lane_controls.is_empty()
+                    // **A parameter waiting for this lane wakes it.** The knob
+                    // and preset road is destructive: the point is popped off
+                    // its ring into a queue that is cleared next block, and the
+                    // only reader is inside the render. A parked lane does not
+                    // defer the edit, it loses it, and the face and the saved
+                    // project keep the new value while the instance keeps the
+                    // old. See `param_lanes`.
+                    || self.param_lanes.contains(ch)
+                    || self.desk.armed.contains(ch);
+                let rate = self.rate;
+                let parked = park_lane(
+                    Some(&mut lane.quiet),
+                    holds_voice,
+                    sounding,
+                    live_now,
+                    frames,
+                    rate,
+                );
+                if parked || !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
+                    // **The gain is advanced whether or not anything renders.** A
+                    // fader moved during a rest has to have arrived by the next
+                    // note, or it comes in at the old level and slides.
+                    //
+                    // A folder's is advanced by the FOLD instead, every block
+                    // without exception, so advancing it here too would smooth
+                    // it twice as fast and land the fader early.
+                    if !is_folder {
+                        let target = if channel_is_heard(ch, &parents, muted, soloed) {
+                            self.lane_gain(ch)
+                        } else {
+                            0.0
+                        };
+                        for _ in 0..frames {
+                            lane.channel_gain += (target - lane.channel_gain) * coeff;
+                        }
+                    }
+                    break 'decide;
+                }
+                // ── and that is the end of what deciding this lane costs ──
+                //
+                // Everything above mutates state the whole desk shares: the
+                // sounding ledger keyed by pitch, the active-clip list and its
+                // cap, the pad hits and their cap, the MIDI cursors. It is one
+                // walk and stays one walk. What is recorded here is exactly what
+                // the render needs and nothing that would make it ask the desk a
+                // question.
+                let room_owns = self.room_rack.contains(ch);
+                // **Claimed only where the render would have claimed it.** The
+                // board call sat inside the `rack_live && !is_folder &&
+                // !room_owns` gate, so taking the claim for every lane here
+                // spends a FOLDER's claim in the lane pass and leaves
+                // `fold_folders` - which is where a group's board belongs - with
+                // nothing to run.
+                let board_runs = rack_live
+                    && !is_folder
+                    && !room_owns
+                    && lane_board_arms(lane, is_folder)
+                    && self.claim_board(ch, false);
+                lane.prep = LanePrep {
+                    is_folder,
+                    armed,
+                    is_builtin,
+                    is_keys,
+                    rack_live,
+                    has_audio,
+                    room_owns,
+                    board_runs,
+                    folder_lat: self.folder_lat[ch],
+                    pedal_latency: lane_pedal_latency(
+                        lane,
+                        is_folder,
+                        &self.shared,
+                        &self.desk.frozen,
+                        ch,
+                    ),
+                };
+                // **Banked by a swap, not a copy.** The local keeps the bank's
+                // old allocation and clears it at the top of the next lane, so
+                // thirty-two lists cost thirty-two swaps and no block allocates.
+                std::mem::swap(&mut lane_notes, &mut lane.notes);
+                std::mem::swap(&mut lane_controls, &mut lane.controls);
+                lane.wants = true;
+                // **The probe's half of the pin rule, gathered where the terms
+                // live.** Only for a lane that is actually about to render: a
+                // parked lane is neither pinned nor eligible, it costs nothing
+                // already, and counting it as eligible would report headroom
+                // that the resting-desk rule reclaimed a week ago.
+                if self.probe {
+                    // `audition_rang` and not the `Shared` cell: the cell is the
+                    // key-DOWN level, and the lane keeps rendering through the
+                    // release tail.
+                    if auditioning {
+                        self.probe_walk_pins.insert(ch);
+                    }
+                    // The built-in and Keys seats, kept apart because the fix is
+                    // cheap: the arrival rings carry `(lane, T)`, so a handoff
+                    // can peek the lane and leave it in the ring rather than
+                    // `mem::replace`-ing a seat a worker may be inside.
+                    if is_builtin || is_keys {
+                        self.probe_inst_pins.insert(ch);
+                    }
+                    // **Nothing is pinned by its source any more.** Audio was
+                    // pinned because the desk kept one block of it for every lane
+                    // at once, and MIDI because what was sounding lived in a
+                    // pitch-keyed word shared with the live stream, a desk-wide
+                    // list with a cap, and a cursor per clip. A lane pulls its
+                    // own audio for whatever block it renders, and its notes are
+                    // found by where the block is rather than by where the last
+                    // one left off.
+                    //
+                    // What is left of the MIDI state is a model of the
+                    // INSTRUMENT rather than of the playhead: which pitches this
+                    // lane's instrument has been told about and when each is due
+                    // to end. It advances in step with the sink whichever block
+                    // feeds it. Whether a RENDERED block may then be thrown away
+                    // is a different question, and it is step 5's; it is not a
+                    // question about whether the lane has a future to read.
+                    let _ = lane_has_clips;
+                }
+            }
+            if let Some(cell) = self.spine.lanes.get_mut(ch) {
+                *cell = Some(boxed);
             }
         }
 
         // ── THE RENDER, which is the walk that forks ─────────────────────
         //
         // Nothing in here reads or writes anything another lane's render
-        // touches: its own seats, its own row of `lane_out`, its own
-        // scratch, and a read-only view of a desk that stopped changing when
-        // the walk above ended. That is what makes it forkable, and the
-        // reason the deciding half had to be lifted out first.
+        // touches: its own box (racks, instruments, grain ring, dry row,
+        // banks), one hand's scratch, and a read-only view of a desk that
+        // stopped changing when the walk above ended. That is what makes it
+        // forkable, and the reason the deciding half had to be lifted out
+        // first.
         //
-        // The seats are carved for every lane at once rather than one at a
-        // time, because the fork needs all thirty-two borrows to exist
-        // before any of them is used. Three `split_at_mut`s and six
-        // iterators, all of it safe: see `lane_seats` for the arithmetic
-        // that makes the blocks disjoint.
+        // **Nothing is carved.** Each lane is its own box, so a hand takes
+        // the lane it claimed and the compiler is not asked to prove that
+        // thirty-two slices of one bank are disjoint; the claim stamp is
+        // what makes two hands unable to hold one lane (`Lane::claimed`).
         //
         // **The lanes to render, as a LIST**, which is what the pool claims
         // from (`LanePool::run_list`): ascending, so the serial walk and the
-        // fork's lane-to-hand order are today's. `lane_wants` is the per-lane
-        // flag it is read off; nothing here is a mask any more.
-        let mut wanted = [0u32; CHANNELS];
-        let mut wanted_n = 0usize;
-        for ch in 0..CHANNELS {
-            if self.lane_wants[ch] {
-                wanted[wanted_n] = ch as u32;
-                wanted_n += 1;
+        // fork's lane-to-hand order are today's. Bought at build, at the
+        // spine's capacity, so filling it allocates nothing.
+        let mut wanted = std::mem::take(&mut self.wanted);
+        wanted.clear();
+        for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+            if l.as_deref_mut().is_some_and(|l| l.body_mut().wants) && wanted.len() < wanted.capacity() {
+                wanted.push(ch as u32);
             }
         }
-        let wanted = &wanted[..wanted_n];
         // ── the eligibility probe's two masks for this block ─────────────
         //
         // Three conditions pin the WHOLE desk rather than a lane. A stopped
@@ -14734,7 +14918,7 @@ impl Renderer {
                 &mut self.pinned,
             );
             let [strict, loose, freed] = &mut self.probe_sets;
-            for &ch in wanted {
+            for &ch in &wanted {
                 let ch = ch as usize;
                 if self.pinned.contains(ch)
                     || self.probe_walk_pins.contains(ch)
@@ -14769,139 +14953,103 @@ impl Renderer {
                 auto_params: &self.auto_params,
                 shared: &self.shared,
                 frozen: &self.desk.frozen,
-                key_prev: &self.key_prev,
-                key_prev_frames: self.key_prev_frames,
+                key_prev: &self.spine.desk.key_prev,
+                key_prev_frames: self.spine.desk.key_prev_frames,
                 controls: &self.controls,
             };
             let stems_dry = self.stems_dry;
             let keys_live = self.keys_live;
-            let preps = &self.lane_prep;
-            let notes = &self.lane_note_bank;
-            let ctls = &self.lane_ctl_bank;
             let samples = &self.sampler_samples;
-            let mut jobs: [Option<LaneWork<'_>>; CHANNELS] = std::array::from_fn(|_| None);
-            {
-                let extra_at = tangent_ui::recorder::FOLDER_EXTRA_SEATS;
-                let pedals = tangent_ui::recorder::AMP_PEDALS;
-                let (low, rest) = self.racks.split_at_mut(extra_at);
-                let (extra_blk, rest) = rest.split_at_mut(CHANNELS);
-                let (board_blk, _) = rest.split_at_mut(CHANNELS * pedals);
-                let mut primaries = low.iter_mut();
-                let mut extras = extra_blk.iter_mut();
-                let mut boards = board_blk.chunks_mut(pedals);
-                let mut dx7s = self.dx7s.iter_mut();
-                let mut keys = self.keys_lanes.iter_mut();
-                // **A slot, not a row.** Each lane's render fills the next
+            // **A new round for every fork, never zero**: a lane is born
+            // with a zero stamp, and a round a lane already holds would read
+            // as taken.
+            self.fork_round = self.fork_round.wrapping_add(1).max(1);
+            let round = self.fork_round;
+            let lanes: &[Option<Box<Lane>>] = &self.spine.lanes;
+            let hands = &self.hands;
+            let probe = self.probe;
+            let [probe_strict, probe_loose, probe_freed] = &self.probe_sets;
+            let render = |ch: usize, hand: usize| {
+                // **One lane, one hand.** The claim is one atomic swap, so a
+                // second claim of this lane in this round, on any thread,
+                // answers `None` and renders nothing: the take-once guarantee
+                // the cells used to give, on the lane itself (design 7.6).
+                let gen = lanes.get(ch).and_then(Option::as_deref).map_or(0, |l| l.gen);
+                let Some(lane) =
+                    crate::lane_bank::claim_lane(lanes, crate::desk_plan::Slot(ch as u32), gen, round)
+                else {
+                    return;
+                };
+                // SAFETY: `claim_lane` answered `Some` for this lane in this
+                // round, so this hand is the only holder of its body until
+                // the fork joins.
+                let body = unsafe { lane.claimed() };
+                // SAFETY: `hand` is what the pool called this work with (0 on
+                // the serial walk), one thread per hand.
+                let Some(scratch) = (unsafe { hands.get(hand) }) else {
+                    return;
+                };
+                let LaneBody {
+                    chains,
+                    board,
+                    dx7,
+                    keys,
+                    grain,
+                    dry,
+                    dry_paid,
+                    notes,
+                    controls,
+                    prep,
+                    at,
+                    len,
+                    folds,
+                    ..
+                } = body;
+                let [rack, extra] = chains;
+                let prep = *prep;
+                // **A slot, not a row.** The lane's render fills the next
                 // slot of its own ring, stamped with the position it is
                 // rendering; the fold asks the ring for a span rather than
                 // trusting that the row it finds is the block it wants.
-                //
-                // The ring itself is carved here and the slot is opened
-                // BELOW, after the `wanted` test: `hold` invalidates the
-                // slot it opens, because the render is about to overwrite
-                // its samples, and a lane that then renders nothing would
-                // have thrown away a grain it still owed the fold.
-                let mut outs = self.lane_grain.iter_mut();
-                let mut drys = self.lane_dry.iter_mut();
-                let mut paids = self.lane_dry_paid.iter_mut();
-                let mut scratches = self.lane_scratch.iter_mut();
-                for (ch, job) in jobs.iter_mut().enumerate() {
-                    let (
-                        Some(rack),
-                        Some(extra),
-                        Some(board),
-                        Some(dx7),
-                        Some(keys_lane),
-                        Some(out),
-                        Some(dry),
-                        Some(paid),
-                        Some(scratch),
-                    ) = (
-                        primaries.next(),
-                        extras.next(),
-                        boards.next(),
-                        dx7s.next(),
-                        keys.next(),
-                        outs.next(),
-                        drys.next(),
-                        paids.next(),
-                        scratches.next(),
-                    )
-                    else {
-                        break;
-                    };
-                    if !self.lane_wants[ch] {
-                        continue;
-                    }
-                    // **This lane's span, which the grain clock may have
-                    // moved.** Equal to the chunk's own unless the clock is
-                    // on and this lane is eligible for it.
-                    let (lane_at, lane_len) = (self.lane_at[ch], self.lane_len[ch]);
-                    let prep = preps[ch];
-                    *job = Some(LaneWork {
-                        seats: LaneSeats {
-                            rack,
-                            extra,
-                            board,
-                            dx7,
-                            keys: keys_lane,
-                        },
-                        io: LaneIo {
-                            fx_in: out.hold(lane_at, lane_len),
-                            fx_out: &mut scratch.fx_out,
-                            dry_io: dry,
-                            dry_paid: paid,
-                            key_io: &mut scratch.key_io,
-                            builtin: &mut scratch.builtin,
-                            keys_scratch: &mut scratch.keys,
-                        },
-                        plan: LanePlan {
-                            ch,
-                            at: lane_at,
-                            frames: lane_len,
-                            is_builtin: prep.is_builtin,
-                            is_keys: prep.is_keys,
-                            is_folder: prep.is_folder,
-                            rack_live: prep.rack_live,
-                            has_audio: prep.has_audio,
-                            room_owns: prep.room_owns,
-                            armed: prep.armed,
-                            board_runs: prep.board_runs,
-                            stems_dry,
-                            keys_live,
-                            notes: &notes[ch],
-                            controls: &ctls[ch],
-                            sample: samples.get(ch).and_then(Option::as_ref),
-                        },
-                    });
-                }
-            }
-            // **One lane, one hand.** The cells exist so that the closure the
-            // pool calls can be `Fn` and `Sync` while the work inside it is
-            // very much `&mut`: each lane's job is taken out of its own cell
-            // exactly once, and the pool's own claim is what guarantees only
-            // one thread ever reaches a given `ch`.
-            let cells = LaneCells(jobs.map(std::cell::UnsafeCell::new));
-            // **Which lanes produced something to fold**, one flag per lane:
-            // written by whichever hand rendered the lane, read back here
-            // once the fork has joined.
-            let folded: [AtomicBool; CHANNELS] = std::array::from_fn(|_| AtomicBool::new(false));
-            let probe = self.probe;
-            let [probe_strict, probe_loose, probe_freed] = &self.probe_sets;
-            let render = |ch: usize| {
-                let Some(job) = cells.take(ch) else {
-                    return;
+                let mut seats = LaneSeats {
+                    rack,
+                    extra,
+                    board: &mut board[..],
+                    dx7,
+                    keys,
                 };
-                let LaneWork { mut seats, mut io, plan } = job;
+                let mut io = LaneIo {
+                    fx_in: grain.hold(*at, *len),
+                    fx_out: &mut scratch.fx_out,
+                    dry_io: dry,
+                    dry_paid,
+                    key_io: &mut scratch.key_io,
+                    builtin: &mut scratch.builtin,
+                    keys_scratch: &mut scratch.keys,
+                };
+                let plan = LanePlan {
+                    ch,
+                    at: *at,
+                    frames: *len,
+                    is_builtin: prep.is_builtin,
+                    is_keys: prep.is_keys,
+                    is_folder: prep.is_folder,
+                    rack_live: prep.rack_live,
+                    has_audio: prep.has_audio,
+                    room_owns: prep.room_owns,
+                    armed: prep.armed,
+                    board_runs: prep.board_runs,
+                    stems_dry,
+                    keys_live,
+                    notes,
+                    controls,
+                    sample: samples.get(ch).and_then(Option::as_ref),
+                };
                 // `Instant::now` on Apple silicon is a commpage read: no
                 // syscall, no lock, no allocation. It is still only paid
                 // when the probe is on.
                 let started = probe.then(Instant::now);
-                if render_lane(&mut seats, &mut io, &plan, &desk) {
-                    if let Some(f) = folded.get(ch) {
-                        f.store(true, Ordering::Relaxed);
-                    }
-                }
+                *folds = render_lane(&mut seats, &mut io, &plan, &desk);
                 if let Some(started) = started {
                     let ns = started.elapsed().as_nanos() as u64;
                     probe_all_ns.fetch_add(ns, Ordering::Relaxed);
@@ -14932,46 +15080,35 @@ impl Renderer {
                         Fanout::Force => true,
                     }
             }) {
-                Some(pool) => pool.run_list(wanted, &|lane, _hand| render(lane)),
+                Some(pool) => pool.run_list(&wanted, &|lane, hand| render(lane, hand)),
                 None => {
-                    for &ch in wanted {
-                        render(ch as usize);
+                    for &ch in &wanted {
+                        render(ch as usize, 0);
                     }
                 }
             }
-            for ch in 0..CHANNELS {
-                self.lane_folds[ch] = folded[ch].load(Ordering::Relaxed);
-                // **Close the slot this lane's render opened.** Done here,
-                // after the fork has joined, because `keep` needs the whole
-                // ring by `&mut` and the render only ever held one slot's
-                // rows. A lane the walk skipped never opened one.
-                if self.lane_wants[ch] {
-                    let prep = self.lane_prep[ch];
-                    let len = self.lane_len[ch];
-                    if let Some(g) = self.lane_grain.get_mut(ch) {
-                        g.keep(len, self.lane_folds[ch], prep.is_folder, prep.armed);
-                    }
+            // **Close the slot each lane's render opened.** Done here, after
+            // the fork has joined, because `keep` finishes the ring's key and
+            // the render only ever held the slot's rows. A lane the walk
+            // skipped never opened one.
+            for l in self.spine.lanes.iter_mut().flatten() {
+                let b = l.body_mut();
+                if b.wants {
+                    b.grain.keep(b.len, b.folds, b.prep.is_folder, b.prep.armed);
                 }
             }
-        } else {
-            // **A block that renders nothing folds nothing.**
-            //
-            // This was inside the branch above, so on a block where no track
-            // wanted to render at all the flags kept the PREVIOUS block's
-            // values. The fold then ran for those tracks over `lane_out`,
-            // which still held the audio of the block before, and mixed it
-            // into the master a second time. One repeated buffer is a click,
-            // and it lands exactly where a desk goes quiet: the last block
-            // before everything rests.
-            //
-            // It also clocked that track's delay compensation an extra time
-            // once that moved to consumption, so the track came back from the
-            // gap a buffer out of step with the rest of the desk.
-            self.lane_folds = [false; CHANNELS];
         }
+        // **A block that renders nothing folds nothing**, which the reset at
+        // the head of the decide walk already says for every lane. It was a
+        // branch here once, and on a block where no track wanted to render
+        // the flags kept the PREVIOUS block's values: the fold then mixed
+        // the block before into the master a second time, a click exactly
+        // where a desk goes quiet.
+        let wanted_len = wanted.len();
+        self.wanted = wanted;
         if self.probe {
             self.note_eligibility(
-                wanted.len(),
+                wanted_len,
                 [
                     probe_all_ns.load(Ordering::Relaxed),
                     probe_strict_ns.load(Ordering::Relaxed),
@@ -14990,120 +15127,127 @@ impl Renderer {
         // which is what lets the render above become several walks without
         // the sum moving.
         for ch in 0..CHANNELS {
-            // **Ask the ring for THIS span, and take what it decided with
-            // it.** A slot that does not hold the span answers `None` -
-            // which is what a locate and a cold start leave behind - and a
-            // lane with nothing to fold is skipped exactly as before.
-            //
-            // The two decisions come out of the KEY rather than out of
-            // `lane_prep`, because a grain can outlive the chunk that made
-            // it and `lane_prep` describes the chunk the decide walk last
-            // ran for.
-            let key = {
-                let (grains, stage) = (&self.lane_grain, &mut self.lane_stage);
-                match grains.get(ch).and_then(|g| g.gather(at, frames, stage)) {
-                    Some(k) if k.folded => k,
-                    _ => continue,
-                }
-            };
-            // **The lane's delay compensation, at CONSUMPTION.**
-            self.run_lane_pdc(ch, frames, pdc_max);
-            // The fold: fader, send, peak — the channel's own, exactly as
-            // every other strip does it.
-            let GrainKey { is_folder, armed, .. } = key;
-            let target = if channel_is_heard(ch, &parents, muted, soloed) {
-                self.lane_gain(ch)
-            } else {
-                0.0
-            };
-            // Unity, centre and no send for a folder: the fold owns all
-            // three, and doing them here as well is doing them twice.
-            let send = if is_folder {
-                0.0
-            } else {
-                self.lane_send(Strip::Channel(ch).index())
-            };
-            let (pan_l, pan_r) = if is_folder {
-                (1.0, 1.0)
-            } else {
-                pan_gains(self.lane_pan(ch))
-            };
-            let want = frames * TAP_CHANNELS;
-            // Stems and ROUTING share this buffer: a send reads the
-            // lane's own audio out of it, so it is filled whenever any
-            // customer asks — see `stems_wanted` for the one list of them.
-            let stems = self.stems_wanted;
-            let dry_on = self.stems_dry;
-            let direct = self.route_direct[ch];
-            let (Some(mix), Some(aux), Some(stem)) = (
-                self.mix.get_mut(..want),
-                self.aux.get_mut(..want),
-                self.stem_scratch.get_mut(..frames * CHANNELS * 2),
-            ) else {
+            // Out of its slot for the fold and back after, as in the decide
+            // walk: the fold asks the renderer's own methods about the lane
+            // it holds.
+            let Some(mut boxed) = self.spine.lanes.get_mut(ch).and_then(Option::take) else {
                 continue;
             };
-            let mut peak = [0.0f32; 2];
-            // **The rack's own output, before the fader** — what the park
-            // rule reads next block to decide whether this lane's instrument
-            // is sounding. Pre-fader on purpose: a note held on a muted or
-            // faded-down lane is still a note, and parking it would leave a
-            // fader that comes back up onto silence.
-            let mut raw = 0.0f32;
-            // And per channel, for an armed lane's meter — see `meter_source`.
-            let mut raw_pk = [0.0f32; 2];
-            for f in 0..frames {
-                let g = if is_folder {
-                    1.0
-                } else {
-                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
-                    self.channel_gain[ch]
+            'fold: {
+                let lane = boxed.body_mut();
+                // **Ask the ring for THIS span, and take what it decided with
+                // it.** A slot that does not hold the span answers `None` -
+                // which is what a locate and a cold start leave behind - and a
+                // lane with nothing to fold is skipped exactly as before.
+                //
+                // The two decisions come out of the KEY rather than out of
+                // `lane_prep`, because a grain can outlive the chunk that made
+                // it and `lane_prep` describes the chunk the decide walk last
+                // ran for.
+                let key = match lane.grain.gather(at, frames, &mut self.lane_stage) {
+                    Some(k) if k.folded => k,
+                    _ => break 'fold,
                 };
-                let s0 = self.lane_stage.first().map_or(0.0, |b| b[f]);
-                let s1 = self.lane_stage.get(1).map_or(0.0, |b| b[f]);
-                raw = raw.max(s0.abs()).max(s1.abs());
-                raw_pk[0] = raw_pk[0].max(s0.abs());
-                raw_pk[1] = raw_pk[1].max(s1.abs());
-                let l = s0 * g * pan_l;
-                let r = s1 * g * pan_r;
-                peak[0] = peak[0].max(l.abs());
-                peak[1] = peak[1].max(r.abs());
-                // `direct` is zero for anything in a group — see where
-                // `route_direct` is derived. That is what keeps a grouped
-                // channel out of the master without any of the three folds
-                // in this file having to know what a folder is.
-                mix[f * TAP_CHANNELS] += l * direct;
-                mix[f * TAP_CHANNELS + 1] += r * direct;
-                aux[f * TAP_CHANNELS] += l * send;
-                aux[f * TAP_CHANNELS + 1] += r * send;
-                if stems {
-                    stem[f * CHANNELS * 2 + ch * 2] += l;
-                    stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
-                }
-                // **The same fader, the same pan, the same gate — a
-                // different signal.** A dry stem is the strip's inserts
-                // removed and NOT its balance: the set still sums to the
-                // mix's own arrangement of levels and positions, which is
-                // the only thing that makes a stem set reimportable. So the
-                // dry write is deliberately a copy of the line above with
-                // `dry_io` in place of `fx_in`, sharing `g`, `pan_l` and
-                // `pan_r` rather than recomputing them, so the two cannot
-                // drift apart when somebody changes one of them.
-                if dry_on {
-                    let dl = self.lane_dry[ch].first().map_or(0.0, |b| b[f]) * g * pan_l;
-                    let dr = self.lane_dry[ch].get(1).map_or(0.0, |b| b[f]) * g * pan_r;
-                    if let Some(d) = self.dry_scratch.get_mut(..frames * CHANNELS * 2) {
-                        d[f * CHANNELS * 2 + ch * 2] += dl;
-                        d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
+                // **The lane's delay compensation, at CONSUMPTION.**
+                self.run_lane_pdc(ch, lane, frames, pdc_max);
+                // The fold: fader, send, peak — the channel's own, exactly as
+                // every other strip does it.
+                let GrainKey { is_folder, armed, .. } = key;
+                let target = if channel_is_heard(ch, &parents, muted, soloed) {
+                    self.lane_gain(ch)
+                } else {
+                    0.0
+                };
+                // Unity, centre and no send for a folder: the fold owns all
+                // three, and doing them here as well is doing them twice.
+                let send = if is_folder {
+                    0.0
+                } else {
+                    self.lane_send(Strip::Channel(ch).index())
+                };
+                let (pan_l, pan_r) = if is_folder {
+                    (1.0, 1.0)
+                } else {
+                    pan_gains(self.lane_pan(ch))
+                };
+                let want = frames * TAP_CHANNELS;
+                // Stems and ROUTING share this buffer: a send reads the
+                // lane's own audio out of it, so it is filled whenever any
+                // customer asks — see `stems_wanted` for the one list of them.
+                let stems = self.stems_wanted;
+                let dry_on = self.stems_dry;
+                let direct = self.route_direct[ch];
+                let (Some(mix), Some(aux), Some(stem)) = (
+                    self.mix.get_mut(..want),
+                    self.aux.get_mut(..want),
+                    self.spine.desk.stem_scratch.get_mut(..frames * CHANNELS * 2),
+                ) else {
+                    break 'fold;
+                };
+                let mut peak = [0.0f32; 2];
+                // **The rack's own output, before the fader** — what the park
+                // rule reads next block to decide whether this lane's instrument
+                // is sounding. Pre-fader on purpose: a note held on a muted or
+                // faded-down lane is still a note, and parking it would leave a
+                // fader that comes back up onto silence.
+                let mut raw = 0.0f32;
+                // And per channel, for an armed lane's meter — see `meter_source`.
+                let mut raw_pk = [0.0f32; 2];
+                for f in 0..frames {
+                    let g = if is_folder {
+                        1.0
+                    } else {
+                        lane.channel_gain += (target - lane.channel_gain) * coeff;
+                        lane.channel_gain
+                    };
+                    let s0 = self.lane_stage.first().map_or(0.0, |b| b[f]);
+                    let s1 = self.lane_stage.get(1).map_or(0.0, |b| b[f]);
+                    raw = raw.max(s0.abs()).max(s1.abs());
+                    raw_pk[0] = raw_pk[0].max(s0.abs());
+                    raw_pk[1] = raw_pk[1].max(s1.abs());
+                    let l = s0 * g * pan_l;
+                    let r = s1 * g * pan_r;
+                    peak[0] = peak[0].max(l.abs());
+                    peak[1] = peak[1].max(r.abs());
+                    // `direct` is zero for anything in a group — see where
+                    // `route_direct` is derived. That is what keeps a grouped
+                    // channel out of the master without any of the three folds
+                    // in this file having to know what a folder is.
+                    mix[f * TAP_CHANNELS] += l * direct;
+                    mix[f * TAP_CHANNELS + 1] += r * direct;
+                    aux[f * TAP_CHANNELS] += l * send;
+                    aux[f * TAP_CHANNELS + 1] += r * send;
+                    if stems {
+                        stem[f * CHANNELS * 2 + ch * 2] += l;
+                        stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
+                    }
+                    // **The same fader, the same pan, the same gate — a
+                    // different signal.** A dry stem is the strip's inserts
+                    // removed and NOT its balance: the set still sums to the
+                    // mix's own arrangement of levels and positions, which is
+                    // the only thing that makes a stem set reimportable. So the
+                    // dry write is deliberately a copy of the line above with
+                    // `dry_io` in place of `fx_in`, sharing `g`, `pan_l` and
+                    // `pan_r` rather than recomputing them, so the two cannot
+                    // drift apart when somebody changes one of them.
+                    if dry_on {
+                        let dl = lane.dry.first().map_or(0.0, |b| b[f]) * g * pan_l;
+                        let dr = lane.dry.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                        if let Some(d) = self.spine.desk.dry_scratch.get_mut(..frames * CHANNELS * 2) {
+                            d[f * CHANNELS * 2 + ch * 2] += dl;
+                            d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
+                        }
                     }
                 }
+                lane.loud = raw > PARK_FLOOR;
+                let peak = meter_source(armed, peak, raw_pk);
+                // The folder's meter is the GROUP's, and the fold reports it.
+                if !is_folder {
+                    self.shared.note_strip_peak(Strip::Channel(ch), peak);
+                }
             }
-            if let Some(loud) = self.lane_loud.get_mut(ch) {
-                *loud = raw > PARK_FLOOR;
-            }
-            let peak = meter_source(armed, peak, raw_pk);
-            // The folder's meter is the GROUP's, and the fold reports it.
-            if !is_folder {
-                self.shared.note_strip_peak(Strip::Channel(ch), peak);
+            if let Some(cell) = self.spine.lanes.get_mut(ch) {
+                *cell = Some(boxed);
             }
         }
         self.lane_notes = lane_notes;
@@ -15158,14 +15302,11 @@ impl Renderer {
     }
 
     fn amp_board_arms(&self, ch: usize) -> bool {
-        if self.racks.get(ch).is_some_and(rack_holds_amp) {
-            return true;
-        }
-        self.folder_is.get(ch).copied().unwrap_or(false)
-            && self
-                .racks
-                .get(tangent_ui::recorder::folder_extra_seat(ch))
-                .is_some_and(rack_holds_amp)
+        let is_folder = self.folder_is.get(ch).copied().unwrap_or(false);
+        self.spine.lanes
+            .get(ch)
+            .and_then(Option::as_deref)
+            .is_some_and(|l| lane_board_arms(l.peek(), is_folder))
     }
 
     /// What channel `ch`'s pedal racks add to its chain, in frames.
@@ -15188,15 +15329,9 @@ impl Renderer {
     /// which is the case they were written for. `amp_board_arms` is still
     /// the single arming question, so the two cannot drift.
     fn pedal_latency(&self, ch: usize) -> u32 {
-        if !self.amp_board_arms(ch) {
-            return 0;
-        }
-        (0..tangent_ui::recorder::AMP_PEDALS).fold(0u32, |acc, pedal| {
-            acc.saturating_add(Rack::latency(
-                &self.shared,
-                &self.desk.frozen,
-                tangent_ui::recorder::amp_pedal_seat(ch, pedal),
-            ))
+        let is_folder = self.folder_is.get(ch).copied().unwrap_or(false);
+        self.spine.lanes.get(ch).and_then(Option::as_deref).map_or(0, |l| {
+            lane_pedal_latency(l.peek(), is_folder, &self.shared, &self.desk.frozen, ch)
         })
     }
 
@@ -15285,14 +15420,11 @@ impl Renderer {
         }
         let controls: &[Control] = if armed { &self.controls } else { &[] };
         let first = tangent_ui::recorder::amp_pedal_seat(ch, 0);
-        let Some(board) = self
-            .racks
-            .get_mut(first..first + tangent_ui::recorder::AMP_PEDALS)
-        else {
+        let Some(lane) = self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) else {
             return;
         };
         run_board(
-            board,
+            &mut lane.body_mut().board,
             first,
             &self.auto_params,
             &mut self.fx_in,
@@ -15303,6 +15435,48 @@ impl Renderer {
             controls,
         );
     }
+}
+
+/// **Whether `lane`'s pedalboard is armed this chunk**: a bay holding the
+/// amp in its own chain, or, for a FOLDER, in its extra chain too. See
+/// `Renderer::amp_board_arms`, which asks this of the lane in its slot; the
+/// decide walk asks it of the lane it is holding.
+fn lane_board_arms(lane: &LaneBody, is_folder: bool) -> bool {
+    rack_holds_amp(&lane.chains[CHAIN_OWN]) || (is_folder && rack_holds_amp(&lane.chains[CHAIN_EXTRA]))
+}
+
+/// What `lane`'s pedal racks add to its chain, in frames: zero when the
+/// board is not armed. See `Renderer::pedal_latency` for why the room's run
+/// of the board is not in this figure.
+fn lane_pedal_latency(
+    lane: &LaneBody,
+    is_folder: bool,
+    shared: &Shared,
+    frozen: &LaneSet,
+    ch: usize,
+) -> u32 {
+    if !lane_board_arms(lane, is_folder) {
+        return 0;
+    }
+    (0..tangent_ui::recorder::AMP_PEDALS).fold(0u32, |acc, pedal| {
+        acc.saturating_add(Rack::latency(
+            shared,
+            frozen,
+            tangent_ui::recorder::amp_pedal_seat(ch, pedal),
+        ))
+    })
+}
+
+/// Whether `lane`'s own instrument still has anything sounding — a key
+/// held, or a release that has not finished ringing.
+///
+/// Asked of the INSTRUMENT rather than of the note list, for the reason
+/// the keyboard's own force-quiet gives a few hundred lines down: a
+/// pedalled chord, or a patch with a long release, is still making sound
+/// long after the last note-off went in. It is how an audition knows when
+/// it is finally done with the lane it borrowed.
+fn lane_instrument_active(lane: &LaneBody) -> bool {
+    lane.dx7.as_ref().is_some_and(|d| d.active()) || lane.keys.as_ref().is_some_and(|k| k.active())
 }
 
 /// **One lane's pedalboard, over the buffer its amp is about to see.**
@@ -15402,6 +15576,8 @@ impl Renderer {
                 dst[..frames].fill(0.0);
                 for f in 0..frames {
                     dst[f] += self
+                        .spine
+                        .desk
                         .stem_scratch
                         .get(f * stride + ch * 2 + c)
                         .copied()
@@ -15418,6 +15594,8 @@ impl Renderer {
                     };
                     for f in 0..frames {
                         dst[f] += self
+                            .spine
+                            .desk
                             .stem_scratch
                             .get(f * stride + kid * 2 + c)
                             .copied()
@@ -15492,7 +15670,7 @@ impl Renderer {
             //
             // No live notes and no controls: a folder is a bus, and a bus is
             // not played.
-            if !self.racks[ch].is_empty() {
+            if seat_rack(&self.racks, &self.spine.lanes, ch).is_some_and(|r| !r.is_empty()) {
                 // **A folder's bays are automated like anybody's.** It is a
                 // channel — one of the sixteen, with a lane and a strip — and
                 // the only thing unusual about it is WHERE its rack runs. A
@@ -15508,30 +15686,33 @@ impl Renderer {
                             .get(ch * INSERTS + b)
                             .map_or(&[][..], Vec::as_slice)
                     });
-                run_rack(
-                    &mut self.racks[ch],
-                    &mut self.fx_in,
-                    frames,
-                    &mut self.fx_out,
-                    &[],
-                    &[],
-                    &seat_params,
-                    &self.shared,
-                    &self.desk.frozen,
-                    ch,
-                    // Still one of the sixteen — see the note above about
-                    // where a folded lane's rack runs — so it keeps its own
-                    // sample, exactly as it keeps its own automation row.
-                    self.sampler_samples.get(ch).and_then(Option::as_ref),
-                    // Not a key pass in v1: a folder's rack runs here, after
-                    // the chunk's snapshot customers were decided — keying a
-                    // bus comp IN a group is a second pass this feature does
-                    // not make yet. See `KeyFeed`.
-                    None,
+                // THE-FOLD: the folder's own first chain, out of its lane.
+                if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, ch) {
+                    run_rack(
+                        rack,
+                        &mut self.fx_in,
+                        frames,
+                        &mut self.fx_out,
+                        &[],
+                        &[],
+                        &seat_params,
+                        &self.shared,
+                        &self.desk.frozen,
+                        ch,
+                        // Still one of the sixteen — see the note above about
+                        // where a folded lane's rack runs — so it keeps its own
+                        // sample, exactly as it keeps its own automation row.
+                        self.sampler_samples.get(ch).and_then(Option::as_ref),
+                        // Not a key pass in v1: a folder's rack runs here, after
+                        // the chunk's snapshot customers were decided — keying a
+                        // bus comp IN a group is a second pass this feature does
+                        // not make yet. See `KeyFeed`.
+                        None,
                 
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                }
             }
             // **THE-FOLD: the folder's SECOND rack** - bays 3..5, seated
             // past everything (`folder_extra_seat`), run here and only here
@@ -15541,35 +15722,37 @@ impl Renderer {
             // eye reads it.
             {
                 let extra = tangent_ui::recorder::folder_extra_seat(ch);
-                if !self.racks[extra].is_empty() {
+                if seat_rack(&self.racks, &self.spine.lanes, extra).is_some_and(|r| !r.is_empty()) {
                     let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
                         std::array::from_fn(|b| {
                             self.auto_params
                                 .get(extra * INSERTS + b)
                                 .map_or(&[][..], Vec::as_slice)
                         });
-                    run_rack(
-                        &mut self.racks[extra],
-                        &mut self.fx_in,
-                        frames,
-                        &mut self.fx_out,
-                        &[],
-                        &[],
-                        &seat_params,
-                        &self.shared,
-                        &self.desk.frozen,
-                        extra,
-                        // **NOT-A-CHANNEL:** a folder's second rack is
-                        // seated past every channel (`folder_extra_seat`),
-                        // so it can never carry a lane's sample.
-                        None,
-                        // Not a key pass in v1, exactly as the folder's
-                        // first rack above. See `KeyFeed`.
-                        None,
+                    if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, extra) {
+                        run_rack(
+                            rack,
+                            &mut self.fx_in,
+                            frames,
+                            &mut self.fx_out,
+                            &[],
+                            &[],
+                            &seat_params,
+                            &self.shared,
+                            &self.desk.frozen,
+                            extra,
+                            // **NOT-A-CHANNEL:** a folder's second rack is
+                            // seated past every channel (`folder_extra_seat`),
+                            // so it can never carry a lane's sample.
+                            None,
+                            // Not a key pass in v1, exactly as the folder's
+                            // first rack above. See `KeyFeed`.
+                            None,
                     
-            None,
-            u64::MAX,
-        );
+                None,
+                u64::MAX,
+            );
+                    }
                 }
             }
             // **No wait here, and that is the point.** Everything in this
@@ -15600,9 +15783,17 @@ impl Renderer {
             let to_master = up < 0;
             let want = frames * TAP_CHANNELS;
             let mut peak = [0.0f32; 2];
+            // The folder's own fader lives in its lane; a folder row with no
+            // lane (none today: a legacy desk installs every row) has a
+            // fader that does not move, at unity.
+            let mut spare = 1.0f32;
+            let fader = match self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) {
+                Some(l) => &mut l.body_mut().channel_gain,
+                None => &mut spare,
+            };
             for f in 0..frames {
-                self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
-                let g = self.channel_gain[ch];
+                *fader += (target - *fader) * coeff;
+                let g = *fader;
                 let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
                 let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
@@ -15612,7 +15803,7 @@ impl Renderer {
                 // the post-rack, post-fader result back is what lets the
                 // next folder up read this one as a child, and is what makes
                 // a group's STEM the group rather than an empty row.
-                if let Some(st) = self.stem_scratch.get_mut(..frames * stride) {
+                if let Some(st) = self.spine.desk.stem_scratch.get_mut(..frames * stride) {
                     st[f * stride + ch * 2] = l;
                     st[f * stride + ch * 2 + 1] = r;
                 }
@@ -15622,7 +15813,7 @@ impl Renderer {
                 if self.stems_dry {
                     let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * pan_l;
                     let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
-                    if let Some(d) = self.dry_scratch.get_mut(..frames * stride) {
+                    if let Some(d) = self.spine.desk.dry_scratch.get_mut(..frames * stride) {
                         d[f * stride + ch * 2] = dl;
                         d[f * stride + ch * 2 + 1] = dr;
                     }
@@ -15645,6 +15836,11 @@ impl Renderer {
             // and it moves because there is finally something in the bus.
             self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
+    }
+
+    /// Where lane `ch`'s fader has slewed to, unity for a slot with no lane.
+    fn fader_now(&self, ch: usize) -> f32 {
+        self.spine.lanes.get(ch).and_then(Option::as_deref).map_or(1.0, |l| l.peek().channel_gain)
     }
 
     /// **What the folders a lane's audio is folded through will make of
@@ -15678,7 +15874,7 @@ impl Renderer {
                 break;
             }
             let (pl, pr) = pan_gains(self.lane_pan(a));
-            let fg = self.channel_gain.get(a).copied().unwrap_or(1.0);
+            let fg = self.fader_now(a);
             g[0] *= fg * pl;
             g[1] *= fg * pr;
             up = self.folders.get(a).copied().unwrap_or(-1);
@@ -15712,7 +15908,7 @@ impl Renderer {
                 break;
             }
             let (pl, pr) = pan_gains(self.lane_pan(a));
-            let fg = self.channel_gain.get(a).copied().unwrap_or(1.0);
+            let fg = self.fader_now(a);
             path[0] *= fg * pl;
             path[1] *= fg * pr;
             let send = self.lane_send(Strip::Channel(a).index());
@@ -16533,6 +16729,10 @@ impl Engine {
             .then(offline_peers)
             .filter(|p| *p > 1)
             .map(|peers| LanePool::new(peers, None, None));
+        // A scratch set per hand of the NEW pool: the work is only ever
+        // called with `hand < hands()`, and a set short would be a lane
+        // rendered with nothing to render through.
+        r.hands = Hands::new(r.fanout.as_ref().map_or(1, LanePool::hands));
         r.fanout_any = on;
     }
 
@@ -16918,6 +17118,11 @@ impl Engine {
                     .map(Arc::new);
                 Some(LanePool::new(peers, wg, Some(plan)))
             });
+        // **A legacy desk: row r at slot r, every lane installed now.** The
+        // bank is built seat by seat to pair with the host's rings above;
+        // the lanes take their nine racks out of it here.
+        let (racks, spine) = spine_from_bank(racks, LEGACY_GEN);
+        let hands = Hands::new(pool.as_ref().map_or(1, LanePool::hands));
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -16936,14 +17141,9 @@ impl Engine {
             midi_routes: [tangent_ui::recorder::MidiRoute::default(); CHANNELS],
             clips: Vec::new(),
             midi_clips: Vec::new(),
-            told: [0; CHANNELS],
-            told_off: Box::new([[0; 128]; CHANNELS]),
-            park_from: [u64::MAX; CHANNELS],
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            live_pedal: [[0; 3]; CHANNELS],
-            lane_pedal_sent: [[0; 3]; CHANNELS],
             lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
@@ -16958,7 +17158,6 @@ impl Engine {
             maps_incoming,
             maps_retiring,
             auto: AutoNow::default(),
-            pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: tangent_ui::automation::Automation::default(),
             // **Grown once, here.** Sixteen parameters a bay is more than any
@@ -16993,15 +17192,10 @@ impl Engine {
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             pad_gain: vec![1.0; CHANNELS],
-            dx7s: (0..CHANNELS).map(|_| None).collect(),
             dx7_incoming,
             dx7_retiring,
-            audition_on: [None; CHANNELS],
-            audition_rang: [false; CHANNELS],
-            keys_lanes: (0..CHANNELS).map(|_| None).collect(),
             keys_incoming,
             keys_retiring,
-            channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
             room_effects: crate::effects::Effects::new_live(rate as f32),
@@ -17011,30 +17205,16 @@ impl Engine {
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             racks,
-            lane_quiet: vec![0; CHANNELS],
-            lane_loud: vec![false; CHANNELS],
+            spine,
+            hands,
+            fork_round: 0,
+            wanted: Vec::with_capacity(CHANNELS),
             fanout: pool,
             fanout_any: false,
-            lane_scratch: (0..CHANNELS).map(|_| LaneScratch::new()).collect(),
-            lane_note_bank: (0..CHANNELS)
-                .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
-                .collect(),
-            lane_ctl_bank: (0..CHANNELS)
-                .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
-                .collect(),
-            lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: desk_lane_set(),
             curve_lanes: desk_lane_set(),
             ui_held: Vec::with_capacity(1024),
-            lane_wants: [false; CHANNELS],
-            lane_at: [0; CHANNELS],
-            lane_len: [0; CHANNELS],
-            lane_skip: [false; CHANNELS],
-            lane_folds: [false; CHANNELS],
-            lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
-            lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
-            lane_dry_paid: [0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -17064,7 +17244,6 @@ impl Engine {
             monitor_scratch: vec![0.0; widest * 4096],
             cap_tx,
             stem_tx,
-            stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             folders: [-1; CHANNELS],
             folder_is: [false; CHANNELS],
             folder_lat: [0; CHANNELS],
@@ -17098,8 +17277,6 @@ impl Engine {
             stems_live: false,
             stems_wanted: false,
             keys_live: false,
-            key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
-            key_prev_frames: 0,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
@@ -17109,9 +17286,7 @@ impl Engine {
             midi_first: None,
             clip_lanes: desk_lane_set(),
             clip_under: desk_lane_set(),
-            dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
-            dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
             board_ran: desk_lane_set(),
@@ -23254,6 +23429,7 @@ mod tests {
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             }
         }).collect();
+        let (racks, spine) = spine_from_bank(racks, LEGACY_GEN);
         Renderer {
             monitor: None,
             monitor_channels: 0,
@@ -23265,7 +23441,6 @@ mod tests {
             monitor_scratch: Vec::new(),
             cap_tx: Vec::new(),
             stem_tx: RingBuffer::<f32>::new(1 << 16).0,
-            stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             folders: [-1; CHANNELS],
             folder_is: [false; CHANNELS],
             folder_lat: [0; CHANNELS],
@@ -23299,8 +23474,6 @@ mod tests {
             stems_live: false,
             stems_wanted: false,
             keys_live: false,
-            key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
-            key_prev_frames: 0,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
@@ -23310,9 +23483,7 @@ mod tests {
             midi_first: None,
             clip_lanes: desk_lane_set(),
             clip_under: desk_lane_set(),
-            dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
-            dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
             board_ran: desk_lane_set(),
@@ -23333,30 +23504,16 @@ mod tests {
             route_placed: desk_lane_set(),
             route_deps: (0..CHANNELS).map(|_| desk_lane_set()).collect(),
             racks,
-            lane_quiet: vec![0; CHANNELS],
-            lane_loud: vec![false; CHANNELS],
+            spine,
+            hands: Hands::new(1),
+            fork_round: 0,
+            wanted: Vec::with_capacity(CHANNELS),
             fanout: None,
             fanout_any: false,
-            lane_scratch: (0..CHANNELS).map(|_| LaneScratch::new()).collect(),
-            lane_note_bank: (0..CHANNELS)
-                .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
-                .collect(),
-            lane_ctl_bank: (0..CHANNELS)
-                .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
-                .collect(),
-            lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: desk_lane_set(),
             curve_lanes: desk_lane_set(),
             ui_held: Vec::with_capacity(1024),
-            lane_wants: [false; CHANNELS],
-            lane_at: [0; CHANNELS],
-            lane_len: [0; CHANNELS],
-            lane_skip: [false; CHANNELS],
-            lane_folds: [false; CHANNELS],
-            lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
-            lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
-            lane_dry_paid: [0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
@@ -23372,14 +23529,9 @@ mod tests {
             fx_return_gain: 1.0,
             clips: Vec::new(),
             midi_clips: Vec::new(),
-            told: [0; CHANNELS],
-            told_off: Box::new([[0; 128]; CHANNELS]),
-            park_from: [u64::MAX; CHANNELS],
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            live_pedal: [[0; 3]; CHANNELS],
-            lane_pedal_sent: [[0; 3]; CHANNELS],
             lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
@@ -23416,7 +23568,6 @@ mod tests {
             rate: RATE,
             dev_channels: dev_ch,
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            channel_gain: [1.0; CHANNELS],
             midi,
             ui_params,
             hw_midi,
@@ -23424,15 +23575,8 @@ mod tests {
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             midi_routes: [tangent_ui::recorder::MidiRoute::default(); CHANNELS],
-            // Every lane empty, like a fresh desk; a test that wants an
-            // instrument installs one directly, which is the assignment the
-            // host's sync would have made.
-            dx7s: (0..CHANNELS).map(|_| None).collect(),
             dx7_incoming: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).1,
             dx7_retiring: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).0,
-            audition_on: [None; CHANNELS],
-            audition_rang: [false; CHANNELS],
-            keys_lanes: (0..CHANNELS).map(|_| None).collect(),
             keys_incoming: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).1,
             keys_retiring: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).0,
             effects: crate::effects::Effects::new_send(RATE as f32),
@@ -23453,7 +23597,6 @@ mod tests {
             maps_incoming: RingBuffer::<Maps>::new(2).1,
             maps_retiring: RingBuffer::<Maps>::new(2).0,
             auto: AutoNow::default(),
-            pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: tangent_ui::automation::Automation::default(),
             // **Grown once, here.** Sixteen parameters a bay is more than any
@@ -23488,7 +23631,7 @@ mod tests {
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
-        r.dx7s[0] = Some(Box::new(crate::dx7::Dx7::new(RATE as f32)));
+        r.lane_body_mut(0).dx7 = Some(Box::new(crate::dx7::Dx7::new(RATE as f32)));
         r.midi = midi_rx;
         (r, midi_tx, shared)
     }
@@ -27308,15 +27451,15 @@ mod tests {
     fn every_renderer_constructor_buys_the_key_scratches_up_front() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let r = e.offline.as_ref().expect("an offline engine holds its renderer");
-        assert_eq!(r.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
-        assert_eq!(r.key_prev_frames, 0, "a fresh snapshot claims frames it never wrote");
+        assert_eq!(r.spine.desk.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        assert_eq!(r.spine.desk.key_prev_frames, 0, "a fresh snapshot claims frames it never wrote");
         assert_eq!(r.key_io.len(), TAP_CHANNELS);
         assert!(r.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
         assert_eq!(r.shared.insert_key.len(), RACK_SEATS * INSERTS);
 
         let (tx, _rx) = RingBuffer::<f32>::new(64);
         let t = test_renderer(Arc::new(Shared::new()), tx, 2);
-        assert_eq!(t.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        assert_eq!(t.spine.desk.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
         assert_eq!(t.key_io.len(), TAP_CHANNELS);
         assert!(t.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
     }
@@ -29238,7 +29381,7 @@ mod tests {
             "the pad struck at {peak}, wanted {want}"
         );
         assert!(
-            !r.dx7s[0].as_ref().is_some_and(|d| d.active()),
+            !r.lane_body(0).dx7.as_ref().is_some_and(|d| d.active()),
             "a drum-channel note reached the piano through a loaded kit"
         );
     }
@@ -29257,7 +29400,7 @@ mod tests {
             "a channel-10 note with no kit loaded produced {peak}"
         );
         assert!(
-            r.dx7s[0].as_ref().is_some_and(|d| d.active()),
+            r.lane_body(0).dx7.as_ref().is_some_and(|d| d.active()),
             "the built-in never saw the note"
         );
     }
@@ -29733,7 +29876,7 @@ mod tests {
             shared.pick_strip[0].store(1, Ordering::Relaxed);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-            r.channel_gain[1] = 1.0;
+            r.lane_body_mut(1).channel_gain = 1.0;
             shared.monitor_on.store(true, Ordering::Relaxed);
             shared.limiter_mix.store(limiter.to_bits(), Ordering::Relaxed);
             r.room_gain = 1.0;
@@ -29824,7 +29967,7 @@ mod tests {
             shared.pick_strip[0].store(1, Ordering::Relaxed);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-            r.channel_gain[1] = 1.0;
+            r.lane_body_mut(1).channel_gain = 1.0;
             shared.monitor_on.store(true, Ordering::Relaxed);
             r.room_gain = 1.0;
             if route {
@@ -29900,7 +30043,7 @@ mod tests {
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.armed.store(1 << 1, Ordering::Relaxed);
         shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-        r.channel_gain[1] = 1.0;
+        r.lane_body_mut(1).channel_gain = 1.0;
         shared.routes[0].store(pack_route(1, 2, false, false), Ordering::Relaxed);
         shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
         shared.route_count.store(1, Ordering::Release);
@@ -31563,9 +31706,11 @@ mod tests {
             e.offline
                 .as_ref()
                 .expect("renderer")
-                .racks
-                .get(ch)
-                .is_some_and(|r| r.slots[0].0.is_some())
+                .lane_body(ch)
+                .chains[CHAIN_OWN]
+                .slots[0]
+                .0
+                .is_some()
         };
         assert!(
             !seated(&e, HELD),
@@ -31626,7 +31771,7 @@ mod tests {
         let mut out = vec![0.0_f32; 2 * 128];
         r.render(&mut out, 0, 0);
         assert!(
-            r.dx7s[HELD].is_none(),
+            r.lane_body(HELD).dx7.is_none(),
             "a held track's instrument was replaced under the worker holding it"
         );
 
@@ -31634,7 +31779,7 @@ mod tests {
         r.leased.clear();
         r.render(&mut out, 0, 0);
         assert!(
-            r.dx7s[HELD].is_some(),
+            r.lane_body(HELD).dx7.is_some(),
             "the deferred instrument never arrived, so it was dropped rather than waited"
         );
 
@@ -32103,7 +32248,7 @@ mod tests {
             if let Some(cell) = shared.channel_gains.first() {
                 cell.store(gain.to_bits(), Ordering::Relaxed);
             }
-            r.channel_gain[0] = gain;
+            r.lane_body_mut(0).channel_gain = gain;
             queue(&mut tx, 0, [0x90, 60, 100]);
             let mut out = vec![0.0_f32; 2 * 4096];
             r.render(&mut out, 0, 0);
@@ -32422,9 +32567,10 @@ mod tests {
         let mut out = vec![0.0f32; 128 * 2];
         r.render(&mut out, 0, 0);
         assert_eq!(r.controls.len(), 2, "both should travel as controls");
-        for (ch, pedals) in r.live_pedal.iter().enumerate() {
+        for ch in 0..CHANNELS {
+            let pedals = r.lane_body(ch).live_pedal;
             assert_eq!(
-                *pedals, [0_u8; 3],
+                pedals, [0_u8; 3],
                 "lane {ch} has a pedal down that nobody pressed"
             );
         }
@@ -32601,7 +32747,7 @@ mod tests {
         shared.pick_strip[0].store(1, Ordering::Relaxed);
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-        r.channel_gain[1] = 1.0;
+        r.lane_body_mut(1).channel_gain = 1.0;
         shared.monitor_on.store(true, Ordering::Relaxed);
         r.room_gain = 1.0;
 
@@ -32709,7 +32855,7 @@ mod tests {
             shared.pick_strip[0].store(1, Ordering::Relaxed);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-            r.channel_gain[1] = 1.0;
+            r.lane_body_mut(1).channel_gain = 1.0;
             r.monitor_gain[0] = 1.0;
             shared.monitor_on.store(monitored, Ordering::Relaxed);
             r.room_gain = if monitored { 1.0 } else { 0.0 };
@@ -32793,7 +32939,7 @@ mod tests {
             if solo_other {
                 shared.soloed.store(1 << 2, Ordering::Relaxed);
             }
-            r.channel_gain[1] = 1.0;
+            r.lane_body_mut(1).channel_gain = 1.0;
             shared.monitor_on.store(monitoring, Ordering::Relaxed);
             let mut tap = RecorderTap {
                 rx: tap_rx,
@@ -32869,8 +33015,8 @@ mod tests {
             if folder_muted {
                 shared.muted.store(1 << 2, Ordering::Relaxed);
             }
-            r.channel_gain[1] = 1.0;
-            r.channel_gain[2] = 1.0;
+            r.lane_body_mut(1).channel_gain = 1.0;
+            r.lane_body_mut(2).channel_gain = 1.0;
             shared.monitor_on.store(monitoring, Ordering::Relaxed);
             let mut tap = RecorderTap {
                 rx: tap_rx,
@@ -32959,8 +33105,8 @@ mod tests {
             shared.armed.store(1 << 1, Ordering::Relaxed);
             shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
             shared.channel_gains[2].store(dest_gain.to_bits(), Ordering::Relaxed);
-            r.channel_gain[1] = 1.0;
-            r.channel_gain[2] = dest_gain;
+            r.lane_body_mut(1).channel_gain = 1.0;
+            r.lane_body_mut(2).channel_gain = dest_gain;
             if dest_muted {
                 shared.muted.store(1 << 2, Ordering::Relaxed);
             }
@@ -33038,10 +33184,10 @@ mod tests {
             for &(lane, parent) in tree {
                 shared.folder_of[lane].store(parent, Ordering::Relaxed);
                 shared.channel_gains[lane].store(1.0f32.to_bits(), Ordering::Relaxed);
-                r.channel_gain[lane] = 1.0;
+                r.lane_body_mut(lane).channel_gain = 1.0;
                 if let Ok(p) = usize::try_from(parent) {
                     shared.channel_gains[p].store(1.0f32.to_bits(), Ordering::Relaxed);
-                    r.channel_gain[p] = 1.0;
+                    r.lane_body_mut(p).channel_gain = 1.0;
                 }
             }
             shared.pick_strip[0].store(child as i64, Ordering::Relaxed);
@@ -33141,7 +33287,7 @@ mod tests {
             shared.midi_off.store(1 << 2, Ordering::Relaxed);
             shared.armed.store(1 << 2, Ordering::Relaxed);
             shared.channel_gains[2].store(0.5f32.to_bits(), Ordering::Relaxed);
-            r.channel_gain[2] = 0.5;
+            r.lane_body_mut(2).channel_gain = 0.5;
             if muted {
                 shared.muted.store(1 << 2, Ordering::Relaxed);
             }
@@ -33254,7 +33400,7 @@ mod tests {
         shared
             .limiter_mix
             .store(tangent_ui::recorder::LIMITER_SHIPS_AT.to_bits(), Ordering::Relaxed);
-        r.channel_gain[1] = 1.0;
+        r.lane_body_mut(1).channel_gain = 1.0;
         let mut out = vec![0.0f32; 256 * 2];
         let mut peak = 0.0f32;
         for b in 0..200 {
@@ -33317,27 +33463,29 @@ mod tests {
         let (tap_tx, _rx) = RingBuffer::<f32>::new(1 << 16);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
         r.gain_coeff = gain_coefficient(RATE);
-        r.channel_gain = [1.0; CHANNELS];
+        for ch in 0..CHANNELS {
+            r.lane_body_mut(ch).channel_gain = 1.0;
+        }
         shared.set_channel_gain(0, 0.0);
         let mut out = vec![0.0f32; 8 * 2];
         r.render(&mut out, 0, 0);
         assert!(
-            r.channel_gain[0] > 0.9,
+            r.lane_body(0).channel_gain > 0.9,
             "a 10 ms smoother must not cross most of its range in 8 frames \
              (it reached {})",
-            r.channel_gain[0]
+            r.lane_body(0).channel_gain
         );
         // 600 blocks of 8 frames is 4800 frames, 100 ms, ten time constants.
         for _ in 0..600 {
             r.render(&mut out, 0, 0);
         }
         assert!(
-            r.channel_gain[0] < 0.01,
+            r.lane_body(0).channel_gain < 0.01,
             "the smoother never arrived ({})",
-            r.channel_gain[0]
+            r.lane_body(0).channel_gain
         );
         assert_eq!(
-            (r.channel_gain[1], r.channel_gain[2]),
+            (r.lane_body(1).channel_gain, r.lane_body(2).channel_gain),
             (1.0, 1.0),
             "one fader moved and took its neighbours with it"
         );
@@ -34018,13 +34166,43 @@ mod stack_budget {
             "Shared is {} bytes: something per-seat went back inline",
             size_of::<Shared>()
         );
-        // The seat count itself is the thing that turns a small array into a
-        // large one. If this ever shrinks back the ceilings above stop
-        // meaning anything, so say so.
+        // **A lane is what multiplies now, not a seat.** The ceilings above
+        // used to mean something only while `RACK_SEATS` was large, and this
+        // asserted that it was. A desk grows by boxed lanes, so the number
+        // that turns a small inline field into a large desk is the size of
+        // one [`Lane`]: its racks, its banks and its ledgers are inline, and
+        // everything sized by a block (grain ring, dry row, delay lines) is
+        // on the heap behind it. A ring or a row declared inline here again
+        // fails by name.
         assert!(
-            RACK_SEATS > 1000,
-            "RACK_SEATS fell to {RACK_SEATS}: re-tighten the ceilings here"
+            size_of::<Lane>() <= 8 * 1024,
+            "Lane is {} bytes: something sized by a block went back inline",
+            size_of::<Lane>()
         );
+    }
+
+    /// **The key snapshot is the desk's, never a lane's** (design 7.1,
+    /// critique A1). A keyed lane reads ANOTHER lane's last-chunk stem while
+    /// both render on different hands; a lane box holds only what its own
+    /// hand touches, so the snapshot lives in the renderer and is borrowed
+    /// read-only by the fork. A scan, because the property is an absence.
+    #[test]
+    fn the_key_snapshot_is_not_a_lane_field() {
+        let src = include_str!("instrument.rs");
+        // The declaration's own line, newline and all: this test's string
+        // spells the newline as an escape, so it cannot find itself.
+        let body = src
+            .split_once("\npub(crate) struct LaneBody {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("LaneBody is declared");
+        assert!(body.contains("chains:"), "the lane body was not found:\n{body}");
+        for banned in ["key_prev", "stem_scratch", "dry_scratch"] {
+            assert!(
+                !body.lines().any(|l| l.trim_start().starts_with(&format!("{banned}:"))),
+                "`{banned}` is a lane field again: another lane's hand reads it"
+            );
+        }
     }
 }
 
