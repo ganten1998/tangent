@@ -283,6 +283,35 @@ impl DrumpadDoc {
         (out, stated)
     }
 
+    /// **Every kit in the sidecar beside `doc`, by the track it is**, empty
+    /// kits left out (an empty kit is the absence of one, the writers'
+    /// rule). For a caller with no desk to read the file against: a scratch
+    /// whose document is missing, or two sidecars compared kit for kit.
+    ///
+    /// A `track_kits` file names its tracks itself, so every kit in it is
+    /// here whatever desk wrote it: read through the identity desk, a kit
+    /// on a track minted past 31 (`t32`, every track Add makes) had no lane
+    /// and vanished, and the launch sweep then took a scratch holding one
+    /// for an empty clone and deleted it, kit and all. A legacy file reads
+    /// as it always did, its lanes as ids by the identity rule.
+    pub fn load_by_track(
+        doc: &std::path::Path,
+        legacy_lane: Option<usize>,
+    ) -> std::collections::BTreeMap<crate::desk_id::TrackId, Self> {
+        let named: Option<Vec<crate::desk_id::TrackId>> = std::fs::read_to_string(Self::sidecar(doc))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| match v.get(TRACK_KITS) {
+                // The grammar's own parse: canonical spellings only, the
+                // rule `load_all_beside_ids` keeps.
+                Some(Value::Object(kits)) => Some(kits.keys().filter_map(|k| k.parse().ok()).collect()),
+                _ => None,
+            });
+        let ids = named.unwrap_or_else(|| crate::desk_legacy::identity_ids(crate::recorder::CHANNELS));
+        let (kits, _) = Self::load_all_beside_ids(doc, &ids, legacy_lane);
+        ids.into_iter().zip(kits).filter(|(_, k)| !k.is_empty()).collect()
+    }
+
     /// **Every lane's kit into the one sidecar**, its lanes read as ids by
     /// the identity rule. The host's road until it holds the desk's ids;
     /// the app writes through [`Self::save_all_beside_ids`].
