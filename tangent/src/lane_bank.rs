@@ -298,6 +298,10 @@ pub struct ApplyReport {
     pub attach_retired: u32,
     pub grow_refused: u32,
     pub capture_refused: u32,
+    /// Plans that passed validation and now play (the last of them is the
+    /// one playing). What tells the callback a plan's own tables, its keys
+    /// among them, are due to be published.
+    pub plans_taken: u32,
     /// Remove named a slot that held no lane.
     pub remove_empty: u32,
     /// Ops are still queued because the retire ring had no room.
@@ -438,9 +442,30 @@ where
                 return Some(EngineOp::Plan(next));
             }
             std::mem::swap(plan, &mut next);
+            report.plans_taken += 1;
             Some(EngineOp::Plan(next))
         }
-        EngineOp::Monitor(next) => spine.monitor.replace(next).map(EngineOp::Monitor),
+        EngineOp::Monitor(mut next) => {
+            // **A layout that lands on a ring the renderer has not taken in
+            // yet joins that ring's plan; it does not displace it.** Every
+            // queued op is applied before the renderer looks at
+            // `spine.monitor`, so a ring plan and the layout pushed after it
+            // can arrive in one pass (a device opened and a pick changed in
+            // one UI frame, a stalled callback, an offline settle). Replaced
+            // here, the ring would go home unused inside the plan it came
+            // in, and the layout would be applied to the OLD ring, or to
+            // none. The two tables swap instead, so the newer layout stays
+            // with the new ring and the one it replaced leaves in `next`.
+            if next.layout_only {
+                if let Some(held) = spine.monitor.as_deref_mut().filter(|h| h.fresh && !h.layout_only) {
+                    std::mem::swap(&mut held.widths, &mut next.widths);
+                    std::mem::swap(&mut held.columns, &mut next.columns);
+                    std::mem::swap(&mut held.picks, &mut next.picks);
+                    return Some(EngineOp::Monitor(next));
+                }
+            }
+            spine.monitor.replace(next).map(EngineOp::Monitor)
+        }
         EngineOp::Capture { pick, ring } => {
             let at = pick.0 as usize;
             if at >= spine.captures.len() || spine.capturing.contains(at) {
@@ -667,6 +692,7 @@ mod tests {
                 report,
                 ApplyReport {
                     applied: 11,
+                    plans_taken: 2,
                     ..ApplyReport::default()
                 },
                 "capacity {cap}: something was refused"
@@ -972,5 +998,64 @@ mod tests {
         .unwrap();
         let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
         assert_eq!(r.capture_refused, 0);
+    }
+
+    /// **A ring and the layout pushed after it, applied in one pass, both
+    /// arrive** (design 7.4: the monitor ring and its layout travel
+    /// together). The layout joins the ring's plan, which the renderer has
+    /// not taken in yet; the plan that comes home carries the ring's OLD
+    /// tables and no ring. Once the renderer has taken the ring in, a layout
+    /// is a plan of its own again and displaces the spent one.
+    #[test]
+    fn a_layout_behind_an_untaken_ring_joins_it_rather_than_sending_it_home() {
+        let mut spine: Spine<Toy> = Spine::with_capacity(4, 1);
+        let mut plan = Box::new(DeskPlan::empty());
+        let (mut tx, mut rx, mut rtx, mut rrx) = rings(8);
+        let (_, ring) = RingBuffer::<f32>::new(16);
+        tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
+            ring: Some(ring),
+            channels: 4,
+            block: 64,
+            widths: vec![1, 1].into_boxed_slice(),
+            fresh: true,
+            ..MonitorPlan::default()
+        })))
+        .unwrap();
+        tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
+            widths: vec![2, 0].into_boxed_slice(),
+            layout_only: true,
+            fresh: true,
+            ..MonitorPlan::default()
+        })))
+        .unwrap();
+        let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
+        assert_eq!(r.applied, 2);
+        let held = spine.monitor.as_deref().expect("a plan is held");
+        assert!(held.ring.is_some(), "the new device's ring was sent home unused");
+        assert!(held.fresh && !held.layout_only);
+        assert_eq!((held.channels, held.block), (4, 64));
+        assert_eq!(&held.widths[..], &[2, 0], "the newer layout was lost");
+        let home = drain(&mut rrx);
+        assert_eq!(home.len(), 1);
+        match &home[0] {
+            EngineOp::Monitor(m) => {
+                assert!(m.ring.is_none(), "a ring went home");
+                assert_eq!(&m.widths[..], &[1, 1], "the displaced tables are the ring's old ones");
+            }
+            other => panic!("{other:?} came home"),
+        }
+        // Taken in by the renderer: the next layout displaces the spent plan.
+        spine.monitor.as_deref_mut().unwrap().fresh = false;
+        tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
+            widths: vec![0, 2].into_boxed_slice(),
+            layout_only: true,
+            fresh: true,
+            ..MonitorPlan::default()
+        })))
+        .unwrap();
+        apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
+        let held = spine.monitor.as_deref().expect("a plan is held");
+        assert!(held.layout_only && held.fresh);
+        assert_eq!(drain(&mut rrx).len(), 1, "the spent plan stayed");
     }
 }

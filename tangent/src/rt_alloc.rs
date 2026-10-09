@@ -37,6 +37,18 @@ struct Counting;
 thread_local! {
     /// `None` when this thread is not the counting one.
     static TOUCHES: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Bytes the counting thread asked for inside its window (see
+    /// [`count_bytes`]): what a build costs, where `TOUCHES` is how often.
+    static ASKED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Add `size` to the counting thread's bytes; nothing on any other thread.
+fn ask(size: usize) {
+    let _ = TOUCHES.try_with(|t| {
+        if t.get().is_some() {
+            let _ = ASKED.try_with(|a| a.set(a.get().saturating_add(size)));
+        }
+    });
 }
 
 /// Whether a window is open: lane hands count only then.
@@ -96,6 +108,7 @@ fn touch() {
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         touch();
+        ask(layout.size());
         // SAFETY: forwarding the caller's own layout.
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -106,11 +119,13 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         touch();
+        ask(new_size);
         // SAFETY: forwarding the caller's own pointer, layout and size.
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         touch();
+        ask(layout.size());
         // SAFETY: forwarding the caller's own layout.
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
@@ -149,6 +164,16 @@ pub fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, Counted) {
     let here = TOUCHES.with(Cell::take).unwrap_or(0);
     let hands = HANDS.load(Ordering::SeqCst);
     (out, Counted { here, hands })
+}
+
+/// **How many bytes `f` asked the allocator for, on this thread**: every
+/// allocation's size and every reallocation's new size, frees not
+/// subtracted. A ceiling on what a build costs (design 7.12 pins an idle
+/// lane at 256 KB), counted rather than estimated from capacities.
+pub fn count_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    ASKED.with(|a| a.set(0));
+    let (out, _) = count_allocs(f);
+    (out, ASKED.with(Cell::get))
 }
 
 /// The smallest of `tries` windows over `f`, element by element.
