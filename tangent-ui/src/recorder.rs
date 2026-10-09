@@ -382,6 +382,11 @@ pub struct ScrubView {
     /// longer, so the rectangle is always telling the truth. Zero means
     /// "no document": the wave face falls back to the track's own length.
     pub domain_s: f64,
+    /// **How many rows the overview stacks**: the desk's extent, handed in.
+    /// It read the desk's compile-time width, which tied a picture of the
+    /// song to a capacity constant; the desk says how deep it is now, and
+    /// zero (no document) draws one row. Appended.
+    pub rows: usize,
 }
 
 impl RecorderView<'_> {
@@ -1140,6 +1145,19 @@ pub fn track_cap(supporter: bool) -> Option<usize> {
 /// "make the default at full screen or max size 16 in one row".
 pub const DEFAULT_MAX_STRIPS: usize = 16;
 
+/// **The most strips or lanes either view lays out at once**, whatever the
+/// zoom asks for: the clamp on the mixer's strip count and the arrangement's
+/// lane count, and the top rung of their zoom ladder.
+///
+/// A geometry number, not a width. It was the channel count, which tied how
+/// many strips a screen can carry to how many tracks the desk holds: a
+/// desk that grows past it now scrolls instead, and a view never builds,
+/// lays out, hit-tests or describes more than this many plus its pinned
+/// strips (docs/design/unlimited-tracks.md, section 10). Sixty-four because
+/// that is a full-width desk on the largest screen the owner uses at the
+/// narrowest strip that still reads (`mixer_panel::MIN_STRIP_W`).
+pub const VISIBLE_MAX: usize = 64;
+
 /// **The palette's period**: how many colours a palette deals before it
 /// repeats. Track `n` wears slot `n % PALETTE_SLOTS`, so tracks 0..31 keep
 /// the colours they always had and track 32 starts the deal again rather
@@ -1650,42 +1668,218 @@ impl Default for DrumKitParams {
 /// landed on the click, and its typed name went to a channel with no column to
 /// show it. Each time the fix was one missed call site.
 ///
-/// So the two spaces get two types. A `Column` comes from geometry — a press,
-/// a drawn strip — and the ONLY ways out of it are [`Column::strip`], which
-/// answers what the column is, and [`Column::desk_index`], which answers where
-/// its settings live. Indexing anything desk-shaped with `.0` is greppable,
-/// deliberate, and almost always the bug being reintroduced.
+/// So the two spaces get two types, and the column is an ENUM now rather
+/// than a number. It was `Column(usize)`, whose pinned click and master were
+/// "one past the channels" and "two past", so a desk that grew a track moved
+/// both of them and every `.0` that compared against the width was a fourth
+/// shipping of the same bug waiting for the desk to change size (docs/design/
+/// unlimited-tracks.md, section 10). A track column names its ROW; the click
+/// and the master name themselves, and no arithmetic reaches either.
+///
+/// The ways out are [`Column::strip`], which answers what the column is, and
+/// [`Column::strip_ref`], which hands the question of where its settings live
+/// to [`StripRef`], the one home of strip-index arithmetic.
+///
+/// The derived order is the order the desk draws them in: every track, then
+/// the click, then the master, which is the order `Column(usize)` sorted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Column(pub usize);
+pub enum Column {
+    /// The strip of the track on this ROW of the desk.
+    Track(usize),
+    /// The click's pinned strip, left of the master.
+    Click,
+    /// The master's pinned strip, rightmost.
+    Master,
+}
 
 impl Column {
     /// Which strip this column shows, or `None` for the master.
     ///
-    /// The one place a column becomes a strip. `shown()` and `all()` are not
-    /// the same list — the click and the effects bus are strips with no column
-    /// of their own — and everything that turns a press into a change goes
-    /// through here.
+    /// The one place a column becomes a strip. It used to look itself up in
+    /// a freshly built `Strip::shown()` array on every call, which cost a
+    /// thirty-three-entry array per question; a match is the same answer.
     pub fn strip(self) -> Option<Strip> {
-        Strip::shown().get(self.0).copied()
+        match self {
+            Column::Track(row) => Some(Strip::Channel(row)),
+            Column::Click => Some(Strip::Click),
+            Column::Master => None,
+        }
+    }
+
+    /// What this column is, as the identity every desk array is read by.
+    pub fn strip_ref(self) -> StripRef {
+        match self {
+            Column::Track(row) => StripRef::Row(row),
+            Column::Click => StripRef::Click,
+            Column::Master => StripRef::Master,
+        }
     }
 
     /// Where this column's settings live in every desk array.
     ///
-    /// The master's are last, past every channel — it is not in `shown()` and
-    /// has no `Strip` of its own, so `STRIPS` is its slot by convention and
-    /// this is where that convention is written down.
+    /// A shim over [`StripRef::desk_index`], which is where the master's
+    /// "past every strip" convention is written down.
     pub fn desk_index(self) -> usize {
-        self.strip().map_or(STRIPS, Strip::index)
+        self.strip_ref().desk_index()
+    }
+
+    /// The track ROW this column draws, or `None` for the two pinned strips.
+    pub fn row(self) -> Option<usize> {
+        match self {
+            Column::Track(row) => Some(row),
+            Column::Click | Column::Master => None,
+        }
+    }
+
+    /// Whether this column is one of the two pinned at the right, which
+    /// never scroll and never clip.
+    pub fn pinned(self) -> bool {
+        matches!(self, Column::Click | Column::Master)
+    }
+
+    /// Every column of a desk `rows` tracks wide, in drawn order: the tracks,
+    /// then the click, then the master. What a test walks where it walked
+    /// `0..COLUMNS` before the columns had names.
+    pub fn every(rows: usize) -> impl Iterator<Item = Column> {
+        (0..rows).map(Column::Track).chain([Column::Click, Column::Master])
     }
 }
 
+/// Said the way a test message or a log line names it: `Track(3)`, `Click`,
+/// `Master`.
+impl std::fmt::Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
 
-/// How many COLUMNS the desk draws: every strip that has one, then the master.
+/// **A strip of the desk, by what it is**: a track's row, one of the three
+/// buses, or the master.
 ///
-/// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
-/// this crate's panels do not depend on each other, so it is stated here and
-/// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = CHANNELS + 2;
+/// The ONE home of strip-index arithmetic until the specials leave strip
+/// space (W5). The desk arrays (`strip_names`, `strip_sends`, the mute and
+/// solo masks, the meter holds, the insert seats) are laid out as the rows,
+/// then the drum bus, the click and the effects return, then the master;
+/// every other piece of code asks this type where something lives instead
+/// of adding a width to an index. The views do no such sums at all: a scan
+/// (`no_view_code_does_strip_index_arithmetic`) holds them to it, so the day
+/// the desk stops being a fixed width there is one place that changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StripRef {
+    /// The track on this row.
+    Row(usize),
+    /// The drum bus, which has a desk slot and no column.
+    Drums,
+    /// The click.
+    Click,
+    /// The effects return, which has a desk slot and no column.
+    Fx,
+    /// The master, past every strip.
+    Master,
+}
+
+impl StripRef {
+    /// Its place in `Desk`'s arrays: the rows first, the three buses after
+    /// them, the master last.
+    pub const fn desk_index(self) -> usize {
+        match self {
+            StripRef::Row(row) => row,
+            StripRef::Drums => CHANNELS,
+            StripRef::Click => CHANNELS + 1,
+            StripRef::Fx => CHANNELS + 2,
+            StripRef::Master => STRIPS,
+        }
+    }
+
+    /// The strip at a desk index, the exact inverse of [`Self::desk_index`].
+    /// `None` past the master, which is no strip at all.
+    pub const fn from_desk_index(i: usize) -> Option<StripRef> {
+        Some(if i < CHANNELS {
+            StripRef::Row(i)
+        } else if i == CHANNELS {
+            StripRef::Drums
+        } else if i == CHANNELS + 1 {
+            StripRef::Click
+        } else if i == CHANNELS + 2 {
+            StripRef::Fx
+        } else if i == STRIPS {
+            StripRef::Master
+        } else {
+            return None;
+        })
+    }
+
+    /// The `Strip` this is, or `None` for the master, which has none.
+    pub const fn strip(self) -> Option<Strip> {
+        match self {
+            StripRef::Row(row) => Some(Strip::Channel(row)),
+            StripRef::Drums => Some(Strip::Drums),
+            StripRef::Click => Some(Strip::Click),
+            StripRef::Fx => Some(Strip::Fx),
+            StripRef::Master => None,
+        }
+    }
+
+    /// The mixer column it is drawn in, or `None` for the drum bus and the
+    /// effects return, which have none.
+    pub const fn column(self) -> Option<Column> {
+        match self {
+            StripRef::Row(row) => Some(Column::Track(row)),
+            StripRef::Click => Some(Column::Click),
+            StripRef::Master => Some(Column::Master),
+            StripRef::Drums | StripRef::Fx => None,
+        }
+    }
+
+    /// The track row, or `None` for a bus or the master.
+    pub const fn row(self) -> Option<usize> {
+        match self {
+            StripRef::Row(row) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// The master's desk index, for the arrays that keep it past the strips.
+    pub const MASTER_INDEX: usize = StripRef::Master.desk_index();
+
+    /// **The lane the automation store files this strip's curves under.**
+    ///
+    /// A different space from the desk index, and the reason it is spelt
+    /// out: a track's curves sit on its row, and the MASTER's on the lane
+    /// one past the rows, which is where the drum bus sits in the desk
+    /// arrays. Only tracks and the master have curves, so a bus has no lane.
+    /// The master's lane becomes `AutoLane::Master` in W6 and this goes.
+    pub const fn auto_lane(self) -> Option<usize> {
+        match self {
+            StripRef::Row(row) => Some(row),
+            StripRef::Master => Some(CHANNELS),
+            StripRef::Drums | StripRef::Click | StripRef::Fx => None,
+        }
+    }
+
+    /// The strip a stored automation lane belongs to: a track's row, the
+    /// master's lane, or nothing past it.
+    pub const fn from_auto_lane(lane: usize) -> Option<StripRef> {
+        if lane < CHANNELS {
+            Some(StripRef::Row(lane))
+        } else if lane == CHANNELS {
+            Some(StripRef::Master)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<Strip> for StripRef {
+    fn from(s: Strip) -> Self {
+        match s {
+            Strip::Channel(row) => StripRef::Row(row),
+            Strip::Drums => StripRef::Drums,
+            Strip::Click => StripRef::Click,
+            Strip::Fx => StripRef::Fx,
+        }
+    }
+}
 
 impl Strip {
     /// The channels the MIXER draws, in order: the eight, then the CLICK,
@@ -1722,19 +1916,23 @@ impl Strip {
         })
     }
 
-    /// The column this strip is drawn in, or `None` for the click and the
-    /// bus, which have none. The inverse of [`Column::strip`].
+    /// The column this strip is drawn in, or `None` for the drum bus and
+    /// the effects return, which have none. The inverse of [`Column::strip`].
     pub fn column_of(self) -> Option<Column> {
-        Self::shown().iter().position(|s| *s == self).map(Column)
+        match self {
+            Strip::Channel(row) => Some(Column::Track(row)),
+            Strip::Click => Some(Column::Click),
+            Strip::Drums | Strip::Fx => None,
+        }
     }
 
-    /// Its place in `Desk`'s arrays.
+    /// Its place in `Desk`'s arrays. See [`StripRef::desk_index`].
     pub const fn index(self) -> usize {
         match self {
-            Strip::Channel(i) => i,
-            Strip::Drums => CHANNELS,
-            Strip::Click => CHANNELS + 1,
-            Strip::Fx => CHANNELS + 2,
+            Strip::Channel(row) => StripRef::Row(row).desk_index(),
+            Strip::Drums => StripRef::Drums.desk_index(),
+            Strip::Click => StripRef::Click.desk_index(),
+            Strip::Fx => StripRef::Fx.desk_index(),
         }
     }
 
@@ -6426,4 +6624,209 @@ fn resting_scope() -> &'static crate::scope::Scope {
 fn resting_analyzer() -> &'static crate::analyzer::Analyzer {
     static A: std::sync::OnceLock<crate::analyzer::Analyzer> = std::sync::OnceLock::new();
     A.get_or_init(|| crate::analyzer::Analyzer::new(48_000.0))
+}
+
+/// The column and strip types, and the scan that keeps the views off
+/// strip-index arithmetic (docs/design/unlimited-tracks.md, W2-views-windowed).
+#[cfg(test)]
+mod strip_ref_tests {
+    use super::*;
+
+    /// **A column, its strip and its desk slot agree, by name.** The
+    /// aliasing pin re-pinned on the enum: the click is the click's column
+    /// and slot, the master the master's, and every track its own row in
+    /// all three spaces. `Column(usize)` called the click's desk index the
+    /// master's column; no number links the two any more.
+    #[test]
+    fn a_column_a_strip_and_a_desk_slot_name_the_same_thing() {
+        for col in Column::every(CHANNELS) {
+            let r = col.strip_ref();
+            assert_eq!(r.column(), Some(col), "{col} does not come back from its StripRef");
+            assert_eq!(col.desk_index(), r.desk_index());
+            assert_eq!(StripRef::from_desk_index(r.desk_index()), Some(r));
+            assert_eq!(col.strip(), r.strip(), "{col} and its StripRef name different strips");
+            if let Some(s) = col.strip() {
+                assert_eq!(s.column_of(), Some(col));
+                assert_eq!(s.index(), col.desk_index());
+                assert_eq!(StripRef::from(s), r);
+            }
+        }
+        assert_eq!(Column::Click.strip(), Some(Strip::Click));
+        assert_eq!(Column::Master.strip(), None);
+        assert_eq!(Column::Master.desk_index(), STRIPS);
+        assert_eq!(Column::Click.desk_index(), Strip::Click.index());
+        assert_ne!(Column::Click.desk_index(), Column::Master.desk_index());
+        // The two buses with no column have none.
+        assert_eq!(Strip::Drums.column_of(), None);
+        assert_eq!(Strip::Fx.column_of(), None);
+        // A track column past today's desk is still THAT track: the old
+        // `Column(n)` answered "the master" for any n past the click.
+        assert_eq!(Column::Track(40).strip(), Some(Strip::Channel(40)));
+        assert_eq!(Column::Track(40).row(), Some(40));
+        // Drawn order: every track, then the click, then the master.
+        let order: Vec<Column> = Column::every(3).collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+        assert_eq!(
+            order,
+            vec![Column::Track(0), Column::Track(1), Column::Track(2), Column::Click, Column::Master]
+        );
+    }
+
+    /// **Every desk slot is exactly one StripRef**, and the automation lane
+    /// space keeps the master apart from the drum bus it shares a number
+    /// with in the desk arrays.
+    #[test]
+    fn every_desk_slot_is_one_strip_ref_and_the_auto_lanes_keep_the_master_apart() {
+        let all: Vec<StripRef> = (0..=STRIPS).map(|i| {
+            StripRef::from_desk_index(i).unwrap_or_else(|| panic!("slot {i} is nobody"))
+        }).collect();
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.desk_index(), i);
+        }
+        assert_eq!(StripRef::from_desk_index(STRIPS + 1), None);
+        assert_eq!(StripRef::MASTER_INDEX, STRIPS);
+        assert_eq!(StripRef::Master.auto_lane(), Some(CHANNELS));
+        assert_eq!(StripRef::Drums.auto_lane(), None, "the drum bus took the master's lane");
+        assert_eq!(StripRef::from_auto_lane(CHANNELS), Some(StripRef::Master));
+        assert_eq!(StripRef::from_auto_lane(3), Some(StripRef::Row(3)));
+        assert_eq!(StripRef::from_auto_lane(CHANNELS + 1), None);
+    }
+
+    /// The code a scan reads: comments dropped, and every top-level
+    /// `#[cfg(test)]` module cut out wherever it stands (the views' tests
+    /// build fixtures and may say whatever they like; `recorder_panel.rs`
+    /// has production code after its first one, so cutting at the first
+    /// would hide it). A top-level module ends at the first `}` in column
+    /// zero, which is rustfmt's shape and saves counting braces through
+    /// strings and comments.
+    fn code_of(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < lines.len() {
+            let next = lines.get(k + 1).copied().unwrap_or("");
+            if lines[k].trim_end() == "#[cfg(test)]"
+                && (next.starts_with("mod ") || next.starts_with("pub(crate) mod "))
+            {
+                k += 2;
+                while k < lines.len() && lines[k].trim_end() != "}" {
+                    k += 1;
+                }
+                k += 1;
+                continue;
+            }
+            out.push(lines[k].split("//").next().unwrap_or(""));
+            k += 1;
+        }
+        out.join("\n")
+    }
+
+    /// One function's body out of a source file, by its signature's start.
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone; re-anchor the scan"));
+        let open = at + src[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[at..open + k + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{sig}` never closes")
+    }
+
+    /// What the scan refuses in view code, and the reason for each.
+    fn banned_in(code: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in code.lines().enumerate() {
+            let squashed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            let hits = [
+                // A pinned strip found by adding to the width.
+                squashed.contains("CHANNELS +") || squashed.contains("CHANNELS+"),
+                // The master's slot by the strips' count.
+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| w == "STRIPS" || w == "MASTER_LANE" || w == "MASTER_COLUMN"),
+                // A column or lane tested against the width.
+                ["< CHANNELS", "<= CHANNELS", "> CHANNELS", ">= CHANNELS", "< recorder::CHANNELS",
+                    ">= recorder::CHANNELS", "> recorder::CHANNELS", "<= recorder::CHANNELS",
+                    "< crate::recorder::CHANNELS", ">= crate::recorder::CHANNELS"]
+                    .iter()
+                    .any(|p| squashed.contains(p)),
+            ];
+            if hits.iter().any(|h| *h) {
+                out.push(format!("{}: {}", n + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// The view builders and hit dispatch in `app.rs`: what builds a view,
+    /// and what turns a press on one into a change.
+    const APP_VIEW_FNS: [&str; 16] = [
+        "fn mixer_view(&self)",
+        "pub(crate) fn mixer_view_in(",
+        "fn mixer_view_of(",
+        "fn mixer_view_rows(",
+        "fn arrange_view<'a>(",
+        "fn arr_lane_window(",
+        "fn arr_clip_views(",
+        "fn scrub_view(",
+        "fn arrangement_input(",
+        "fn apply_arrange_key(",
+        "fn apply_mixer_hit(",
+        "fn apply_mixer_hit_spread(",
+        "fn apply_mixer_hit_one(",
+        "fn mixer_value(",
+        "pub fn strip_color(",
+        "fn arr_open_automation_menu(",
+    ];
+
+    /// **No view does strip-index arithmetic.** Not `CHANNELS +` (a pinned
+    /// strip found by adding to the width), not `STRIPS`, `MASTER_LANE` or
+    /// `MASTER_COLUMN` (the master by a count), and not a column tested
+    /// against the width: in the three panels, and in the app's view
+    /// builders and hit dispatch. `StripRef` is where that arithmetic lives
+    /// until the specials leave strip space, so the day the desk stops
+    /// being a fixed width the views are not where it breaks.
+    ///
+    /// Revert-check: put `Hit::BusBay(_, b) => Some((recorder::STRIPS, b))`
+    /// back in `arrangement_input`, or `let click_col = CHANNELS;` back in
+    /// `mixer_panel::Layout::new`, and this names the line.
+    #[test]
+    fn no_view_code_does_strip_index_arithmetic() {
+        let mut bad = Vec::new();
+        for (file, src) in [
+            ("mixer_panel.rs", include_str!("mixer_panel.rs")),
+            ("arrangement_panel.rs", include_str!("arrangement_panel.rs")),
+            ("recorder_panel.rs", include_str!("recorder_panel.rs")),
+        ] {
+            for hit in banned_in(&code_of(src)) {
+                bad.push(format!("{file}:{hit}"));
+            }
+        }
+        let app = include_str!("app.rs");
+        for sig in APP_VIEW_FNS {
+            for hit in banned_in(&code_of(body_of(app, sig))) {
+                bad.push(format!("app.rs {sig}: {hit}"));
+            }
+        }
+        assert!(bad.is_empty(), "strip-index arithmetic in view code:\n  {}", bad.join("\n  "));
+        // And the scan can see what it bans: a planted line of each kind.
+        for planted in [
+            "let click_col = CHANNELS + 1;",
+            "Some((recorder::STRIPS, b))",
+            "if i >= CHANNELS { return; }",
+            "let m = MASTER_LANE;",
+        ] {
+            assert!(!banned_in(planted).is_empty(), "the scan is blind to `{planted}`");
+        }
+    }
 }
