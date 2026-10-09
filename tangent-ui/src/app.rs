@@ -1117,8 +1117,9 @@ pub struct TangentApp {
     /// PASTE FX. See `copy_fx`.
     fx_clipboard: Option<(usize, usize)>,
     /// A paste asked the host to copy plugin state from one strip to
-    /// another. Taken once, like `clips_dirty`.
-    insert_state_copy: Option<(usize, usize)>,
+    /// another: `(from lane, to lane, from track, to track)`. Taken once,
+    /// like `clips_dirty`, by whichever form the host asks for.
+    insert_state_copy: Option<(usize, usize, crate::desk_id::TrackId, crate::desk_id::TrackId)>,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -2662,6 +2663,11 @@ struct TrackCopy {
     /// Which lane it came from — the host needs it to find the plugin state
     /// files, which are keyed by strip and bay.
     from: usize,
+    /// **Which track it came from**, which no reorder renumbers: what the
+    /// host finds the plugin states by once they are named by identity
+    /// (`take_insert_state_copy_ids`). `from` is remapped by hand across a
+    /// lane move; this needs nothing.
+    from_id: crate::desk_id::TrackId,
     kind: Option<recorder::ChannelKind>,
     name: String,
     color: i64,
@@ -3097,8 +3103,9 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
             LoadOutcome::Loaded(a) => a.named || !a.clips.is_empty(),
             // Unreadable bytes are somebody's song until proven otherwise —
             // reclaiming a folder on the strength of a failed parse is how
-            // a corrupt SAVED project would be deleted outright.
-            LoadOutcome::Damaged => true,
+            // a corrupt SAVED project would be deleted outright. A refused
+            // desk is a desk this build cannot read, which is the same.
+            LoadOutcome::Damaged | LoadOutcome::Refused(_) => true,
             LoadOutcome::Missing | LoadOutcome::Empty => false,
         };
         held
@@ -3150,6 +3157,12 @@ pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
+    // **A document's legacy bytes are Tangent's own file** (design 6.7): the
+    // first format-2 save keeps them beside the document, so a scratch that
+    // was ever saved over a legacy one carries them, and a sweep that read
+    // them as somebody's work would keep every such scratch for ever.
+    let pre_v8 = [crate::arrangement::DOC_NAME, crate::arrangement::DOC_NAME_LEGACY]
+        .map(|d| format!("{d}{}", crate::arrangement::PRE_V8_SUFFIX));
     entries.into_iter().all(|e| {
         let Ok(e) = e else {
             return false;
@@ -3158,7 +3171,11 @@ pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
             return false;
         };
         let name = e.file_name();
-        match name.to_string_lossy().as_ref() {
+        let name = name.to_string_lossy();
+        if pre_v8.iter().any(|p| *p == name) {
+            return kind.is_file();
+        }
+        match name.as_ref() {
             // `DrumpadDoc::save_beside` writes `drumpad.json.tmp` and renames.
             crate::arrangement::DOC_NAME
             | crate::arrangement::DOC_NAME_LEGACY
@@ -3240,13 +3257,13 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
             _ => None,
         }
     });
+    // **By TRACK, as each file names them**, not through the identity desk:
+    // every track Add makes is minted past 31, and a format-2 kit on `t32`
+    // read through ids 0..31 had no lane, so a scratch whose only kit was
+    // on an added track read as empty (or as the template's clone) and the
+    // sweep deleted it, kit and all. See `DrumpadDoc::load_by_track`.
     let kits = |p: &std::path::Path| {
-        crate::drumpad::DrumpadDoc::load_all_beside(
-            &p.with_file_name(crate::arrangement::DOC_NAME),
-            recorder::CHANNELS,
-            legacy,
-        )
-        .0
+        crate::drumpad::DrumpadDoc::load_by_track(&p.with_file_name(crate::arrangement::DOC_NAME), legacy)
     };
     let parses = matches!(
         serde_json::from_slice::<serde_json::Value>(&bytes),
@@ -3258,8 +3275,22 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
         // clone written with another lane showing, or by a newer build, read
         // as work to a byte compare - and was kept for ever.
         Ok(t) => bytes != t && (!parses || kits(kit) != kits(template_kit)),
-        Err(_) => !parses || kits(kit).iter().any(|k| !k.is_empty()),
+        Err(_) => !parses || !kits(kit).is_empty(),
     }
+}
+
+/// **The rows' ids of the document at `doc`**, lane by lane, as wide as
+/// the live desk: what its kit sidecar's `track_kits` keys name. The
+/// identity desk when the document has no desk this build reads (missing,
+/// damaged, refused) or one of another width, which is every legacy
+/// document's answer anyway (legacy row r is `TrackId(r)`).
+fn template_row_ids(doc: &std::path::Path) -> Vec<crate::desk_id::TrackId> {
+    let read = match crate::arrangement::Arrangement::read_from(doc) {
+        crate::arrangement::LoadOutcome::Loaded(a) => a.desk.map(|d| d.ids.rows().into_owned()),
+        _ => None,
+    };
+    read.filter(|ids| ids.len() == recorder::CHANNELS)
+        .unwrap_or_else(|| crate::desk_legacy::identity_ids(recorder::CHANNELS))
 }
 
 /// **The document a session's relative MEDIA resolves against** - a pad's
@@ -4581,6 +4612,11 @@ impl TangentApp {
         // reset itself is in front of somebody, and "why" belongs with it.
         // See `Settings::unreadable`.
         if let Some(why) = me.settings.unreadable.take() {
+            me.notify(crate::notify::Kind::Error, why);
+        }
+        // And a desk the reader dropped entries from, or refused, on the
+        // same terms: the settings stood, the desk did not stand whole.
+        if let Some(why) = me.settings.desk_notice.take() {
             me.notify(crate::notify::Kind::Error, why);
         }
         me
@@ -6830,6 +6866,11 @@ impl TangentApp {
         let keeps_indent = self.folder_of(n).is_some();
         self.set_in_folder(n, keeps_indent);
         self.settings.tracks_added &= !(1 << n);
+        // **The emptied row is not the removed track any more**, so it
+        // stops wearing its id: whatever still names that id (a selection,
+        // a host's note) is inert from here, and the undo that brings the
+        // track back brings the id back with it.
+        self.mint_row_id(n);
         use crate::recorder::Strip;
         let d = Settings::default();
         let at = Strip::Channel(n).index();
@@ -9798,9 +9839,16 @@ impl TangentApp {
         // remembered project whose file went bad must be quarantined, not
         // silently replaced by an empty document that the first implicit
         // write makes permanent.
-        let (arr, doc) = self.read_for_adoption(&doc);
+        let (arr, doc) = match self.read_for_adoption(&doc) {
+            Ok(read) => read,
+            Err(why) => {
+                self.say_project_refused(&why);
+                return false;
+            }
+        };
         self.project_doc = doc;
         self.arrangement = arr;
+        self.say_desk_dropped();
         self.clips_dirty = true;
         self.desk_index_dirty();
         self.load_drumpad_doc();
@@ -10500,7 +10548,14 @@ impl TangentApp {
     /// puts back. Captured on every save, so a session folder always knows
     /// its own instruments.
     fn desk_snapshot(&self) -> crate::arrangement::DeskSnap {
-        Self::desk_snapshot_of(&self.settings)
+        let mut d = Self::desk_snapshot_of(&self.settings);
+        // **The document's marker rides every snapshot of it** (design
+        // 6.6): the live desk cannot say which legacy names the document's
+        // `state/` folder wears, so it is carried from the desk the document
+        // already holds, save after save, until the host's verified mirror
+        // clears it (`forget_legacy_states`).
+        d.legacy_states = crate::arrangement::Aside(self.doc_legacy_states());
+        d
     }
 
     /// The same snapshot, taken from ANY settings.
@@ -10664,6 +10719,10 @@ impl TangentApp {
                 tuning: &s.fretboard_tuning,
             }),
             frozen: Some(&s.frozen_lanes),
+            // The rows' identities (W3): a moment holds them, so an undo
+            // puts every track back on its own id.
+            ids: &s.track_ids,
+            next_id: s.next_track_id,
         }
     }
 
@@ -10685,6 +10744,27 @@ impl TangentApp {
         // the dense array as the file holds it. They ran here once, on a
         // clone of every desk applied — every open and every undo step —
         // although a moment can never hold an old-era desk.
+        //
+        // **The rows' ids, first**: a moment's ids are what undo puts back,
+        // a format-2 document's are its own, and a desk that does not say
+        // (every legacy document) is the identity desk by the identity rule.
+        // The counter never falls below what the ids need; past that it is
+        // the snapshot's, so an open lands on the document's own counter.
+        // Undo keeps the higher of the two (`undo_apply`), so an id handed
+        // out and undone is not handed out again.
+        let n = recorder::CHANNELS;
+        let said = d.ids.len() == n
+            && d.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
+        self.settings.track_ids =
+            if said { d.ids.0.clone() } else { crate::desk_legacy::identity_ids(n) };
+        self.settings.next_track_id = self
+            .settings
+            .track_ids
+            .iter()
+            .map(|id| u64::from(id.0) + 1)
+            .max()
+            .unwrap_or(0)
+            .max(d.next_id.0);
         if d.icons.is_empty() {
             // A document from before the badges: derive them — the drum
             // where the drumpad stands, auto everywhere else — instead of
@@ -11578,12 +11658,14 @@ impl TangentApp {
     fn set_channel_input_spec(&mut self, ch: usize, spec: &str) -> bool {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if !spec.is_empty()
-            && ch < recorder::CHANNELS
-            && !self.row_counted(ch)
-            && !self.admit_tracks(1)
-        {
+        let fresh = !spec.is_empty() && ch < recorder::CHANNELS && !self.row_counted(ch);
+        if fresh && !self.admit_tracks(1) {
             return false;
+        }
+        // An input on an empty row makes it a track (the input IS the
+        // kind): a new track, a new id.
+        if fresh {
+            self.mint_row_id(ch);
         }
         while self.settings.channel_inputs.len() < recorder::CHANNELS {
             self.settings.channel_inputs.push(String::new());
@@ -12056,6 +12138,10 @@ impl TangentApp {
         }
 
         // ── channel space ────────────────────────────────────────────────
+        // **The ids move with their rows**: a reorder renumbers lanes and
+        // nothing else, so every track keeps the id it had.
+        let ids = self.settings.desk_ids();
+        self.settings.track_ids = (0..CHANNELS).map(|n| ids[order[n]]).collect();
         self.settings.channel_gains =
             std::array::from_fn(|n| self.settings.channel_gains[order[n]]);
         self.settings.channel_pans =
@@ -12651,8 +12737,13 @@ impl TangentApp {
         if n >= recorder::CHANNELS {
             return false;
         }
-        if !self.row_counted(n) && !self.admit_tracks(1) {
+        let fresh = !self.row_counted(n);
+        if fresh && !self.admit_tracks(1) {
             return false;
+        }
+        // A new track is a new identity, on a reused row as on any other.
+        if fresh {
+            self.mint_row_id(n);
         }
         self.settings.tracks_added |= 1 << n;
         // Dry at birth — see the bind's own comment: only the shipped DX7
@@ -12695,6 +12786,7 @@ impl TangentApp {
         self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
             from: n,
+            from_id: self.track_id_at(n),
             kind: self.channel_kind(n),
             name: self
                 .settings
@@ -12855,6 +12947,9 @@ impl TangentApp {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
         let at = recorder::Strip::Channel(into).index();
+        // A paste is a NEW track, never the source again: its own id. Before
+        // `set_channel_kind`, which then finds the row counted.
+        self.mint_row_id(into);
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
         if let Some(name) = self.settings.strip_names.get_mut(at) {
@@ -12938,7 +13033,7 @@ impl TangentApp {
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
         // defaults, which is a different instrument wearing the same name.
-        self.insert_state_copy = Some((copy.from, into));
+        self.insert_state_copy = Some((copy.from, into, copy.from_id, self.track_id_at(into)));
         self.selected_channel = Some(into);
         self.selected_tracks = vec![into];
         self.save_settings();
@@ -12950,7 +13045,77 @@ impl TangentApp {
     /// The (from, to) strips whose insert state the host should copy, taken
     /// once. See `paste_track`.
     pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
-        self.insert_state_copy.take()
+        self.insert_state_copy.take().map(|(from, to, _, _)| (from, to))
+    }
+
+    /// **The same note, by identity**: the (from, to) TRACKS, taken once.
+    /// The host's form once plugin states are named by `SeatBay` (W4); the
+    /// source track is the one copied, wherever it stands now. Taking
+    /// either form takes the note.
+    pub fn take_insert_state_copy_ids(
+        &mut self,
+    ) -> Option<(crate::desk_id::TrackId, crate::desk_id::TrackId)> {
+        self.insert_state_copy.take().map(|(_, _, from, to)| (from, to))
+    }
+
+    /// **Every row's id, in lane order**: the desk's rows by identity, for
+    /// the host to name plugin states and engine lanes by (C11). Row r is
+    /// `track_ids()[r]`.
+    pub fn track_ids(&self) -> &[crate::desk_id::TrackId] {
+        &self.settings.track_ids
+    }
+
+    /// **The row a track sits on**, or `None` for a track this desk does
+    /// not hold (removed, or never here): the one way back from an id.
+    pub fn row_of(&self, id: crate::desk_id::TrackId) -> Option<usize> {
+        self.settings.track_ids.iter().position(|t| *t == id)
+    }
+
+    /// Row `n`'s id. A row past the ids reads as its identity id, the rule
+    /// every legacy desk obeys; no row past the live desk is ever asked.
+    fn track_id_at(&self, n: usize) -> crate::desk_id::TrackId {
+        self.settings
+            .track_ids
+            .get(n)
+            .copied()
+            .unwrap_or(crate::desk_id::TrackId(u32::try_from(n).unwrap_or(u32::MAX)))
+    }
+
+    /// **Row `n` becomes a new track, so it gets a new id** (design 3): add,
+    /// paste, a folder's header, a kind given to an empty row, and a row a
+    /// removal emptied. Fresh means never held by any row of this desk, so
+    /// whatever session state still names the old id is inert, and an undo
+    /// that brings the old row back brings its old id with it.
+    fn mint_row_id(&mut self, n: usize) {
+        let Some(slot) = self.settings.track_ids.get_mut(n) else {
+            return;
+        };
+        let Ok(id) = u32::try_from(self.settings.next_track_id) else {
+            // Four billion tracks minted in one session: keep the id the row
+            // has rather than wrap onto one in use.
+            return;
+        };
+        *slot = crate::desk_id::TrackId(id);
+        self.settings.next_track_id += 1;
+    }
+
+    /// **Which legacy shape the open document's `state/` folder is in**,
+    /// while any of its plugins may have only a legacy sidecar (design
+    /// 6.6), or `None` for a document born format 2 or already mirrored.
+    /// The host reads plugin state pstate-first, then by this era's legacy
+    /// names.
+    pub fn doc_legacy_states(&self) -> Option<crate::desk_lift::DeskEra> {
+        self.arrangement.desk.as_ref().and_then(|d| d.legacy_states.0)
+    }
+
+    /// **The host has mirrored every plugin of the open document to its
+    /// pstate name**, verified on disk, and has patched the marker out of
+    /// the file: forget it in memory too, so the next save does not write
+    /// it back. The host's call and only the host's.
+    pub fn forget_legacy_states(&mut self) {
+        if let Some(d) = self.arrangement.desk.as_mut() {
+            d.legacy_states = crate::arrangement::Aside(None);
+        }
     }
 
     /// **The track menu, from one place.** Four callers open it — the
@@ -13327,9 +13492,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // poisons every clone with its damage. Unlike a project, it is
         // fully regenerable, so anything but a clean read falls through to
         // the reseed below.
-        if let crate::arrangement::LoadOutcome::Loaded(old) =
-            crate::arrangement::Arrangement::read_from(&doc)
-        {
+        //
+        // **Except a REFUSED desk** (design 6.3: "document or template: the
+        // open is refused with a message; nothing is written over it"). Its
+        // bytes are not damage: they are a desk this build cannot put on
+        // its own (two rows with one id, a shape it does not know, more
+        // rows than any desk holds), quite possibly the template somebody
+        // curated in another build. Reseeding wrote the stock desk over it,
+        // and when the file was already format 2 no `.pre-v8` was kept, so
+        // the template was gone without a word. It stands, untouched;
+        // `adopt_template` says the refusal when it next reads it.
+        let old = match crate::arrangement::Arrangement::read_from(&doc) {
+            crate::arrangement::LoadOutcome::Refused(_) => return,
+            crate::arrangement::LoadOutcome::Loaded(old) => Some(old),
+            crate::arrangement::LoadOutcome::Missing
+            | crate::arrangement::LoadOutcome::Empty
+            | crate::arrangement::LoadOutcome::Damaged => None,
+        };
+        if let Some(old) = old {
             // A template somebody touched stands. But an UNTOUCHED stock
             // seed — no clips, no names, the desk exactly as SOME shipped
             // default wrote it — is re-seeded, so a desk that changes after
@@ -13371,10 +13551,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // one new Untitled per launch. Repaired here, at the
                 // template's own home, so existing installs heal on their
                 // next launch.
+                //
+                // **By patching that one key in the file**, never by
+                // re-serialising the document: a re-save would write the
+                // template in this build's format, and a legacy template
+                // written as format 2 by a heal nobody asked for would stand
+                // beside a `state/` folder still in legacy names (design
+                // 6.6). The heal changes `named` and nothing else.
                 if old.named {
-                    let mut fixed = old;
-                    fixed.named = false;
-                    fixed.save_to(&doc);
+                    crate::arrangement::Arrangement::patch_doc_key(&doc, "named", None);
                 }
                 return;
             }
@@ -13451,11 +13636,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// untitled PERIOD" - so launch and New write NOTHING; the folder
     /// materialises at the first thing worth keeping (a take, a kit edit,
     /// a Save), through `materialize_project_dir`.
+    ///
+    /// **A template whose desk is refused still leaves a session to stand
+    /// on** (design 6.3). Refusing the read the way a project open does
+    /// would keep the OUTGOING session's clips and desk on screen while
+    /// everything here repoints at a fresh scratch, aims its media at the
+    /// template and loads its kit, and the host then mirrors the template's
+    /// plugin states over it: the old song, half-adopted, one save from a
+    /// stray Untitled with its media missing. So the read is refused, said,
+    /// and the session lands on the stock desk instead: what `seed_template`
+    /// would have reseeded the template to, without a byte of it written.
     pub fn adopt_template(&mut self, template_dir: &std::path::Path, dir: &std::path::Path) {
         // **`KeepPath::Leave`**: the settings must never name the template,
         // not even for the two statements between here and the repoint below.
         // See `open_project_keeping` for what one crash in that window costs.
-        self.open_project_keeping(&crate::arrangement::doc_in(template_dir), KeepPath::Leave);
+        // A refused template stands the session on the stock desk: see above.
+        let template_doc = crate::arrangement::doc_in(template_dir);
+        let (arr, read_doc) = match self.read_for_adoption(&template_doc) {
+            Ok(read) => read,
+            Err(why) => {
+                self.set_startup_notice(format!(
+                    "The template's desk could not be read ({why}). The template is \
+                     untouched, and this session opened on the stock desk."
+                ));
+                let mut stock = crate::arrangement::Arrangement::default();
+                stock.desk = Some(Self::template_desk());
+                (stock, template_doc.clone())
+            }
+        };
+        let on_shelf = inside_template_shelf(&template_doc, &self.project_root());
+        self.inhabit_document(arr, read_doc, KeepPath::Leave, on_shelf);
         // **The kit's samples are still in the template**, and they stay
         // there until this scratch becomes real. See `media_source` for what
         // the repoint below does to a relative pad path without it.
@@ -13522,9 +13732,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !dir.join(crate::drumpad::FILE_NAME).exists()
             && self.drumpad_kits.iter().any(|k| !k.is_empty())
         {
-            crate::drumpad::DrumpadDoc::save_all_beside(
-                &self.drumpad_kits,
-                self.drumpad_lane,
+            crate::drumpad::DrumpadDoc::save_all_beside_ids(
+            &self.drumpad_kits,
+            &self.settings.track_ids,
+            self.drumpad_lane,
                 &self.project_doc,
             );
         }
@@ -13573,8 +13784,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// The live kit sidecar into `dir`, whatever is in it.
     pub fn write_kit_into(&self, dir: &std::path::Path) {
-        crate::drumpad::DrumpadDoc::save_all_beside(
+        crate::drumpad::DrumpadDoc::save_all_beside_ids(
             &self.drumpad_kits,
+            &self.settings.track_ids,
             self.drumpad_lane,
             &crate::arrangement::doc_in(dir),
         );
@@ -13607,7 +13819,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         match Arrangement::read_from(&crate::arrangement::doc_in(dir)) {
             LoadOutcome::Missing | LoadOutcome::Empty => true,
-            LoadOutcome::Damaged => false,
+            LoadOutcome::Damaged | LoadOutcome::Refused(_) => false,
             LoadOutcome::Loaded(a) => !a.named && a.clips.is_empty(),
         }
     }
@@ -13678,6 +13890,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // template wants to SEE it, and now they can, they just cannot save
         // over it by accident.
         let on_shelf = inside_template_shelf(doc, &self.project_root());
+        // **Read before anything moves**: a document whose desk is refused
+        // is not opened at all (design 6.3), so the session that asked
+        // must still be standing, whole, when the refusal is said.
+        match self.read_for_adoption(doc) {
+            Ok((arr, doc)) => self.inhabit_document(arr, doc, keep, on_shelf),
+            Err(why) => self.say_project_refused(&why),
+        }
+    }
+
+    /// **A project whose desk this build refuses was not opened**, said
+    /// once; its files are exactly as they lay (design 6.3).
+    fn say_project_refused(&mut self, why: &str) {
+        self.set_startup_notice(format!(
+            "This project's desk could not be read ({why}). The project was \
+             not opened, and its files are untouched."
+        ));
+    }
+
+    /// **The session moves onto a document already read**: the half of an
+    /// open that comes after `read_for_adoption` said yes, shared by
+    /// `open_project_keeping` and by `adopt_template`, whose refused
+    /// template hands it the stock desk instead. `on_shelf` is whether the
+    /// path asked for is a stencil, which is read but never inhabited.
+    fn inhabit_document(
+        &mut self,
+        arr: crate::arrangement::Arrangement,
+        doc: std::path::PathBuf,
+        keep: KeepPath,
+        on_shelf: bool,
+    ) {
         let keep = if on_shelf { KeepPath::Leave } else { keep };
         // An explicit open owns its own folder; nothing is borrowed from a
         // template. `adopt_template` sets this again immediately after,
@@ -13685,8 +13927,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.media_source = None;
         // A new session: whatever folder it stands on was not made by it.
         self.made_real_here.set(false);
-        let (arr, doc) = self.read_for_adoption(doc);
         self.arrangement = arr;
+        self.say_desk_dropped();
         // A stencil is read but never inhabited: the session keeps whatever
         // home it had, and `adopt_template` gives it a scratch a line later.
         if !on_shelf {
@@ -13746,12 +13988,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// If even the rename fails, the path is not adopted at all: the open
     /// diverts to a fresh scratch and leaves the damaged file exactly as
     /// it lies.
+    ///
+    /// `Refused` (a format-2 desk this build cannot read: design 6.3) is
+    /// the one outcome that adopts NOTHING: `Err` with why, the file left
+    /// exactly as it lies. Nothing is wrong with its bytes, so it is not
+    /// moved aside the way damage is. The CALLER says it, because what
+    /// stands afterwards is the caller's: a project open keeps the session
+    /// it had, a template adoption lands on the stock desk.
     fn read_for_adoption(
         &mut self,
         doc: &std::path::Path,
-    ) -> (crate::arrangement::Arrangement, std::path::PathBuf) {
+    ) -> Result<(crate::arrangement::Arrangement, std::path::PathBuf), String> {
         use crate::arrangement::{Arrangement, LoadOutcome};
-        match Arrangement::read_from(doc) {
+        Ok(match Arrangement::read_from(doc) {
+            LoadOutcome::Refused(why) => return Err(why),
             LoadOutcome::Loaded(a) => (a, doc.to_path_buf()),
             LoadOutcome::Missing => (Arrangement::default(), doc.to_path_buf()),
             LoadOutcome::Empty => {
@@ -13798,6 +14048,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     (Arrangement::default(), crate::arrangement::doc_in(&dir))
                 }
             },
+        })
+    }
+
+    /// **What the desk reader dropped from the document just read**, said
+    /// once (design 6.3): a plugin, route, key or send that named no row
+    /// is left out and the rest opens, so somebody hears which. Taken off
+    /// the document, so it is said for this read and never again.
+    fn say_desk_dropped(&mut self) {
+        let dropped = self
+            .arrangement
+            .desk
+            .as_mut()
+            .map(|d| std::mem::take(&mut d.dropped.0))
+            .unwrap_or_default();
+        if let Some(line) = crate::settings::dropped_notice("This project's desk", &dropped) {
+            self.notify(crate::notify::Kind::Error, line);
         }
     }
 
@@ -13986,7 +14252,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             use crate::arrangement::LoadOutcome;
             match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(s)) {
                 LoadOutcome::Loaded(a) => a.named,
-                LoadOutcome::Damaged => true,
+                LoadOutcome::Damaged | LoadOutcome::Refused(_) => true,
                 LoadOutcome::Missing | LoadOutcome::Empty => false,
             }
         });
@@ -14017,7 +14283,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.named = true;
         self.save_project_doc();
         self.save_settings();
-        crate::drumpad::DrumpadDoc::save_all_beside(&self.drumpad_kits, self.drumpad_lane, &doc);
+        crate::drumpad::DrumpadDoc::save_all_beside_ids(
+            &self.drumpad_kits,
+            &self.settings.track_ids,
+            self.drumpad_lane, &doc);
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
@@ -14082,8 +14351,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.save_settings();
         // The kit's sidecar is part of the project and copies with it — its
         // samples already came along inside `media/`.
-        crate::drumpad::DrumpadDoc::save_all_beside(
+        crate::drumpad::DrumpadDoc::save_all_beside_ids(
             &self.drumpad_kits,
+            &self.settings.track_ids,
             self.drumpad_lane,
             &doc,
         );
@@ -17453,6 +17723,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// them.
     #[cfg(test)]
     fn cap_sentinel(&self, state: &Moment) {
+        self.desk_sentinel();
         let Some(cap) = self.track_cap() else {
             return;
         };
@@ -17467,6 +17738,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
              against a cap of {cap}: some road made a track without asking \
              `may_add_tracks`"
         );
+    }
+
+    /// **The writer side of design 6.3, under test**: every gesture ends on
+    /// a desk the format-2 reader would read whole. The live desk as the
+    /// model (`Settings::desk_model`) must drop nothing (no plugin, bypass,
+    /// route, key or send naming a row or bay that is not there), and its
+    /// rows must be one distinct id each. A gesture that left a dangling
+    /// reference would cost that entry at the first format-2 save, so it is
+    /// caught here, at the gesture, instead.
+    #[cfg(test)]
+    fn desk_sentinel(&self) {
+        let ids = &self.settings.track_ids;
+        assert_eq!(ids.len(), recorder::CHANNELS, "the desk lost its row ids");
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "two rows hold one id: {ids:?}");
+        let dropped = self.settings.desk_model().dropped;
+        assert!(dropped.is_empty(), "a gesture left the desk with dangling entries: {dropped:?}");
     }
 
     /// **The commit at a click's release on a row that jumps to the
@@ -17535,6 +17823,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         };
         let from = self.hist_at;
         self.hist_at = at;
+        // The id counter before the moment lands: see below, where it is
+        // kept from falling.
+        let next_before = self.settings.next_track_id;
         // **The lanes the moments crossed, for the host to carry the plugins
         // by.** Back across a reorder is its inverse, newest first; forward
         // is the reorder again. The words put every bundle NAME back on its
@@ -17646,8 +17937,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // a restored folder, rides the same write. Do not put a synchronous
         // `save_settings` back here.
         self.save_settings_soon();
+        // **Undo moves the desk, never the document's marker or the id
+        // counter**: the marker is a fact about the FILE (cleared by the
+        // host after a verified mirror, and an undo that brought it back
+        // would send the host looking for legacy files again), and the
+        // counter only rises, so an id handed out before this undo is
+        // never handed out again after it.
+        let marker = self.doc_legacy_states();
+        self.settings.next_track_id = self.settings.next_track_id.max(next_before);
         let mut arr = (*moment.arr).clone();
-        arr.desk = Some((*moment.desk).clone());
+        let mut desk = (*moment.desk).clone();
+        desk.legacy_states = crate::arrangement::Aside(marker);
+        arr.desk = Some(desk);
         self.arrangement = arr;
         // **The files a restored clip or pad stands on**, out of the template
         // this session was adopted from, once its folder is real. Making it
@@ -19739,6 +20040,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         new_rows.dedup();
         if !self.admit_tracks(new_rows.len()) {
             return;
+        }
+        // Each row a clip makes a track of is a new track: a new id.
+        for lane in &new_rows {
+            self.mint_row_id(*lane);
         }
         let mut fresh = Vec::new();
         for mut c in pasted {
@@ -22530,9 +22835,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 })
             });
         let (kits, saved_lane) = match doc {
-            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(
+            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside_ids(
                 doc,
-                recorder::CHANNELS,
+                &self.settings.track_ids,
                 legacy_lane,
             ),
             None => (
@@ -22602,8 +22907,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
-        crate::drumpad::DrumpadDoc::save_all_beside(
+        crate::drumpad::DrumpadDoc::save_all_beside_ids(
             &self.drumpad_kits,
+            &self.settings.track_ids,
             self.drumpad_lane,
             &doc,
         );
@@ -22641,8 +22947,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
-        crate::drumpad::DrumpadDoc::save_all_beside(
+        crate::drumpad::DrumpadDoc::save_all_beside_ids(
             &self.drumpad_kits,
+            &self.settings.track_ids,
             self.drumpad_lane,
             &doc,
         );
@@ -22746,8 +23053,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The kit saves itself, so the kit is a REAL thing: the folder
             // is born here if it never was.
             self.materialize_project_dir();
-            crate::drumpad::DrumpadDoc::save_all_beside(
+            crate::drumpad::DrumpadDoc::save_all_beside_ids(
             &self.drumpad_kits,
+            &self.settings.track_ids,
             self.drumpad_lane,
             &doc,
         );
@@ -31055,8 +31363,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             // **A folder is a counted row** (owner call 2), so an empty slot
             // becoming one is a new track as far as the cap is concerned.
-            if !self.row_counted(n) && !self.admit_tracks(1) {
+            let fresh = !self.row_counted(n);
+            if fresh && !self.admit_tracks(1) {
                 return false;
+            }
+            if fresh {
+                self.mint_row_id(n);
             }
             self.set_is_folder(n, true);
             // A folder is a ROW, so it has to exist as one: without this it
@@ -31131,7 +31443,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.begin_one_moment();
         self.reorder_channels(&order);
         // After the move the folder sits at `at` and its run begins directly
-        // below it.
+        // below it. The spare row it spent becomes a header row: a new row,
+        // so a new id.
+        self.mint_row_id(at);
         self.set_is_folder(at, true);
         self.settings.tracks_added |= 1 << at;
         // The folder itself belongs to whatever folder IT landed in, so
@@ -31769,11 +32083,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let shelf = self.project_root().join(TEMPLATE_SHELF).join("default");
         let doc = crate::arrangement::doc_in(&shelf);
         let (kits, lane) = if doc.exists() {
-            crate::drumpad::DrumpadDoc::load_all_beside(
-                &doc,
-                recorder::CHANNELS,
-                None,
-            )
+            // **Read against the TEMPLATE's own desk**, whose rows the kits
+            // are keyed by: a template saved from a desk with added tracks
+            // names them `t32` and up, and the identity desk has no such row,
+            // so those kits read as empty and the primary as none. Lane r of
+            // the template then lands on lane r here, as it always did.
+            let ids = template_row_ids(&doc);
+            crate::drumpad::DrumpadDoc::load_all_beside_ids(&doc, &ids, None)
         } else {
             (
                 (0..recorder::CHANNELS)
@@ -34180,9 +34496,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if kind.is_some() && n < recorder::CHANNELS && !self.row_counted(n) && !self.admit_tracks(1)
-        {
+        let fresh = kind.is_some() && n < recorder::CHANNELS && !self.row_counted(n);
+        if fresh && !self.admit_tracks(1) {
             return;
+        }
+        // An empty row given a kind is a new track: a new id.
+        if fresh {
+            self.mint_row_id(n);
         }
         if let Some(slot) = self.settings.channel_kinds.get_mut(n) {
             *slot = recorder::ChannelKind::as_u8(kind);
@@ -61380,6 +61700,10 @@ mod tests {
              takes are unaffected.",
             "This project's document could not be read, or moved aside. It has \
              not been touched. A fresh project at project-2 opened instead.",
+            // A refused template's, with the longest reason the reader gives.
+            "The template's desk could not be read (the desk is not readable: \
+             more rows than this build's desk holds). The template is \
+             untouched, and this session opened on the stock desk.",
         ];
         // **The crash notice with a plugin name at the long end of real.**
         // It is the one that must not be cut — a bay that is silently empty is
@@ -81998,5 +82322,435 @@ mod views_windowed_tests {
         frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far), button(far, false)]);
         assert_eq!(a.arr_lane_scroll, bar.max_rows, "the lanes stopped short of the end");
         assert!(a.arr_drag.is_none(), "the bar's press started a drag on the lanes");
+    }
+}
+
+/// **Identity and format 2 on the app's own roads** (W3-persist-v23-v8):
+/// the rows' ids through every structural edit and undo, the kits by track,
+/// the opens that must touch nothing, and the template heal that must not
+/// re-serialise. Format 2 is reached through `desk_format::with_format2`,
+/// never by flipping `WRITE_V8`.
+#[cfg(test)]
+mod persist_tests {
+    use super::tests::{headless, project_scratch};
+    use super::*;
+    use crate::desk_id::TrackId;
+
+    fn ids(app: &TangentApp) -> Vec<TrackId> {
+        app.track_ids().to_vec()
+    }
+
+    /// **A reorder renumbers lanes and nothing else**: every track keeps its
+    /// id wherever it lands, and undo and redo put the ids back with the
+    /// rows they belong to.
+    #[test]
+    fn a_reorder_carries_every_id_and_undo_and_redo_put_them_back() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.add_bare_track(2) && app.add_bare_track(3));
+        let before = ids(&app);
+        app.move_channel(3, 0);
+        let after = ids(&app);
+        assert_eq!(&after[..4], &[before[3], before[0], before[1], before[2]], "the ids did not move with their rows");
+        assert_eq!(&after[4..], &before[4..], "a row the move did not touch changed id");
+        app.undo();
+        assert_eq!(ids(&app), before, "undo did not put the ids back");
+        app.redo();
+        assert_eq!(ids(&app), after, "redo did not put the moved ids back");
+    }
+
+    /// **A new track is a new identity**, minted above every id the desk
+    /// has held: an add on a vacant row, a paste, and the header row a
+    /// folder spends. Tracks that already exist keep theirs, and the paste
+    /// tells the host which TRACK it copied from.
+    #[test]
+    fn add_paste_and_make_folder_mint_fresh_ids() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let seen: std::collections::BTreeSet<TrackId> = ids(&app).into_iter().collect();
+        assert!(app.add_bare_track(5));
+        let added = ids(&app)[5];
+        assert!(!seen.contains(&added), "an add reused an id the desk held");
+
+        app.copy_track(1);
+        let source = ids(&app)[1];
+        app.paste_track(7);
+        let pasted = ids(&app)[7];
+        assert!(!seen.contains(&pasted) && pasted != added && pasted != source, "a paste reused an id");
+        assert_eq!(app.take_insert_state_copy_ids(), Some((source, pasted)));
+        assert_eq!(app.take_insert_state_copy(), None, "taking one form took the note");
+
+        let tracks = ids(&app);
+        app.selected_tracks = vec![5, 7];
+        app.selected_channel = Some(5);
+        assert!(app.make_folder());
+        let header = app.selected_channel.expect("the folder is selected");
+        let after = ids(&app);
+        assert!(!tracks.contains(&after[header]), "the folder's header row kept a stranger's id");
+        for id in [added, pasted, source] {
+            assert!(app.row_of(id).is_some(), "the folder lost a track's id");
+        }
+        let all: std::collections::BTreeSet<TrackId> = after.iter().copied().collect();
+        assert_eq!(all.len(), after.len(), "two rows hold one id");
+    }
+
+    /// **A row a removal emptied is not the removed track**: it wears a new
+    /// id at once, and a track added there later wears another again. Undo
+    /// of the removal brings the old id back with its row.
+    #[test]
+    fn a_reused_cleared_slot_gets_a_fresh_id() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.add_bare_track(5));
+        let first = ids(&app)[5];
+        app.remove_channel(5);
+        let cleared = ids(&app)[5];
+        assert_ne!(cleared, first, "the emptied row kept the removed track's id");
+        app.undo();
+        assert_eq!(ids(&app)[5], first, "undo did not bring the removed track's id back");
+        app.redo();
+        assert_eq!(ids(&app)[5], cleared);
+        assert!(app.add_bare_track(5));
+        let reused = ids(&app)[5];
+        assert!(![first, cleared, TrackId(5)].contains(&reused), "a reused slot reused an id");
+    }
+
+    /// A fresh project folder with this document in it, and its path.
+    fn project_with(tag: &str, doc_text: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = project_scratch(tag);
+        let dir = root.join("Projects").join("Song");
+        std::fs::create_dir_all(dir.join("media")).expect("dir");
+        std::fs::create_dir_all(dir.join("state")).expect("state");
+        let doc = dir.join(crate::arrangement::DOC_NAME);
+        std::fs::write(&doc, doc_text).expect("doc");
+        std::fs::write(dir.join("state").join("insert-state-0-0.bin"), b"knobs").expect("state");
+        (root, doc)
+    }
+
+    /// Every file under `dir`, by path, with its bytes.
+    fn folder_bytes(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("dir").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.insert(p.clone(), std::fs::read(&p).expect("file"));
+                }
+            }
+        }
+        out
+    }
+
+    /// **Opening a project writes nothing into its folder**: every era
+    /// fixture, legacy and as format 2, opens with its folder byte for byte
+    /// as it was, the legacy plugin state included. The first format-2 SAVE
+    /// is the one that may write; an open never does.
+    #[test]
+    fn opening_any_fixture_project_touches_nothing_in_its_folder() {
+        for (name, text) in crate::era_corpus::DOCUMENTS {
+            let v2 = {
+                let a = crate::arrangement::Arrangement::from_json(text);
+                a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::V2)
+            };
+            for (shape, body) in [("legacy", text.to_string()), ("v8", v2)] {
+                let (root, doc) = project_with("untouched", &body);
+                let dir = doc.parent().expect("dir").to_path_buf();
+                let before = folder_bytes(&dir);
+                let (_ctx, mut app) = headless(Caps::DESKTOP);
+                crate::desk_format::with_format2(|| app.open_project(&doc));
+                assert_eq!(app.project_doc(), Some(doc.as_path()), "{name} {shape} did not open");
+                assert_eq!(folder_bytes(&dir), before, "{name} {shape}: the open wrote into the folder");
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    /// **A desk the reader refuses refuses the open**, and leaves both the
+    /// session that asked and the refused file exactly as they were.
+    #[test]
+    fn a_refused_document_is_not_opened_and_not_touched() {
+        let (_, text) = crate::era_corpus::DOCUMENTS[5];
+        let a = crate::arrangement::Arrangement::from_json(text);
+        let mut v: serde_json::Value = serde_json::from_str(
+            &a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::V2),
+        )
+        .expect("json");
+        let first = v["desk"]["rows"][0]["id"].clone();
+        v["desk"]["rows"][1]["id"] = first;
+        let (root, doc) = project_with("refused", &serde_json::to_string_pretty(&v).expect("json"));
+        let dir = doc.parent().expect("dir").to_path_buf();
+        let before = folder_bytes(&dir);
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let standing = app.project_doc().map(std::path::Path::to_path_buf);
+        let desk_before = app.desk_snapshot();
+        app.open_project(&doc);
+        assert_eq!(app.project_doc().map(std::path::Path::to_path_buf), standing, "the session moved");
+        assert!(app.desk_snapshot() == desk_before, "the session's desk moved");
+        assert_eq!(folder_bytes(&dir), before, "the refused project's folder changed");
+        let said = app.messages.notes().last().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(said.contains("could not be read") && !said.contains('\u{2014}'), "{said}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Kits follow their tracks through a reorder the document never
+    /// saw** (design 6.8, writers forced): a reorder, then a pad edit (the
+    /// kit saves itself), then a reopen of the document as it was saved
+    /// BEFORE the reorder. Every kit is on its own track: by id, not by the
+    /// lane the kit file was written at.
+    #[test]
+    fn kits_land_on_their_own_tracks_after_a_reorder_the_document_never_saw() {
+        crate::desk_format::with_format2(|| {
+            let root = project_scratch("kits-follow");
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            app.bootstrap_project(&root.join("Projects"));
+            let doc = app.project_doc().expect("a project").to_path_buf();
+            let mut b = crate::drumpad::DrumpadDoc::default();
+            b.pads[36].path = "media/b-kick.wav".into();
+            app.drumpad_kits[4] = b;
+            app.drumpad_edited();
+            assert!(app.add_bare_track(4));
+            app.save_project_doc();
+            let a_kit = app.drumpad_kits[0].clone();
+            let (id0, id4) = (ids(&app)[0], ids(&app)[4]);
+
+            app.move_channel(4, 0);
+            assert_eq!(ids(&app)[0], id4);
+            app.drumpad_kits[0].pads[40].path = "media/b-snare.wav".into();
+            app.drumpad_edited();
+
+            let (_ctx2, mut back) = headless(Caps::DESKTOP);
+            back.open_project(&doc);
+            let lane_of = |id| back.row_of(id).expect("the track is on the desk");
+            let b_back = &back.drumpad_kits[lane_of(id4)];
+            assert_eq!(b_back.pads[36].path, "media/b-kick.wav", "track 4's kit left its track");
+            assert_eq!(b_back.pads[40].path, "media/b-snare.wav", "the unsaved pad edit was lost");
+            assert_eq!(back.drumpad_kits[lane_of(id0)], a_kit, "track 0's kit left its track");
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// **The template heal changes `named` and nothing else** (design 6.6):
+    /// a named legacy template is patched in place, byte for byte but that
+    /// one key, and stays legacy even with the format-2 writers on.
+    #[test]
+    fn seed_templates_heal_patches_only_the_named_key() {
+        let (_, text) = crate::era_corpus::DOCUMENTS[5];
+        let root = project_scratch("heal");
+        let dir = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let doc = dir.join(crate::arrangement::DOC_NAME);
+        let mut a = crate::arrangement::Arrangement::from_json(text);
+        a.named = true;
+        a.save_to_as(&doc, crate::desk_format::Format::Legacy);
+        let before = std::fs::read_to_string(&doc).expect("doc");
+        assert!(before.contains("\"named\": true"));
+        let (_ctx, app) = headless(Caps::DESKTOP);
+        crate::desk_format::with_format2(|| app.seed_template(&dir));
+        let after = std::fs::read_to_string(&doc).expect("doc");
+        let want: String = before
+            .lines()
+            .filter(|l| l.trim() != "\"named\": true,")
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(format!("{after}\n"), want, "the heal changed more than `named`");
+        assert!(!crate::arrangement::Arrangement::pre_v8_path(&doc).exists(), "the heal wrote format 2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A format-2 document whose desk the reader refuses: two rows with
+    /// one id, which only a hand edit or another build writes.
+    fn refused_doc_text() -> String {
+        let (_, text) = crate::era_corpus::DOCUMENTS[5];
+        let a = crate::arrangement::Arrangement::from_json(text);
+        let mut v: serde_json::Value = serde_json::from_str(
+            &a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::V2),
+        )
+        .expect("json");
+        let first = v["desk"]["rows"][0]["id"].clone();
+        v["desk"]["rows"][1]["id"] = first;
+        serde_json::to_string_pretty(&v).expect("json")
+    }
+
+    /// **A template whose desk is refused is never reseeded** (design 6.3:
+    /// "nothing is written over it"): launch and New call `seed_template`,
+    /// which used to treat a refusal as damage and write the stock desk
+    /// over it, keeping no `.pre-v8` because the file was already format 2.
+    /// The folder is byte for byte as it was, writers forced or not.
+    #[test]
+    fn a_refused_template_survives_seed_template_byte_for_byte() {
+        let root = project_scratch("refused-template-seed");
+        let dir = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(dir.join("media")).expect("dir");
+        let doc = dir.join(crate::arrangement::DOC_NAME);
+        std::fs::write(&doc, refused_doc_text()).expect("doc");
+        assert!(matches!(
+            crate::arrangement::Arrangement::read_from(&doc),
+            crate::arrangement::LoadOutcome::Refused(_)
+        ));
+        let before = folder_bytes(&dir);
+        let (_ctx, app) = headless(Caps::DESKTOP);
+        app.seed_template(&dir);
+        crate::desk_format::with_format2(|| app.seed_template(&dir));
+        assert_eq!(folder_bytes(&dir), before, "seed_template wrote over a refused template");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Adopting a refused template lands on the stock desk, never on
+    /// the outgoing session.** The read is refused, so nothing of the
+    /// template's desk is taken; and it used to return early, which left
+    /// the previous song's desk on screen while the session was repointed
+    /// at a fresh scratch with the template's kit and media under it. The
+    /// template itself is untouched, and the refusal is said.
+    #[test]
+    fn adopting_a_refused_template_stands_on_the_stock_desk() {
+        let root = project_scratch("refused-template-adopt");
+        let template = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(template.join("media")).expect("dir");
+        std::fs::write(crate::arrangement::doc_in(&template), refused_doc_text()).expect("doc");
+        let before = folder_bytes(&template);
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.add_bare_track(5));
+        let outgoing = app.desk_snapshot();
+        let scratch = root.join("Projects").join("Untitled");
+        app.adopt_template(&template, &scratch);
+        let stock = TangentApp::template_desk();
+        let now = app.desk_snapshot();
+        assert!(now != outgoing, "the outgoing session's desk is still standing");
+        assert_eq!(now.kinds, stock.kinds, "the session is not on the stock desk");
+        assert_eq!(now.tracks_added, stock.tracks_added, "the outgoing session's added track stands");
+        assert_eq!(app.project_doc(), Some(scratch.join(crate::arrangement::DOC_NAME).as_path()));
+        assert!(!app.arrangement.named);
+        assert_eq!(folder_bytes(&template), before, "the refused template was written");
+        assert!(!scratch.exists(), "adoption made the scratch folder");
+        let said: Vec<String> = app.messages.notes().iter().map(|n| n.text.clone()).collect();
+        assert!(
+            said.iter().any(|t| t.contains("template's desk could not be read")),
+            "{said:?}"
+        );
+        assert!(said.iter().all(|t| !t.contains('\u{2014}')), "{said:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A kit on an added track is work to the sweep** (writers forced):
+    /// every track Add makes is minted past 31, and a scratch whose kit is
+    /// on `t32` read through the identity desk as empty, or as the
+    /// template's clone, so `fresh_project_dir` reclaimed it and its kit
+    /// was deleted with the folder. Both arms: no template kit, and a
+    /// template kit the scratch also carries on `t0`.
+    #[test]
+    fn a_kit_on_an_added_track_keeps_its_scratch() {
+        use crate::drumpad::DrumpadDoc;
+        let root = project_scratch("kit-t32");
+        let projects = root.join("Projects");
+        let template = projects.join(TEMPLATE_SHELF).join("default");
+        let scratch = projects.join("Untitled");
+        std::fs::create_dir_all(template.join("media")).expect("template");
+        std::fs::create_dir_all(scratch.join("media")).expect("scratch");
+        let kit = |path: &str| {
+            let mut k = DrumpadDoc::default();
+            k.pads[36].path = path.into();
+            k
+        };
+        let lanes = |placed: &[(usize, DrumpadDoc)]| {
+            let mut kits: Vec<DrumpadDoc> = (0..recorder::CHANNELS).map(|_| DrumpadDoc::default()).collect();
+            for (lane, k) in placed {
+                kits[*lane] = k.clone();
+            }
+            kits
+        };
+        let mut ids = crate::desk_legacy::identity_ids(recorder::CHANNELS);
+        ids[7] = TrackId(32);
+        let scratch_doc = crate::arrangement::doc_in(&scratch);
+        let write = |kits: &[DrumpadDoc], doc: &std::path::Path| {
+            DrumpadDoc::save_all_beside_as(kits, &ids, 0, doc, crate::desk_format::Format::V2);
+        };
+        write(&lanes(&[(7, kit("media/mine.wav"))]), &scratch_doc);
+        let side: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(scratch.join(crate::drumpad::FILE_NAME)).expect("kit"),
+        )
+        .expect("json");
+        assert!(side["track_kits"].get("t32").is_some(), "{side}");
+        // No template kit: a kit with a sample is work.
+        assert!(holds_only_scratch(&scratch));
+        assert_ne!(fresh_project_dir(&projects), scratch, "the t32 kit's scratch was reclaimed");
+        // A template kit on t0, which the scratch carries too, beside its own.
+        let stock = kit("media/stock.wav");
+        write(&lanes(&[(0, stock.clone())]), &crate::arrangement::doc_in(&template));
+        write(&lanes(&[(0, stock.clone()), (7, kit("media/mine.wav"))]), &scratch_doc);
+        assert_ne!(fresh_project_dir(&projects), scratch, "the t32 kit read as the template's clone");
+        // And a true clone is still reclaimed.
+        write(&lanes(&[(0, stock)]), &scratch_doc);
+        assert_eq!(fresh_project_dir(&projects), scratch, "a verbatim clone stopped being litter");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The default kit is read against the template's own desk**
+    /// (writers forced): a template saved from a desk with an added track
+    /// keys that track's kit `t32`, and the reset read it through the
+    /// identity desk, so it came back empty and the panel's lane unknown.
+    #[test]
+    fn the_default_kit_reads_a_template_by_its_own_ids() {
+        crate::desk_format::with_format2(|| {
+            let root = project_scratch("reset-kit-ids");
+            let template = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+            let (_ctx, mut author) = headless(Caps::DESKTOP);
+            assert!(author.add_bare_track(5));
+            let lane = author.track_ids().iter().position(|id| id.0 >= 32).expect("a minted row");
+            author.drumpad_kits[lane].pads[36].path = "media/added.wav".into();
+            author.drumpad_lane = lane;
+            author.write_template_into(&template).expect("template");
+            let side = std::fs::read_to_string(template.join(crate::drumpad::FILE_NAME)).expect("kit");
+            let minted = author.track_ids()[lane].to_string();
+            assert!(side.contains(&format!("\"{minted}\"")), "{side}");
+
+            let (_ctx2, mut app) = headless(Caps::DESKTOP);
+            app.settings.project_dir = Some(root.join("Projects").to_string_lossy().into_owned());
+            app.reset_kits_to_default();
+            assert_eq!(app.drumpad_kits[lane].pads[36].path, "media/added.wav", "the kit came back empty");
+            assert_eq!(app.drumpad_lane, lane, "the panel's lane was lost");
+            let _ = std::fs::remove_dir_all(&root);
+        });
+    }
+
+    /// **A document's legacy bytes are Tangent's own file** to the sweeps:
+    /// a scratch holding `project.tan.pre-v8` is still only a scratch.
+    #[test]
+    fn a_pre_v8_backup_is_scratch_to_the_sweeps() {
+        let root = project_scratch("pre-v8-sweep");
+        std::fs::write(root.join(crate::arrangement::DOC_NAME), "{}").expect("doc");
+        let backup = crate::arrangement::Arrangement::pre_v8_path(&root.join(crate::arrangement::DOC_NAME));
+        std::fs::write(&backup, "{}").expect("backup");
+        assert!(holds_only_scratch(&root), "the backup read as somebody's work");
+        std::fs::write(root.join("notes.txt"), "mine").expect("work");
+        assert!(!holds_only_scratch(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The document's marker rides every save and survives undo**, and
+    /// only the host clears it: a legacy document saved as format 2 says
+    /// its era until `forget_legacy_states`, and an undo across the clear
+    /// does not bring it back.
+    #[test]
+    fn the_legacy_marker_rides_saves_and_undo_never_moves_it() {
+        let (_, text) = crate::era_corpus::DOCUMENTS[2];
+        let (root, doc) = project_with("marker", text);
+        crate::desk_format::with_format2(|| {
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            app.open_project(&doc);
+            let era = app.doc_legacy_states().expect("a legacy document carries its era");
+            assert!(app.add_bare_track(9));
+            app.save_project_doc();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&doc).expect("doc")).expect("json");
+            assert_eq!(saved["desk"]["legacy_states"], era.name(), "the save dropped the marker");
+            app.forget_legacy_states();
+            app.undo();
+            assert_eq!(app.doc_legacy_states(), None, "undo brought the marker back");
+            app.save_project_doc();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&doc).expect("doc")).expect("json");
+            assert!(saved["desk"].get("legacy_states").is_none(), "the cleared marker was written");
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
