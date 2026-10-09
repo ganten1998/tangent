@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Design the nineteen VELOCITY gradients — the pair of colours a theme lends
+"""Design the thirty-two VELOCITY gradients — the pair of colours a theme lends
 the velocity lane — against the same rules the Rust tests enforce, then emit
 the Rust.
 
@@ -230,6 +230,20 @@ HUES = {
     "Amber":      (12, 160),   # red-orange, and the same teal Phosphor keeps
     "Phosphor":   (27, 160),   # the console's orange and its teal
     "Silverface": (12, 190),   # the jewel's glow and the script's turquoise
+    # The 2026-10-08 batch, slots 19..31.
+    "Urushi":     (8, 150),    # vermilion, and the pine of the scope
+    "Paperback":  (18, 140),   # the fiction orange, the crime green
+    "Malachite":  (350, 160),  # rose quartz against the stone's green
+    "Sodium":     (28, 280),   # the streetlamp against the ultraviolet sky
+    "Kiln":       (16, 150),   # the ember and the ash glaze
+    "Lapis":      (10, 222),   # a red for the gold, the ultramarine back
+    "Chartres":   (350, 140),  # ruby glass and emerald glass
+    "Overprint":  (340, 225),  # the two drums: fluorescent pink, federal blue
+    "Woodblock":  (12, 200),   # the seal and the wave
+    "Toffee":     (20, 160),   # cherry against the jade dial
+    "Confetti":   (350, 178),  # Memphis pink and Memphis teal
+    "Lamplight":  (10, 150),   # oxblood leather and the green glass shade
+    "Ditto":      (335, 200),  # aniline magenta and the duplicator's faded blue
     # The 2026-09-18 redo retired Studio (14, 96), Aurora (338, 148),
     # Blueprint (20, 176), Porcelain (348, 146), Dusk (344, 170) and Iris
     # (330, 140); their pairs went with them.
@@ -317,7 +331,7 @@ def report():
               f"#{'%02x%02x%02x' % faces[0]}/#{'%02x%02x%02x' % faces[1]}{flag}")
     print()
     print("floor", FLOOR, " separation", SEPARATION, " chroma max", CHROMA_MAX)
-    print("FAIL" if bad else "all nineteen clear both grounds on their own theme")
+    print("FAIL" if bad else "all thirty-two clear both grounds on their own theme")
 
 
 def emit():

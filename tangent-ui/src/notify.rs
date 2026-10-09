@@ -1059,7 +1059,7 @@ impl Style {
             // Info has no hue of its own. Its stripe is the card's quiet ink,
             // which reads as "these are just words" beside a stripe that is
             // red — and it is derived from the card, so it is right on all
-            // nineteen palettes without any of them naming it.
+            // thirty-two palettes without any of them naming it.
             info: s.faint,
             success: distinct_surface_at(METER_GREEN, s.bg, ACCENT_FLOOR),
             error: distinct_surface_at(REC_RED, s.bg, ACCENT_FLOOR),
@@ -1476,8 +1476,8 @@ mod tests {
     fn every_theme_dresses_a_notification() {
         let themes = crate::theme::factory();
         assert!(
-            themes.len() >= 19,
-            "the sweep expects the nineteen factory themes, found {}",
+            themes.len() >= 32,
+            "the sweep expects the thirty-two factory themes, found {}",
             themes.len()
         );
         let mut bad: Vec<String> = Vec::new();
@@ -1532,7 +1532,7 @@ mod tests {
                 }
             }
         }
-        assert!(swept >= 19 * 2 * 4, "the sweep covered {swept} dressings");
+        assert!(swept >= 32 * 2 * 4, "the sweep covered {swept} dressings");
         assert!(
             bad.is_empty(),
             "a notification is unreadable:\n  {}",

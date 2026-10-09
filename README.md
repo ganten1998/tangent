@@ -127,7 +127,7 @@ including the Linux aarch64 tarball and checksums, are on the
   voicing you are holding, in every key if you want. *Correct Chord Name…*
   teaches a general leaning instead, so similar voicings shift too. *Manage
   Taught Chords…* lists, deletes, and can forget everything learned.
-- **Nineteen themes.** `T` cycles them; every theme carries its own palette,
+- **Thirty-two themes.** `T` cycles them; every theme carries its own palette,
   solved against contrast floors rather than picked by eye. Key and note
   colors are customizable on top.
 - **Keyboard shortcuts.** Hold **H** and every view's bindings appear. **N**

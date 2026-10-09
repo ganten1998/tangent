@@ -4992,7 +4992,7 @@ fn face_to_return_to(ctx: &egui::Context, closed: bool) -> Option<Dialog> {
 /// because what they mean does not change with the decor. "This erases a
 /// file" belongs in that family as squarely as any of them. It goes through
 /// `surface_of` like every other ground in the app, so its label is measured
-/// on it rather than guessed, on all nineteen themes in both modes.
+/// on it rather than guessed, on all thirty-two themes in both modes.
 const IR_DANGER: Color32 = crate::face::CORR_RED;
 
 fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
@@ -5957,9 +5957,10 @@ pub fn export_layout(rect: Rect) -> ExportLayout {
 ///
 /// `#E83A4E` has a relative luminance of 0.207 — inside the 0.12–0.22 dead
 /// zone this app has learned about from a screenshot seven times, the band
-/// where neither ink wins. The sweep dresses nineteen factory themes in two
-/// modes against the two faces this window can read, which is seventy-six
-/// dressings, and the shipped red comes out under 3:1 on SEVEN of them: as
+/// where neither ink wins. The sweep dresses thirty-two factory themes in
+/// two modes against the two faces this window can read, which is a
+/// hundred and twenty-eight dressings, and the shipped red comes out under
+/// 3:1 on SEVEN of them: as
 /// low as 2.43:1 on Sandstone dark's pale well, and short on Default,
 /// Centennial and Porcelain too. A red line on a cream ground that the eye
 /// has to hunt for. That was survivable while the wave was 96 points tall in
@@ -5973,8 +5974,10 @@ pub fn export_layout(rect: Rect) -> ExportLayout {
 /// measured on the surface rather than guessed from a role, and it is what
 /// keeps this line honest when the palette moves under it.
 ///
-/// In practice it leaves sixty-nine of the seventy-six dressings on the
-/// shipped red untouched, and at its furthest lands on `#C43142`, so the
+/// In practice it leaves a hundred and twenty-one of the hundred and
+/// twenty-eight dressings on the shipped red untouched (the thirteen themes
+/// of 2026-10-08 were designed to move it nowhere: `palgen.py --themes`
+/// counts the moves per theme, and every one of theirs is zero), and at its furthest lands on `#C43142`, so the
 /// playhead is plainly red everywhere and findable everywhere.
 fn playhead_ink(well: Color32) -> Color32 {
     const RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
@@ -18233,10 +18236,10 @@ at: None,
     /// alpha, a guide rather than ink, and measuring a translucent colour as
     /// though it were opaque would be measuring the wrong thing.
     ///
-    /// **Seventy-six dressings, not thirty-eight.** Nineteen factory themes,
-    /// two modes each, and TWO faces this window can be handed — the desk's
-    /// strip and the band's ground, because it reads whichever one `show`
-    /// remembered. The first draft of this test counted the faces and then
+    /// **A hundred and twenty-eight dressings, not sixty-four.** Thirty-two
+    /// factory themes, two modes each, and TWO faces this window can be
+    /// handed — the desk's strip and the band's ground, because it reads
+    /// whichever one `show` remembered. The first draft of this test counted the faces and then
     /// wrote thirty-eight in its own prose, which is how the commit that
     /// shipped it under-reported the playhead's failures by half. The counts
     /// are asserted below rather than described, so the prose cannot drift
@@ -18246,8 +18249,8 @@ at: None,
         use crate::recorder_panel::contrast_ratio;
         let themes = crate::theme::factory();
         assert!(
-            themes.len() >= 19,
-            "the sweep expects the nineteen factory themes, found {}",
+            themes.len() >= 32,
+            "the sweep expects the thirty-two factory themes, found {}",
             themes.len()
         );
         let mut bad: Vec<String> = Vec::new();
@@ -18317,7 +18320,7 @@ at: None,
                 }
             }
         }
-        // Nineteen themes, two modes, two faces. Named as the product it is
+        // Thirty-two themes, two modes, two faces. Named as the product it is
         // so a face added to the list moves the number rather than the
         // comment about it.
         assert_eq!(
@@ -18325,7 +18328,8 @@ at: None,
             themes.len() * 2 * 2,
             "the sweep covered {swept} dressings, not one per theme per mode per face"
         );
-        assert_eq!(swept, 76, "the sweep is no longer seventy-six dressings");
+        // Seventy-six until the 2026-10-08 batch added thirteen themes.
+        assert_eq!(swept, 128, "the sweep is no longer a hundred and twenty-eight dressings");
         assert!(
             bad.is_empty(),
             "the export window is unreadable:\n  {}",
@@ -18335,7 +18339,7 @@ at: None,
         // would leave the marker as the body ink, and nobody would ever see
         // a playhead again — so every answer has to read as red, and the
         // shipped red itself has to survive untouched on the dressings that
-        // can carry it (it does on sixty-nine of the seventy-six).
+        // can carry it (it does on 121 of the 128).
         assert!(
             reds.contains(&(0xE8, 0x3A, 0x4E)),
             "the walk moved the playhead on every theme; it is no longer the \
@@ -18348,7 +18352,8 @@ at: None,
             );
         }
         // **The exact count, because the doc quotes it.** Seven of the
-        // seventy-six need the move and sixty-nine do not. A palette change
+        // 128 need the move and 121 do not; the thirteen themes added on
+        // 2026-10-08 added none, by design, so the seven are the same seven. A palette change
         // that moves this number is not a bug — it is a fact the prose above
         // `playhead_ink` is claiming, and this is what makes the two argue.
         assert_eq!(

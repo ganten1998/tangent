@@ -646,6 +646,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Thirteen new themes, thirty-two in all.** Each is named for an object
+  and dressed in its colours, and each fills a gap the nineteen left:
+  Urushi (a black lacquer box with cinnabar and gold), Paperback (a shelf
+  of mid-century paperbacks), Malachite (banded emerald and rose quartz),
+  Sodium (a night bus at 3 a.m.), Kiln (a terracotta page and a soot
+  band), Lapis (ultramarine and gold leaf), Chartres (a rose window in
+  black lead), Overprint (a pink and blue riso zine, the fourth light
+  desk), Woodblock (Prussian blue on washi with one vermilion seal),
+  Toffee (a cast-resin radio with a jade dial), Confetti (a Memphis
+  sideboard), Lamplight (a green glass desk lamp) and Ditto (a
+  spirit-duplicator handout). Five of them keep their ground dark, as
+  Amber and Phosphor do. The existing themes and their slots are
+  unchanged, so a saved desk opens exactly as it was, and every new theme
+  carries its own 32-channel palette.
+
+- **The Themes menu fits a short window.** A hover menu taller than the
+  screen now shrinks its rows to fit, as the main menu already did,
+  instead of running off the bottom of a small plugin editor.
+
 - **Render ahead: the CPU headroom of a big buffer at the latency of a
   small one.** A new row in the audio setup panel, beside the buffer size,
   set to Auto by default. A settings file written by a development build
