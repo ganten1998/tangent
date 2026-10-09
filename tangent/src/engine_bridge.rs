@@ -1043,7 +1043,9 @@ mod tests {
         for (lane, at) in [(0, 0.0), (1, 0.25), (2, 0.5), (3, 0.0)] {
             doc.add_clip(audio(lane, &format!("n{lane}.wav"), at));
         }
-        out.push(Corpus { name: "faders-sends", settings: s, doc, live: vec![], kits: vec![], freeze: vec![1] });
+        // Lane 3 is muted: its freeze is the one that proves a mute on the desk
+        // cannot silence the lane being frozen.
+        out.push(Corpus { name: "faders-sends", settings: s, doc, live: vec![], kits: vec![], freeze: vec![1, 3] });
 
         // Dialled racks, a bypassed bay, polarity.
         let mut s = blank();
