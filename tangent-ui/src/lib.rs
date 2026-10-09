@@ -13,6 +13,11 @@ pub mod automation;
 /// The busy overlay: what covers a mid-session stall, and says what it is.
 pub mod busy;
 pub mod chord_strip;
+/// Identity on the desk: tracks, racks and bays named by what they are, not
+/// by where they sit. Pure; see the module for why positions had to go.
+pub mod desk_id;
+/// The frozen 32-channel seat map and its one road to identity.
+pub mod desk_legacy;
 pub mod dialogs;
 pub mod face;
 pub mod faces;
