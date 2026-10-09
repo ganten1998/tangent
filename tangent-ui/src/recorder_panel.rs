@@ -8530,6 +8530,65 @@ mod tests {
         }
     }
 
+    /// **The SEND chip says what the send is DOING.** A send that faulted
+    /// is off for the session with `device_send_enabled` still true, and the
+    /// chip that read the setting kept saying "on" over a silent cable. Every
+    /// state's word is painted, inside the row, at the narrowest window.
+    #[test]
+    fn the_send_chip_paints_the_live_status_not_the_setting() {
+        use crate::ports::DeviceSendStatus as S;
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let s = Settings {
+            device_send_enabled: true,
+            device_send_name: "CABLE Input".to_owned(),
+            ..Settings::default()
+        };
+        let dev = || "CABLE Input".to_owned();
+        let states = [
+            (S::Off, "To device: off"),
+            (S::NoDevice, "To device: none"),
+            (S::Waiting, "To device: waiting"),
+            (S::Sending { device: dev(), engine_rate: 48_000, device_rate: 48_000 }, "To device: on"),
+            (S::Missing { device: dev() }, "To device: missing"),
+            (S::Failed { device: dev(), reason: "the device went away".to_owned() }, "To device: stopped"),
+            (S::Refused { device: dev(), reason: "busy".to_owned() }, "To device: failed"),
+        ];
+        for w in [1117.0_f32, 1920.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            let l = SetupLayout::new(screen, anchor, SetupShape::Machine);
+            for (status, word) in &states {
+                assert_eq!(status.chip(), *word);
+                let view = RecorderView { device_send: status, ..RecorderView::empty() };
+                let out = ctx.run(
+                    egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                    |ctx| {
+                        let painter = Painter::new(ctx.clone(), egui::LayerId::background(), screen);
+                        draw_setup(&painter, screen, anchor, &view, &s, SetupShape::Machine);
+                    },
+                );
+                fn walk(shape: &egui::Shape, row: Rect, out: &mut Vec<String>) {
+                    match shape {
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, row, out)),
+                        egui::Shape::Text(t) if row.contains(t.visual_bounding_rect().center()) => {
+                            out.push(t.galley.text().to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+                let mut texts = Vec::new();
+                for c in &out.shapes {
+                    walk(&c.shape, l.send_row, &mut texts);
+                }
+                assert!(
+                    texts.iter().any(|t| t == word),
+                    "at {w} the SEND chip for {status:?} painted {texts:?}, not {word:?}"
+                );
+            }
+        }
+    }
+
     /// **Every SIG field shows its caret.** The signature is typed into the
     /// TAKE panel's SIG and into the AUDIO tier's, which the cog's panel and
     /// the red button's RECORDING panel show; only the TAKE panel's drew a
@@ -11560,6 +11619,7 @@ mod tests {
                                 play_pending: false,
                                 view_window: (0.0, 60.0),
                                 input_monitor: false,
+                                device_send: &crate::ports::DeviceSendStatus::Off,
                                 scrub: crate::recorder::ScrubView::default(),
                                 state,
                                 elapsed_s: 3725.0,
@@ -14278,16 +14338,11 @@ pub fn draw_setup(
         rows.ink,
         rows,
     );
-    // Its sibling, read the same way: the SETTING, on or off. What the send
-    // is actually doing is in its window, which the host keeps live.
-    labelled(
-        painter,
-        l.send_row,
-        "SEND",
-        if s.device_send_enabled { "To device: on" } else { "To device: off" },
-        rows.ink,
-        rows,
-    );
+    // Its sibling, read from what the send is DOING rather than from the
+    // setting: a send that faulted is off for the session with the setting
+    // still on, and a chip that said "on" over a silent cable was a lie the
+    // ReaStream chip never has to tell. Its window has the whole story.
+    labelled(painter, l.send_row, "SEND", view.device_send.chip(), rows.ink, rows);
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing

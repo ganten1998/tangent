@@ -315,6 +315,9 @@ pub struct RecorderView<'a> {
     /// The live input is being heard. Never persisted — see
     /// `TangentApp::input_monitor`.
     pub input_monitor: bool,
+    /// What the device send is DOING, for the cog's SEND chip: the host's
+    /// status, not the setting (see `ports::DeviceSendStatus::chip`).
+    pub device_send: &'a crate::ports::DeviceSendStatus,
     /// Beats and tempo, shared by the click, the count-in and the SMF's tempo
     /// mark — one number, because a click at 90 against a file that says 120
     /// is a take nobody can edit afterwards. **One number at a take's START**:
@@ -398,6 +401,7 @@ impl RecorderView<'_> {
             pointer: None,
             prefer_flats: false,
             input_monitor: false,
+            device_send: &crate::ports::DeviceSendStatus::Off,
             state: RecordState::Idle,
             elapsed_s: 0.0,
             position_s: 0.0,
@@ -2072,6 +2076,7 @@ impl RecorderState {
             pointer: None,
             prefer_flats: false,
             input_monitor: false,
+            device_send: &crate::ports::DeviceSendStatus::Off,
             scrub: ScrubView::default(),
             state: self.state,
             elapsed_s: self.elapsed_s,

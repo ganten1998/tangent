@@ -421,8 +421,13 @@ pub enum DeviceSendStatus {
     /// On, and no output goes by that name. Tried again when the dialog is
     /// closed or the engine restarts.
     Missing { device: String },
-    /// It opened (or tried to) and stopped. Off until it is asked again.
+    /// It opened, sent, and stopped: its device went away or the backend
+    /// faulted. Off until it is asked again.
     Failed { device: String, reason: String },
+    /// It is there and would not open, so nothing was ever sent. Apart
+    /// from [`Self::Failed`] because "Stopped sending to" a device that
+    /// never started is a status line that lies. Off until asked again.
+    Refused { device: String, reason: String },
 }
 
 impl DeviceSendStatus {
@@ -440,6 +445,29 @@ impl DeviceSendStatus {
                 "Stopped sending to {device}: {}. Press Retry or pick another device.",
                 reason.trim_end_matches('.')
             ),
+            DeviceSendStatus::Refused { device, reason } => format!(
+                "Could not open {device}: {}. Press Retry or pick another device.",
+                reason.trim_end_matches('.')
+            ),
+        }
+    }
+
+    /// **The cog's SEND chip**: one short word for what the send is DOING.
+    ///
+    /// Not the setting. A send that faulted or found its device missing is
+    /// off for the session while `device_send_enabled` stays true, so a chip
+    /// that read the setting said "on" over a cable carrying silence; the
+    /// ReaStream chip it was copied from has no such state. Short words,
+    /// because the chip is half a row and fits its text by shrinking it.
+    pub fn chip(&self) -> &'static str {
+        match self {
+            DeviceSendStatus::Off => "To device: off",
+            DeviceSendStatus::NoDevice => "To device: none",
+            DeviceSendStatus::Waiting => "To device: waiting",
+            DeviceSendStatus::Sending { .. } => "To device: on",
+            DeviceSendStatus::Missing { .. } => "To device: missing",
+            DeviceSendStatus::Failed { .. } => "To device: stopped",
+            DeviceSendStatus::Refused { .. } => "To device: failed",
         }
     }
 
@@ -464,7 +492,9 @@ impl DeviceSendStatus {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            DeviceSendStatus::Missing { .. } | DeviceSendStatus::Failed { .. }
+            DeviceSendStatus::Missing { .. }
+                | DeviceSendStatus::Failed { .. }
+                | DeviceSendStatus::Refused { .. }
         )
     }
 }
