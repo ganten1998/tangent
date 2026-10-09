@@ -4212,12 +4212,17 @@ fn vst3_locations() -> &'static str {
 /// `supporter` is the install's standing (see `Dialog::About`). It reaches
 /// here so the line can say what THIS install's desk is: a free desk of
 /// thirty-two tracks, or one with no track limit.
+///
+/// **The desk's size is the creation cap's, asked the cap's own way.** The
+/// line said "32-channel mixer" for everybody, from the desk's width
+/// constant, and the desk stopped having a width: what a licence decides is
+/// how many tracks an install may CREATE (`recorder::track_cap`), so the card
+/// asks `track_cap` and prints its answer. A free install reads "32-track
+/// desk" from the same `FREE_TRACKS` the gate refuses at, so the two cannot
+/// disagree; a supporter reads "unlimited tracks". A build with no recorder
+/// has no desk to describe, so its line is the chord display's whatever the
+/// standing.
 fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, String) {
-    // MERGE-ME(W3-copy): the tier's own wording ("32-track desk" free,
-    // "unlimited tracks" with a supporter) is the copy lane's to write; W1
-    // only carries the standing to the card. Until then the line names the
-    // desk's capacity for both, which is true of both.
-    let _ = supporter;
     if !caps.capture_devices {
         return (
             "A piano display with chord intelligence",
@@ -4229,15 +4234,31 @@ fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, Strin
     } else {
         "VST3"
     };
+    let desk = match crate::recorder::track_cap(supporter) {
+        Some(cap) => format!("{cap}-track desk"),
+        None => "unlimited tracks".to_owned(),
+    };
     (
         "A recording DAW with chord intelligence",
-        // The channel count comes from the desk's own constant, so it cannot
-        // fall behind the desk again: it read 16 here while the desk had 32.
-        format!(
-            "Recorder, {}-channel mixer, arrangement, MIDI editor, drum machine, {formats}",
-            crate::recorder::CHANNELS
-        ),
+        format!("Recorder, {desk}, arrangement, MIDI editor, drum machine, {formats}"),
     )
+}
+
+/// The Supporter Key dialog's three lines for an install with no key yet.
+///
+/// A function, and not literals in the arm, so the wording that names the
+/// free desk's size takes it from `recorder::FREE_TRACKS`: the dialog that
+/// sells the key and the gate that refuses the 33rd track read one number.
+fn key_dialog_lines() -> [String; 3] {
+    [
+        format!(
+            "Tangent is free, with up to {} tracks.",
+            crate::recorder::FREE_TRACKS
+        ),
+        "A supporter key (or a certain code) takes the track limit away and lights the heart."
+            .to_owned(),
+        "Buses, returns, sends and routes have no limit for anyone.".to_owned(),
+    ]
 }
 
 impl Dialog {
@@ -13206,8 +13227,11 @@ fn show_on(
                 ctx,
                 placement,
                 "Supporter Key",
-                Vec2::new(460.0, 310.0),
-                Vec2::new(400.0, 270.0),
+                // Forty points taller than the two-line card it was: the
+                // three lines above the paste box wrap to four or five rows,
+                // and the failure message under the box still needs its room.
+                Vec2::new(460.0, 350.0),
+                Vec2::new(400.0, 310.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.bg;
@@ -13223,16 +13247,22 @@ fn show_on(
                                         .color(t.text),
                                 );
                             } else {
-                                ui.label(
-                                    RichText::new("Tangent is free, and it stays free.")
-                                        .font(bold(12.0))
-                                        .color(t.text),
-                                );
-                                ui.label(
-                                    RichText::new("A key is a thank-you, nothing more.")
-                                        .font(bold(12.0))
-                                        .color(t.text),
-                                );
+                                // **What a key does, said truthfully.** This
+                                // read "a thank-you, nothing more" while a
+                                // key was about to lift the free desk's track
+                                // limit, which is a promise broken in the one
+                                // place a buyer reads before paying. Three
+                                // facts, each its own line so none is buried:
+                                // the free desk's size (the gate's own
+                                // `FREE_TRACKS`, so the two cannot drift),
+                                // what a key or the Konami code changes (owner
+                                // call 9: "a certain code", in the app and
+                                // nowhere else), and what never had a limit.
+                                for line in key_dialog_lines() {
+                                    ui.label(
+                                        RichText::new(line).font(bold(12.0)).color(t.text),
+                                    );
+                                }
                                 // The store, said out loud. This dialog asks
                                 // for a key and never used to say where one
                                 // comes from — the only purchase link lived
@@ -18005,9 +18035,11 @@ at: None,
             !painted.contains("Simple MIDI Keyboard Monitor"),
             "the 1.x tagline is back: {painted}"
         );
-        // The desk's real size, from the same constant the desk is built
-        // from. The line said "16-channel mixer" over a 32-channel desk.
-        let desk = format!("{}-channel mixer", crate::recorder::CHANNELS);
+        // The FREE desk's size, from the constant the gate refuses at. The
+        // line said "16-channel mixer" over a 32-channel desk, and then a
+        // width for everybody once a key lifted the limit;
+        // `about_names_the_desk_this_standing_gets` holds both tiers.
+        let desk = format!("{}-track desk", crate::recorder::FREE_TRACKS);
         assert!(painted.contains(&desk), "About does not say {desk:?}: {painted}");
         // **The formats THIS platform's build hosts**, which it said were
         // "LV2/VST3" everywhere. LV2 is compiled only on Linux and FreeBSD;
@@ -18025,6 +18057,38 @@ at: None,
             painted.contains(concat!("Version ", env!("CARGO_PKG_VERSION"))),
             "{painted}"
         );
+    }
+
+    /// **The card says what THIS install's desk is.** A free install has a
+    /// desk of `FREE_TRACKS` tracks and a supporter (a key covering this
+    /// major, or the Konami marker) has no track limit, so the one line
+    /// that names the desk names it per standing: the free card must not
+    /// promise unlimited tracks, and a supporter's must not print the cap
+    /// they paid to lift. Both read as painted, through the desktop's card.
+    #[test]
+    fn about_names_the_desk_this_standing_gets() {
+        let desktop = crate::host::Caps {
+            child_windows: false,
+            ..crate::host::Caps::DESKTOP
+        };
+        let free_desk = format!("{}-track desk", crate::recorder::FREE_TRACKS);
+        let mut dialog = Some(Dialog::About { supporter: false });
+        let (free, _) = run_picker_with(&mut dialog, desktop);
+        assert!(free.contains(&free_desk), "the free card lost its desk size: {free}");
+        assert!(!free.contains("unlimited"), "the free card promises no limit: {free}");
+
+        let mut dialog = Some(Dialog::About { supporter: true });
+        let (paid, _) = run_picker_with(&mut dialog, desktop);
+        assert!(paid.contains("unlimited tracks"), "a supporter's card keeps a limit: {paid}");
+        assert!(
+            !paid.contains(&free_desk),
+            "a supporter's card prints the cap they lifted: {paid}"
+        );
+        // Everything else on the line is the same for both: the desk is the
+        // one thing the standing changes.
+        let (_, free_line) = about_lines(crate::host::Caps::DESKTOP, false);
+        let (_, paid_line) = about_lines(crate::host::Caps::DESKTOP, true);
+        assert_eq!(free_line.replace(&free_desk, "unlimited tracks"), paid_line);
     }
 
     /// **A build with no recorder claims neither recording nor hosting.** A
@@ -18048,6 +18112,12 @@ at: None,
             about_lines(crate::host::Caps::MINIMAL, false),
             about_lines(crate::host::Caps::PLUGIN, false)
         );
+        // **And the standing changes neither.** A chord display has no desk,
+        // so a supporter's Minimal or plugin card keeps the chord-display
+        // line rather than claiming tracks it cannot record.
+        for caps in [crate::host::Caps::MINIMAL, crate::host::Caps::PLUGIN] {
+            assert_eq!(about_lines(caps, true), about_lines(caps, false));
+        }
     }
 
     /// **The card's LV2 rule is the host's own.** tangent-ui cannot depend on
@@ -18109,6 +18179,17 @@ at: None,
             painted.contains("ganten.gumroad.com/l/ivory"),
             "no way to buy a key from the dialog that asks for one: {painted}"
         );
+        // **What the key does, all three facts.** The free desk's size from
+        // the gate's own constant, what a key (or the code) changes, and what
+        // has no limit for anyone. It said the key changed nothing.
+        let free = format!("Tangent is free, with up to {} tracks.", crate::recorder::FREE_TRACKS);
+        for fact in [
+            free.as_str(),
+            "A supporter key (or a certain code) takes the track limit away",
+            "Buses, returns, sends and routes have no limit for anyone.",
+        ] {
+            assert!(painted.contains(fact), "the key dialog no longer says {fact:?}: {painted}");
+        }
 
         let mut dialog = Some(Dialog::SupporterKey {
             input: String::new(),

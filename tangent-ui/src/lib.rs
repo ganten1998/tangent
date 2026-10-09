@@ -76,6 +76,10 @@ pub mod desk_lift;
 /// and the scans that keep the lifts off the live constants. Test-only.
 #[cfg(test)]
 mod era_corpus;
+/// The phrase scan over every surface that says what a supporter key does.
+/// Test-only.
+#[cfg(test)]
+mod copy_scan;
 /// Musical time: the tempo map, the meter map, and the two conversions
 /// everything else in the app used to do with a multiply.
 pub mod tempo;

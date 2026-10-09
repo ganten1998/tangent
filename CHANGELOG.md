@@ -29,6 +29,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   the window starts it again. The cog's SEND chip shows what the send is
   doing: on, missing, stopped or failed.
 
+### Changed
+
+- **A supporter key now takes the track limit away, and the free app holds
+  32 tracks.** Without a key the desk holds up to 32 tracks: MIDI and audio
+  tracks and folders count. With one there is no limit but the machine's.
+  Every key already sold does the same, since keys have no expiry and cover
+  every version. Buses, returns, sends and routes have no limit for anyone
+  and are never counted. The limit only ever stops a new track: a project
+  with more than 32 tracks opens, plays, edits, exports and saves whole
+  without a key, and adding a track to it asks for one. The About card
+  names the desk an install has, and the Supporter Key dialog, the README
+  and the store page say what a key does; they said it unlocked nothing.
+
 ### Fixed
 
 - **The launch clean-up no longer deletes a folder that holds anything
