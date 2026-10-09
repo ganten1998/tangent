@@ -3257,13 +3257,13 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
             _ => None,
         }
     });
+    // **By TRACK, as each file names them**, not through the identity desk:
+    // every track Add makes is minted past 31, and a format-2 kit on `t32`
+    // read through ids 0..31 had no lane, so a scratch whose only kit was
+    // on an added track read as empty (or as the template's clone) and the
+    // sweep deleted it, kit and all. See `DrumpadDoc::load_by_track`.
     let kits = |p: &std::path::Path| {
-        crate::drumpad::DrumpadDoc::load_all_beside(
-            &p.with_file_name(crate::arrangement::DOC_NAME),
-            recorder::CHANNELS,
-            legacy,
-        )
-        .0
+        crate::drumpad::DrumpadDoc::load_by_track(&p.with_file_name(crate::arrangement::DOC_NAME), legacy)
     };
     let parses = matches!(
         serde_json::from_slice::<serde_json::Value>(&bytes),
@@ -3275,8 +3275,22 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
         // clone written with another lane showing, or by a newer build, read
         // as work to a byte compare - and was kept for ever.
         Ok(t) => bytes != t && (!parses || kits(kit) != kits(template_kit)),
-        Err(_) => !parses || kits(kit).iter().any(|k| !k.is_empty()),
+        Err(_) => !parses || !kits(kit).is_empty(),
     }
+}
+
+/// **The rows' ids of the document at `doc`**, lane by lane, as wide as
+/// the live desk: what its kit sidecar's `track_kits` keys name. The
+/// identity desk when the document has no desk this build reads (missing,
+/// damaged, refused) or one of another width, which is every legacy
+/// document's answer anyway (legacy row r is `TrackId(r)`).
+fn template_row_ids(doc: &std::path::Path) -> Vec<crate::desk_id::TrackId> {
+    let read = match crate::arrangement::Arrangement::read_from(doc) {
+        crate::arrangement::LoadOutcome::Loaded(a) => a.desk.map(|d| d.ids.rows().into_owned()),
+        _ => None,
+    };
+    read.filter(|ids| ids.len() == recorder::CHANNELS)
+        .unwrap_or_else(|| crate::desk_legacy::identity_ids(recorder::CHANNELS))
 }
 
 /// **The document a session's relative MEDIA resolves against** - a pad's
@@ -9825,8 +9839,12 @@ impl TangentApp {
         // remembered project whose file went bad must be quarantined, not
         // silently replaced by an empty document that the first implicit
         // write makes permanent.
-        let Some((arr, doc)) = self.read_for_adoption(&doc) else {
-            return false;
+        let (arr, doc) = match self.read_for_adoption(&doc) {
+            Ok(read) => read,
+            Err(why) => {
+                self.say_project_refused(&why);
+                return false;
+            }
         };
         self.project_doc = doc;
         self.arrangement = arr;
@@ -13474,9 +13492,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // poisons every clone with its damage. Unlike a project, it is
         // fully regenerable, so anything but a clean read falls through to
         // the reseed below.
-        if let crate::arrangement::LoadOutcome::Loaded(old) =
-            crate::arrangement::Arrangement::read_from(&doc)
-        {
+        //
+        // **Except a REFUSED desk** (design 6.3: "document or template: the
+        // open is refused with a message; nothing is written over it"). Its
+        // bytes are not damage: they are a desk this build cannot put on
+        // its own (two rows with one id, a shape it does not know, more
+        // rows than any desk holds), quite possibly the template somebody
+        // curated in another build. Reseeding wrote the stock desk over it,
+        // and when the file was already format 2 no `.pre-v8` was kept, so
+        // the template was gone without a word. It stands, untouched;
+        // `adopt_template` says the refusal when it next reads it.
+        let old = match crate::arrangement::Arrangement::read_from(&doc) {
+            crate::arrangement::LoadOutcome::Refused(_) => return,
+            crate::arrangement::LoadOutcome::Loaded(old) => Some(old),
+            crate::arrangement::LoadOutcome::Missing
+            | crate::arrangement::LoadOutcome::Empty
+            | crate::arrangement::LoadOutcome::Damaged => None,
+        };
+        if let Some(old) = old {
             // A template somebody touched stands. But an UNTOUCHED stock
             // seed — no clips, no names, the desk exactly as SOME shipped
             // default wrote it — is re-seeded, so a desk that changes after
@@ -13603,11 +13636,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// untitled PERIOD" - so launch and New write NOTHING; the folder
     /// materialises at the first thing worth keeping (a take, a kit edit,
     /// a Save), through `materialize_project_dir`.
+    ///
+    /// **A template whose desk is refused still leaves a session to stand
+    /// on** (design 6.3). Refusing the read the way a project open does
+    /// would keep the OUTGOING session's clips and desk on screen while
+    /// everything here repoints at a fresh scratch, aims its media at the
+    /// template and loads its kit, and the host then mirrors the template's
+    /// plugin states over it: the old song, half-adopted, one save from a
+    /// stray Untitled with its media missing. So the read is refused, said,
+    /// and the session lands on the stock desk instead: what `seed_template`
+    /// would have reseeded the template to, without a byte of it written.
     pub fn adopt_template(&mut self, template_dir: &std::path::Path, dir: &std::path::Path) {
         // **`KeepPath::Leave`**: the settings must never name the template,
         // not even for the two statements between here and the repoint below.
         // See `open_project_keeping` for what one crash in that window costs.
-        self.open_project_keeping(&crate::arrangement::doc_in(template_dir), KeepPath::Leave);
+        // A refused template stands the session on the stock desk: see above.
+        let template_doc = crate::arrangement::doc_in(template_dir);
+        let (arr, read_doc) = match self.read_for_adoption(&template_doc) {
+            Ok(read) => read,
+            Err(why) => {
+                self.set_startup_notice(format!(
+                    "The template's desk could not be read ({why}). The template is \
+                     untouched, and this session opened on the stock desk."
+                ));
+                let mut stock = crate::arrangement::Arrangement::default();
+                stock.desk = Some(Self::template_desk());
+                (stock, template_doc.clone())
+            }
+        };
+        let on_shelf = inside_template_shelf(&template_doc, &self.project_root());
+        self.inhabit_document(arr, read_doc, KeepPath::Leave, on_shelf);
         // **The kit's samples are still in the template**, and they stay
         // there until this scratch becomes real. See `media_source` for what
         // the repoint below does to a relative pad path without it.
@@ -13832,13 +13890,37 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // template wants to SEE it, and now they can, they just cannot save
         // over it by accident.
         let on_shelf = inside_template_shelf(doc, &self.project_root());
-        let keep = if on_shelf { KeepPath::Leave } else { keep };
         // **Read before anything moves**: a document whose desk is refused
         // is not opened at all (design 6.3), so the session that asked
         // must still be standing, whole, when the refusal is said.
-        let Some((arr, doc)) = self.read_for_adoption(doc) else {
-            return;
-        };
+        match self.read_for_adoption(doc) {
+            Ok((arr, doc)) => self.inhabit_document(arr, doc, keep, on_shelf),
+            Err(why) => self.say_project_refused(&why),
+        }
+    }
+
+    /// **A project whose desk this build refuses was not opened**, said
+    /// once; its files are exactly as they lay (design 6.3).
+    fn say_project_refused(&mut self, why: &str) {
+        self.set_startup_notice(format!(
+            "This project's desk could not be read ({why}). The project was \
+             not opened, and its files are untouched."
+        ));
+    }
+
+    /// **The session moves onto a document already read**: the half of an
+    /// open that comes after `read_for_adoption` said yes, shared by
+    /// `open_project_keeping` and by `adopt_template`, whose refused
+    /// template hands it the stock desk instead. `on_shelf` is whether the
+    /// path asked for is a stencil, which is read but never inhabited.
+    fn inhabit_document(
+        &mut self,
+        arr: crate::arrangement::Arrangement,
+        doc: std::path::PathBuf,
+        keep: KeepPath,
+        on_shelf: bool,
+    ) {
+        let keep = if on_shelf { KeepPath::Leave } else { keep };
         // An explicit open owns its own folder; nothing is borrowed from a
         // template. `adopt_template` sets this again immediately after,
         // which is why it is cleared here rather than by every caller.
@@ -13908,23 +13990,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it lies.
     ///
     /// `Refused` (a format-2 desk this build cannot read: design 6.3) is
-    /// the one outcome that adopts NOTHING: `None`, said in a notice, the
-    /// file left exactly as it lies. Nothing is wrong with its bytes, so it
-    /// is not moved aside the way damage is; it is simply not opened, and
-    /// the caller keeps whatever session it had.
+    /// the one outcome that adopts NOTHING: `Err` with why, the file left
+    /// exactly as it lies. Nothing is wrong with its bytes, so it is not
+    /// moved aside the way damage is. The CALLER says it, because what
+    /// stands afterwards is the caller's: a project open keeps the session
+    /// it had, a template adoption lands on the stock desk.
     fn read_for_adoption(
         &mut self,
         doc: &std::path::Path,
-    ) -> Option<(crate::arrangement::Arrangement, std::path::PathBuf)> {
+    ) -> Result<(crate::arrangement::Arrangement, std::path::PathBuf), String> {
         use crate::arrangement::{Arrangement, LoadOutcome};
-        Some(match Arrangement::read_from(doc) {
-            LoadOutcome::Refused(why) => {
-                self.set_startup_notice(format!(
-                    "This project's desk could not be read ({why}). The project was \
-                     not opened, and its files are untouched."
-                ));
-                return None;
-            }
+        Ok(match Arrangement::read_from(doc) {
+            LoadOutcome::Refused(why) => return Err(why),
             LoadOutcome::Loaded(a) => (a, doc.to_path_buf()),
             LoadOutcome::Missing => (Arrangement::default(), doc.to_path_buf()),
             LoadOutcome::Empty => {
@@ -32006,11 +32083,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let shelf = self.project_root().join(TEMPLATE_SHELF).join("default");
         let doc = crate::arrangement::doc_in(&shelf);
         let (kits, lane) = if doc.exists() {
-            crate::drumpad::DrumpadDoc::load_all_beside(
-                &doc,
-                recorder::CHANNELS,
-                None,
-            )
+            // **Read against the TEMPLATE's own desk**, whose rows the kits
+            // are keyed by: a template saved from a desk with added tracks
+            // names them `t32` and up, and the identity desk has no such row,
+            // so those kits read as empty and the primary as none. Lane r of
+            // the template then lands on lane r here, as it always did.
+            let ids = template_row_ids(&doc);
+            crate::drumpad::DrumpadDoc::load_all_beside_ids(&doc, &ids, None)
         } else {
             (
                 (0..recorder::CHANNELS)
@@ -61621,6 +61700,10 @@ mod tests {
              takes are unaffected.",
             "This project's document could not be read, or moved aside. It has \
              not been touched. A fresh project at project-2 opened instead.",
+            // A refused template's, with the longest reason the reader gives.
+            "The template's desk could not be read (the desk is not readable: \
+             more rows than this build's desk holds). The template is \
+             untouched, and this session opened on the stock desk.",
         ];
         // **The crash notice with a plugin name at the long end of real.**
         // It is the one that must not be cut — a bay that is silently empty is
@@ -82472,6 +82555,161 @@ mod persist_tests {
         assert_eq!(format!("{after}\n"), want, "the heal changed more than `named`");
         assert!(!crate::arrangement::Arrangement::pre_v8_path(&doc).exists(), "the heal wrote format 2");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A format-2 document whose desk the reader refuses: two rows with
+    /// one id, which only a hand edit or another build writes.
+    fn refused_doc_text() -> String {
+        let (_, text) = crate::era_corpus::DOCUMENTS[5];
+        let a = crate::arrangement::Arrangement::from_json(text);
+        let mut v: serde_json::Value = serde_json::from_str(
+            &a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::V2),
+        )
+        .expect("json");
+        let first = v["desk"]["rows"][0]["id"].clone();
+        v["desk"]["rows"][1]["id"] = first;
+        serde_json::to_string_pretty(&v).expect("json")
+    }
+
+    /// **A template whose desk is refused is never reseeded** (design 6.3:
+    /// "nothing is written over it"): launch and New call `seed_template`,
+    /// which used to treat a refusal as damage and write the stock desk
+    /// over it, keeping no `.pre-v8` because the file was already format 2.
+    /// The folder is byte for byte as it was, writers forced or not.
+    #[test]
+    fn a_refused_template_survives_seed_template_byte_for_byte() {
+        let root = project_scratch("refused-template-seed");
+        let dir = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(dir.join("media")).expect("dir");
+        let doc = dir.join(crate::arrangement::DOC_NAME);
+        std::fs::write(&doc, refused_doc_text()).expect("doc");
+        assert!(matches!(
+            crate::arrangement::Arrangement::read_from(&doc),
+            crate::arrangement::LoadOutcome::Refused(_)
+        ));
+        let before = folder_bytes(&dir);
+        let (_ctx, app) = headless(Caps::DESKTOP);
+        app.seed_template(&dir);
+        crate::desk_format::with_format2(|| app.seed_template(&dir));
+        assert_eq!(folder_bytes(&dir), before, "seed_template wrote over a refused template");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Adopting a refused template lands on the stock desk, never on
+    /// the outgoing session.** The read is refused, so nothing of the
+    /// template's desk is taken; and it used to return early, which left
+    /// the previous song's desk on screen while the session was repointed
+    /// at a fresh scratch with the template's kit and media under it. The
+    /// template itself is untouched, and the refusal is said.
+    #[test]
+    fn adopting_a_refused_template_stands_on_the_stock_desk() {
+        let root = project_scratch("refused-template-adopt");
+        let template = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(template.join("media")).expect("dir");
+        std::fs::write(crate::arrangement::doc_in(&template), refused_doc_text()).expect("doc");
+        let before = folder_bytes(&template);
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.add_bare_track(5));
+        let outgoing = app.desk_snapshot();
+        let scratch = root.join("Projects").join("Untitled");
+        app.adopt_template(&template, &scratch);
+        let stock = TangentApp::template_desk();
+        let now = app.desk_snapshot();
+        assert!(now != outgoing, "the outgoing session's desk is still standing");
+        assert_eq!(now.kinds, stock.kinds, "the session is not on the stock desk");
+        assert_eq!(now.tracks_added, stock.tracks_added, "the outgoing session's added track stands");
+        assert_eq!(app.project_doc(), Some(scratch.join(crate::arrangement::DOC_NAME).as_path()));
+        assert!(!app.arrangement.named);
+        assert_eq!(folder_bytes(&template), before, "the refused template was written");
+        assert!(!scratch.exists(), "adoption made the scratch folder");
+        let said: Vec<String> = app.messages.notes().iter().map(|n| n.text.clone()).collect();
+        assert!(
+            said.iter().any(|t| t.contains("template's desk could not be read")),
+            "{said:?}"
+        );
+        assert!(said.iter().all(|t| !t.contains('\u{2014}')), "{said:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A kit on an added track is work to the sweep** (writers forced):
+    /// every track Add makes is minted past 31, and a scratch whose kit is
+    /// on `t32` read through the identity desk as empty, or as the
+    /// template's clone, so `fresh_project_dir` reclaimed it and its kit
+    /// was deleted with the folder. Both arms: no template kit, and a
+    /// template kit the scratch also carries on `t0`.
+    #[test]
+    fn a_kit_on_an_added_track_keeps_its_scratch() {
+        use crate::drumpad::DrumpadDoc;
+        let root = project_scratch("kit-t32");
+        let projects = root.join("Projects");
+        let template = projects.join(TEMPLATE_SHELF).join("default");
+        let scratch = projects.join("Untitled");
+        std::fs::create_dir_all(template.join("media")).expect("template");
+        std::fs::create_dir_all(scratch.join("media")).expect("scratch");
+        let kit = |path: &str| {
+            let mut k = DrumpadDoc::default();
+            k.pads[36].path = path.into();
+            k
+        };
+        let lanes = |placed: &[(usize, DrumpadDoc)]| {
+            let mut kits: Vec<DrumpadDoc> = (0..recorder::CHANNELS).map(|_| DrumpadDoc::default()).collect();
+            for (lane, k) in placed {
+                kits[*lane] = k.clone();
+            }
+            kits
+        };
+        let mut ids = crate::desk_legacy::identity_ids(recorder::CHANNELS);
+        ids[7] = TrackId(32);
+        let scratch_doc = crate::arrangement::doc_in(&scratch);
+        let write = |kits: &[DrumpadDoc], doc: &std::path::Path| {
+            DrumpadDoc::save_all_beside_as(kits, &ids, 0, doc, crate::desk_format::Format::V2);
+        };
+        write(&lanes(&[(7, kit("media/mine.wav"))]), &scratch_doc);
+        let side: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(scratch.join(crate::drumpad::FILE_NAME)).expect("kit"),
+        )
+        .expect("json");
+        assert!(side["track_kits"].get("t32").is_some(), "{side}");
+        // No template kit: a kit with a sample is work.
+        assert!(holds_only_scratch(&scratch));
+        assert_ne!(fresh_project_dir(&projects), scratch, "the t32 kit's scratch was reclaimed");
+        // A template kit on t0, which the scratch carries too, beside its own.
+        let stock = kit("media/stock.wav");
+        write(&lanes(&[(0, stock.clone())]), &crate::arrangement::doc_in(&template));
+        write(&lanes(&[(0, stock.clone()), (7, kit("media/mine.wav"))]), &scratch_doc);
+        assert_ne!(fresh_project_dir(&projects), scratch, "the t32 kit read as the template's clone");
+        // And a true clone is still reclaimed.
+        write(&lanes(&[(0, stock)]), &scratch_doc);
+        assert_eq!(fresh_project_dir(&projects), scratch, "a verbatim clone stopped being litter");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The default kit is read against the template's own desk**
+    /// (writers forced): a template saved from a desk with an added track
+    /// keys that track's kit `t32`, and the reset read it through the
+    /// identity desk, so it came back empty and the panel's lane unknown.
+    #[test]
+    fn the_default_kit_reads_a_template_by_its_own_ids() {
+        crate::desk_format::with_format2(|| {
+            let root = project_scratch("reset-kit-ids");
+            let template = root.join("Projects").join(TEMPLATE_SHELF).join("default");
+            let (_ctx, mut author) = headless(Caps::DESKTOP);
+            assert!(author.add_bare_track(5));
+            let lane = author.track_ids().iter().position(|id| id.0 >= 32).expect("a minted row");
+            author.drumpad_kits[lane].pads[36].path = "media/added.wav".into();
+            author.drumpad_lane = lane;
+            author.write_template_into(&template).expect("template");
+            let side = std::fs::read_to_string(template.join(crate::drumpad::FILE_NAME)).expect("kit");
+            let minted = author.track_ids()[lane].to_string();
+            assert!(side.contains(&format!("\"{minted}\"")), "{side}");
+
+            let (_ctx2, mut app) = headless(Caps::DESKTOP);
+            app.settings.project_dir = Some(root.join("Projects").to_string_lossy().into_owned());
+            app.reset_kits_to_default();
+            assert_eq!(app.drumpad_kits[lane].pads[36].path, "media/added.wav", "the kit came back empty");
+            assert_eq!(app.drumpad_lane, lane, "the panel's lane was lost");
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 
     /// **A document's legacy bytes are Tangent's own file** to the sweeps:
