@@ -744,38 +744,68 @@ REDO = [
     # emerald, no ultramarine, no dark ground outside amber and green) and
     # then nudged until `desk_errors` came back empty: Lapis's cobalt sits
     # at 212 rather than 218 because 218 put channels 21 and 22 9.6 dE
-    # apart, and Mauve's mulberry and click moved to 335 and 300 for the
-    # same reason (channels 30/31 at 10.0, a click 7.3 dE off a channel).
+    # apart, and Ditto's click sits at 300 for the same reason (at 330 it
+    # was 7.3 dE off a channel).
     #
+    # **Four of them WEIGHT their families** (eight entries; see
+    # `design_redo`), because the first cut cycled four colours evenly and
+    # the critic's boards showed what that costs. Chartres was ruby,
+    # sapphire, emerald and topaz in even quarters on black, which is
+    # Prism's red, blue, green and yellow cycle with the lights off; a rose
+    # window is mostly blue glass, so cobalt and sapphire now take half the
+    # desk, ruby a quarter and emerald and topaz an eighth each. Urushi
+    # was a muted rainbow with no majority, and is now cinnabar and
+    # black-red for half, gold and gold-brown for a quarter, pine and ink
+    # as the two inlays. Lamplight's leather sat between its greens and
+    # made it Malachite's twin; brass and amber now carry the warm half,
+    # so it reads as a study. Overprint keeps its two drums, pink and
+    # federal blue, and their overprint purple for three quarters, with
+    # periwinkle and one teal as the only strays.
+    #
+    # **And Kiln, Woodblock and Ditto were REORDERED, not recoloured.** A
+    # run's families in the same order as another's line up channel for
+    # channel, and that is what a desk shows: Kiln's clay, ash, slip and
+    # umber walked Paperback's orange, green, blue and cerise at 13.8 dE a
+    # channel, the closest pair on the menu. Kiln is now cobalt slip,
+    # iron, ash and celadon (22 from its nearest run), Woodblock starts on
+    # indigo (it walked Silverface's at 17), and Ditto's grey carbon became
+    # a washed violet, the faded copy, starting on blue-violet.
     # **The odd degrees are there so no run reuses another's bytes.** A
     # family at the same (hue, sat) as an older run's lands on exactly the
-    # same colours -- Mauve's damson at 315/0.55 was Celadon's plum to the
+    # same colours -- Ditto's damson at 315/0.55 was Celadon's plum to the
     # byte, Malachite's azurite at 222/0.60 was Storm's storm -- and a strip
     # that is literally another palette's strip is a palette quietly
     # borrowing an identity. Two or three degrees moves the bytes and not
     # the colour anybody sees; every run below shares none with any other.
     #
-    # **Woodblock's master search starts at 20 and Lamplight's at 340, not
+    # **Woodblock's master search starts at 22 and Lamplight's at 340, not
     # at 355.** From 355 Woodblock took #b0221a, 6.4 dE from Silverface's
     # jewel; the 6 dE gate passes that, but red master space is the most
     # crowded corner of the table and Silverface's own report holds its
     # jewel to 7. Moving Woodblock's start sent the next free red to
-    # Lamplight, so both moved: Woodblock's master is now the ochre of the
+    # Lamplight, so both moved: Woodblock's master is the ochre of the
     # print's cartouche and Lamplight's a crimson, and no master in the
-    # batch sits within 15 dE of the jewel.
-    ("Urushi", 19, [("cinnabar", 10, 0.72), ("pine", 150, 0.45), ("gold", 40, 0.60), ("ink", 225, 0.35)], (20, 0.18), 350),
+    # batch sits within 12 dE of the jewel. From 20 the ochre came out
+    # #73571d, which was Chartres' topaz strip to the byte, a master
+    # borrowing another palette's identity; 22 lands it on #75551d, and
+    # `--check` now refuses any live master that is some run's strip.
+    ("Urushi", 19, [("cinnabar", 11, 0.72), ("gold", 40, 0.60), ("blackred", 2, 0.55), ("pine", 150, 0.45),
+                  ("cinnabar", 11, 0.72), ("goldbrown", 31, 0.50), ("blackred", 2, 0.55), ("ink", 225, 0.45)], (20, 0.18), 350),
     ("Paperback", 20, [("orange", 22, 0.75), ("crime", 140, 0.55), ("pelican", 220, 0.62), ("cerise", 330, 0.55)], (30, 0.10), 0),
-    ("Malachite", 21, [("malachite", 158, 0.70), ("jade", 172, 0.40), ("quartz", 345, 0.45), ("azurite", 224, 0.60)], (150, 0.15), 355),
+    ("Malachite", 21, [("malachite", 158, 0.70), ("jade", 172, 0.60), ("quartz", 345, 0.45), ("azurite", 224, 0.60)], (150, 0.15), 355),
     ("Sodium", 22, [("uv", 270, 0.60), ("sodium", 32, 0.80), ("neon", 310, 0.60), ("mercury", 175, 0.50)], (275, 0.20), 5),
-    ("Kiln", 23, [("clay", 18, 0.62), ("ash", 140, 0.30), ("slip", 220, 0.50), ("umber", 30, 0.40)], (25, 0.20), 0),
+    ("Kiln", 23, [("slip", 226, 0.50), ("iron", 12, 0.62), ("ash", 75, 0.40), ("celadon", 168, 0.48)], (25, 0.20), 0),
     ("Lapis", 24, [("ultramarine", 232, 0.75), ("cobalt", 212, 0.60), ("lapis", 248, 0.55), ("pyrite", 45, 0.55)], (230, 0.15), 5),
-    ("Chartres", 25, [("ruby", 345, 0.72), ("sapphire", 219, 0.72), ("emerald", 140, 0.65), ("topaz", 40, 0.75)], (260, 0.08), 15),
-    ("Overprint", 26, [("pink", 335, 0.65), ("federal", 223, 0.75), ("violet", 275, 0.55), ("teal", 180, 0.55)], (300, 0.15), 10),
-    ("Woodblock", 27, [("prussian", 200, 0.75), ("indigo", 227, 0.60), ("sky", 195, 0.40), ("seal", 14, 0.70)], (35, 0.25), 20),
+    ("Chartres", 25, [("cobalt", 226, 0.78), ("ruby", 345, 0.72), ("sapphire", 208, 0.65), ("emerald", 140, 0.65),
+                    ("cobalt", 226, 0.78), ("ruby", 345, 0.72), ("sapphire", 208, 0.65), ("topaz", 40, 0.75)], (235, 0.10), 15),
+    ("Overprint", 26, [("pink", 335, 0.65), ("federal", 223, 0.75), ("purple", 285, 0.55), ("periwinkle", 245, 0.50),
+                     ("pink", 335, 0.65), ("federal", 223, 0.75), ("purple", 285, 0.55), ("teal", 180, 0.65)], (300, 0.15), 10),
+    ("Woodblock", 27, [("indigo", 227, 0.60), ("sky", 196, 0.60), ("seal", 14, 0.70), ("prussian", 200, 0.75)], (35, 0.25), 22),
     ("Toffee", 28, [("butterscotch", 34, 0.80), ("jade", 162, 0.55), ("cherry", 353, 0.65), ("rootbeer", 22, 0.50)], (40, 0.18), 5),
     ("Confetti", 29, [("mulberry", 322, 0.62), ("teal", 178, 0.62), ("cobalt", 228, 0.65), ("mustard", 48, 0.70)], (330, 0.15), 10),
-    ("Lamplight", 30, [("emerald", 150, 0.70), ("bottle", 165, 0.50), ("leather", 8, 0.55), ("brass", 42, 0.60)], (140, 0.12), 340),
-    ("Mauve", 31, [("mauve", 287, 0.62), ("damson", 313, 0.55), ("mulberry", 335, 0.50), ("carbon", 230, 0.25)], (300, 0.17), 10),
+    ("Lamplight", 30, [("bottle", 165, 0.60), ("emerald", 150, 0.70), ("brass", 42, 0.60), ("amber", 32, 0.70),
+                     ("bottle", 165, 0.60), ("leather", 18, 0.55), ("brass", 42, 0.60), ("emerald", 150, 0.70)], (140, 0.12), 340),
+    ("Ditto", 31, [("blueviolet", 262, 0.55), ("damson", 313, 0.52), ("washed", 289, 0.30), ("aniline", 281, 0.62)], (300, 0.17), 10),
 ]
 
 # The pins: what the machinery above produced, frozen the day it shipped and
@@ -911,21 +941,21 @@ REDO_PINS = {
     # The 2026-10-08 batch, pasted from `--redo` in REDO order.
     "Urushi": dict(
         slots=[
-            (0x3b, 0x17, 0x10), (0x21, 0x3c, 0x2f), (0x59, 0x47, 0x24), (0x4f, 0x5a, 0x7a),
-            (0x5e, 0x26, 0x1a), (0x2d, 0x51, 0x3f), (0x6d, 0x57, 0x2c), (0x1e, 0x22, 0x2d),
-            (0x7d, 0x32, 0x23), (0x37, 0x63, 0x4d), (0x29, 0x21, 0x11), (0x30, 0x36, 0x4a),
-            (0x91, 0x43, 0x34), (0x15, 0x25, 0x1d), (0x42, 0x35, 0x1b), (0x41, 0x49, 0x63),
+            (0x3a, 0x18, 0x10), (0x42, 0x35, 0x1b), (0x75, 0x37, 0x35), (0x37, 0x63, 0x4d),
+            (0x5d, 0x27, 0x1a), (0x5c, 0x45, 0x2e), (0x90, 0x44, 0x41), (0x1c, 0x21, 0x33),
+            (0x7c, 0x33, 0x23), (0x6d, 0x57, 0x2c), (0x36, 0x1a, 0x19), (0x21, 0x3c, 0x2f),
+            (0x92, 0x44, 0x32), (0x2a, 0x20, 0x15), (0x57, 0x29, 0x27), (0x3c, 0x48, 0x6d),
         ],
         ext=[
-            (0x46, 0x25, 0x14), (0x27, 0x47, 0x3d), (0x5c, 0x53, 0x25), (0x57, 0x5a, 0x85),
-            (0x64, 0x34, 0x1c), (0x32, 0x5a, 0x4d), (0x69, 0x5f, 0x2a), (0x2b, 0x2c, 0x41),
+            (0x46, 0x26, 0x14), (0x49, 0x41, 0x1d), (0x7a, 0x45, 0x37), (0x38, 0x66, 0x57),
+            (0x63, 0x35, 0x1c), (0x60, 0x51, 0x30), (0x8b, 0x4e, 0x3e), (0x29, 0x2b, 0x4a),
         ],
         ext2=[
-            (0x8b, 0x38, 0x38), (0x39, 0x67, 0x48), (0x3c, 0x2a, 0x18), (0x36, 0x42, 0x52),
-            (0x99, 0x44, 0x44), (0x1c, 0x32, 0x23), (0x55, 0x3c, 0x22), (0x45, 0x54, 0x69),
+            (0x8d, 0x37, 0x35), (0x7c, 0x57, 0x31), (0x4a, 0x21, 0x27), (0x28, 0x48, 0x32),
+            (0x9b, 0x42, 0x41), (0x3d, 0x29, 0x1f), (0x68, 0x2f, 0x37), (0x3f, 0x54, 0x72),
         ],
         click=(0x5b, 0x51, 0x4b),
-        master=(0xb1, 0x1a, 0x3d),
+        master=(0x96, 0x0c, 0x23),
     ),
     "Paperback": dict(
         slots=[
@@ -947,18 +977,18 @@ REDO_PINS = {
     ),
     "Malachite": dict(
         slots=[
-            (0x0c, 0x26, 0x1d), (0x24, 0x3b, 0x38), (0x6c, 0x3c, 0x48), (0x40, 0x58, 0x9a),
-            (0x13, 0x3e, 0x2e), (0x30, 0x4f, 0x4b), (0x85, 0x49, 0x58), (0x18, 0x21, 0x3b),
-            (0x19, 0x53, 0x3e), (0x3a, 0x61, 0x5c), (0x32, 0x1c, 0x21), (0x26, 0x35, 0x5f),
-            (0x1f, 0x66, 0x4c), (0x16, 0x24, 0x23), (0x50, 0x2c, 0x35), (0x33, 0x47, 0x80),
+            (0x0c, 0x26, 0x1d), (0x18, 0x3c, 0x38), (0x6c, 0x3c, 0x48), (0x40, 0x58, 0x9a),
+            (0x13, 0x3e, 0x2e), (0x21, 0x51, 0x4b), (0x85, 0x49, 0x58), (0x18, 0x21, 0x3b),
+            (0x19, 0x53, 0x3e), (0x28, 0x64, 0x5c), (0x32, 0x1c, 0x21), (0x26, 0x35, 0x5f),
+            (0x1f, 0x66, 0x4c), (0x0f, 0x25, 0x22), (0x50, 0x2c, 0x35), (0x33, 0x47, 0x80),
         ],
         ext=[
-            (0x0f, 0x33, 0x2c), (0x2a, 0x46, 0x46), (0x79, 0x43, 0x47), (0x51, 0x59, 0x9c),
-            (0x16, 0x49, 0x3f), (0x36, 0x58, 0x5a), (0x8b, 0x4c, 0x51), (0x24, 0x29, 0x5a),
+            (0x0f, 0x33, 0x2c), (0x1d, 0x47, 0x49), (0x79, 0x43, 0x47), (0x51, 0x59, 0x9c),
+            (0x16, 0x49, 0x3f), (0x25, 0x5a, 0x5c), (0x8b, 0x4c, 0x51), (0x24, 0x29, 0x5a),
         ],
         ext2=[
-            (0x1c, 0x5e, 0x3b), (0x3d, 0x65, 0x59), (0x42, 0x25, 0x31), (0x28, 0x42, 0x65),
-            (0x20, 0x6a, 0x43), (0x1e, 0x31, 0x2c), (0x5e, 0x34, 0x46), (0x33, 0x54, 0x7f),
+            (0x1c, 0x5e, 0x3b), (0x2a, 0x68, 0x56), (0x42, 0x25, 0x31), (0x28, 0x42, 0x65),
+            (0x20, 0x6a, 0x43), (0x15, 0x33, 0x2a), (0x5e, 0x34, 0x46), (0x33, 0x54, 0x7f),
         ],
         click=(0x49, 0x55, 0x4f),
         master=(0xa9, 0x2a, 0x3d),
@@ -983,21 +1013,21 @@ REDO_PINS = {
     ),
     "Kiln": dict(
         slots=[
-            (0x32, 0x1c, 0x13), (0x29, 0x3a, 0x2f), (0x37, 0x49, 0x6e), (0x6c, 0x57, 0x41),
-            (0x50, 0x2e, 0x1f), (0x38, 0x4f, 0x3f), (0x44, 0x5b, 0x88), (0x29, 0x20, 0x18),
-            (0x6d, 0x3e, 0x29), (0x44, 0x61, 0x4e), (0x1a, 0x22, 0x33), (0x42, 0x34, 0x27),
-            (0x86, 0x4c, 0x33), (0x1a, 0x24, 0x1d), (0x29, 0x37, 0x52), (0x58, 0x47, 0x35),
+            (0x1b, 0x21, 0x36), (0x55, 0x2b, 0x20), (0x46, 0x4d, 0x2e), (0x34, 0x63, 0x5a),
+            (0x2b, 0x35, 0x57), (0x72, 0x3a, 0x2c), (0x55, 0x5e, 0x39), (0x13, 0x25, 0x22),
+            (0x3a, 0x48, 0x74), (0x8d, 0x47, 0x35), (0x20, 0x23, 0x15), (0x1f, 0x3c, 0x37),
+            (0x48, 0x58, 0x90), (0x35, 0x1b, 0x14), (0x34, 0x39, 0x22), (0x2a, 0x50, 0x49),
         ],
         ext=[
-            (0x3e, 0x29, 0x18), (0x31, 0x45, 0x3b), (0x44, 0x4f, 0x88), (0x6b, 0x5d, 0x40),
-            (0x57, 0x3b, 0x21), (0x3e, 0x58, 0x4b), (0x4d, 0x5a, 0x9a), (0x33, 0x2d, 0x1f),
+            (0x28, 0x2b, 0x50), (0x5d, 0x39, 0x23), (0x49, 0x57, 0x34), (0x35, 0x66, 0x65),
+            (0x39, 0x3c, 0x71), (0x76, 0x47, 0x2d), (0x53, 0x63, 0x3c), (0x1a, 0x31, 0x31),
         ],
         ext2=[
-            (0x85, 0x3d, 0x33), (0x47, 0x65, 0x4c), (0x20, 0x2f, 0x3f), (0x52, 0x3c, 0x31),
-            (0x97, 0x46, 0x39), (0x23, 0x31, 0x25), (0x2d, 0x43, 0x59), (0x68, 0x4c, 0x3f),
+            (0x3c, 0x53, 0x77), (0x9a, 0x43, 0x40), (0x2e, 0x2f, 0x1c), (0x25, 0x47, 0x3b),
+            (0x44, 0x5f, 0x88), (0x4e, 0x1f, 0x1e), (0x41, 0x43, 0x28), (0x30, 0x5b, 0x4b),
         ],
         click=(0x5b, 0x51, 0x49),
-        master=(0x92, 0x16, 0x26),
+        master=(0x92, 0x16, 0x2f),
     ),
     "Lapis": dict(
         slots=[
@@ -1019,57 +1049,57 @@ REDO_PINS = {
     ),
     "Chartres": dict(
         slots=[
-            (0x3f, 0x12, 0x1d), (0x1c, 0x35, 0x65), (0x1d, 0x53, 0x2f), (0x73, 0x57, 0x1d),
-            (0x65, 0x1c, 0x2e), (0x26, 0x48, 0x88), (0x24, 0x67, 0x3b), (0x2b, 0x20, 0x0b),
-            (0x83, 0x2a, 0x40), (0x35, 0x5a, 0x9d), (0x0e, 0x27, 0x16), (0x46, 0x35, 0x12),
-            (0x97, 0x3c, 0x53), (0x12, 0x21, 0x3f), (0x16, 0x3e, 0x23), (0x5d, 0x46, 0x17),
+            (0x11, 0x1e, 0x4c), (0x65, 0x1c, 0x2e), (0x26, 0x4c, 0x6e), (0x24, 0x67, 0x3b),
+            (0x20, 0x33, 0x71), (0x83, 0x2a, 0x40), (0x2f, 0x5f, 0x88), (0x2b, 0x20, 0x0b),
+            (0x31, 0x46, 0x88), (0x97, 0x3c, 0x53), (0x12, 0x24, 0x33), (0x16, 0x3e, 0x23),
+            (0x43, 0x57, 0x99), (0x3f, 0x12, 0x1d), (0x1d, 0x39, 0x52), (0x5d, 0x46, 0x17),
         ],
         ext=[
-            (0x55, 0x18, 0x1d), (0x2f, 0x3c, 0x7b), (0x21, 0x5d, 0x3f), (0x6b, 0x5d, 0x1b),
-            (0x78, 0x22, 0x29), (0x40, 0x4e, 0x91), (0x25, 0x6a, 0x48), (0x34, 0x2e, 0x0d),
+            (0x22, 0x27, 0x64), (0x78, 0x22, 0x29), (0x31, 0x53, 0x8c), (0x25, 0x6a, 0x48),
+            (0x36, 0x3b, 0x7b), (0x8d, 0x35, 0x3d), (0x38, 0x5d, 0x9f), (0x34, 0x2e, 0x0d),
         ],
         ext2=[
-            (0x8c, 0x33, 0x58), (0x2a, 0x61, 0x95), (0x12, 0x34, 0x18), (0x5c, 0x3a, 0x17),
-            (0x98, 0x40, 0x64), (0x14, 0x30, 0x49), (0x1a, 0x4a, 0x22), (0x74, 0x49, 0x1d),
+            (0x27, 0x52, 0x94), (0x98, 0x40, 0x64), (0x16, 0x31, 0x3d), (0x1a, 0x4a, 0x22),
+            (0x30, 0x5e, 0xa1), (0x53, 0x17, 0x30), (0x1e, 0x46, 0x56), (0x74, 0x49, 0x1d),
         ],
-        click=(0x54, 0x52, 0x59),
+        click=(0x52, 0x52, 0x5b),
         master=(0x9f, 0x3a, 0x18),
     ),
     "Overprint": dict(
         slots=[
-            (0x3b, 0x15, 0x25), (0x1c, 0x33, 0x6f), (0x5e, 0x3b, 0x77), (0x2d, 0x63, 0x63),
-            (0x5e, 0x21, 0x3b), (0x2d, 0x46, 0x88), (0x70, 0x4b, 0x89), (0x11, 0x25, 0x25),
-            (0x7e, 0x2c, 0x4f), (0x3f, 0x58, 0x99), (0x2c, 0x1a, 0x3a), (0x1b, 0x3c, 0x3c),
-            (0x94, 0x3c, 0x61), (0x12, 0x20, 0x46), (0x47, 0x2a, 0x5d), (0x24, 0x50, 0x50),
+            (0x3b, 0x15, 0x25), (0x1c, 0x33, 0x6f), (0x65, 0x37, 0x75), (0x58, 0x53, 0x94),
+            (0x5e, 0x21, 0x3b), (0x2d, 0x46, 0x88), (0x76, 0x49, 0x86), (0x0d, 0x25, 0x25),
+            (0x7e, 0x2c, 0x4f), (0x3f, 0x58, 0x99), (0x30, 0x19, 0x37), (0x35, 0x31, 0x61),
+            (0x94, 0x3c, 0x61), (0x12, 0x20, 0x46), (0x4c, 0x28, 0x59), (0x1d, 0x51, 0x51),
         ],
         ext=[
-            (0x50, 0x1c, 0x29), (0x33, 0x3c, 0x7c), (0x6f, 0x40, 0x7e), (0x32, 0x65, 0x70),
-            (0x71, 0x27, 0x3a), (0x45, 0x4d, 0x8d), (0x7a, 0x4c, 0x8a), (0x19, 0x32, 0x36),
+            (0x50, 0x1c, 0x29), (0x33, 0x3c, 0x7c), (0x75, 0x3e, 0x79), (0x64, 0x54, 0x95),
+            (0x71, 0x27, 0x3a), (0x45, 0x4d, 0x8d), (0x81, 0x49, 0x86), (0x13, 0x31, 0x38),
         ],
         ext2=[
-            (0x85, 0x36, 0x64), (0x28, 0x5f, 0xa1), (0x37, 0x25, 0x51), (0x20, 0x47, 0x41),
-            (0x93, 0x42, 0x71), (0x14, 0x2e, 0x4f), (0x4e, 0x34, 0x72), (0x29, 0x5b, 0x53),
+            (0x85, 0x36, 0x64), (0x28, 0x5f, 0xa1), (0x3c, 0x23, 0x4d), (0x38, 0x3d, 0x70),
+            (0x93, 0x42, 0x71), (0x14, 0x2e, 0x4f), (0x55, 0x32, 0x6e), (0x20, 0x5c, 0x52),
         ],
         click=(0x5c, 0x4f, 0x5c),
         master=(0x88, 0x28, 0x14),
     ),
     "Woodblock": dict(
         slots=[
-            (0x0c, 0x24, 0x31), (0x28, 0x34, 0x63), (0x34, 0x4e, 0x56), (0x91, 0x45, 0x2e),
-            (0x14, 0x3b, 0x4e), (0x35, 0x46, 0x84), (0x40, 0x60, 0x6a), (0x37, 0x1a, 0x11),
-            (0x1a, 0x4e, 0x69), (0x44, 0x57, 0x9b), (0x18, 0x23, 0x27), (0x59, 0x29, 0x1b),
-            (0x20, 0x60, 0x81), (0x19, 0x21, 0x3d), (0x26, 0x3a, 0x40), (0x77, 0x37, 0x24),
+            (0x19, 0x21, 0x3d), (0x1c, 0x3b, 0x46), (0x77, 0x37, 0x24), (0x20, 0x60, 0x81),
+            (0x28, 0x34, 0x63), (0x26, 0x4f, 0x5e), (0x91, 0x45, 0x2e), (0x0c, 0x24, 0x31),
+            (0x35, 0x46, 0x84), (0x2e, 0x61, 0x74), (0x37, 0x1a, 0x11), (0x14, 0x3b, 0x4e),
+            (0x44, 0x57, 0x9b), (0x11, 0x25, 0x2b), (0x59, 0x29, 0x1b), (0x1a, 0x4e, 0x69),
         ],
         ext=[
-            (0x13, 0x30, 0x4c), (0x37, 0x3b, 0x78), (0x3e, 0x56, 0x67), (0x89, 0x50, 0x29),
-            (0x1b, 0x43, 0x6a), (0x49, 0x4d, 0x8d), (0x46, 0x62, 0x75), (0x43, 0x27, 0x14),
+            (0x25, 0x28, 0x5c), (0x25, 0x44, 0x5b), (0x79, 0x46, 0x24), (0x27, 0x60, 0x9a),
+            (0x37, 0x3b, 0x78), (0x2f, 0x56, 0x75), (0x89, 0x50, 0x29), (0x13, 0x30, 0x4c),
         ],
         ext2=[
-            (0x1a, 0x5a, 0x67), (0x3c, 0x5e, 0x96), (0x1e, 0x31, 0x32), (0x73, 0x28, 0x23),
-            (0x1d, 0x67, 0x75), (0x1d, 0x2e, 0x49), (0x2b, 0x46, 0x48), (0x8c, 0x38, 0x32),
+            (0x35, 0x53, 0x84), (0x2c, 0x67, 0x6d), (0x52, 0x1c, 0x19), (0x14, 0x47, 0x52),
+            (0x3c, 0x5e, 0x96), (0x15, 0x32, 0x35), (0x73, 0x28, 0x23), (0x1a, 0x5a, 0x67),
         ],
         click=(0x5b, 0x52, 0x44),
-        master=(0x73, 0x57, 0x1d),
+        master=(0x75, 0x55, 0x1d),
     ),
     "Toffee": dict(
         slots=[
@@ -1087,7 +1117,7 @@ REDO_PINS = {
             (0x8d, 0x4e, 0x25), (0x17, 0x33, 0x26), (0x71, 0x27, 0x3c), (0x75, 0x46, 0x3b),
         ],
         click=(0x58, 0x52, 0x48),
-        master=(0xaf, 0x1a, 0x53),
+        master=(0xb4, 0x0e, 0x43),
     ),
     "Confetti": dict(
         slots=[
@@ -1109,36 +1139,36 @@ REDO_PINS = {
     ),
     "Lamplight": dict(
         slots=[
-            (0x0c, 0x27, 0x1a), (0x1e, 0x3c, 0x35), (0x70, 0x3a, 0x32), (0x6c, 0x59, 0x2b),
-            (0x13, 0x3e, 0x29), (0x29, 0x51, 0x47), (0x8b, 0x48, 0x3e), (0x29, 0x22, 0x10),
-            (0x19, 0x53, 0x36), (0x32, 0x63, 0x57), (0x34, 0x1b, 0x18), (0x41, 0x36, 0x1a),
-            (0x1f, 0x67, 0x43), (0x13, 0x25, 0x21), (0x53, 0x2c, 0x26), (0x57, 0x48, 0x23),
+            (0x0f, 0x26, 0x21), (0x13, 0x3e, 0x29), (0x57, 0x48, 0x23), (0x7b, 0x52, 0x25),
+            (0x19, 0x3d, 0x34), (0x67, 0x40, 0x2f), (0x6c, 0x59, 0x2b), (0x0c, 0x27, 0x1a),
+            (0x21, 0x52, 0x46), (0x1f, 0x67, 0x43), (0x29, 0x22, 0x10), (0x4a, 0x32, 0x16),
+            (0x28, 0x64, 0x55), (0x30, 0x1d, 0x16), (0x41, 0x36, 0x1a), (0x19, 0x53, 0x36),
         ],
         ext=[
-            (0x0f, 0x33, 0x27), (0x24, 0x47, 0x45), (0x74, 0x48, 0x34), (0x67, 0x5f, 0x29),
-            (0x16, 0x49, 0x38), (0x2d, 0x5a, 0x57), (0x85, 0x51, 0x3c), (0x32, 0x2e, 0x14),
+            (0x14, 0x32, 0x30), (0x16, 0x49, 0x38), (0x5b, 0x54, 0x24), (0x73, 0x5a, 0x22),
+            (0x1d, 0x47, 0x44), (0x6c, 0x4c, 0x31), (0x67, 0x5f, 0x29), (0x0f, 0x33, 0x27),
         ],
         ext2=[
-            (0x1c, 0x5e, 0x32), (0x34, 0x67, 0x52), (0x4a, 0x21, 0x23), (0x54, 0x3c, 0x22),
-            (0x20, 0x6b, 0x39), (0x19, 0x32, 0x28), (0x69, 0x2f, 0x31), (0x6a, 0x4d, 0x2b),
+            (0x25, 0x5c, 0x45), (0x20, 0x6b, 0x39), (0x3b, 0x2a, 0x18), (0x61, 0x36, 0x1d),
+            (0x2a, 0x69, 0x4f), (0x46, 0x25, 0x1f), (0x54, 0x3c, 0x22), (0x1c, 0x5e, 0x32),
         ],
         click=(0x4b, 0x55, 0x4f),
-        master=(0xa7, 0x2a, 0x53),
+        master=(0xb0, 0x1a, 0x4c),
     ),
-    "Mauve": dict(
+    "Ditto": dict(
         slots=[
-            (0x33, 0x17, 0x3b), (0x54, 0x26, 0x4a), (0x6f, 0x38, 0x4f), (0x55, 0x59, 0x71),
-            (0x51, 0x24, 0x5d), (0x71, 0x33, 0x64), (0x89, 0x44, 0x61), (0x20, 0x22, 0x2a),
-            (0x66, 0x37, 0x73), (0x87, 0x42, 0x78), (0x34, 0x1a, 0x24), (0x34, 0x36, 0x45),
-            (0x78, 0x48, 0x86), (0x34, 0x18, 0x2e), (0x53, 0x2a, 0x3b), (0x45, 0x48, 0x5c),
+            (0x28, 0x1c, 0x3d), (0x52, 0x28, 0x49), (0x59, 0x42, 0x5e), (0x74, 0x4a, 0x88),
+            (0x40, 0x2d, 0x63), (0x6e, 0x35, 0x62), (0x6e, 0x51, 0x74), (0x31, 0x17, 0x3c),
+            (0x55, 0x3e, 0x7e), (0x88, 0x42, 0x79), (0x29, 0x1f, 0x2c), (0x4e, 0x25, 0x60),
+            (0x66, 0x4f, 0x8f), (0x33, 0x19, 0x2e), (0x42, 0x31, 0x46), (0x62, 0x38, 0x76),
         ],
         ext=[
-            (0x48, 0x1c, 0x4a), (0x65, 0x2e, 0x50), (0x7e, 0x3f, 0x4f), (0x5c, 0x5c, 0x7a),
-            (0x63, 0x2b, 0x65), (0x81, 0x3a, 0x65), (0x8f, 0x48, 0x59), (0x2c, 0x2c, 0x3b),
+            (0x3b, 0x24, 0x4f), (0x63, 0x2f, 0x4f), (0x67, 0x49, 0x68), (0x7e, 0x4b, 0x87),
+            (0x53, 0x33, 0x70), (0x7e, 0x3c, 0x65), (0x75, 0x52, 0x76), (0x45, 0x1d, 0x4d),
         ],
         ext2=[
-            (0x69, 0x43, 0x81), (0x86, 0x47, 0x82), (0x45, 0x23, 0x37), (0x3b, 0x42, 0x4f),
-            (0x75, 0x4f, 0x8c), (0x46, 0x20, 0x44), (0x61, 0x31, 0x4d), (0x4b, 0x53, 0x63),
+            (0x56, 0x49, 0x8b), (0x85, 0x48, 0x81), (0x35, 0x29, 0x3b), (0x52, 0x32, 0x71),
+            (0x61, 0x54, 0x98), (0x44, 0x21, 0x42), (0x4b, 0x3b, 0x54), (0x65, 0x45, 0x84),
         ],
         click=(0x5d, 0x4e, 0x5d),
         master=(0x91, 0x45, 0x24),
@@ -1192,7 +1222,7 @@ MENU = [
     "Prism", "Storm", "Amber", "Phosphor", "Silverface",
     # The 2026-10-08 batch, appended in slot order (19..31).
     "Urushi", "Paperback", "Malachite", "Sodium", "Kiln", "Lapis", "Chartres",
-    "Overprint", "Woodblock", "Toffee", "Confetti", "Lamplight", "Mauve",
+    "Overprint", "Woodblock", "Toffee", "Confetti", "Lamplight", "Ditto",
 ]
 
 
@@ -1423,6 +1453,23 @@ def check(verbose=True):
         errs.extend(f"{name}: {e}" for e in perrs)
         shown.update(f"{name}: {e}" for e in perrs)
 
+    # **No live master is some run's strip, byte for byte.** The spread gate
+    # measures a master against the other MASTERS, so nothing stopped one
+    # landing exactly on another palette's channel: the 2026-10-08 batch's
+    # first cut gave Woodblock the master #73571d, Chartres' topaz strip to
+    # the byte, which is the borrowed identity the odd degrees above REDO
+    # exist to prevent. Retired runs count as strips (a saved desk can
+    # still wear them); a retired MASTER is in no menu and is not asked.
+    strips = {}
+    for name, p in ALL_RUNS.items():
+        for c in p["slots"] + [p["click"]] + EXT_RUNS[name] + EXT2_RUNS[name]:
+            strips.setdefault(c, []).append(name)
+    for name, p in ALL_RUNS.items():
+        if name in RETIRED:
+            continue
+        if p["master"] in strips:
+            errs.append(f"{name}: master {hexs(p['master'])} is a strip of {', '.join(strips[p['master']])}")
+
     if verbose:
         # **Everything not already printed beside its palette**, which is
         # not the same as "everything whose prefix is not a run name". The
@@ -1543,11 +1590,12 @@ def live_master_items():
 def redo_ext(fams, first, nudge):
     """Eight channels seeded from run slots `first..first+8`: the seed's
     family on the half-tone above the seed's tone, hue nudged `nudge` --
-    `faceplate_ext`'s walk over any four families."""
+    `faceplate_ext`'s walk over any four families (or eight; see
+    `design_redo`)."""
     out = []
     for j in range(8):
         i = first + j
-        _, hue, sat = fams[i % 4]
+        _, hue, sat = fams[i % len(fams)]
         out.append(make(hue + nudge, sat, None, lum=HALF_TONES[(i // 4 + i) % 4]))
     return out
 
@@ -1555,11 +1603,20 @@ def redo_ext(fams, first, nudge):
 def design_redo(spec, others):
     """One replacement run from its spec. `others` is every master that is
     live at the time -- the shipped ones and the redo runs designed before
-    this one -- so the spread gate sees the whole menu."""
+    this one -- so the spread gate sees the whole menu.
+
+    **Four families, or eight to WEIGHT them.** Four cycle evenly, a
+    quarter of the desk each, which is right for a theme of four equal
+    colours and wrong for one with a lead colour: a rose window is mostly
+    blue glass, a lacquer box mostly red. Eight entries cycle the same way
+    with a family named twice taking a quarter of the desk where once takes
+    an eighth, and the tone walk is unchanged: a family named at positions
+    k and k+4 lands on all four tones exactly as a four-family run does.
+    A four-family spec produces exactly the bytes it always did."""
     name, _slot, fams, (chue, csat), hue0 = spec
     slots = []
     for i in range(16):
-        _, hue, sat = fams[i % 4]
+        _, hue, sat = fams[i % len(fams)]
         slots.append(make(hue, sat, (i // 4 + i) % 4))
     click = make(chue, csat, None, lum=HALF_TONES[2])
     master = make_master(slots, click, others, hue0=hue0)
@@ -2230,7 +2287,7 @@ REDO_THEMES = {
 # (Lapis), the empty arc between 210 and 260 (Woodblock), a dark ground in
 # something other than amber or green (Urushi, Sodium, Chartres, Toffee,
 # Lamplight), a clay page (Kiln), a butter page (Confetti), a pink light
-# desk (Overprint), a magenta band on white (Mauve). The comments on each
+# desk (Overprint), a violet band on white copy paper (Ditto). The comments on each
 # theme's Rust say what it is and why each mark is the colour it is; the
 # numbers that forced a choice are recorded there too.
 #
@@ -2244,20 +2301,20 @@ REDO_THEMES = {
 NEW_THEMES = {
     "Urushi": T(
         background="#140a08", white_key="#140a08", black_key="#0a0504",
-        key_active="#ff6a3a", sustain="#f0cc80", key_separator="#3a1810",
+        key_active="#f0c850", sustain="#f0502e", key_separator="#3a1810",
         text="#f2d2b8", theory_line="#64321f", interval_text="#e8a070",
-        recorder_bg="#3e140c", fx_knob="#e8c070", master_knob="#ff4f6e",
+        recorder_bg="#3e140c", fx_knob="#6fbf8e", master_knob="#ff4f6e",
         varispeed="#f2d2b8", velocity_loud="#fe6c56", velocity_quiet="#19b064",
-        meter_bg="#0a0504", scope_draw="#7fc89a", fx_strip="#2c0e08",
-        input_chip="#ff6a3a", fretboard="#0a0504", string="#8a6450",
+        meter_bg="#0a0504", scope_draw="#f0c850", fx_strip="#2c0e08",
+        input_chip="#f0c850", fretboard="#0a0504", string="#8a6450",
         dark=dict(background="#0a0504"),
     ),
     "Paperback": T(
         background="#f5f3ee", white_key="#f5f3ee", black_key="#1e140e",
         key_active="#ff8a3a", sustain="#5a8ae0", key_separator="#8a5a3a",
         text="#f2e6cc", theory_line="#b0a898", interval_text="#c04a14",
-        recorder_bg="#74381a", fx_knob="#4caa6a", master_knob="#ff6a5a",
-        varispeed="#f2e6cc", velocity_loud="#fa753c", velocity_quiet="#19b24c",
+        recorder_bg="#74381a", fx_knob="#ffcc9c", master_knob="#ff6a5a",
+        varispeed="#9cc0f8", velocity_loud="#fa753c", velocity_quiet="#19b24c",
         meter_bg="#24140c", scope_draw="#9cc0f8", fx_strip="#5e2c14",
         input_chip="#ff8a3a", fretboard="#24140c", string="#c8b8a0",
         dark=dict(background="#1e140e"),
@@ -2284,43 +2341,43 @@ NEW_THEMES = {
     ),
     "Kiln": T(
         background="#f8cfb9", white_key="#f8cfb9", black_key="#2a1612",
-        key_active="#ff9440", sustain="#64907c", key_separator="#8a5a44",
+        key_active="#ea5401", sustain="#3c6656", key_separator="#8a5a44",
         text="#f0dcc0", theory_line="#b8907a", interval_text="#8a3a1a",
-        recorder_bg="#2a1e1a", fx_knob="#f0dcc0", master_knob="#ff6a50",
-        varispeed="#e8a070", velocity_loud="#f56c3b", velocity_quiet="#18ab61",
+        recorder_bg="#2a1e1a", fx_knob="#e8a070", master_knob="#ff6a50",
+        varispeed="#f0dcc0", velocity_loud="#f56c3b", velocity_quiet="#18ab61",
         meter_bg="#140c0a", scope_draw="#ff9440", fx_strip="#201612",
-        input_chip="#ff9440", fretboard="#140c0a", string="#c09070",
+        input_chip="#ea5401", fretboard="#140c0a", string="#c09070",
         dark=dict(background="#2a1612"),
     ),
     "Lapis": T(
-        background="#ecedf1", white_key="#ecedf1", black_key="#141a40",
-        key_active="#e8b640", sustain="#5a80f0", key_separator="#2a3478",
+        background="#efece4", white_key="#efece4", black_key="#141a40",
+        key_active="#8c8cff", sustain="#e8b640", key_separator="#2a3478",
         text="#ece8dc", theory_line="#a8aabc", interval_text="#2a3a9a",
-        recorder_bg="#232d6a", fx_knob="#e8b640", master_knob="#ff6a5a",
+        recorder_bg="#232d6a", fx_knob="#f8d060", master_knob="#ff6a5a",
         varispeed="#f4e4b0", velocity_loud="#fe7256", velocity_quiet="#709afe",
         meter_bg="#0c1030", scope_draw="#f8e8a8", fx_strip="#1a2152",
-        input_chip="#e8b640", fretboard="#0c1030", string="#a8acc8",
+        input_chip="#8c8cff", fretboard="#0c1030", string="#a8acc8",
         dark=dict(background="#141a40"),
     ),
     "Chartres": T(
         background="#0c0c0d", white_key="#0c0c0d", black_key="#050505",
-        key_active="#5a8cff", sustain="#f0b83a", key_separator="#2a2a2e",
-        text="#e8ecf0", theory_line="#404046", interval_text="#e8577e",
-        recorder_bg="#222226", fx_knob="#48d890", master_knob="#ff7a50",
+        key_active="#e8577e", sustain="#48d890", key_separator="#2a2c3a",
+        text="#e8ecf0", theory_line="#404458", interval_text="#f0b83a",
+        recorder_bg="#242838", fx_knob="#4070ff", master_knob="#ff7a50",
         varispeed="#e8ecf0", velocity_loud="#fe5672", velocity_quiet="#17a847",
-        meter_bg="#050505", scope_draw="#48d890", fx_strip="#1a1a1d",
-        input_chip="#e8577e", fretboard="#050505", string="#7a7a84",
+        meter_bg="#050505", scope_draw="#7aa0ff", fx_strip="#1a1c28",
+        input_chip="#f0b83a", fretboard="#050505", string="#7a7e94",
         dark=dict(background="#050505"),
     ),
     "Overprint": T(
-        background="#fbf7ef", white_key="#fbf7ef", black_key="#2a1a44",
-        key_active="#1e3590", sustain="#a8204e", key_separator="#c8a8b8",
+        background="#fbf7ef", white_key="#fbf7ef", black_key="#1a1030",
+        key_active="#2f52d8", sustain="#f06aa0", key_separator="#c8a8b8",
         text="#2a1a44", theory_line="#c8b8c0", interval_text="#1e3590",
         recorder_bg="#f9d2e0", fx_knob="#1e3590", master_knob="#a82a1a",
         varispeed="#2a1a44", velocity_loud="#ffa3c2", velocity_quiet="#a2b9fe",
         meter_bg="#2a1a44", scope_draw="#f9a8c8", fx_strip="#f1e9ee",
         input_chip="#1e3590", fretboard="#c8a8b8", string="#4a3a5a",
-        dark=dict(background="#2a1a44"),
+        dark=dict(background="#1a1030"),
     ),
     "Woodblock": T(
         background="#e9e6df", white_key="#e9e6df", black_key="#0e2a3c",
@@ -2334,12 +2391,12 @@ NEW_THEMES = {
     ),
     "Toffee": T(
         background="#160e08", white_key="#160e08", black_key="#0a0604",
-        key_active="#4cc8a0", sustain="#f6d496", key_separator="#3a2410",
+        key_active="#34a078", sustain="#dc9038", key_separator="#3a2410",
         text="#f4e2b8", theory_line="#5a4020", interval_text="#e8b060",
-        recorder_bg="#4e2d04", fx_knob="#f4e2b8", master_knob="#ff5a4a",
+        recorder_bg="#4e2d04", fx_knob="#f05a5a", master_knob="#f8ecd0",
         varispeed="#9ee8cc", velocity_loud="#fe7d3d", velocity_quiet="#1ab782",
-        meter_bg="#0a0604", scope_draw="#f6d496", fx_strip="#3a2204",
-        input_chip="#4cc8a0", fretboard="#0a0604", string="#9a7a50",
+        meter_bg="#0a0604", scope_draw="#ff8a80", fx_strip="#3a2204",
+        input_chip="#34a078", fretboard="#0a0604", string="#9a7a50",
         dark=dict(background="#0a0604"),
     ),
     "Confetti": T(
@@ -2356,20 +2413,20 @@ NEW_THEMES = {
         background="#0a120e", white_key="#0a120e", black_key="#050806",
         key_active="#ffe6a8", sustain="#6fcf9a", key_separator="#1a3426",
         text="#f0e2c0", theory_line="#2a4a36", interval_text="#e8c070",
-        recorder_bg="#00461f", fx_knob="#e88a74", master_knob="#ff5a6a",
+        recorder_bg="#00461f", fx_knob="#d0705a", master_knob="#ff5a6a",
         varispeed="#f0d8a0", velocity_loud="#fe7256", velocity_quiet="#19b366",
         meter_bg="#050806", scope_draw="#e8c070", fx_strip="#003416",
-        input_chip="#e88a74", fretboard="#050806", string="#8a9a80",
+        input_chip="#d0705a", fretboard="#050806", string="#8a9a80",
         dark=dict(background="#050806"),
     ),
-    "Mauve": T(
+    "Ditto": T(
         background="#f6f5f2", white_key="#f6f5f2", black_key="#2a1236",
-        key_active="#ff6ad5", sustain="#f0c8e0", key_separator="#6a3a7a",
+        key_active="#9a7cff", sustain="#7a3aa8", key_separator="#6a3a7a",
         text="#f4e8f0", theory_line="#b8b0bc", interval_text="#6a2a7a",
-        recorder_bg="#4a1e56", fx_knob="#f0c8e0", master_knob="#ff6a50",
-        varispeed="#c8b0f8", velocity_loud="#ff579d", velocity_quiet="#1f9ede",
-        meter_bg="#1e0a26", scope_draw="#ff8ae0", fx_strip="#3a1248",
-        input_chip="#ff6ad5", fretboard="#1e0a26", string="#b8a0c0",
+        recorder_bg="#451f59", fx_knob="#e8d0f0", master_knob="#ff6a50",
+        varispeed="#a8e0d8", velocity_loud="#ff579d", velocity_quiet="#1f9ede",
+        meter_bg="#1e0a26", scope_draw="#c0a8ff", fx_strip="#36164a",
+        input_chip="#9a7cff", fretboard="#1e0a26", string="#b8a0c0",
         dark=dict(background="#2a1236"),
     ),
 }
@@ -2624,8 +2681,12 @@ def derived_errors(name, t):
       a dressing whose well sits within 3:1 of the shipped red makes the
       playhead move, and that test pins how many of the 128 do.
 
-    And three more, ported 2026-10-08 because the thirteen new themes
+    And four more, ported 2026-10-08 because the thirteen new themes
     cleared every gate here and failed them in Rust:
+
+    - `recorder_panel::every_theme_dresses_the_loudness_meter`'s hot fill:
+      the bar is the pressed-key colour until it turns the transport red,
+      and the two must stand 20 dE apart on the meter's well
 
     - `faces_sampler::the_browsers_rows_read_on_the_ground_they_are_drawn_on`'s
       second half, files and folders 10 dE apart
@@ -2635,6 +2696,17 @@ def derived_errors(name, t):
     """
     errs = []
     p = band_palette(t)
+    # The loudness meter's two fills on its well. The well is the meter's
+    # glass separated from the band; the ordinary fill is the pressed-key
+    # colour and the hot one `REC_RED`, each walked off the well to 2:1. A
+    # seal red pressed key (Woodblock's second cut, #fc5a52) is a meter
+    # that never visibly goes hot: 12.4 dE where the test asks 20. The
+    # band does not branch on dark mode, so one reading covers both.
+    meter = surface_of(distinct_surface_at(p["lcd_face"], p["bg"], 1.25))["bg"]
+    cool = distinct_surface_at(p["accent"], meter, 2.0)
+    hot = distinct_surface_at((0xE8, 0x3A, 0x4E), meter, 2.0)
+    if de(cool, hot) < 20.0:
+        errs.append(f"loudness meter: the hot fill is {de(cool, hot):.1f} dE from the ordinary one < 20")
     for dark in (False, True):
         mode = "dark" if dark else "light"
         # The marker strip against the band.

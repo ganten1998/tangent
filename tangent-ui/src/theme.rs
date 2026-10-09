@@ -1238,30 +1238,32 @@ pub fn factory() -> Vec<Theme> {
         // near-black and the piano lifts its sharps (`keys_apart`). The band is
         // a red you read as lacquer rather than wine: darker and more orange
         // than Default's #61373a, at hue 36 where Default's sits at 18.
-        // Vermilion sounds, gold dust is held, and a pine trace on the scope is
-        // the one cool thing on the box. The gold is lifted from the measured
-        // #d8a84a, which sat 1.30:1 from the vermilion (a held note and a struck
-        // one barely told apart), to 1.85:1. The master is pulled cool and pink
-        // so it never reads as the vermilion beside it.
+        // Maki-e gold sounds and cinnabar is held, the reverse of the first cut:
+        // a vermilion pressed key sat 6.6 dE from Woodblock's seal, with Kiln's
+        // ember wanting the same corner, while a gold key on black lacquer is
+        // nobody else's (Storm's yellow is 12.7 dE off, Rhodes' gold 15.5). The two are 2.22:1 apart, a struck note and a held one plainly
+        // told apart. The knobs are pine, the one cool thing on the box, so the
+        // gold is not on every knob as well, and the master is pulled cool and
+        // pink so it never reads as the cinnabar.
         Theme {
             name: "Urushi".to_owned(),
             background: c(0x14, 0x0a, 0x08),
             white_key: c(0x14, 0x0a, 0x08),
             black_key: c(0x0a, 0x05, 0x04),
-            key_active: c(0xff, 0x6a, 0x3a),
-            sustain: c(0xf0, 0xcc, 0x80),
+            key_active: c(0xf0, 0xc8, 0x50),
+            sustain: c(0xf0, 0x50, 0x2e),
             key_separator: c(0x3a, 0x18, 0x10),
             text: c(0xf2, 0xd2, 0xb8),
             theory_line: c(0x64, 0x32, 0x1f),
             interval_text: c(0xe8, 0xa0, 0x70),
             recorder_bg: c(0x3e, 0x14, 0x0c),
-            fx_knob: c(0xe8, 0xc0, 0x70),
+            fx_knob: c(0x6f, 0xbf, 0x8e),
             master_knob: c(0xff, 0x4f, 0x6e),
             varispeed: c(0xf2, 0xd2, 0xb8),
             meter_bg: c(0x0a, 0x05, 0x04),
-            scope_draw: c(0x7f, 0xc8, 0x9a),
+            scope_draw: c(0xf0, 0xc8, 0x50),
             fx_strip: c(0x2c, 0x0e, 0x08),
-            input_chip: c(0xff, 0x6a, 0x3a),
+            input_chip: c(0xf0, 0xc8, 0x50),
             fretboard: c(0x0a, 0x05, 0x04),
             string: c(0x8a, 0x64, 0x50),
             // velgen.py's solver against this theme's own roll.
@@ -1277,10 +1279,13 @@ pub fn factory() -> Vec<Theme> {
         // pressed key is the fiction orange, bright enough to show on the white
         // page and on the band; a cream key would vanish on a white page. Held
         // is the essays' blue, lifted out of the dead zone to 0.25 luminance so
-        // the note name on it reads. Green knobs for crime, and the scope a pale
+        // the note name on it reads. The knobs are the cover's cream panel warmed
+        // toward the orange, so the band is two tones and one blue: green knobs
+        // beside an orange key read as Christmas, and a plain cream sat 3.6 dE
+        // from Woodblock's washi knobs. The scope and the pitch dial are a pale
         // blue rather than cream: the browser's file rows print in the trace's
         // colour and its folders in the band's cream ink, and a cream trace put
-        // the two 3.7 dE apart.
+        // the two 3.7 dE apart; the dial must stand 25 dE off the knobs.
         Theme {
             name: "Paperback".to_owned(),
             background: c(0xf5, 0xf3, 0xee),
@@ -1293,9 +1298,9 @@ pub fn factory() -> Vec<Theme> {
             theory_line: c(0xb0, 0xa8, 0x98),
             interval_text: c(0xc0, 0x4a, 0x14),
             recorder_bg: c(0x74, 0x38, 0x1a),
-            fx_knob: c(0x4c, 0xaa, 0x6a),
+            fx_knob: c(0xff, 0xcc, 0x9c),
             master_knob: c(0xff, 0x6a, 0x5a),
-            varispeed: c(0xf2, 0xe6, 0xcc),
+            varispeed: c(0x9c, 0xc0, 0xf8),
             meter_bg: c(0x24, 0x14, 0x0c),
             scope_draw: c(0x9c, 0xc0, 0xf8),
             fx_strip: c(0x5e, 0x2c, 0x14),
@@ -1383,27 +1388,34 @@ pub fn factory() -> Vec<Theme> {
         // held at 0.68 luminance so it still takes the dark ink. The band is
         // soot and deliberately carries no brick, because Paperback and Urushi
         // already own the saturated bands between hue 40 and 55. What sounds is
-        // the firebox orange; what is held is an ash-glaze green, lifted out of
-        // the dead zone so its note name reads.
+        // an ember, a full-chroma red-orange: the first cut's firebox orange
+        // sat 5.3 dE from Paperback's key, and the ember is 22 from it and
+        // 18.6 from Woodblock's seal while staying 20 dE off the loudness
+        // meter's hot red. 2.53:1 on the clay is about as far as a key can
+        // stand off this page, because it must clear 3:1 on the soot and carry
+        // its note name, which puts it at 0.22 luminance or more. The knobs are
+        // the glow itself rather than cream, and what is held is a deep
+        // ash-glaze green, 4.53:1 on the clay so a held key reads from across
+        // the room.
         Theme {
             name: "Kiln".to_owned(),
             background: c(0xf8, 0xcf, 0xb9),
             white_key: c(0xf8, 0xcf, 0xb9),
             black_key: c(0x2a, 0x16, 0x12),
-            key_active: c(0xff, 0x94, 0x40),
-            sustain: c(0x64, 0x90, 0x7c),
+            key_active: c(0xea, 0x54, 0x01),
+            sustain: c(0x3c, 0x66, 0x56),
             key_separator: c(0x8a, 0x5a, 0x44),
             text: c(0xf0, 0xdc, 0xc0),
             theory_line: c(0xb8, 0x90, 0x7a),
             interval_text: c(0x8a, 0x3a, 0x1a),
             recorder_bg: c(0x2a, 0x1e, 0x1a),
-            fx_knob: c(0xf0, 0xdc, 0xc0),
+            fx_knob: c(0xe8, 0xa0, 0x70),
             master_knob: c(0xff, 0x6a, 0x50),
-            varispeed: c(0xe8, 0xa0, 0x70),
+            varispeed: c(0xf0, 0xdc, 0xc0),
             meter_bg: c(0x14, 0x0c, 0x0a),
             scope_draw: c(0xff, 0x94, 0x40),
             fx_strip: c(0x20, 0x16, 0x12),
-            input_chip: c(0xff, 0x94, 0x40),
+            input_chip: c(0xea, 0x54, 0x01),
             fretboard: c(0x14, 0x0c, 0x0a),
             string: c(0xc0, 0x90, 0x70),
             // velgen.py's solver against this theme's own roll.
@@ -1415,28 +1427,33 @@ pub fn factory() -> Vec<Theme> {
         // ── Lapis: a Byzantine ceiling, ground lapis lazuli for the sky and
         // gold leaf for the stars. The band is ultramarine at hue 295, as
         // saturated as the chroma ceiling allows (41 against 42): the most
-        // chromatic band on the menu and plainly not Navi's chroma-27 navy. Gold
-        // leaf sounds; what is held is a deeper ultramarine than a sky blue
-        // would be, because the pale #8aaaff sat 1.2:1 from the gold.
+        // chromatic band on the menu and plainly not Navi's chroma-27 navy. The
+        // page is warm plaster, not Prism's blue-white, which the first cut sat
+        // 0.6 dE from. A pale ultramarine sounds and the gold is held, the
+        // reverse of Storm's yellow key and blue hold; the knobs are a brighter
+        // leaf than the held gold, where the first cut pressed the knobs' own
+        // hex and a pressed key said nothing the knobs did not. The pressed
+        // blue leans violet because a key must clear 3:1 on this band, and a
+        // plain pale blue there is Navi's #7f9bff.
         Theme {
             name: "Lapis".to_owned(),
-            background: c(0xec, 0xed, 0xf1),
-            white_key: c(0xec, 0xed, 0xf1),
+            background: c(0xef, 0xec, 0xe4),
+            white_key: c(0xef, 0xec, 0xe4),
             black_key: c(0x14, 0x1a, 0x40),
-            key_active: c(0xe8, 0xb6, 0x40),
-            sustain: c(0x5a, 0x80, 0xf0),
+            key_active: c(0x8c, 0x8c, 0xff),
+            sustain: c(0xe8, 0xb6, 0x40),
             key_separator: c(0x2a, 0x34, 0x78),
             text: c(0xec, 0xe8, 0xdc),
             theory_line: c(0xa8, 0xaa, 0xbc),
             interval_text: c(0x2a, 0x3a, 0x9a),
             recorder_bg: c(0x23, 0x2d, 0x6a),
-            fx_knob: c(0xe8, 0xb6, 0x40),
+            fx_knob: c(0xf8, 0xd0, 0x60),
             master_knob: c(0xff, 0x6a, 0x5a),
             varispeed: c(0xf4, 0xe4, 0xb0),
             meter_bg: c(0x0c, 0x10, 0x30),
             scope_draw: c(0xf8, 0xe8, 0xa8),
             fx_strip: c(0x1a, 0x21, 0x52),
-            input_chip: c(0xe8, 0xb6, 0x40),
+            input_chip: c(0x8c, 0x8c, 0xff),
             fretboard: c(0x0c, 0x10, 0x30),
             string: c(0xa8, 0xac, 0xc8),
             // velgen.py's solver against this theme's own roll.
@@ -1446,38 +1463,39 @@ pub fn factory() -> Vec<Theme> {
             dark: dark_of(&[("background", (0x14, 0x1a, 0x40))]),
         },
         // ── Chartres: a rose window lit from behind. Cobalt, ruby, emerald
-        // and topaz glass held in black lead. A DARK-ground theme (the piano
-        // lifts its sharps) on a NEUTRAL lead-black, kept neutral on purpose so
-        // it cannot be taken for Sodium's violet-black, and a leaded-grey band
-        // no darker than 0.016: at 0.013 the varispeed dial's recess, the band
-        // darkened twice, had no room left and sat 1.17:1 where a shape wants
-        // 1.18.
-        // The glass lives in the marks and the strips, one jewel per control:
-        // cobalt sounds, topaz is held, emerald on the knobs and the scope, ruby
-        // on the marks. The master is a warm coral so it does not fight the
-        // ruby. Not Prism: that page is pale and its band is charcoal; this one
-        // is lead all the way down.
+        // and topaz glass held in lead. A DARK-ground theme (the piano lifts
+        // its sharps) on a neutral lead-black, and a blue-black band, the lead
+        // at night, at 0.022 luminance: below 0.016 the varispeed dial's recess,
+        // the band darkened twice, has no room left (at 0.013 it sat 1.17:1
+        // where a shape wants 1.18). The blue also takes it off Silverface's
+        // grey band, 8.2 dE away.
+        // Blue leads the marks as it leads the strips, because a rose window is
+        // mostly blue glass: cobalt knobs and a paler cobalt trace, ruby sounds,
+        // emerald is held, topaz on the marks. The first cut pressed cobalt and
+        // put emerald on the knobs, and beside an even four-jewel cycle on black
+        // that read as Prism with the lights off. The master is a warm coral so
+        // it does not fight the ruby.
         Theme {
             name: "Chartres".to_owned(),
             background: c(0x0c, 0x0c, 0x0d),
             white_key: c(0x0c, 0x0c, 0x0d),
             black_key: c(0x05, 0x05, 0x05),
-            key_active: c(0x5a, 0x8c, 0xff),
-            sustain: c(0xf0, 0xb8, 0x3a),
-            key_separator: c(0x2a, 0x2a, 0x2e),
+            key_active: c(0xe8, 0x57, 0x7e),
+            sustain: c(0x48, 0xd8, 0x90),
+            key_separator: c(0x2a, 0x2c, 0x3a),
             text: c(0xe8, 0xec, 0xf0),
-            theory_line: c(0x40, 0x40, 0x46),
-            interval_text: c(0xe8, 0x57, 0x7e),
-            recorder_bg: c(0x22, 0x22, 0x26),
-            fx_knob: c(0x48, 0xd8, 0x90),
+            theory_line: c(0x40, 0x44, 0x58),
+            interval_text: c(0xf0, 0xb8, 0x3a),
+            recorder_bg: c(0x24, 0x28, 0x38),
+            fx_knob: c(0x40, 0x70, 0xff),
             master_knob: c(0xff, 0x7a, 0x50),
             varispeed: c(0xe8, 0xec, 0xf0),
             meter_bg: c(0x05, 0x05, 0x05),
-            scope_draw: c(0x48, 0xd8, 0x90),
-            fx_strip: c(0x1a, 0x1a, 0x1d),
-            input_chip: c(0xe8, 0x57, 0x7e),
+            scope_draw: c(0x7a, 0xa0, 0xff),
+            fx_strip: c(0x1a, 0x1c, 0x28),
+            input_chip: c(0xf0, 0xb8, 0x3a),
             fretboard: c(0x05, 0x05, 0x05),
-            string: c(0x7a, 0x7a, 0x84),
+            string: c(0x7a, 0x7e, 0x94),
             // velgen.py's solver against this theme's own roll.
             velocity_loud: c(0xfe, 0x56, 0x72),
             velocity_quiet: c(0x17, 0xa8, 0x47),
@@ -1496,13 +1514,19 @@ pub fn factory() -> Vec<Theme> {
         // walked 30% further toward white, sat 1.04:1 from the panel. 0.83 is
         // 3.00:1 and 1.05:1, both floors. Not a Porcelain revival: that was a
         // blue-grey desk with cobalt and violet marks.
+        // A brighter riso blue sounds than the federal on the knobs, because
+        // there is no dark-mode key: one colour has to show on the paper AND on
+        // the dark naturals, and the band's 3:1 caps it at 0.12 luminance. The
+        // federal sat 1.48:1 on the dark naturals, a pressed key that vanished;
+        // this blue on naturals deepened to #1a1030 is 2.86:1. The other drum,
+        // the fluorescent pink, is what is held.
         Theme {
             name: "Overprint".to_owned(),
             background: c(0xfb, 0xf7, 0xef),
             white_key: c(0xfb, 0xf7, 0xef),
-            black_key: c(0x2a, 0x1a, 0x44),
-            key_active: c(0x1e, 0x35, 0x90),
-            sustain: c(0xa8, 0x20, 0x4e),
+            black_key: c(0x1a, 0x10, 0x30),
+            key_active: c(0x2f, 0x52, 0xd8),
+            sustain: c(0xf0, 0x6a, 0xa0),
             key_separator: c(0xc8, 0xa8, 0xb8),
             text: c(0x2a, 0x1a, 0x44),
             theory_line: c(0xc8, 0xb8, 0xc0),
@@ -1521,7 +1545,7 @@ pub fn factory() -> Vec<Theme> {
             velocity_loud: c(0xff, 0xa3, 0xc2),
             velocity_quiet: c(0xa2, 0xb9, 0xfe),
             channel_palette: Some(26),
-            dark: dark_of(&[("background", (0x2a, 0x1a, 0x44))]),
+            dark: dark_of(&[("background", (0x1a, 0x10, 0x30))]),
         },
         // ── Woodblock: a woodblock print of a great wave. Prussian blue
         // on washi paper, and one vermilion seal in the corner. The only band in
@@ -1561,27 +1585,32 @@ pub fn factory() -> Vec<Theme> {
         // dial, cherry knobs. A DARK-ground theme (the piano lifts its sharps).
         // The band is lighter and more saturated than Amber's, about 22 dE off
         // it, and what sounds is the JADE of the dial, not amber: that is what
-        // keeps it from being an Amber clone. The cherry master is lifted to
-        // 3:1 on the band.
+        // keeps it from being an Amber clone. The jade is deepened to 21.9 dE
+        // off Hydra's, and the rest is the radio rather than the menu: the
+        // knobs are the cherry, the master a cream knob so it cannot be taken
+        // for them, what is held is the butterscotch itself and the trace a
+        // cherry glow. The first cut's cream knobs sat 2.7 dE from Ochre's and
+        // its pale hold 4.2 from Amber's. The held butterscotch is as deep as
+        // it can go and stay 1.25:1 off the jade (1.26:1).
         Theme {
             name: "Toffee".to_owned(),
             background: c(0x16, 0x0e, 0x08),
             white_key: c(0x16, 0x0e, 0x08),
             black_key: c(0x0a, 0x06, 0x04),
-            key_active: c(0x4c, 0xc8, 0xa0),
-            sustain: c(0xf6, 0xd4, 0x96),
+            key_active: c(0x34, 0xa0, 0x78),
+            sustain: c(0xdc, 0x90, 0x38),
             key_separator: c(0x3a, 0x24, 0x10),
             text: c(0xf4, 0xe2, 0xb8),
             theory_line: c(0x5a, 0x40, 0x20),
             interval_text: c(0xe8, 0xb0, 0x60),
             recorder_bg: c(0x4e, 0x2d, 0x04),
-            fx_knob: c(0xf4, 0xe2, 0xb8),
-            master_knob: c(0xff, 0x5a, 0x4a),
+            fx_knob: c(0xf0, 0x5a, 0x5a),
+            master_knob: c(0xf8, 0xec, 0xd0),
             varispeed: c(0x9e, 0xe8, 0xcc),
             meter_bg: c(0x0a, 0x06, 0x04),
-            scope_draw: c(0xf6, 0xd4, 0x96),
+            scope_draw: c(0xff, 0x8a, 0x80),
             fx_strip: c(0x3a, 0x22, 0x04),
-            input_chip: c(0x4c, 0xc8, 0xa0),
+            input_chip: c(0x34, 0xa0, 0x78),
             fretboard: c(0x0a, 0x06, 0x04),
             string: c(0x9a, 0x7a, 0x50),
             // velgen.py's solver against this theme's own roll.
@@ -1630,8 +1659,10 @@ pub fn factory() -> Vec<Theme> {
         // 21 dE from Phosphor's, and every mark is WARM so it can never read as
         // Phosphor: lamplight white sounds, a brighter glass green is held,
         // oxblood leather on the knobs and brass on the dial and scope. The
-        // brass is lighter than a brass wants to be because #e8c070 sat 24 dE
-        // from the gain cap.
+        // leather is as deep as clears 3:1 on the emerald (3.24:1); the first
+        // cut's #e88a74 read as coral, and coral beside a green band is
+        // Malachite's rose. The brass is lighter than a brass wants to be
+        // because #e8c070 sat 24 dE from the gain cap.
         Theme {
             name: "Lamplight".to_owned(),
             background: c(0x0a, 0x12, 0x0e),
@@ -1644,13 +1675,13 @@ pub fn factory() -> Vec<Theme> {
             theory_line: c(0x2a, 0x4a, 0x36),
             interval_text: c(0xe8, 0xc0, 0x70),
             recorder_bg: c(0x00, 0x46, 0x1f),
-            fx_knob: c(0xe8, 0x8a, 0x74),
+            fx_knob: c(0xd0, 0x70, 0x5a),
             master_knob: c(0xff, 0x5a, 0x6a),
             varispeed: c(0xf0, 0xd8, 0xa0),
             meter_bg: c(0x05, 0x08, 0x06),
             scope_draw: c(0xe8, 0xc0, 0x70),
             fx_strip: c(0x00, 0x34, 0x16),
-            input_chip: c(0xe8, 0x8a, 0x74),
+            input_chip: c(0xd0, 0x70, 0x5a),
             fretboard: c(0x05, 0x08, 0x06),
             string: c(0x8a, 0x9a, 0x80),
             // velgen.py's solver against this theme's own roll.
@@ -1659,32 +1690,37 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(30),
             dark: dark_of(&[("background", (0x05, 0x08, 0x06))]),
         },
-        // ── Mauve: a spirit-duplicator handout still smelling of solvent.
-        // Aniline violet ink on white copy paper; mauve is the first aniline
-        // dye and the purple of the school handout. The page is plain copy
-        // white, deliberately not lilac (Zinc's page and the retired Iris and
-        // Dusk were lilac), and the band is double Zinc's chroma on a more
-        // magenta hue. Hot magenta sounds, a smudged pink-white is held; no
-        // lilac key and no brass, which are Zinc's.
+        // ── Ditto: a spirit-duplicator handout still smelling of solvent.
+        // Aniline violet ink on white copy paper, the purple of every school
+        // worksheet. The page is plain copy white, deliberately not lilac
+        // (Zinc's page and the retired Iris and Dusk were lilac), and the band
+        // is the ink, nudged bluer than the first cut's so it stands 13 dE off
+        // Confetti's mulberry rather than 10.5. Ditto violet sounds and a deep
+        // aniline purple is held: the first cut pressed a hot magenta and held
+        // a pink-white that sat 1.37:1 on the white keys, a held key that looked
+        // unpressed, where this purple is 6.4:1. The knobs are the pale violet
+        // of a fiftieth copy, the pitch dial the one cool mark. Named for the
+        // machine rather than the dye, as the rest of its batch is named for a
+        // thing.
         Theme {
-            name: "Mauve".to_owned(),
+            name: "Ditto".to_owned(),
             background: c(0xf6, 0xf5, 0xf2),
             white_key: c(0xf6, 0xf5, 0xf2),
             black_key: c(0x2a, 0x12, 0x36),
-            key_active: c(0xff, 0x6a, 0xd5),
-            sustain: c(0xf0, 0xc8, 0xe0),
+            key_active: c(0x9a, 0x7c, 0xff),
+            sustain: c(0x7a, 0x3a, 0xa8),
             key_separator: c(0x6a, 0x3a, 0x7a),
             text: c(0xf4, 0xe8, 0xf0),
             theory_line: c(0xb8, 0xb0, 0xbc),
             interval_text: c(0x6a, 0x2a, 0x7a),
-            recorder_bg: c(0x4a, 0x1e, 0x56),
-            fx_knob: c(0xf0, 0xc8, 0xe0),
+            recorder_bg: c(0x45, 0x1f, 0x59),
+            fx_knob: c(0xe8, 0xd0, 0xf0),
             master_knob: c(0xff, 0x6a, 0x50),
-            varispeed: c(0xc8, 0xb0, 0xf8),
+            varispeed: c(0xa8, 0xe0, 0xd8),
             meter_bg: c(0x1e, 0x0a, 0x26),
-            scope_draw: c(0xff, 0x8a, 0xe0),
-            fx_strip: c(0x3a, 0x12, 0x48),
-            input_chip: c(0xff, 0x6a, 0xd5),
+            scope_draw: c(0xc0, 0xa8, 0xff),
+            fx_strip: c(0x36, 0x16, 0x4a),
+            input_chip: c(0x9a, 0x7c, 0xff),
             fretboard: c(0x1e, 0x0a, 0x26),
             string: c(0xb8, 0xa0, 0xc0),
             // velgen.py's solver against this theme's own roll.
@@ -1826,7 +1862,7 @@ pub const EXAMPLE: &str = r##"{
   "_comment10b": "16 Amber     17 Phosphor  18 Silverface 19 Urushi",
   "_comment10c": "20 Paperback 21 Malachite 22 Sodium    23 Kiln",
   "_comment10d": "24 Lapis     25 Chartres  26 Overprint 27 Woodblock",
-  "_comment10e": "28 Toffee    29 Confetti  30 Lamplight 31 Mauve",
+  "_comment10e": "28 Toffee    29 Confetti  30 Lamplight 31 Ditto",
   "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
   "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
   "_comment13": "and the channels keep dressing for whichever theme is applied.",
