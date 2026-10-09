@@ -27,8 +27,21 @@
 //! units a structural edit must carry; the model cannot reach them, so each
 //! edit hands its caller a [`Reshape`] that says where every old lane went,
 //! and the class of a row ([`RowClass`]) takes what the arrangement knows
-//! about it as a [`RowUse`]. A folder's run is positional too, but its
-//! flags ride on its rows, so they move with them.
+//! about it as a [`RowUse`].
+//!
+//! **A folder's run is the third positional unit, and the model DOES reach
+//! it**, because it is spelled entirely in row flags: a row with `in_folder`
+//! belongs to the nearest `folder` row above it with only members between
+//! ([`DeskModel::folder_of`], the same walk as `TangentApp::folder_of`).
+//! Carrying the flags with their rows is therefore not enough: a row that
+//! leaves or lands changes what the rows below it walk up to. So each edit
+//! keeps every run whole itself. `remove_rows` hands a removed header's
+//! members up to the folder it sat in, or out to the top level, exactly as
+//! `remove_channel_inner` always has. `insert_rows` refuses to re-file any
+//! row already on the desk. `permute` refuses to strand a member under no
+//! folder; WHICH folder a moved row lands in is the gesture's to decide
+//! (a drop sets the leaders' flags first), so it answers every row whose
+//! folder changed in [`Reshape::refiled`] rather than guessing at intent.
 //!
 //! **Scalars that never lived in strip space keep their own keys** (the
 //! drum bus's fader, the click's, the master's, the tempo): they are not
@@ -384,6 +397,13 @@ pub enum RowClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reshape {
     pub old_to_new: Vec<Option<usize>>,
+    /// **Every kept row whose folder changed**, in new lane order: a
+    /// removed header's members handed up or out, a moved row landing in
+    /// another run. Membership is positional, so this is the one fact about
+    /// a run the caller could not read off `old_to_new`; a gesture checks it
+    /// against what it meant, and an empty list says no run moved under
+    /// anybody.
+    pub refiled: Vec<TrackId>,
 }
 
 impl Reshape {
@@ -406,13 +426,23 @@ pub enum EditRefused {
     /// `permute` was handed something that is not a permutation of the
     /// rows.
     NotAPermutation,
+    /// **The edit would break a folder run at this row**: leave a member
+    /// (`in_folder`) with no folder above it that had one, place a new row
+    /// that says it is a member under no folder, or (an insert) walk a row
+    /// already on the desk into a different folder. A drop sets the moving
+    /// rows' flags for where they land BEFORE the edit; this is what it says
+    /// when one was missed, instead of the members below quietly joining
+    /// the folder above or drawing indented under nothing.
+    BreaksFolder(TrackId),
 }
 
 /// **What `remove_rows` took with the rows**: every plugin and bypass on
 /// their racks (chains, pedals and pads: the pedalboard leaves with its
 /// row), every route and key touching them, and every send into them. The
 /// caller writes the plugin states to the shelf and keeps the rest for its
-/// undo; nothing is left in the model naming a removed id.
+/// undo; nothing is left in the model naming a removed id. A removed
+/// folder's members stay on the desk, handed up a level; they are listed in
+/// `reshape.refiled`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Removed {
     pub reshape: Reshape,
@@ -486,6 +516,46 @@ impl DeskModel {
             Node::Track(id) => self.row_of(id).is_some(),
             _ => true,
         }
+    }
+
+    // ── folder runs ──────────────────────────────────────────────────────
+
+    /// **The folder row `row` belongs to**: the nearest `folder` row above
+    /// it, with only members between. The run has to be contiguous, the
+    /// rule `TangentApp::folder_of` has always used: a member flag with a
+    /// plain row between it and any folder belongs to nothing, so a stale
+    /// flag draws flat instead of letting one reorder swallow every track
+    /// below a folder.
+    pub fn folder_of(&self, row: usize) -> Option<usize> {
+        if !self.rows.get(row)?.in_folder {
+            return None;
+        }
+        for n in (0..row).rev() {
+            if self.rows[n].folder {
+                return Some(n);
+            }
+            if !self.rows[n].in_folder {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// **Every row that says it is a member and has no folder above it**:
+    /// a run some edit or some older build broke. Empty for a desk whose
+    /// runs are whole. Not part of [`Self::check`], deliberately: a stale
+    /// flag names nothing, today's app already draws it flat, and the
+    /// reader must carry it byte for byte (a dense desk round-trips whole),
+    /// so it is not an entry to drop. What the edits promise is narrower and
+    /// checked under cfg(test): none of them ever makes a new one.
+    pub fn orphans(&self) -> Vec<TrackId> {
+        let lanes = folder_lanes(self.rows.iter());
+        self.rows
+            .iter()
+            .zip(lanes)
+            .filter(|(r, f)| r.in_folder && f.is_none())
+            .map(|(r, _)| r.id)
+            .collect()
     }
 
     // ── classes ──────────────────────────────────────────────────────────
@@ -576,6 +646,14 @@ impl DeskModel {
     /// their count. The rows keep the ids they carry (an undo or a paste
     /// within the document restores its own), so every id must be new to
     /// the desk and to the batch; `next_id` rises past any of them.
+    ///
+    /// **The new rows' flags say which run they join** (a member flag below
+    /// a folder or one of its members joins it), and they may not re-file
+    /// anybody else. A plain row dropped into the middle of a run would cut
+    /// the members below it loose, and a folder row there would take them
+    /// over; both are refused with [`EditRefused::BreaksFolder`] naming the
+    /// first row that would move, as is a new member with no folder above
+    /// it. Inserting is unambiguous about what moved, so this can be strict.
     pub fn insert_rows(&mut self, at: usize, rows: Vec<TrackRow>) -> Result<Reshape, EditRefused> {
         let old = self.rows.len();
         if at > old {
@@ -590,23 +668,56 @@ impl DeskModel {
                 return Err(EditRefused::DuplicateId(r.id));
             }
         }
-        #[cfg(test)]
-        let before = self.check();
         let k = rows.len();
+        {
+            let before = folder_ids(&self.rows.iter().collect::<Vec<_>>());
+            let view: Vec<&TrackRow> =
+                self.rows[..at].iter().chain(rows.iter()).chain(self.rows[at..].iter()).collect();
+            let after = folder_ids(&view);
+            for (n, r) in view.iter().enumerate() {
+                let new = (at..at + k).contains(&n);
+                let broken = if new {
+                    r.in_folder && after[n].is_none()
+                } else {
+                    let was = if n < at { n } else { n - k };
+                    after[n] != before[was]
+                };
+                if broken {
+                    return Err(EditRefused::BreaksFolder(r.id));
+                }
+            }
+        }
+        #[cfg(test)]
+        let before = self.audit_before();
         if let Some(top) = rows.iter().map(|r| u64::from(r.id.0) + 1).max() {
             self.next_id = self.next_id.max(top);
         }
         self.rows.splice(at..at, rows);
         #[cfg(test)]
-        self.audit_after(&before);
+        self.audit_after(before);
         Ok(Reshape {
             old_to_new: (0..old).map(|n| Some(if n < at { n } else { n + k })).collect(),
+            refiled: Vec::new(),
         })
     }
 
     /// **Remove the rows at `lanes`** (any order, repeats ignored), and
     /// everything that names them: see [`Removed`]. The specials and every
     /// other row keep all their own references.
+    ///
+    /// **A folder takes its membership with it**, the rule
+    /// `remove_channel_inner` has kept since folders existed, now that the
+    /// row really goes. Membership is "the nearest folder above me", so
+    /// deleting a header without touching its members would have them walk
+    /// up into whatever folder sits further up (silently joining a group
+    /// they were never put in), or, with none, draw indented under nothing.
+    /// Each kept row instead stays in its nearest folder that survives: a
+    /// removed inner folder's members land in the outer one, a removed
+    /// top-level folder's go to the top level, and a nested folder among
+    /// them stays a folder over its own members. Only `in_folder` flags are
+    /// rewritten, and only where the walk would otherwise answer a
+    /// different folder; the rows whose folder changed are in
+    /// `reshape.refiled`.
     pub fn remove_rows(&mut self, lanes: &[usize]) -> Result<Removed, EditRefused> {
         let old = self.rows.len();
         let gone: BTreeSet<usize> = lanes.iter().copied().collect();
@@ -614,23 +725,70 @@ impl DeskModel {
             return Err(EditRefused::NoSuchRow(bad));
         }
         #[cfg(test)]
-        let before = self.check();
+        let before = self.audit_before();
         let ids: BTreeSet<TrackId> = gone.iter().map(|n| self.rows[*n].id).collect();
         let named = |n: Node| matches!(n, Node::Track(id) if ids.contains(&id));
+
+        // Each row's folder before, and its nearest SURVIVING ancestor:
+        // top-down, since a row's folder always sits above it, so one pass
+        // settles a chain of removed nested headers however deep.
+        let was = folder_lanes(self.rows.iter());
+        let mut keeps: Vec<Option<usize>> = Vec::with_capacity(old);
+        for f in &was {
+            let up = match *f {
+                Some(q) if gone.contains(&q) => keeps[q],
+                other => other,
+            };
+            keeps.push(up);
+        }
+        let old_ids = self.ids();
 
         let mut rows = Vec::with_capacity(gone.len());
         let mut kept = Vec::with_capacity(old - gone.len());
         let mut old_to_new = Vec::with_capacity(old);
+        let mut from = Vec::with_capacity(old - gone.len());
         for (n, row) in std::mem::take(&mut self.rows).into_iter().enumerate() {
             if gone.contains(&n) {
                 old_to_new.push(None);
                 rows.push((n, row));
             } else {
                 old_to_new.push(Some(kept.len()));
+                from.push(n);
                 kept.push(row);
             }
         }
         self.rows = kept;
+
+        // Rewrite the flags top-down, so each row is settled against the
+        // rows above it as they now stand. Setting a member flag is enough
+        // to reach the wanted folder: every kept row between that folder
+        // and this one was in the same chain of runs, and every folder on
+        // that chain below it was removed, so nothing else can catch it.
+        let mut refiled = Vec::new();
+        let mut reach: Option<usize> = None;
+        for (lane, o) in from.iter().enumerate() {
+            let want = keeps[*o].map(|q| old_ids[q]);
+            let above = reach.map(|q| self.rows[q].id);
+            let r = &mut self.rows[lane];
+            // A row whose folder went is re-filed even when the walk happens
+            // to answer right: with no folder left above it, a member flag
+            // left on would be a stranded one.
+            let refile = want != was[*o].map(|q| old_ids[q]);
+            if refile || r.in_folder.then_some(above).flatten() != want {
+                r.in_folder = want.is_some();
+            }
+            debug_assert_eq!(r.in_folder.then_some(above).flatten(), want, "a hand-up missed its folder");
+            if refile {
+                refiled.push(r.id);
+            }
+            reach = if r.folder {
+                Some(lane)
+            } else if r.in_folder {
+                reach
+            } else {
+                None
+            };
+        }
 
         let (plugins, keep): (BTreeMap<_, _>, BTreeMap<_, _>) =
             std::mem::take(&mut self.plugins).into_iter().partition(|(sb, _)| named(sb.seat.node));
@@ -669,9 +827,9 @@ impl DeskModel {
             }
         }
         #[cfg(test)]
-        self.audit_after(&before);
+        self.audit_after(before);
         Ok(Removed {
-            reshape: Reshape { old_to_new },
+            reshape: Reshape { old_to_new, refiled },
             rows,
             plugins,
             bypass,
@@ -682,8 +840,21 @@ impl DeskModel {
     }
 
     /// **Reorder the rows**: `order[new] = old`, the convention every
-    /// reorder in the app already uses. Nothing but the row list changes:
-    /// every reference is by id.
+    /// reorder in the app already uses. Every reference is by id, so the
+    /// row list is all that changes.
+    ///
+    /// **Folder runs: refused if one strands a member, answered if one
+    /// moves.** The flags travel with their rows and membership is read off
+    /// the new order, so a permutation can leave a member under no folder:
+    /// one child carried out of its run with its flag still set, a plain row
+    /// dropped mid-run (every member below it is cut loose), a folder moved
+    /// off its children. Each is refused with [`EditRefused::BreaksFolder`].
+    /// It can also move a row into a different run, and that one the model
+    /// cannot judge: "drag this child into that folder" and "drag that
+    /// folder over this child" are the SAME permutation, and only the
+    /// gesture knows which the hand did. So it is allowed, and every row it
+    /// re-filed is listed in [`Reshape::refiled`] for the gesture to check
+    /// against what it set the leaders' flags to.
     pub fn permute(&mut self, order: &[usize]) -> Result<Reshape, EditRefused> {
         let n = self.rows.len();
         if order.len() != n {
@@ -696,24 +867,49 @@ impl DeskModel {
                 _ => return Err(EditRefused::NotAPermutation),
             }
         }
+        let mut refiled = Vec::new();
+        {
+            let before = folder_ids(&self.rows.iter().collect::<Vec<_>>());
+            let view: Vec<&TrackRow> = order.iter().map(|old| &self.rows[*old]).collect();
+            let after = folder_ids(&view);
+            for (new, old) in order.iter().enumerate() {
+                let r = view[new];
+                if r.in_folder && after[new].is_none() && before[*old].is_some() {
+                    return Err(EditRefused::BreaksFolder(r.id));
+                }
+                if after[new] != before[*old] {
+                    refiled.push(r.id);
+                }
+            }
+        }
         #[cfg(test)]
-        let before = self.check();
+        let before = self.audit_before();
         let mut taken: Vec<Option<TrackRow>> = std::mem::take(&mut self.rows).into_iter().map(Some).collect();
         self.rows = order.iter().map(|old| taken[*old].take().expect("a permutation")).collect();
         #[cfg(test)]
-        self.audit_after(&before);
-        Ok(Reshape { old_to_new })
+        self.audit_after(before);
+        Ok(Reshape { old_to_new, refiled })
     }
 
-    /// **An edit never makes a reference dangle.** Weaker than "the desk is
-    /// clean", deliberately: the model is pure and a test may build a desk
-    /// that is dirty on purpose. W6 wires `check` into the undo sentinel,
-    /// where the desk is the app's and must be clean.
+    /// What an edit is audited against: the dangling references and the
+    /// stranded members the desk already had.
     #[cfg(test)]
-    fn audit_after(&self, before: &[Dropped]) {
+    fn audit_before(&self) -> (Vec<Dropped>, BTreeSet<TrackId>) {
+        (self.check(), self.orphans().into_iter().collect())
+    }
+
+    /// **An edit never makes a reference dangle, nor strands a member.**
+    /// Weaker than "the desk is clean", deliberately: the model is pure and
+    /// a test may build a desk that is dirty on purpose. W6 wires `check`
+    /// and `orphans` into the undo sentinel, where the desk is the app's and
+    /// must be clean.
+    #[cfg(test)]
+    fn audit_after(&self, (dropped, orphans): (Vec<Dropped>, BTreeSet<TrackId>)) {
         let after = self.check();
-        let new: Vec<_> = after.iter().filter(|d| !before.contains(d)).collect();
+        let new: Vec<_> = after.iter().filter(|d| !dropped.contains(d)).collect();
         assert!(new.is_empty(), "a structural edit left references dangling: {new:?}");
+        let stranded: Vec<_> = self.orphans().into_iter().filter(|id| !orphans.contains(id)).collect();
+        assert!(stranded.is_empty(), "a structural edit stranded folder members: {stranded:?}");
     }
 
     // ── validation ───────────────────────────────────────────────────────
@@ -1114,6 +1310,32 @@ fn drop_at<T>(v: &mut Vec<T>, gone: impl Fn(usize) -> bool) {
     });
 }
 
+/// **The folder lane each row sits in**, in one walk over `rows` in
+/// order: [`DeskModel::folder_of`] for every row at once. `reach` is the
+/// nearest folder above the next row with only members between, so a run
+/// ends at the first row that is neither.
+fn folder_lanes<'a>(rows: impl Iterator<Item = &'a TrackRow>) -> Vec<Option<usize>> {
+    let mut out = Vec::new();
+    let mut reach: Option<usize> = None;
+    for (n, r) in rows.enumerate() {
+        out.push(if r.in_folder { reach } else { None });
+        reach = if r.folder {
+            Some(n)
+        } else if r.in_folder {
+            reach
+        } else {
+            None
+        };
+    }
+    out
+}
+
+/// The same walk answered by identity, so a desk before an edit and the
+/// rows after it can be compared row by row whatever moved.
+fn folder_ids(rows: &[&TrackRow]) -> Vec<Option<TrackId>> {
+    folder_lanes(rows.iter().copied()).into_iter().map(|f| f.map(|q| rows[q].id)).collect()
+}
+
 fn dropped(what: &'static str, key: String) -> Dropped {
     Dropped { what, key }
 }
@@ -1476,8 +1698,12 @@ mod tests {
         SeatBay::new(node, rack, bay)
     }
 
-    /// A row that differs from vacant in EVERY field, so a test that
-    /// destructures it after an edit can see each one travel.
+    /// A row that differs from vacant in every field but one, so a test
+    /// that destructures it after an edit can see each one travel. The one
+    /// is `in_folder`: a member flag on every row is a chain of folders each
+    /// nested in the one above, which no reorder can leave whole, so these
+    /// rows are empty top-level folders and the folder-run tests below
+    /// carry `in_folder` loud instead.
     fn loud_row(id: u32) -> TrackRow {
         let n = f64::from(id);
         TrackRow {
@@ -1497,7 +1723,7 @@ mod tests {
             arm: true,
             theory: true,
             folder: true,
-            in_folder: true,
+            in_folder: false,
             shut: true,
             sends: vec![Send { to: Node::Fx, level: n / 100.0, pre: true }],
             dx7: Dx7 { cart: format!("cart{id}"), patch: 9 },
@@ -1742,7 +1968,13 @@ mod tests {
         let named = add(&|r| r.name = "a name and a colour are not a track".into());
         let pedal_only = add(&|_| {});
         let pad_only = add(&|_| {});
+        // The header first: an edit refuses a member flag under no folder.
+        let folder = add(&|r| r.folder = true);
         let indent = add(&|r| r.in_folder = true);
+        let folder_child_track = add(&|r| {
+            r.in_folder = true;
+            r.kind = Some(RowKind::Midi);
+        });
         let bus = add(&|r| r.kind = Some(RowKind::Bus));
         let bus_added = add(&|r| {
             r.kind = Some(RowKind::Bus);
@@ -1751,11 +1983,6 @@ mod tests {
         let midi = add(&|r| r.kind = Some(RowKind::Midi));
         let audio = add(&|r| r.kind = Some(RowKind::Audio));
         let bare = add(&|r| r.added = true);
-        let folder = add(&|r| r.folder = true);
-        let folder_child_track = add(&|r| {
-            r.in_folder = true;
-            r.kind = Some(RowKind::Midi);
-        });
         let frozen = add(&|r| r.frozen = Some(Frozen { path: "f.wav".into(), len_s: 1.0 }));
         let chain = add(&|_| {});
         let routed_to = add(&|_| {});
@@ -1932,5 +2159,245 @@ mod tests {
         assert_eq!(m.to_v22(), None);
         m.remove_rows(&[32]).expect("remove");
         assert!(m.to_v22().is_some());
+    }
+
+    // ── folder runs ──────────────────────────────────────────────────────
+
+    /// A desk spelled one letter a row, ids 0, 1, 2... in lane order:
+    /// `F` a top-level folder, `N` a folder nested in the run above it, `m`
+    /// a member, `p` a plain row.
+    fn runs(spec: &str) -> DeskModel {
+        let mut m = DeskModel::empty();
+        for (n, c) in spec.chars().enumerate() {
+            let mut r = TrackRow::vacant(t(n as u32));
+            r.kind = Some(RowKind::Midi);
+            (r.folder, r.in_folder) = match c {
+                'F' => (true, false),
+                'N' => (true, true),
+                'm' => (false, true),
+                'p' => (false, false),
+                _ => unreachable!("{c}"),
+            };
+            m.rows.push(r);
+        }
+        m.next_id = spec.len() as u64;
+        m
+    }
+
+    /// Every row as `id:folder-id`, `-` for none, so a run reads at a
+    /// glance.
+    fn membership(m: &DeskModel) -> String {
+        (0..m.rows.len())
+            .map(|n| {
+                let f = m.folder_of(n).map_or("-".to_owned(), |q| m.rows[q].id.0.to_string());
+                format!("{}:{f}", m.rows[n].id.0)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// **The reviewed case**: [G, X, F, A, B, C] with F a top-level folder.
+    /// Deleting F used to leave A and B with their member flags, walking up
+    /// through X into G, a group nobody put them in.
+    #[test]
+    fn a_removed_folder_hands_its_members_out_not_into_the_folder_above() {
+        let mut m = runs("FmFmmp");
+        assert_eq!(membership(&m), "0:- 1:0 2:- 3:2 4:2 5:-");
+        let gone = m.remove_rows(&[2]).expect("remove");
+        assert_eq!(membership(&m), "0:- 1:0 3:- 4:- 5:-", "A and B joined G");
+        assert_eq!(gone.reshape.refiled, vec![t(3), t(4)]);
+        assert!(m.orphans().is_empty());
+        assert!(!m.rows[2].in_folder && !m.rows[3].in_folder, "the flags came off");
+
+        // A top-level header with nothing above: its members do not draw
+        // indented under nothing.
+        let mut m = runs("Fmmp");
+        let gone = m.remove_rows(&[0]).expect("remove");
+        assert_eq!(membership(&m), "1:- 2:- 3:-");
+        assert_eq!(gone.reshape.refiled, vec![t(1), t(2)]);
+        assert!(m.orphans().is_empty(), "{:?}", m.orphans());
+    }
+
+    /// **Handed UP, a level at a time**, the way `remove_channel_inner`
+    /// does it: an inner folder's members land in the outer one; an outer
+    /// folder's nested folder becomes a top-level folder and keeps its own.
+    #[test]
+    fn a_removed_folder_hands_its_members_to_the_folder_it_sat_in() {
+        // G, X, F nested in G, A, B in F.
+        let mut m = runs("FmNmmp");
+        assert_eq!(membership(&m), "0:- 1:0 2:0 3:2 4:2 5:-");
+        let gone = m.remove_rows(&[2]).expect("remove");
+        assert_eq!(membership(&m), "0:- 1:0 3:0 4:0 5:-");
+        assert_eq!(gone.reshape.refiled, vec![t(3), t(4)]);
+        assert!(m.rows[2].in_folder, "a member of the outer folder keeps its flag");
+
+        let mut m = runs("FmNmmp");
+        let gone = m.remove_rows(&[0]).expect("remove");
+        assert_eq!(membership(&m), "1:- 2:- 3:2 4:2 5:-");
+        assert_eq!(gone.reshape.refiled, vec![t(1), t(2)], "F's own members stayed F's");
+        assert!(m.rows[1].folder, "the nested folder is still a folder");
+
+        // Both headers in one batch: everything below goes out to the top.
+        let mut m = runs("FmNmmp");
+        let gone = m.remove_rows(&[2, 0]).expect("remove");
+        assert_eq!(membership(&m), "1:- 3:- 4:- 5:-");
+        assert_eq!(gone.reshape.refiled, vec![t(1), t(3), t(4)]);
+        assert!(m.orphans().is_empty());
+
+        // A member leaving re-files nobody: the run closes up behind it.
+        let mut m = runs("Fmmmp");
+        let gone = m.remove_rows(&[2]).expect("remove");
+        assert_eq!(membership(&m), "0:- 1:0 3:0 4:-");
+        assert!(gone.reshape.refiled.is_empty());
+    }
+
+    /// **A stale member flag stays out of the folder above**: a member flag
+    /// with a plain row between it and the folder belongs to nothing, and
+    /// removing that plain row must not hand it a group.
+    #[test]
+    fn removing_a_row_never_lets_a_stale_flag_join_a_folder() {
+        let mut m = runs("Fmpm");
+        assert_eq!(m.orphans(), vec![t(3)], "an older file's stale flag");
+        let gone = m.remove_rows(&[2]).expect("remove");
+        assert_eq!(membership(&m), "0:- 1:0 3:-");
+        assert!(gone.reshape.refiled.is_empty(), "its folder did not change: it had none");
+        assert!(m.orphans().is_empty(), "the flag came off rather than joining 0");
+    }
+
+    /// **An insert re-files nobody already on the desk**, and a new member
+    /// needs a folder above it. Refused whole, before anything changes.
+    #[test]
+    fn an_insert_that_would_break_a_run_is_refused() {
+        let base = runs("Fmmp");
+        let row = |id: u32, folder: bool, in_folder: bool| TrackRow { folder, in_folder, ..TrackRow::vacant(t(id)) };
+        let cases = [
+            (2, row(9, false, false), Err(EditRefused::BreaksFolder(t(2))), "a plain row cut the run"),
+            (2, row(9, true, false), Err(EditRefused::BreaksFolder(t(2))), "a folder took 2 from 0"),
+            (2, row(9, true, true), Err(EditRefused::BreaksFolder(t(2))), "a nested folder took 2"),
+            (0, row(9, false, true), Err(EditRefused::BreaksFolder(t(9))), "a member under nothing"),
+            (4, row(9, false, true), Err(EditRefused::BreaksFolder(t(9))), "after a plain row"),
+        ];
+        for (at, r, want, why) in cases {
+            let mut m = base.clone();
+            assert_eq!(m.insert_rows(at, vec![r]).map(|_| ()), want, "{why}");
+            assert_eq!(m, base, "a refused insert changed the desk: {why}");
+        }
+        // A member inside the run, or a row past its end, is fine.
+        let mut m = base.clone();
+        let r = m.insert_rows(2, vec![row(9, false, true)]).expect("a new member");
+        assert!(r.refiled.is_empty());
+        assert_eq!(membership(&m), "0:- 1:0 9:0 2:0 3:-");
+        m.insert_rows(4, vec![row(10, true, true), row(11, false, true)]).expect("a nested folder at the end");
+        assert_eq!(membership(&m), "0:- 1:0 9:0 2:0 10:0 11:10 3:-");
+        assert_eq!(m.append(row(12, false, false)), Ok(7));
+    }
+
+    /// **A permutation never strands a member**, and says every row it
+    /// moved into another run.
+    #[test]
+    fn a_permutation_that_strands_a_member_is_refused() {
+        // G, g1, g2, C, H, h1.
+        let base = runs("FmmpFm");
+        let cases: [(&[usize], u32, &str); 4] = [
+            (&[0, 2, 3, 1, 4, 5], 1, "a child carried out of its run with its flag on"),
+            (&[0, 1, 3, 2, 4, 5], 2, "a plain row dropped mid-run cut the rest loose"),
+            (&[1, 2, 0, 3, 4, 5], 1, "a folder moved off its children"),
+            (&[0, 1, 2, 3, 5, 4], 5, "a child moved above its own folder"),
+        ];
+        for (order, id, why) in cases {
+            let mut m = base.clone();
+            assert_eq!(m.permute(order).map(|_| ()), Err(EditRefused::BreaksFolder(t(id))), "{why}");
+            assert_eq!(m, base, "a refused permutation changed the desk: {why}");
+        }
+        // A folder carried with its run re-files nobody.
+        let mut m = base.clone();
+        let r = m.permute(&[4, 5, 0, 1, 2, 3]).expect("a block move");
+        assert!(r.refiled.is_empty());
+        assert_eq!(membership(&m), "4:- 5:4 0:- 1:0 2:0 3:-");
+        // A child dropped at the end of another run lands in it, and is
+        // named: the gesture decides, the model reports.
+        let mut m = base.clone();
+        let r = m.permute(&[0, 1, 3, 4, 5, 2]).expect("into H");
+        assert_eq!(r.refiled, vec![t(2)]);
+        assert_eq!(membership(&m), "0:- 1:0 3:- 4:- 5:4 2:4");
+    }
+
+    /// **`in_folder` travels with its row through every edit**, loud: the
+    /// field `loud_row` leaves quiet, carried here in runs that stay whole.
+    #[test]
+    fn folder_flags_travel_with_their_rows_through_every_edit() {
+        let member = |id: u32| TrackRow { folder: false, in_folder: true, ..loud_row(id) };
+        let mut header = loud_row(0);
+        header.in_folder = false;
+        let mut m = DeskModel::empty();
+        m.append(header.clone()).expect("header");
+        m.append(member(1)).expect("member");
+        m.append(loud_row(2)).expect("a top-level folder");
+        m.insert_rows(2, vec![member(3)]).expect("a member inside the run");
+        let before = m.rows.clone();
+        let r = m.permute(&[3, 0, 1, 2]).expect("a run moved whole");
+        assert!(r.refiled.is_empty());
+        for (old, want) in before.iter().enumerate() {
+            assert_row_is(&m.rows[r.lane(old).expect("kept")], want);
+        }
+        // The empty folder now on top goes; the run below it is untouched.
+        let gone = m.remove_rows(&[0]).expect("remove");
+        assert!(gone.reshape.refiled.is_empty());
+        assert_eq!(gone.rows[0].1.id, t(2));
+        for (old, want) in before.iter().enumerate() {
+            if let Some(now) = gone.reshape.lane(r.lane(old).expect("kept")) {
+                assert_row_is(&m.rows[now], want);
+            }
+        }
+        assert_eq!(m.rows.len(), 3);
+    }
+
+    /// The single-row walk and the bulk one agree on every row of a busy
+    /// desk, stale flags included.
+    #[test]
+    fn folder_of_agrees_with_the_bulk_walk() {
+        let m = runs("mFmNmmpmFFmNNmp");
+        let bulk = folder_lanes(m.rows.iter());
+        for (n, f) in bulk.iter().enumerate() {
+            assert_eq!(m.folder_of(n), *f, "row {n}");
+        }
+        assert_eq!(m.folder_of(m.rows.len()), None);
+        assert_eq!(m.orphans(), vec![t(0), t(7)]);
+    }
+
+    /// **Every small desk, every one- and two-row removal**: each kept row
+    /// ends in its nearest folder that survived (read off the desk BEFORE,
+    /// one `folder_of` hop at a time), nothing is newly stranded, and
+    /// `refiled` is exactly the rows whose folder changed. Six rows of four
+    /// letters is 4,096 desks, every nesting and stale-flag shape included.
+    #[test]
+    fn every_removal_keeps_each_row_in_its_nearest_surviving_folder() {
+        const LETTERS: [char; 4] = ['F', 'N', 'm', 'p'];
+        for code in 0..4usize.pow(6) {
+            let spec: String = (0..6).map(|k| LETTERS[code / 4usize.pow(k) % 4]).collect();
+            let base = runs(&spec);
+            let stale: BTreeSet<TrackId> = base.orphans().into_iter().collect();
+            let mut batches: Vec<Vec<usize>> = (0..6).map(|a| vec![a]).collect();
+            batches.extend((0..6).flat_map(|a| (a + 1..6).map(move |b| vec![a, b])));
+            for gone in batches {
+                let mut m = base.clone();
+                let out = m.remove_rows(&gone).expect("remove");
+                let mut refiled = Vec::new();
+                for (old, row) in base.rows.iter().enumerate() {
+                    let Some(now) = out.reshape.lane(old) else { continue };
+                    let mut up = base.folder_of(old);
+                    while let Some(q) = up.filter(|q| gone.contains(q)) {
+                        up = base.folder_of(q);
+                    }
+                    let want = up.map(|q| base.rows[q].id);
+                    assert_eq!(m.folder_of(now).map(|q| m.rows[q].id), want, "{spec} less {gone:?}: row {old}");
+                    if want != base.folder_of(old).map(|q| base.rows[q].id) {
+                        refiled.push(row.id);
+                    }
+                }
+                assert_eq!(out.reshape.refiled, refiled, "{spec} less {gone:?}");
+                assert!(m.orphans().iter().all(|id| stale.contains(id)), "{spec} less {gone:?}");
+            }
+        }
     }
 }
