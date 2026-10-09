@@ -358,11 +358,39 @@ pub struct KeyTable {
     pub sources: LaneSet,
 }
 
-/// The post-fork graph in topological layers of RANKS. Each layer's nodes
-/// depend only on earlier layers, so a layer may run its nodes in parallel
-/// and publish them serially in the order listed, which is today's order.
+/// The post-fork graph in topological layers of RANKS: a COMPUTE schedule.
+/// Each layer's nodes depend only on earlier layers, so a layer may run its
+/// nodes in parallel, and each node may write its OWN stem column (nobody
+/// else writes it, so the order of those writes is no sum) before the next
+/// layer starts, because that column is what the next layer reads.
+///
+/// **The listed order is not the publish order.** What a node adds into the
+/// shared sums (`mix`, `aux`) must be added in [`Publish`]'s order, which is
+/// today's serial walks, and that order crosses layers: `fold_folders` is
+/// one descending walk over every folder, so a shallow folder ranked above a
+/// deep one publishes between the deep one and its parent; the sends pass
+/// adds in Kahn order, which places a lone destination by rank, ahead of a
+/// deeper one. f32 `+=` is not associative, so publishing layer by layer
+/// would move bits on exactly those desks. A runner therefore holds each
+/// node's sums until its whole phase has run and then adds them in
+/// [`Publish`] order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Levels(pub Box<[Box<[u32]>]>);
+
+/// The order the post-fork nodes add into `mix` and `aux`: today's serial
+/// walks, transcribed. Each phase is a permutation of its own levels (the
+/// fold's are `levels[..first_level]`, the route phase's the rest).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Publish {
+    /// Every folder, descending rank: `fold_folders`' one walk up the
+    /// channels, whatever each folder's depth.
+    pub fold: Box<[u32]>,
+    /// Every route-phase node: the sweep's placed order, then the cycle tail.
+    /// On a desk with no sends into lanes (every desk today) this is exactly
+    /// [`RouteTable::order`]; a bus row that only sends reach is placed by
+    /// the same rule, which is W6's to keep.
+    pub routes: Box<[u32]>,
+}
 
 /// The shape of the desk for as long as nothing that decides an order moves.
 #[derive(Debug, Default)]
@@ -377,6 +405,9 @@ pub struct DeskPlan {
     pub sends: SendTable,
     pub keys: KeyTable,
     pub levels: Levels,
+    /// The order the levels' nodes publish their sums in (not the levels'
+    /// own order; see [`Levels`]).
+    pub publish: Publish,
     /// f32 bits: every route's gain by edge index, then every send's level.
     /// The host keeps the last clone (design 7.14 invariant 5).
     pub gains: Arc<[AtomicU32]>,
@@ -650,9 +681,17 @@ pub fn build_plan(inputs: &PlanInputs, prev: Option<&DeskPlan>) -> DeskPlan {
         .max()
         .unwrap_or(0);
     let mut levels: Vec<Box<[u32]>> = Vec::new();
+    // Today's publish order for the fold: ONE walk up the channels over
+    // every folder. Not the layers concatenated: a shallow folder ranked
+    // between a deep one and its parent sits in an earlier layer but
+    // publishes between them.
+    let fold_publish: Vec<u32> = (0..n as u32)
+        .rev()
+        .filter(|&f| is_folder[f as usize])
+        .collect();
     for k in 0..fold_depth {
-        // Descending rank inside a layer: `fold_folders` walks the channels
-        // from the bottom up, which is today's publish order.
+        // Descending rank inside a layer, so a layer reads in the same
+        // direction as the walk; the publish order is `fold_publish`.
         let layer: Vec<u32> = (0..n as u32)
             .rev()
             .filter(|&f| is_folder[f as usize] && flevel[f as usize] == k)
@@ -694,6 +733,11 @@ pub fn build_plan(inputs: &PlanInputs, prev: Option<&DeskPlan>) -> DeskPlan {
             .collect();
         levels.push(layer.into_boxed_slice());
     }
+    // The route phase publishes in the sweep's order (pass, then rank), not
+    // layer by layer: a lone destination ranked above a chain's second link
+    // is placed, and adds into `mix`, before it.
+    let mut route_publish = lplaced.clone();
+    route_publish.extend_from_slice(&ltail);
     let cycle_level = !ltail.is_empty();
     if cycle_level {
         levels.push(ltail.into_boxed_slice());
@@ -779,6 +823,10 @@ pub fn build_plan(inputs: &PlanInputs, prev: Option<&DeskPlan>) -> DeskPlan {
             sources,
         },
         levels: Levels(levels.into_boxed_slice()),
+        publish: Publish {
+            fold: fold_publish.into_boxed_slice(),
+            routes: route_publish.into_boxed_slice(),
+        },
         gains,
         any_solo,
     }
@@ -1583,8 +1631,10 @@ mod tests {
         // And it allocates nothing doing it.
         let s = soup(&mut rng, 300);
         let plan = plan_of(&s);
+        // `here`: the walk runs on this thread only, and the hands' figure
+        // would only catch a neighbour test's pool by its thread names.
         let (_, c) = crate::rt_alloc::count_allocs(|| resolve_heard(&plan, &s.auto, &mut out));
-        assert_eq!(c.total(), 0, "resolve_heard allocated");
+        assert_eq!(c.here, 0, "resolve_heard allocated: {c:?}");
     }
 
     /// The two derived bits are the plan's to set: whatever the host hands
@@ -1795,7 +1845,7 @@ mod tests {
 
     // ── levels ──────────────────────────────────────────────────────────
 
-    /// **The levels are a topological layering, in today's order**: the
+    /// **The levels are a topological layering**: the
     /// fold first (deepest folders first, descending rank within a layer,
     /// as `fold_folders` walks), then the route phase by longest feeder
     /// chain (Kahn order within a layer), then every cycle member and what
@@ -1915,6 +1965,160 @@ mod tests {
             assert_eq!(
                 got, want,
                 "trial {trial}: parents {parents:?} edges {edges:?}"
+            );
+        }
+    }
+
+    /// **The sums publish in today's serial order, which is not the levels'
+    /// order.** The desks the review found, with literal answers: the layers
+    /// concatenated would add into `mix` and `aux` in a different order, and
+    /// f32 `+=` is not associative, so a runner that published layer by
+    /// layer would move the folder and route goldens.
+    #[test]
+    fn the_publish_order_crosses_the_levels_where_rank_and_depth_disagree() {
+        let ids: Vec<u32> = (0..10).collect();
+        let none = vec![-1; 10];
+        let flat = |p: &DeskPlan, phase: std::ops::Range<usize>| -> Vec<u32> {
+            p.levels.0[phase]
+                .iter()
+                .flat_map(|l| l.iter().copied())
+                .collect()
+        };
+
+        // Folder 2 holds lane 3; folder 7 holds folder 8, which holds lane 9.
+        let mut parents = vec![-1; 10];
+        parents[3] = 2;
+        parents[8] = 7;
+        parents[9] = 8;
+        let p = build_plan(&route_inputs(10, &ids, &parents, &[]), None);
+        let fold = p.routes.first_level as usize;
+        let layers: Vec<&[u32]> = p.levels.0[..fold].iter().map(|l| &l[..]).collect();
+        assert_eq!(layers, [&[8u32, 2][..], &[7][..]]);
+        assert_eq!(&p.publish.fold[..], &[8, 7, 2], "fold_folders' one walk");
+        assert_ne!(flat(&p, 0..fold), p.publish.fold.to_vec());
+
+        // Folder 2 holds row 3; folder 4 holds folder 5, which holds row 6:
+        // contiguous, as a desk draws it.
+        let mut parents = vec![-1; 10];
+        parents[3] = 2;
+        parents[5] = 4;
+        parents[6] = 5;
+        let p = build_plan(&route_inputs(10, &ids, &parents, &[]), None);
+        let fold = p.routes.first_level as usize;
+        assert_eq!(flat(&p, 0..fold), [5, 2, 4]);
+        assert_eq!(&p.publish.fold[..], &[5, 4, 2]);
+
+        // Routes 0 -> 1, 1 -> 2, 0 -> 3: Kahn places 1, 2, 3 in one pass;
+        // the layers are [1, 3] then [2].
+        let p = build_plan(
+            &route_inputs(
+                10,
+                &ids,
+                &none,
+                &[(0, 1, false, 1.0), (1, 2, false, 1.0), (0, 3, false, 1.0)],
+            ),
+            None,
+        );
+        let fold = p.routes.first_level as usize;
+        assert_eq!(fold, 0);
+        let all = p.levels.0.len();
+        assert_eq!(flat(&p, 0..all), [1, 3, 2]);
+        assert_eq!(&p.routes.order[..], &[1, 2, 3]);
+        assert_eq!(&p.publish.routes[..], &p.routes.order[..]);
+
+        // 2 -> 3, and a lone destination 5 fed by a lane that is none.
+        let p = build_plan(
+            &route_inputs(
+                10,
+                &ids,
+                &none,
+                &[(2, 3, false, 1.0), (0, 2, false, 1.0), (4, 5, false, 1.0)],
+            ),
+            None,
+        );
+        let all = p.levels.0.len();
+        assert_eq!(flat(&p, 0..all), [2, 5, 3]);
+        assert_eq!(&p.publish.routes[..], &[2, 3, 5]);
+    }
+
+    /// **The publish order is today's two walks, on random desks**:
+    /// `fold_folders`' descending walk over every folder, and the sends
+    /// pass's Kahn order (the frozen sweep, with sends into lanes as more
+    /// edges); and each phase's publish order is a permutation of its own
+    /// levels, so deferring the sums to the phase's end publishes everything
+    /// once.
+    #[test]
+    fn the_publish_order_is_todays_serial_walks() {
+        let mut rng = Rng(0x9b11_5400_0000_0011);
+        for trial in 0..5_000 {
+            let n = 1 + rng.below(32);
+            let shuffle = rng.chance(0.5);
+            let (parents, slots) = random_tree(&mut rng, n, shuffle);
+            let raw = random_routes(&mut rng, n);
+            let lane_sends: Vec<(usize, usize)> = if rng.chance(0.5) {
+                Vec::new()
+            } else {
+                (0..rng.below(6))
+                    .map(|_| (rng.below(n), rng.below(n)))
+                    .collect()
+            };
+            let mut inputs = route_inputs(n, &slots, &parents, &raw);
+            inputs.sends = lane_sends
+                .iter()
+                .map(|&(f, t)| InSend {
+                    from: SendFrom::Lane(Slot(slots[f])),
+                    to: SendTo::Lane(Slot(slots[t])),
+                    level: 0.5,
+                    pre: false,
+                })
+                .collect();
+            let plan = build_plan(&inputs, None);
+
+            // `fold_folders`: `for ch in (0..CHANNELS).rev()`, skipping
+            // whatever is not `folder_is`.
+            let folder_is: Vec<bool> = (0..n).map(|f| parents.contains(&(f as i32))).collect();
+            let fold: Vec<u32> = (0..n as u32)
+                .rev()
+                .filter(|f| folder_is[*f as usize])
+                .collect();
+            assert_eq!(plan.publish.fold.to_vec(), fold, "trial {trial}");
+
+            let mut edges: Vec<(usize, usize, bool, f32)> = frozen_latch(n, &raw)
+                .into_iter()
+                .filter(|&(_, _, h, g)| !h && g > 0.0)
+                .collect();
+            if lane_sends.is_empty() {
+                assert_eq!(
+                    plan.publish.routes, plan.routes.order,
+                    "trial {trial}: today's desk publishes in the sends pass's order"
+                );
+            }
+            edges.extend(lane_sends.iter().map(|&(f, t)| (f, t, false, 1.0)));
+            let kahn: Vec<u32> = frozen_kahn(n, &edges)
+                .into_iter()
+                .map(|d| d as u32)
+                .collect();
+            assert_eq!(plan.publish.routes.to_vec(), kahn, "trial {trial}");
+
+            let first = plan.routes.first_level as usize;
+            let sorted = |v: Vec<u32>| {
+                let mut v = v;
+                v.sort_unstable();
+                v
+            };
+            let phase = |r: std::ops::Range<usize>| -> Vec<u32> {
+                sorted(
+                    plan.levels.0[r]
+                        .iter()
+                        .flat_map(|l| l.iter().copied())
+                        .collect(),
+                )
+            };
+            assert_eq!(phase(0..first), sorted(fold), "trial {trial}");
+            assert_eq!(
+                phase(first..plan.levels.0.len()),
+                sorted(kahn),
+                "trial {trial}"
             );
         }
     }
