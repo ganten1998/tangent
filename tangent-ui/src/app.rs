@@ -14124,6 +14124,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .fold(0.0, f64::max)
     }
 
+    /// **The timeline's frame**, without its rows: what `Layout::new` would
+    /// begin with for this view. The lane bar's gutter is in it, read off
+    /// the same two numbers `arrange_view` hands the layout, so the lanes'
+    /// width here is the one the clips are drawn against.
+    fn arr_frame(&self, rect: Rect) -> crate::arrangement_panel::Frame {
+        crate::arrangement_panel::Layout::frame(
+            rect,
+            self.arr_header_w_pt(),
+            crate::arrangement_panel::lane_bar_shown(self.arr_visible(), self.desk_extent()),
+        )
+    }
+
     /// What the clip pictures should be drawn FOR: the window on screen and
     /// how many points wide the lanes are.
     ///
@@ -14138,7 +14150,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The host asks this every frame; the lanes' width is the frame's
         // and the window is `arr_window_now`, so neither the clip views nor
         // the row stack are built to answer it.
-        let f = crate::arrangement_panel::Layout::frame(rect, self.arr_header_w_pt());
+        let f = self.arr_frame(rect);
         let w = f.lanes_area.width();
         let (start, len) = self.arr_window_now();
         (w >= 1.0).then_some((start, len, w))
@@ -25730,10 +25742,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // The frame alone: the seam's place does not depend
                         // on the rows, and this is asked on every frame the
                         // pointer is anywhere over the panel.
-                        let f = crate::arrangement_panel::Layout::frame(
-                            rect,
-                            self.arr_header_w_pt(),
-                        );
+                        let f = self.arr_frame(rect);
                         f.grip.is_positive() && f.grip.contains(p)
                     });
             self.arr_grip_lit = dragging || hovering;
@@ -26883,7 +26892,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // starting a drag from the setting would jump the
                         // column to the clamp's floor the moment it engaged.
                         let from_w = f64::from(
-                            crate::arrangement_panel::Layout::frame(rect, self.arr_header_w_pt())
+                            self.arr_frame(rect)
                                 .grip
                                 .left()
                                 - rect.left(),

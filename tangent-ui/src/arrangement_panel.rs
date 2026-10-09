@@ -1104,8 +1104,16 @@ pub struct Layout {
 /// window, and nothing said how many lanes were below. A desk that grows by
 /// appending needs both (docs/design/unlimited-tracks.md, section 10). The
 /// track is every row of the desk, the thumb the rows on screen; it stands
-/// at the lanes' right edge, where every timeline keeps it, and a press on
-/// it is the bar's (see [`lane_bar_grab`]).
+/// right of the lanes, where every timeline keeps it, and a press on it is
+/// the bar's (see [`lane_bar_grab`]).
+///
+/// **Beside the lanes, never on them.** It was laid inside the lanes'
+/// right edge, and the press the bar claims first took the last few points
+/// of every lane: a clip running off the window's right edge is clamped
+/// there, so its right trim zone and fade-out corner sat wholly under the
+/// bar, and a press meant to trim scrolled the lanes instead. The bar has
+/// its own gutter now ([`LANE_GUTTER`]), taken out of the lanes area while
+/// the bar shows, so nothing a lane draws or answers lies under it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LaneBar {
     /// Every row of the desk, laid down the lanes' right edge.
@@ -1121,9 +1129,22 @@ impl LaneBar {
     pub const NONE: Self = Self { track: Rect::NOTHING, thumb: Rect::NOTHING, max_rows: 0 };
 }
 
-/// The bar's width, inset from the lanes' right edge, and its shortest thumb.
+/// The bar's width and its shortest thumb.
 const LANE_BAR_W: f32 = 5.0;
 const LANE_BAR_MIN: f32 = 18.0;
+/// **The bar's gutter**: the strip right of the lanes it stands in, one
+/// point clear of the lanes and of the window's edge.
+pub const LANE_GUTTER: f32 = LANE_BAR_W + 2.0;
+
+/// **Whether the lane scrollbar shows**: the desk is taller than the window
+/// of lanes. Kept beside [`lane_window_start`], whose clamps it reads, so
+/// the frame (which reserves the gutter) and the layout (which draws the
+/// bar) cannot disagree.
+pub fn lane_bar_shown(visible_lanes: usize, active: usize) -> bool {
+    let active = active.max(1);
+    let (_, visible) = lane_window_start(0, visible_lanes, active);
+    visible < active
+}
 
 
 /// A bus row's header: what it is, and the one control it has.
@@ -1481,8 +1502,11 @@ pub struct Frame {
 
 impl Layout {
     /// See [`Frame`]. `header_w` is `ArrangeView::header_w`: a dragged width,
-    /// or `None` for the automatic share.
-    pub fn frame(rect: Rect, header_w: Option<f32>) -> Frame {
+    /// or `None` for the automatic share. `lane_bar` is [`lane_bar_shown`]
+    /// for the view: the bar's gutter comes out of the lanes, the ruler and
+    /// the chip strip with them, so a time read off the ruler and one read
+    /// off a lane are the same span.
+    pub fn frame(rect: Rect, header_w: Option<f32>, lane_bar: bool) -> Frame {
         if !rect.is_positive() {
             return Frame {
                 header: Rect::NOTHING,
@@ -1529,9 +1553,12 @@ impl Layout {
         // the playhead to the start, which keeps the generous
         // back-to-bar-one target the gutter used to provide.
         let field_x = rect.left() + header_w + GRIP_W;
+        // Never left of the field's start: a window too narrow for the
+        // gutter keeps an empty field, not an inverted one.
+        let field_r = if lane_bar { (rect.right() - LANE_GUTTER).max(field_x) } else { rect.right() };
         let ruler = Rect::from_min_max(
             Pos2::new(field_x, rect.top()),
-            Pos2::new(rect.right(), rect.top() + ruler_h),
+            Pos2::new(field_r, rect.top() + ruler_h),
         );
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
@@ -1553,7 +1580,7 @@ impl Layout {
         };
         let lanes_area = Rect::from_min_max(
             Pos2::new(field_x, rect.top() + ruler_h),
-            rect.max,
+            Pos2::new(field_r, rect.bottom()),
         );
         let grip = Rect::from_min_max(
             Pos2::new(rect.left() + header_w, rect.top()),
@@ -1584,7 +1611,7 @@ impl Layout {
         }
         // The frame first — see [`Frame`] for why it is its own step.
         let Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h } =
-            Self::frame(rect, view.header_w);
+            Self::frame(rect, view.header_w, lane_bar_shown(view.visible_lanes, view.active));
         // **Eight lanes show; the rest scroll.** The desk grew past what
         // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
         // and `view.lane_scroll` chooses which window shows. A lane outside
@@ -1796,9 +1823,10 @@ impl Layout {
         // the window's share of the rows, at the scroll's share of its range.
         let max_rows = active.saturating_sub(visible);
         let lane_bar = if max_rows > 0 && lanes_area.is_positive() {
+            // In the gutter the frame left for it, one point off the lanes.
             let track = Rect::from_min_max(
-                Pos2::new(lanes_area.right() - LANE_BAR_W - 1.0, lanes_area.top()),
-                Pos2::new(lanes_area.right() - 1.0, lanes_area.bottom()),
+                Pos2::new(lanes_area.right() + 1.0, lanes_area.top()),
+                Pos2::new(lanes_area.right() + 1.0 + LANE_BAR_W, lanes_area.bottom()),
             );
             let h = (track.height() * visible as f32 / active as f32)
                 .clamp(LANE_BAR_MIN.min(track.height()), track.height());
@@ -3803,11 +3831,22 @@ pub fn drop_lane_rect(l: &Layout, view: &ArrangeView<'_>) -> Option<Rect> {
 /// **A press on the lane scrollbar**: where on the thumb the hand took it,
 /// or `None` when the press is not on the bar. A press on the thumb keeps
 /// its grip; a press beside it centres the thumb under the hand, so the
-/// lanes jump to where it was pressed. A few points wider than it is drawn,
-/// because five points is a line to look at and not a target to hit.
+/// lanes jump to where it was pressed. The whole gutter and a little past
+/// the window's edge, because five points is a line to look at and not a
+/// target to hit; never a point of the lanes, which belong to the clips,
+/// nodes and points drawn there (see [`LaneBar`]).
 pub fn lane_bar_grab(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<f32> {
-    let bar = Layout::new(rect, view).lane_bar;
-    if !bar.track.is_positive() || !bar.track.expand2(Vec2::new(2.0, 0.0)).contains(pos) {
+    let l = Layout::new(rect, view);
+    let bar = l.lane_bar;
+    if !bar.track.is_positive() {
+        return None;
+    }
+    let band = Rect::from_min_max(
+        Pos2::new(l.lanes_area.right(), bar.track.top()),
+        Pos2::new(bar.track.right() + 3.0, bar.track.bottom()),
+    );
+    // Strictly right of the lanes: their last point is a lane's.
+    if pos.x <= l.lanes_area.right() || !band.contains(pos) {
         return None;
     }
     Some(if bar.thumb.y_range().contains(pos.y) {
@@ -13537,7 +13576,11 @@ selected: false,
         let l = Layout::new(r, &v);
         let bar = l.lane_bar;
         assert!(bar.track.is_positive(), "a desk taller than the window drew no bar");
-        assert!(l.lanes_area.contains_rect(bar.track), "the bar is off the lanes");
+        // Beside the lanes, inside the panel: it was pinned ON the lanes,
+        // which is where it took the clips' edge presses (see
+        // `the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge`).
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
         assert_eq!(bar.max_rows, CHANNELS - 8);
         let share = 8.0 / CHANNELS as f32;
         assert!((bar.thumb.height() - bar.track.height() * share).abs() < 0.5);
@@ -13555,6 +13598,59 @@ selected: false,
         assert_eq!(lane_bar_scroll(r, &v, near, grab), Some(0));
         // A press in the middle of a lane is never the bar's.
         assert_eq!(lane_bar_grab(r, &v, l.lane_rows[0].center()), None);
+    }
+
+    /// **The bar stands beside the lanes and takes none of their presses.**
+    /// A clip running off the window's right edge is clamped to the lanes'
+    /// right edge, so its right trim zone and its fade-out corner are the
+    /// last few points of the lanes. With the bar laid on the lanes, and
+    /// claimed before any hit, those points were the bar's: a press to trim
+    /// scrolled the lanes instead.
+    ///
+    /// Revert-check: lay the track back inside `lanes_area.right()` with its
+    /// band at `expand2(2, 0)`, and both presses below are the bar's.
+    #[test]
+    fn the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge() {
+        let mut c = clips();
+        // Lane 0, running far past the window's end.
+        c[0].start_s = 30.0;
+        c[0].len_s = 1.0e4;
+        c[0].max_len_s = f64::INFINITY;
+        let r = rect();
+        let v = ArrangeView { visible_lanes: 8, ..a_view(&c) };
+        let l = Layout::new(r, &v);
+        let bar = l.lane_bar;
+        assert!(bar.track.is_positive(), "fixture: a desk taller than the window drew no bar");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        let cr = clip_rect_in(&l, &v, &c[0]);
+        assert!(
+            cr.is_positive() && (cr.right() - l.lanes_area.right()).abs() < 0.5,
+            "fixture: the clip is not clamped at the lanes' edge ({cr:?})"
+        );
+        for (p, want) in [
+            (Pos2::new(cr.right() - 1.0, cr.center().y), Hit::ClipRight(1)),
+            (Pos2::new(cr.right() - 0.5, cr.top() + 2.0), Hit::FadeOut(1)),
+        ] {
+            assert_eq!(lane_bar_grab(r, &v, p), None, "the bar took {want:?}'s press at {p:?}");
+            assert_eq!(hit_test(r, &v, p), Some(want), "at {p:?}");
+        }
+        // The bar still takes a press anywhere in its gutter, on the thumb
+        // or beside it, and a little past the window's edge.
+        assert!(lane_bar_grab(r, &v, bar.thumb.center()).is_some(), "the thumb took no press");
+        let beside = Pos2::new(bar.track.center().x, bar.track.bottom() - 2.0);
+        assert!(!bar.thumb.contains(beside), "fixture: the thumb reaches the bottom");
+        assert!(lane_bar_grab(r, &v, beside).is_some(), "the track beside the thumb took no press");
+        let past = Pos2::new(r.right() + 1.0, bar.thumb.center().y);
+        assert!(lane_bar_grab(r, &v, past).is_some(), "the window's edge took no press");
+        // One span of time: the ruler ends where the lanes do, and the
+        // frame the app reads on its own agrees with the layout.
+        assert_eq!(l.ruler.right(), l.lanes_area.right());
+        let f = Layout::frame(r, v.header_w, lane_bar_shown(v.visible_lanes, v.active));
+        assert_eq!(f.lanes_area, l.lanes_area);
+        // No bar, no gutter: a desk that fits keeps every point.
+        let all = ArrangeView { visible_lanes: v.active, ..a_view(&c) };
+        assert_eq!(Layout::new(r, &all).lanes_area.right(), r.right());
     }
 
     /// **A hovering file lights the lane it will land on, scrolled or not.**
