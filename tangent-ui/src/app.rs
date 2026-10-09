@@ -31811,6 +31811,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .or_else(|| self.settings.audio_system().map(str::to_owned)),
             outputs_stale: listed.is_none(),
             outputs: listed.unwrap_or_default(),
+            // **Whose list it is**, which `system` above is not during an
+            // ASIO fallback. See `Dialog::AudioSetup::listed_for`.
+            listed_for: self.settings.audio_system().map(str::to_owned),
             // What the ENGINE reads, not the raw setting: a blank one is the
             // system's own there, and handed over raw it lit no chip at all.
             output: self.audio_output_device(),
@@ -31858,9 +31861,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(listed) = self.chosen_outputs() else {
             return true;
         };
-        if let Some(Dialog::AudioSetup { outputs, outputs_stale, .. }) = self.dialog.as_mut() {
+        let chosen = self.settings.audio_system().map(str::to_owned);
+        if let Some(Dialog::AudioSetup { outputs, outputs_stale, listed_for, .. }) =
+            self.dialog.as_mut()
+        {
             *outputs = listed;
             *outputs_stale = false;
+            *listed_for = chosen;
         }
         false
     }
@@ -44572,8 +44579,11 @@ mod tests {
         fn systems(&self) -> Vec<String> {
             vec!["ASIO".to_owned(), "WASAPI".to_owned()]
         }
+        // The host's own name for what it runs, which on the platform
+        // default is that default's: a fallback reads as WASAPI here, as it
+        // does on the tester's machine.
         fn active_system(&self) -> Option<String> {
-            self.0.lock().expect("host").on.clone()
+            Some(self.0.lock().expect("host").on.clone().unwrap_or_else(|| "WASAPI".to_owned()))
         }
         fn outputs(&self, system: Option<&str>) -> Option<Vec<String>> {
             let mut host = self.0.lock().expect("host");
@@ -44650,6 +44660,10 @@ mod tests {
             "the new system's outputs waited for Setup to be opened again"
         );
         assert_eq!(host.listed(), 2, "the new list was not read exactly once");
+        assert!(
+            matches!(&app.dialog, Some(Dialog::AudioSetup { listed_for: Some(s), .. }) if s == "ASIO"),
+            "the filled row still names the old system as its own"
+        );
         for _ in 0..4 {
             let _ = run_frame(&ctx, &mut app);
         }
@@ -44749,6 +44763,21 @@ mod tests {
             (rows(ASIO_ROWS), false),
             "Setup opened during an ASIO fallback offered the stand-in's endpoints as ASIO outputs"
         );
+        // **And says whose they are.** The lit chip is the stand-in that is
+        // running, so the list carries the system it was read for, which is
+        // what the row's ASIO lines ask (see `listed_for`); asked of the lit
+        // chip, the drivers read as WASAPI's.
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { system, listed_for, .. }) => {
+                assert_eq!(system.as_deref(), Some("WASAPI"), "the stand-in is not the lit chip");
+                assert_eq!(
+                    listed_for.as_deref(),
+                    Some("ASIO"),
+                    "the drivers under the stand-in's chip do not say they are ASIO's"
+                );
+            }
+            _ => panic!("Setup closed"),
+        }
     }
 
     /// **Setup opens on the output the engine opens.** A blank setting is
