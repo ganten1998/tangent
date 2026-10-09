@@ -57,6 +57,14 @@ paste it back into this file.
 NO EM DASHES anywhere in it. They read as machine-written and have drawn a
 real accusation before.
 
+What a key does is said the same way on every surface: the free app holds 32
+tracks, a key takes that limit away (keys already sold included), and buses,
+returns, sends and routes have no limit for anyone. The app also names "a
+certain code" beside the key; the store, the email and the README do not (owner
+call 9 in `docs/design/unlimited-tracks.md`). `copy_scan.rs` in tangent-ui
+fails the build if the old wording (a key as a thanks that unlocks nothing)
+comes back here, in the README or in the email.
+
 ---
 
 Play a chord. Tangent names it.
@@ -83,10 +91,11 @@ that are close light up together.
 Teach it your own names. If you call something a Hendrix chord, right-click,
 type it, and that is what it says from then on, in every key if you want.
 
-Tangent is free and it stays free. There is no trial, no locked feature and no
-account. It talks to no server and collects nothing. Paying gets you a
-supporter key, which turns on a small pixel heart and nothing else, and my
-thanks.
+Tangent is free, with up to 32 tracks. There is no trial, no time limit and no
+account, and buses, returns, sends and routes have no limit for anyone. It
+talks to no server and collects nothing. Paying gets you a supporter key,
+which takes the track limit away and sets a small pixel heart moving through
+your theme's colours, and my thanks. Every key already sold does the same.
 
 macOS 11 or later (Apple Silicon or Intel), Windows 10 or later, Linux x86_64.
 Signed and notarized on macOS.
@@ -114,7 +123,7 @@ It pulls every `releases/latest/download/` URL out of this file and out of
 `tools/tangent-fulfil/src/main.rs` and fetches each one. Run it after publishing
 and before pasting.
 
-## The 3.0.0 swap — done
+## The 3.0.0 swap: done
 
 The block below hands out the **installers** rather than the archives. At 3.0.0
 that was because each one offered the app and the plugin as separate choices and
@@ -147,8 +156,9 @@ Ping and mints a real key.
 
 Thank you for supporting Tangent.
 
-Tangent is free and stays free. Your supporter key is a thank-you, not an unlock.
-Nothing in the app is hidden behind it.
+Tangent is free, with up to 32 tracks. Your supporter key takes the track
+limit away, on every machine you own. Buses, returns, sends and routes have no
+limit for anyone, and every other feature is in the free app too.
 
 DOWNLOAD TANGENT
 

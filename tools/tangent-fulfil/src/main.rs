@@ -299,18 +299,26 @@ const DOWNLOAD_LINUX: &str =
 /// Split out from `send_email` purely so it can be rendered and asserted on in
 /// a test. The one email a buyer ever receives is not a good place to discover
 /// a formatting mistake.
+///
+/// **What the key does, in the words every other surface uses.** It said
+/// "a thank-you, not an unlock" until a key lifted the free desk's track
+/// limit; now it says the limit (the app's `FREE_TRACKS`, 32), that the key
+/// takes it away, and that buses, returns, sends and routes were never
+/// limited. tangent-ui's `copy_scan.rs` reads this function's literals and
+/// fails on the old wording. The installers stopped offering a VST3 plugin
+/// when it was retired at 4.77.0, so the line saying each one did is gone.
 fn email_body(key: &str) -> String {
     format!(
         "Thank you for supporting Tangent.\n\n\
-         Tangent is free and stays free. This key is a thank-you, not an unlock.\n\n\
+         Tangent is free, with up to 32 tracks. This key takes the track limit\n\
+         away. Buses, returns, sends and routes have no limit for anyone.\n\n\
          Your supporter key:\n\n\
          {key}\n\n\
          To use it: open Tangent, right-click anywhere, choose \"Support Tangent...\",\n\
          paste the key and press Activate. Case, spaces, dashes and line breaks\n\
          do not matter.\n\n\
          Downloads. These links always give you the current version, so they are\n\
-         worth keeping alongside the key. Each installer offers the app and the\n\
-         VST3 plugin as separate choices, so you can take either or both:\n\n\
+         worth keeping alongside the key:\n\n\
          \x20 macOS 11 or later, Apple Silicon or Intel\n\
          \x20 {macos}\n\n\
          \x20 Windows 10 or later\n\
@@ -873,5 +881,21 @@ mod tests {
     #[test]
     fn email_has_no_em_dashes() {
         assert!(!email_body("K").contains('\u{2014}'));
+    }
+
+    /// **The email says what the key does.** It told every buyer the key was
+    /// "a thank-you, not an unlock"; a key now lifts the free desk's track
+    /// limit, so the one message a buyer keeps says so, with the limit's
+    /// number and what was never limited.
+    #[test]
+    fn email_says_the_key_takes_the_track_limit_away() {
+        let body = email_body("K").split_whitespace().collect::<Vec<_>>().join(" ");
+        for fact in [
+            "Tangent is free, with up to 32 tracks.",
+            "This key takes the track limit away.",
+            "Buses, returns, sends and routes have no limit for anyone.",
+        ] {
+            assert!(body.contains(fact), "the email no longer says {fact:?}:\n{body}");
+        }
     }
 }
