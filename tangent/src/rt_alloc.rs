@@ -189,8 +189,11 @@ mod tests {
     fn the_counter_sees_the_callback_and_the_lane_hands_and_nobody_else() {
         let (_, c) = count_allocs(|| drop(vec![0u8; 4096]));
         assert_eq!(c.here, 2, "one allocation and one free");
-        let (_, quiet) = count_allocs(|| ());
-        assert_eq!(quiet.total(), 0);
+        // Nothing in the window is nothing counted, hands included; through
+        // `least_of`, because a neighbour test's pool shares the hands' names
+        // and a single window can catch its thread starting or ending.
+        let (_, quiet) = least_of(5, || ());
+        assert_eq!(quiet.total(), 0, "{quiet:?}");
 
         let spawn = |name: &str| {
             std::thread::Builder::new()
