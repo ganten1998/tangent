@@ -1063,7 +1063,7 @@ impl ArrRecLane {
 /// the same list in the same order and the picker reads it, so the two stay
 /// aligned by construction as long as nobody reorders one of them alone.
 #[cfg(feature = "recorder")]
-fn keys_patch_of(index: usize) -> crate::keys::Patch {
+pub(crate) fn keys_patch_of(index: usize) -> crate::keys::Patch {
     crate::keys::Patch::ALL
         .get(index)
         .copied()
@@ -2229,7 +2229,7 @@ fn effect_defaults() -> tangent_ui::ports::EffectDefaults {
 /// the prefix — a new effect sentinel then reaches the engine with no edit
 /// here, and a new instrument sentinel is a deliberate line.
 #[cfg(feature = "recorder")]
-fn is_instrument_sentinel(path: &str) -> bool {
+pub(crate) fn is_instrument_sentinel(path: &str) -> bool {
     matches!(
         path,
         tangent_ui::dialogs::BUILTIN_PATH
@@ -2531,7 +2531,7 @@ fn slope_choice(key: &str, default: crate::effects::Slope) -> tangent_ui::ports:
 /// is what makes a settings file written by an older build load without a
 /// migration, and one written by a newer build load without an error.
 #[cfg(feature = "recorder")]
-fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate::effects::Params {
+pub(crate) fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate::effects::Params {
     use crate::effects::{Division, EchoMode, Params};
     let mut p = Params::default();
     let num = |key: &str| {
@@ -3967,7 +3967,7 @@ fn frozen_lane_clip(z: &tangent_ui::arrangement::FrozenLane) -> tangent_ui::arra
 /// silent, as it does live, and its sentence is answered with the
 /// placement: the placed audio, the placed MIDI, and what could not be read.
 #[cfg(feature = "recorder")]
-fn export_clip_placement(
+pub(crate) fn export_clip_placement(
     doc: &tangent_ui::arrangement::Arrangement,
     frozen: &[tangent_ui::arrangement::FrozenLane],
     rate: u32,
@@ -17472,7 +17472,7 @@ fn render_placed_span(
 /// the rest for devices, so such a stem gets a `_` in front
 /// ([`is_windows_device_name`]).
 #[cfg(feature = "recorder")]
-fn sanitize_file_stem(name: &str) -> String {
+pub(crate) fn sanitize_file_stem(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
@@ -17972,7 +17972,7 @@ fn desk_insert_state(
 /// which drives exactly this call with a comp dialled in on one engine and the
 /// same comp, still at the ratio it came up with, sitting on the shelf.
 #[cfg(feature = "recorder")]
-fn furnish_mirror_bay(
+pub(crate) fn furnish_mirror_bay(
     mirror: &mut crate::instrument::Engine,
     live: Option<&crate::instrument::Engine>,
     strip: usize,
@@ -18026,7 +18026,7 @@ fn sampler_file(stored: &str, doc: Option<&std::path::Path>) -> std::path::PathB
 /// resolves a file stored relative to the project against (`kit_doc`), so
 /// the export reads the file the desk plays.
 #[cfg(feature = "recorder")]
-fn mirror_sampler_samples(
+pub(crate) fn mirror_sampler_samples(
     mirror: &mut crate::instrument::Engine,
     rate: u32,
     doc: Option<&std::path::Path>,
@@ -18054,7 +18054,7 @@ fn mirror_sampler_samples(
 
 /// The frozen lanes as the engine's mask - see `Shared::frozen`.
 #[cfg(feature = "recorder")]
-fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
+pub(crate) fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
     frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
 }
 
@@ -18079,7 +18079,7 @@ fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
 /// buffer have to agree and one place to agree in is cheaper than five — see
 /// `Shared::stems_dry`.
 #[cfg(feature = "recorder")]
-fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
+pub(crate) fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
     e.set_stems(stems);
     e.set_stems_dry(stems && dry);
 }

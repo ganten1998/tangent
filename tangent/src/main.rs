@@ -127,6 +127,11 @@ mod rt_alloc;
 /// Render goldens of today's engine, to the bit, over built-in units.
 #[cfg(all(test, feature = "recorder"))]
 mod render_golden;
+/// The one seam between the app and the engine: the desk-structure pushes
+/// (`Bridge::sync`) and the offline furnishing every export, probe and
+/// freeze is built by (`furnish_offline`). docs/design/unlimited-tracks.md, C9.
+#[cfg(feature = "recorder")]
+mod engine_bridge;
 /// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
 /// a drop-in for the handful of midir calls `midi` makes, so the difference is
 /// one `use` and not a second code path. A target gate, not a feature gate —
