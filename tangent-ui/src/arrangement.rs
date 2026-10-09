@@ -288,7 +288,17 @@ impl Fingerprint {
 /// stamp "version 4" on a file still full of version 9's keys, and the build
 /// that wrote them would then run its 4→9 migrations over data that had
 /// already been through them.
-pub const ARRANGEMENT_VERSION: u64 = 7;
+///
+/// **Version 8: the desk is one format-2 `desk` object** (`desk_format`),
+/// rows by id. The constant follows the shape rather than the build:
+/// [`crate::desk_format::WRITE_V8`] decides it, so nothing is stamped 8
+/// before it is format 2. The reader dispatches on the desk's own `format`,
+/// never on this number, so no migration arm is needed in either direction.
+pub const ARRANGEMENT_VERSION: u64 = if crate::desk_format::WRITE_V8 {
+    crate::desk_format::Format::V2.document_stamp()
+} else {
+    crate::desk_format::Format::Legacy.document_stamp()
+};
 
 /// **Version 5: musical time.**
 ///
@@ -345,6 +355,39 @@ const V5_MUSICAL_TIME: u64 = 5;
 /// and the two meet in `DeskRef`, where the walk reads either shape as
 /// the same sequence of occupied seats.
 pub const V7_SPARSE_SEATS: u64 = 7;
+
+/// **Every key the legacy writer spells a document desk's strip space in**:
+/// what a format-2 desk says in its rows, plugins, routes and keys instead.
+/// Everything else in a document's `desk` (the buses' faders, the tempo, the
+/// rack, the view) is a scalar that never lived in strip space and keeps
+/// its key in both shapes.
+const LEGACY_DOC_DESK_KEYS: [&str; 25] = [
+    "kinds",
+    "icons",
+    "names",
+    "colors",
+    "inserts",
+    "inserts_tail",
+    "sends",
+    "muted",
+    "soloed",
+    "gains",
+    "pans",
+    "inputs",
+    "midi_inputs",
+    "tracks_added",
+    "is_folder",
+    "in_folder",
+    "folder_shut",
+    "armed",
+    "phase",
+    "to_theory",
+    "routes",
+    "insert_keys",
+    "insert_bypass",
+    "instruments",
+    "frozen",
+];
 
 /// The seats a document's desk carries as a plain array: every strip and
 /// the master, `(35 + 1) * 3`. See [`V7_SPARSE_SEATS`].
@@ -1438,6 +1481,123 @@ pub struct DeskSnap {
     /// frozen, and opening it thaws whatever the last one had. The live
     /// desk always says `Some`, empty when nothing is frozen.
     pub frozen: Option<Vec<FrozenLane>>,
+    // ── **Identity** (W3) ──────────────────────────────────────────────
+    //
+    // Appended, and spelt in the document only by a format-2 desk.
+    /// **Which track each row is**, in lane order (`Settings::track_ids`).
+    /// EMPTY means the document does not say, which is every legacy
+    /// document: the identity rule then speaks for it (legacy row r is
+    /// `TrackId(r)` in every era), and `apply_desk_snapshot` reads it so.
+    /// See [`RowIds`], which makes the two spellings one value.
+    pub ids: RowIds,
+    /// The next id the desk mints (`Settings::next_track_id`); zero on a
+    /// desk that does not say, where the ids it holds decide. Bookkeeping,
+    /// not the desk: it moves only when `ids` does, so two snapshots that
+    /// agree on the rows are equal whatever it says ([`Aside`]).
+    pub next_id: Aside<u64>,
+    /// **Which legacy shape this document's `state/` folder was written
+    /// in**, while any plugin there may still have only its legacy sidecar
+    /// (design 6.6): set by the legacy read, carried by every save, cleared
+    /// only by the host after a verified mirror (`forget_legacy_states`).
+    /// Not a fact anybody edits, so it is not in the walk, two snapshots of
+    /// one desk are equal whatever it says ([`Aside`]), and undo never
+    /// moves it.
+    pub legacy_states: Aside<Option<crate::desk_lift::DeskEra>>,
+    /// **What the reader dropped** from a format-2 desk (design 6.3), for
+    /// the opener's one notice. Never written and never hashed; empty on
+    /// every snapshot but a document just read.
+    pub dropped: Aside<Vec<crate::desk_format::Dropped>>,
+}
+
+/// **A desk's row ids, where "does not say" and the identity desk are one
+/// value.** A legacy document cannot spell ids, and the identity rule says
+/// what they are (legacy row r is `TrackId(r)`), so an empty list and the
+/// identity list of the dense desk's width are the same rows: equal, and
+/// hashed alike ([`RowIds::rows`]). Without that, a live identity desk
+/// written by the legacy writer would read back as a different desk.
+#[derive(Debug, Clone, Default)]
+pub struct RowIds(pub Vec<crate::desk_id::TrackId>);
+
+impl RowIds {
+    /// The ids as they are meant: the identity desk when none are said.
+    pub fn rows(&self) -> std::borrow::Cow<'_, [crate::desk_id::TrackId]> {
+        rows_meant(&self.0)
+    }
+}
+
+/// [`RowIds::rows`] over a borrowed list: the one place "empty" becomes the
+/// identity desk, for the snapshot and for `DeskRef`'s walk alike.
+fn rows_meant(ids: &[crate::desk_id::TrackId]) -> std::borrow::Cow<'_, [crate::desk_id::TrackId]> {
+    if ids.is_empty() {
+        std::borrow::Cow::Owned(crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS))
+    } else {
+        std::borrow::Cow::Borrowed(ids)
+    }
+}
+
+impl PartialEq for RowIds {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows() == other.rows()
+    }
+}
+
+impl std::ops::Deref for RowIds {
+    type Target = Vec<crate::desk_id::TrackId>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// **A note the reader keeps beside a desk that is not part of the desk**:
+/// equal to every other, so a snapshot read from a file and the snapshot
+/// that file was written from compare equal whatever the reader noticed
+/// about the FILE (its legacy era, what it dropped). The desk is the rows;
+/// these are about where the rows came from.
+#[derive(Debug, Clone, Default)]
+pub struct Aside<T>(pub T);
+
+impl<T> PartialEq for Aside<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// **Which of the late fields a snapshot SAYS**, one bit each: the
+/// `Option`s on [`DeskSnap`] read as a set. A format-2 desk says all of them;
+/// a legacy document says what its build knew, and the live desk stands for
+/// the rest. Derived from the `Option`s while they exist rather than stored
+/// beside them, so the two can never disagree; it becomes the stored half
+/// when the dense fields give way to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Says(pub u32);
+
+impl Says {
+    pub const PHASE: Self = Self(1);
+    pub const TO_THEORY: Self = Self(1 << 1);
+    pub const ROUTES: Self = Self(1 << 2);
+    pub const KEYS: Self = Self(1 << 3);
+    pub const BYPASS: Self = Self(1 << 4);
+    pub const INSTRUMENTS: Self = Self(1 << 5);
+    pub const RACK: Self = Self(1 << 6);
+    pub const TRACK_GAIN: Self = Self(1 << 7);
+    pub const MASTER_MONO: Self = Self(1 << 8);
+    pub const LUFS_WINDOW: Self = Self(1 << 9);
+    pub const VARISPEED: Self = Self(1 << 10);
+    pub const CLICK: Self = Self(1 << 11);
+    pub const TRANSPOSE: Self = Self(1 << 12);
+    pub const COUNT_IN: Self = Self(1 << 13);
+    pub const TAKE_NAME: Self = Self(1 << 14);
+    pub const FEEL: Self = Self(1 << 15);
+    pub const NOTATION: Self = Self(1 << 16);
+    pub const LOOK: Self = Self(1 << 17);
+    pub const VIEW: Self = Self(1 << 18);
+    pub const FROZEN: Self = Self(1 << 19);
+    /// Every field: what a live desk and a format-2 desk say.
+    pub const ALL: Self = Self((1 << 20) - 1);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 /// **What the built-in instruments are set to**, per strip.
@@ -1814,6 +1974,11 @@ pub struct DeskRef<'a> {
     pub view: Option<ViewRef<'a>>,
     /// See [`DeskSnap::frozen`].
     pub frozen: Option<&'a [FrozenLane]>,
+    /// See [`DeskSnap::ids`].
+    pub ids: &'a [crate::desk_id::TrackId],
+    /// See [`DeskSnap::next_id`]. Not hashed: it moves only when an id is
+    /// minted, which moves `ids`.
+    pub next_id: u64,
 }
 
 /// [`Rack`] borrowed — see [`DeskRef`].
@@ -1992,6 +2157,12 @@ impl DeskRef<'_> {
                 tuning: n.tuning.to_owned(),
             }),
             frozen: self.frozen.map(<[FrozenLane]>::to_vec),
+            ids: RowIds(self.ids.to_vec()),
+            next_id: Aside(self.next_id),
+            // The document's own, which the app carries across: see
+            // `TangentApp::desk_snapshot`.
+            legacy_states: Aside(None),
+            dropped: Aside(Vec::new()),
         }
     }
 
@@ -2268,6 +2439,17 @@ impl DeskRef<'_> {
             f.f64(v.quantize_sensitivity);
             f.str(if v.quantize_fit == "auto" { "" } else { v.quantize_fit });
         }
+        // **The rows' ids, appended by the same rule** (W3). A reorder
+        // moves them with everything else; a fresh track mints one. So a
+        // moment holds its rows' identities and an undo puts them back,
+        // and two desks that differ only in which track is which row are
+        // different desks, as a format-2 file writes them.
+        // As meant: a desk that does not say is the identity desk.
+        let ids = rows_meant(self.ids);
+        f.len(ids.len());
+        for id in ids.iter() {
+            f.u64(u64::from(id.0));
+        }
     }
 }
 
@@ -2366,7 +2548,41 @@ impl DeskSnap {
                 tuning: &n.tuning,
             }),
             frozen: self.frozen.as_deref(),
+            ids: &self.ids.0,
+            next_id: self.next_id.0,
         }
+    }
+
+    /// **Which late fields this snapshot says.** See [`Says`].
+    pub fn says(&self) -> Says {
+        let mut bits = 0;
+        for (on, s) in [
+            (self.phase.is_some(), Says::PHASE),
+            (self.to_theory.is_some(), Says::TO_THEORY),
+            (self.routes.is_some(), Says::ROUTES),
+            (self.insert_keys.is_some(), Says::KEYS),
+            (self.bypass.is_some(), Says::BYPASS),
+            (self.instruments.is_some(), Says::INSTRUMENTS),
+            (self.rack.is_some(), Says::RACK),
+            (self.track_gain.is_some(), Says::TRACK_GAIN),
+            (self.master_mono.is_some(), Says::MASTER_MONO),
+            (self.lufs_window.is_some(), Says::LUFS_WINDOW),
+            (self.varispeed.is_some(), Says::VARISPEED),
+            (self.click.is_some(), Says::CLICK),
+            (self.transpose.is_some(), Says::TRANSPOSE),
+            (self.count_in.is_some(), Says::COUNT_IN),
+            (self.take_name.is_some(), Says::TAKE_NAME),
+            (self.feel.is_some(), Says::FEEL),
+            (self.notation.is_some(), Says::NOTATION),
+            (self.look.is_some(), Says::LOOK),
+            (self.view.is_some(), Says::VIEW),
+            (self.frozen.is_some(), Says::FROZEN),
+        ] {
+            if on {
+                bits |= s.0;
+            }
+        }
+        Says(bits)
     }
 
     /// What stands in seat `bay`, if anything. Binary search, since the
@@ -2419,7 +2635,56 @@ impl DeskSnap {
         pairs
     }
 
+    /// The desk in the production format. Only tests ask for it bare: the
+    /// writer goes through `to_value_as` with the document's own format.
+    #[cfg(test)]
     fn to_value(&self) -> Value {
+        self.to_value_as(crate::desk_format::Format::current())
+    }
+
+    /// **This desk as a document's `desk` object, in `format`.** Format 2
+    /// is the one `desk_format` object (the rows by id, the plugins by
+    /// identity, `legacy_states` while the document has one) with this
+    /// snapshot's scalars beside it under the keys they always had: the
+    /// fader levels of the buses, the tempo, the rack, the view. Those were
+    /// never strip space, so they have nothing to move to.
+    pub(crate) fn to_value_as(&self, format: crate::desk_format::Format) -> Value {
+        let legacy = self.to_value_legacy();
+        if format == crate::desk_format::Format::Legacy {
+            return legacy;
+        }
+        let Value::Object(scalars) = legacy else {
+            return legacy;
+        };
+        let Value::Object(mut desk) = crate::desk_format::write(&self.desk_model().model) else {
+            return Value::Null;
+        };
+        for (k, v) in scalars {
+            if !LEGACY_DOC_DESK_KEYS.contains(&k.as_str()) {
+                desk.insert(k, v);
+            }
+        }
+        Value::Object(desk)
+    }
+
+    /// **This snapshot as the format-2 model**: its dense strip fields by
+    /// row id (identity when it does not say), the marker it carries. A
+    /// late field the snapshot does not say reads as vacant, which no live
+    /// snapshot reaches: the live desk says every one.
+    pub fn desk_model(&self) -> crate::desk_format::DeskRead {
+        use crate::desk_model::{DeskModel, V22Desk};
+        let dense = V22Desk::from_snap(self, &V22Desk::vacant());
+        let n = crate::desk_lift::V32_CHANNELS;
+        let said = self.ids.len() == n
+            && self.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
+        let ids = if said { self.ids.0.clone() } else { crate::desk_legacy::identity_ids(n) };
+        let mut read = DeskModel::from_v22(&dense, &ids);
+        read.model.next_id = read.model.next_id.max(self.next_id.0);
+        read.model.legacy_states = self.legacy_states.0;
+        read
+    }
+
+    fn to_value_legacy(&self) -> Value {
         let mut m = Map::new();
         let nums = |v: &[f64]| {
             Value::Array(v.iter().map(|x| serde_json::json!(x)).collect())
@@ -2683,7 +2948,53 @@ impl DeskSnap {
         Value::Object(m)
     }
 
-    fn from_value(v: &Value) -> Option<Self> {
+    /// **A document's `desk` object, read**: dispatched on its SHAPE (a
+    /// format-2 desk says `format: 2`; anything else is the legacy chain),
+    /// never on the document's stamp. `Ok(None)` is no desk at all; `Err`
+    /// is a format-2 desk refused whole (design 6.3), which refuses the
+    /// OPEN, never the bytes: see `Arrangement::read_from`.
+    ///
+    /// A legacy desk carries its era as `legacy_states`, so the first
+    /// format-2 save of it still knows which names its `state/` folder's
+    /// plugin files wear.
+    fn from_value(v: &Value) -> Result<Option<Self>, crate::desk_format::DeskRefused> {
+        use crate::desk_format::{DeskRefused, Structural};
+        if !crate::desk_format::is_format2(v) {
+            let era = crate::desk_lift::era_of_desk(v);
+            return Ok(Self::from_value_legacy(v).map(|mut d| {
+                d.legacy_states = Aside(Some(era));
+                d
+            }));
+        }
+        // The scalars by the legacy reader, which reads them under the keys
+        // they always had and finds no strip key to lift.
+        let Some(mut d) = Self::from_value_legacy(v) else {
+            return Ok(None);
+        };
+        let read = crate::desk_format::read(v)?;
+        // The live desk is still 32 wide (W6 removes the width), and a
+        // desk past it cannot be put on it without hiding rows: refused
+        // like a structural fault, the file untouched.
+        let Some((dense, mut ids)) = read.model.to_v22() else {
+            return Err(DeskRefused {
+                why: Structural::BadShape("more rows than this build's desk holds"),
+                raw: v.clone(),
+            });
+        };
+        let mut next = read.model.next_id;
+        while ids.len() < crate::desk_lift::V32_CHANNELS {
+            ids.push(crate::desk_id::TrackId(u32::try_from(next).unwrap_or(u32::MAX)));
+            next += 1;
+        }
+        dense.into_snap(&mut d);
+        d.ids = RowIds(ids);
+        d.next_id = Aside(next);
+        d.legacy_states = Aside(read.model.legacy_states);
+        d.dropped = Aside(read.dropped);
+        Ok(Some(d))
+    }
+
+    fn from_value_legacy(v: &Value) -> Option<Self> {
         let m = v.as_object()?;
         let f = |k: &str, d: f64| m.get(k).and_then(Value::as_f64).unwrap_or(d);
         let strings = |k: &str| -> Vec<String> {
@@ -3146,6 +3457,12 @@ impl DeskSnap {
                     .collect()
             }),
             inserts,
+            // A legacy desk does not say its ids: the identity rule speaks
+            // for it (see `DeskSnap::ids`). `from_value` sets the rest.
+            ids: RowIds(Vec::new()),
+            next_id: Aside(0),
+            legacy_states: Aside(None),
+            dropped: Aside(Vec::new()),
         })
     }
 }
@@ -3291,6 +3608,12 @@ pub enum LoadOutcome {
     Missing,
     Empty,
     Damaged,
+    /// **The document parses and its format-2 desk does not** (design
+    /// 6.3: too many rows, two rows with one id, not a desk): why, in a
+    /// sentence. Unlike `Damaged` the file is not moved aside, because
+    /// nothing is wrong with the bytes a newer build could not read; the
+    /// open is refused and nothing is written over it.
+    Refused(String),
 }
 
 impl Default for Arrangement {
@@ -3314,6 +3637,12 @@ impl Default for Arrangement {
         }
     }
 }
+
+/// The suffix a document's legacy bytes are kept under: see
+/// [`Arrangement::pre_v8_path`]. Tangent's own file wherever it is found
+/// (`holds_only_scratch` and the Untitled sweeps), and never carried into
+/// a template.
+pub const PRE_V8_SUFFIX: &str = ".pre-v8";
 
 /// **The document's file name, canonical and legacy.** New sessions write
 /// `project.tan` - the owner's call, and no breach of anything: file
@@ -3364,8 +3693,12 @@ impl Arrangement {
     /// writer replaces the damaged file — which was recoverable — with the
     /// emptiness, which is not.
     pub fn load_from(path: &std::path::Path) -> Self {
-        match Self::read_from(path) {
-            LoadOutcome::Loaded(a) => a,
+        // Not through `read_from`: a REFUSED desk is still a document here,
+        // read without its desk and carrying the raw desk in `extra`, so a
+        // lenient caller that saves cannot write the desk away. Every other
+        // failure is the empty document, as it always was.
+        match std::fs::read_to_string(path).map(|t| serde_json::from_str::<Value>(&t)) {
+            Ok(Ok(Value::Object(map))) => Self::from_map(map),
             _ => Self::default(),
         }
     }
@@ -3390,7 +3723,10 @@ impl Arrangement {
             return LoadOutcome::Empty;
         }
         match serde_json::from_str::<Value>(&text) {
-            Ok(Value::Object(map)) => LoadOutcome::Loaded(Self::from_map(map)),
+            Ok(Value::Object(map)) => match Self::from_map_report(map) {
+                (doc, None) => LoadOutcome::Loaded(doc),
+                (_, Some(refused)) => LoadOutcome::Refused(refused.why.to_string()),
+            },
             _ => LoadOutcome::Damaged,
         }
     }
@@ -3403,12 +3739,79 @@ impl Arrangement {
 
     /// Save a document anywhere — the PROJECT system's road out.
     pub fn save_to(&self, path: &std::path::Path) {
+        self.save_to_as(path, crate::desk_format::Format::current());
+    }
+
+    /// `save_to` in `format`. **The first format-2 write over a legacy
+    /// document keeps the legacy one first**, byte for byte, as
+    /// `<doc>.pre-v8` beside it (design 6.7), once and never again: a
+    /// release build handed that file back opens the project whole,
+    /// because no new build renames or deletes a legacy sidecar either.
+    pub(crate) fn save_to_as(&self, path: &std::path::Path, format: crate::desk_format::Format) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        if format == crate::desk_format::Format::V2 {
+            Self::keep_pre_v8(path);
+        }
         let tmp = path.with_extension("tangent.tmp");
-        if std::fs::write(&tmp, self.to_json()).is_ok() {
+        if std::fs::write(&tmp, self.to_json_with_desk_as(self.desk.as_ref(), format)).is_ok() {
             let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// **One top-level key of a document file, changed in place** and
+    /// nothing else: `None` takes it out. The file is parsed, the key
+    /// patched and the rest written back in its own order and this
+    /// writer's own layout, so on a document this build (or any build of
+    /// this writer) wrote, the bytes change by that key alone. Temp and
+    /// rename. `false` when the file is not a document object or did not
+    /// land.
+    ///
+    /// For the heals that must not re-serialise a document, which would
+    /// write it in this build's format: `seed_template`'s `named`.
+    pub fn patch_doc_key(path: &std::path::Path, key: &str, value: Option<Value>) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
+            return false;
+        };
+        match value {
+            Some(v) => {
+                map.insert(key.to_owned(), v);
+            }
+            None => {
+                map.shift_remove(key);
+            }
+        }
+        serde_json::to_string_pretty(&Value::Object(map))
+            .is_ok_and(|out| crate::settings::write_atomic(path, out.as_bytes()))
+    }
+
+    /// Where a document's legacy bytes are kept: `project.tan.pre-v8`
+    /// beside `project.tan`, the document's own extension kept so a
+    /// `project.tangent` keeps its own.
+    pub fn pre_v8_path(doc: &std::path::Path) -> PathBuf {
+        let mut name = doc.as_os_str().to_owned();
+        name.push(PRE_V8_SUFFIX);
+        PathBuf::from(name)
+    }
+
+    /// The backup half of `save_to_as`: the bytes on disk, unless they are
+    /// already format 2 (their first format-2 write was earlier) or a
+    /// backup already stands (the first one is the legacy file).
+    fn keep_pre_v8(doc: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(doc) else {
+            return;
+        };
+        let format2 = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("desk").map(crate::desk_format::is_format2))
+            .unwrap_or(false);
+        let backup = Self::pre_v8_path(doc);
+        if !format2 && !backup.exists() {
+            crate::settings::write_atomic(&backup, &bytes);
         }
     }
 
@@ -3479,7 +3882,20 @@ impl Arrangement {
         }
     }
 
-    fn from_map(mut map: Map<String, Value>) -> Self {
+    fn from_map(map: Map<String, Value>) -> Self {
+        Self::from_map_report(map).0
+    }
+
+    /// `from_map`, and the format-2 desk it refused, if it refused one.
+    ///
+    /// **A refused desk costs the open, never the bytes** (design 6.3). The
+    /// strict road (`read_from`) answers `LoadOutcome::Refused` and the app
+    /// opens nothing; the lenient roads (a template probe, a `named` peek)
+    /// get the document with no desk and the raw desk kept under its own
+    /// key in `extra`, so even a lenient save writes it back as it was.
+    fn from_map_report(
+        mut map: Map<String, Value>,
+    ) -> (Self, Option<crate::desk_format::DeskRefused>) {
         // Version 1 documents simply lack the v2 fields, and every one of
         // them has an honest default — no trim, no fade, name from the file,
         // ids assigned below — so the "migration" is the defaults.
@@ -3498,7 +3914,11 @@ impl Arrangement {
         let era = map
             .get("desk")
             .map_or(crate::desk_lift::DeskEra::V32, crate::desk_lift::era_of_desk);
-        let desk = map.shift_remove("desk").as_ref().and_then(DeskSnap::from_value);
+        let (desk, refused) = match map.shift_remove("desk").as_ref().map(DeskSnap::from_value) {
+            None => (None, None),
+            Some(Ok(desk)) => (desk, None),
+            Some(Err(refused)) => (None, Some(refused)),
+        };
         // **The version-4 migration, and the document's first real one.**
         //
         // A v4 file has no maps and one tempo, which lives on the desk
@@ -3797,7 +4217,10 @@ impl Arrangement {
                 .collect(),
             _ => Vec::new(),
         };
-        Self {
+        if let Some(r) = refused.as_ref() {
+            map.insert("desk".into(), r.raw.clone());
+        }
+        let doc = Self {
             clips,
             desk,
             next_id,
@@ -3810,7 +4233,8 @@ impl Arrangement {
             meter,
             markers,
             automation,
-        }
+        };
+        (doc, refused)
     }
 
     /// The two maps, migrated from whatever the file happened to be.
@@ -3889,7 +4313,10 @@ impl Arrangement {
             .iter()
             .filter_map(|v| {
                 let o = v.as_object()?;
-                let lane = usize::try_from(o.get("lane")?.as_u64()?).ok()?;
+                // A format-2 document names the master's curves by target
+                // (`automation::MASTER_TARGET`); it lands on V32's master
+                // lane, the in-memory lane every era's master is lifted to.
+                let lane = crate::automation::persisted_lane(o, crate::desk_lift::V32_MASTER_LANE)?;
                 // A curve naming a channel this desk does not have is
                 // DROPPED rather than clamped onto channel 15: a level
                 // landing on the wrong instrument is worse than one that
@@ -3951,14 +4378,26 @@ impl Arrangement {
     /// string copied, per committed edit and once per frame, to overwrite a
     /// single `Option`.
     pub fn to_json_with_desk(&self, desk: Option<&DeskSnap>) -> String {
+        self.to_json_with_desk_as(desk, crate::desk_format::Format::current())
+    }
+
+    /// The document in `format`: the road a test takes to a format-2 file
+    /// without flipping [`crate::desk_format::WRITE_V8`].
+    pub(crate) fn to_json_with_desk_as(
+        &self,
+        desk: Option<&DeskSnap>,
+        format: crate::desk_format::Format,
+    ) -> String {
+        let v2 = format == crate::desk_format::Format::V2;
         let mut map = Map::new();
         // The document's OWN version, not this build's constant. See
         // [`Arrangement::version`]: stamping 4 onto a file still carrying a
         // version-9 build's keys — which `extra` faithfully preserves —
-        // would tell that build its own migrations had not run yet.
+        // would tell that build its own migrations had not run yet. A
+        // format-2 desk raises it to 8 at least: the stamp says the shape.
         map.insert(
             "arrangement_version".into(),
-            Value::Number(self.version.into()),
+            Value::Number(self.version.max(format.document_stamp()).into()),
         );
         // **Written NORMALISED, so that reading it back is a fixed point.**
         //
@@ -3984,7 +4423,7 @@ impl Arrangement {
             ),
         );
         if let Some(desk) = desk {
-            map.insert("desk".into(), desk.to_value());
+            map.insert("desk".into(), desk.to_value_as(format));
         }
         // Written only once true: older documents stay byte-identical.
         if self.named {
@@ -4210,7 +4649,16 @@ impl Arrangement {
                         .iter()
                         .map(|c| {
                             let mut o = Map::new();
-                            o.insert("lane".into(), Value::Number((c.lane as u64).into()));
+                            // The master by NAME in format 2 (see
+                            // `automation::MASTER_TARGET`); a row by lane.
+                            if v2 && c.lane == crate::desk_lift::V32_MASTER_LANE {
+                                o.insert(
+                                    "target".into(),
+                                    Value::String(crate::automation::MASTER_TARGET.into()),
+                                );
+                            } else {
+                                o.insert("lane".into(), Value::Number((c.lane as u64).into()));
+                            }
                             o.insert("param".into(), Value::String(c.param.key().to_owned()));
                             // Only on a curve that is waiting for its plugin.
                             if !c.tenant.is_empty() {
@@ -5633,6 +6081,12 @@ mod tests {
                 path: "media/frozen-02-1.wav".into(),
                 len_s: 12.5,
             }]),
+            // A legacy document says no ids; the reader's notes compare
+            // equal whatever they say.
+            ids: RowIds(Vec::new()),
+            next_id: Aside(0),
+            legacy_states: Aside(None),
+            dropped: Aside(Vec::new()),
         });
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
@@ -5791,7 +6245,7 @@ mod tests {
         let mut value = snap.to_value();
         let obj = value.as_object_mut().expect("a desk object");
         assert!(obj.remove("armed").is_some(), "the key was never written");
-        let back = DeskSnap::from_value(&value).expect("the desk should read");
+        let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
         assert_eq!(
             back.armed,
             1 << 1,
@@ -5801,7 +6255,7 @@ mod tests {
         // Written, and read back as itself — including the silent desk.
         for mask in [0u32, 1 << 1, 0b1010] {
             snap.armed = mask;
-            let read = DeskSnap::from_value(&snap.to_value()).expect("the desk should read");
+            let read = DeskSnap::from_value(&snap.to_value()).ok().flatten().expect("the desk should read");
             assert_eq!(read.armed, mask, "the arm mask did not round trip");
         }
     }

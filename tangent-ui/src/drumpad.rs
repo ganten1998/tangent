@@ -59,6 +59,14 @@ const KIT_KEYS: [&str; 3] = ["version", "master", "pads"];
 /// "differed" and rewrite the sidecar for nothing.
 const SIDECAR_KEYS: [&str; 2] = ["primary_lane", "lane_kits"];
 
+/// **The format-2 sidecar's kits, by track** (design 6.8): `"t<id>": kit`.
+/// Present, it is the whole answer; absent, the file is legacy.
+const TRACK_KITS: &str = "track_kits";
+
+/// The format-2 sidecar's panel track, `"t<id>"`: `primary_lane` by
+/// identity.
+const PRIMARY_TRACK: &str = "primary_track";
+
 /// One pad's slot in the document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PadSlot {
@@ -181,6 +189,28 @@ impl DrumpadDoc {
         lanes: usize,
         legacy_lane: Option<usize>,
     ) -> (Vec<Self>, Option<usize>) {
+        Self::load_all_beside_ids(doc, &crate::desk_legacy::identity_ids(lanes), legacy_lane)
+    }
+
+    /// **Every track's kit, by identity** (design 6.8): one per entry of
+    /// `ids`, the desk's rows in lane order.
+    ///
+    /// A file with `track_kits` (`"t<id>": kit`) is read by id alone, its
+    /// `primary_track` naming the panel's track: a kit follows its TRACK,
+    /// so a reorder saved in the kit but not yet in the document lands
+    /// every kit on its own track when both are next read. Such a file
+    /// ignores a top-level kit, `lane_kits` and `primary_lane` entirely:
+    /// they can only be strays from a legacy build that saved over it.
+    ///
+    /// Without `track_kits` the file is legacy (only legacy builds wrote
+    /// those keys) and reads as it always did, its lanes read as ids by the
+    /// identity rule: legacy row r is `TrackId(r)`.
+    pub fn load_all_beside_ids(
+        doc: &std::path::Path,
+        ids: &[crate::desk_id::TrackId],
+        legacy_lane: Option<usize>,
+    ) -> (Vec<Self>, Option<usize>) {
+        let lanes = ids.len();
         let mut out: Vec<Self> = (0..lanes).map(|_| Self::default()).collect();
         let Ok(text) = std::fs::read_to_string(Self::sidecar(doc)) else {
             return (out, None);
@@ -194,6 +224,26 @@ impl DrumpadDoc {
         let Ok(Value::Object(mut root)) = serde_json::from_str::<Value>(&text) else {
             return (out, None);
         };
+        if let Some(Value::Object(kits)) = root.shift_remove(TRACK_KITS) {
+            let lane_of = |key: &str| {
+                let id = key.strip_prefix('t')?.parse::<u32>().ok()?;
+                // Canonical spelling only, the grammar's rule: `t03` is
+                // not `t3`.
+                (format!("t{id}") == key).then_some(())?;
+                ids.iter().position(|t| t.0 == id)
+            };
+            for (key, v) in kits {
+                // A kit for a track this desk does not hold is left out:
+                // there is no lane to put it on.
+                let Some(lane) = lane_of(&key) else { continue };
+                out[lane] = match v {
+                    Value::Object(m) => Self::from_value(m),
+                    _ => Self::default(),
+                };
+            }
+            let primary = root.get(PRIMARY_TRACK).and_then(Value::as_str).and_then(lane_of);
+            return (out, primary);
+        }
         // The file's own word first; the desk's answer second; lane 0 only
         // when neither has an opinion.
         let said = root.get("primary_lane").and_then(Value::as_u64).map(|n| n as usize);
@@ -233,9 +283,63 @@ impl DrumpadDoc {
         (out, stated)
     }
 
-    /// **Every lane's kit into the one sidecar.** See `load_all_beside` for
-    /// why the primary kit is also written at the top level.
+    /// **Every lane's kit into the one sidecar**, its lanes read as ids by
+    /// the identity rule. The host's road until it holds the desk's ids;
+    /// the app writes through [`Self::save_all_beside_ids`].
     pub fn save_all_beside(kits: &[Self], primary: usize, doc: &std::path::Path) {
+        let ids = crate::desk_legacy::identity_ids(kits.len());
+        Self::save_all_beside_as(kits, &ids, primary, doc, crate::desk_format::Format::current());
+    }
+
+    /// **Every track's kit into the one sidecar**: `kits[lane]` is the kit
+    /// of the track `ids[lane]`. Format 2 when [`crate::desk_format::WRITE_V8`]
+    /// says so, today's bytes otherwise.
+    pub fn save_all_beside_ids(
+        kits: &[Self],
+        ids: &[crate::desk_id::TrackId],
+        primary: usize,
+        doc: &std::path::Path,
+    ) {
+        Self::save_all_beside_as(kits, ids, primary, doc, crate::desk_format::Format::current());
+    }
+
+    /// The sidecar in `format`. **Format 2 names each kit by its track**
+    /// (`track_kits`, `primary_track`) and nothing else: no lane key and no
+    /// top-level kit is ever written again, so a reorder can never strand a
+    /// kit on the lane its track left. A kit whose lane has no id is not
+    /// written; the desk is the one that says which tracks exist.
+    pub(crate) fn save_all_beside_as(
+        kits: &[Self],
+        ids: &[crate::desk_id::TrackId],
+        primary: usize,
+        doc: &std::path::Path,
+        format: crate::desk_format::Format,
+    ) {
+        if format == crate::desk_format::Format::Legacy {
+            Self::save_all_beside_legacy(kits, primary, doc);
+            return;
+        }
+        let mut track_kits = Map::new();
+        for (lane, kit) in kits.iter().enumerate() {
+            let Some(id) = ids.get(lane) else { continue };
+            // An empty kit is the absence of one, the legacy writer's rule.
+            if !kit.is_empty() {
+                track_kits.insert(id.to_string(), Value::Object(kit.to_value()));
+            }
+        }
+        let mut root = Map::new();
+        root.insert(TRACK_KITS.into(), Value::Object(track_kits));
+        if let Some(id) = ids.get(primary) {
+            root.insert(PRIMARY_TRACK.into(), Value::String(id.to_string()));
+        }
+        let path = Self::sidecar(doc);
+        let text = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        crate::settings::write_atomic(&path, text.as_bytes());
+    }
+
+    /// Today's bytes: the primary kit at the top level for a pre-lanes
+    /// build, `lane_kits` by lane, `primary_lane`.
+    fn save_all_beside_legacy(kits: &[Self], primary: usize, doc: &std::path::Path) {
         // The kit's map straight into the root. This used to pretty-print
         // each kit to text and parse it back into a `Value` — 128 pads
         // through the printer and the parser per kit per save — to arrive
@@ -1915,5 +2019,92 @@ mod fingerprint_tests {
             "the compact form is not a fixed point"
         );
         assert_eq!(mark(&back), mark(&kits), "a round trip moved the fingerprint");
+    }
+}
+
+/// **The sidecar by identity** (W3-persist-v23-v8, design 6.8).
+#[cfg(test)]
+mod track_kit_tests {
+    use super::*;
+    use crate::desk_format::Format;
+    use crate::desk_id::TrackId;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-w3-kits-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir.join(crate::arrangement::DOC_NAME)
+    }
+
+    fn kit(tag: &str) -> DrumpadDoc {
+        let mut k = DrumpadDoc::default();
+        k.pads[36].path = format!("media/{tag}.wav");
+        k
+    }
+
+    /// **A kit follows its TRACK**: written by id and read against a desk
+    /// whose rows have moved since, every kit lands on its own track and the
+    /// panel's track is still the panel's. No lane key is written.
+    #[test]
+    fn a_kit_follows_its_track_across_a_reorder() {
+        let doc = scratch("follow");
+        let ids = [TrackId(0), TrackId(7), TrackId(40), TrackId(3)];
+        let kits = vec![kit("a"), DrumpadDoc::default(), kit("c"), kit("d")];
+        DrumpadDoc::save_all_beside_as(&kits, &ids, 2, &doc, Format::V2);
+        let text = std::fs::read_to_string(DrumpadDoc::sidecar(&doc)).expect("sidecar");
+        let v: Value = serde_json::from_str(&text).expect("json");
+        assert!(
+            v.get("lane_kits").is_none() && v.get("primary_lane").is_none() && v.get("pads").is_none(),
+            "a legacy key was written: {text}"
+        );
+        // The desk moved: t40 is on lane 0 now, t0 on lane 3.
+        let moved = [TrackId(40), TrackId(3), TrackId(7), TrackId(0)];
+        let (back, primary) = DrumpadDoc::load_all_beside_ids(&doc, &moved, None);
+        assert_eq!(back[0], kits[2]);
+        assert_eq!(back[1], kits[3]);
+        assert!(back[2].is_empty());
+        assert_eq!(back[3], kits[0]);
+        assert_eq!(primary, Some(0), "the panel's track was not followed");
+        let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
+    }
+
+    /// **A file with `track_kits` ignores every legacy key in it**: a stray
+    /// top-level kit, `lane_kits` and `primary_lane` can only be a legacy
+    /// build's leftovers, and reading them would put a kit on a lane by a
+    /// position that no longer means anything.
+    #[test]
+    fn track_kits_ignore_a_stray_top_level_kit_and_primary_lane() {
+        let doc = scratch("stray");
+        let mut root = kit("stray").to_value();
+        root.insert("primary_lane".into(), Value::from(1u64));
+        root.insert("lane_kits".into(), serde_json::json!({ "1": kit("lane").to_value() }));
+        root.insert("track_kits".into(), serde_json::json!({ "t5": kit("five").to_value() }));
+        root.insert("primary_track".into(), Value::from("t5"));
+        std::fs::write(DrumpadDoc::sidecar(&doc), Value::Object(root).to_string()).expect("file");
+        let ids = crate::desk_legacy::identity_ids(8);
+        let (back, primary) = DrumpadDoc::load_all_beside_ids(&doc, &ids, Some(0));
+        assert_eq!(back[5], kit("five"));
+        assert_eq!(primary, Some(5));
+        for (lane, k) in back.iter().enumerate().filter(|(l, _)| *l != 5) {
+            assert!(k.is_empty(), "lane {lane} took a legacy kit");
+        }
+        let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
+    }
+
+    /// **Without the switch, today's bytes**: the id-keyed writer in the
+    /// legacy format is the legacy writer, whatever the ids say.
+    #[test]
+    fn the_legacy_format_writes_todays_bytes() {
+        let doc = scratch("legacy");
+        let kits = vec![kit("a"), kit("b")];
+        DrumpadDoc::save_all_beside_legacy(&kits, 1, &doc);
+        let want = std::fs::read(DrumpadDoc::sidecar(&doc)).expect("legacy");
+        DrumpadDoc::save_all_beside_as(&kits, &[TrackId(9), TrackId(4)], 1, &doc, Format::Legacy);
+        assert_eq!(std::fs::read(DrumpadDoc::sidecar(&doc)).expect("ids"), want);
+        let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
     }
 }

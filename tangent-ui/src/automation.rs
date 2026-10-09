@@ -27,6 +27,27 @@
 //! default for the same reason: a curve drawn against a performance belongs
 //! where it was drawn.
 
+/// **The persisted name of the master's curves in a format-2 document**:
+/// `{"target": "master"}` in place of a `lane`.
+///
+/// A lane number for the master was the channel count, so it moved every
+/// time the desk grew (16, then 24, then 32), and every older document's
+/// master curves needed `desk_lift::master_auto_lane` to find them again. A
+/// name does not move. Rows keep `{"lane": row}`: a row's lane is its
+/// position, which the structural edits carry with the curve.
+pub const MASTER_TARGET: &str = "master";
+
+/// **Where a persisted curve says it lives**, read off its object: a row's
+/// `lane`, or the master by `target`. `None` for a curve that says neither
+/// (or names a target this build does not have), which the reader drops
+/// rather than guesses at.
+pub fn persisted_lane(o: &serde_json::Map<String, serde_json::Value>, master_lane: usize) -> Option<usize> {
+    match o.get("target") {
+        Some(t) => (t.as_str()? == MASTER_TARGET).then_some(master_lane),
+        None => usize::try_from(o.get("lane")?.as_u64()?).ok(),
+    }
+}
+
 /// Which control a curve moves.
 ///
 /// **An index space that is persisted**, so it is append-only like every
