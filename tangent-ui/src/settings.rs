@@ -411,6 +411,61 @@ fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
     s.strip_soloed = move_mask(s.strip_soloed);
 }
 
+/// **A pre-lanes project's pad plugins follow their drumpad.**
+///
+/// Before a drum instrument could load on more than one channel, there was
+/// exactly one drumpad and its hundred and twenty-eight pad racks sat right
+/// after the master (seat 36 in V32). That block belongs to CHANNEL 0 now,
+/// because a per-channel map has to key on something stable and the ordinal
+/// among drum lanes moves whenever one is added.
+///
+/// So a session whose drumpad was on channel 7 would find its per-pad
+/// plugins on channel 0's pads — somebody else's kit, or nobody's. This
+/// moves them once, on load, before anything reads them.
+///
+/// **On the lifted V32 desk, at the V32 literals.** It read `STRIPS`,
+/// `CHANNELS` and `pad_rack_index`, so the next desk shape would have moved
+/// the legacy block it looks for along with everything else. It is part of
+/// the legacy read and nothing else; a desk written in the identity format
+/// has no legacy block to find.
+///
+/// It runs on every legacy load and is a no-op for the overwhelming
+/// majority: the block is empty unless somebody put a plugin on an
+/// individual pad.
+fn move_legacy_pad_racks(inserts: &mut Vec<String>) {
+    use crate::desk_lift::{v32_pad_seat, PADS, V32_BAYS, V32_CHANNELS, V32_INSERT_SPACE, V32_PAD_BLOCK};
+    // Which channel carries the drumpad, by the same sentinel the engine
+    // reads. Channel 0 already owns the legacy block; nothing to do.
+    let Some(ch) = (1..V32_CHANNELS).find(|c| {
+        inserts
+            .get(c * V32_BAYS)
+            .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+    }) else {
+        return;
+    };
+    let legacy = V32_PAD_BLOCK * V32_BAYS;
+    let span = PADS * V32_BAYS;
+    if inserts.len() < legacy + span
+        || inserts[legacy..legacy + span].iter().all(String::is_empty)
+    {
+        return;
+    }
+    // The destination has to exist before anything is written into it.
+    if inserts.len() < V32_INSERT_SPACE {
+        inserts.resize(V32_INSERT_SPACE, String::new());
+    }
+    for pad in 0..PADS {
+        for bay in 0..V32_BAYS {
+            let from = (V32_PAD_BLOCK + pad) * V32_BAYS + bay;
+            let to = v32_pad_seat(ch, pad) * V32_BAYS + bay;
+            if from == to {
+                continue;
+            }
+            inserts[to] = std::mem::take(&mut inserts[from]);
+        }
+    }
+}
+
 /// Recorder backgrounds this app shipped as defaults before [`SETTINGS_VERSION`]
 /// 1, and which are therefore not evidence that anybody chose them.
 const V0_RECORDER_BG: [&str; 2] = ["#4a3b2c", "#33271b"];
@@ -1752,11 +1807,17 @@ pub struct Settings {
     /// stepped up 8. The host renames their insert-state sidecars once.
     /// Set by `adopt_desk` on an eight-channel-era desk, never serialized.
     pub desk_state_shift_v19: bool,
-    /// **The channel count grew 16 -> 24** (the supporter desk), so every
-    /// seat at or above the old channel block stepped up 8. The host
-    /// renames the insert-state sidecars once. Set by `adopt_desk` on a
-    /// sixteen-channel-era desk, never serialized.
+    /// **The channel count grew 16 -> 32**, so every seat at or above the
+    /// old channel block stepped up 16. The host renames the insert-state
+    /// sidecars once. Set by `adopt_desk` on a sixteen-channel-era desk
+    /// (and, after v19, on an eight-channel one), never serialized.
     pub desk_state_shift_v20: bool,
+    /// **The 24-channel window grew to 32**: every seat from 24 up stepped
+    /// up 8. Set by `adopt_desk` on a 27-sends desk, never serialized.
+    /// The host has no in-place rename for it and never will (a new build
+    /// renames no legacy sidecar); the copy-only shelf conversion reads it
+    /// through [`Settings::shelf_shuffles`].
+    pub desk_state_shift_v24: bool,
     /// Draw the menu and the dialogs INSIDE the main window, so a screen
     /// reader can reach them.
     ///
@@ -1879,6 +1940,7 @@ impl Default for Settings {
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
             desk_state_shift_v20: false,
+            desk_state_shift_v24: false,
             screen_reader_mode: false,
             window_w: None,
             window_h: None,
@@ -3772,160 +3834,52 @@ impl Settings {
         s
     }
 
-    /// Fold the file's desk arrays into this build's fixed ones.
+    /// **The file's desk, lifted onto the frozen V32 shape, then folded into
+    /// this build's arrays.**
     ///
-    /// Rows past the end are dropped HERE, after the migration has had its
-    /// chance to move anything worth keeping — which is the whole point of
-    /// [`LegacyDesk`]. A row that reaches this function and does not fit is a
-    /// row the migration decided not to carry.
-     /// **A pre-lanes project's pad plugins follow their drumpad.**
+    /// Two halves, and the line between them is the point. Everything here is
+    /// history: the era comes off the file's own lengths
+    /// ([`crate::desk_lift::era_of`]), and every strip row, every strip mask
+    /// (phase included) and every bay goes through `desk_lift` at the V32
+    /// literals, as does the pre-lanes pad move. A lift that read today's
+    /// `CHANNELS` would redefine itself the next time the desk changed shape,
+    /// which is how the 24-channel window came to have no arm at all: its
+    /// buses and its master opened on channels 24..26. Only
+    /// [`Self::fold_v32_desk`] knows this build's widths.
     ///
-    /// Before a drum instrument could load on more than one channel, there
-    /// was exactly one drumpad and its hundred and twenty-eight pad racks
-    /// sat at `STRIPS + 1`. That block belongs to CHANNEL 0 now, because a
-    /// per-channel map has to key on something stable and the ordinal among
-    /// drum lanes moves whenever one is added.
-    ///
-    /// So a session whose drumpad was on channel 7 would find its per-pad
-    /// plugins on channel 0's pads — somebody else's kit, or nobody's. This
-    /// moves them once, on load, before anything reads them.
-    ///
-    /// It runs on every load and is a no-op for the overwhelming majority:
-    /// the block is empty unless somebody put a plugin on an individual pad.
-    fn move_legacy_pad_racks(&mut self) {
-        use crate::recorder::{DRUM_PADS, INSERTS, STRIPS};
-        let ins = INSERTS;
-        // Which channel carries the drumpad, by the same sentinel the engine
-        // reads. Channel 0 already owns the legacy block; nothing to do.
-        let Some(ch) = (1..crate::recorder::CHANNELS).find(|c| {
-            self.strip_inserts
-                .get(c * ins)
-                .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
-        }) else {
-            return;
-        };
-        let legacy = (STRIPS + 1) * INSERTS;
-        let span = DRUM_PADS * INSERTS;
-        if self.strip_inserts.len() < legacy + span
-            || self.strip_inserts[legacy..legacy + span]
-                .iter()
-                .all(String::is_empty)
-        {
-            return;
-        }
-        // The destination has to exist before anything is written into it.
-        if self.strip_inserts.len() < crate::recorder::INSERT_SPACE {
-            self.strip_inserts
-                .resize(crate::recorder::INSERT_SPACE, String::new());
-        }
-        for pad in 0..DRUM_PADS {
-            for bay in 0..INSERTS {
-                let from = (STRIPS + 1 + pad) * INSERTS + bay;
-                let to = crate::recorder::pad_rack_index(ch, pad) * INSERTS + bay;
-                if from == to {
-                    continue;
-                }
-                self.strip_inserts[to] = std::mem::take(&mut self.strip_inserts[from]);
+    /// Rows past the end are dropped in the fold, after the migration has had
+    /// its chance to move anything worth keeping, which is the whole point of
+    /// [`LegacyDesk`]. A row that reaches the fold and does not fit is a row
+    /// the migration decided not to carry.
+    fn adopt_desk(&mut self, desk: LegacyDesk) {
+        use crate::desk_lift::{self as lift, DeskEra};
+        let era = lift::era_of(desk.sends.len(), desk.inserts.len());
+        let mut colors = lift::lift_strip_rows(era, desk.colors, 0, true, true);
+        let names = lift::lift_strip_rows(era, desk.names, String::new(), true, true);
+        let sends = lift::lift_strip_rows(era, desk.sends, 0.0, false, true);
+        let mut inserts = lift::lift_bays(era, desk.inserts, true);
+        // **Phase with mute and solo.** It arrived inside the sixteen-channel
+        // era and was the one strip mask this lift left where the file had
+        // it, so a phase-inverted drum bus came back as an inverted channel
+        // 16 while the real drum bus played the right way up.
+        self.strip_muted = lift::lift_strip_mask(era, self.strip_muted, true);
+        self.strip_soloed = lift::lift_strip_mask(era, self.strip_soloed, true);
+        self.strip_phase = lift::lift_strip_mask(era, self.strip_phase, true);
+        // The host renames the seat-numbered global sidecars once, by the
+        // in-place shuffles that take this era to V32 (`shelf_shuffles`
+        // names the same set). **The eight-channel era needs v20 as well
+        // as v19**: v19 only ever took it to sixteen (+8), and since the
+        // desk grew past sixteen the lift has moved its buses, master and
+        // pads +24 while the shelf followed +8, so the master's saved
+        // knobs were looked for on what is now channel 19.
+        match era {
+            DeskEra::V8Pads16 | DeskEra::V8 => {
+                self.desk_state_shift_v19 = true;
+                self.desk_state_shift_v20 = true;
             }
-        }
-    }
-
-   fn adopt_desk(&mut self, mut desk: LegacyDesk) {
-        // **The sixteen-pad era → 128 pads, base 12.** A desk from before the
-        // pad rescale carries `(V12_STRIPS+1+16)*V11_INSERTS` insert seats and
-        // its pads were keys 36..51. Done on the staging at the FROZEN v18
-        // base, and FIRST — before the channel widening below moves that base.
-        if desk.inserts.len() == (V12_STRIPS + 1 + 16) * V11_INSERTS {
-            desk.inserts
-                .resize((V12_STRIPS + 1 + 128) * V11_INSERTS, String::new());
-            for pad in (0..16usize).rev() {
-                for bay in 0..V11_INSERTS {
-                    let from = (V12_STRIPS + 1 + pad) * V11_INSERTS + bay;
-                    let to = (V12_STRIPS + 1 + 36 + pad) * V11_INSERTS + bay;
-                    desk.inserts[to] = std::mem::take(&mut desk.inserts[from]);
-                }
-            }
-        }
-        // **An eight-channel-era desk, grown to today's channel count.** Its
-        // drums/click/fx/master and every pad-insert seat sit `V12_CHANNELS`
-        // slots low; fold them up by inserting the new channels at index
-        // `V12_CHANNELS`. Keyed on the sends length — `V12_STRIPS` is the
-        // era's fingerprint — so a desk already at today's width is left
-        // alone, and so is a future width (its own step will detect its own
-        // length). This is `adopt_desk`, the fold-onto-today function, so
-        // reading today's `CHANNELS` here is right where the migration rule
-        // forbids it in the frozen `migrate_*` steps.
-        if desk.sends.len() == V12_STRIPS && crate::recorder::CHANNELS > V12_CHANNELS {
-            let grow = crate::recorder::CHANNELS - V12_CHANNELS;
-            let at = V12_CHANNELS;
-            for _ in 0..grow {
-                if at <= desk.colors.len() {
-                    desk.colors.insert(at, 0);
-                }
-                if at <= desk.names.len() {
-                    desk.names.insert(at, String::new());
-                }
-                if at <= desk.sends.len() {
-                    desk.sends.insert(at, 0.0);
-                }
-            }
-            let ins_at = at * V11_INSERTS;
-            for _ in 0..(grow * V11_INSERTS) {
-                if ins_at <= desk.inserts.len() {
-                    desk.inserts.insert(ins_at, String::new());
-                }
-            }
-            // The masks live on `self`; bits at or above the insert point
-            // step up by `grow`. Bits below (the kept channels) stay.
-            let move_mask = |mask: u64| -> u64 {
-                let keep = mask & ((1u64 << at) - 1);
-                let above = mask >> at;
-                keep | (above << (at + grow))
-            };
-            self.strip_muted = move_mask(self.strip_muted);
-            self.strip_soloed = move_mask(self.strip_soloed);
-            // The host renames the seat-numbered insert-state sidecars once:
-            // drums/click/fx/master and all 128 pad seats just moved up.
-            self.desk_state_shift_v19 = true;
-        }
-        // **A sixteen-channel-era desk, grown to twenty-four.** The next
-        // fingerprint down the years: nineteen sends is 4.82-through-5.0.
-        // Same fold as the eight-era block above; the masks and the whole
-        // seat map (buses, master, every pad block) step up by exactly
-        // eight, which `shift_insert_states_for_v20` mirrors on disk.
-        const V19_CHANNELS: usize = 16;
-        if desk.sends.len() == 19 && crate::recorder::CHANNELS > V19_CHANNELS {
-            let grow = crate::recorder::CHANNELS - V19_CHANNELS;
-            let at = V19_CHANNELS;
-            for _ in 0..grow {
-                if at <= desk.colors.len() {
-                    desk.colors.insert(at, 0);
-                }
-                if at <= desk.names.len() {
-                    desk.names.insert(at, String::new());
-                }
-                if at <= desk.sends.len() {
-                    desk.sends.insert(at, 0.0);
-                }
-            }
-            let ins_at = at * V11_INSERTS;
-            for _ in 0..(grow * V11_INSERTS) {
-                if ins_at <= desk.inserts.len() {
-                    desk.inserts.insert(ins_at, String::new());
-                }
-            }
-            let move_mask = |mask: u64| -> u64 {
-                let keep = mask & ((1u64 << at) - 1);
-                let above = mask >> at;
-                keep | (above << (at + grow))
-            };
-            self.strip_muted = move_mask(self.strip_muted);
-            self.strip_soloed = move_mask(self.strip_soloed);
-            self.desk_state_shift_v20 = true;
-        }
-
-        for (i, n) in desk.colors.iter().take(crate::recorder::STRIPS + 1).enumerate() {
-            self.strip_colors[i] = *n;
+            DeskEra::V16 => self.desk_state_shift_v20 = true,
+            DeskEra::V24 => self.desk_state_shift_v24 = true,
+            DeskEra::V16NoDrumBus | DeskEra::V32 => {}
         }
         // **The click and the master rejoin the palette.** Both used to SHIP
         // hand-painted — amber and red — so every desk ever saved carries a
@@ -3934,29 +3888,45 @@ impl Settings {
         // would be the only two strips a theme could never move, which is
         // exactly what the owner saw. Recognised by their old default value
         // and only there: a click somebody really did paint amber is a click
-        // that stays amber.
+        // that stays amber. At V32's click (33) and master (35).
         for (slot, legacy) in [
-            (
-                crate::recorder::Strip::Click.index(),
-                crate::mixer_panel::LEGACY_CLICK_COLOR,
-            ),
-            (
-                crate::recorder::STRIPS,
-                crate::mixer_panel::LEGACY_MASTER_COLOR,
-            ),
+            (lift::V32_CLICK, crate::mixer_panel::LEGACY_CLICK_COLOR),
+            (lift::V32_MASTER, crate::mixer_panel::LEGACY_MASTER_COLOR),
         ] {
-            if self.strip_colors[slot] == legacy {
-                self.strip_colors[slot] = 0;
+            if let Some(c) = colors.get_mut(slot).filter(|c| **c == legacy) {
+                *c = 0;
             }
         }
-        for (i, n) in desk.sends.iter().take(crate::recorder::STRIPS).enumerate() {
-            self.strip_sends[i] = *n;
+        if !inserts.is_empty() {
+            // **The whole V32 seat map**, which includes the master's second
+            // rack. Truncating to the old length would drop the three bays
+            // that live past the pads every time a session was loaded.
+            inserts.truncate(lift::V32_INSERT_SPACE);
+            inserts.resize(lift::V32_INSERT_SPACE, String::new());
+            move_legacy_pad_racks(&mut inserts);
         }
-        if !desk.inserts.is_empty() {
-            self.strip_inserts = desk.inserts;
-            // **`INSERT_SPACE`, which includes the master's second rack.**
-            // Truncating to the old length would drop the three bays that
-            // live past the pads every time a session was loaded.
+        self.fold_v32_desk(colors, names, sends, inserts);
+    }
+
+    /// **The one place the settings desk meets this build's widths.** A V32
+    /// desk (`adopt_desk`'s output) copied into the live arrays from the
+    /// front; a live desk of another width is a later wave's business, and
+    /// every lift before this line is literal so that it can be.
+    fn fold_v32_desk(
+        &mut self,
+        colors: Vec<i64>,
+        names: Vec<String>,
+        sends: Vec<f64>,
+        inserts: Vec<String>,
+    ) {
+        for (dst, n) in self.strip_colors.iter_mut().zip(colors) {
+            *dst = n;
+        }
+        for (dst, n) in self.strip_sends.iter_mut().zip(sends) {
+            *dst = n;
+        }
+        if !inserts.is_empty() {
+            self.strip_inserts = inserts;
             self.strip_inserts.truncate(crate::recorder::INSERT_SPACE);
             // **Back to full length.** The writer trims trailing empties so
             // the file does not carry thousands of `""`, which means what
@@ -3966,12 +3936,35 @@ impl Settings {
             // small and the value identical.
             self.strip_inserts
                 .resize(crate::recorder::INSERT_SPACE, String::new());
-            self.move_legacy_pad_racks();
         }
-        if !desk.names.is_empty() {
-            self.strip_names = desk.names;
+        if !names.is_empty() {
+            self.strip_names = names;
             self.strip_names.truncate(crate::recorder::STRIPS + 1);
         }
+    }
+
+    /// **Which in-place global-shelf renames this load raised**, as the set
+    /// [`crate::desk_lift::legacy_shelf_seat`] composes. A set and not the
+    /// stamp: v13, v14 and v18 come from the version, v19, v20 and v24 from
+    /// the desk's sends length, which no stamp records. The copy-only shelf
+    /// conversion reads this (or the durable pending marker written from it)
+    /// instead of renaming anything.
+    pub fn shelf_shuffles(&self) -> crate::desk_lift::ShelfShuffles {
+        use crate::desk_lift::ShelfShuffles as S;
+        let mut set = S::NONE;
+        for (on, s) in [
+            (self.desk_state_shift_v13, S::V13),
+            (self.desk_state_shift_v14, S::V14),
+            (self.pad_state_shift_v18, S::V18),
+            (self.desk_state_shift_v19, S::V19),
+            (self.desk_state_shift_v20, S::V20),
+            (self.desk_state_shift_v24, S::V24),
+        ] {
+            if on {
+                set.insert(s);
+            }
+        }
+        set
     }
 
     /// Move a file written before [`SETTINGS_VERSION`] onto the defaults it
@@ -4088,7 +4081,7 @@ impl Settings {
             // through adoption (the pad rescale and the v19 widening both
             // move seats ABOVE them), so the staged write lands.
             let (seats, bay0): (&mut Vec<String>, usize) = if desk.inserts.is_empty() {
-                (&mut self.strip_inserts, 7 * crate::recorder::INSERTS)
+                (&mut self.strip_inserts, 7 * V11_INSERTS)
             } else {
                 (&mut desk.inserts, 7 * V11_INSERTS)
             };
@@ -4103,7 +4096,9 @@ impl Settings {
                     seats.push(String::new());
                 }
                 seats[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
-                while self.channel_inputs.len() < crate::recorder::CHANNELS {
+                // To the frozen V32 width, as this always grew it: the
+                // channel arrays keep their indices through every lift.
+                while self.channel_inputs.len() < crate::desk_lift::V32_CHANNELS {
                     self.channel_inputs.push(String::new());
                 }
                 if self.channel_inputs[7].is_empty() {
@@ -4119,10 +4114,11 @@ impl Settings {
             // named input rode the ordinal walk, whose guess this migration
             // must not freeze into a binding — it keeps its kind and shows
             // NO INPUT until somebody names one in the menu.
-            while self.channel_inputs.len() < crate::recorder::CHANNELS {
+            // The frozen V32 width, as at `was < 17`: never the live one.
+            while self.channel_inputs.len() < crate::desk_lift::V32_CHANNELS {
                 self.channel_inputs.push(String::new());
             }
-            for ch in 0..crate::recorder::CHANNELS {
+            for ch in 0..crate::desk_lift::V32_CHANNELS {
                 if self.channel_kinds.get(ch).copied() == Some(1)
                     && self.channel_inputs[ch].is_empty()
                 {
@@ -7457,7 +7453,7 @@ mod tests {
         let legacy = (STRIPS + 1 + 36) * INSERTS;
         s.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
 
-        s.move_legacy_pad_racks();
+        move_legacy_pad_racks(&mut s.strip_inserts);
 
         // It followed the drumpad to channel 7's block, and left nothing
         // behind on channel 0's — which is somebody else's kit now.
@@ -7476,8 +7472,8 @@ mod tests {
         let mut z = bare();
         z.strip_inserts[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
         z.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
-        z.move_legacy_pad_racks();
-        z.move_legacy_pad_racks();
+        move_legacy_pad_racks(&mut z.strip_inserts);
+        move_legacy_pad_racks(&mut z.strip_inserts);
         assert_eq!(z.strip_inserts[legacy], "/x/Kick.vst3", "channel 0 lost its pad plugin");
 
         // And a session with no per-pad plugins at all is untouched, which
@@ -7485,7 +7481,7 @@ mod tests {
         let mut plain = bare();
         plain.strip_inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
         let before = plain.strip_inserts.clone();
-        plain.move_legacy_pad_racks();
+        move_legacy_pad_racks(&mut plain.strip_inserts);
         assert_eq!(plain.strip_inserts, before, "an empty pad block was rewritten");
         let _ = DRUM_PADS;
     }
@@ -8283,28 +8279,31 @@ mod tests {
 
         // The source itself, because a comment cannot be tested and this rule
         // is one somebody will break by reaching for the nearest constant.
+        //
+        // **By identifier, over every historical region**: the frozen
+        // `migrate_*` steps and the pre-lanes pad move, `migrate_from`, and
+        // `adopt_desk` (the lift half; `fold_v32_desk` is the one place that
+        // may know this build's widths). Comments explain the frozen numbers
+        // by naming the live ones, which is right in prose, so the search is
+        // over CODE; and a frozen name such as `V12_CHANNELS` is its own
+        // identifier, never a match for `CHANNELS`. The banned list is the
+        // corpus's: every capacity constant the unlimited desk deletes.
         let src = include_str!("settings.rs");
-        let migrations = &src[src
-            .find("fn desk_channel_moved")
-            .expect("the migration helper is still called that")
-            ..src.find("/// Recorder backgrounds this app shipped").expect("anchor")];
-        // Comments explain the frozen numbers by naming the live ones, which is
-        // exactly right in prose and would be a false positive here — so the
-        // search is over CODE. And the frozen constants are named after the
-        // live ones, so they come out first.
-        let mut live: String = migrations
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for frozen in ["V10_SLOTS", "V10_INPUTS", "V11_STRIPS", "V11_INSERTS", "V11_FX_INDEX"] {
-            live = live.replace(frozen, "");
-        }
-        for banned in ["SLOTS", "INPUTS", "INSERTS", "Strip::"] {
+        use crate::era_corpus::{banned_in, region};
+        for (what, code, allow) in [
+            (
+                "the frozen migrate_* steps",
+                region(src, "fn desk_channel_moved", "/// Recorder backgrounds this app shipped"),
+                &[][..],
+            ),
+            // `recorder::VideoMode` and `recorder::Layout` are not desk shape.
+            ("migrate_from", region(src, "    fn migrate_from(", "\n    }\n"), &["recorder"][..]),
+            ("adopt_desk", region(src, "    fn adopt_desk(", "    fn fold_v32_desk("), &[][..]),
+        ] {
+            let read = banned_in(code, allow);
             assert!(
-                !live.contains(banned),
-                "a historical migration reads the live `{banned}`; freeze it \
-                 beside `V10_SLOTS` instead"
+                read.is_empty(),
+                "{what} reads the live {read:?}; freeze it beside `V10_SLOTS` or in `desk_lift`"
             );
         }
     }
