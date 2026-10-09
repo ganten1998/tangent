@@ -2938,6 +2938,36 @@ pub fn output_device_names() -> Result<Vec<String>, AudioError> {
     })
 }
 
+/// **[`output_device_names`] for the system named `want`** (`None`: the
+/// platform default), or `None` when that is not the system the listing
+/// would answer for.
+///
+/// **A wrong answer is worse than none.** Every listing goes through the
+/// process-wide [`system`], and the desktop moves that a frame after the
+/// setting, so a Setup panel asking straight after a SYSTEM press was handed
+/// the old system's names to offer as the new one's - and the owner's tester
+/// had to close Setup and reopen it to find his Komplete Audio's ASIO
+/// driver. Refused, the panel asks again next frame, and the refusal is one
+/// lock and a string compare: nothing is enumerated until the process agrees.
+///
+/// **ASIO is answered whatever the process is on**, from the registry
+/// [`output_device_names`] already reads for it, with no driver loaded. That
+/// matters on the one road where the process never agrees: a failed ASIO
+/// open sets [`system`] to the platform default for the stand-in, and the
+/// interface's driver is exactly what the person then needs to pick.
+pub fn output_device_names_for(want: Option<&str>) -> Option<Result<Vec<String>, AudioError>> {
+    #[cfg(all(windows, feature = "asio"))]
+    {
+        if want == Some("ASIO") {
+            return Some(Ok(asio_output_rows(asio_sys::Asio::new().driver_names())));
+        }
+    }
+    if system().as_deref() != want {
+        return None;
+    }
+    Some(output_device_names())
+}
+
 /// **The registry's ASIO driver names as OUTPUT rows**: in the registry's
 /// order, each name once, and no blank one.
 ///
@@ -3614,6 +3644,23 @@ mod tests {
         // Put the process-global choice back for whoever runs next.
         set_system(baseline_system.as_deref());
         with_host(|_| ());
+    }
+
+    /// **A listing for a system the process is not on is refused, not
+    /// answered for the wrong one.** Setup asks straight after a SYSTEM
+    /// press, before the desktop has moved the process, and the old system's
+    /// names came back as the new one's. Asked by a name no test ever
+    /// chooses, so a test switching the process-wide system alongside cannot
+    /// make it agree.
+    #[test]
+    fn a_listing_for_a_system_not_switched_to_is_refused() {
+        assert!(
+            output_device_names_for(Some("a-system-no-test-chooses")).is_none(),
+            "a system the process is not on was listed through the one it is on"
+        );
+        // ASIO is the exception only where its registry is compiled in.
+        #[cfg(not(all(windows, feature = "asio")))]
+        assert!(output_device_names_for(Some("ASIO")).is_none());
     }
 
     /// **The active system is the one the host was built as**, never the

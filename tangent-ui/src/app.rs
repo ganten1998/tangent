@@ -31840,11 +31840,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // one. Under ASIO `outputs()` reads the registry's driver names and
         // loads no driver, so the row offers every driver even while the
         // engine holds one, which is the usual state here (the band Setup
-        // opens from starts the engine).
-        let (systems, rates, outputs) = match self.audio_setup.as_ref() {
-            Some(s) => (s.systems(), s.rates(), s.outputs()),
-            None => (Vec::new(), Vec::new(), Vec::new()),
+        // opens from starts the engine). **For the CHOSEN system**, and
+        // waited for when the host is not on it yet: see `chosen_outputs`.
+        let (systems, rates) = match self.audio_setup.as_ref() {
+            Some(s) => (s.systems(), s.rates()),
+            None => (Vec::new(), Vec::new()),
         };
+        let listed = self.chosen_outputs();
         // **The name the OUTPUT is actually running under**, not the one the
         // settings asked for. They differ in the case that matters: the app
         // opens the system default unless told otherwise, so the request is
@@ -31880,11 +31882,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .as_ref()
                 .and_then(|s| s.active_system())
                 .or_else(|| self.settings.audio_system().map(str::to_owned)),
-            outputs,
+            outputs_stale: listed.is_none(),
+            outputs: listed.unwrap_or_default(),
+            // **Whose list it is**, which `system` above is not during an
+            // ASIO fallback. See `Dialog::AudioSetup::listed_for`.
+            listed_for: self.settings.audio_system().map(str::to_owned),
             // What the ENGINE reads, not the raw setting: a blank one is the
             // system's own there, and handed over raw it lit no chip at all.
             output: self.audio_output_device(),
-            outputs_stale: false,
             rates,
             exposed: self.audio_setup.as_ref().map(|s| s.exposed()).unwrap_or_default(),
             // The DEVICE's width, not the open stream's: a stream with one
@@ -31896,6 +31901,48 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             output_path,
             take_summary: self.settings.show_take_summary,
         });
+    }
+
+    /// **The OUTPUT row's list, for the system the SETTING names**, or
+    /// `None` while the host cannot answer for that system yet.
+    ///
+    /// The setting and not the running system, because the row is where an
+    /// output is chosen FOR it: every name saved from it is opened under the
+    /// setting's system, and a name from any other one cannot open there.
+    /// No port is a build with no audio, which has nothing to wait for.
+    fn chosen_outputs(&self) -> Option<Vec<String>> {
+        match self.audio_setup.as_ref() {
+            Some(s) => s.outputs(self.settings.audio_system()),
+            None => Some(Vec::new()),
+        }
+    }
+
+    /// **An open Setup's OUTPUT row filled the moment the host can list the
+    /// chosen system**, and `true` while it still waits.
+    ///
+    /// A SYSTEM press empties the row (see `DialogAction::SetAudioSystem`),
+    /// and the host moves to the new system a frame later. The row used to
+    /// wait for Setup to be closed and opened again, which is how the owner's
+    /// tester had to find his Komplete Audio's ASIO driver. Asked once a
+    /// frame and only while the row waits, which costs the host a compare:
+    /// it enumerates only on the answer that ends the wait, so the list is
+    /// read exactly once.
+    fn tend_stale_outputs(&mut self) -> bool {
+        if !matches!(self.dialog, Some(Dialog::AudioSetup { outputs_stale: true, .. })) {
+            return false;
+        }
+        let Some(listed) = self.chosen_outputs() else {
+            return true;
+        };
+        let chosen = self.settings.audio_system().map(str::to_owned);
+        if let Some(Dialog::AudioSetup { outputs, outputs_stale, listed_for, .. }) =
+            self.dialog.as_mut()
+        {
+            *outputs = listed;
+            *outputs_stale = false;
+            *listed_for = chosen;
+        }
+        false
     }
 
     /// Open the channel chooser for the device now selected.
@@ -36546,9 +36593,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.settings.audio_output_device = None;
                     // **And an open panel lets go of the old list too**, or
                     // its next press saves one of the old system's names
-                    // against the new system. Not asked again here: the host
-                    // switches a frame later, so `outputs()` would still
-                    // answer for the old one. See `outputs_stale`.
+                    // against the new system. The new list comes when the
+                    // host can answer for the new system - at once under
+                    // ASIO, whose list is the registry's, otherwise the
+                    // frame after it switches - and `frame` keeps asking
+                    // until then. See `tend_stale_outputs`.
                     if let Some(Dialog::AudioSetup { outputs, output, outputs_stale, .. }) =
                         self.dialog.as_mut()
                     {
@@ -36556,6 +36605,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         *output = None;
                         *outputs_stale = true;
                     }
+                    self.tend_stale_outputs();
                 }
                 self.save_settings();
             }
@@ -38174,6 +38224,14 @@ impl TangentApp {
         // the view on show, if one of them moved.** AFTER the paint, because
         // that is where they are moved from. See `commit_view_change`.
         self.commit_view_change();
+        // **And an open Setup's OUTPUT row, once the host has switched.**
+        // AFTER the paint too, so a SYSTEM press is followed on its own
+        // frame. The repaint is what makes the next frame come at all: the
+        // host switches at the top of it, and an idle window would otherwise
+        // sit on "listing" until the pointer moved.
+        if self.tend_stale_outputs() {
+            ctx.request_repaint_after(GUI_TICK);
+        }
     }
 
     /// **A release nobody saw still ends the desk's drags**, on the first
@@ -44540,8 +44598,11 @@ mod tests {
             fn active_system(&self) -> Option<String> {
                 Some("WASAPI".to_owned())
             }
-            fn outputs(&self) -> Vec<String> {
-                vec!["Speakers (Komplete Audio 6 MK2)".to_owned()]
+            // Still on WASAPI: the host switches a frame after the press,
+            // and this fake never does, so ASIO is never answerable.
+            fn outputs(&self, system: Option<&str>) -> Option<Vec<String>> {
+                (system == Some("WASAPI"))
+                    .then(|| vec!["Speakers (Komplete Audio 6 MK2)".to_owned()])
             }
             fn rates(&self) -> Vec<u32> {
                 Vec::new()
@@ -44578,6 +44639,245 @@ mod tests {
                     "the open panel still offers WASAPI endpoints under ASIO: {outputs:?}"
                 );
                 assert!(*outputs_stale, "the row does not say its list belongs to the old system");
+            }
+            _ => panic!("Setup closed"),
+        }
+    }
+
+    /// **A host that switches system when the test says so**: the desktop's
+    /// shape, where a SYSTEM press moves the setting and the process-wide
+    /// system follows at the top of the next frame. `registry` models the
+    /// ASIO build, whose driver list is read from the registry and so is
+    /// answerable whatever the process is on. Counts the listings it hands
+    /// over, which are the enumerations a real host pays for.
+    #[derive(Clone, Default)]
+    struct Switching(std::sync::Arc<std::sync::Mutex<SwitchingHost>>);
+
+    #[derive(Default)]
+    struct SwitchingHost {
+        on: Option<String>,
+        registry: bool,
+        listed: usize,
+    }
+
+    const ASIO_ROWS: [&str; 2] = ["ASIO4ALL v2", "Komplete Audio 6 MK2"];
+    const WASAPI_ROWS: [&str; 2] = ["Speakers (Komplete Audio 6 MK2)", "Speakers (Realtek(R) Audio)"];
+
+    impl Switching {
+        fn on(system: Option<&str>, registry: bool) -> Self {
+            let host = Self::default();
+            host.switch(system);
+            host.0.lock().expect("host").registry = registry;
+            host
+        }
+        fn switch(&self, system: Option<&str>) {
+            self.0.lock().expect("host").on = system.map(str::to_owned);
+        }
+        fn listed(&self) -> usize {
+            self.0.lock().expect("host").listed
+        }
+    }
+
+    impl crate::ports::AudioSetup for Switching {
+        fn systems(&self) -> Vec<String> {
+            vec!["ASIO".to_owned(), "WASAPI".to_owned()]
+        }
+        // The host's own name for what it runs, which on the platform
+        // default is that default's: a fallback reads as WASAPI here, as it
+        // does on the tester's machine.
+        fn active_system(&self) -> Option<String> {
+            Some(self.0.lock().expect("host").on.clone().unwrap_or_else(|| "WASAPI".to_owned()))
+        }
+        fn outputs(&self, system: Option<&str>) -> Option<Vec<String>> {
+            let mut host = self.0.lock().expect("host");
+            let answerable =
+                (host.registry && system == Some("ASIO")) || host.on.as_deref() == system;
+            if !answerable {
+                return None;
+            }
+            host.listed += 1;
+            let rows = if system == Some("ASIO") { ASIO_ROWS } else { WASAPI_ROWS };
+            Some(rows.iter().map(|s| (*s).to_owned()).collect())
+        }
+        fn rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        fn input_channels(&self) -> u16 {
+            0
+        }
+        fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+            Vec::new()
+        }
+        fn set_exposed(&mut self, _: Vec<(u16, Option<u16>)>) -> Vec<String> {
+            Vec::new()
+        }
+        fn output_path(&self, _: Option<&str>) -> crate::ports::OutputPath {
+            crate::ports::OutputPath::default()
+        }
+    }
+
+    /// The OUTPUT row as an open Setup holds it: the list, and whether it
+    /// is still waiting for the chosen system's.
+    fn output_row(app: &TangentApp) -> (Vec<String>, bool) {
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { outputs, outputs_stale, .. }) => {
+                (outputs.clone(), *outputs_stale)
+            }
+            _ => panic!("Setup closed"),
+        }
+    }
+
+    fn rows(names: [&str; 2]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// **A SYSTEM press lists the new system's outputs without leaving
+    /// Setup.** The row used to say they were "listed when Setup next
+    /// opens", and the owner's Windows tester had to close Setup and open it
+    /// again to find his Komplete Audio's ASIO driver. It fills on the first
+    /// frame the host can answer for the new system, from ONE listing: the
+    /// frames in between cost the host a compare, never an enumeration.
+    #[test]
+    fn a_system_press_lists_the_new_systems_outputs_without_reopening_setup() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_system = "WASAPI".to_owned();
+        let host = Switching::on(Some("WASAPI"), false);
+        app.set_audio_setup(Some(Box::new(host.clone())));
+        app.open_audio_setup();
+        assert_eq!(output_row(&app), (rows(WASAPI_ROWS), false), "Setup opened without its list");
+        assert_eq!(host.listed(), 1);
+
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        assert_eq!(output_row(&app), (Vec::new(), true), "the press kept the old list");
+        // The press's own frame: the host has not switched yet.
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(output_row(&app), (Vec::new(), true), "the old system's list came back as the new one's");
+        assert_eq!(host.listed(), 1, "a frame waiting on the switch enumerated");
+
+        // The top of the next frame, where the desktop moves the process.
+        host.switch(Some("ASIO"));
+        let _ = run_frame(&ctx, &mut app);
+        assert_eq!(
+            output_row(&app),
+            (rows(ASIO_ROWS), false),
+            "the new system's outputs waited for Setup to be opened again"
+        );
+        assert_eq!(host.listed(), 2, "the new list was not read exactly once");
+        assert!(
+            matches!(&app.dialog, Some(Dialog::AudioSetup { listed_for: Some(s), .. }) if s == "ASIO"),
+            "the filled row still names the old system as its own"
+        );
+        for _ in 0..4 {
+            let _ = run_frame(&ctx, &mut app);
+        }
+        assert_eq!(host.listed(), 2, "a filled row went on enumerating every frame");
+        assert_eq!(output_row(&app), (rows(ASIO_ROWS), false));
+    }
+
+    /// **A waiting row asks for the frame the host switches on, and lets
+    /// the window rest once it is filled.** The desktop moves the process at
+    /// the top of a frame, and an idle window gets no frame until something
+    /// asks: without one the row sat on "listing" until the pointer moved.
+    /// Rested first, so the ask is this row's and not a startup deadline's.
+    #[test]
+    fn a_waiting_output_row_asks_for_the_next_frame_and_then_rests() {
+        let (ctx, mut app) = quiet_desktop(false);
+        app.settings.audio_system = "WASAPI".to_owned();
+        let host = Switching::on(Some("WASAPI"), false);
+        app.set_audio_setup(Some(Box::new(host.clone())));
+        app.open_audio_setup();
+        let rested = settle(&ctx, &mut app);
+        assert!(rested >= Duration::from_secs(1), "Setup never rested: {}", causes(&ctx));
+
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= GUI_TICK, "a row waiting on the switch asked for no frame: {asked:?}");
+
+        host.switch(Some("ASIO"));
+        let _ = frame_asks(&ctx, &mut app);
+        assert_eq!(output_row(&app), (rows(ASIO_ROWS), false));
+        let rested = settle(&ctx, &mut app);
+        assert!(rested >= Duration::from_secs(1), "the filled row kept the window awake: {}", causes(&ctx));
+    }
+
+    /// **A switch the host has not made yet never offers the old list as the
+    /// new one's.** A take defers the desktop's switch to its end, so the
+    /// row can wait for many frames; every one of them leaves it empty and
+    /// asks nothing that enumerates. Pressing back to the system that is
+    /// running lists it at once, since the host answers for it already.
+    #[test]
+    fn a_switch_the_host_has_not_made_never_offers_the_old_list() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_system = "WASAPI".to_owned();
+        let host = Switching::on(Some("WASAPI"), false);
+        app.set_audio_setup(Some(Box::new(host.clone())));
+        app.open_audio_setup();
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        for _ in 0..10 {
+            let _ = run_frame(&ctx, &mut app);
+            assert_eq!(
+                output_row(&app),
+                (Vec::new(), true),
+                "WASAPI endpoints were offered as ASIO outputs while the host was still on WASAPI"
+            );
+        }
+        assert_eq!(host.listed(), 1, "the wait enumerated");
+        // **Opened while the switch is still owed**, the panel waits too
+        // rather than snapshot the old system's names.
+        app.open_audio_setup();
+        assert_eq!(output_row(&app), (Vec::new(), true), "a panel opened mid-switch offered the old list");
+
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("WASAPI".to_owned())));
+        assert_eq!(output_row(&app), (rows(WASAPI_ROWS), false), "the running system was not listed at once");
+        assert_eq!(host.listed(), 2);
+    }
+
+    /// **An ASIO fallback still lists the ASIO drivers.** A failed ASIO open
+    /// puts the process on the platform default for the stand-in, so the
+    /// process never agrees with the setting - and the driver list is exactly
+    /// what the person then needs, to pick the interface whose driver works.
+    /// The host answers ASIO from the registry whatever is running, so the
+    /// row fills at the press, stays filled through the fallback, and opens
+    /// filled during one; the stand-in's endpoints are never offered as ASIO
+    /// outputs.
+    #[test]
+    fn an_asio_fallback_still_lists_the_asio_drivers() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.audio_system = "WASAPI".to_owned();
+        let host = Switching::on(Some("WASAPI"), true);
+        app.set_audio_setup(Some(Box::new(host.clone())));
+        app.open_audio_setup();
+        app.apply_dialog_action(DialogAction::SetAudioSystem(Some("ASIO".to_owned())));
+        assert_eq!(output_row(&app), (rows(ASIO_ROWS), false), "the registry's drivers waited for a switch");
+        assert_eq!(host.listed(), 2);
+        // The open fails and the stand-in takes over: the process goes to
+        // the platform default and stays there.
+        host.switch(None);
+        for _ in 0..4 {
+            let _ = run_frame(&ctx, &mut app);
+        }
+        assert_eq!(output_row(&app), (rows(ASIO_ROWS), false), "the fallback took the drivers away");
+        assert_eq!(host.listed(), 2, "a filled row enumerated again");
+
+        // Opened during the fallback: the drivers, not the stand-in's list.
+        app.open_audio_setup();
+        assert_eq!(
+            output_row(&app),
+            (rows(ASIO_ROWS), false),
+            "Setup opened during an ASIO fallback offered the stand-in's endpoints as ASIO outputs"
+        );
+        // **And says whose they are.** The lit chip is the stand-in that is
+        // running, so the list carries the system it was read for, which is
+        // what the row's ASIO lines ask (see `listed_for`); asked of the lit
+        // chip, the drivers read as WASAPI's.
+        match app.dialog.as_ref() {
+            Some(Dialog::AudioSetup { system, listed_for, .. }) => {
+                assert_eq!(system.as_deref(), Some("WASAPI"), "the stand-in is not the lit chip");
+                assert_eq!(
+                    listed_for.as_deref(),
+                    Some("ASIO"),
+                    "the drivers under the stand-in's chip do not say they are ASIO's"
+                );
             }
             _ => panic!("Setup closed"),
         }
@@ -63223,8 +63523,8 @@ mod tests {
             fn active_system(&self) -> Option<String> {
                 self.0.map(str::to_owned)
             }
-            fn outputs(&self) -> Vec<String> {
-                Vec::new()
+            fn outputs(&self, _: Option<&str>) -> Option<Vec<String>> {
+                Some(Vec::new())
             }
             fn rates(&self) -> Vec<u32> {
                 Vec::new()
