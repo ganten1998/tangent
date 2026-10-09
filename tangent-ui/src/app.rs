@@ -853,6 +853,11 @@ pub struct TangentApp {
     /// so a stale value after a zoom or resize lands on the nearest legal
     /// position rather than going dead.
     mixer_scroll_px: f32,
+    /// **A hand on the mixer's scrollbar**: where on the thumb it took hold,
+    /// for as long as the button is down. See `mixer_panel::scrollbar_grab`.
+    mixer_bar_grab: Option<f32>,
+    /// The same for the arrangement's lane scrollbar.
+    arr_bar_grab: Option<f32>,
     /// The first lane the arrangement shows — the vertical twin of the
     /// mixer's scroll, moved by the wheel over the track headers. Still a
     /// whole-lane index: the lane stack distributes exact heights (bus
@@ -1224,6 +1229,17 @@ pub struct TangentApp {
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
     meter_hold: [[f32; 2]; recorder::STRIPS],
+    /// **The desk's shape, worked out once** (`desk_index::DeskIndex`):
+    /// drawn order, ranks, classes, folders and clip counts, which every
+    /// view reads so building one is O(visible). Rebuilt by `desk_index`
+    /// when what it was built from changes; behind a cell because the views
+    /// are built from `&self`.
+    desk_index: std::cell::RefCell<Option<std::sync::Arc<crate::desk_index::DeskIndex>>>,
+    /// The generation the next rebuild of `desk_index` takes.
+    desk_index_gen: std::cell::Cell<u64>,
+    /// Set by undo, redo and a load, which replace the desk wholesale: the
+    /// next ask rebuilds whatever the facts say. See `touch_desk_index`.
+    desk_index_stale: std::cell::Cell<bool>,
     /// The UNDO history: whole document states (clips + desk baked in),
     /// shared by the editor, the arrangement and the mixer — one line of
     /// time, whichever surface wrote it. `hist_at` is where NOW stands.
@@ -2342,7 +2358,9 @@ enum ArrDrag {
     FadeIn { id: u64 },
     FadeOut { id: u64 },
     /// The header knob: relative and vertical, the mixer fader's feel.
-    Gain { lane: usize, from_y: f32, from: f32 },
+    /// `lane` is the mixer COLUMN whose fader it moves: a track's, or the
+    /// master's for the bus row's dial.
+    Gain { lane: recorder::Column, from_y: f32, from: f32 },
     /// The header's send dial, on the same terms.
     Send { lane: usize, from_y: f32, from: f32 },
     /// The header's pan dial, ditto — the value is the mixer's 0..1.
@@ -4258,6 +4276,8 @@ impl TangentApp {
             pressed_on: None,
             mixer_open: false,
             mixer_scroll_px: 0.0,
+            mixer_bar_grab: None,
+            arr_bar_grab: None,
             arr_lane_scroll: 0,
             arr_scroll_acc: 0.0,
             mixer_grab: None,
@@ -4355,6 +4375,9 @@ impl TangentApp {
             met_at: None,
             met_drag: false,
             meter_hold: [[0.0; 2]; recorder::STRIPS],
+            desk_index: std::cell::RefCell::new(None),
+            desk_index_gen: std::cell::Cell::new(0),
+            desk_index_stale: std::cell::Cell::new(true),
             history: Vec::new(),
             saved_state: None,
             pending_after_save: None,
@@ -5936,9 +5959,9 @@ impl TangentApp {
             )),
             H::Fader(i) => view
                 .strips
-                .get(i.0)
+                .get(i)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
-            H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
+            H::Send(i) => view.strips.get(i).map_or(0.0, |s| s.send),
             // A route's own level, by its place in THIS channel's list.
             H::RouteGain(i, k) => match i.strip() {
                 Some(recorder::Strip::Channel(n)) => self
@@ -5950,7 +5973,7 @@ impl TangentApp {
                 _ => 0.0,
             },
             H::Routing(_) => 0.0,
-            H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
+            H::Pan(i) => view.strips.get(i).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
             H::Mono(_) | H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::ToTheory(_)
             | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
             | H::FxMenu(..) | H::InputChip(_) => 0.0,
@@ -6154,9 +6177,9 @@ impl TangentApp {
                 }
                 for m in others {
                     let their = match hit {
-                        H::Fader(_) => H::Fader(Column(m)),
-                        H::Send(_) => H::Send(Column(m)),
-                        _ => H::Pan(Column(m)),
+                        H::Fader(_) => H::Fader(Column::Track(m)),
+                        H::Send(_) => H::Send(Column::Track(m)),
+                        _ => H::Pan(Column::Track(m)),
                     };
                     let to = (self.mixer_value(their) + delta).clamp(0.0, 1.0);
                     self.apply_mixer_hit_one(their, to);
@@ -6169,10 +6192,10 @@ impl TangentApp {
                 let want = self.strip_switch(hit, n);
                 for m in others {
                     let their = match hit {
-                        H::Mute(_) => H::Mute(Column(m)),
-                        H::Solo(_) => H::Solo(Column(m)),
-                        H::Arm(_) => H::Arm(Column(m)),
-                        _ => H::ToTheory(Column(m)),
+                        H::Mute(_) => H::Mute(Column::Track(m)),
+                        H::Solo(_) => H::Solo(Column::Track(m)),
+                        H::Arm(_) => H::Arm(Column::Track(m)),
+                        _ => H::ToTheory(Column::Track(m)),
                     };
                     if self.strip_switch(their, m) != want {
                         self.apply_mixer_hit_one(their, value);
@@ -6207,7 +6230,7 @@ impl TangentApp {
     /// Whether one of the four switches is on for channel `n`.
     fn strip_switch(&self, hit: crate::mixer_panel::Hit, n: usize) -> bool {
         use crate::mixer_panel::Hit as H;
-        let bit = recorder::Column(n).desk_index();
+        let bit = recorder::Column::Track(n).desk_index();
         match hit {
             H::Mute(_) => self.settings.strip_muted & (1 << bit) != 0,
             H::Solo(_) => self.settings.strip_soloed & (1 << bit) != 0,
@@ -6416,7 +6439,7 @@ impl TangentApp {
                 let seed = {
                     let view = self.mixer_view();
                     view.strips
-                        .get(i.0)
+                        .get(i)
                         .map(|st| {
                             if st.gain <= 0.001 {
                                 "-60".to_owned()
@@ -6459,7 +6482,7 @@ impl TangentApp {
                     _ => self
                         .mixer_view()
                         .strips
-                        .get(i.0)
+                        .get(i)
                         .map_or(String::new(), |v| v.name.to_owned()),
                 };
                 self.mixer_naming = Some((i, seed));
@@ -6627,7 +6650,7 @@ impl TangentApp {
         let row = match hit {
             H::Fader(i) => match i.strip() {
                 Some(Strip::Channel(n)) => (n, AutoParam::Gain),
-                None => (crate::arrangement_panel::MASTER_LANE, AutoParam::Gain),
+                None => (master_lane(), AutoParam::Gain),
                 _ => return None,
             },
             H::Pan(i) => (channel_of(i)?, AutoParam::Pan),
@@ -7306,11 +7329,42 @@ impl TangentApp {
         self.arrange_view(clips)
     }
 
+    /// **The desk, every drawn track of it.** For the callers that hold no
+    /// rect (an event handler asking about a column, a test, a picture of
+    /// the whole desk): O(desk), and never on the per-frame road, which asks
+    /// [`Self::mixer_view_in`] with the rect it will draw into.
     fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
-        use crate::recorder::Strip;
+        self.mixer_view_ranks(None)
+    }
+
+    /// **The desk as a layout at `rect` will place it**: the strips in the
+    /// scrolled window and nothing else, plus the pinned click and master.
+    /// What paint, hit-test and the screen reader build every frame, so
+    /// each is O(visible) however long the desk is.
+    pub(crate) fn mixer_view_in(&self, rect: Rect) -> crate::mixer_panel::MixerView<'_> {
+        let ranks = crate::mixer_panel::track_window(
+            rect,
+            self.mixer_visible(),
+            self.desk_index().shown_len(),
+            self.mixer_scroll_px,
+        );
+        self.mixer_view_ranks(Some(ranks))
+    }
+
+    /// The one builder behind both: the strips of the drawn tracks whose
+    /// ranks are in `ranks` (all of them for `None`).
+    fn mixer_view_ranks(
+        &self,
+        ranks: Option<std::ops::Range<usize>>,
+    ) -> crate::mixer_panel::MixerView<'_> {
+        use crate::recorder::{Strip, StripRef};
         let g = self.settings.knobs().gains;
         let desk = self.desk();
-        let peaks = self.meter_hold;
+        let index = self.desk_index();
+        // **Borrowed, not copied.** This was `let peaks = self.meter_hold`,
+        // a copy of every strip's hold on every view build: thirty-five
+        // pairs is nothing, a desk that grows by appending is not.
+        let peaks = &self.meter_hold;
         // **The inputs that are open, and one spare to add to.** Four empty
         // microphone columns is not a rack with room in it, it is a desk that
         // is mostly plus signs. The first is always drawn — it is the band's
@@ -7377,10 +7431,6 @@ impl TangentApp {
                     Strip::Channel(n) => self.folder_shut(n),
                     _ => false,
                 },
-                hidden: match s {
-                    Strip::Channel(n) => self.lane_hidden(n),
-                    _ => false,
-                },
                 to_theory: match s {
                     Strip::Channel(n) => self.to_theory(n),
                     _ => false,
@@ -7438,7 +7488,7 @@ impl TangentApp {
                     let (seat, bay) = recorder::seat_bay(i, n);
                     self.insert_bypassed(seat, bay)
                 }),
-                frozen: i < recorder::CHANNELS && self.lane_frozen(i).is_some(),
+                frozen: matches!(s, Strip::Channel(n) if self.lane_frozen(n).is_some()),
                 kind,
                 icon,
                 empty,
@@ -7461,16 +7511,26 @@ impl TangentApp {
                 // What the × means, where it means anything: a used general
                 // channel goes back to being an empty slot. The click and
                 // the bus are the desk's own and stay.
+                // The clip count from the index: `lane_has_clips` walks
+                // every clip in the song, per strip.
                 removable: matches!(s, Strip::Channel(_))
                     && (kind.is_some()
-                        || matches!(s, Strip::Channel(n) if self.lane_has_clips(n))),
+                        || matches!(s, Strip::Channel(n) if index.clip_count(n) > 0)),
                 armed: match s {
                     Strip::Channel(n) => self.armed_mask() & (1 << n) != 0,
                     _ => false,
                 },
             }
         };
-        let channels = Strip::shown();
+        let master = StripRef::MASTER_INDEX;
+        let shown = index.shown_len();
+        let ranks = ranks.unwrap_or(0..shown);
+        let first = ranks.start.min(shown);
+        let tracks: Vec<_> = index
+            .window(first, ranks.end.saturating_sub(first))
+            .iter()
+            .map(|row| strip(Strip::Channel(*row as usize)))
+            .collect();
         crate::mixer_panel::MixerView {
             // **What the click is playing**, for its own button. The chosen
             // file's name; the bundled click has no path, so it says what it
@@ -7479,24 +7539,26 @@ impl TangentApp {
             routes: &self.route_labels,
             fx_strip: self.settings.fx_strip_color.to_color32(),
             input_chip: self.settings.input_chip_color.to_color32(),
-            strips: std::array::from_fn(|i| match channels.get(i) {
-                Some(s) => strip(*s),
-                None => crate::mixer_panel::StripView {
+            strips: crate::mixer_panel::DeskStrips {
+                tracks,
+                first,
+                shown,
+                click: strip(Strip::Click),
+                master: crate::mixer_panel::StripView {
                     mono: self.settings.master_mono,
-                    phase: self.settings.strip_phase & (1 << i) != 0,
+                    phase: self.settings.strip_phase & (1 << master) != 0,
                     // The master is not a channel and has no MIDI to send.
                     to_theory: false,
                     is_folder: false,
                     in_folder: false,
                     folder_shut: false,
-                    hidden: false,
                     route_count: 0,
                     strip: None,
                     icon: 0,
                     name: self
                         .settings
                         .strip_names
-                        .get(recorder::STRIPS)
+                        .get(master)
                         .map_or("MASTER", |n| if n.is_empty() { "MASTER" } else { n.as_str() }),
                     detail: "",
                     // **Through `strip_color`, like every other strip.**
@@ -7509,7 +7571,7 @@ impl TangentApp {
                     // had painted by hand got a zero, which is the wood, so
                     // the master came out the same bone as the empty slots
                     // beside it on every theme including the default.
-                    color: self.strip_color(recorder::STRIPS),
+                    color: self.strip_color(master),
                     // **Through `seat_bay`, like every other strip.** The
                     // master is the one strip whose six slots do NOT live in
                     // one rack — its first three are the extra seat appended
@@ -7520,8 +7582,7 @@ impl TangentApp {
                     // top three named the bottom three, and the bottom three
                     // named something that was never on the master at all.
                     inserts: std::array::from_fn(|n| {
-                        let (seat, bay) =
-                            recorder::seat_bay(recorder::STRIPS, n);
+                        let (seat, bay) = recorder::seat_bay(master, n);
                         self.insert(seat, bay).map_or("", insert_chip_name)
                     }),
                     kind: None,
@@ -7553,14 +7614,12 @@ impl TangentApp {
                     // are: slots 0..2 are the extra seat, 3..5 the original.
                     frozen: false,
                     bypassed: std::array::from_fn(|n| {
-                        let (seat, bay) =
-                            recorder::seat_bay(recorder::STRIPS, n);
+                        let (seat, bay) = recorder::seat_bay(master, n);
                         self.insert_bypassed(seat, bay)
                     }),
                 },
-            }),
+            },
             any_solo: desk.any_solo(),
-            active: self.desk_extent(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
             selected: self.selected_channel,
@@ -10564,6 +10623,8 @@ impl TangentApp {
     /// `save_settings`, which made every open two synchronous pretty-prints
     /// of a 15,000-line file and every Ctrl+Z one more.
     fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
+        // Every open, undo and redo lands here: a new index generation.
+        self.touch_desk_index();
         // A desk from an earlier era of the desk's shape arrives already
         // lifted: `DeskSnap::from_value` runs the length-keyed era lifts on
         // the dense array as the file holds it. They ran here once, on a
@@ -13050,14 +13111,13 @@ impl TangentApp {
             // used to hold fixed amber and fixed red whatever the theme was,
             // which is how a purple theme ended up with an orange click and a
             // red master sitting next to sixteen channels that had all moved.
-            if i == recorder::Strip::Click.index() {
-                return pal.click();
-            }
-            if i == recorder::STRIPS {
-                return pal.master();
-            }
-            if i < recorder::CHANNELS {
-                return pal.slot(i);
+            // By what the strip IS (`StripRef`, the one home of desk-index
+            // arithmetic), not by comparing the index against widths.
+            match recorder::StripRef::from_desk_index(i) {
+                Some(recorder::StripRef::Click) => return pal.click(),
+                Some(recorder::StripRef::Master) => return pal.master(),
+                Some(recorder::StripRef::Row(row)) => return pal.slot(row),
+                _ => {}
             }
         }
         0
@@ -14496,11 +14556,48 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_window = Some((start.clamp(0.0, max_start), len));
     }
 
+    /// **The lanes the timeline can place right now**, as ranks among the
+    /// drawn rows, with the clamped scroll the view carries and the index
+    /// they were read from.
+    ///
+    /// The rows the layout can place from the scroll down:
+    /// `lane_window_start` is the layout's own arithmetic, so the lanes the
+    /// view builds and the clips it carries are the ones the layout reads,
+    /// and a desk of any length builds O(visible) of them. One past the most
+    /// that can show, which is the row that proves the stack ends flush.
+    fn arr_lane_window(
+        &self,
+    ) -> (std::sync::Arc<crate::desk_index::DeskIndex>, usize, std::ops::Range<usize>) {
+        let index = self.desk_index();
+        let lane_scroll = self
+            .arr_lane_scroll
+            .min(self.desk_extent().saturating_sub(self.arr_visible()));
+        let (first_row, can_show) = crate::arrangement_panel::lane_window_start(
+            lane_scroll,
+            self.arr_visible(),
+            self.desk_extent(),
+        );
+        let first = index.rank_at_or_after(first_row);
+        let last = (first + can_show + 1).min(index.shown_len());
+        (index, lane_scroll, first..last)
+    }
+
+    /// **The clips the timeline can draw**: every clip on a lane in the
+    /// window (`arr_lane_window`), and the takes being recorded onto one.
+    ///
+    /// **Culled by lane.** It built a view of every clip in the song, every
+    /// frame, and the layout then threw away each one standing on a lane it
+    /// did not place (`clip_rect` answers `NOTHING` there). A clip on a lane
+    /// outside the window is drawn nowhere, hit nowhere and read by no
+    /// caller, so it is no longer built.
     fn arr_clip_views(&self) -> Vec<crate::arrangement_panel::ClipView<'_>> {
+        let (index, _, ranks) = self.arr_lane_window();
+        let in_window = |lane: usize| index.rank_of(lane).is_some_and(|r| ranks.contains(&r));
         let mut views: Vec<crate::arrangement_panel::ClipView<'_>> = self
             .arrangement
             .clips
             .iter()
+            .filter(|c| in_window(c.lane.min(recorder::CHANNELS - 1)))
             .map(|c| {
                 let info = self.clip_infos.get(&c.id);
                 let wave = info.map_or(&[][..], |i| i.wave.as_slice());
@@ -14544,6 +14641,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let len = (self.recorder.position_s - rec.start_s).max(0.0);
             if len > 0.0 {
                 for (lane, is_midi) in &rec.lanes {
+                    if !in_window((*lane).min(recorder::CHANNELS - 1)) {
+                        continue;
+                    }
                     views.push(crate::arrangement_panel::ClipView {
                         id: 0,
                         lane: (*lane).min(recorder::CHANNELS - 1),
@@ -15122,9 +15222,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let clips = self.arr_clip_views();
         let view = self.arrange_view(&clips);
         let l = crate::arrangement_panel::Layout::new(rect, &view);
-        let at = l.header_rows.iter().position(|row| {
-            row.panel.is_positive() && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
-        })?;
+        let at = l
+            .header_rows
+            .find_row(|row| {
+                row.panel.is_positive() && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+            })?;
         let edge = l.header_rows.get(at).is_some_and(|row| {
             crate::arrangement_panel::folder_drop_strip(row.panel).contains(p)
         });
@@ -15529,7 +15631,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `auto_param_label` and `auto_resting` resolve by.
     fn auto_param_bay(lane: usize, param: crate::automation::AutoParam) -> Option<(usize, usize)> {
         let bay = param.bay()?;
-        Some(if lane == crate::arrangement_panel::MASTER_LANE {
+        Some(if lane == master_lane() {
             Self::master_bay(bay)
         } else {
             recorder::seat_bay(lane, bay)
@@ -15541,7 +15643,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// cannot disagree. `None` for a bay no lane's curves can drive (a
     /// bus's, a drum pad's, a pedal's).
     fn auto_address_of(seat: usize, bay: usize) -> Option<(usize, u8)> {
-        (0..=crate::arrangement_panel::MASTER_LANE)
+        (0..=master_lane())
             .flat_map(|lane| (0..recorder::INSERTS * 2).map(move |b| (lane, b as u8)))
             .find(|&(lane, b)| {
                 Self::auto_param_bay(lane, crate::automation::AutoParam::Plugin { bay: b, id: 0 })
@@ -15557,8 +15659,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and rebuilding is a handful of strings.
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
-        let master = lane == crate::arrangement_panel::MASTER_LANE;
-        if lane >= recorder::CHANNELS && !master {
+        let master = lane == master_lane();
+        // A track's lane or the master's, and nothing past them.
+        if recorder::StripRef::from_auto_lane(lane).is_none() {
             return;
         }
         // **The master offers what the master HAS** - which grew: fader,
@@ -16212,7 +16315,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::arrangement_panel::Layout::new(rect, &view)
             .rows
             .iter()
-            .find(|r| r.kind == crate::arrangement_panel::RowKind::Automation(lane, slot))
+            .find(|r| {
+                r.kind
+                    == crate::arrangement_panel::RowKind::Automation(
+                        crate::arrangement_panel::LaneId::from_auto_lane(lane),
+                        slot,
+                    )
+            })
             .map(|r| r.lane)
             .filter(Rect::is_positive)
     }
@@ -16496,7 +16605,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the master's bit is bit 32, and in a u32 it ALIASED channel 31's,
         // so writing channel 31's fader suspended the master's curve.
         for lane in
-            (0..recorder::CHANNELS).chain([crate::arrangement_panel::MASTER_LANE])
+            (0..recorder::CHANNELS).chain([master_lane()])
         {
             let mode = self.arr_auto_mode(lane);
             // `true` for touching: a lane whose mode writes on touch is
@@ -16705,12 +16814,88 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// does nothing instead.
     /// How many channel strips the mixer actually SHOWS - the active desk
     /// minus every child a shut folder has folded away. What the scroll
-    /// range answers to.
+    /// range answers to. Read off the index, which counted it once.
     pub fn mixer_shown_channels(&self) -> usize {
-        (0..self.desk_extent())
-            .filter(|n| !self.lane_hidden(*n))
-            .count()
-            .max(1)
+        self.desk_index().shown_len().max(1)
+    }
+
+    /// **The desk's shape**, as of now: see `desk_index::DeskIndex`.
+    ///
+    /// Gathers the facts it is built from (the folder flags, the kinds, the
+    /// added bits, what keeps a row from being vacant, and the clips on each
+    /// row) and hands back the standing index when they are exactly the ones
+    /// it was built from, a new generation otherwise. Exact rather than
+    /// hashed: a collision would draw a desk that does not exist. The gather
+    /// is a pass over flag words and clip lanes, with no strings and no
+    /// layout; every view then reads what it needs in O(1) per strip.
+    pub fn desk_index(&self) -> std::sync::Arc<crate::desk_index::DeskIndex> {
+        let (facts, clips) = self.desk_index_inputs();
+        let mut cached = self.desk_index.borrow_mut();
+        if let Some(ix) = cached.as_ref() {
+            if !self.desk_index_stale.get() && ix.built_from(&facts, &clips) {
+                return std::sync::Arc::clone(ix);
+            }
+        }
+        let generation = self.desk_index_gen.get() + 1;
+        self.desk_index_gen.set(generation);
+        self.desk_index_stale.set(false);
+        let ix = std::sync::Arc::new(crate::desk_index::DeskIndex::build(generation, facts, clips));
+        *cached = Some(std::sync::Arc::clone(&ix));
+        ix
+    }
+
+    /// What the index is built from: one `RowFacts` per row of the desk, and
+    /// how many clips stand on each.
+    fn desk_index_inputs(&self) -> (Vec<crate::desk_index::RowFacts>, Vec<u32>) {
+        let rows = self.desk_extent();
+        let flag = |v: &[bool], r: usize| v.get(r).copied().unwrap_or(false);
+        // **What keeps a row from being vacant without making it a track**:
+        // a curve, a freeze, a chain plugin. Pedals are not on the list; a
+        // pedal-only row is still vacant (section 4).
+        let mut residue = vec![false; rows];
+        for c in self.arrangement.automation.curves() {
+            if let Some(r) = residue.get_mut(c.lane) {
+                *r = true;
+            }
+        }
+        for z in &self.settings.frozen_lanes {
+            if let Some(r) = residue.get_mut(z.lane) {
+                *r = true;
+            }
+        }
+        let facts = (0..rows)
+            .map(|r| crate::desk_index::RowFacts {
+                folder: flag(&self.settings.strip_is_folder, r),
+                in_folder: flag(&self.settings.strip_in_folder, r),
+                shut: flag(&self.settings.strip_folder_shut, r),
+                kind: self.channel_kind(r),
+                added: u32::try_from(r)
+                    .ok()
+                    .and_then(|b| self.settings.tracks_added.checked_shr(b))
+                    .is_some_and(|w| w & 1 == 1),
+                residue: residue[r]
+                    || (0..recorder::INSERTS * 2).any(|n| {
+                        let (seat, bay) = recorder::seat_bay(r, n);
+                        self.insert(seat, bay).is_some()
+                    }),
+            })
+            .collect();
+        let mut clips = vec![0u32; rows];
+        for c in &self.arrangement.clips {
+            if let Some(n) = clips.get_mut(c.lane) {
+                *n += 1;
+            }
+        }
+        (facts, clips)
+    }
+
+    /// **Undo, redo and a load replace the desk wholesale**, so the index
+    /// takes a new generation on its next ask whatever the facts say. The
+    /// facts would catch every change on their own; the explicit bump is
+    /// what lets a view cache keyed on the generation trust it across a
+    /// restore that happens to land on an identical shape.
+    fn touch_desk_index(&self) {
+        self.desk_index_stale.set(true);
     }
 
     /// **The exact comparison, deliberately.** A wrong "nothing changed"
@@ -17157,6 +17342,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// A fresh project starts a fresh line of time.
     fn undo_reset(&mut self) {
+        // The load, New, a template: the desk was replaced.
+        self.touch_desk_index();
         // A fresh line of time is also a fresh baseline for "unsaved": every
         // road into a document — open, save-as, new, launch — ends here, so
         // this is the one place that cannot be forgotten. One moment serves
@@ -17177,6 +17364,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(moment) = self.history.get(at).cloned() else {
             return;
         };
+        self.touch_desk_index();
         let from = self.hist_at;
         self.hist_at = at;
         // **The lanes the moments crossed, for the host to carry the plugins
@@ -18830,18 +19018,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return crate::arrangement_panel::Layout::new(rect, &view).tool_met;
         }
         // **The click's COLUMN, not its desk index.** `Strip::index` is
-        // where a strip's settings live and `Layout::strips` is laid out in
-        // column order, and the click is not at the same number in both: it
-        // is desk index `CHANNELS + 1` and column `CHANNELS`. So this read
-        // the MASTER's rectangles, whose `met` is `NOTHING` — the panel
-        // opened anchored to nothing and landed wherever a degenerate rect
-        // put it, which is the whole of "the chip was never wired to the
-        // menu". The type exists to prevent exactly this; see `Column`.
-        let view = self.mixer_view();
+        // where a strip's settings live and `Layout::strips` is laid out by
+        // column, and the click was not at the same number in both when a
+        // column was a number. So this read the MASTER's rectangles, whose
+        // `met` is `NOTHING` — the panel opened anchored to nothing and
+        // landed wherever a degenerate rect put it, which is the whole of
+        // "the chip was never wired to the menu". The type exists to
+        // prevent exactly this, and now the click is a column by name.
+        let view = self.mixer_view_in(rect);
         let l = crate::mixer_panel::Layout::new(rect, &view);
         recorder::Strip::Click
             .column_of()
-            .and_then(|c| l.strips.get(c.0))
+            .and_then(|c| l.strips.get(c))
             .map_or(Rect::NOTHING, |s| s.met)
     }
 
@@ -25737,6 +25925,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             return;
         }
+        // **The lane scrollbar, before anything on the lanes can claim the
+        // press.** A press on it moves the window to where it landed and a
+        // drag carries the thumb; every frame of that gesture, its release
+        // included, is the bar's and nothing else's.
+        if pressed && self.arr_drag.is_none() {
+            self.arr_bar_grab = pointer.filter(|p| rect.contains(*p)).and_then(|p| {
+                let clips = self.arr_clip_views();
+                let view = self.arrange_view(&clips);
+                crate::arrangement_panel::lane_bar_grab(rect, &view, p)
+            });
+        }
+        if let Some(grab) = self.arr_bar_grab {
+            match pointer.filter(|_| pointer_down) {
+                Some(p) => {
+                    let to = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::lane_bar_scroll(rect, &view, p, grab)
+                    };
+                    if let Some(to) = to {
+                        self.arr_lane_scroll = to;
+                    }
+                }
+                None => self.arr_bar_grab = None,
+            }
+            return;
+        }
         // **A right-click on a lane HEADER opens the TRACK menu** — remove,
         // colour, auto-palette — the same menu the mixer strip answers.
         // On the GRIDBOX it steps one coarser, the drag's cheap sibling.
@@ -25839,8 +26054,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let view = self.arrange_view(&clips);
                     match crate::arrangement_panel::hit_test(rect, &view, p) {
                         Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((n, b)),
-                        Some(crate::arrangement_panel::Hit::BusBay(_, b)) => {
-                            Some((recorder::STRIPS, b))
+                        Some(crate::arrangement_panel::Hit::BusBay(col, b)) => {
+                            Some((col.desk_index(), b))
                         }
                         _ => None,
                     }
@@ -25865,9 +26080,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     let l = crate::arrangement_panel::Layout::new(rect, &view);
-                    l.header_rows
-                        .iter()
-                        .position(|row| row.panel.is_positive() && row.panel.contains(p))
+                    l.header_rows.find_row(|row| row.panel.is_positive() && row.panel.contains(p))
                 };
                 if let Some(lane) = lane {
                     // **An EMPTY slot has a menu now too** — a short one, and
@@ -25918,6 +26131,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             return;
                         }
                         Some(A::AutoPoint(lane, row, i)) => {
+                            let lane = lane.auto_lane();
                             // By INDEX, like the alt-click: a step's two
                             // halves share the time a pointer would name.
                             if let Some(param) = self.arr_auto_param_at(lane, row) {
@@ -25947,7 +26161,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     let l = crate::arrangement_panel::Layout::new(rect, &view);
-                    l.lane_rows.iter().any(|r| r.is_positive() && r.contains(p))
+                    l.lane_rows.find_row(|r| r.is_positive() && r.contains(p)).is_some()
                 };
                 if on_lanes {
                     if !ctx.input(|i| i.modifiers.shift) {
@@ -26030,8 +26244,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // concrete number is what turns auto into a choice.
                         let steps = self.wheel_arr_zoom.steps(d);
                         let cur = self.arr_visible() as i64;
+                        // On the zoom's own ceiling, never the desk's width:
+                        // a desk longer than a screen scrolls.
                         let next = (cur + i64::from(steps))
-                            .clamp(1, recorder::CHANNELS as i64);
+                            .clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX) as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
                             // And the height it was chosen at - see `carried_count`.
@@ -26141,7 +26357,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // **A double-click puts a dial back** — the desk's one rule,
                 // finally honoured on this view's three as well.
                 if let Some(A::Gain(n) | A::Send(n) | A::Pan(n)) = hit {
-                    let col = recorder::Column(n);
+                    let col = recorder::Column::Track(n);
                     let mixer_hit = match hit {
                         Some(A::Gain(_)) => crate::mixer_panel::Hit::Fader(col),
                         Some(A::Send(_)) => crate::mixer_panel::Hit::Send(col),
@@ -26156,9 +26372,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // it answers `BusGain` rather than `Gain`, and it was the one
                 // fader on this view that could not be put back.
                 if let Some(A::BusGain(n)) = hit {
-                    self.reset_mixer_hit(crate::mixer_panel::Hit::Fader(
-                        recorder::Column(n),
-                    ));
+                    self.reset_mixer_hit(crate::mixer_panel::Hit::Fader(n));
                     self.undo_commit();
                     self.arr_drag = None;
                     return;
@@ -26202,6 +26416,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // "reset" on a level means the shipped one, which is what
                 // `auto_resting` answers.
                 if let Some(A::AutoDial(lane, slot)) = hit {
+                    let lane = lane.auto_lane();
                     if let Some(param) = self.arr_auto_param_at(lane, slot) {
                         let to = self.auto_resting(lane, param);
                         self.auto_set_base(lane, param, to);
@@ -26260,7 +26475,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .filter(|s| !s.is_empty())
                             .cloned()
                             .unwrap_or_else(|| self.channel_display_name(n).to_owned());
-                        self.mixer_naming = Some((recorder::Column(n), seed));
+                        self.mixer_naming = Some((recorder::Column::Track(n), seed));
                         self.arr_drag = None;
                         return;
                     }
@@ -26333,6 +26548,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     A::AutoPoint(n, row, _) | A::AutoLane(n, row, ..) | A::AutoParamPick(n, row),
                 ) = hit
                 {
+                    let n = n.auto_lane();
                     if let Some(param) = self.arr_auto_param_at(n, row) {
                         self.arr_auto_focus = Some((n, param));
                     }
@@ -26345,7 +26561,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     //
                     // The fold arrow and the parameter picker are the row's
                     // own chrome; the lane itself makes and moves points.
-                    Some(A::AutoMenu(n)) => self.arr_open_automation_menu(n),
+                    Some(A::AutoMenu(n)) => self.arr_open_automation_menu(n.auto_lane()),
                     // A press on the row's own header opens the same menu
                     // the A button does, with this row's box already ticked —
                     // which is how you take a row away again.
@@ -26353,15 +26569,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // It used to open the automation menu — which the A
                     // button on the track's own header already does, so the
                     // menu keeps its door and the row gains one.
-                    Some(A::AutoParamPick(n, slot)) => self.arr_select_auto_row(n, slot),
+                    Some(A::AutoParamPick(n, slot)) => {
+                        self.arr_select_auto_row(n.auto_lane(), slot)
+                    }
                     Some(A::Phase(n)) => {
                         self.touch_track(n);
-                        self.apply_mixer_hit(M::Phase(Column(n)), 0.0);
+                        self.apply_mixer_hit(M::Phase(Column::Track(n)), 0.0);
                     }
-                    Some(A::AutoClose(n, slot)) => self.arr_close_auto_row(n, slot),
-                    Some(A::AutoArm(n, slot)) => self.arr_toggle_auto_arm(n, slot),
-                    Some(A::AutoBypass(n, slot)) => self.arr_toggle_auto_bypass(n, slot),
+                    Some(A::AutoClose(n, slot)) => self.arr_close_auto_row(n.auto_lane(), slot),
+                    Some(A::AutoArm(n, slot)) => self.arr_toggle_auto_arm(n.auto_lane(), slot),
+                    Some(A::AutoBypass(n, slot)) => {
+                        self.arr_toggle_auto_bypass(n.auto_lane(), slot)
+                    }
                     Some(A::AutoDial(n, slot)) => {
+                        let n = n.auto_lane();
                         if let Some(param) = self.arr_auto_param_at(n, slot) {
                             self.arr_drag = Some(ArrDrag::AutoDial {
                                 lane: n,
@@ -26372,6 +26593,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         }
                     }
                     Some(A::AutoPoint(n, row, i)) => {
+                        let n = n.auto_lane();
                         // **ALT removes it.** The owner's pairing: shift
                         // makes a node, alt takes one away, and neither
                         // needs a second gesture or a menu.
@@ -26514,6 +26736,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // it; a plain press is a box or a click (see below, and
                     // `ArrDrag::AutoMarquee`).
                     Some(A::AutoLane(n, row, t, v)) => {
+                        let n = n.auto_lane();
                         let Some(param) = self.arr_auto_param_at(n, row) else {
                             return;
                         };
@@ -26558,7 +26781,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     // The header's switches are the mixer strip's own, by
                     // the same hits, so the two surfaces cannot drift.
-                    Some(A::Arm(n)) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
+                    Some(A::Arm(n)) => self.apply_mixer_hit(M::Arm(Column::Track(n)), 0.0),
                     // The input chip: the one menu, wherever the channel is.
                     Some(A::HdrInput(n)) => {
                         self.menu_anchor = p;
@@ -26588,9 +26811,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // through `seat_bay` because the master's six slots live
                     // in two racks; the panel hands over a slot in strip
                     // order and this is where that becomes a seat.
-                    Some(A::BusBay(_, slot)) => {
-                        let (seat, bay) =
-                            recorder::seat_bay(recorder::STRIPS, slot);
+                    Some(A::BusBay(col, slot)) => {
+                        let (seat, bay) = recorder::seat_bay(col.desk_index(), slot);
                         if self.insert(seat, bay).is_some() {
                             self.bay_carry = Some((seat, bay, p, false));
                         } else {
@@ -26664,36 +26886,42 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // Through the desk, so a multiple selection carries — see
                     // the arm of the same name in `apply_arrange_key`.
                     Some(A::ToTheory(n)) => {
-                        self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0);
+                        self.apply_mixer_hit(M::ToTheory(Column::Track(n)), 0.0);
                     }
                     Some(A::HdrCollapse(n)) => self.toggle_folder_shut(n),
-                    Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
-                    Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
+                    Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column::Track(n)), 0.0),
+                    Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column::Track(n)), 0.0),
                     // **The bus rows' levels go through the same drag.**
-                    // `ArrDrag::Gain` carries a COLUMN — it always did, the
-                    // field is merely named for the case where a lane and a
-                    // column are the same number — so the master's and the
-                    // click's reach the desk's own fader with no second
-                    // road to it.
-                    Some(A::Gain(n)) | Some(A::BusGain(n)) => {
+                    // `ArrDrag::Gain` carries a COLUMN — it always did, and
+                    // it is typed as one now rather than as a number that
+                    // happened to equal a lane — so the master's reaches the
+                    // desk's own fader with no second road to it.
+                    Some(A::Gain(n)) => {
                         self.arr_drag = Some(ArrDrag::Gain {
-                            lane: n,
+                            lane: Column::Track(n),
                             from_y: p.y,
-                            from: self.mixer_value(M::Fader(Column(n))),
+                            from: self.mixer_value(M::Fader(Column::Track(n))),
+                        });
+                    }
+                    Some(A::BusGain(col)) => {
+                        self.arr_drag = Some(ArrDrag::Gain {
+                            lane: col,
+                            from_y: p.y,
+                            from: self.mixer_value(M::Fader(col)),
                         });
                     }
                     Some(A::Send(n)) => {
                         self.arr_drag = Some(ArrDrag::Send {
                             lane: n,
                             from_y: p.y,
-                            from: self.mixer_value(M::Send(Column(n))),
+                            from: self.mixer_value(M::Send(Column::Track(n))),
                         });
                     }
                     Some(A::Pan(n)) => {
                         self.arr_drag = Some(ArrDrag::HdrPan {
                             lane: n,
                             from_y: p.y,
-                            from: self.mixer_value(M::Pan(Column(n))),
+                            from: self.mixer_value(M::Pan(Column::Track(n))),
                         });
                     }
                     // The toolbar. The click's switch is the settings' own;
@@ -26947,7 +27175,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             let clips = self.arr_clip_views();
                             let view = self.arrange_view(&clips);
                             let l = crate::arrangement_panel::Layout::new(rect, &view);
-                            l.header_rows.iter().position(|row| {
+                            l.header_rows.find_row(|row| {
                                 row.panel.is_positive() && row.panel.contains(p)
                             })
                         };
@@ -27010,7 +27238,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .find(|r| {
                                 r.kind
                                     == crate::arrangement_panel::RowKind::Automation(
-                                        lane, slot,
+                                        crate::arrangement_panel::LaneId::from_auto_lane(lane),
+                                        slot,
                                     )
                             })
                             .map(|r| r.lane)
@@ -27043,7 +27272,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .find(|r| {
                                 r.kind
                                     == crate::arrangement_panel::RowKind::Automation(
-                                        lane, slot,
+                                        crate::arrangement_panel::LaneId::from_auto_lane(lane),
+                                        slot,
                                     )
                             })
                             .map(|r| r.lane);
@@ -27228,7 +27458,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         };
                         l.lane_rows
                             .iter()
-                            .enumerate()
                             .filter(|(_, r)| r.is_positive())
                             .min_by(|(_, a), (_, b)| gap(a).total_cmp(&gap(b)))
                             .map(|(i, _)| i)
@@ -27248,10 +27477,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 ArrDrag::Gain { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
-                    self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Fader(recorder::Column(lane)),
-                        v,
-                    );
+                    self.apply_mixer_hit(crate::mixer_panel::Hit::Fader(lane), v);
                     self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });
                     // **One moment when the hand lets go.** These four dials
                     // wrote the desk once a frame and marked nothing, so a
@@ -27287,7 +27513,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Pan(recorder::Column(lane)),
+                        crate::mixer_panel::Hit::Pan(recorder::Column::Track(lane)),
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::HdrPan { lane, from_y: p.y, from: v });
@@ -27297,7 +27523,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Send(recorder::Column(lane)),
+                        crate::mixer_panel::Hit::Send(recorder::Column::Track(lane)),
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Send { lane, from_y: p.y, from: v });
@@ -27408,7 +27634,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let clips = self.arr_clip_views();
                 let view = self.arrange_view(&clips);
                 let l = crate::arrangement_panel::Layout::new(rect, &view);
-                let target = l.header_rows.iter().position(|row| {
+                let target = l.header_rows.find_row(|row| {
                     row.panel.is_positive()
                         && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
                 });
@@ -27424,8 +27650,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     // The master's six slots live in two racks, and the
                     // header reaches them by their own variant.
-                    Some(crate::arrangement_panel::Hit::BusBay(_, slot)) => {
-                        Some(recorder::seat_bay(recorder::STRIPS, slot))
+                    Some(crate::arrangement_panel::Hit::BusBay(col, slot)) => {
+                        Some(recorder::seat_bay(col.desk_index(), slot))
                     }
                     _ => None,
                 };
@@ -27915,8 +28141,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let l = crate::arrangement_panel::Layout::new(rect, &view);
             let lane = l
                 .lane_rows
-                .iter()
-                .position(|r| r.is_positive() && r.contains(p))
+                .find_row(|r| r.is_positive() && r.contains(p))
                 .unwrap_or_else(|| me.selected_channel.unwrap_or(0));
             (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
         };
@@ -28048,7 +28273,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .iter()
             .map(|c| {
                 (
-                    c.lane.min(recorder::CHANNELS - 1),
+                    c.lane.min(self.desk_extent().saturating_sub(1)),
                     (c.start_s / domain) as f32,
                     (self.clip_len_resolved(c) / domain) as f32,
                     self.strip_color(c.lane),
@@ -28063,6 +28288,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             blocks,
             viewport,
             domain_s: domain,
+            rows: self.desk_extent(),
         }
     }
 
@@ -28097,10 +28323,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &'a self,
         clips: &'a [crate::arrangement_panel::ClipView<'a>],
     ) -> crate::arrangement_panel::ArrangeView<'a> {
+        use crate::recorder::StripRef;
         let g = self.settings.knobs().gains;
         let desk = self.desk();
-        let peaks = self.meter_hold;
+        // Borrowed, not copied: see `mixer_view_ranks`.
+        let peaks = &self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
+        let master = StripRef::MASTER_INDEX;
+        let (index, lane_scroll, ranks) = self.arr_lane_window();
+        let window = index.window(ranks.start, ranks.len());
         crate::arrangement_panel::ArrangeView {
             active: self.desk_extent(),
             // **The master's row.** Its level and colour come from the same
@@ -28111,7 +28342,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.recorder.master.left.peak,
                 self.recorder.master.right.peak,
             ],
-            master_color: self.strip_color(recorder::MASTER_SEAT),
+            master_color: self.strip_color(master),
             accent: {
                 let c = self.settings.white_key_active_color;
                 (c.r, c.g, c.b)
@@ -28124,13 +28355,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The master's two racks, in strip order — `seat_bay` is the one
             // place that knows which of its six slots lives where.
             master_inserts: std::array::from_fn(|n| {
-                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, n);
+                let (seat, bay) = recorder::seat_bay(master, n);
                 self.insert(seat, bay).map_or("", insert_chip_name)
             }),
             // Which of them are out of circuit, read from the same pair of
             // numbers as the names above — see `settings::BypassBays`.
             master_bypassed: std::array::from_fn(|n| {
-                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, n);
+                let (seat, bay) = recorder::seat_bay(master, n);
                 self.insert_bypassed(seat, bay)
             }),
             // No UI to open it yet — the row exists so the tempo work has
@@ -28169,43 +28400,43 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // resting value, arm and bypass — so the row that appears under
             // the master is a track's row in every respect but its subject.
             master_automation: self
-                .arr_auto_rows(crate::arrangement_panel::MASTER_LANE)
+                .arr_auto_rows(master_lane())
                 .into_iter()
                 .enumerate()
                 .map(|(slot, param)| crate::arrangement_panel::AutoView {
                     param,
-                    label: self.auto_param_label(crate::arrangement_panel::MASTER_LANE, param),
+                    label: self.auto_param_label(master_lane(), param),
                     selected: self.arr_auto_sel
-                        == Some((crate::arrangement_panel::MASTER_LANE, slot)),
-                    resting: self.auto_base(crate::arrangement_panel::MASTER_LANE, param),
+                        == Some((master_lane(), slot)),
+                    resting: self.auto_base(master_lane(), param),
                     armed: self
                         .arr_auto_armed
-                        .contains(&(crate::arrangement_panel::MASTER_LANE, param)),
+                        .contains(&(master_lane(), param)),
                     bypassed: self
                         .arr_auto_bypassed
-                        .contains(&(crate::arrangement_panel::MASTER_LANE, param)),
+                        .contains(&(master_lane(), param)),
                     points: self
                         .arrangement
                         .automation
-                        .get(crate::arrangement_panel::MASTER_LANE, param)
+                        .get(master_lane(), param)
                         .map_or(&[][..], crate::automation::Curve::points),
                     hot: self
                         .arr_auto_hot
                         .filter(|(l, s, _)| {
-                            *l == crate::arrangement_panel::MASTER_LANE && *s == slot
+                            *l == master_lane() && *s == slot
                         })
                         .map(|(_, _, i)| i),
                     chosen: self
                         .arr_auto_nodes
                         .iter()
                         .filter(|(l, s, _)| {
-                            *l == crate::arrangement_panel::MASTER_LANE && *s == slot
+                            *l == master_lane() && *s == slot
                         })
                         .map(|(_, _, i)| *i)
                         .collect(),
                     moving: match self.arr_drag {
                         Some(ArrDrag::AutoPoint(l, s, i))
-                            if l == crate::arrangement_panel::MASTER_LANE && s == slot =>
+                            if l == master_lane() && s == slot =>
                         {
                             Some(i)
                         }
@@ -28213,9 +28444,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     },
                 })
                 .collect(),
-            lanes: std::array::from_fn(|n| {
+            lanes: crate::arrangement_panel::Lanes::new(window.iter().map(|row| {
+                let n = *row as usize;
                 let kind = self.channel_kind(n);
-                crate::arrangement_panel::LaneView {
+                (n, crate::arrangement_panel::LaneView {
                     automation: self
                         .arr_auto_rows(n)
                         .into_iter()
@@ -28285,24 +28517,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }),
                     color: self.strip_color(n),
                     kind,
-                    used: self.channel_used(n),
+                    // `channel_used`, with the clip count from the index
+                    // rather than a walk over every clip in the song.
+                    used: kind.is_some()
+                        || index.clip_count(n) > 0
+                        || (self.settings.tracks_added >> n) & 1 == 1,
                     armed: self.armed_mask() & (1 << n) != 0,
                     muted: desk.muted[n],
                     phase: self.settings.strip_phase & (1 << n) != 0,
                     soloed: desk.soloed[n],
                     to_theory: self.to_theory(n),
                     is_folder: self.is_folder(n),
-                    in_folder: self.in_folder(n),
+                    in_folder: index.in_folder(n),
                     folder_shut: self.folder_shut(n),
-                    folder_count: self.folder_children(n).len(),
-                    hidden: self.lane_hidden(n),
+                    folder_count: index.child_count(n),
+                    hidden: index.hidden(n),
                     // A folder's own mute dims the folder AND its children;
                     // a track muted on its own is left alone, because its
                     // switch already says so.
                     frozen: self.lane_frozen(n).is_some(),
                     folder_silent: {
-                        let by_parent = self
-                            .folder_of(n)
+                        let by_parent = index
+                            .parent(n)
                             .is_some_and(|f| self.settings.strip_muted & (1 << f) != 0);
                         let own_group = self.is_folder(n)
                             && self.settings.strip_muted & (1 << n) != 0;
@@ -28312,22 +28548,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     send: desk.send[n],
                     pan: self.channel_pan(n),
                     peak: peaks[n],
-                }
-            }),
-            lane_scroll: self
-                .arr_lane_scroll
-                .min(self.desk_extent().saturating_sub(self.arr_visible())),
+                })
+            })
+            .collect()),
+            lane_scroll,
             visible_lanes: self.arr_visible(),
             clips,
             header_w: self.arr_header_w_pt(),
             time_sel: self.time_sel,
             selected_channel: self.selected_channel,
             selected_tracks: &self.selected_tracks,
+            // A track's name being typed, by its row: the click and the
+            // master have no header to type into here.
             naming: self
                 .mixer_naming
                 .as_ref()
-                .and_then(|(at, buf)| at.strip().map(|s| (s.index(), buf.as_str())))
-                .filter(|(i, _)| *i < recorder::CHANNELS),
+                .and_then(|(at, buf)| at.row().map(|row| (row, buf.as_str()))),
             metronome_on: self.settings.metronome_on,
             snap_on: self.settings.arr_snap,
             grip_lit: self.arr_grip_lit,
@@ -28337,7 +28573,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             auto_marquee: match self.arr_drag {
                 Some(ArrDrag::AutoMarquee { lane, slot, from, to, moved: true, .. }) => {
                     Some(crate::arrangement_panel::AutoMarquee {
-                        lane,
+                        lane: crate::arrangement_panel::LaneId::from_auto_lane(lane),
                         slot,
                         t0: from.0,
                         t1: to.0,
@@ -29000,17 +29236,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // silently inaudible. Not offering it is the owner's call and the
         // honest one; `set_is_folder` drops any route that already points at
         // a track being turned into a group.
-        let channels = (0..recorder::CHANNELS)
+        //
+        // **Named as the desk names them** (`channel_display_name`, the
+        // strip's and the header's one function), so the picker can lead
+        // with the name: see `dialogs::picker_rows`.
+        let channels = (0..self.desk_extent())
             .filter(|n| *n != channel && self.channel_used(*n) && !self.is_folder(*n))
-            .map(|n| {
-                let name = self
-                    .settings
-                    .strip_names
-                    .get(n)
-                    .cloned()
-                    .unwrap_or_default();
-                (n, name)
-            })
+            .map(|n| (n, self.channel_display_name(n).to_owned()))
             .collect();
         let existing = self
             .settings
@@ -29025,6 +29257,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             hardware,
             channels,
             existing,
+            filter: String::new(),
         }
     }
 
@@ -29044,23 +29277,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// channel is not a thing anyone means) and unused channels (a key that
     /// never sounds is a compressor that never ducks, silently).
     fn key_picker_dialog(&self, strip: usize, slot: usize) -> Dialog {
-        let channels = (0..recorder::CHANNELS)
+        // Named as the desk names them, for the name-first rows: see
+        // `routing_dialog`.
+        let channels = (0..self.desk_extent())
             .filter(|n| *n != strip && self.channel_used(*n))
-            .map(|n| {
-                let name = self
-                    .settings
-                    .strip_names
-                    .get(n)
-                    .cloned()
-                    .unwrap_or_default();
-                (n, name)
-            })
+            .map(|n| (n, self.channel_display_name(n).to_owned()))
             .collect();
         Dialog::InsertKeySource {
             strip,
             slot,
             current: self.settings.insert_keys.get(strip, slot),
             channels,
+            filter: String::new(),
         }
     }
 
@@ -29148,7 +29376,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **The master reads its own controls**, not `channel_gains[16]`,
         // which does not exist. Its rows are a track's in every other
         // respect; this is the one place the subject differs.
-        if lane == crate::arrangement_panel::MASTER_LANE {
+        if lane == master_lane() {
             return match param {
                 AutoParam::Gain => {
                     f64::from(recorder::gain_to_fader(self.settings.master_gain as f32))
@@ -29217,10 +29445,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // does — that is the one road to the engine, and a second one is how
         // the desk and the arrangement come to disagree about where a fader
         // is standing.
-        if lane == crate::arrangement_panel::MASTER_LANE {
+        if lane == master_lane() {
             if matches!(param, AutoParam::Gain) {
                 self.apply_mixer_hit(
-                    M::Fader(Column(crate::arrangement_panel::MASTER_COLUMN)),
+                    M::Fader(Column::Master),
                     v as f32,
                 );
                 self.auto_write_if_armed(lane, param, v);
@@ -29230,7 +29458,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the reason spelled out below.
             return;
         }
-        let col = Column(lane);
+        let col = Column::Track(lane);
         match param {
             AutoParam::Gain => self.apply_mixer_hit(M::Fader(col), v as f32),
             AutoParam::Pan => self.apply_mixer_hit(M::Pan(col), v as f32),
@@ -29318,7 +29546,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // seats and a channel's 3..5 on its folder seat. Unresolved, the
         // master's rows (and a folder's lower rack's) fell back to the
         // address.
-        let (seat, sb) = if lane == crate::arrangement_panel::MASTER_LANE {
+        let (seat, sb) = if lane == master_lane() {
             Self::master_bay(bay)
         } else {
             recorder::seat_bay(lane, bay)
@@ -32389,7 +32617,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 mixer_run_w(pane),
             )
         };
-        want.clamp(1, self.desk_extent())
+        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
     }
     fn arr_visible(&self) -> usize {
         // Zero is the auto sentinel; see `mixer_visible` and
@@ -32404,7 +32632,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 arr_timeline_h(&self.settings, pane),
             )
         };
-        want.clamp(1, self.desk_extent())
+        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -32807,12 +33035,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // and deleting are the right button's, and a reader reaches
             // those the way a hand does.
             A::Flag(i) => self.arr_locate_marker(i),
-            A::Arm(n) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
-            A::Mute(n) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
-            A::Solo(n) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
-            A::Gain(n) | A::BusGain(n) => self.apply_mixer_hit(M::Fader(Column(n)), v),
-            A::Send(n) => self.apply_mixer_hit(M::Send(Column(n)), v),
-            A::Pan(n) => self.apply_mixer_hit(M::Pan(Column(n)), v),
+            A::Arm(n) => self.apply_mixer_hit(M::Arm(Column::Track(n)), 0.0),
+            A::Mute(n) => self.apply_mixer_hit(M::Mute(Column::Track(n)), 0.0),
+            A::Solo(n) => self.apply_mixer_hit(M::Solo(Column::Track(n)), 0.0),
+            A::Gain(n) => self.apply_mixer_hit(M::Fader(Column::Track(n)), v),
+            A::BusGain(col) => self.apply_mixer_hit(M::Fader(col), v),
+            A::Send(n) => self.apply_mixer_hit(M::Send(Column::Track(n)), v),
+            A::Pan(n) => self.apply_mixer_hit(M::Pan(Column::Track(n)), v),
             // **Through the desk, like the three switches beside it.**
             //
             // T was the one switch on this header that toggled its own lane
@@ -32821,7 +33050,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // select four tracks, press M and four mute, press T and one
             // changes. The mixer's T already went the right way, which is what
             // made the two panels disagree about the same switch.
-            A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0),
+            A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column::Track(n)), 0.0),
             A::HdrCollapse(n) => self.toggle_folder_shut(n),
             A::HdrAdd(n) => {
                 let _ = self.add_bare_track(n);
@@ -32836,8 +33065,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.touch_track(n);
                 self.open_input_menu(n);
             }
-            A::BusBay(_, slot) => {
-                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, slot);
+            A::BusBay(col, slot) => {
+                let (seat, bay) = recorder::seat_bay(col.desk_index(), slot);
                 self.open_insert_face(seat, bay);
             }
             A::HdrBay(n, bay) => {
@@ -32845,11 +33074,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let (seat, b) = recorder::seat_bay(n, bay);
                 self.open_insert_face(seat, b);
             }
-            A::AutoParamPick(n, slot) => self.arr_select_auto_row(n, slot),
-            A::Phase(n) => self.apply_mixer_hit(M::Phase(Column(n)), 0.0),
-            A::AutoClose(n, slot) => self.arr_close_auto_row(n, slot),
-            A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n, slot),
-            A::AutoBypass(n, slot) => self.arr_toggle_auto_bypass(n, slot),
+            A::AutoParamPick(n, slot) => self.arr_select_auto_row(n.auto_lane(), slot),
+            A::Phase(n) => self.apply_mixer_hit(M::Phase(Column::Track(n)), 0.0),
+            A::AutoClose(n, slot) => self.arr_close_auto_row(n.auto_lane(), slot),
+            A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n.auto_lane(), slot),
+            A::AutoBypass(n, slot) => self.arr_toggle_auto_bypass(n.auto_lane(), slot),
             A::AutoDial(..) => {}
             A::TempoHeader => self.arr_ask_flatten_tempo(),
             A::ToolMetronome => self.toggle_metronome(),
@@ -37770,7 +37999,11 @@ const BASE_OF_MONITOR: f64 = 0.5 * 1.25;
 /// shown exactly, trading a few points of slack for a number that reads as a
 /// decision. The steps widen as they climb — nobody distinguishes a 27-lane
 /// default from a 28-lane one, but 6 versus 8 is a real choice — and it ends at
-/// [`crate::recorder::CHANNELS`], the most lanes the desk has to show.
+/// [`crate::recorder::VISIBLE_MAX`], the most lanes either view lays out at
+/// once. It ended at thirty-two, the desk's width, which made a screen's
+/// capacity a property of how many tracks exist; 48 and 64 are the rungs a
+/// big screen climbs to once the desk is longer than that, and every count
+/// is still clamped to the desk it shows.
 ///
 /// **Ten was added when the owner asked for ten strips**, and it belongs here
 /// on the ladder's own terms rather than as a favour to one number: ten is as
@@ -37783,7 +38016,14 @@ const BASE_OF_MONITOR: f64 = 0.5 * 1.25;
 /// quotient to sit near, which is why [`COMFY_LANE_H`] and
 /// [`COMFY_STRIP_PITCH`] are now chosen for their DISTANCE from a boundary
 /// across a table of real displays rather than solved off one screen.
-const COUNT_LADDER: [usize; 8] = [4, 6, 8, 10, 12, 16, 24, 32];
+const COUNT_LADDER: [usize; 10] = [4, 6, 8, 10, 12, 16, 24, 32, 48, 64];
+
+/// **The automation lane the master's curves are filed under.** One name for
+/// [`crate::arrangement_panel::LaneId::auto_lane`] on the master, which asks
+/// `StripRef`, so the app no longer spells "one past the channels" itself.
+pub(crate) fn master_lane() -> usize {
+    crate::arrangement_panel::LaneId::Master.auto_lane()
+}
 
 /// **A comfortable arrangement LANE height, in points.**
 ///
@@ -37971,7 +38211,9 @@ fn carried_count(chosen: usize, at: f32, now: f32) -> usize {
     if (now / at - 1.0).abs() <= CARRY_TOLERANCE {
         return chosen;
     }
-    sensible_visible_count(now, at / chosen as f32, 1, recorder::CHANNELS)
+    // The zoom's own ceiling, never the desk's width; the caller clamps to
+    // the desk it shows.
+    sensible_visible_count(now, at / chosen as f32, 1, recorder::VISIBLE_MAX)
 }
 
 fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
@@ -39015,7 +39257,7 @@ impl TangentApp {
             // The mixer wins the tie, exactly as it does in the live paint:
             // both flags can be set and only one surface is drawn.
             if self.mixer_open {
-                let view = self.mixer_view();
+                let view = self.mixer_view_in(under_band);
                 crate::mixer_panel::draw(painter, under_band, &view);
             } else {
                 let clips = self.arr_clip_views();
@@ -40357,7 +40599,7 @@ impl TangentApp {
             }
         }
         if let Some(rect) = mixer_rect {
-            let view = self.mixer_view();
+            let view = self.mixer_view_in(rect);
             crate::mixer_panel::draw(ui.painter(), rect, &view);
             self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // Sixteen strips' worth of tab stops. See `tangent_ui::a11y`.
@@ -40395,7 +40637,7 @@ impl TangentApp {
             // A strip mid-carry: the source dims, the target column lights.
             if let Some((from, _, true)) = self.mixer_reorder {
                 let l = crate::mixer_panel::Layout::new(rect, &view);
-                if let Some(src) = l.strips.get(from) {
+                if let Some(src) = l.strips.get(recorder::Column::Track(from)) {
                     ui.painter().rect_filled(
                         src.panel,
                         4.0,
@@ -40411,7 +40653,7 @@ impl TangentApp {
                         .unwrap_or(None),
                     at,
                 ) {
-                    let on_edge = l.strips.get(n).is_some_and(|s| {
+                    let on_edge = l.strips.get(recorder::Column::Track(n)).is_some_and(|s| {
                         crate::mixer_panel::folder_drop_strip(s.panel).contains(p)
                     });
                     let joins = self.folder_drop_target(n, on_edge);
@@ -40420,7 +40662,7 @@ impl TangentApp {
                         // hand, and the receiving folder named by lighting
                         // its own TOP edge - the arrangement's left-edge
                         // fill, turned.
-                        if let Some(dst) = l.strips.get(n) {
+                        if let Some(dst) = l.strips.get(recorder::Column::Track(n)) {
                             let strip =
                                 crate::mixer_panel::folder_drop_strip(dst.panel);
                             if strip.is_positive() {
@@ -40441,7 +40683,7 @@ impl TangentApp {
                                 );
                             }
                         }
-                        if let Some(head) = l.strips.get(folder) {
+                        if let Some(head) = l.strips.get(recorder::Column::Track(folder)) {
                             ui.painter().rect_filled(
                                 Rect::from_min_max(
                                     head.panel.min,
@@ -40455,7 +40697,7 @@ impl TangentApp {
                             );
                         }
                     } else if n != from {
-                        if let Some(dst) = l.strips.get(n) {
+                        if let Some(dst) = l.strips.get(recorder::Column::Track(n)) {
                             ui.painter().line_segment(
                                 [
                                     Pos2::new(dst.panel.left(), dst.panel.top()),
@@ -40467,7 +40709,7 @@ impl TangentApp {
                     } else if self.in_folder(from) {
                         // The drag that came home: release leaves the
                         // folder, the strip stays put.
-                        if let Some(dst) = l.strips.get(n) {
+                        if let Some(dst) = l.strips.get(recorder::Column::Track(n)) {
                             ui.painter().rect_stroke(
                                 dst.panel,
                                 4.0,
@@ -40555,7 +40797,7 @@ impl TangentApp {
                 }
                 let at = ui.ctx().input(|i| i.pointer.interact_pos());
                 if let Some(t) = at.and_then(|p| {
-                    l.header_rows.iter().position(|row| {
+                    l.header_rows.find_row(|row| {
                         row.panel.is_positive()
                             && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
                     })
@@ -41125,8 +41367,10 @@ impl TangentApp {
                         // zoom for the same rule.
                         let steps = self.wheel_mixer_zoom.steps(d);
                         let cur = self.mixer_visible() as i64;
+                        // On the zoom's own ceiling, never the desk's width:
+                        // a desk longer than a screen scrolls.
                         let next = (cur + i64::from(steps))
-                            .clamp(1, recorder::CHANNELS as i64);
+                            .clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX) as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
                             self.settings.mixer_visible_at = mixer_run_w(self.count_pane());
@@ -41270,7 +41514,7 @@ impl TangentApp {
             // overlay owns the surface.
             if ctx.input(|i| i.pointer.secondary_pressed()) {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_in(rect);
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
                         // **A loaded bay answers with its menu, not with the
                         // deed.** Right-click used to unload the plugin in one
@@ -41349,7 +41593,7 @@ impl TangentApp {
             // one.
             if double {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_in(rect);
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
                         Some(hit @ crate::mixer_panel::Hit::Name(_)) => {
                             self.apply_mixer_hit(hit, 0.0);
@@ -41363,6 +41607,27 @@ impl TangentApp {
             let released = ctx.input(|i| i.pointer.any_released());
             let pos = ctx.pointer_interact_pos();
             let pointer_down = ctx.input(|i| i.pointer.primary_down());
+            // **The scrollbar under the run.** A press there is the bar's
+            // (no strip draws in that margin, so nothing else would have
+            // answered it), and while the button stays down the hand carries
+            // the thumb and the desk with it.
+            if pressed {
+                self.mixer_bar_grab = pos.filter(|p| rect.contains(*p)).and_then(|p| {
+                    let view = self.mixer_view_in(rect);
+                    crate::mixer_panel::scrollbar_grab(rect, &view, p)
+                });
+            }
+            if let Some(grab) = self.mixer_bar_grab {
+                match pos.filter(|_| pointer_down) {
+                    Some(p) => {
+                        let view = self.mixer_view_in(rect);
+                        if let Some(px) = crate::mixer_panel::scrollbar_scroll(rect, &view, p, grab) {
+                            self.mixer_scroll_px = px;
+                        }
+                    }
+                    None => self.mixer_bar_grab = None,
+                }
+            }
             if pressed {
                 // A press anywhere else finishes the figure being typed.
                 if self.mixer_typing.is_some() {
@@ -41382,7 +41647,7 @@ impl TangentApp {
                 }
                 if let Some(pos) = pos.filter(|p| rect.contains(*p)) {
                     self.menu_anchor = pos;
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_in(rect);
                     // Any press on a channel SELECTS it — the slight light
                     // the owner asked for, useful later.
                     let pressed_strip = crate::mixer_panel::strip_at(rect, &view, pos)
@@ -41390,7 +41655,7 @@ impl TangentApp {
                     if let Some(recorder::Strip::Channel(n)) = pressed_strip {
                         self.select_track(n, ui.input(|i| i.modifiers));
                     }
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_in(rect);
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
                         // **A LOADED bay arms the carry** rather than
                         // opening at once: the window still opens on a press
@@ -41505,7 +41770,7 @@ impl TangentApp {
             // Only once ARMED, the `true` in each carry: a motionless press is
             // still a click, and a click that scrolled the desk out from under
             // itself would be unusable. And nothing to do at the landing
-            // sites — `mixer_view()` is rebuilt from `mixer_scroll_px` every
+            // sites — `mixer_view_in` is rebuilt from `mixer_scroll_px` every
             // frame, so `strip_at` and the carry's own highlight both answer
             // about whatever column has scrolled under the pointer.
             if pointer_down {
@@ -41513,7 +41778,7 @@ impl TangentApp {
                     || self.bay_carry.is_some_and(|(_, _, _, live)| live);
                 if let (true, Some(p)) = (carrying, pos) {
                     let region = {
-                        let view = self.mixer_view();
+                        let view = self.mixer_view_in(rect);
                         crate::mixer_panel::Layout::new(rect, &view).region
                     };
                     let step = edge_scroll_step(&ctx, region, p, EdgeAxes::X);
@@ -41529,7 +41794,7 @@ impl TangentApp {
                         self.bay_carry = Some((strip, bay, origin, true));
                     }
                 } else {
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_in(rect);
                     let target = crate::mixer_panel::strip_at(rect, &view, p)
                         .map(recorder::Column::desk_index);
                     // The BAY under the hand, in SEAT space like the carry
@@ -41564,13 +41829,13 @@ impl TangentApp {
                         // and a drag that comes home EJECTS in place - one
                         // set of rules, both views, the owner's ask.
                         let (target, on_edge) = {
-                            let view = self.mixer_view();
+                            let view = self.mixer_view_in(rect);
                             match crate::mixer_panel::strip_at(rect, &view, p)
                                 .and_then(recorder::Column::strip)
                             {
                                 Some(recorder::Strip::Channel(to)) => {
                                     let l = crate::mixer_panel::Layout::new(rect, &view);
-                                    let edge = l.strips.get(to).is_some_and(|s| {
+                                    let edge = l.strips.get(recorder::Column::Track(to)).is_some_and(|s| {
                                         crate::mixer_panel::folder_drop_strip(s.panel)
                                             .contains(p)
                                     });
@@ -42781,7 +43046,7 @@ mod paywall_tests {
                 on_full: false,
                 go: |app, _| {
                     let v = vacant(app);
-                    app.apply_mixer_hit(crate::mixer_panel::Hit::Add(recorder::Column(v)), 0.0);
+                    app.apply_mixer_hit(crate::mixer_panel::Hit::Add(recorder::Column::Track(v)), 0.0);
                     None
                 },
             },
@@ -43178,7 +43443,7 @@ mod paywall_tests {
         assert!(!app.add_bare_track(10), "a desk past the cap grew");
         // Edits commit (the sentinel stays quiet over a desk already above
         // the cap), and so do removals.
-        app.commit_mixer_name(recorder::Column(2), "Bass".to_owned());
+        app.commit_mixer_name(recorder::Column::Track(2), "Bass".to_owned());
         app.remove_channel(5);
         app.remove_channel(4);
         assert_eq!(app.counted_tracks(), 4);
@@ -43596,7 +43861,7 @@ mod tests {
 
         // And back, with no trace left of a drag that was in progress.
         app.mixer_grab = Some(MixerGrab {
-            hit: crate::mixer_panel::Hit::Fader(recorder::Column(0)),
+            hit: crate::mixer_panel::Hit::Fader(recorder::Column::Track(0)),
             from: Pos2::ZERO,
             moved: true,
             from_value: 0.5,
@@ -43628,13 +43893,7 @@ mod tests {
         // index is the MASTER's column, and what the test proved was that the
         // master moved the metronome. Both halves are now named by the column
         // they really are.
-        let column = |s: Strip| {
-            Strip::shown()
-                .iter()
-                .position(|c| *c == s)
-                .map(recorder::Column)
-                .expect("that strip has no column")
-        };
+        let column = |s: Strip| s.column_of().expect("that strip has no column");
         app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.25);
         let quiet = app.settings.knobs().gains.channels[2];
         app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.75);
@@ -44503,7 +44762,7 @@ mod tests {
         app.arrangement_open = false;
         let _ = run_frame(&ctx, &mut app);
         let at = app.mixer_rect.expect("the mixer was not drawn").center();
-        let fader = crate::mixer_panel::Hit::Fader(recorder::Column(1));
+        let fader = crate::mixer_panel::Hit::Fader(recorder::Column::Track(1));
         app.apply_mixer_hit(fader, 0.3);
         app.undo_commit();
         let before = app.hist_at;
@@ -44604,7 +44863,7 @@ mod tests {
             let rect = app.mixer_rect.expect("the mixer did not open");
             let (at, hit) = {
                 let view = app.mixer_view();
-                let f = crate::mixer_panel::Layout::new(rect, &view).strips[0].fader;
+                let f = crate::mixer_panel::Layout::new(rect, &view).strips[recorder::Column::Track(0)].fader;
                 let hit = crate::mixer_panel::hit_test(rect, &view, f.center())
                     .expect("nothing at all is at the fader's centre");
                 (f.center(), hit)
@@ -44788,7 +45047,7 @@ mod tests {
             }),
             ("a mixer fader", |a, on| {
                 a.mixer_grab = on.then_some(MixerGrab {
-                    hit: crate::mixer_panel::Hit::Fader(recorder::Column(1)),
+                    hit: crate::mixer_panel::Hit::Fader(recorder::Column::Track(1)),
                     from: Pos2::ZERO,
                     moved: true,
                     from_value: 0.5,
@@ -45008,9 +45267,9 @@ mod tests {
 
         // **A switch is a press, so a moment.** One each, and each on its own.
         for (what, hit) in [
-            ("mute", crate::mixer_panel::Hit::Mute(recorder::Column(2))),
-            ("solo", crate::mixer_panel::Hit::Solo(recorder::Column(2))),
-            ("the theory send", crate::mixer_panel::Hit::ToTheory(recorder::Column(2))),
+            ("mute", crate::mixer_panel::Hit::Mute(recorder::Column::Track(2))),
+            ("solo", crate::mixer_panel::Hit::Solo(recorder::Column::Track(2))),
+            ("the theory send", crate::mixer_panel::Hit::ToTheory(recorder::Column::Track(2))),
         ] {
             let before = app.hist_at;
             app.apply_mixer_hit(hit, 0.0);
@@ -45031,7 +45290,7 @@ mod tests {
         let before = app.hist_at;
         for f in 1..=30 {
             app.apply_mixer_hit(
-                crate::mixer_panel::Hit::Fader(recorder::Column(2)),
+                crate::mixer_panel::Hit::Fader(recorder::Column::Track(2)),
                 f as f32 / 60.0,
             );
             app.arr_gesture_dirty = true;
@@ -45107,7 +45366,7 @@ mod tests {
         use crate::mixer_panel::{FxAction, Hit as H};
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.arrangement_open = true;
-        let col = recorder::Column(3);
+        let col = recorder::Column::Track(3);
         let (seat, bay) = app.slot_seat(col, 0);
         app.set_insert(seat, bay, Some("/x/comp.vst3"));
         app.arr_save_edits();
@@ -45547,7 +45806,7 @@ mod tests {
 
         // A track worth copying: a name, two plugins and a clip.
         app.add_bare_track(1);
-        app.commit_mixer_name(recorder::Column(1), "Rhodes".to_owned());
+        app.commit_mixer_name(recorder::Column::Track(1), "Rhodes".to_owned());
         app.set_insert(1, 0, Some("/x/EP.vst3"));
         app.set_insert(1, 1, Some("/x/Plate.vst3"));
         app.arrangement.add_clip(crate::arrangement::ArrClip {
@@ -45586,7 +45845,7 @@ mod tests {
         // **And an EMPTY track still leaves one.** Nothing in it commits, so
         // without the hold's own commit this gesture left none at all.
         app.add_bare_track(8);
-        app.commit_mixer_name(recorder::Column(8), "Bare".to_owned());
+        app.commit_mixer_name(recorder::Column::Track(8), "Bare".to_owned());
         app.copy_track(8);
         let before = app.hist_at;
         app.paste_track(9);
@@ -48542,7 +48801,7 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         // Furnish the desk: a channel kind, a name, a plugin, a fader.
         app.set_channel_kind(2, Some(recorder::ChannelKind::Midi));
-        app.commit_mixer_name(recorder::Column(2), "Rhodes".to_owned());
+        app.commit_mixer_name(recorder::Column::Track(2), "Rhodes".to_owned());
         app.set_insert(2, 0, Some("/x/EP.vst3"));
         app.settings.channel_gains[2] = 0.42;
         app.settings.record_export.tempo_bpm = 93.0;
@@ -49490,7 +49749,7 @@ mod tests {
             app.mixer_open = road.ends_with("mixer") || road == "the mixer's cut";
             match road {
                 "the Track menu" => app.apply_dialog_action(DialogAction::TrackRemove(lane)),
-                "the strip's ×" => app.apply_mixer_hit(Hit::Remove(Column(lane)), 0.0),
+                "the strip's ×" => app.apply_mixer_hit(Hit::Remove(Column::Track(lane)), 0.0),
                 "the mixer's cut" => frame_with(ctx, app, vec![egui::Event::Cut]),
                 _ => {
                     frame_with(ctx, app, vec![delete(true)]);
@@ -49880,24 +50139,24 @@ mod tests {
         assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
 
         // ── a SWITCH takes them all ──────────────────────────────────────
-        app.apply_mixer_hit(M::Mute(Column(3)), 0.0);
+        app.apply_mixer_hit(M::Mute(Column::Track(3)), 0.0);
         for n in [2usize, 3, 4, 5] {
             assert!(
-                app.strip_switch(M::Mute(Column(n)), n),
+                app.strip_switch(M::Mute(Column::Track(n)), n),
                 "track {n} did not follow the mute"
             );
         }
         // And pressing it again takes them all back.
-        app.apply_mixer_hit(M::Mute(Column(3)), 0.0);
+        app.apply_mixer_hit(M::Mute(Column::Track(3)), 0.0);
         for n in [2usize, 3, 4, 5] {
-            assert!(!app.strip_switch(M::Mute(Column(n)), n), "track {n} stayed muted");
+            assert!(!app.strip_switch(M::Mute(Column::Track(n)), n), "track {n} stayed muted");
         }
 
         // ── a LEVEL moves them by the same distance ──────────────────────
-        let before: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column(n)))).collect();
+        let before: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column::Track(n)))).collect();
         let to = before[1] - 0.1;
-        app.apply_mixer_hit(M::Fader(Column(3)), to);
-        let after: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column(n)))).collect();
+        app.apply_mixer_hit(M::Fader(Column::Track(3)), to);
+        let after: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column::Track(n)))).collect();
         let moved = after[1] - before[1];
         for (k, n) in (2..=5).enumerate() {
             assert!(
@@ -49921,10 +50180,10 @@ mod tests {
         );
 
         // ── and an UNSELECTED track is left alone ────────────────────────
-        let bystander = app.mixer_value(M::Fader(Column(9)));
-        app.apply_mixer_hit(M::Fader(Column(3)), to - 0.1);
+        let bystander = app.mixer_value(M::Fader(Column::Track(9)));
+        app.apply_mixer_hit(M::Fader(Column::Track(3)), to - 0.1);
         assert!(
-            (app.mixer_value(M::Fader(Column(9))) - bystander).abs() < 1.0e-6,
+            (app.mixer_value(M::Fader(Column::Track(9))) - bystander).abs() < 1.0e-6,
             "a track outside the selection followed the drag"
         );
     }
@@ -50237,11 +50496,11 @@ mod tests {
         use crate::recorder::Column;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         let before = app.to_theory(3);
-        app.apply_mixer_hit(M::ToTheory(Column(3)), 0.0);
+        app.apply_mixer_hit(M::ToTheory(Column::Track(3)), 0.0);
         assert_ne!(app.to_theory(3), before, "T did not switch");
 
         let mono = app.settings.master_mono;
-        app.apply_mixer_hit(M::Mono(Column(recorder::CHANNELS)), 0.0);
+        app.apply_mixer_hit(M::Mono(Column::Master), 0.0);
         assert_ne!(app.settings.master_mono, mono, "the mono fold did not switch");
     }
 
@@ -50277,7 +50536,7 @@ mod tests {
         let (_c2, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
-        app.apply_mixer_hit(M::ToTheory(Column(3)), 0.0);
+        app.apply_mixer_hit(M::ToTheory(Column::Track(3)), 0.0);
         for n in picked {
             assert!(app.to_theory(n), "the mixer's T missed track {n}");
         }
@@ -52682,7 +52941,7 @@ mod tests {
     #[test]
     fn a_column_moves_its_own_fader_and_no_other() {
         use crate::mixer_panel::Hit;
-        use crate::recorder::{Strip, COLUMNS_FOR_TEST};
+        use crate::recorder::Strip;
         let snapshot = |s: &Settings| {
             let mut v: Vec<f64> = s.channel_gains.to_vec();
             v.push(s.drums_gain);
@@ -52691,7 +52950,7 @@ mod tests {
             v.push(s.master_gain);
             v
         };
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             let before = snapshot(&app.settings);
             // A position nothing defaults to, so "it changed" is unambiguous.
@@ -52711,8 +52970,7 @@ mod tests {
             assert_eq!(
                 moved,
                 vec![want],
-                "column {} ({:?}) moved {moved:?}, not just {want}",
-                col.0,
+                "column {col:?} ({:?}) moved {moved:?}, not just {want}",
                 col.strip()
             );
         }
@@ -52724,9 +52982,8 @@ mod tests {
     #[test]
     fn the_desks_master_is_the_bands_master_dial() {
         use crate::mixer_panel::Hit;
-        use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        app.apply_mixer_hit(Hit::Fader(recorder::Column(COLUMNS_FOR_TEST - 1)), 0.42);
+        app.apply_mixer_hit(Hit::Fader(recorder::Column::Master), 0.42);
         let desk = app.settings.master_gain;
         assert!(
             (desk - f64::from(recorder::fader_to_gain(0.42))).abs() < 1e-9,
@@ -52760,7 +53017,6 @@ mod tests {
     #[test]
     fn a_send_resets_to_dry_on_every_strip_but_still_ships_wet() {
         use crate::mixer_panel::Hit;
-        use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
 
         // The desk OPENS with the instrument's send up - the half that must
@@ -52771,17 +53027,17 @@ mod tests {
              which is a change to what a fresh install sounds like"
         );
 
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             app.apply_mixer_hit(Hit::Send(col), 0.61);
         }
         assert!(
             app.settings.strip_sends.iter().any(|v| *v > 0.5),
             "nothing moved, so resetting proves nothing"
         );
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             app.reset_mixer_hit(Hit::Send(col));
         }
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             let at = col.desk_index();
             // The master column has no send row of its own, so it indexes
             // one past the table - it is the one strip this question does
@@ -52805,17 +53061,16 @@ mod tests {
     #[test]
     fn a_double_click_puts_a_fader_back_to_its_default() {
         use crate::mixer_panel::Hit;
-        use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         let fresh = Settings::default();
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             app.apply_mixer_hit(Hit::Fader(col), 0.13);
         }
         assert_ne!(
             app.settings.master_gain, fresh.master_gain,
             "nothing moved, so resetting proves nothing"
         );
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             app.reset_mixer_hit(Hit::Fader(col));
         }
         for (what, got, want) in [
@@ -52841,10 +53096,10 @@ mod tests {
     /// That is the third time this aliasing has shipped.
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
-        use crate::recorder::{COLUMNS_FOR_TEST, STRIPS};
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        use crate::recorder::STRIPS;
+        for col in recorder::Column::every(recorder::CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-            app.commit_mixer_name(col, format!("col{}", col.0));
+            app.commit_mixer_name(col, format!("{col:?}"));
             let named: Vec<usize> = (0..=STRIPS)
                 .filter(|i| {
                     app.settings.strip_names.get(*i).is_some_and(|n| !n.is_empty())
@@ -52853,8 +53108,7 @@ mod tests {
             assert_eq!(
                 named,
                 vec![col.desk_index()],
-                "column {} ({:?}) named {named:?}",
-                col.0,
+                "column {col:?} ({:?}) named {named:?}",
                 col.strip()
             );
         }
@@ -52863,15 +53117,13 @@ mod tests {
     /// And what it names is what the desk reads back for that column.
     #[test]
     fn a_typed_name_is_the_one_the_desk_shows() {
-        use crate::recorder::COLUMNS_FOR_TEST;
-        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
+        for col in recorder::Column::every(recorder::CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, "Rhodes".to_owned());
             assert_eq!(
-                app.mixer_view().strips[col.0].name,
+                app.mixer_view().strips[col].name,
                 "Rhodes",
-                "column {} does not show the name it was given",
-                col.0
+                "column {col:?} does not show the name it was given"
             );
         }
     }
@@ -53024,7 +53276,7 @@ mod tests {
         // two bays answer differently.
         app.set_insert(1, 1, Some("/x/Pianoteq 8.vst3"));
 
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
         assert!(
             matches!(app.dialog, Some(Dialog::PatchPicker { slot: 1, .. })),
             "the built-in did not open its patches"
@@ -53038,7 +53290,7 @@ mod tests {
         assert!(app.take_recorder_request().is_none());
 
         app.dialog = None;
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 1), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 1), 0.0);
         assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
         assert_eq!(
             app.take_recorder_request(),
@@ -54862,9 +55114,9 @@ mod tests {
         // rather than the seat, which is what `default_armed` is for.
         assert_eq!(app.armed_mask(), 2, "a fresh desk should open with the DX7 armed");
 
-        app.apply_mixer_hit(Hit::Arm(Column(1)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(1)), 0.0);
         assert_eq!(app.armed_mask(), 0, "R did not disarm");
-        app.apply_mixer_hit(Hit::Arm(Column(1)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(1)), 0.0);
         assert_eq!(app.armed_mask(), 2, "R did not arm again");
 
         // A track somebody just added touches NOBODY's arms — its own
@@ -54881,11 +55133,11 @@ mod tests {
             2,
             "adding a track changed the arms (its own or another's)"
         );
-        app.apply_mixer_hit(Hit::Arm(Column(n)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(n)), 0.0);
         assert_ne!(app.armed_mask() & (1 << n), 0, "R would not arm the new track");
 
         // And the × takes the arm with the channel.
-        app.apply_mixer_hit(Hit::Remove(Column(n)), 0.0);
+        app.apply_mixer_hit(Hit::Remove(Column::Track(n)), 0.0);
         assert_eq!(app.armed_mask() & (1 << n), 0, "a removed channel stayed armed");
 
         // **And the desk carries it.** The mask is in the settings file and
@@ -55202,10 +55454,10 @@ mod tests {
         // Arm two more tracks beside the piano, mute one and solo another —
         // the desk somebody actually leaves behind.
         for n in [3_usize, 5] {
-            app.apply_mixer_hit(Hit::Arm(Column(n)), 0.0);
+            app.apply_mixer_hit(Hit::Arm(Column::Track(n)), 0.0);
         }
-        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
-        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
         let armed = app.armed_mask();
         let muted = app.settings.strip_muted;
         let soloed = app.settings.strip_soloed;
@@ -55215,8 +55467,8 @@ mod tests {
 
         // The session moves on: everything disarmed, the mute lifted.
         app.set_armed_mask(0);
-        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
-        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
         assert_eq!(app.armed_mask(), 0);
 
         // Open it again: the desk that was saved is the desk that comes back.
@@ -55295,38 +55547,38 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
-        let bit = |n: usize| 1u64 << Column(n).desk_index();
+        let bit = |n: usize| 1u64 << Column::Track(n).desk_index();
         app.settings.strip_muted = 0;
         app.settings.strip_soloed = 0;
 
         // Plain presses stack, exactly as the arm's do.
-        app.apply_mixer_hit(Hit::Mute(Column(2)), 0.0);
-        app.apply_mixer_hit(Hit::Mute(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(2)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(3)), 0.0);
         assert_eq!(app.settings.strip_muted, bit(2) | bit(3), "plain mutes did not stack");
         // …and a second plain press takes just that one back out.
-        app.apply_mixer_hit(Hit::Mute(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(3)), 0.0);
         assert_eq!(app.settings.strip_muted, bit(2), "a plain mute did not toggle off");
 
         // SHIFT builds a set and unpicks it, one strip at a time.
         app.shift_down = true;
-        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
         assert_eq!(app.settings.strip_muted, bit(2) | bit(4), "shift+mute did not add");
-        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
         assert_eq!(app.settings.strip_muted, bit(2), "shift+mute could not take it back out");
         app.shift_down = false;
 
         // ALT is THIS STRIP ALONE, and alt on the one already alone clears.
         app.alt_down = true;
-        app.apply_mixer_hit(Hit::Mute(Column(5)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(5)), 0.0);
         assert_eq!(app.settings.strip_muted, bit(5), "alt+mute did not stand the rest down");
-        app.apply_mixer_hit(Hit::Mute(Column(5)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column::Track(5)), 0.0);
         assert_eq!(app.settings.strip_muted, 0, "alt+mute on the lone strip did not clear it");
 
         // The solo is the same arithmetic over the other mask — exclusive
         // solo being the gesture this whole change is worth having for.
-        app.apply_mixer_hit(Hit::Solo(Column(2)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column::Track(2)), 0.0);
         assert_eq!(app.settings.strip_soloed, bit(2), "alt+solo is not exclusive");
-        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
         assert_eq!(app.settings.strip_soloed, bit(6), "alt+solo did not move the solo");
         app.alt_down = false;
 
@@ -55354,8 +55606,8 @@ mod tests {
         assert_eq!(app.armed_mask(), 2, "a bind changed the arms");
 
         // Plain presses STACK — a deliberate multi-lane take…
-        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
             app.armed_mask(),
             2 | (1 << 2) | (1 << 3),
@@ -55363,7 +55615,7 @@ mod tests {
         );
 
         // …a plain press on an armed lane disarms just that lane…
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(app.armed_mask(), 2 | (1 << 2), "the toggle took the wrong lanes");
 
         // …SHIFT builds a set AND takes lanes back out of it. The owner:
@@ -55372,13 +55624,13 @@ mod tests {
         // to undo, and the plain press with shift still held is a different
         // gesture — it carries the selection.
         app.shift_down = true;
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
             app.armed_mask(),
             2 | (1 << 2) | (1 << 3),
             "shift+arm did not add a lane"
         );
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
             app.armed_mask(),
             2 | (1 << 2),
@@ -55388,12 +55640,12 @@ mod tests {
 
         // …ALT is THIS LANE ALONE…
         app.alt_down = true;
-        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
         assert_eq!(app.armed_mask(), 1 << 2, "alt+arm did not stand the rest down");
 
         // …and alt on the lane that is ALREADY alone stands everything down,
         // so the one key both arrives at one lane and leaves with none.
-        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
         assert_eq!(app.armed_mask(), 0, "alt+arm could not undo itself");
         app.alt_down = false;
     }
@@ -55453,7 +55705,7 @@ mod tests {
         );
 
         app.alt_down = true;
-        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
         app.alt_down = false;
         assert_eq!(
             app.armed_mask(),
@@ -55466,7 +55718,7 @@ mod tests {
         // it is for, so a three-strip selection must not flip together.
         app.set_armed_mask(0);
         app.shift_down = true;
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         app.shift_down = false;
         assert_eq!(
             app.armed_mask(),
@@ -55496,20 +55748,20 @@ mod tests {
         app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
         app.note_frozen(0, "media/frozen-01-1.wav".into(), 3.0);
 
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Delete), 0.0);
         assert!(
             app.insert(0, 1).is_some(),
             "delete took a frozen lane's plugin out of a bay that is already \
              in the rendered file"
         );
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass), 0.0);
         assert!(
             !app.insert_bypassed(0, 1),
             "bypass flipped a frozen lane's bay, which changes nothing until \
              it thaws"
         );
-        app.apply_mixer_hit(Hit::Insert(Column(0), 1), 0.0);
+        app.apply_mixer_hit(Hit::Insert(Column::Track(0), 1), 0.0);
         assert!(
             !matches!(app.dialog, Some(Dialog::PluginPicker { .. })),
             "pressing a frozen lane's bay opened the picker"
@@ -55517,8 +55769,8 @@ mod tests {
 
         // And the thaw gives all of it back.
         app.unfreeze_track(0);
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Delete), 0.0);
         assert_eq!(
             app.insert(0, 1),
             None,
@@ -55538,14 +55790,14 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
 
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Delete), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Delete), 0.0);
         assert_eq!(app.insert(0, 1), None, "delete did not delete");
         assert_eq!(app.mixer_fx_menu, None, "the menu answers one press");
 
         app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Replace), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Replace), 0.0);
         assert!(
             app.insert(0, 1).is_some(),
             "replace must keep the plugin until a choice is made"
@@ -55562,8 +55814,8 @@ mod tests {
         assert_eq!(app.mixer_fx_menu, None);
 
         app.dialog = None;
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Dismiss), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Dismiss), 0.0);
         assert!(app.insert(0, 1).is_some(), "a dismissal deleted something");
         assert!(app.dialog.is_none());
         assert_eq!(app.mixer_fx_menu, None);
@@ -55571,19 +55823,19 @@ mod tests {
         // BYPASS takes the tenant out of circuit and KEEPS it; UNBYPASS
         // puts it back. Each row is a stated position, so BYPASS pressed
         // twice is not a toggle that comes back on.
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass), 0.0);
         assert!(app.insert(0, 1).is_some(), "bypass unloaded the bay");
         assert!(app.insert_bypassed(0, 1), "bypass did not bypass");
         assert_eq!(app.mixer_fx_menu, None, "the menu answers one press");
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass), 0.0);
         assert!(
             app.insert_bypassed(0, 1),
             "a second BYPASS press flipped the flag back"
         );
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Unbypass), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Unbypass), 0.0);
         assert!(!app.insert_bypassed(0, 1), "unbypass did not put the tenant back");
         assert!(app.insert(0, 1).is_some(), "unbypass unloaded the bay");
         // The timeline's menu offers the same row, facing the same way.
@@ -55594,8 +55846,8 @@ mod tests {
         // out of circuit, and a flag left there would wait for a tenant.
         app.set_insert(0, 1, None);
         assert!(!app.insert_bypassed(0, 1), "the tenant left and its flag stayed");
-        app.mixer_fx_menu = Some((Column(0), 1));
-        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        app.mixer_fx_menu = Some((Column::Track(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column::Track(0), 1, FxAction::Bypass), 0.0);
         assert!(!app.insert_bypassed(0, 1), "a bypass flag landed on an empty bay");
     }
 
@@ -55612,7 +55864,7 @@ mod tests {
             .find(|n| !app.channel_used(*n))
             .expect("a fresh desk has an unused channel");
 
-        app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
+        app.apply_mixer_hit(Hit::Add(Column::Track(n)), 0.0);
         assert!(app.channel_used(n), "the circle did not add the track");
         assert_eq!(app.channel_kind(n), None, "a bare track has no kind yet");
         assert!(app.input_menu.is_none(), "adding must not open a menu");
@@ -55624,7 +55876,7 @@ mod tests {
         assert_eq!(app.armed_mask() & (1 << n), 0, "a fresh track armed itself");
 
         // The same press on the now-EXISTING track opens the input menu.
-        app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
+        app.apply_mixer_hit(Hit::Add(Column::Track(n)), 0.0);
         assert!(
             matches!(app.input_menu, Some(InputMenu { ch, .. }) if ch == n),
             "the icon of a bare track did not open the input menu"
@@ -55659,7 +55911,7 @@ mod tests {
         app.settings.strip_names[0] = "BELL KEYS".to_owned();
         app.settings.strip_colors[0] = 14;
         app.settings.strip_muted |= 1;
-        app.apply_mixer_hit(Hit::Remove(Column(0)), 0.0);
+        app.apply_mixer_hit(Hit::Remove(Column::Track(0)), 0.0);
         assert_eq!(app.channel_kind(0), None, "the channel is still a kind");
         assert_eq!(app.insert(0, 0), None, "bay 0 survived the removal");
         assert_eq!(app.insert(0, 1), None, "bay 1 survived the removal");
@@ -55671,7 +55923,7 @@ mod tests {
         // Remove with nothing at all. (The backing file's × lives on the
         // band's timeline now; its strip retired at v13.)
         while app.take_recorder_request().is_some() {}
-        app.apply_mixer_hit(Hit::Remove(Column(recorder::CHANNELS)), 0.0);
+        app.apply_mixer_hit(Hit::Remove(Column::Click), 0.0);
         assert_eq!(app.take_recorder_request(), None);
     }
 
@@ -55680,7 +55932,7 @@ mod tests {
     #[test]
     fn loading_a_cartridge_refills_the_open_picker() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
@@ -55718,7 +55970,7 @@ mod tests {
     #[test]
     fn a_cartridge_that_fails_leaves_the_good_one_alone() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
             bank: "ROM1A".to_owned(),
@@ -55807,7 +56059,7 @@ mod tests {
     fn a_held_patch_row_sounds_its_strip_and_is_put_back_when_the_hand_lifts() {
         let ctx = egui::Context::default();
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column::Track(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
             bank: "ROM1A".to_owned(),
@@ -56548,7 +56800,7 @@ mod tests {
         let p = {
             let v = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &v);
-            let chip = l.strips[0].input_chip;
+            let chip = l.strips[recorder::Column::Track(0)].input_chip;
             assert!(chip.is_positive(), "the first channel wears no input chip");
             chip.center()
         };
@@ -56590,7 +56842,7 @@ mod tests {
         assert!(app.channel_used(2), "the fixture channel is not used");
         app.selected_channel = Some(2);
         // A lane rename is open — the same state the header's name field sets.
-        app.mixer_naming = Some((recorder::Column(2), "DR".to_owned()));
+        app.mixer_naming = Some((recorder::Column::Track(2), "DR".to_owned()));
         assert!(app.text_entry_active(), "a rename must count as text entry");
         let _ = run_frame(&ctx, &mut app);
         // Backspace, then D, then D — the owner's "DDDD"/backspace title.
@@ -56883,7 +57135,7 @@ mod tests {
                     // The middle of the first strip's FADER: a control, and
                     // exactly where a hand lands when it right-clicks "the
                     // channel".
-                    l.strips[0].fader.center()
+                    l.strips[recorder::Column::Track(0)].fader.center()
                 }
                 _ => {
                     let rect = app.arrangement_rect.expect("arrangement did not open");
@@ -57558,7 +57810,7 @@ mod tests {
             app.arr_auto_modes.insert(0, mode);
             app.recorder.playing = rolling;
             app.recorder.position_s = 4.0;
-            app.apply_mixer_hit(M::Fader(Column(0)), 0.6);
+            app.apply_mixer_hit(M::Fader(Column::Track(0)), 0.6);
             app.arrangement.automation.get(0, AutoParam::Gain).is_some()
         };
 
@@ -57589,7 +57841,7 @@ mod tests {
 
         // Nothing is armed until something is actually touched.
         assert!(!app.arr_auto_writing(0, false), "a latch armed itself");
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column(0)), 0.6);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column::Track(0)), 0.6);
         // ...and now it stays armed with the hand off.
         assert!(app.arr_auto_writing(0, false), "the latch did not hold");
 
@@ -57602,7 +57854,7 @@ mod tests {
         // A Touch, by contrast, lets go the moment the hand does.
         app.arr_auto_modes.insert(1, AutoMode::Touch);
         app.recorder.playing = true;
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column(1)), 0.6);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column::Track(1)), 0.6);
         assert!(!app.arr_auto_writing(1, false), "a Touch latched");
     }
 
@@ -57624,7 +57876,7 @@ mod tests {
         for i in 0..600 {
             app.recorder.position_s = f64::from(i) / 60.0;
             let v = 0.5 + f64::from(i) / 6_000.0;
-            app.apply_mixer_hit(M::Fader(Column(0)), v as f32);
+            app.apply_mixer_hit(M::Fader(Column::Track(0)), v as f32);
         }
         let n = app
             .arrangement
@@ -57656,7 +57908,7 @@ mod tests {
         still.recorder.playing = true;
         for i in 0..600 {
             still.recorder.position_s = f64::from(i) / 10.0;
-            still.apply_mixer_hit(M::Fader(Column(0)), 0.5);
+            still.apply_mixer_hit(M::Fader(Column::Track(0)), 0.5);
         }
         let held = still
             .arrangement
@@ -60410,7 +60662,7 @@ mod tests {
                     crate::arrangement_panel::Layout::new(rect, &v).header_rows[lane].bays[slot]
                 } else {
                     let v = app.mixer_view();
-                    crate::mixer_panel::Layout::new(rect, &v).strips[lane].inserts[slot]
+                    crate::mixer_panel::Layout::new(rect, &v).strips[recorder::Column::Track(lane)].inserts[slot]
                 };
                 assert!(r.is_positive(), "{where_}: lane {lane} has no bay {slot} to press");
                 r.center()
@@ -60484,11 +60736,11 @@ mod tests {
         app.toggle_insert_bypass(recorder::MASTER_EXTRA_SEAT, 1);
 
         let v = app.mixer_view();
-        assert!(v.strips[1].bypassed[3], "the mixer's folder rack lost the flag");
-        assert!(!v.strips[1].bypassed[0], "the flag reached the wrong bay");
+        assert!(v.strips[recorder::Column::Track(1)].bypassed[3], "the mixer's folder rack lost the flag");
+        assert!(!v.strips[recorder::Column::Track(1)].bypassed[0], "the flag reached the wrong bay");
         // The MASTER's slots run extra-first: its extra seat's bay 1 is
         // slot 1, which is exactly the resolution `seat_bay` exists for.
-        let master = v.strips.len() - 1;
+        let master = recorder::Column::Master;
         assert!(
             v.strips[master].bypassed[1],
             "the master's second rack lost the flag"
@@ -61003,7 +61255,7 @@ mod tests {
         let (fader_at, hit) = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            let f = l.strips[0].fader;
+            let f = l.strips[recorder::Column::Track(0)].fader;
             assert!(f.is_positive(), "the first strip was drawn with no fader");
             let at = f.center();
             let hit = crate::mixer_panel::hit_test(rect, &view, at)
@@ -62107,12 +62359,13 @@ mod tests {
                 |ctx| app.frame(ctx),
             );
         };
+        // Every track's panel BY ROW, `NOTHING` for one the layout did not
+        // place: the layout keeps only what it placed now.
         let strips = |app: &mut TangentApp| {
             let view = app.mixer_view();
-            crate::mixer_panel::Layout::new(rect, &view)
-                .strips
-                .iter()
-                .map(|s| s.panel)
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            (0..recorder::CHANNELS)
+                .map(|n| l.strips[recorder::Column::Track(n)].panel)
                 .collect::<Vec<_>>()
         };
         let press = |pos| egui::Event::PointerButton {
@@ -62132,7 +62385,7 @@ mod tests {
         let panels = strips(&mut app);
         let grab = {
             let view = app.mixer_view();
-            crate::mixer_panel::Layout::new(rect, &view).strips[3].name.center()
+            crate::mixer_panel::Layout::new(rect, &view).strips[recorder::Column::Track(3)].name.center()
         };
         let drop = crate::mixer_panel::folder_drop_strip(panels[1]).center();
         frame(&mut app, vec![egui::Event::PointerMoved(grab), press(grab)]);
@@ -62154,7 +62407,7 @@ mod tests {
         let panels = strips(&mut app);
         let grab = {
             let view = app.mixer_view();
-            crate::mixer_panel::Layout::new(rect, &view).strips[child].name.center()
+            crate::mixer_panel::Layout::new(rect, &view).strips[recorder::Column::Track(child)].name.center()
         };
         let away = Pos2::new(panels[4].center().x, panels[4].center().y);
         frame(&mut app, vec![egui::Event::PointerMoved(grab), press(grab)]);
@@ -62280,9 +62533,9 @@ mod tests {
                 let rect = app.mixer_rect.expect("mixer rect");
                 let view = app.mixer_view();
                 let l = crate::mixer_panel::Layout::new(rect, &view);
-                let body = l.strips[4].panel;
+                let body = l.strips[recorder::Column::Track(4)].panel;
                 (
-                    l.strips[2].name.center(),
+                    l.strips[recorder::Column::Track(2)].name.center(),
                     Pos2::new(body.left() + body.width() * 0.3, body.center().y),
                 )
             } else {
@@ -62375,17 +62628,17 @@ mod tests {
         let open_x = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            assert!(l.strips[2].panel.is_positive(), "the open child lost its strip");
-            l.strips[3].panel.left()
+            assert!(l.strips[recorder::Column::Track(2)].panel.is_positive(), "the open child lost its strip");
+            l.strips[recorder::Column::Track(3)].panel.left()
         };
         app.toggle_folder_shut(1);
         let view = app.mixer_view();
         let l = crate::mixer_panel::Layout::new(rect, &view);
         assert!(
-            !l.strips[2].panel.is_positive(),
+            !l.strips[recorder::Column::Track(2)].panel.is_positive(),
             "the shut folder's child still holds a column"
         );
-        let shut_x = l.strips[3].panel.left();
+        let shut_x = l.strips[recorder::Column::Track(3)].panel.left();
         assert!(
             shut_x < open_x - 1.0,
             "the columns did not close ranks: {shut_x} vs {open_x}"
@@ -62410,14 +62663,14 @@ mod tests {
         for h in [560.0_f32, 904.0, 1400.0] {
             let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, h));
             let l = crate::mixer_panel::Layout::new(r, &view);
-            let half = view.active.div_ceil(2);
+            let half = view.strips.shown.div_ceil(2);
             assert!(
-                !(l.strips[half].panel.is_positive()
-                    && (l.strips[half].panel.top() - l.strips[0].panel.top()).abs() > 1.0),
+                !(l.strips[recorder::Column::Track(half)].panel.is_positive()
+                    && (l.strips[recorder::Column::Track(half)].panel.top() - l.strips[recorder::Column::Track(0)].panel.top()).abs() > 1.0),
                 "the desk folded into two rows at {h} points tall"
             );
             assert!(
-                l.strips[0].theory.is_positive(),
+                l.strips[recorder::Column::Track(0)].theory.is_positive(),
                 "a strip lost its note button at {h} points tall"
             );
         }
@@ -62433,7 +62686,7 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 640.0));
         let view = app.mixer_view();
         let l = crate::mixer_panel::Layout::new(rect, &view);
-        let track = &l.strips[0];
+        let track = &l.strips[recorder::Column::Track(0)];
         assert!(track.theory.is_positive(), "the track lost its note button");
         assert!(
             (track.theory.right() - (track.panel.right() - 6.0)).abs() < 0.5,
@@ -62444,23 +62697,23 @@ mod tests {
             "the note hangs off the strip"
         );
         assert!(
-            !l.strips[1].theory.is_positive(),
+            !l.strips[recorder::Column::Track(1)].theory.is_positive(),
             "the folder grew a note button"
         );
         assert!(
-            !l.strips[1].arm.is_positive(),
+            !l.strips[recorder::Column::Track(1)].arm.is_positive(),
             "the folder grew a record arm"
         );
         // The collapse control is the TAB at the plate's top-left; the
         // icon spot stays FREE for a badge of the user's choosing.
-        let tab = l.strips[1].folder;
+        let tab = l.strips[recorder::Column::Track(1)].folder;
         assert!(tab.is_positive(), "the folder lost its collapse tab");
         assert!(
-            tab.top() < l.strips[1].panel.top() + l.strips[1].panel.height() * 0.12,
+            tab.top() < l.strips[recorder::Column::Track(1)].panel.top() + l.strips[recorder::Column::Track(1)].panel.height() * 0.12,
             "the tab is not at the strip's top"
         );
         assert!(
-            l.strips[1].add.is_positive(),
+            l.strips[recorder::Column::Track(1)].add.is_positive(),
             "the folder's icon spot no longer offers the picker"
         );
         // And a child steps DOWN by the chop's height.
@@ -62468,8 +62721,8 @@ mod tests {
         let view = app.mixer_view();
         let l = crate::mixer_panel::Layout::new(rect, &view);
         assert!(
-            (l.strips[2].panel.top()
-                - (l.strips[0].panel.top() + crate::mixer_panel::CHILD_INDENT))
+            (l.strips[recorder::Column::Track(2)].panel.top()
+                - (l.strips[recorder::Column::Track(0)].panel.top() + crate::mixer_panel::CHILD_INDENT))
                 .abs()
                 < 0.5,
             "the child did not step down by the chop"
@@ -62577,7 +62830,7 @@ mod tests {
         let l = crate::mixer_panel::Layout::new(rect, &view);
         let chip = recorder::Strip::Click
             .column_of()
-            .and_then(|c| l.strips.get(c.0))
+            .and_then(|c| l.strips.get(c))
             .map(|s| s.met)
             .expect("the click has no column");
         assert!(chip.is_positive(), "the click strip wears no sound chip");
@@ -63812,7 +64065,13 @@ mod tests {
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == crate::arrangement_panel::RowKind::Automation(0, 0))
+            .find(|r| {
+                r.kind
+                    == crate::arrangement_panel::RowKind::Automation(
+                        crate::arrangement_panel::LaneId::Row(0),
+                        0,
+                    )
+            })
             .expect("the volume row is not drawn")
             .lane;
         Pos2::new(
@@ -67482,7 +67741,7 @@ mod tests {
         assert!((app.settings.routes.0[0].gain - 119.0 / 120.0).abs() < 1e-6, "the drag did not land");
         for i in 0..120 {
             app.apply_mixer_hit(
-                crate::mixer_panel::Hit::RouteGain(recorder::Column(0), 0),
+                crate::mixer_panel::Hit::RouteGain(recorder::Column::Track(0), 0),
                 i as f32 / 240.0,
             );
         }
@@ -67749,6 +68008,52 @@ mod tests {").expect("the tests module")];
             "an idle band still asks for a frame in {asked:?}; asked by {}",
             causes(&ctx)
         );
+    }
+
+    /// **Thirty idle frames over each windowed view ask for what they asked
+    /// for before the views were windowed: nothing.** The repaint record is
+    /// egui's own (`ctx.repaint_causes`, the `causes` helper's source), read
+    /// on every frame that asked for a frame sooner than a second, with the
+    /// line numbers dropped so the comparison is about WHO asks and why,
+    /// not where the asking code happens to sit in the file.
+    ///
+    /// This stands in for the PACE probe, which needs a running binary: a
+    /// window that grew a repaint source by being windowed (a scroll that
+    /// never settles, a bar that animates) shows here as a non-empty set.
+    /// Run against the base of this lane with the same test text, the set
+    /// was empty and no frame asked; it is pinned to that.
+    #[test]
+    fn idle_frames_over_the_windowed_views_ask_for_the_same_repaints() {
+        let (ctx, mut app) = quiet_desktop(true);
+        if app.license.cheated() {
+            return;
+        }
+        for n in 0..recorder::CHANNELS {
+            app.add_bare_track(n);
+        }
+        app.settings.mixer_visible = 8;
+        app.settings.arr_visible = 8;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut busy = 0;
+        for (mixer, arrangement) in [(true, false), (false, true)] {
+            app.mixer_open = mixer;
+            app.arrangement_open = arrangement;
+            let _ = settle(&ctx, &mut app);
+            for _ in 0..30 {
+                if frame_asks(&ctx, &mut app) < Duration::from_secs(1) {
+                    busy += 1;
+                    for c in ctx.repaint_causes() {
+                        let c = format!("{c}");
+                        // "file:line reason" -> "file reason".
+                        let (at, why) = c.split_once(' ').unwrap_or((c.as_str(), ""));
+                        let file = at.rsplit_once(':').map_or(at, |(f, _)| f);
+                        seen.insert(format!("{file} {why}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(busy, 0, "idle frames over the views asked for a frame; asked by {seen:?}");
+        assert!(seen.is_empty(), "new repaint causes over the idle views: {seen:?}");
     }
 
     /// **A desk that is LOADED but idle rests too** — the case the test
@@ -68910,7 +69215,7 @@ mod tests {").expect("the tests module")];
         // this test would pass by being blocked for the right reason.
         let rect = app.mixer_rect.expect("the mixer is not up");
         let v = app.mixer_view();
-        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[0].fader;
+        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[recorder::Column::Track(0)].fader;
         assert!(
             !amp.intersects(fader) && !pedal.intersects(fader),
             "the windows cover the fader this test drives: {fader:?} under {amp:?} / {pedal:?}"
@@ -69228,7 +69533,7 @@ mod tests {").expect("the tests module")];
     fn pull_the_first_fader(ctx: &egui::Context, app: &mut TangentApp) -> (f64, f64) {
         let rect = app.mixer_rect.expect("the mixer is not up");
         let v = app.mixer_view();
-        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[0].fader;
+        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[recorder::Column::Track(0)].fader;
         let before = app.settings.channel_gains[0];
         let grab = fader.center();
         press(ctx, app, grab);
@@ -73045,9 +73350,9 @@ mod tests {").expect("the tests module")];
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
             let drawn: Vec<usize> = (0..recorder::CHANNELS)
-                .filter(|&i| l.strips[i].panel.is_positive())
+                .filter(|&i| l.strips[recorder::Column::Track(i)].panel.is_positive())
                 .collect();
-            (l.strips[0].name.center(), l.region, drawn)
+            (l.strips[recorder::Column::Track(0)].name.center(), l.region, drawn)
         };
         assert!(
             drawn_at_press.len() < 10,
@@ -73119,7 +73424,7 @@ mod tests {").expect("the tests module")];
         let (grab, region) = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            (l.strips[0].name.center(), l.region)
+            (l.strips[recorder::Column::Track(0)].name.center(), l.region)
         };
         press(&ctx, &mut app, grab);
         assert!(app.mixer_reorder.is_some(), "the press did not arm a carry");
@@ -73169,7 +73474,7 @@ mod tests {").expect("the tests module")];
         let (grab, region) = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            (l.strips[0].inserts[0].center(), l.region)
+            (l.strips[recorder::Column::Track(0)].inserts[0].center(), l.region)
         };
         press(&ctx, &mut app, grab);
         assert!(app.bay_carry.is_some(), "the press did not arm a bay carry");
@@ -76016,7 +76321,7 @@ mod folder_tests {
         use crate::automation::{AutoParam, Point, Shape};
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
-        use crate::arrangement_panel::MASTER_LANE;
+        use crate::app::master_lane;
         let mut a = app();
         let base = |a: &TangentApp, lane: usize, p: AutoParam| {
             a.arrangement
@@ -76028,7 +76333,7 @@ mod folder_tests {
 
         // The master's row, with nothing on it but the node the owner's
         // session had.
-        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+        a.arrangement.automation.entry(master_lane(), AutoParam::Gain).put(Point {
             at_s: 0.0,
             value: 0.448,
             shape: Shape::Linear,
@@ -76037,8 +76342,8 @@ mod folder_tests {
 
         // Push the master fader to the top. The node has to come with it, or
         // the push does nothing at all.
-        a.apply_mixer_hit(M::Fader(Column(crate::arrangement_panel::MASTER_COLUMN)), 1.0);
-        let moved = base(&a, MASTER_LANE, AutoParam::Gain).expect("the node vanished");
+        a.apply_mixer_hit(M::Fader(Column::Master), 1.0);
+        let moved = base(&a, master_lane(), AutoParam::Gain).expect("the node vanished");
         assert!(
             (moved - 1.0).abs() < 1.0e-6,
             "the master fader did not carry its base node: {moved}"
@@ -76050,7 +76355,7 @@ mod folder_tests {
             value: 0.2,
             shape: Shape::Linear,
         });
-        a.apply_mixer_hit(M::Fader(Column(2)), 0.75);
+        a.apply_mixer_hit(M::Fader(Column::Track(2)), 0.75);
         let moved = base(&a, 2, AutoParam::Gain).expect("the node vanished");
         assert!((moved - 0.75).abs() < 1.0e-6, "a channel fader left its base behind: {moved}");
 
@@ -76067,7 +76372,7 @@ mod folder_tests {
             value: 0.9,
             shape: Shape::Linear,
         });
-        a.apply_mixer_hit(M::Fader(Column(3)), 0.75);
+        a.apply_mixer_hit(M::Fader(Column::Track(3)), 0.75);
         let kept = base(&a, 3, AutoParam::Gain).expect("the node vanished");
         assert!(
             (kept - 0.2).abs() < 1.0e-6,
@@ -76083,10 +76388,10 @@ mod folder_tests {
     #[test]
     fn opening_a_session_lands_the_fader_where_the_base_node_is() {
         use crate::automation::{AutoParam, Point, Shape};
-        use crate::arrangement_panel::MASTER_LANE;
+        use crate::app::master_lane;
         let mut a = app();
         a.settings.master_gain = 1.0;
-        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+        a.arrangement.automation.entry(master_lane(), AutoParam::Gain).put(Point {
             at_s: 0.0,
             value: 0.448,
             shape: Shape::Linear,
@@ -77109,20 +77414,20 @@ mod folder_tests {
 
     #[test]
     fn the_master_owns_automation_rows_like_a_track_does() {
-        use crate::arrangement_panel::MASTER_LANE;
+        use crate::app::master_lane;
         use crate::automation::{AutoParam, Point, Shape};
         let mut a = app();
 
         // Nothing showing to begin with.
-        assert!(a.arr_auto_rows(MASTER_LANE).is_empty());
+        assert!(a.arr_auto_rows(master_lane()).is_empty());
 
         // Opening one seeds a node at the start, exactly as a track's does.
-        a.arr_toggle_automation_param(MASTER_LANE, AutoParam::Gain);
-        assert_eq!(a.arr_auto_rows(MASTER_LANE), vec![AutoParam::Gain]);
+        a.arr_toggle_automation_param(master_lane(), AutoParam::Gain);
+        assert_eq!(a.arr_auto_rows(master_lane()), vec![AutoParam::Gain]);
         let pts = a
             .arrangement
             .automation
-            .get(MASTER_LANE, AutoParam::Gain)
+            .get(master_lane(), AutoParam::Gain)
             .expect("the master's curve was not made")
             .points()
             .to_vec();
@@ -77132,7 +77437,7 @@ mod folder_tests {
         // **Its resting value is the MASTER's fader**, not `channel_gains`
         // at an index that does not exist.
         a.settings.master_gain = 0.25;
-        let resting = a.auto_resting(MASTER_LANE, AutoParam::Gain);
+        let resting = a.auto_resting(master_lane(), AutoParam::Gain);
         let want = f64::from(recorder::gain_to_fader(0.25));
         assert!(
             (resting - want).abs() < 1e-9,
@@ -77141,7 +77446,7 @@ mod folder_tests {
 
         // The curve is document state and survives a round trip, which is
         // what puts it on the undo timeline and in the saved project.
-        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+        a.arrangement.automation.entry(master_lane(), AutoParam::Gain).put(Point {
             at_s: 4.0,
             value: 0.1,
             shape: Shape::Linear,
@@ -77150,7 +77455,7 @@ mod folder_tests {
         let back = crate::arrangement::Arrangement::from_json(&json);
         assert_eq!(
             back.automation
-                .get(MASTER_LANE, AutoParam::Gain)
+                .get(master_lane(), AutoParam::Gain)
                 .map_or(0, |c| c.points().len()),
             2,
             "the master's curve did not survive the document"
@@ -78635,7 +78940,12 @@ mod aspect_snap_tests {
             (100.0, 100.0, 4, 32, 4),   // 1.0 -> 4
             (3000.0, 100.0, 4, 32, 32), // 30 -> 32 (|30-32|=2 < |30-24|=6)
             // The ceiling clamps a huge screen down to what the desk has.
-            (5000.0, 100.0, 4, 16, 16), // 50 -> 32, clamped to 16
+            (5000.0, 100.0, 4, 16, 16), // 50 -> 48, clamped to 16
+            // The two rungs a desk longer than a screen climbs to, and the
+            // tie between thirty-two and forty-eight keeping the smaller.
+            (4800.0, 100.0, 4, 64, 48), // 48 -> 48
+            (7000.0, 100.0, 4, 64, 64), // 70 -> 64
+            (4000.0, 100.0, 4, 64, 32), // 40 between 32 and 48 -> 32
             // The floor lifts a tiny screen up to a taste minimum.
             (400.0, 100.0, 8, 32, 8), // 4 -> rung 4, lifted to floor 8
         ];
@@ -80257,21 +80567,30 @@ mod arrange_axis_tests {
                     Some((0.0, (song * 4.0).max(3_600.0))),
                 ] {
                     app.arr_window = window;
-                    let clips = app.arr_clip_views();
-                    let view = app.arrange_view(&clips);
-                    let l = Layout::new(rect, &view);
-                    for c in &clips {
-                        let a = clip_rect(rect, &view, c);
-                        let b = clip_rect_in(&l, &view, c);
-                        assert_eq!(
-                            bits(a),
-                            bits(b),
-                            "{} clip {} at {w}x{h}, window {window:?}: {a:?} vs {b:?}",
-                            size.tag(),
-                            c.id
-                        );
-                        checked += 1;
-                        on_screen += usize::from(a.is_positive());
+                    // **Scrolled down the whole desk**, a window at a time:
+                    // the clip views are culled to the lanes in the window
+                    // now, so one scroll position checks only the clips it
+                    // can show, and the walk over every position is what
+                    // still reaches every clip of the fixture.
+                    for scroll in (0..app.desk_extent()).step_by(8) {
+                        app.arr_lane_scroll = scroll;
+                        let clips = app.arr_clip_views();
+                        let view = app.arrange_view(&clips);
+                        let l = Layout::new(rect, &view);
+                        for c in &clips {
+                            let a = clip_rect(rect, &view, c);
+                            let b = clip_rect_in(&l, &view, c);
+                            assert_eq!(
+                                bits(a),
+                                bits(b),
+                                "{} clip {} at {w}x{h}, window {window:?}, scroll {scroll}: \
+                                 {a:?} vs {b:?}",
+                                size.tag(),
+                                c.id
+                            );
+                            checked += 1;
+                            on_screen += usize::from(a.is_positive());
+                        }
                     }
                 }
             }
@@ -80987,5 +81306,310 @@ mod sampler_road_tests {
             vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
             "the preset forgot which file it was playing"
         );
+    }
+}
+
+/// The windowed views from the app's side: the desk index's invalidation,
+/// the views carrying only their window, the clip views culled to it, and
+/// the two scrollbars driven by a hand (docs/design/unlimited-tracks.md,
+/// W2-views-windowed).
+#[cfg(test)]
+mod views_windowed_tests {
+    use super::tests::headless_with;
+    use super::*;
+
+    fn app() -> TangentApp {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (_, mut app) = headless_with(Caps::DESKTOP, s);
+        app.dialog = None;
+        app
+    }
+
+    fn clip(lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
+        crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane,
+            start_s,
+            len_s: 2.0,
+            loop_s: 2.0,
+            name: "c".into(),
+            ..Default::default()
+        }
+    }
+
+    /// **The index says what the app's own rules say**, row by row: the
+    /// folder walk, the shut fold, the child runs, the clips on each lane
+    /// and the counted classes, each read from the app's functions that do
+    /// NOT go through the index.
+    fn agrees(app: &TangentApp, what: &str) {
+        let ix = app.desk_index();
+        assert_eq!(ix.extent(), app.desk_extent(), "{what}: the index is the wrong width");
+        let mut rank = 0;
+        for row in 0..app.desk_extent() {
+            assert_eq!(ix.hidden(row), app.lane_hidden(row), "{what}: row {row} hidden");
+            assert_eq!(ix.parent(row), app.folder_of(row), "{what}: row {row} folder");
+            assert_eq!(ix.in_folder(row), app.in_folder(row), "{what}: row {row} in folder");
+            assert_eq!(ix.shut(row), app.folder_shut(row), "{what}: row {row} shut");
+            assert_eq!(
+                ix.child_count(row),
+                app.folder_children(row).len(),
+                "{what}: row {row} children"
+            );
+            assert_eq!(
+                ix.clip_count(row),
+                app.arrangement.clips.iter().filter(|c| c.lane == row).count(),
+                "{what}: row {row} clips"
+            );
+            assert_eq!(
+                ix.class(row) == crate::desk_index::RowClass::Counted,
+                app.row_counted(row),
+                "{what}: row {row} counted"
+            );
+            if !app.lane_hidden(row) {
+                assert_eq!(ix.rank_of(row), Some(rank), "{what}: row {row} rank");
+                rank += 1;
+            }
+        }
+        assert_eq!(ix.counted(), app.counted_tracks(), "{what}: the count");
+    }
+
+    /// **Every kind of mutation moves the index, and only a mutation does.**
+    /// Rows, kinds, folders (made, joined, shut), clips (added, moved,
+    /// removed), plugins, a reorder, a removal, undo, redo and a load: after
+    /// each the generation has moved and the index agrees with the app's
+    /// own rules. Asking again with nothing changed hands back the same
+    /// index, so an idle frame rebuilds nothing.
+    ///
+    /// Revert-check: drop `clips` from what `desk_index_inputs` gathers and
+    /// the "a clip lands" step names the stale lane; drop the
+    /// `touch_desk_index` in `undo_apply` and "undo" keeps its generation.
+    #[test]
+    fn the_desk_index_follows_every_kind_of_mutation() {
+        let mut a = app();
+        agrees(&a, "fresh");
+        let steps: Vec<(&str, Box<dyn Fn(&mut TangentApp)>)> = vec![
+            ("a bare track", Box::new(|a| {
+                a.add_bare_track(0);
+                a.undo_commit();
+            })),
+            ("a second track", Box::new(|a| {
+                a.add_bare_track(1);
+                a.undo_commit();
+            })),
+            ("a kind", Box::new(|a| {
+                a.set_channel_kind(2, Some(recorder::ChannelKind::Audio));
+                a.undo_commit();
+            })),
+            ("a folder", Box::new(|a| {
+                a.toggle_folder(1);
+                a.undo_commit();
+            })),
+            ("a member", Box::new(|a| {
+                a.set_in_folder(2, true);
+                a.undo_commit();
+            })),
+            ("the folder shut", Box::new(|a| {
+                a.toggle_folder_shut(1);
+                a.undo_commit();
+            })),
+            ("a clip lands", Box::new(|a| {
+                a.arrangement.add_clip(clip(5, 1.0));
+                a.undo_commit();
+            })),
+            ("a clip moves lanes", Box::new(|a| {
+                if let Some(c) = a.arrangement.clips.iter_mut().find(|c| c.lane == 5) {
+                    c.lane = 6;
+                }
+                a.undo_commit();
+            })),
+            ("a clip leaves", Box::new(|a| {
+                a.arrangement.clips.retain(|c| c.lane != 6);
+                a.undo_commit();
+            })),
+            ("a plugin on an empty row", Box::new(|a| {
+                a.set_insert(9, 0, Some("/Library/Audio/Plug-Ins/VST3/x.vst3"));
+                a.undo_commit();
+            })),
+            ("a reorder", Box::new(|a| {
+                a.move_channel(0, 3);
+                a.undo_commit();
+            })),
+            ("a removal", Box::new(|a| {
+                a.remove_channel(3);
+                a.undo_commit();
+            })),
+            ("undo", Box::new(|a| a.undo())),
+            ("redo", Box::new(|a| a.redo())),
+            ("a load", Box::new(|a| {
+                a.arrangement.clips.clear();
+                a.undo_reset();
+            })),
+        ];
+        for (what, step) in steps {
+            let before = a.desk_index();
+            step(&mut a);
+            let after = a.desk_index();
+            assert!(
+                after.generation() > before.generation(),
+                "{what}: the index kept generation {}",
+                before.generation()
+            );
+            agrees(&a, what);
+            // And nothing changed since: the same index, not a rebuild.
+            let again = a.desk_index();
+            assert!(std::sync::Arc::ptr_eq(&after, &again), "{what}: an idle ask rebuilt");
+        }
+    }
+
+    /// **The views carry their window and no more**: the desk built for a
+    /// rect is the strips the layout places there plus the pinned two, the
+    /// timeline is the lanes from the scroll down plus one, and both are
+    /// short of the whole desk.
+    #[test]
+    fn the_views_carry_only_their_window() {
+        let mut a = app();
+        for n in 0..recorder::CHANNELS {
+            a.add_bare_track(n);
+        }
+        a.settings.mixer_visible = 8;
+        a.settings.arr_visible = 8;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0));
+        for scroll in [0.0_f32, 700.0, 1.0e9] {
+            a.mixer_scroll_px = scroll;
+            let v = a.mixer_view_in(rect);
+            let visible = a.mixer_visible();
+            assert!(
+                v.strips.len() <= visible + 2 + 2,
+                "scroll {scroll}: the desk built {} strips for {visible} on screen",
+                v.strips.len()
+            );
+            let l = crate::mixer_panel::Layout::new(rect, &v);
+            let placed = l.strips.iter().filter(|(c, s)| !c.pinned() && s.panel.is_positive()).count();
+            assert_eq!(placed, v.strips.tracks.len(), "scroll {scroll}: built strips the layout dropped");
+            // The windowed view lays out what the whole desk would have.
+            let dense = a.mixer_view();
+            let ld = crate::mixer_panel::Layout::new(rect, &dense);
+            for (col, s) in ld.strips.iter() {
+                assert_eq!(l.strips[col].panel, s.panel, "scroll {scroll}: {col} moved");
+            }
+        }
+        for scroll in [0usize, 9, 99] {
+            a.arr_lane_scroll = scroll;
+            let clips = a.arr_clip_views();
+            let v = a.arrange_view(&clips);
+            assert!(
+                v.lanes.len() <= a.arr_visible() + 1,
+                "scroll {scroll}: the timeline built {} lanes for {}",
+                v.lanes.len(),
+                a.arr_visible()
+            );
+        }
+    }
+
+    /// **The clip views are the clips on the window's lanes**, every one of
+    /// them and nothing else, and a clip the cull dropped is one the layout
+    /// would have put nowhere.
+    #[test]
+    fn the_clip_views_are_the_clips_on_the_windows_lanes() {
+        let mut a = app();
+        for lane in [0usize, 5, 9, 20, 31] {
+            a.arrangement.add_clip(clip(lane, 1.0));
+        }
+        a.settings.arr_visible = 8;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 700.0));
+        for scroll in [0usize, 8, 16, 24] {
+            a.arr_lane_scroll = scroll;
+            let (ix, _, ranks) = a.arr_lane_window();
+            let window: Vec<usize> = ix.window(ranks.start, ranks.len()).iter().map(|r| *r as usize).collect();
+            let mut got: Vec<usize> = a.arr_clip_views().iter().map(|c| c.lane).collect();
+            got.sort_unstable();
+            let want: Vec<usize> =
+                [0usize, 5, 9, 20, 31].into_iter().filter(|l| window.contains(l)).collect();
+            assert_eq!(got, want, "scroll {scroll}: window {window:?}");
+            // Every clip left out stands on a lane the layout did not place.
+            let clips = a.arr_clip_views();
+            let v = a.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &v);
+            for lane in [0usize, 5, 9, 20, 31] {
+                if !want.contains(&lane) {
+                    assert!(!l.lane_rows[lane].is_positive(), "scroll {scroll}: culled a drawn lane {lane}");
+                }
+            }
+        }
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// **A hand on either scrollbar carries the view**: press the thumb,
+    /// drag it past the end, let go, and the desk and the timeline stand at
+    /// the end of their rails, with nothing selected, armed or moved by the
+    /// press on the way.
+    #[test]
+    fn a_hand_on_either_scrollbar_carries_the_view_to_the_end() {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (ctx, mut a) = headless_with(Caps::DESKTOP, s);
+        a.dialog = None;
+        for n in 0..recorder::CHANNELS {
+            a.add_bare_track(n);
+        }
+        a.settings.mixer_visible = 8;
+        a.mixer_open = true;
+        frame(&ctx, &mut a, Vec::new());
+        frame(&ctx, &mut a, Vec::new());
+        let rect = a.mixer_rect.expect("the mixer drew nowhere");
+        let bar = {
+            let v = a.mixer_view_in(rect);
+            crate::mixer_panel::Layout::new(rect, &v).bar
+        };
+        assert!(bar.track.is_positive(), "a 32-track desk at 8 drew no bar");
+        let selected = a.selected_tracks.clone();
+        let p = bar.thumb.center();
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(p), button(p, true)]);
+        let far = Pos2::new(rect.right() + 40.0, p.y);
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far)]);
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far), button(far, false)]);
+        assert!((a.mixer_scroll_px - bar.max_px).abs() < 0.5, "the desk stopped at {}", a.mixer_scroll_px);
+        assert_eq!(a.selected_tracks, selected, "the bar's press selected a track");
+        assert!(a.mixer_grab.is_none() && a.mixer_reorder.is_none(), "the bar's press armed a strip");
+
+        a.mixer_open = false;
+        a.arrangement_open = true;
+        a.settings.arr_visible = 8;
+        frame(&ctx, &mut a, Vec::new());
+        frame(&ctx, &mut a, Vec::new());
+        let rect = a.arrangement_rect.expect("the timeline drew nowhere");
+        let bar = {
+            let clips = a.arr_clip_views();
+            let v = a.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &v).lane_bar
+        };
+        assert!(bar.track.is_positive(), "a 32-lane timeline at 8 drew no bar");
+        let p = bar.thumb.center();
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(p), button(p, true)]);
+        let far = Pos2::new(p.x, rect.bottom() + 200.0);
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far)]);
+        frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far), button(far, false)]);
+        assert_eq!(a.arr_lane_scroll, bar.max_rows, "the lanes stopped short of the end");
+        assert!(a.arr_drag.is_none(), "the bar's press started a drag on the lanes");
     }
 }

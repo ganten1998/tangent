@@ -561,6 +561,10 @@ pub enum Dialog {
         /// forgot the level, which left a route that could only ever be made
         /// at full and never turned down from the view the owner was in.
         existing: Vec<(usize, String, f32)>,
+        /// **What has been typed to narrow the channel list.** See
+        /// [`picker_rows`]: a list that grows with the desk is found by
+        /// typing a name, not by scrolling past every channel. Appended.
+        filter: String,
     },
     /// **The quantize window**: every knob the feature has, in one place.
     ///
@@ -775,6 +779,8 @@ pub enum Dialog {
         /// picker's list: a group's stem holds the group's whole mix, and
         /// ducking to the drum bus is the classic ask.
         channels: Vec<(usize, String)>,
+        /// What has been typed to narrow the list. See [`picker_rows`].
+        filter: String,
     },
     /// **The IR wizard**: capture a hardware unit's impulse response through
     /// a physical loop — interface outs into the box, box outs back into the
@@ -7397,6 +7403,52 @@ pub fn show(
     show_on(ctx, dialog_opt, face, placement)
 }
 
+/// **One picker row per channel: the NAME first, then the number, narrowed
+/// to what has been typed.**
+///
+/// The route and key pickers listed "Ch 3 - Bass": a number first, which is
+/// the one thing about a channel nobody looks for, on a list that grows by
+/// one row for every track the desk has. A person reaching for the bass
+/// types "ba"; the list answers with the bass and keeps its number beside
+/// the name, so two tracks both called "Vox" can still be told apart. A
+/// channel with no name is its number alone. The match is case-blind and
+/// against the whole row, so "3" still finds channel three (and anything
+/// else with a 3 in it, which is what typing a digit asks).
+///
+/// `channels` is the app's list of `(index, name)`; the answer is
+/// `(index, row text)`, in the list's order.
+pub fn picker_rows(channels: &[(usize, String)], filter: &str) -> Vec<(usize, String)> {
+    let want = filter.trim().to_lowercase();
+    channels
+        .iter()
+        .filter_map(|(idx, name)| {
+            let number = crate::routing::Target::Channel(*idx).label();
+            let shown = if name.trim().is_empty() {
+                number
+            } else {
+                format!("{} ({number})", name.trim())
+            };
+            (want.is_empty() || shown.to_lowercase().contains(&want)).then_some((*idx, shown))
+        })
+        .collect()
+}
+
+/// The field a picker's list is narrowed with, focused when the list first
+/// shows so the hand that opened it can start typing at once.
+fn picker_filter(ui: &mut egui::Ui, filter: &mut String, font: FontId, text: Color32) {
+    let resp = ui.add(
+        egui::TextEdit::singleline(filter)
+            .hint_text("type a name to filter")
+            .font(font)
+            .text_color(text)
+            .desired_width(ui.available_width()),
+    );
+    if ui.memory(|m| m.focused().is_none()) {
+        resp.request_focus();
+    }
+    ui.add_space(6.0);
+}
+
 /// **The same window machinery, drawn on the STACKED surface** — one pedal's
 /// own editor, standing over the amp face that opened it.
 ///
@@ -11940,6 +11992,7 @@ fn show_on(
             hardware,
             channels,
             existing,
+            filter,
         } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
@@ -12128,6 +12181,9 @@ fn show_on(
                                         .color(t.text),
                                     );
                                     ui.add_space(6.0);
+                                    if !is_hw {
+                                        picker_filter(ui, filter, bold(12.0), t.text);
+                                    }
                                     egui::ScrollArea::vertical()
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .max_height(ui.available_height() - 40.0)
@@ -12153,15 +12209,11 @@ fn show_on(
                                                     }
                                                 }
                                             } else {
-                                                for (idx, name) in channels.iter() {
+                                                for (idx, shown) in picker_rows(channels, filter) {
+                                                    let idx = &idx;
                                                     let label =
                                                         crate::routing::Target::Channel(*idx)
                                                             .label();
-                                                    let shown = if name.is_empty() {
-                                                        label.clone()
-                                                    } else {
-                                                        format!("{label} - {name}")
-                                                    };
                                                     let free =
                                                         !existing.iter().any(|(_, l, _)| *l == label);
                                                     if row(ui, &shown, "", free) {
@@ -12199,7 +12251,7 @@ fn show_on(
             )
         }
 
-        Dialog::InsertKeySource { strip, slot, current, channels } => {
+        Dialog::InsertKeySource { strip, slot, current, channels, filter } => {
             let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
             let (at, bay, now) = (*strip, *slot, *current);
@@ -12246,6 +12298,7 @@ fn show_on(
                                 .color(dim),
                             );
                             ui.add_space(8.0);
+                            picker_filter(ui, filter, bold(12.0), t.text);
                             egui::ScrollArea::vertical()
                                 .scroll_bar_visibility(
                                     egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
@@ -12263,14 +12316,8 @@ fn show_on(
                                             from: None,
                                         });
                                     }
-                                    for (idx, name) in channels.iter() {
-                                        let label =
-                                            crate::routing::Target::Channel(*idx).label();
-                                        let shown = if name.is_empty() {
-                                            label
-                                        } else {
-                                            format!("{label} - {name}")
-                                        };
+                                    for (idx, shown) in picker_rows(channels, filter) {
+                                        let idx = &idx;
                                         // The current source is greyed, the
                                         // routing picker's no-duplicates
                                         // grammar: saying "already this" before
@@ -22040,6 +22087,7 @@ at: None,
                     slot: 0,
                     current: None,
                     channels: Vec::new(),
+                    filter: String::new(),
                 },
             ),
             (
@@ -22736,5 +22784,48 @@ mod shot {
             "wrote {out} ({w}x{h}, {} mode)",
             if set.dark_mode { "dark" } else { "light" }
         );
+    }
+}
+
+/// The route and key pickers' rows: name first, narrowed by typing.
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    fn desk() -> Vec<(usize, String)> {
+        vec![
+            (0, "Bass".to_owned()),
+            (1, String::new()),
+            (2, "Vox".to_owned()),
+            (12, "Backing vox".to_owned()),
+            (39, "Room".to_owned()),
+        ]
+    }
+
+    /// **The name leads and the number follows**; a channel with no name is
+    /// its number alone. It was "Ch 3 - Vox": the number first, which is the
+    /// one thing about a channel nobody goes looking for.
+    #[test]
+    fn a_picker_row_leads_with_the_name() {
+        let rows = picker_rows(&desk(), "");
+        let shown: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(shown, vec!["Bass (Ch 1)", "Ch 2", "Vox (Ch 3)", "Backing vox (Ch 13)", "Room (Ch 40)"]);
+        // The index rides along untouched, whatever the row says.
+        assert_eq!(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2, 12, 39]);
+    }
+
+    /// **Typing narrows the list, by name or by number, case-blind**, and an
+    /// empty or blank field narrows nothing.
+    #[test]
+    fn typing_narrows_the_picker_by_name_or_number() {
+        let pick = |f: &str| picker_rows(&desk(), f).into_iter().map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(pick("VOX"), vec![2, 12], "a name did not narrow, or not case-blind");
+        assert_eq!(pick("  ba "), vec![0, 12], "the typed text was not trimmed");
+        assert_eq!(pick("ch 40"), vec![39], "the number did not find its channel");
+        assert_eq!(pick("zzz"), Vec::<usize>::new());
+        assert_eq!(pick("   ").len(), 5);
+        // And a picker that has been typed into still sends its INDEX: the
+        // row text is for the eye, never parsed back.
+        assert_eq!(picker_rows(&desk(), "room"), vec![(39, "Room (Ch 40)".to_owned())]);
     }
 }
