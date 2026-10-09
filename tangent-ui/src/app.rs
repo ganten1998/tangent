@@ -60203,8 +60203,8 @@ mod tests {
             fn active_system(&self) -> Option<String> {
                 Some("ASIO".to_owned())
             }
-            fn outputs(&self) -> Vec<String> {
-                vec!["Komplete Audio ASIO Driver".to_owned()]
+            fn outputs(&self, _system: Option<&str>) -> Option<Vec<String>> {
+                Some(vec!["Komplete Audio ASIO Driver".to_owned()])
             }
             fn rates(&self) -> Vec<u32> {
                 Vec::new()
@@ -60291,8 +60291,8 @@ mod tests {
             fn active_system(&self) -> Option<String> {
                 Some("WASAPI".to_owned())
             }
-            fn outputs(&self) -> Vec<String> {
-                Vec::new()
+            fn outputs(&self, _system: Option<&str>) -> Option<Vec<String>> {
+                Some(Vec::new())
             }
             fn rates(&self) -> Vec<u32> {
                 Vec::new()
