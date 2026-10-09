@@ -167,14 +167,14 @@ muted 0x200000004 soloed 0x400000020 phase 0x900000000
 kinds [1,1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 inputs []
 shuffles v20"#),
-    ("settings-v20-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,0,0,0,0,0,0,0,0,124,125,126,127]
-sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.25,0.26,0.27]
-names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","","","","","","","","","s24","s25","s26","s27"]
-inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 96=/x/s24.vst3 99=/x/s25.vst3 102=/x/s26.vst3 105=/x/s27.vst3 107=/x/s27b2.vst3 108=/x/pad0.vst3 229=/x/pad40.vst3 491=/x/pad127.vst3 493=/x/master-extra.vst3 1278=/x/c3pad5.vst3 9326=/x/c23pad127.vst3
-muted 0x200000004 soloed 0x400200000 phase 0x900000008
+    ("settings-v20-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,0,0,0,0,0,0,0,0]
+sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
+names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","s24","s25","s26","s27"]
+inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 72=/x/s24.vst3 75=/x/s25.vst3 78=/x/s26.vst3 81=/x/s27.vst3 83=/x/s27b2.vst3 84=/x/pad0.vst3 205=/x/pad40.vst3 467=/x/pad127.vst3 469=/x/master-extra.vst3 1254=/x/c3pad5.vst3 9302=/x/c23pad127.vst3
+muted 0x2000004 soloed 0x4200000 phase 0x9000008
 kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,1,0,0,0,0,0,0,0,0]
 inputs []
-shuffles v24"#),
+shuffles "#),
     ("settings-v20.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.3,0.31,0.32,0.33,0.34,0.35]
 names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","s24","s25","s26","s27","s28","s29","s30","s31","s32","s33","s34","s35"]
@@ -248,13 +248,13 @@ inserts 0=@tangent-drums 3=@tangent-dx7 96=/x/drumbus.vst3 99=/x/click.vst3 107=
 muted 0x200000000 soloed 0x100000004 phase None
 tracks_added 0x7 armed 0x2
 curves 2:gain 32:gain"#),
-    ("doc-v6-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,0,0,0,0,0,0,0,0,124,125,126,127]
-sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.25,0.26,0.27]
-names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","","","","","","","","","s24","s25","s26","s27"]
-inserts 0=@tangent-drums 3=@tangent-dx7 69=/x/c23.vst3 96=/x/drumbus.vst3 103=/x/fx.vst3 107=/x/master.vst3 489=/x/pad127.vst3 493=/x/master-extra.vst3 1280=/x/c3pad5.vst3
-muted 0x200800000 soloed 0x400000000 phase None
+    ("doc-v6-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127]
+sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27]
+names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","s24","s25","s26","s27"]
+inserts 0=@tangent-drums 3=@tangent-dx7 69=/x/c23.vst3 72=/x/drumbus.vst3 79=/x/fx.vst3 83=/x/master.vst3 465=/x/pad127.vst3 469=/x/master-extra.vst3 1256=/x/c3pad5.vst3
+muted 0x2800000 soloed 0x4000000 phase None
 tracks_added 0x800003 armed 0x2
-curves 23:gain 32:gain 32:pan"#),
+curves 23:gain 24:gain 24:pan"#),
     ("doc-v6-35.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.3,0.31,0.32,0.33,0.34,0.35]
 names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","s24","s25","s26","s27","s28","s29","s30","s31","s32","s33","s34","s35"]
@@ -271,12 +271,45 @@ tracks_added 0x3 armed 0x2
 curves 1:gain 32:gain 32:fx:4:7"#),
 ];
 
+/// **The 24-channel window as it opens once [`crate::desk_lift::V24_LIFT`]
+/// is on**: buses and master at 32..35, pads +8, the master's curves on
+/// the master. Pinned now, read under `with_v24_lift`, so the switch flips
+/// onto a lift that is already tested; the tables above pin what the window
+/// opens as today (the base's picture, each plugin beside its own sidecar).
+const V24_LIFTED_WANT: [(&str, &str); 2] = [
+    ("settings-v20-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,0,0,0,0,0,0,0,0,124,125,126,127]
+sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.25,0.26,0.27]
+names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","","","","","","","","","s24","s25","s26","s27"]
+inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 96=/x/s24.vst3 99=/x/s25.vst3 102=/x/s26.vst3 105=/x/s27.vst3 107=/x/s27b2.vst3 108=/x/pad0.vst3 229=/x/pad40.vst3 491=/x/pad127.vst3 493=/x/master-extra.vst3 1278=/x/c3pad5.vst3 9326=/x/c23pad127.vst3
+muted 0x200000004 soloed 0x400200000 phase 0x900000008
+kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,1,0,0,0,0,0,0,0,0]
+inputs []
+shuffles v24"#),
+    ("doc-v6-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,0,0,0,0,0,0,0,0,124,125,126,127]
+sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.25,0.26,0.27]
+names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13","s14","s15","s16","s17","s18","s19","s20","s21","s22","s23","","","","","","","","","s24","s25","s26","s27"]
+inserts 0=@tangent-drums 3=@tangent-dx7 69=/x/c23.vst3 96=/x/drumbus.vst3 103=/x/fx.vst3 107=/x/master.vst3 489=/x/pad127.vst3 493=/x/master-extra.vst3 1280=/x/c3pad5.vst3
+muted 0x200800000 soloed 0x400000000 phase None
+tracks_added 0x800003 armed 0x2
+curves 23:gain 32:gain 32:pan"#),
+];
+
+/// The picture `name` opens to in this build: the table's, or the lifted
+/// window's once [`crate::desk_lift::V24_LIFT`] is on, so the switch flips
+/// onto pictures already pinned.
+fn want_now(name: &str, table: &'static str) -> &'static str {
+    V24_LIFTED_WANT
+        .iter()
+        .find(|(n, _)| crate::desk_lift::V24_LIFT && *n == name)
+        .map_or(table, |(_, w)| w)
+}
+
 /// **Every settings file and DAW blob opens to its literal picture.**
 #[test]
 fn every_settings_fixture_opens_to_its_literal_picture() {
     for ((name, text), (want_name, want)) in SETTINGS.iter().zip(SETTINGS_WANT) {
         assert_eq!(*name, want_name, "the tables are out of step");
-        assert_eq!(observe_settings(text), want, "{name} opened differently");
+        assert_eq!(observe_settings(text), want_now(name, want), "{name} opened differently");
     }
 }
 
@@ -285,7 +318,28 @@ fn every_settings_fixture_opens_to_its_literal_picture() {
 fn every_document_fixture_opens_to_its_literal_picture() {
     for ((name, text), (want_name, want)) in DOCUMENTS.iter().zip(DOCUMENTS_WANT) {
         assert_eq!(*name, want_name, "the tables are out of step");
-        assert_eq!(observe_document(text), want, "{name} opened differently");
+        assert_eq!(observe_document(text), want_now(name, want), "{name} opened differently");
+    }
+}
+
+/// **The 24-channel window opens to its lifted picture under the switch**,
+/// and to the base's without it (the tables above).
+#[test]
+fn the_24_channel_window_opens_to_its_lifted_picture_under_the_switch() {
+    for (name, want) in V24_LIFTED_WANT {
+        let (_, text) = SETTINGS
+            .iter()
+            .chain(DOCUMENTS.iter())
+            .find(|(n, _)| *n == name)
+            .expect("fixture");
+        let seen = crate::desk_lift::with_v24_lift(|| {
+            if name.starts_with("settings") {
+                observe_settings(text)
+            } else {
+                observe_document(text)
+            }
+        });
+        assert_eq!(seen, want, "{name} lifted differently");
     }
 }
 
@@ -295,6 +349,11 @@ fn every_document_fixture_opens_to_its_literal_picture() {
 /// on each save would drift in every project that holds it.
 #[test]
 fn every_fixture_round_trips_once_opened() {
+    round_trips();
+    crate::desk_lift::with_v24_lift(round_trips);
+}
+
+fn round_trips() {
     for (name, text) in SETTINGS {
         let once = Settings::from_json(text).to_json();
         let twice = Settings::from_json(&once).to_json();
@@ -332,8 +391,15 @@ fn write_observations() {
 /// The 24-channel window (d298cee..af9bda6) had no arm, so its drum bus,
 /// click, fx return and master opened on channels 24..27 and its master's
 /// automation on channel 24. Red at the base.
+///
+/// Read under `with_v24_lift`: the lift is pinned here and switched on
+/// with the copy-only shelf (see `crate::desk_lift::V24_LIFT`).
 #[test]
 fn a_27_sends_file_lifts_its_buses_master_and_master_curves() {
+    crate::desk_lift::with_v24_lift(a_27_sends_file_lifts);
+}
+
+fn a_27_sends_file_lifts() {
     let (_, text) = fixture!("settings-v20-27.json");
     let s = Settings::from_json(text);
     // The fixture paints strip i with 100 + i: drums 24, click 25, fx 26,
@@ -411,6 +477,14 @@ fn tagged(text: &str) -> Value {
 /// legacy bay arrives somewhere.
 #[test]
 fn provenance_maps_every_lifted_bay_back_to_its_legacy_bay() {
+    // The window reads unlifted until the switch, and its provenance is the
+    // identity then, as its reader is.
+    let window = if crate::desk_lift::V24_LIFT { DeskEra::V24 } else { DeskEra::V32 };
+    provenance_agrees_with_the_reader(window);
+    crate::desk_lift::with_v24_lift(|| provenance_agrees_with_the_reader(DeskEra::V24));
+}
+
+fn provenance_agrees_with_the_reader(window: DeskEra) {
     for (name, text) in DOCUMENTS {
         let raw: Value = serde_json::from_str(text).expect("fixture");
         let p = provenance_of_document(&raw).expect("a legacy desk has a provenance");
@@ -441,7 +515,7 @@ fn provenance_maps_every_lifted_bay_back_to_its_legacy_bay() {
         .collect();
     assert_eq!(
         eras,
-        [DeskEra::V8Pads16, DeskEra::V16NoDrumBus, DeskEra::V16, DeskEra::V24, DeskEra::V32, DeskEra::V32]
+        [DeskEra::V8Pads16, DeskEra::V16NoDrumBus, DeskEra::V16, window, DeskEra::V32, DeskEra::V32]
     );
     // No desk is no provenance; a format-2 desk answers its marker.
     assert_eq!(provenance_of_document(&serde_json::json!({"clips": []})), None);
@@ -558,7 +632,11 @@ fn each_settings_era_raises_the_shelf_set_its_desk_lift_needs() {
     assert_eq!(names("settings-v17-pads16.json"), ["v18", "v19", "v20"]);
     assert_eq!(names("settings-v18.json"), ["v19", "v20"]);
     assert_eq!(names("settings-v19.json"), ["v20"]);
-    assert_eq!(names("settings-v20-27.json"), ["v24"]);
+    // The window raises its shuffle only where it is lifted: an unlifted
+    // window's plugins sit on their own seats and need no shelf move.
+    let window: &[&str] = if crate::desk_lift::V24_LIFT { &["v24"] } else { &[] };
+    assert_eq!(names("settings-v20-27.json"), window);
+    assert_eq!(crate::desk_lift::with_v24_lift(|| names("settings-v20-27.json")), ["v24"]);
     assert_eq!(names("settings-v20.json"), Vec::<&str>::new());
     assert_eq!(names("settings-v22.json"), Vec::<&str>::new());
     // The shelf and the desk agree, seat for seat, for the eras that moved
@@ -572,6 +650,166 @@ fn each_settings_era_raises_the_shelf_set_its_desk_lift_needs() {
         for (legacy, v32) in pairs {
             assert_eq!(legacy_shelf_seat(set, *legacy), Some(*v32), "{name}: seat {legacy}");
         }
+    }
+}
+
+/// The host's global-shelf and `state/` file name for a seat's bay:
+/// `desktop.rs`'s `sidecar_name`, transcribed and held to it below.
+fn sidecar(seat: usize, bay: usize) -> String {
+    format!("insert-state-{seat}-{bay}.bin")
+}
+
+/// **What a session does to a seat-named shelf**, as the host does it: every
+/// plugin reads its seat's file, keeps the knobs only when the file names
+/// its own bundle (the owner check), and on save writes what it has back
+/// over the same name, its own knobs or its defaults. `bays` is the desk as
+/// opened, flat V32 bay to plugin. Answers how many plugins opened at
+/// their defaults (no file, or somebody else's).
+fn host_load_and_save<'a>(dir: &std::path::Path, bays: impl Iterator<Item = (usize, &'a str)>) -> usize {
+    let mut at_defaults = 0;
+    for (flat, bundle) in bays.filter(|(_, p)| !p.is_empty()) {
+        let path = dir.join(sidecar(flat / 3, flat % 3));
+        let knobs = std::fs::read(&path)
+            .ok()
+            .and_then(|b| {
+                let nul = b.iter().position(|c| *c == 0)?;
+                (&b[..nul] == bundle.as_bytes()).then(|| b[nul + 1..].to_vec())
+            })
+            .unwrap_or_else(|| {
+                at_defaults += 1;
+                b"defaults".to_vec()
+            });
+        let mut out = bundle.as_bytes().to_vec();
+        out.push(0);
+        out.extend_from_slice(&knobs);
+        std::fs::write(&path, out).expect("write a sidecar");
+    }
+    at_defaults
+}
+
+/// Every file in `dir`, by name, with its bytes.
+fn shelf_bytes(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .expect("the shelf")
+        .flatten()
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).expect("read")))
+        .collect()
+}
+
+/// A shelf of the file's own era: one sidecar per occupied legacy bay, at
+/// that bay's seat, holding that plugin's bundle and knobs named for it.
+fn legacy_shelf(tag: &str, legacy: &[Value]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tangent-era-shelf-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp shelf");
+    for (flat, p) in legacy.iter().enumerate() {
+        let Some(p) = p.as_str().filter(|p| !p.is_empty()) else { continue };
+        let mut body = p.as_bytes().to_vec();
+        body.push(0);
+        body.extend_from_slice(format!("knobs-of-legacy-bay-{flat}").as_bytes());
+        std::fs::write(dir.join(sidecar(flat / 3, flat % 3)), body).expect("seed");
+    }
+    dir
+}
+
+/// **A 24-channel-window shelf survives a load and a save untouched.**
+///
+/// Until the copy-only shelf conversion lands, the host reads and writes
+/// plugin state by SEAT over the legacy names, on the global shelf for the
+/// settings desk and in a project's `state/` for a document. So the window
+/// must open with every plugin on the seat the file had it at, and a whole
+/// session (open, every plugin's read, a save, a reopen, the reads and the
+/// save again) must leave every legacy file byte for byte as it was, each
+/// plugin having found its own knobs. Under the lift it would not: the drum
+/// bus at seat 32 opens what is the window's channel 0 pad 4 and writes over
+/// it, which is why the lift waits (`crate::desk_lift::V24_LIFT`); that half
+/// is asserted too, so this test cannot pass by testing nothing.
+#[test]
+fn a_24_channel_window_shelf_survives_a_load_and_save_untouched() {
+    // The transcription is the host's naming.
+    let host = include_str!("../../tangent/src/desktop.rs");
+    for line in [
+        "const SIDECAR_PREFIX: &str = \"insert-state-\";",
+        "format!(\"{SIDECAR_PREFIX}{strip}-{bay}.bin\")",
+    ] {
+        assert!(host.contains(line), "the host's sidecar names changed: `{line}` is gone");
+    }
+
+    let (_, text) = SETTINGS.iter().find(|(n, _)| *n == "settings-v20-27.json").expect("fixture");
+    let raw: Value = serde_json::from_str(text).expect("fixture");
+    let legacy = raw["strip_inserts"].as_array().expect("a dense desk").clone();
+    let cycle = |tag: &str| {
+        let dir = legacy_shelf(tag, &legacy);
+        let before = shelf_bytes(&dir);
+        let opened = Settings::from_json(text);
+        let lost = host_load_and_save(&dir, opened.strip_inserts.iter().map(String::as_str).enumerate());
+        let reopened = Settings::from_json(&opened.to_json());
+        host_load_and_save(&dir, reopened.strip_inserts.iter().map(String::as_str).enumerate());
+        let after = shelf_bytes(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        (before, after, lost, opened.shelf_shuffles())
+    };
+    let (before, after, lost, shuffles) = cycle("settings");
+    if !crate::desk_lift::V24_LIFT {
+        assert!(before.len() > 30, "the fixture seeds a real shelf");
+        assert_eq!(lost, 0, "a plugin opened without its own knobs");
+        assert_eq!(after, before, "a settings load and save changed a legacy sidecar");
+        assert!(shuffles.is_empty(), "an unlifted window asked the host to move its shelf");
+    }
+    let (before, after, lost, _) = crate::desk_lift::with_v24_lift(|| cycle("settings-lifted"));
+    assert!(lost > 0, "the lifted window's buses should miss their legacy knobs");
+    assert_ne!(after, before, "the lifted window should write past its own shelf");
+
+    let (_, text) = DOCUMENTS.iter().find(|(n, _)| *n == "doc-v6-27.json").expect("fixture");
+    let raw: Value = serde_json::from_str(text).expect("fixture");
+    let legacy = raw["desk"]["inserts"].as_array().expect("a dense desk").clone();
+    let cycle = |tag: &str| {
+        let dir = legacy_shelf(tag, &legacy);
+        let before = shelf_bytes(&dir);
+        let opened = Arrangement::from_json(text);
+        let desk = opened.desk.as_ref().expect("a desk");
+        let lost = host_load_and_save(&dir, desk.inserts.iter().map(|(b, p)| (*b, p.as_str())));
+        let reopened = Arrangement::from_json(&opened.to_json());
+        let desk = reopened.desk.as_ref().expect("a desk");
+        host_load_and_save(&dir, desk.inserts.iter().map(|(b, p)| (*b, p.as_str())));
+        let after = shelf_bytes(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        (before, after, lost)
+    };
+    let (before, after, lost) = cycle("doc");
+    if !crate::desk_lift::V24_LIFT {
+        assert!(before.len() > 5, "the fixture seeds a real state folder");
+        assert_eq!(lost, 0, "a plugin opened without its own knobs");
+        assert_eq!(after, before, "a document open and save changed a legacy sidecar in state/");
+    }
+    let (before, after, lost) = crate::desk_lift::with_v24_lift(|| cycle("doc-lifted"));
+    assert!(lost > 0, "the lifted window's buses should miss their legacy knobs");
+    assert_ne!(after, before, "the lifted window should write past its own state/");
+}
+
+/// **The 24-channel lift switches on only beside the copy-only shelf.**
+///
+/// Lifted, the window's plugins sit eight seats above their legacy
+/// sidecars, and only the identity-named shelf (`convert_global_shelf`
+/// copying through `legacy_shelf_seat`, and the project reader trying
+/// pstate names, then legacy ones through the provenance) pairs them back
+/// without writing over a legacy file. So `V24_LIFT` may be true only in a
+/// tree that has both, and no tree may ever rename the window's shelf in
+/// place.
+#[test]
+fn the_v24_lift_waits_for_the_copy_only_shelf() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let host = std::fs::read_to_string(root.join("tangent/src/desktop.rs")).expect("desktop.rs");
+    assert!(
+        !host.contains("fn shift_insert_states_for_v24"),
+        "the 24-channel window's shelf must be copied, never renamed in place"
+    );
+    if crate::desk_lift::V24_LIFT {
+        let shelf = std::fs::read_to_string(root.join("tangent/src/shelf.rs")).unwrap_or_default();
+        for needed in ["fn convert_global_shelf", "PstateThenLegacy"] {
+            assert!(shelf.contains(needed), "V24_LIFT is on without shelf.rs's `{needed}`");
+        }
+        assert!(host.contains("convert_global_shelf("), "V24_LIFT is on and the host never converts");
     }
 }
 

@@ -179,7 +179,21 @@ impl std::str::FromStr for DeskEra {
 /// whose last plugin sat on seat 27 was 84 bays long and had channels 12..27
 /// rescaled onto 48..63 at load. The sixteen-pad desk only ever had eight
 /// channels, so the sends count settles it.
+///
+/// **A 27-sends desk reads as V32 until [`V24_LIFT`] is on**, so every
+/// reader (settings, documents, the master's curve lane, the provenance)
+/// leaves the 24-channel window exactly where the base left it, all
+/// together. [`era_written`] is the bare fingerprint.
 pub fn era_of(sends_len: usize, inserts_len: usize) -> DeskEra {
+    match era_written(sends_len, inserts_len) {
+        DeskEra::V24 if !v24_lift_on() => DeskEra::V32,
+        era => era,
+    }
+}
+
+/// **The shape a desk was written in, from its lengths alone**, whether or
+/// not the readers lift it yet ([`era_of`] is what they lift by).
+pub const fn era_written(sends_len: usize, inserts_len: usize) -> DeskEra {
     match sends_len {
         11 if inserts_len == DeskEra::V8Pads16.bays() => DeskEra::V8Pads16,
         11 => DeskEra::V8,
@@ -188,6 +202,41 @@ pub fn era_of(sends_len: usize, inserts_len: usize) -> DeskEra {
         27 => DeskEra::V24,
         _ => DeskEra::V32,
     }
+}
+
+/// **Whether the readers lift the 24-channel window yet. Off, and on only
+/// together with the copy-only shelf.**
+///
+/// The lift moves a 27-sends desk's drum bus, click, fx return and master
+/// up eight seats (24..27 to 32..35) and every pad with them. Its plugin
+/// STATES do not move: they are files named by seat (`insert-state-S-B.bin`
+/// on the global shelf and in every project's `state/`), and the host reads
+/// and writes each plugin's knobs at its seat. Lifted, the drum bus at seat
+/// 32 opens the file that is the window's channel 0 pad 4 (or its own knobs
+/// under a same-bundle stranger's), and the first save writes the drum
+/// bus's knobs over it: a legacy file destroyed, which section 6.6 of the
+/// unlimited-tracks design forbids, and destroyed before the conversion that
+/// was going to read it.
+///
+/// Nothing the readers can do fixes that from here. A copy into the lifted
+/// names cannot be copy-only, because the lifted names from 32 to 3100 are
+/// the window's own legacy names for other plugins; the only safe
+/// destination is the identity names (`pstate-<seatbay>.bin`), and those
+/// arrive with `shelf.rs`'s `convert_global_shelf` and its pstate-then-legacy
+/// project reader (W4-integrate checkpoint (B)). Until then the window opens
+/// as it always did: buses and master on channels 24..27, each plugin beside
+/// its own file, nothing renamed and nothing overwritten.
+///
+/// MERGE-ME(W4-integrate (B)): delete this const and read
+/// `desk_format::WRITE_V8` in its place, in the commit that lands
+/// `convert_global_shelf` and the pstate names, so the lift, its
+/// `ShelfShuffles::V24` and the copy that honours them switch on together.
+/// `era_corpus::the_v24_lift_waits_for_the_copy_only_shelf` holds the order.
+pub const V24_LIFT: bool = false;
+
+/// [`V24_LIFT`], or a test that asked for the lifted picture.
+pub fn v24_lift_on() -> bool {
+    V24_LIFT || v24_lift_forced()
 }
 
 /// **The era of a document's legacy `desk` object**, by the lengths
@@ -590,6 +639,36 @@ pub const fn legacy_shelf_seat(set: ShelfShuffles, seat: usize) -> Option<usize>
     Some(s)
 }
 
+#[cfg(not(test))]
+const fn v24_lift_forced() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static V24_LIFT_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn v24_lift_forced() -> bool {
+    V24_LIFT_FORCED.with(std::cell::Cell::get)
+}
+
+/// **`f` read with the 24-channel window lifted**, on this thread only: the
+/// picture [`V24_LIFT`] turns on, pinned now so the switch flips onto a
+/// tested lift. Restored on the way out, a panic included.
+#[cfg(test)]
+pub(crate) fn with_v24_lift<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            V24_LIFT_FORCED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(V24_LIFT_FORCED.with(|c| c.replace(true)));
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,18 +689,25 @@ mod tests {
     /// an 84-bay array beside any other sends count is that count's era.
     #[test]
     fn the_era_is_the_sends_length_and_the_pad_sub_era_needs_both() {
-        assert_eq!(era_of(11, 84), DeskEra::V8Pads16);
-        assert_eq!(era_of(11, 420), DeskEra::V8);
-        assert_eq!(era_of(11, 36), DeskEra::V8);
-        assert_eq!(era_of(18, 57), DeskEra::V16NoDrumBus);
-        assert_eq!(era_of(19, 84), DeskEra::V16);
-        assert_eq!(era_of(27, 84), DeskEra::V24);
-        assert_eq!(era_of(35, 84), DeskEra::V32);
-        assert_eq!(era_of(0, 84), DeskEra::V32);
-        assert_eq!(era_of(64, 0), DeskEra::V32);
+        assert_eq!(era_written(11, 84), DeskEra::V8Pads16);
+        assert_eq!(era_written(11, 420), DeskEra::V8);
+        assert_eq!(era_written(11, 36), DeskEra::V8);
+        assert_eq!(era_written(18, 57), DeskEra::V16NoDrumBus);
+        assert_eq!(era_written(19, 84), DeskEra::V16);
+        assert_eq!(era_written(27, 84), DeskEra::V24);
+        assert_eq!(era_written(35, 84), DeskEra::V32);
+        assert_eq!(era_written(0, 84), DeskEra::V32);
+        assert_eq!(era_written(64, 0), DeskEra::V32);
         for e in DeskEra::ALL {
-            assert_eq!(era_of(e.sends(), e.bays()), e, "{e}'s own lengths");
+            assert_eq!(era_written(e.sends(), e.bays()), e, "{e}'s own lengths");
+            // What the readers lift by: the same, apart from the window,
+            // which waits for the copy-only shelf (`V24_LIFT`).
+            let lifted = if e == DeskEra::V24 && !V24_LIFT { DeskEra::V32 } else { e };
+            assert_eq!(era_of(e.sends(), e.bays()), lifted, "{e} as the readers take it");
+            assert_eq!(with_v24_lift(|| era_of(e.sends(), e.bays())), e, "{e} lifted");
         }
+        // The switch is per thread and comes back off after a forced read.
+        assert_eq!(era_of(27, 84), if V24_LIFT { DeskEra::V24 } else { DeskEra::V32 });
     }
 
     /// **Each era's widening, at literal seats.** A bay at the era's drum
