@@ -848,7 +848,10 @@ mod tests {
             r.keys.patch = 7;
             r.keys.params[63] = 0.999;
             r.frozen = Some(Frozen { path: "media/f.wav".into(), len_s: 12.5 });
-            m.append(r).expect("append");
+            // Pushed, not appended: three members under no folder is a run
+            // an edit refuses to make, and exactly the stale flags an older
+            // file can hold, which the format must carry byte for byte.
+            m.rows.push(r);
         }
         // Sent after every row is in: an edit refuses to leave a send to a
         // row that is not there yet.
