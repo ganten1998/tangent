@@ -225,6 +225,7 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::laneset::LaneSet;
 use crate::rtwork::{LanePool, RtPlan, Workgroup};
 use std::time::{Duration, Instant};
 
@@ -526,6 +527,40 @@ pub(crate) struct MidiEvent {
     pub(crate) data2: u8,
 }
 
+/// **Which lanes may hear one live event**: the device and wire channel it
+/// came on, kept beside the event and asked of each lane's route at the lane.
+///
+/// It was a `u32` per event, one bit per channel, decided in `collect_notes`
+/// and read by the lane walk as `mask & (1 << ch.min(31))`. A word has a
+/// width and a desk does not, so the event keeps what the bits were derived
+/// from instead, and each lane asks its own route
+/// ([`Renderer::midi_routes`], read once per chunk beside the events) the
+/// question the bit used to answer. Same routes, same chunk, same answer.
+///
+/// [`Reach::EVERY`] is the app's own source slot, which every route admits
+/// unconditionally: an event from the app itself, and a flush's note-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reach {
+    src: u8,
+    chan: u8,
+}
+
+impl Reach {
+    /// Every lane. `MidiRoute::admits` answers yes to the app's slot whatever
+    /// the route says.
+    const EVERY: Reach = Reach { src: tangent_ui::recorder::MIDI_SRC_APP, chan: 0 };
+
+    /// The reach of an event from source slot `src` with status byte `status`.
+    fn of(src: u8, status: u8) -> Self {
+        Reach { src, chan: status & 0x0F }
+    }
+
+    /// Whether a lane listening through `route` hears this event.
+    fn reaches(self, route: tangent_ui::recorder::MidiRoute) -> bool {
+        route.admits(self.src, self.chan)
+    }
+}
+
 /// Raw MIDI bytes to a VST3 note, or `None` for anything that is not one.
 ///
 /// Three traps, all of them cheap to get wrong and expensive to hear:
@@ -744,6 +779,18 @@ fn permute_rows<T: Default>(rows: &mut [T], order: &[usize]) {
     }
 }
 
+/// **One lane's bit in a strip-space word, or no bit at all.**
+///
+/// The mute and solo words are still strip masks until the plan's
+/// `resolve_heard` replaces them, and the question asked of them is "is this
+/// strip in the word". It was asked as `1 << n.min(63)`, which answers a
+/// strip past the word with the word's LAST bit: lane 70 muted whenever
+/// strip 63 was. A strip the word has no bit for is not in it, so it gets
+/// an empty bit and every test against it says no.
+fn word_bit(n: usize) -> u64 {
+    u32::try_from(n).ok().and_then(|s| 1u64.checked_shl(s)).unwrap_or(0)
+}
+
 fn strip_is_heard(strip: Strip, muted: u64, soloed: u64) -> bool {
     // Soloed by name: heard, whatever its own mute says. Pressing solo on a
     // muted channel is unambiguously a request to hear it, and the
@@ -789,7 +836,7 @@ fn strip_is_heard(strip: Strip, muted: u64, soloed: u64) -> bool {
 /// block. The walk terminates because a parent index is always lower than
 /// its child's; `CHANNELS` is the belt-and-braces bound.
 fn channel_is_heard(ch: usize, parents: &[i32; CHANNELS], muted: u64, soloed: u64) -> bool {
-    let bit = |n: usize| 1u64 << n.min(63);
+    let bit = word_bit;
     // Muted anywhere up the chain: silent, whatever anything else says.
     // Checked before solo, and deliberately: an explicit solo overrides the
     // channel's OWN mute, but nothing overrides a group being switched off.
@@ -3989,12 +4036,13 @@ impl Rack {
         cell.swap(frames, Ordering::Relaxed) != frames
     }
 
-    fn latency(shared: &Shared, seat: usize) -> u32 {
+    fn latency(shared: &Shared, frozen: &LaneSet, seat: usize) -> u32 {
         // A frozen LANE's seats report none: none of its racks run, and its
         // file was rendered with the lead already cut - see `Shared::frozen`
         // and `lane_of_seat`. This asked whether the SEAT was frozen, which
         // is the same question only for a lane's first block of three.
-        if seat_is_frozen(shared, seat) {
+        // `frozen` is the chunk's decoded set, `DeskLanes::frozen`.
+        if seat_is_frozen(frozen, seat) {
             return 0;
         }
         (0..INSERTS)
@@ -4542,7 +4590,10 @@ mod engine_parts {
         for f in 0..frames {
             let now = at + f as u64;
             for placed in &clips {
-                let lane = placed.strip.min(CHANNELS - 1);
+                let lane = placed.strip;
+                if lane >= CHANNELS {
+                    continue;
+                }
                 let Some(k) = now.checked_sub(placed.start) else {
                     continue;
                 };
@@ -4740,7 +4791,7 @@ mod engine_parts {
             mk(2, 300, 0.7, -0.5),
         ];
         let mut sorted = unsorted.clone();
-        sorted.sort_by_key(|p| p.strip.min(CHANNELS - 1));
+        sorted.sort_by_key(|p| p.strip);
 
         // The table: absent for the unsorted list, present and exact for the
         // sorted one.
@@ -4755,7 +4806,7 @@ mod engine_parts {
         for ch in 0..CHANNELS {
             for placed in lane_run(&sorted, Some(&at), ch) {
                 assert_eq!(
-                    placed.strip.min(CHANNELS - 1),
+                    placed.strip,
                     ch,
                     "lane {ch}'s run holds another lane's clip"
                 );
@@ -4827,8 +4878,9 @@ mod engine_parts {
         doc.set(ramp(2, AutoParam::Plugin { bay: 1, id: 7 }));
 
         // A position gives that position's value, wherever the playhead is.
-        let near = automation_now(&doc, 0, 2.5);
-        let far = automation_now(&doc, 0, 7.5);
+        let none = LaneSet::with_capacity(DESK_WORD_LANES);
+        let near = automation_now(&doc, &none, 2.5);
+        let far = automation_now(&doc, &none, 7.5);
         let g = |a: &AutoNow| a.gain[3].expect("lane 3 is automated");
         assert!((g(&near) - 0.25).abs() < 1e-6, "near was {}", g(&near));
         assert!((g(&far) - 0.75).abs() < 1e-6, "far was {}", g(&far));
@@ -4836,7 +4888,7 @@ mod engine_parts {
         // **Asking far ahead does not disturb the answer for now**, which is
         // the property the whole overhaul rests on and the reason this is a
         // function rather than a pass over a shared table.
-        let again = automation_now(&doc, 0, 2.5);
+        let again = automation_now(&doc, &none, 2.5);
         assert!(
             near.gain == again.gain
                 && near.pan == again.pan
@@ -4847,7 +4899,7 @@ mod engine_parts {
         );
 
         // A held control is left alone at every position.
-        let held = automation_now(&doc, 1 << 3, 2.5);
+        let held = automation_now(&doc, &LaneSet::from_u64(1 << 3), 2.5);
         assert!(held.gain[3].is_none(), "a suspended lane took its curve anyway");
         assert!(held.pan[5].is_some(), "suspending one lane silenced another");
 
@@ -4855,8 +4907,9 @@ mod engine_parts {
         let seats = RACK_SEATS * INSERTS;
         let mut out: Vec<Vec<tangent_host::ParamPoint>> =
             (0..seats).map(|_| Vec::with_capacity(8)).collect();
-        let touched = fill_automation_params(&doc, 0, 7.5, &mut out);
-        assert_ne!(touched, 0, "no lane was reported awake, so nothing was written");
+        let mut touched = LaneSet::with_capacity(CHANNELS);
+        fill_automation_params(&doc, &none, 7.5, &mut out, &mut touched);
+        assert!(!touched.is_empty(), "no lane was reported awake, so nothing was written");
         let wrote: Vec<f32> = out.iter().flatten().map(|p| p.value as f32).collect();
         assert_eq!(wrote.len(), 1, "expected exactly the one automated bay");
         assert!((wrote[0] - 0.75).abs() < 1e-6, "the bay took {}", wrote[0]);
@@ -4867,7 +4920,7 @@ mod engine_parts {
         for q in &mut out {
             q.clear();
         }
-        let _ = fill_automation_params(&doc, 0, 2.5, &mut out);
+        fill_automation_params(&doc, &none, 2.5, &mut out, &mut touched);
         let early: Vec<f64> = out.iter().flatten().map(|p| p.value).collect();
         assert!((early[0] - 0.25).abs() < 1e-6, "the bay took {} at 2.5 s", early[0]);
     }
@@ -5183,7 +5236,7 @@ mod engine_parts {
         }
         for seat in &seats {
             assert_eq!(
-                Rack::latency(&r.shared, *seat),
+                Rack::latency(&r.shared, &DeskLanes::read(&r.shared).frozen, *seat),
                 64,
                 "seat {seat} reported nothing before the freeze"
             );
@@ -5191,7 +5244,7 @@ mod engine_parts {
         r.shared.frozen.store(1u32 << CH, Ordering::Relaxed);
         for seat in &seats {
             assert_eq!(
-                Rack::latency(&r.shared, *seat),
+                Rack::latency(&r.shared, &DeskLanes::read(&r.shared).frozen, *seat),
                 0,
                 "seat {seat} still publishes latency on a frozen lane"
             );
@@ -5203,7 +5256,7 @@ mod engine_parts {
             cell.store(64, Ordering::Relaxed);
         }
         assert_eq!(
-            Rack::latency(&r.shared, other),
+            Rack::latency(&r.shared, &DeskLanes::read(&r.shared).frozen, other),
             64,
             "freezing lane {CH} silenced lane {}'s extra rack",
             CH + 1
@@ -5284,6 +5337,28 @@ mod engine_parts {
     #[test]
     fn a_lane_that_is_live_in_any_way_is_never_rendered_ahead() {
         use tangent_ui::recorder::folder_extra_seat;
+        // The rule answers in a set now, decoded from the words it is handed;
+        // read back as the lane word every assertion below was written
+        // against, so not one of them had to change to follow it.
+        let pinned_lanes = |shared: &Shared,
+                            folders: &[bool; CHANNELS],
+                            receives: u32,
+                            room: u32,
+                            keys_live: bool|
+         -> u32 {
+            let mut out = LaneSet::with_capacity(CHANNELS);
+            pinned_lanes(
+                shared,
+                &DeskLanes::read(shared),
+                folders,
+                &LaneSet::from_u32(receives),
+                &[&LaneSet::from_u32(room)],
+                keys_live,
+                &mut out,
+            );
+            assert!(out.iter().all(|ch| ch < CHANNELS), "a lane past the desk was pinned");
+            out.iter().fold(0u32, |m, ch| m | 1 << ch)
+        };
         let shared = Shared::new();
         let none = [false; CHANNELS];
         // `Shared::new` arms everything and leaves every lane's MIDI on, so
@@ -5541,9 +5616,127 @@ fn lane_of_seat(seat: usize) -> Option<usize> {
 }
 
 /// Whether the lane that owns `seat` is frozen. See [`lane_of_seat`].
-fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
-    lane_of_seat(seat)
-        .is_some_and(|ch| shared.frozen.load(Ordering::Relaxed) & (1u32 << ch) != 0)
+///
+/// Asked of the chunk's decoded set ([`DeskLanes::frozen`]) and not of the
+/// word, so a seat whose lane the word has no bit for is simply not frozen.
+fn seat_is_frozen(frozen: &LaneSet, seat: usize) -> bool {
+    lane_of_seat(seat).is_some_and(|ch| frozen.contains(ch))
+}
+
+/// **The strip whose MIDI arm a bus seat's chain asks**, for the seats
+/// `run_insert_chain` runs: the Fx bus, and the master's two racks.
+///
+/// A seat is not a strip. The master's second rack sits far past the strips
+/// (`MASTER_EXTRA_SEAT`), and it was asked as `at.min(63)`, which read
+/// whatever bit 63 of the strip word happened to hold: the master's arm only
+/// while the host left the high bits alone. Both of the master's racks are
+/// the master strip's, so both ask its bit; every other seat here is a strip
+/// already.
+fn chain_strip(at: usize) -> usize {
+    if at == tangent_ui::recorder::MASTER_EXTRA_SEAT { STRIPS } else { at }
+}
+
+/// **How many lanes a desk word can name**: the width of the widest one, the
+/// `u64` strip words. The decoded sets are bought at this capacity once, so
+/// decoding a word on the audio thread is a clear and a few inserts and never
+/// an allocation.
+const DESK_WORD_LANES: usize = u64::BITS as usize;
+
+/// **The desk's lane words, decoded ONCE per chunk.**
+///
+/// The host still publishes these as words on [`Shared`] (`set_armed`,
+/// `set_midi_off`, `set_drum_strips` and the rest keep their signatures), and
+/// every walk used to test them in place as `word & (1 << ch.min(31))`. That
+/// spelling is the defect this type ends. Past the word, `1 << n` wraps in a
+/// release build and lane 32 answers for lane 0; the `.min` that was added
+/// to stop the debug panic folds every lane past the edge onto the last
+/// one, so arming lane 40 would arm lane 31. A [`LaneSet`] has no edge to
+/// fold onto: a lane it has no bit for is not in it.
+///
+/// **Once per chunk, at the head of the chunk, and that is the point as
+/// much as the width.** A walk that loaded `armed` at its own moment could
+/// see a different arm from the walk before it inside one chunk; every walk
+/// now reads the same answer, the one the chunk started with. Offline and
+/// in every test the words are set before the render and nothing changes.
+///
+/// The mute and solo words are not here: they are strip masks read once per
+/// CALLBACK and rewritten per chunk by `muted_now`, and the plan's
+/// `resolve_heard` replaces the lot. See [`word_bit`].
+struct DeskLanes {
+    /// `Shared::armed`: armed for recording.
+    armed: LaneSet,
+    /// The complement of `Shared::midi_off`, in strip space: a strip whose
+    /// MIDI input is open. Decoded as the lanes that LISTEN, so a strip the
+    /// word has no bit for is deaf rather than open.
+    midi_on: LaneSet,
+    /// `Shared::drum_strips`.
+    drums: LaneSet,
+    /// `Shared::builtin_strips`: lanes holding a DX7.
+    builtins: LaneSet,
+    /// `Shared::keys_strips`: lanes holding the modelled keyboard.
+    keys: LaneSet,
+    /// `Shared::frozen`.
+    frozen: LaneSet,
+    /// `Shared::auto_suspend`, in automation-lane space: the channels, then
+    /// [`MASTER_AUTO_LANE`].
+    suspend: LaneSet,
+}
+
+impl DeskLanes {
+    /// Every set bought at [`DESK_WORD_LANES`]. The only call that
+    /// allocates, made when a renderer is built.
+    fn new() -> Self {
+        let set = || LaneSet::with_capacity(DESK_WORD_LANES);
+        Self {
+            armed: set(),
+            midi_on: set(),
+            drums: set(),
+            builtins: set(),
+            keys: set(),
+            frozen: set(),
+            suspend: set(),
+        }
+    }
+
+    /// The words as they stand now, decoded fresh, for a test that has no
+    /// renderer's copy to read.
+    #[cfg(test)]
+    fn read(shared: &Shared) -> Self {
+        let mut d = Self::new();
+        d.decode(shared);
+        d
+    }
+
+    /// **Reload every set from `shared`.** No allocation: each set keeps
+    /// the capacity [`Self::new`] bought.
+    fn decode(&mut self, shared: &Shared) {
+        let load32 = |w: &AtomicU32| u64::from(w.load(Ordering::Relaxed));
+        load_word(&mut self.armed, load32(&shared.armed));
+        load_word(&mut self.midi_on, !shared.midi_off.load(Ordering::Relaxed));
+        load_word(&mut self.drums, load32(&shared.drum_strips));
+        load_word(&mut self.builtins, load32(&shared.builtin_strips));
+        load_word(&mut self.keys, load32(&shared.keys_strips));
+        load_word(&mut self.frozen, load32(&shared.frozen));
+        load_word(&mut self.suspend, shared.auto_suspend.load(Ordering::Relaxed));
+    }
+}
+
+/// **A set of the renderer's lanes**, bought at build: one per channel,
+/// which [`LaneSet`] rounds up to a whole word. What every lane mask on the
+/// renderer became.
+fn desk_lane_set() -> LaneSet {
+    LaneSet::with_capacity(CHANNELS)
+}
+
+/// **`set` becomes exactly the lanes `word` names**, lowest first, with no
+/// allocation: a clear and one insert per set bit.
+fn load_word(set: &mut LaneSet, word: u64) {
+    set.clear();
+    let mut rest = word;
+    while rest != 0 {
+        set.insert(rest.trailing_zeros() as usize);
+        rest &= rest - 1;
+    }
 }
 
 /// **Which lanes may NEVER be rendered ahead of the callback.**
@@ -5605,39 +5798,47 @@ fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
 ///
 /// The Fx bus and the two master seats are not channels and never reach this
 /// loop, so they are asserted rather than tested per lane.
+///
+/// **Written into `pinned`, which it clears first**, rather than returned:
+/// the answer is a [`LaneSet`] and the audio thread may not buy one, so the
+/// caller lends the one it bought. `room` is every room-claim set the caller
+/// holds (`room_rack` and `board_live` today), unioned here.
+#[allow(clippy::too_many_arguments)]
 fn pinned_lanes(
     shared: &Shared,
+    desk: &DeskLanes,
     folders: &[bool; CHANNELS],
-    receives: u32,
-    room: u32,
+    receives: &LaneSet,
+    room: &[&LaneSet],
     keys_live: bool,
-) -> u32 {
-    let midi_off = shared.midi_off.load(Ordering::Relaxed);
-    let armed = shared.armed.load(Ordering::Relaxed);
-    let drums = shared.drum_strips.load(Ordering::Relaxed);
-    let frozen = shared.frozen.load(Ordering::Relaxed);
-    let mut pinned = receives | drums | room | frozen;
+    pinned: &mut LaneSet,
+) {
+    pinned.clear();
+    for set in [receives, &desk.drums, &desk.frozen].into_iter().chain(room.iter().copied()) {
+        for ch in set.iter() {
+            pinned.insert(ch);
+        }
+    }
     // The tap names one seat; the lane that owns it is pinned.
     if let Some(ch) = unpack_tap(shared.insert_tap_route.load(Ordering::Relaxed))
         .and_then(|(seat, _)| lane_of_seat(seat))
     {
-        pinned |= 1u32 << ch.min(CHANNELS - 1);
+        pinned.insert(ch);
     }
     for ch in 0..CHANNELS {
-        let bit = 1u32 << ch;
-        if pinned & bit != 0 {
+        if pinned.contains(ch) {
             continue;
         }
-        if midi_off & (1u64 << ch) == 0 || armed & bit != 0 {
-            pinned |= bit;
+        if desk.midi_on.contains(ch) || desk.armed.contains(ch) {
+            pinned.insert(ch);
             continue;
         }
         if shared.punch[ch].load(Ordering::Relaxed) != u64::MAX {
-            pinned |= bit;
+            pinned.insert(ch);
             continue;
         }
         if folders.get(ch).copied().unwrap_or(false) {
-            pinned |= bit;
+            pinned.insert(ch);
             continue;
         }
         if keys_live {
@@ -5650,11 +5851,10 @@ fn pinned_lanes(
                         .is_some_and(|c| unpack_key(c.load(Ordering::Relaxed)).is_some())
                 })
             }) {
-                pinned |= bit;
+                pinned.insert(ch);
             }
         }
     }
-    pinned
 }
 
 /// **How wide the fan-out is allowed to be.**
@@ -6289,6 +6489,9 @@ struct DeskRef<'a> {
     clip_first: Option<&'a [u32; CHANNELS + 1]>,
     auto_params: &'a [Vec<tangent_host::ParamPoint>],
     shared: &'a Shared,
+    /// The chunk's decoded frozen set, for `run_rack`'s stand-down. See
+    /// [`DeskLanes`]: read, never written, by every hand.
+    frozen: &'a LaneSet,
     key_prev: &'a [f32],
     key_prev_frames: usize,
     /// The LIVE control list, which the pedalboard takes when the lane is
@@ -6312,19 +6515,25 @@ struct DeskRef<'a> {
 /// **Which lane a scheduled thing stands on.** Implemented by both schedules
 /// so that one bounds table and one narrowing serve audio clips and MIDI
 /// clips alike, rather than two spellings that can drift.
+///
+/// **The strip as it stands, never clamped.** It was `strip.min(CHANNELS - 1)`,
+/// which filed a clip on lane 40 under lane 31 and played it there. A lane
+/// past the table is no lane's: [`lane_bounds`] answers `None` for a list
+/// holding one, so the walks fall back to the whole list and filter by
+/// strip, and no lane's filter matches it.
 trait LaneOf {
     fn lane(&self) -> usize;
 }
 
 impl LaneOf for Placed {
     fn lane(&self) -> usize {
-        self.strip.min(CHANNELS - 1)
+        self.strip
     }
 }
 
 impl LaneOf for PlacedMidi {
     fn lane(&self) -> usize {
-        self.strip.min(CHANNELS - 1)
+        self.strip
     }
 }
 
@@ -6406,20 +6615,26 @@ fn lane_range(first: Option<&[u32; CHANNELS + 1]>, ch: usize, len: usize) -> std
 /// renders the chunk the curve was read for. The desk's fader, pan, send and
 /// mute need no pin: `automation_now` resolves them for the chunk and the
 /// fold applies them at consumption.
+///
+/// **The lanes go into `lanes`, cleared first**, and `suspend` is the
+/// chunk's decoded set ([`DeskLanes::suspend`]): a curve on a lane the
+/// suspend word has no bit for is simply not suspended, where the old
+/// `.min(63)` suspended it whenever lane 63 was.
 fn fill_automation_params(
     automation: &tangent_ui::automation::Automation,
-    suspend: u64,
+    suspend: &LaneSet,
     secs: f64,
     out: &mut [Vec<tangent_host::ParamPoint>],
-) -> u32 {
+    lanes: &mut LaneSet,
+) {
     use tangent_ui::automation::AutoParam;
-    let mut lanes = 0u32;
+    lanes.clear();
         for curve in automation.curves() {
             let AutoParam::Plugin { bay, id } = curve.param else {
                 continue;
             };
             let lane = curve.lane;
-            if suspend & (1 << lane.min(63)) != 0 {
+            if suspend.contains(lane) {
                 continue;
             }
             // **The MASTER's rack is a block past the channels'.**
@@ -6449,7 +6664,7 @@ fn fill_automation_params(
             // waking mid-ramp under a curve it has not been fed jumps to the
             // curve's current value instead of arriving on it.
             if let Some(ch) = lane_of_seat(slot_lane) {
-                lanes |= 1u32 << ch.min(CHANNELS - 1);
+                lanes.insert(ch);
             }
             // The cap is the pre-grown capacity: pushing past it would
             // allocate, which is the one thing this thread may not do.
@@ -6465,7 +6680,6 @@ fn fill_automation_params(
                 });
             }
         }
-    lanes
 }
 
 /// **The desk's automated fader, pan, send and mute at a position.**
@@ -6484,13 +6698,13 @@ fn fill_automation_params(
 /// grain ring that block, which runs no rack, until the lane's rack runs.
 fn automation_now(
     automation: &tangent_ui::automation::Automation,
-    suspend: u64,
+    suspend: &LaneSet,
     secs: f64,
 ) -> AutoNow {
     use tangent_ui::automation::AutoParam;
     let mut now = AutoNow::default();
         for lane in 0..CHANNELS {
-            if suspend & (1 << lane) != 0 {
+            if suspend.contains(lane) {
                 now.gain[lane] = None;
                 now.pan[lane] = None;
                 now.send[lane] = None;
@@ -6562,7 +6776,7 @@ pub(crate) fn pull_lane_clips(
     }
     let end = at.saturating_add(frames as u64);
     for placed in clips {
-        if placed.strip.min(CHANNELS - 1) != ch {
+        if placed.strip != ch {
             continue;
         }
         let from = at.max(placed.start);
@@ -6799,6 +7013,7 @@ fn render_lane(
                 &mut io.fx_in,
                 &mut io.fx_out,
                 desk.shared,
+                desk.frozen,
                 frames,
                 if armed { desk.controls } else { &[] },
             );
@@ -6843,6 +7058,7 @@ fn render_lane(
             controls,
         &seat_params,
             desk.shared,
+            desk.frozen,
             ch,
             // **THE road a sampler's audio takes.** This is the pass
             // that carries the lane's notes, so it is the pass a
@@ -6873,6 +7089,7 @@ fn render_lane(
             &mut io.fx_in,
             &mut io.fx_out,
             desk.shared,
+            desk.frozen,
             tangent_ui::recorder::folder_extra_seat(ch),
             frames,
             &lane_notes,
@@ -6940,6 +7157,9 @@ fn run_extra_rack(
     planar: &mut [Vec<f32>],
     out: &mut [Vec<f32>],
     shared: &Shared,
+    // **The chunk's decoded frozen set** (`DeskLanes::frozen`), which
+    // `seat_is_frozen` asks rather than the word.
+    frozen: &LaneSet,
     // The EXTRA seat itself, not the strip it belongs to: a channel's comes
     // from `folder_extra_seat` and a bus's from `bus_extra_seat`, and the two
     // blocks are appended in different places. Naming the seat here is what
@@ -6993,6 +7213,7 @@ fn run_extra_rack(
         controls,
         &seat_params,
         shared,
+        frozen,
         extra,
         sample,
         key,
@@ -7064,6 +7285,9 @@ fn run_rack(
     // until a block has run, so the figure has to be picked up here rather than
     // polled from the main thread the way a VST3's is.
     shared: &Shared,
+    // **The chunk's decoded frozen set** (`DeskLanes::frozen`), which
+    // `seat_is_frozen` asks rather than the word.
+    frozen: &LaneSet,
     seat: usize,
     // **This seat's loaded sample, or `None`.** Only a built-in sampler bay
     // reads it, and only a CHANNEL seat can have one — a pedal seat, a pad
@@ -7133,7 +7357,7 @@ fn run_rack(
     // `lane_of_seat`: this asked whether the SEAT was frozen, so a frozen
     // lane's extra rack and pedalboard kept running over a file the freeze
     // render had already baked them into.
-    if seat_is_frozen(shared, seat) {
+    if seat_is_frozen(frozen, seat) {
         if tap_bay.is_some() {
             push_insert_tap(shared, planar, frames);
         }
@@ -7654,8 +7878,9 @@ struct Renderer {
     /// belongs to a later block lives here rather than being pushed back.
     pending: Option<MidiEvent>,
     notes: Vec<Note>,
-    /// **WHICH LANES may hear each of `notes`**, one bit per channel, in step
-    /// with it index for index.
+    /// **WHICH LANES may hear each of `notes`**, as the event's [`Reach`], in
+    /// step with it index for index. It was one bit per channel; a lane now
+    /// asks its own route of the reach (see [`Reach`] for why).
     ///
     /// A parallel `Vec` rather than a field on `Note`, because `Note` is
     /// `tangent_host`'s type and travels into every plugin: a routing mask is
@@ -7663,9 +7888,9 @@ struct Renderer {
     /// beside `notes` and cleared with it, so the audio thread never grows
     /// either.
     ///
-    /// `u32::MAX` for an event from the app itself — see
+    /// [`Reach::EVERY`] for an event from the app itself — see
     /// `recorder::MIDI_SRC_APP`.
-    note_lanes: Vec<u32>,
+    note_lanes: Vec<Reach>,
     /// The instrument this app ships with.
     ///
     /// Rendered when a slot has asked for it, and when NO slot has anything at
@@ -8070,7 +8295,7 @@ struct Renderer {
     /// PARKING; it does not stop `plan_grains` serving the lane from its grain
     /// ring, which runs no rack either, so an edit for such a lane is kept in
     /// `ui_held` and applied again until its rack runs.
-    param_lanes: u32,
+    param_lanes: LaneSet,
     /// **Which lanes carry a plugin-parameter CURVE**, from this chunk's walk
     /// of the document (`fill_automation_params`), kept apart from the knob
     /// bits `param_lanes` also holds.
@@ -8082,7 +8307,7 @@ struct Renderer {
     /// Pinned, the lane renders the chunk the table was read for. Reading the
     /// curve at the grain's own position instead would still hold one value
     /// for the whole grain, which is the staircase back again.
-    curve_lanes: u32,
+    curve_lanes: LaneSet,
     /// **Knob and preset edits a lane served from its grain ring has not
     /// heard yet.**
     ///
@@ -8168,7 +8393,12 @@ struct Renderer {
     /// The same for `controls`, in step index for index. A pedal is a message
     /// from a device like any other: a foot on keyboard A's damper must not
     /// hold keyboard B's track.
-    control_lanes: Vec<u32>,
+    control_lanes: Vec<Reach>,
+    /// **Each lane's MIDI route, read once per chunk** by `collect_notes`,
+    /// and the half of a live event's [`Reach`] the event does not carry.
+    /// Read again by the lane walk later in the same chunk, so a lane asks
+    /// exactly the route the event was collected under.
+    midi_routes: [tangent_ui::recorder::MidiRoute; CHANNELS],
 
     tap: Producer<f32>,
     /// Interleaved recorder mix for one block. Sized once.
@@ -8459,7 +8689,7 @@ struct Renderer {
     /// thirty-two times and the list can be long. See `mix_clips` for why
     /// the answer is deliberately whole-timeline rather than
     /// under-the-playhead.
-    clip_lanes: u32,
+    clip_lanes: LaneSet,
     /// **Which lanes have a clip under the playhead this block.**
     ///
     /// The per-block twin of [`Self::clip_lanes`], which is deliberately a
@@ -8467,7 +8697,7 @@ struct Renderer {
     /// whole-timeline one and not this: the seed in `render_lane`, the
     /// folder walk, and the lane pass's `has_audio`. This one decides only
     /// whether a lane is worth RENDERING, never whether it has audio at all.
-    clip_under: u32,
+    clip_under: LaneSet,
     /// **APPENDED — the DRY stem block**, `stem_scratch`'s exact layout and
     /// its exact indexing, filled only while a dry stems pass is running.
     ///
@@ -8524,7 +8754,7 @@ struct Renderer {
     /// and everybody after is refused. See [`Renderer::board_live`] for who
     /// is meant to get there first, and `run_pedalboard` for the two rules
     /// in one place.
-    board_ran: u32,
+    board_ran: LaneSet,
     /// **APPENDED — whose board the ROOM owned last chunk**, one bit per
     /// channel, written by `mix_monitor` and read by the lane pass.
     ///
@@ -8545,7 +8775,7 @@ struct Renderer {
     /// time at the top of the chunk to get an exact answer, which buys five
     /// milliseconds of a fading-in signal at the price of the duplication
     /// this app has been bitten by three times.
-    board_live: u32,
+    board_live: LaneSet,
     /// **Lanes a worker is holding across a block boundary.**
     ///
     /// Zero in every build today, because nothing leases yet. It exists now
@@ -8559,7 +8789,7 @@ struct Renderer {
     /// look before it takes, and leave it where it is for a lane it may not
     /// touch. That is the shape the racks' own handoff already uses when the
     /// retiring ring is full: backpressure, not loss.
-    leased: u32,
+    leased: LaneSet,
 
     /// **The eligibility probe.** See [`ProbeCells`]. `probe` is latched
     /// from the environment once, so the per-block cost of all of this is a
@@ -8568,9 +8798,9 @@ struct Renderer {
     /// Lanes the DECIDE walk pinned this block, which is the half
     /// [`pinned_lanes`] cannot see, and the clip-source half kept apart
     /// because it is the one a future engine could remove.
-    probe_walk_pins: u32,
-    probe_clip_pins: u32,
-    probe_inst_pins: u32,
+    probe_walk_pins: LaneSet,
+    probe_clip_pins: LaneSet,
+    probe_inst_pins: LaneSet,
     /// The desk words the probe watches for a change, to count the blocks in
     /// which a look-ahead ring would have been thrown away.
     probe_watch: ProbeWatch,
@@ -8608,7 +8838,32 @@ struct Renderer {
     /// the lane pass. The cost of that is one chunk of a clip paying its rack
     /// on the chunk an input is first armed — inaudible, and the alternative
     /// is a second walk of the interface at the head of every block.
-    room_rack: u32,
+    room_rack: LaneSet,
+    /// **The claim `mix_monitor` found when it began**, which is the one
+    /// the lane walk acted on: `room_rack` is swapped into here and cleared
+    /// for the claim being built. A set the renderer owns rather than a
+    /// local, so the swap moves two boxes and buys none.
+    stood_aside: LaneSet,
+
+    /// **The desk's lane words, decoded at the head of every chunk.** Every
+    /// walk below reads these and not the words. See [`DeskLanes`].
+    desk: DeskLanes,
+    /// **Which lanes a route lands on this chunk** (a send destination, see
+    /// `live_now`), refilled by [`Renderer::fill_receives`].
+    receives: LaneSet,
+    /// **Which lanes the grain clock may serve from their rings this chunk**,
+    /// the complement of [`pinned_lanes`] and the walk's own pins; empty when
+    /// the grain does not exceed the chunk. Read by `grain_ok`.
+    grain_free: LaneSet,
+    /// [`pinned_lanes`]' answer, lent to it so the audio thread buys none.
+    pinned: LaneSet,
+    /// The probe's three eligibility classes for the block (strict, loose,
+    /// freed), each a subset of the lanes that rendered.
+    probe_sets: [LaneSet; 3],
+    /// The route walk's scratch in `render_program`: the destinations
+    /// already placed, and per destination the sources it waits for.
+    route_placed: LaneSet,
+    route_deps: Box<[LaneSet]>,
 }
 
 
@@ -8656,7 +8911,9 @@ impl Renderer {
         // switched away from MIDI, in which case it is fed nothing and holds
         // its tails. The gate is per CHANNEL and travels as one atomic mask,
         // like mute and solo.
-        let armed = self.shared.midi_off.load(Ordering::Relaxed) & (1 << at.min(63)) == 0;
+        //
+        // Asked of the STRIP that owns the rack: see `chain_strip`.
+        let armed = self.desk.midi_on.contains(chain_strip(at));
         let notes: &[Note] = if armed { &self.notes } else { &[] };
         let controls: &[Control] = if armed { &self.controls } else { &[] };
         let Some(rack) = self.racks.get(at) else {
@@ -8713,6 +8970,7 @@ impl Renderer {
             controls,
             &params,
             &self.shared,
+            &self.desk.frozen,
             at,
             // **NOT-A-CHANNEL**, per this function's own note: a bus seat
             // cannot be a lane and cannot have a sample loaded.
@@ -8774,7 +9032,7 @@ impl Renderer {
             // lane can be read without committing; a lane a worker holds
             // leaves its arrival in the ring and gets it on a later block.
             match self.sampler_incoming.peek() {
-                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok((lane, _)) if self.leased.contains(*lane) => break,
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -8832,11 +9090,9 @@ impl Renderer {
         // above zero, so the walk runs again next block and the swap lands
         // the moment the track is released. That is the same backpressure
         // the ring already applies when the return side is full.
-        let leased = self.leased;
+        let leased = &self.leased;
         for (seat, rack) in self.racks.iter_mut().enumerate() {
-            if lane_of_seat(seat)
-                .is_some_and(|ch| leased & (1u32 << ch.min(CHANNELS - 1)) != 0)
-            {
+            if lane_of_seat(seat).is_some_and(|ch| leased.contains(ch)) {
                 continue;
             }
             swapped += rack.swap();
@@ -8907,12 +9163,12 @@ impl Renderer {
         // `midi_off`, read just below, says whether it is listening at all.
         // Two questions, and a lane hears a message only when both say yes —
         // see `Shared::midi_src` for why they are not one mask.
-        let routes: [tangent_ui::recorder::MidiRoute; CHANNELS] = std::array::from_fn(|ch| {
-            tangent_ui::recorder::MidiRoute {
+        for (ch, route) in self.midi_routes.iter_mut().enumerate() {
+            *route = tangent_ui::recorder::MidiRoute {
                 src: self.shared.midi_src[ch].load(Ordering::Relaxed),
                 chan: self.shared.midi_chan[ch].load(Ordering::Relaxed),
-            }
-        });
+            };
+        }
         // Whether channel 10 belongs to the drums this block. Read once: a
         // kit swap lands in `mix_pads`, so this answers for the PREVIOUS
         // chunk's kit — one chunk of grace on a load, never a torn read.
@@ -8921,13 +9177,11 @@ impl Renderer {
         // follows: a lane hears the keyboard when it is armed or selected,
         // which is what `midi_off` already says. A strike is pushed PER such
         // lane, because each one has its own kit and its own voices now.
-        let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
-        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
         let mut live_drum_lanes: [usize; CHANNELS] = [0; CHANNELS];
         let mut live_drum_n = 0usize;
         for ch in 0..CHANNELS {
-            if drum_mask & (1 << ch.min(31)) != 0
-                && midi_off & (1 << ch.min(31)) == 0
+            if self.desk.drums.contains(ch)
+                && self.desk.midi_on.contains(ch)
                 && self.pad_kits.get(ch).is_some_and(PadKit::live)
             {
                 live_drum_lanes[live_drum_n] = ch;
@@ -8976,12 +9230,7 @@ impl Renderer {
             // app-made note came from no device and can be in no device set,
             // so filtering it would silence the on-screen piano, the
             // fretboard and the lattice all at once.
-            let mut lanes = 0u32;
-            for (ch, route) in routes.iter().enumerate() {
-                if route.admits(event.src, event.status & 0x0F) {
-                    lanes |= 1u32 << ch;
-                }
-            }
+            let reach = Reach::of(event.src, event.status);
             // ── channel 10: the drum channel ───────────────────────────────
             // While a kit is loaded, a channel-10 note is a pad strike and
             // nothing else — it never reaches the lanes, because a kick that
@@ -9011,7 +9260,7 @@ impl Renderer {
                             // The same routing rule the notes answer to: a
                             // drum track that named its own pad controller
                             // must not be struck by somebody else's.
-                            if lanes & (1u32 << lane.min(31)) == 0 {
+                            if !self.midi_routes.get(lane).is_some_and(|r| reach.reaches(*r)) {
                                 continue;
                             }
                             if self.shared.pad_obey[lane][pad >> 6].load(Ordering::Relaxed)
@@ -9045,7 +9294,7 @@ impl Renderer {
                             if self.pad_hits.len() >= self.pad_hits.capacity() {
                                 break;
                             }
-                            if lanes & (1u32 << lane.min(31)) == 0 {
+                            if !self.midi_routes.get(lane).is_some_and(|r| reach.reaches(*r)) {
                                 continue;
                             }
                             self.pad_hits.push(PadHit {
@@ -9081,7 +9330,7 @@ impl Renderer {
                     }
                 }
                 self.notes.push(Note { offset, ..note });
-                self.note_lanes.push(lanes);
+                self.note_lanes.push(reach);
             } else if let Some(control) = control_from_midi(
                 event.status,
                 event.data1,
@@ -9113,7 +9362,7 @@ impl Renderer {
                         // level let a foot on keyboard A's damper hold the
                         // notes on a track that only ever asked for keyboard B.
                         for ch in 0..CHANNELS {
-                            if lanes & (1u32 << ch.min(31)) != 0 {
+                            if reach.reaches(self.midi_routes[ch]) {
                                 self.live_pedal[ch][slot] = event.data2 & 0x7F;
                             }
                         }
@@ -9126,7 +9375,7 @@ impl Renderer {
                     // channel's CC64, so sending channel 0 for a keyboard
                     // transmitting on channel 3 moves the wrong piano.
                     self.controls.push(Control { offset, ..control });
-                    self.control_lanes.push(lanes);
+                    self.control_lanes.push(reach);
                 } else {
                     self.shared.pedal_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -9372,6 +9621,10 @@ impl Renderer {
         while done < frames {
             let n = chunk.min(frames - done);
             self.chunks += 1;
+            // **The desk's lane words, once, before anything in the chunk
+            // reads one.** `collect_notes` is the first reader. See
+            // `DeskLanes`.
+            self.desk.decode(&self.shared);
 
             // Each chunk gets its own window in the host timeline, so an event
             // stamped inside the second half of a 1024-frame callback lands in
@@ -9447,7 +9700,7 @@ impl Renderer {
                         // because an off for a pitch a lane is not holding is
                         // a no-op everywhere, and the alternative is
                         // remembering which lanes were told about each pitch.
-                        self.note_lanes.push(u32::MAX);
+                        self.note_lanes.push(Reach::EVERY);
                     }
                 }
                 self.live_sounding = 0;
@@ -9488,6 +9741,10 @@ impl Renderer {
                 kept += 1;
             }
             self.route_n = kept;
+            // And the lanes it lands on, off the same latch: the lane pass's
+            // `live_now`, the grain pins and the route order below all ask
+            // this one answer. See `fill_receives`.
+            self.fill_receives();
             // **Which channels have stopped going straight to the master.**
             // Read off the table that was just latched, so it answers for
             // exactly the routes this block will run — and recomputed every
@@ -9589,7 +9846,7 @@ impl Renderer {
             // walk below, the room in `mix_monitor`, and the fold at the
             // foot — and a claim reset inside any one of them would be a
             // claim the other two could not see. See `Renderer::board_ran`.
-            self.board_ran = 0;
+            self.board_ran.clear();
             self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_channels(n, muted, soloed, at, rolling, flush, wrap_from);
 
@@ -9838,9 +10095,7 @@ impl Renderer {
                     }
                 }
                 {
-                    let armed = self.shared.midi_off.load(Ordering::Relaxed)
-                        & (1 << Strip::Click.index().min(63))
-                        == 0;
+                    let armed = self.desk.midi_on.contains(Strip::Click.index());
                     let notes: &[Note] = if armed { &self.notes } else { &[] };
                     let controls: &[Control] = if armed { &self.controls } else { &[] };
                     // **NOT-A-CHANNEL:** the click's own strip, which can
@@ -9871,6 +10126,7 @@ impl Renderer {
                         controls,
                     &seat_params,
                         &self.shared,
+                        &self.desk.frozen,
                         Strip::Click.index(),
                         // The click is a cue seat, not a lane: no sample.
                         None,
@@ -9892,6 +10148,7 @@ impl Renderer {
                         &mut self.fx_in,
                         &mut self.fx_out,
                         &self.shared,
+                        &self.desk.frozen,
                         tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
                         n,
                         notes,
@@ -9953,21 +10210,19 @@ impl Renderer {
                 // lands on; `deps` is, per destination, the sources feeding
                 // it that are themselves destinations — the only ones worth
                 // waiting for, because everything else is already in the stem.
-                let mut receives: u32 = 0;
-                for i in 0..self.route_n {
-                    let (_, target, hardware, _, gain) = self.route_cache[i];
-                    if !hardware && gain > 0.0 && target < CHANNELS {
-                        receives |= 1 << target;
-                    }
+                // `receives` was filled when the table was latched.
+                for deps in self.route_deps.iter_mut() {
+                    deps.clear();
                 }
-                let mut deps = [0u32; CHANNELS];
                 for i in 0..self.route_n {
                     let (from, target, hardware, _, gain) = self.route_cache[i];
                     if hardware || gain <= 0.0 || target >= CHANNELS || from >= CHANNELS {
                         continue;
                     }
-                    if receives & (1 << from) != 0 {
-                        deps[target] |= 1 << from;
+                    if self.receives.contains(from) {
+                        if let Some(deps) = self.route_deps.get_mut(target) {
+                            deps.insert(from);
+                        }
                     }
                 }
                 // Kahn's, over bitmasks: at most CHANNELS passes, each a
@@ -9975,18 +10230,18 @@ impl Renderer {
                 // all on a desk with no routes.
                 let mut order = [0usize; CHANNELS];
                 let mut n_order = 0usize;
-                let mut placed: u32 = 0;
+                self.route_placed.clear();
                 for _ in 0..CHANNELS {
                     let mut moved = false;
                     for dest in 0..CHANNELS {
-                        let bit = 1u32 << dest;
-                        if receives & bit == 0 || placed & bit != 0 {
+                        if !self.receives.contains(dest) || self.route_placed.contains(dest) {
                             continue;
                         }
-                        if deps[dest] & !placed == 0 {
+                        let placed = &self.route_placed;
+                        if self.route_deps[dest].iter().all(|from| placed.contains(from)) {
                             order[n_order] = dest;
                             n_order += 1;
-                            placed |= bit;
+                            self.route_placed.insert(dest);
                             moved = true;
                         }
                     }
@@ -9997,8 +10252,7 @@ impl Renderer {
                 // Whatever is left is in a cycle (a self-route counts): it
                 // runs last, one hop, exactly as before.
                 for dest in 0..CHANNELS {
-                    let bit = 1u32 << dest;
-                    if receives & bit != 0 && placed & bit == 0 {
+                    if self.receives.contains(dest) && !self.route_placed.contains(dest) {
                         order[n_order] = dest;
                         n_order += 1;
                     }
@@ -10095,6 +10349,7 @@ impl Renderer {
                             &[],
                             &seat_params,
                             &self.shared,
+                            &self.desk.frozen,
                             dest,
                             // A destination CAN be one of the sixteen, so it
                             // can hold a sampler; handed the same file the
@@ -10767,7 +11022,7 @@ impl Renderer {
         // and a mask cleared anywhere else would go on telling the lane pass
         // to stand aside for a guitar that is no longer there. See
         // `Renderer::board_live`.
-        self.board_live = 0;
+        self.board_live.clear();
         // And no channel's RACK belongs to the room until this pass says so,
         // cleared here for the same reason and by the same single writer.
         // See `Renderer::room_rack`.
@@ -10777,8 +11032,8 @@ impl Renderer {
         // chunk, so the mask the lane walk read a moment ago is the one being
         // cleared here — and both the rack run and the clip merge below have
         // to agree with what that walk did, not with what the next one will.
-        let stood_aside = self.room_rack;
-        self.room_rack = 0;
+        std::mem::swap(&mut self.stood_aside, &mut self.room_rack);
+        self.room_rack.clear();
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         // **A layout change for the ring already held.** Read before the
         // ring handoff so a frame where both arrive takes the new ring's own
@@ -11146,7 +11401,7 @@ impl Renderer {
             // as the monitor folds (a mono input to both sides) — pre-fader,
             // pre-rack, pre-arm. The take is the signal at the jack, not the
             // room's opinion of it. ──
-            if capturing & (1 << input.min(31)) != 0 {
+            if u64::from(capturing) & word_bit(input) != 0 {
                 if let Some(tx) = self.cap_tx.get_mut(input) {
                     if tx.slots() >= n * 2 {
                         for i in 0..n {
@@ -11186,8 +11441,7 @@ impl Renderer {
             // withholds a live input. An unarmed input still drains (the ring
             // must keep moving) and reaches nothing once its gain has faded:
             // a project must open without headphones.
-            let live =
-                self.shared.armed.load(Ordering::Relaxed) & (1 << strip.index().min(31)) != 0;
+            let live = self.desk.armed.contains(strip.index());
             let audible = strip_is_heard(strip, muted, soloed);
             let heard = live && audible;
             live_in_room |= heard;
@@ -11227,7 +11481,9 @@ impl Renderer {
             // easily have been left out of** — it is not the arrangement, so
             // a version that automated clips would look right and do nothing
             // to somebody's own playing coming through the desk.
-            let lane = strip.index().min(CHANNELS - 1);
+            // The pick is bound to a channel below `CHANNELS` (the filter
+            // above), so the strip IS the lane; no clamp stands between them.
+            let lane = strip.index();
             // **A live input on a FOLDER goes into the bus raw**, like every
             // other source standing on one: the folder's fader, rack, pan,
             // send and meter are the fold's to apply, once, over the whole
@@ -11272,14 +11528,14 @@ impl Renderer {
             // Whether this lane holds any timeline audio at all. A
             // whole-timeline answer, not a per-block one, so nothing below it
             // can flicker chunk to chunk and hole the audio at a clip's edge.
-            let clip_on_lane = self.clip_lanes & (1u32 << lane.min(CHANNELS - 1)) != 0;
+            let clip_on_lane = self.clip_lanes.contains(lane);
             // **This pass runs the rack only for a seat the lane walk has
             // already stood aside for**, which is what keeps one chain on one
             // clock across a chunk where the claim changes: the walk read the
             // mask a moment ago, and the claim being built now is for next
             // time. Without it, the chunk monitoring is switched on runs the
             // lane's chain twice.
-            let takes_rack = stood_aside & (1u32 << strip.index().min(31)) != 0;
+            let takes_rack = self.stood_aside.contains(strip.index());
             // **The timeline's audio on this lane joins the input, ahead of
             // the rack**, when the room is the one holding that rack.
             //
@@ -11305,13 +11561,13 @@ impl Renderer {
                 // Pulled for THIS block, into a scratch of its own: the read
                 // below is inside a per-sample loop that also advances the
                 // monitor's smoother, so it cannot be streamed.
-                let run = lane_run(&self.clips, self.clip_first.as_ref(), lane.min(CHANNELS - 1));
+                let run = lane_run(&self.clips, self.clip_first.as_ref(), lane);
                 pull_lane_clips(
                     run,
-                    lane.min(CHANNELS - 1),
+                    lane,
                     at,
                     n,
-                    self.punch_now[lane.min(CHANNELS - 1)],
+                    self.punch_now.get(lane).copied().unwrap_or(u64::MAX),
                     &mut self.clip_room,
                 );
             }
@@ -11356,8 +11612,7 @@ impl Renderer {
             // Hoisted above the board because the board wants it too: a wah
             // or a tremolo listening for a controller is listening on the
             // same terms its channel's rack is.
-            let armed =
-                self.shared.midi_off.load(Ordering::Relaxed) & (1 << strip.index().min(63)) == 0;
+            let armed = self.desk.midi_on.contains(strip.index());
             // ── THE PEDALBOARD, on the signal somebody is PLAYING ─────────
             //
             // **This is where a guitar meets its pedals**, and until this
@@ -11387,7 +11642,7 @@ impl Renderer {
             // `live: true` marks this as the room's claim, which is what
             // makes the lane pass stand aside for it next chunk.
             if !is_folder && self.amp_board_arms(lane) {
-                self.board_live |= 1u32 << lane.min(CHANNELS - 1);
+                self.board_live.insert(lane);
                 self.run_pedalboard(lane, n, armed, true);
             }
             {
@@ -11451,7 +11706,7 @@ impl Renderer {
                     // twice is two INSTANCES of every plugin on the lane.
                     // That is the real price, and it is not worth paying here.
                     if monitoring || !clip_on_lane {
-                        self.room_rack |= 1u32 << strip.index().min(31);
+                        self.room_rack.insert(strip.index());
                     }
                     // **Still inside the `!is_folder` arm opened above**, and
                     // it has to be: a folder's rack belongs to `fold_folders`,
@@ -11471,6 +11726,7 @@ impl Renderer {
                         controls,
                         &seat_params,
                         &self.shared,
+                        &self.desk.frozen,
                         strip.index(),
                         self.sampler_samples
                             .get(strip.index())
@@ -11495,6 +11751,7 @@ impl Renderer {
                             &mut self.fx_in,
                             &mut self.fx_out,
                             &self.shared,
+                            &self.desk.frozen,
                             tangent_ui::recorder::folder_extra_seat(strip.index()),
                             n,
                             notes,
@@ -11651,8 +11908,7 @@ impl Renderer {
     /// anything set one without the other — which is exactly how a test
     /// ended up assigning a kit to lane 0 and a lane to channel 7.
     fn first_drum_lane(&self) -> Option<usize> {
-        let mask = self.shared.drum_strips.load(Ordering::Relaxed);
-        (mask != 0).then(|| mask.trailing_zeros() as usize).filter(|ch| *ch < CHANNELS)
+        self.desk.drums.iter().next().filter(|ch| *ch < CHANNELS)
     }
 
     fn lane_gain(&self, lane: usize) -> f32 {
@@ -11689,22 +11945,21 @@ impl Renderer {
                 let _ = self.auto_retiring.push(old);
             }
         }
-        let suspend = self.shared.auto_suspend.load(Ordering::Relaxed);
         for q in &mut self.auto_params {
             q.clear();
         }
         // **Which lanes are owed a parameter this block.** See
         // `param_lanes`: a parked lane would lose the point rather than
         // defer it, so this is what keeps it awake.
-        self.param_lanes = 0;
-        self.curve_lanes = 0;
+        self.param_lanes.clear();
+        self.curve_lanes.clear();
         // **The edits a lane served from its grain ring has not heard yet** -
         // see `ui_held`. `lane_skip` still holds the LAST block's plan here
         // (`plan_grains` runs later in the chunk), so what stays is exactly
         // the edits whose lane ran no rack; the rest were delivered.
         let skipped = self.lane_skip;
         self.ui_held.retain(|u| {
-            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| skipped[ch.min(CHANNELS - 1)])
+            lane_of_seat(usize::from(u.lane)).is_some_and(|ch| skipped.get(ch).copied().unwrap_or(false))
         });
         let held = self.ui_held.len();
         let mut next_held = 0usize;
@@ -11755,7 +12010,7 @@ impl Renderer {
             // a master, bus or pad seat, whose racks run in passes the park
             // never touches.
             if let Some(ch) = lane_of_seat(lane) {
-                self.param_lanes |= 1u32 << ch.min(CHANNELS - 1);
+                self.param_lanes.insert(ch);
             }
             // **The LAST value for an id wins, in place.** A knob dragged
             // across three frames lands three points in one block and only
@@ -11795,19 +12050,23 @@ impl Renderer {
         // hundred and forty-four bays; asking every bay whether it has a curve
         // would be four hundred lookups a block to find three. The curve list
         // is the source of truth and it is already sorted.
-        self.curve_lanes = fill_automation_params(
+        let suspend = &self.desk.suspend;
+        fill_automation_params(
             &self.automation,
             suspend,
             secs,
             &mut self.auto_params,
+            &mut self.curve_lanes,
         );
-        self.param_lanes |= self.curve_lanes;
+        for ch in self.curve_lanes.iter() {
+            self.param_lanes.insert(ch);
+        }
         self.auto = automation_now(&self.automation, suspend, secs);
         // **The master's own curve**, read at the lane the UI addresses it
         // by — one past the channels. Suspended by the same rule a channel
         // is: a fader being HELD is the hand talking, and a curve must not
         // argue with it mid-gesture.
-        if suspend & (1 << MASTER_AUTO_LANE.min(63)) != 0 {
+        if self.desk.suspend.contains(MASTER_AUTO_LANE) {
             self.auto.master_gain = None;
             self.auto.master_pan = None;
             self.auto.master_mute = None;
@@ -11881,9 +12140,10 @@ impl Renderer {
                 if p >= CHANNELS {
                     break;
                 }
-                acc = acc.saturating_add(Rack::latency(&self.shared, p));
+                acc = acc.saturating_add(Rack::latency(&self.shared, &self.desk.frozen, p));
                 acc = acc.saturating_add(Rack::latency(
                     &self.shared,
+                    &self.desk.frozen,
                     tangent_ui::recorder::folder_extra_seat(p),
                 ));
                 up = self.folders[p];
@@ -11903,7 +12163,7 @@ impl Renderer {
             let mut l = self
                 .racks
                 .get(lane)
-                .map_or(0, |_| Rack::latency(&self.shared, lane));
+                .map_or(0, |_| Rack::latency(&self.shared, &self.desk.frozen, lane));
             // **BOTH racks on every lane** — six bays, one figure, or the
             // readout hides half of what the lane pays. It was gated on
             // FOLDER while a folder was the only thing with a second rack;
@@ -11911,6 +12171,7 @@ impl Renderer {
             // must not drift or a lane waits for its own plugins.
             l = l.saturating_add(Rack::latency(
                 &self.shared,
+                &self.desk.frozen,
                 tangent_ui::recorder::folder_extra_seat(lane),
             ));
             // An amp-bearing lane's chain includes its seven pedal racks —
@@ -11937,7 +12198,7 @@ impl Renderer {
         self.shared.max_latency.store(max, Ordering::Relaxed);
         // ...and the READOUT is the whole of it, because a figure that hides
         // latency somebody is paying is worth nothing.
-        let master = Rack::latency(&self.shared, tangent_ui::recorder::STRIPS);
+        let master = Rack::latency(&self.shared, &self.desk.frozen, tangent_ui::recorder::STRIPS);
         self.shared
             .total_latency
             .store(max.saturating_add(master), Ordering::Relaxed);
@@ -11945,15 +12206,17 @@ impl Renderer {
 
     /// The mute mask with automation folded in.
     ///
-    /// The mask is a `u32` of bits the desk owns; a curve overrides one bit
+    /// The mask is a `u64` of bits the desk owns; a curve overrides one bit
     /// without disturbing the others, so a lane nobody has automated goes on
-    /// answering to its own button.
+    /// answering to its own button. The bit is [`word_bit`]'s, as every other
+    /// question asked of this strip-space word is: a lane the word has no bit
+    /// for is left alone rather than wrapped onto lane 0.
     fn muted_now(&self, muted: u64) -> u64 {
         let mut out = muted;
         for lane in 0..CHANNELS {
             match self.auto.mute[lane] {
-                Some(true) => out |= 1 << lane,
-                Some(false) => out &= !(1 << lane),
+                Some(true) => out |= word_bit(lane),
+                Some(false) => out &= !word_bit(lane),
                 None => {}
             }
         }
@@ -12166,7 +12429,7 @@ impl Renderer {
         // The cost of the coarse answer is that an audio track's plugins run
         // over silence while the song is parked, which is exactly what a
         // MIDI track's have always done.
-        let mut lanes = 0u32;
+        self.clip_lanes.clear();
         // **And which of them have something under the playhead RIGHT NOW.**
         //
         // `clip_lanes` above is deliberately a whole-timeline answer, for
@@ -12179,23 +12442,23 @@ impl Renderer {
         // By SPAN and not by sample: a recorded rest, a fade-out or a quiet
         // passage is still the clip playing, and a lane that parked inside
         // one would wake on the next loud moment with its chain cold.
-        let mut under = 0u32;
+        //
+        // A clip on a strip no lane walks stands on nobody: it is in the set
+        // under its own number (or refused by `insert` past the capacity),
+        // where `1 << strip.min(..)` filed it under the last lane.
+        self.clip_under.clear();
         let end = at.saturating_add(frames as u64);
         for placed in &self.clips {
-            let bit = 1u32 << placed.strip.min(CHANNELS - 1);
-            lanes |= bit;
+            self.clip_lanes.insert(placed.strip);
             if rolling && placed.start < end && at < placed.start.saturating_add(placed.len) {
-                under |= bit;
+                self.clip_under.insert(placed.strip);
             }
         }
         for m in &self.midi_clips {
-            let bit = 1u32 << m.strip.min(CHANNELS - 1);
             if rolling && m.start < end && at < m.start.saturating_add(m.len) {
-                under |= bit;
+                self.clip_under.insert(m.strip);
             }
         }
-        self.clip_lanes = lanes;
-        self.clip_under = under;
         // **The per-lane fader's own smoothing state, advanced here and read
         // by the SENDS pass.**
         //
@@ -12365,9 +12628,9 @@ impl Renderer {
             // the next note" — and this bus was the one place that did not
             // do it.
             let coeff = self.gain_coeff;
-            let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
+            let drums = &self.desk.drums;
             for ch in 0..CHANNELS {
-                let target = if drum_mask & (1 << ch.min(31)) != 0 {
+                let target = if drums.contains(ch) {
                     // **Through the FOLDER TREE**, like every other lane. A
                     // kit's lane can sit in a group, and the flat rule here
                     // knew nothing about one: soloing the group silenced the
@@ -12379,7 +12642,7 @@ impl Renderer {
                     } else {
                         0.0
                     }
-                } else if ch == 0 && drum_mask == 0 {
+                } else if ch == 0 && drums.is_empty() {
                     // The bare drumpad window, which keeps its level in
                     // slot zero — see `lane_ix`.
                     if strip_is_heard(Strip::Drums, muted, soloed) {
@@ -12406,11 +12669,10 @@ impl Renderer {
         // existed and must survive: no channel carries a drumpad, the
         // drumpad window is being played bare, and the hidden `Strip::Drums`
         // internals rule at unity.
-        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
         let mut targets: [Option<usize>; CHANNELS] = [None; CHANNELS];
         let mut target_n = 0usize;
         for ch in 0..CHANNELS {
-            if drum_mask & (1 << ch.min(31)) != 0 {
+            if self.desk.drums.contains(ch) {
                 targets[target_n] = Some(ch);
                 target_n += 1;
             }
@@ -12655,6 +12917,7 @@ impl Renderer {
                     &[],
                 &seat_params,
                     &self.shared,
+                    &self.desk.frozen,
                     rack_at,
                     // A pad seat is not a lane and has no sample of its own.
                     None,
@@ -12752,6 +13015,7 @@ impl Renderer {
                 &[],
                 &seat_params,
                 &self.shared,
+                &self.desk.frozen,
                 bus_rack,
                 self.sampler_samples.get(bus_rack).and_then(Option::as_ref),
                 // NOT a key pass — for a non-drum lane this is the seat's
@@ -12775,7 +13039,7 @@ impl Renderer {
         // reason: wait for what this audio does not pay on its way out.
         {
             let ch = drum_lane.unwrap_or(CHANNELS);
-            let own = Rack::latency(&self.shared, bus_rack);
+            let own = Rack::latency(&self.shared, &self.desk.frozen, bus_rack);
             let folded = drum_lane.map_or(0, |c| self.folder_lat[c]);
             let wait = usize::try_from(
                 self.shared
@@ -12909,7 +13173,7 @@ impl Renderer {
     fn clip_pedal_level(clips: &[PlacedMidi], ch: usize, at: u64) -> [u8; 3] {
         let mut out = [0_u8; 3];
         for mc in clips {
-            if mc.strip.min(CHANNELS - 1) != ch {
+            if mc.strip != ch {
                 continue;
             }
             if at < mc.start || at >= mc.start.saturating_add(mc.len) {
@@ -13035,7 +13299,7 @@ impl Renderer {
         frames: usize,
         rolling: bool,
         grain: usize,
-        free: u32,
+        free: &LaneSet,
     ) {
         // The default every lane keeps: this chunk, as it always was.
         for ch in 0..CHANNELS {
@@ -13207,7 +13471,7 @@ impl Renderer {
     fn next_pedal_edge(clips: &[PlacedMidi], ch: usize, from: u64) -> Option<u64> {
         let mut soonest: Option<u64> = None;
         for mc in clips {
-            if mc.strip.min(CHANNELS - 1) != ch {
+            if mc.strip != ch {
                 continue;
             }
             let end = mc.start.saturating_add(mc.len);
@@ -13311,8 +13575,8 @@ impl Renderer {
     /// position, and a lane grained from that table played its curves up to
     /// two grains late, so a lane carrying one renders the chunk
     /// (`curve_lanes`).
-    fn grain_ok(&self, ch: usize, free: u32) -> bool {
-        if free & (1u32 << ch.min(CHANNELS - 1)) == 0 {
+    fn grain_ok(&self, ch: usize, free: &LaneSet) -> bool {
+        if !free.contains(ch) {
             return false;
         }
         // **A lane carrying an instrument is grained too**, and getting
@@ -13354,9 +13618,10 @@ impl Renderer {
         // pedal racks as well, because they all run on the way out.
         // `publish_latency` counts them into the target by the same rule and
         // the two must not drift, or the lane waits for its own pedals.
-        let own = Rack::latency(&self.shared, ch)
+        let own = Rack::latency(&self.shared, &self.desk.frozen, ch)
             .saturating_add(Rack::latency(
                 &self.shared,
+                &self.desk.frozen,
                 tangent_ui::recorder::folder_extra_seat(ch),
             ))
             .saturating_add(prep.pedal_latency);
@@ -13407,13 +13672,16 @@ impl Renderer {
         }
     }
 
-    fn note_eligibility(&mut self, wanted: u32, masks: [u32; 3], ns: [u64; 4]) {
+    /// `wanted` is how many lanes rendered; the three classes are
+    /// `Renderer::probe_sets`, filled by the render walk for this block.
+    fn note_eligibility(&mut self, wanted: usize, ns: [u64; 4]) {
         let c = &self.shared.probe;
         let first = c.blocks.fetch_add(1, Ordering::Relaxed) == 0;
-        c.rendered.fetch_add(u64::from(wanted.count_ones()), Ordering::Relaxed);
-        c.strict.fetch_add(u64::from(masks[0].count_ones()), Ordering::Relaxed);
-        c.loose.fetch_add(u64::from(masks[1].count_ones()), Ordering::Relaxed);
-        c.freed.fetch_add(u64::from(masks[2].count_ones()), Ordering::Relaxed);
+        let [strict, loose, freed] = &self.probe_sets;
+        c.rendered.fetch_add(wanted as u64, Ordering::Relaxed);
+        c.strict.fetch_add(strict.len() as u64, Ordering::Relaxed);
+        c.loose.fetch_add(loose.len() as u64, Ordering::Relaxed);
+        c.freed.fetch_add(freed.len() as u64, Ordering::Relaxed);
         c.rendered_ns.fetch_add(ns[0], Ordering::Relaxed);
         c.strict_ns.fetch_add(ns[1], Ordering::Relaxed);
         c.loose_ns.fetch_add(ns[2], Ordering::Relaxed);
@@ -13435,7 +13703,7 @@ impl Renderer {
         };
         // A knob, a preset or an automation point for any lane. This is the
         // one that is claimed to run at drag rate.
-        bump(&c.discard_param, self.param_lanes != 0);
+        bump(&c.discard_param, !self.param_lanes.is_empty());
         bump(&c.discard_transport, now.transport != was.transport);
         bump(&c.discard_loop, now.loop_a != was.loop_a || now.loop_b != was.loop_b);
         bump(&c.discard_tempo, now.bpm != was.bpm);
@@ -13460,18 +13728,15 @@ impl Renderer {
         // because it changes when a plugin is loaded and not within a
         // buffer. See `publish_latency`.
         let pdc_max = self.shared.max_latency.load(Ordering::Relaxed);
-        // **Which lanes the sends pass will also run**, lifted from that
-        // pass's own loop. A destination's rack is clocked a second time
+        // **Which lanes the sends pass will also run** (`receives`), lifted
+        // from that pass's own loop. A destination's rack is clocked a second time
         // over the arrivals, so such a lane must never rest: its chain
         // would change clock rate mid-song, and this pass is the only one
         // that ever hands a channel seat its sidechain key. See `live_now`.
-        let mut receives = 0u32;
-        for i in 0..self.route_n {
-            let (_, target, hardware, _, gain) = self.route_cache[i];
-            if !hardware && gain > 0.0 && target < CHANNELS {
-                receives |= 1u32 << target;
-            }
-        }
+        //
+        // Filled once per chunk, when the route table is latched in
+        // `render_program`; see `fill_receives`.
+
         // Instrument instances arriving or leaving, by the kit's own swap
         // protocol: built and freed on the UI thread, installed here by
         // pointer swap. Whatever a slot held rides back on the retiring ring,
@@ -13483,7 +13748,7 @@ impl Renderer {
             // Peeked for its lane first, and left alone for a leased one.
             // See `Renderer::leased`.
             match self.dx7_incoming.peek() {
-                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok((lane, _)) if self.leased.contains(*lane) => break,
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -13501,7 +13766,7 @@ impl Renderer {
             // Peeked for its lane first, and left alone for a leased one.
             // See `Renderer::leased`.
             match self.keys_incoming.peek() {
-                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok((lane, _)) if self.leased.contains(*lane) => break,
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -13526,9 +13791,9 @@ impl Renderer {
             // would drop that lane's patch on the floor. The queue is
             // already the deferral mechanism; keeping an entry is how it is
             // used as one, and `retain` allocates nothing.
-            let (leased, dx7s) = (self.leased, &mut self.dx7s);
+            let (leased, dx7s) = (&self.leased, &mut self.dx7s);
             g.retain(|(lane, v)| {
-                if leased & (1u32 << (*lane).min(31)) != 0 {
+                if leased.contains(*lane) {
                     return true;
                 }
                 if let Some(Some(d)) = dx7s.get_mut(*lane) {
@@ -13562,9 +13827,8 @@ impl Renderer {
         // **Every lane holding a drumpad**, not the first. A drum instrument
         // loads a full instance per channel, so each of those lanes turns its
         // own clip notes into strikes on its OWN kit — which is what makes a
-        // duplicated drum track sound at all.
-        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
-        let is_drum_lane = |ch: usize| drum_mask & (1 << ch.min(31)) != 0;
+        // duplicated drum track sound at all. Read off the chunk's decoded
+        // `self.desk.drums`, as are the DX7, keyboard and MIDI arm sets below.
         // **The DX7 and the keyboard hold to the drumpad's terms now: the
         // mask says who holds one, and every masked lane renders its OWN
         // instance.** The old arrangement — one instrument behind the mask,
@@ -13573,9 +13837,7 @@ impl Renderer {
         // to want as "a DX7 track and a piano track" ever was. A lane whose
         // instance has not arrived yet renders nothing for a frame or two,
         // which is the same window a loading kit has.
-        let builtin_mask = self.shared.builtin_strips.load(Ordering::Relaxed);
-        let keys_mask = self.shared.keys_strips.load(Ordering::Relaxed);
-        let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
+        //
         // ── THE GRAIN CLOCK ──────────────────────────────────────────────
         //
         // Runs BEFORE BOTH walks, and the order is the point. The pedal
@@ -13594,32 +13856,40 @@ impl Renderer {
         // lifted.
         {
             let grain = resolve_grain(self.shared.grain.load(Ordering::Relaxed), frames);
-            let free = if grain > frames {
-                let mut free = !pinned_lanes(
+            let mut free = std::mem::take(&mut self.grain_free);
+            free.clear();
+            if grain > frames {
+                pinned_lanes(
                     &self.shared,
+                    &self.desk,
                     &self.folder_is,
-                    receives,
-                    self.room_rack | self.board_live,
+                    &self.receives,
+                    &[&self.room_rack, &self.board_live],
                     self.keys_live,
+                    &mut self.pinned,
                 );
-                // **So does a plugin curve**: it was read for this chunk
-                // alone. See `curve_lanes`.
-                free &= !self.curve_lanes;
-                // **An audition pins its own lane.** It is a LEVEL
-                // reconciled against the playhead once a chunk - the key is
-                // held, not scheduled - and there is no such thing for a
-                // span the playhead has not reached yet.
                 for ch in 0..CHANNELS {
+                    // **So does a plugin curve**: it was read for this chunk
+                    // alone. See `curve_lanes`.
+                    //
+                    // **An audition pins its own lane.** It is a LEVEL
+                    // reconciled against the playhead once a chunk - the key
+                    // is held, not scheduled - and there is no such thing for
+                    // a span the playhead has not reached yet.
                     let held = self.shared.audition[ch].load(Ordering::Relaxed) != u32::MAX;
-                    if held || self.audition_on[ch].is_some() || self.audition_rang[ch] {
-                        free &= !(1u32 << ch);
+                    if self.pinned.contains(ch)
+                        || self.curve_lanes.contains(ch)
+                        || held
+                        || self.audition_on[ch].is_some()
+                        || self.audition_rang[ch]
+                    {
+                        continue;
                     }
+                    free.insert(ch);
                 }
-                free
-            } else {
-                0
-            };
-            self.plan_grains(at, frames, rolling, grain, free);
+            }
+            self.plan_grains(at, frames, rolling, grain, &free);
+            self.grain_free = free;
         }
 
         // This block's pedal moves, refilled from scratch: it is a list of
@@ -13641,8 +13911,7 @@ impl Renderer {
                 continue;
             }
             let at = self.lane_at[ch];
-            let bit = 1u32 << ch.min(31);
-            let armed_here = midi_off & u64::from(bit) == 0;
+            let armed_here = self.desk.midi_on.contains(ch);
             // **What this lane's PEDAL is, live and recorded together.**
             //
             // Live is a level now rather than the block's events (see
@@ -13668,7 +13937,7 @@ impl Renderer {
                     clip_pedal[i]
                 }
             });
-            if keys_mask & bit != 0 {
+            if self.desk.keys.contains(ch) {
                 if let Some(Some(k)) = self.keys_lanes.get_mut(ch) {
                     let want = self.shared.keys_patch[ch].load(Ordering::Relaxed) as usize;
                     if let Some(p) = crate::keys::Patch::ALL.get(want) {
@@ -13694,7 +13963,7 @@ impl Renderer {
                     k.set_pedal(pedal_now[0] >= 64);
                 }
             }
-            if builtin_mask & bit != 0 {
+            if self.desk.builtins.contains(ch) {
                 if let Some(Some(d)) = self.dx7s.get_mut(ch) {
                     d.set_pedal(pedal_now[0] >= 64);
                 }
@@ -13751,9 +14020,9 @@ impl Renderer {
         // and left the block beginning up to one buffer past the loop's
         // head. Everything in that gap is still owed. See
         // `pending_wrap_from`.
-        self.probe_walk_pins = 0;
-        self.probe_clip_pins = 0;
-        self.probe_inst_pins = 0;
+        self.probe_walk_pins.clear();
+        self.probe_clip_pins.clear();
+        self.probe_inst_pins.clear();
         for ch in 0..CHANNELS {
             // **Nothing at all for a lane whose ring already holds this
             // chunk.** Not its notes, not what its instrument has been told,
@@ -13780,7 +14049,7 @@ impl Renderer {
             // the lane is a lane with nothing loaded, exactly like a kit
             // still decoding.
             let is_builtin =
-                builtin_mask & (1 << ch.min(31)) != 0 && self.dx7s.get(ch).is_some_and(Option::is_some);
+                self.desk.builtins.contains(ch) && self.dx7s.get(ch).is_some_and(Option::is_some);
             // **Either seat.** A channel with its first three bays empty and
             // a plugin in bay 4 has a live rack; reading only seat `ch` is
             // how such a lane skipped the whole block and its second rack
@@ -13790,7 +14059,7 @@ impl Renderer {
             // An AUDIO channel's bit is set and its rack runs in
             // `mix_monitor`, over its input — running it here too would fold
             // its effect tails twice.
-            let armed = midi_off & (1 << ch.min(31)) == 0;
+            let armed = self.desk.midi_on.contains(ch);
 
             // ── this lane's notes: the LIVE list while armed, the CLIPS'
             // whenever the transport stands on them — playback does not ask
@@ -13804,9 +14073,9 @@ impl Renderer {
                 // event in `collect_notes`. Copying the whole list here is
                 // what made two keyboards impossible: every armed lane heard
                 // every note, whatever its input chip claimed.
-                let bit = 1u32 << ch.min(31);
+                let route = self.midi_routes[ch];
                 for (n, m) in self.notes.iter().zip(&self.note_lanes) {
-                    if m & bit != 0 {
+                    if m.reaches(route) {
                         lane_notes.push(*n);
                     }
                 }
@@ -13821,9 +14090,9 @@ impl Renderer {
             // move the wrong piano.
             lane_controls.clear();
             if armed {
-                let bit = 1u32 << ch.min(31);
+                let route = self.midi_routes[ch];
                 for (c, m) in self.controls.iter().zip(&self.control_lanes) {
-                    if m & bit != 0 {
+                    if m.reaches(route) {
                         lane_controls.push(*c);
                     }
                 }
@@ -13891,7 +14160,7 @@ impl Renderer {
                     self.told[ch] &= !(1u128 << pitch);
                 }
                 for idx in lane_range(self.midi_first.as_ref(), ch, self.midi_clips.len()) {
-                    if self.midi_clips[idx].strip.min(CHANNELS - 1) != ch {
+                    if self.midi_clips[idx].strip != ch {
                         continue;
                     }
                     lane_has_clips = true;
@@ -14017,7 +14286,7 @@ impl Renderer {
                 lane_has_clips = self
                     .midi_clips
                     .iter()
-                    .any(|m| m.strip.min(CHANNELS - 1) == ch);
+                    .any(|m| m.strip == ch);
             }
 
             // ── the AUDITION, reconciled ────────────────────────────────
@@ -14082,8 +14351,8 @@ impl Renderer {
             // itself carries no signal, but its fader still has to advance
             // so a later un-assignment starts at the written level.
             let is_keys =
-                keys_mask & (1 << ch.min(31)) != 0 && self.keys_lanes.get(ch).is_some_and(Option::is_some);
-            if is_drum_lane(ch) && !is_builtin && !is_keys {
+                self.desk.keys.contains(ch) && self.keys_lanes.get(ch).is_some_and(Option::is_some);
+            if self.desk.drums.contains(ch) && !is_builtin && !is_keys {
                 let obey = [
                     self.shared.pad_obey[ch][0].load(Ordering::Relaxed),
                     self.shared.pad_obey[ch][1].load(Ordering::Relaxed),
@@ -14216,7 +14485,7 @@ impl Renderer {
             // beneath: a lane with a clip on it and an EMPTY bay still has
             // to walk the fold, or the timeline goes silent the moment the
             // last plugin is pulled out of the strip.
-            let has_audio = self.clip_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0;
+            let has_audio = self.clip_lanes.contains(ch);
             let feeds =
                 armed || lane_has_clips || has_audio || !lane_notes.is_empty() || auditioning;
             // ── **the PARK**: a stopped desk stops running its effects ────
@@ -14291,9 +14560,9 @@ impl Renderer {
             // * `param_lanes` - see the field: a knob or a preset for this
             //   lane arrived this block, and a skipped block loses it.
             let live_now = (rolling
-                && (self.clip_under & (1u32 << ch.min(CHANNELS - 1)) != 0
+                && (self.clip_under.contains(ch)
                     || self.lane_loud.get(ch).copied().unwrap_or(true)
-                    || receives & (1u32 << ch.min(CHANNELS - 1)) != 0))
+                    || self.receives.contains(ch)))
                 || auditioning
                 || !lane_notes.is_empty()
                 || !lane_controls.is_empty()
@@ -14304,8 +14573,8 @@ impl Renderer {
                 // defer the edit, it loses it, and the face and the saved
                 // project keep the new value while the instance keeps the
                 // old. See `param_lanes`.
-                || self.param_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0
-                || self.shared.armed.load(Ordering::Relaxed) & (1u32 << ch.min(31)) != 0;
+                || self.param_lanes.contains(ch)
+                || self.desk.armed.contains(ch);
             let rate = self.rate;
             let parked = park_lane(
                 self.lane_quiet.get_mut(ch),
@@ -14343,7 +14612,7 @@ impl Renderer {
             // walk and stays one walk. What is recorded here is exactly what
             // the render needs and nothing that would make it ask the desk a
             // question.
-            let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
+            let room_owns = self.room_rack.contains(ch);
             // **Claimed only where the render would have claimed it.** The
             // board call sat inside the `rack_live && !is_folder &&
             // !room_owns` gate, so taking the claim for every lane here
@@ -14379,19 +14648,18 @@ impl Renderer {
             // already, and counting it as eligible would report headroom
             // that the resting-desk rule reclaimed a week ago.
             if self.probe {
-                let bit = 1u32 << ch.min(CHANNELS - 1);
                 // `audition_rang` and not the `Shared` cell: the cell is the
                 // key-DOWN level, and the lane keeps rendering through the
                 // release tail.
                 if auditioning {
-                    self.probe_walk_pins |= bit;
+                    self.probe_walk_pins.insert(ch);
                 }
                 // The built-in and Keys seats, kept apart because the fix is
                 // cheap: the arrival rings carry `(lane, T)`, so a handoff
                 // can peek the lane and leave it in the ring rather than
                 // `mem::replace`-ing a seat a worker may be inside.
                 if is_builtin || is_keys {
-                    self.probe_inst_pins |= bit;
+                    self.probe_inst_pins.insert(ch);
                 }
                 // **Nothing is pinned by its source any more.** Audio was
                 // pinned because the desk kept one block of it for every lane
@@ -14426,9 +14694,20 @@ impl Renderer {
         // before any of them is used. Three `split_at_mut`s and six
         // iterators, all of it safe: see `lane_seats` for the arithmetic
         // that makes the blocks disjoint.
-        let wanted: u32 = (0..CHANNELS).fold(0u32, |m, ch| {
-            if self.lane_wants[ch] { m | (1u32 << ch) } else { m }
-        });
+        //
+        // **The lanes to render, as a LIST**, which is what the pool claims
+        // from (`LanePool::run_list`): ascending, so the serial walk and the
+        // fork's lane-to-hand order are today's. `lane_wants` is the per-lane
+        // flag it is read off; nothing here is a mask any more.
+        let mut wanted = [0u32; CHANNELS];
+        let mut wanted_n = 0usize;
+        for ch in 0..CHANNELS {
+            if self.lane_wants[ch] {
+                wanted[wanted_n] = ch as u32;
+                wanted_n += 1;
+            }
+        }
+        let wanted = &wanted[..wanted_n];
         // ── the eligibility probe's two masks for this block ─────────────
         //
         // Three conditions pin the WHOLE desk rather than a lane. A stopped
@@ -14437,27 +14716,42 @@ impl Renderer {
         // chunk from a phase accumulator so the chunk LENGTH is not knowable
         // in advance. And a stems export, because the dry copy is taken at
         // render while the fold reads it at consumption.
-        let (probe_strict, probe_loose, probe_freed) = if self.probe {
-            if !rolling || self.varispeed_ratio().is_some() || self.stems_live {
-                (0, 0, 0)
-            } else {
-                let desk = pinned_lanes(
-                    &self.shared,
-                    &self.folder_is,
-                    receives,
-                    self.room_rack | self.board_live,
-                    self.keys_live,
-                );
-                let pinned = desk | self.probe_walk_pins | self.curve_lanes;
-                (
-                    wanted & !(pinned | self.probe_clip_pins | self.probe_inst_pins),
-                    wanted & !(pinned | self.probe_inst_pins),
-                    wanted & !pinned,
-                )
+        //
+        // Strict, loose and freed, each a subset of `wanted`: freed is every
+        // rendered lane nothing pins, loose drops the instrument seats, and
+        // strict the clip-source pins as well.
+        for set in &mut self.probe_sets {
+            set.clear();
+        }
+        if self.probe && rolling && self.varispeed_ratio().is_none() && !self.stems_live {
+            pinned_lanes(
+                &self.shared,
+                &self.desk,
+                &self.folder_is,
+                &self.receives,
+                &[&self.room_rack, &self.board_live],
+                self.keys_live,
+                &mut self.pinned,
+            );
+            let [strict, loose, freed] = &mut self.probe_sets;
+            for &ch in wanted {
+                let ch = ch as usize;
+                if self.pinned.contains(ch)
+                    || self.probe_walk_pins.contains(ch)
+                    || self.curve_lanes.contains(ch)
+                {
+                    continue;
+                }
+                freed.insert(ch);
+                if self.probe_inst_pins.contains(ch) {
+                    continue;
+                }
+                loose.insert(ch);
+                if !self.probe_clip_pins.contains(ch) {
+                    strict.insert(ch);
+                }
             }
-        } else {
-            (0, 0, 0)
-        };
+        }
         // Nanoseconds, not lanes: an empty lane and a lane carrying three
         // reverbs are both one lane. Written from the render walk, which may
         // be several threads, so they are atomics even though nothing here
@@ -14466,7 +14760,7 @@ impl Renderer {
         let probe_strict_ns = AtomicU64::new(0);
         let probe_loose_ns = AtomicU64::new(0);
         let probe_freed_ns = AtomicU64::new(0);
-        if wanted != 0 {
+        if !wanted.is_empty() {
             let desk = DeskRef {
                 clips: &self.clips,
                 clips_rolling: rolling,
@@ -14474,6 +14768,7 @@ impl Renderer {
                 clip_first: self.clip_first.as_ref(),
                 auto_params: &self.auto_params,
                 shared: &self.shared,
+                frozen: &self.desk.frozen,
                 key_prev: &self.key_prev,
                 key_prev_frames: self.key_prev_frames,
                 controls: &self.controls,
@@ -14535,7 +14830,7 @@ impl Renderer {
                     else {
                         break;
                     };
-                    if wanted & (1u32 << ch) == 0 {
+                    if !self.lane_wants[ch] {
                         continue;
                     }
                     // **This lane's span, which the grain clock may have
@@ -14587,8 +14882,12 @@ impl Renderer {
             // exactly once, and the pool's own claim is what guarantees only
             // one thread ever reaches a given `ch`.
             let cells = LaneCells(jobs.map(std::cell::UnsafeCell::new));
-            let folded = AtomicU32::new(0);
+            // **Which lanes produced something to fold**, one flag per lane:
+            // written by whichever hand rendered the lane, read back here
+            // once the fork has joined.
+            let folded: [AtomicBool; CHANNELS] = std::array::from_fn(|_| AtomicBool::new(false));
             let probe = self.probe;
+            let [probe_strict, probe_loose, probe_freed] = &self.probe_sets;
             let render = |ch: usize| {
                 let Some(job) = cells.take(ch) else {
                     return;
@@ -14599,19 +14898,20 @@ impl Renderer {
                 // when the probe is on.
                 let started = probe.then(Instant::now);
                 if render_lane(&mut seats, &mut io, &plan, &desk) {
-                    folded.fetch_or(1u32 << ch, Ordering::Relaxed);
+                    if let Some(f) = folded.get(ch) {
+                        f.store(true, Ordering::Relaxed);
+                    }
                 }
                 if let Some(started) = started {
                     let ns = started.elapsed().as_nanos() as u64;
-                    let bit = 1u32 << ch.min(CHANNELS - 1);
                     probe_all_ns.fetch_add(ns, Ordering::Relaxed);
-                    if probe_strict & bit != 0 {
+                    if probe_strict.contains(ch) {
                         probe_strict_ns.fetch_add(ns, Ordering::Relaxed);
                     }
-                    if probe_loose & bit != 0 {
+                    if probe_loose.contains(ch) {
                         probe_loose_ns.fetch_add(ns, Ordering::Relaxed);
                     }
-                    if probe_freed & bit != 0 {
+                    if probe_freed.contains(ch) {
                         probe_freed_ns.fetch_add(ns, Ordering::Relaxed);
                     }
                 }
@@ -14632,23 +14932,20 @@ impl Renderer {
                         Fanout::Force => true,
                     }
             }) {
-                Some(pool) => pool.run(wanted, &render),
+                Some(pool) => pool.run_list(wanted, &|lane, _hand| render(lane)),
                 None => {
-                    for ch in 0..CHANNELS {
-                        if wanted & (1u32 << ch) != 0 {
-                            render(ch);
-                        }
+                    for &ch in wanted {
+                        render(ch as usize);
                     }
                 }
             }
-            let folded = folded.load(Ordering::Relaxed);
             for ch in 0..CHANNELS {
-                self.lane_folds[ch] = folded & (1u32 << ch) != 0;
+                self.lane_folds[ch] = folded[ch].load(Ordering::Relaxed);
                 // **Close the slot this lane's render opened.** Done here,
                 // after the fork has joined, because `keep` needs the whole
                 // ring by `&mut` and the render only ever held one slot's
                 // rows. A lane the walk skipped never opened one.
-                if wanted & (1u32 << ch) != 0 {
+                if self.lane_wants[ch] {
                     let prep = self.lane_prep[ch];
                     let len = self.lane_len[ch];
                     if let Some(g) = self.lane_grain.get_mut(ch) {
@@ -14674,8 +14971,7 @@ impl Renderer {
         }
         if self.probe {
             self.note_eligibility(
-                wanted,
-                [probe_strict, probe_loose, probe_freed],
+                wanted.len(),
                 [
                     probe_all_ns.load(Ordering::Relaxed),
                     probe_strict_ns.load(Ordering::Relaxed),
@@ -14849,6 +15145,18 @@ impl Renderer {
     /// A channel owns ONE board and a folder has two racks; both racks
     /// therefore share it. See `recorder::pedal_owner`, where that decision
     /// is written down, and `run_pedalboard`, which runs it once.
+    /// **Every lane a live route lands on**, into [`Self::receives`]: a
+    /// channel destination with a gain above zero. One spelling for the two
+    /// walks that ask, the lane pass's `live_now` and the route order.
+    fn fill_receives(&mut self) {
+        self.receives.clear();
+        for &(_, target, hardware, _, gain) in self.route_cache.iter().take(self.route_n) {
+            if !hardware && gain > 0.0 && target < CHANNELS {
+                self.receives.insert(target);
+            }
+        }
+    }
+
     fn amp_board_arms(&self, ch: usize) -> bool {
         if self.racks.get(ch).is_some_and(rack_holds_amp) {
             return true;
@@ -14886,6 +15194,7 @@ impl Renderer {
         (0..tangent_ui::recorder::AMP_PEDALS).fold(0u32, |acc, pedal| {
             acc.saturating_add(Rack::latency(
                 &self.shared,
+                &self.desk.frozen,
                 tangent_ui::recorder::amp_pedal_seat(ch, pedal),
             ))
         })
@@ -14956,20 +15265,21 @@ impl Renderer {
     /// board it is already entitled to run. `board_ran` is one word for the
     /// whole desk: a worker may read the answer, never take it.
     fn claim_board(&mut self, ch: usize, live: bool) -> bool {
-        // The mask is `u32` and `CHANNELS` is 32, so the clamp is a bounds
-        // check and never a fold of one channel onto another.
-        let bit = 1u32 << ch.min(CHANNELS - 1);
-        if self.board_ran & bit != 0 || (!live && self.board_live & bit != 0) {
+        // Sets, not a `u32` behind a `.min`: that clamp was a bounds check
+        // only while `CHANNELS` was the mask's width, and a fold of every
+        // later channel onto the last one the moment it was not.
+        if self.board_ran.contains(ch) || (!live && self.board_live.contains(ch)) {
             return false;
         }
-        self.board_ran |= bit;
-        true
+        // **A lane the set has no bit for is refused**, not run unrecorded:
+        // an unrecorded claim is one the next pass cannot see, which is the
+        // board clocked twice in a chunk.
+        self.board_ran.insert(ch)
     }
 
     fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool, live: bool) {
-        // Rule 1 and rule 2, in the order they are argued above. The mask
-        // is `u32` and `CHANNELS` is 32, so the clamp is a bounds check and
-        // never a fold of one channel onto another.
+        // Rule 1 and rule 2, in the order they are argued above. See
+        // `claim_board` for a lane the claim set cannot hold.
         if !self.claim_board(ch, live) {
             return;
         }
@@ -14988,6 +15298,7 @@ impl Renderer {
             &mut self.fx_in,
             &mut self.fx_out,
             &self.shared,
+            &self.desk.frozen,
             frames,
             controls,
         );
@@ -15008,6 +15319,9 @@ fn run_board(
     planar: &mut [Vec<f32>],
     out: &mut [Vec<f32>],
     shared: &Shared,
+    // **The chunk's decoded frozen set** (`DeskLanes::frozen`), which
+    // `seat_is_frozen` asks rather than the word.
+    frozen: &LaneSet,
     frames: usize,
     controls: &[Control],
 ) {
@@ -15040,6 +15354,7 @@ fn run_board(
                 controls,
                 &pedal_params,
                 shared,
+                frozen,
                 seat,
                 // **NOT-A-CHANNEL:** a pedal seat lives past every channel
                 // index, so it can never have a lane's sample.
@@ -15202,6 +15517,7 @@ impl Renderer {
                     &[],
                     &seat_params,
                     &self.shared,
+                    &self.desk.frozen,
                     ch,
                     // Still one of the sixteen — see the note above about
                     // where a folded lane's rack runs — so it keeps its own
@@ -15241,6 +15557,7 @@ impl Renderer {
                         &[],
                         &seat_params,
                         &self.shared,
+                        &self.desk.frozen,
                         extra,
                         // **NOT-A-CHANNEL:** a folder's second rack is
                         // seated past every channel (`folder_extra_seat`),
@@ -15422,42 +15739,57 @@ impl Renderer {
     ///
     /// Each channel once, so a desk of routes costs one walk of the table
     /// per channel at most, and nothing allocates.
+    ///
+    /// **`path` and `done` are a flag per lane, not a mask.** They were a
+    /// `u32` tested with `1u32 << d`, which is the spelling W2-engine-lanesets
+    /// removed from every other walk: past the word a release build wraps the
+    /// shift onto lane 0, so lane 32 would read lane 0's `done` and hand back
+    /// lane 0's transfer, or see its own cycle where there is none. The flags
+    /// are as wide as the array they guard, live on the stack because this
+    /// runs on `&self` from inside the room's walk. `path` is set on the way
+    /// down and cleared on the way back, so it holds the lanes on the stack,
+    /// the set the `path | bit` copy carried. (A lane that sets it is `done`
+    /// before it returns and `done` is asked first, so a missed clear would
+    /// change nothing; the clear is there so the flag means what it says.)
+    /// The arithmetic and its order are unchanged.
     fn route_transfer(&self) -> [[f32; 2]; CHANNELS] {
         fn walk(
             r: &Renderer,
             d: usize,
-            path: u32,
+            path: &mut [bool; CHANNELS],
             t: &mut [[f32; 2]; CHANNELS],
-            done: &mut u32,
+            done: &mut [bool; CHANNELS],
         ) -> [f32; 2] {
-            let bit = 1u32 << d;
-            if *done & bit != 0 {
+            if done[d] {
                 return t[d];
             }
-            if path & bit != 0 {
+            if path[d] {
                 return [0.0; 2];
             }
+            path[d] = true;
             let mut on = [0.0f32; 2];
             for i in 0..r.route_n {
                 let (from, target, hardware, _, gain) = r.route_cache[i];
                 if from != d || hardware || gain <= 0.0 || target >= CHANNELS {
                     continue;
                 }
-                let next = walk(r, target, path | bit, t, done);
+                let next = walk(r, target, path, t, done);
                 on[0] += gain * next[0];
                 on[1] += gain * next[1];
             }
+            path[d] = false;
             let (pl, pr) = pan_gains(r.lane_pan(d));
             let g = r.lane_gain[d];
             let direct = r.route_direct[d];
             t[d] = [g * pl * (direct + on[0]), g * pr * (direct + on[1])];
-            *done |= bit;
+            done[d] = true;
             t[d]
         }
         let mut t = [[0.0f32; 2]; CHANNELS];
-        let mut done = 0u32;
+        let mut path = [false; CHANNELS];
+        let mut done = [false; CHANNELS];
         for d in 0..CHANNELS {
-            walk(self, d, 0, &mut t, &mut done);
+            walk(self, d, &mut path, &mut t, &mut done);
         }
         t
     }
@@ -16601,6 +16933,7 @@ impl Engine {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            midi_routes: [tangent_ui::recorder::MidiRoute::default(); CHANNELS],
             clips: Vec::new(),
             midi_clips: Vec::new(),
             told: [0; CHANNELS],
@@ -16690,8 +17023,8 @@ impl Engine {
                 .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
-            param_lanes: 0,
-            curve_lanes: 0,
+            param_lanes: desk_lane_set(),
+            curve_lanes: desk_lane_set(),
             ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
@@ -16774,22 +17107,30 @@ impl Engine {
             punch_now: [u64::MAX; CHANNELS],
             clip_first: None,
             midi_first: None,
-            clip_lanes: 0,
-            clip_under: 0,
+            clip_lanes: desk_lane_set(),
+            clip_under: desk_lane_set(),
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
-            board_ran: 0,
-            board_live: 0,
-            leased: 0,
+            board_ran: desk_lane_set(),
+            board_live: desk_lane_set(),
+            leased: desk_lane_set(),
             probe: probe_on(),
-            probe_walk_pins: 0,
-            probe_clip_pins: 0,
-            probe_inst_pins: 0,
+            probe_walk_pins: desk_lane_set(),
+            probe_clip_pins: desk_lane_set(),
+            probe_inst_pins: desk_lane_set(),
             probe_watch: ProbeWatch::default(),
-            room_rack: 0,
+            room_rack: desk_lane_set(),
+            stood_aside: desk_lane_set(),
+            desk: DeskLanes::new(),
+            receives: desk_lane_set(),
+            grain_free: desk_lane_set(),
+            pinned: desk_lane_set(),
+            probe_sets: std::array::from_fn(|_| desk_lane_set()),
+            route_placed: desk_lane_set(),
+            route_deps: (0..CHANNELS).map(|_| desk_lane_set()).collect(),
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -18160,10 +18501,10 @@ impl Engine {
     /// pins there being no second copy of that fact to disagree with.
     #[cfg(test)]
     pub fn renderer_first_drum_lane(&self) -> Option<usize> {
-        let mask = self.shared.drum_strips.load(Ordering::Relaxed);
-        (mask != 0)
-            .then(|| mask.trailing_zeros() as usize)
-            .filter(|ch| *ch < CHANNELS)
+        // The renderer's own decode, of the words as they stand now: the
+        // same `DeskLanes` and the same walk `Renderer::first_drum_lane`
+        // takes over it.
+        DeskLanes::read(&self.shared).drums.iter().next().filter(|ch| *ch < CHANNELS)
     }
 
     /// Every channel the built-in instrument is on.
@@ -19141,7 +19482,7 @@ impl Engine {
         // overlapping on one lane are summed with `+=` and f32 addition is
         // not associative, so within-lane order IS the sum. An unstable sort
         // reorders equal keys and moves the last bits of somebody's mix.
-        clips.sort_by_key(|p| p.strip.min(CHANNELS - 1));
+        clips.sort_by_key(|p| p.strip);
         // Whatever came back earlier is dropped first, so the ring always has
         // room and two rapid loads cannot wedge.
         while self.track_from_audio.pop().is_ok() {}
@@ -19164,7 +19505,7 @@ impl Engine {
         // instead of the whole arrangement once per lane, and STABLY, because
         // within-lane order decides which of two overlapping clips wins a
         // race on the same pitch.
-        clips.sort_by_key(|p| p.strip.min(CHANNELS - 1));
+        clips.sort_by_key(|p| p.strip);
         while self.midi_from_audio.pop().is_ok() {}
         self.midi_pending = None;
         if let Err(rtrb::PushError::Full(clips)) = self.midi_to_audio.push(clips) {
@@ -22164,19 +22505,19 @@ mod tests {
     #[test]
     fn a_chains_latency_is_the_sum_of_what_is_in_it() {
         let shared = Shared::new();
-        assert_eq!(Rack::latency(&shared, 0), 0);
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 0), 0);
         assert!(seat(&shared, 0, 0, 64), "0 -> 64 is a change");
         assert!(!seat(&shared, 0, 0, 64), "and writing it again is not");
-        assert_eq!(Rack::latency(&shared, 0), 64);
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 0), 64);
         // In SERIES: three plugins looking ahead 64 each delay by 192.
         seat(&shared, 0, 1, 64);
         seat(&shared, 0, 2, 64);
-        assert_eq!(Rack::latency(&shared, 0), 192);
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 0), 192);
         // **Each seat is its own**, which is the whole reason the figures
         // live in an indexed table rather than inside the boxes: a bay is
         // read by the seat it sits in, and one rack's contents never leak
         // into another's total.
-        assert_eq!(Rack::latency(&shared, 1), 0, "channel 1 has nothing in it");
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 1), 0, "channel 1 has nothing in it");
         // **A voice is where the signal BEGINS**, so its own figure is not a
         // delay imposed on anything upstream — there is no upstream, and
         // counting it would push every other lane late to match a delay
@@ -22188,7 +22529,7 @@ mod tests {
             "a bay that was already empty has not moved"
         );
         seat(&shared, 1, 1, 32);
-        assert_eq!(Rack::latency(&shared, 1), 32);
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 1), 32);
         // A seat past the end of the table is a seat with nothing in it, and
         // says so instead of panicking: this is reached from the load path.
         assert!(!seat(&shared, RACK_SEATS, 0, 99));
@@ -22967,22 +23308,30 @@ mod tests {
             punch_now: [u64::MAX; CHANNELS],
             clip_first: None,
             midi_first: None,
-            clip_lanes: 0,
-            clip_under: 0,
+            clip_lanes: desk_lane_set(),
+            clip_under: desk_lane_set(),
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
-            board_ran: 0,
-            board_live: 0,
-            leased: 0,
+            board_ran: desk_lane_set(),
+            board_live: desk_lane_set(),
+            leased: desk_lane_set(),
             probe: probe_on(),
-            probe_walk_pins: 0,
-            probe_clip_pins: 0,
-            probe_inst_pins: 0,
+            probe_walk_pins: desk_lane_set(),
+            probe_clip_pins: desk_lane_set(),
+            probe_inst_pins: desk_lane_set(),
             probe_watch: ProbeWatch::default(),
-            room_rack: 0,
+            room_rack: desk_lane_set(),
+            stood_aside: desk_lane_set(),
+            desk: DeskLanes::new(),
+            receives: desk_lane_set(),
+            grain_free: desk_lane_set(),
+            pinned: desk_lane_set(),
+            probe_sets: std::array::from_fn(|_| desk_lane_set()),
+            route_placed: desk_lane_set(),
+            route_deps: (0..CHANNELS).map(|_| desk_lane_set()).collect(),
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
@@ -22996,8 +23345,8 @@ mod tests {
                 .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
-            param_lanes: 0,
-            curve_lanes: 0,
+            param_lanes: desk_lane_set(),
+            curve_lanes: desk_lane_set(),
             ui_held: Vec::with_capacity(1024),
             lane_wants: [false; CHANNELS],
             lane_at: [0; CHANNELS],
@@ -23074,6 +23423,7 @@ mod tests {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            midi_routes: [tangent_ui::recorder::MidiRoute::default(); CHANNELS],
             // Every lane empty, like a fresh desk; a test that wants an
             // instrument installs one directly, which is the assignment the
             // host's sync would have made.
@@ -23571,7 +23921,7 @@ mod tests {
 
         // Let the tails die, then gate the channel and play again.
         std::thread::sleep(Duration::from_millis(2500));
-        engine.set_midi_off(1 << STRIPS.min(63));
+        engine.set_midi_off(1 << STRIPS);
         let t = engine.timebase().now();
         for n in [48u8, 60, 64, 67] {
             engine.send_midi(t, &[0x90, n, 100]);
@@ -31168,14 +31518,16 @@ mod tests {
         assert_eq!(
             r.notes.len(),
             r.note_lanes.len(),
-            "the flush pushed a note-off with no lane mask, so the zip in the \
+            "the flush pushed a note-off with no reach, so the zip in the \
              lane walk drops it and every instrument but a DX7 rings on"
         );
         assert!(
             r.notes
                 .iter()
                 .zip(&r.note_lanes)
-                .any(|(n, m)| !n.on && n.pitch == 64 && *m != 0),
+                .any(|(n, m)| !n.on
+                    && n.pitch == 64
+                    && r.midi_routes.iter().any(|route| m.reaches(*route))),
             "no lane was told the held note had ended"
         );
     }
@@ -31196,7 +31548,7 @@ mod tests {
         use crate::builtin_fx::EQ_PATH;
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         const HELD: usize = 3;
-        e.offline.as_mut().expect("renderer").leased = 1u32 << HELD;
+        e.offline.as_mut().expect("renderer").leased = LaneSet::from_u32(1u32 << HELD);
         e.load_insert(HELD, 0, Some(Path::new(EQ_PATH)), None)
             .expect("the built-in loads")
             .expect("a tenant");
@@ -31222,7 +31574,7 @@ mod tests {
         );
 
         // Released: it arrives, and nothing was thrown away on the way.
-        e.offline.as_mut().expect("renderer").leased = 0;
+        e.offline.as_mut().expect("renderer").leased.clear();
         e.render_offline(&mut out);
         assert!(
             seated(&e, HELD),
@@ -31230,7 +31582,7 @@ mod tests {
         );
 
         // And a free track is not held up by a held one.
-        e.offline.as_mut().expect("renderer").leased = 1u32 << HELD;
+        e.offline.as_mut().expect("renderer").leased = LaneSet::from_u32(1u32 << HELD);
         e.load_insert(HELD + 1, 0, Some(Path::new(EQ_PATH)), None)
             .expect("the built-in loads")
             .expect("a tenant");
@@ -31270,7 +31622,7 @@ mod tests {
         to_audio
             .push((HELD, Some(Box::new(Dx7::new(48_000.0)))))
             .expect("room");
-        r.leased = 1u32 << HELD;
+        r.leased = LaneSet::from_u32(1u32 << HELD);
         let mut out = vec![0.0_f32; 2 * 128];
         r.render(&mut out, 0, 0);
         assert!(
@@ -31279,7 +31631,7 @@ mod tests {
         );
 
         // Released, and it lands on the very next block. Nothing was lost.
-        r.leased = 0;
+        r.leased.clear();
         r.render(&mut out, 0, 0);
         assert!(
             r.dx7s[HELD].is_some(),
@@ -31288,7 +31640,7 @@ mod tests {
 
         // And the patch queue, which is the one that had to change shape.
         let voice = crate::dx7::Voice::default();
-        r.leased = 1u32 << FREE;
+        r.leased = LaneSet::from_u32(1u32 << FREE);
         if let Ok(mut g) = shared.pending_voices.lock() {
             g.push((FREE, voice.clone()));
             g.push((HELD, voice));
@@ -31299,7 +31651,7 @@ mod tests {
             left, 1,
             "the held track's patch was not kept for later, so it was lost"
         );
-        r.leased = 0;
+        r.leased.clear();
         r.render(&mut out, 0, 0);
         let left = shared.pending_voices.lock().map(|g| g.len()).unwrap_or(0);
         assert_eq!(left, 0, "the kept patch was never applied once the track was free");
@@ -32844,10 +33196,10 @@ mod tests {
         let shared = Shared::new();
         shared.seat_latency[INSERTS].store(100, Ordering::Relaxed);
         shared.seat_latency[INSERTS + 1].store(20, Ordering::Relaxed);
-        assert_eq!(Rack::latency(&shared, 1), 120, "a live seat sums its bays");
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 1), 120, "a live seat sums its bays");
         shared.frozen.store(1 << 1, Ordering::Relaxed);
-        assert_eq!(Rack::latency(&shared, 1), 0, "a frozen seat still reported latency");
-        assert_eq!(Rack::latency(&shared, 0), 0);
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 1), 0, "a frozen seat still reported latency");
+        assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 0), 0);
         // The rack's early-out sits before the bay loop, on the same mask.
         // Production only: cut at the tests module, or a renamed `run_rack`
         // finds this test's own literal and the scan passes over nothing.
@@ -32857,7 +33209,7 @@ mod tests {
         let end = src[at..].find("\n}\n").map_or(src.len(), |n| at + n);
         let body = &src[at..end];
         let frozen = body
-            .find("seat_is_frozen(shared, seat)")
+            .find("seat_is_frozen(frozen, seat)")
             .expect("run_rack no longer asks the frozen mask");
         let loop_at = body.find("for (bay, slot) in rack.slots.iter_mut().enumerate()").expect("the bay loop");
         assert!(frozen < loop_at, "the frozen check is not before the bay loop");
@@ -34260,7 +34612,7 @@ mod sampler_road {
             }
             // **NOT-A-CHANNEL:** a synthetic rack built by this test.
             run_rack(
-                &mut rack, &mut planar, NOW, &mut out, &notes, &[], &params, &shared, 0, None,
+                &mut rack, &mut planar, NOW, &mut out, &notes, &[], &params, &shared, &DeskLanes::read(&shared).frozen, 0, None,
                 None,
             
             None,
@@ -34338,6 +34690,7 @@ mod sampler_road {
                 &[],
                 &params,
                 &shared,
+                &DeskLanes::read(&shared).frozen,
                 0,
                 sample,
                 None,
@@ -34361,7 +34714,7 @@ mod sampler_road {
         let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
         // **NOT-A-CHANNEL:** the same synthetic rack as above.
         run_rack(
-            &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, 0, None, None,
+            &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, &DeskLanes::read(&shared).frozen, 0, None, None,
         
             None,
             u64::MAX,
@@ -34847,5 +35200,439 @@ mod sampler_road {
             "the displaced sample is still held somewhere — it was never dropped, \
              or it was dropped on the audio thread"
         );
+    }
+}
+
+/// **No lane folds onto another** (W2-engine-lanesets): the ban scan over
+/// the engine's files, the decoded desk words, and the lanes past the edge
+/// that the clamps used to fold onto the last one.
+#[cfg(test)]
+mod lanesets {
+    use super::*;
+
+    /// The three spellings of a lane clamp, assembled from pieces so this
+    /// file's own source does not carry them and the scan below can read the
+    /// whole of it, tests included.
+    fn clamp_needles() -> [String; 2] {
+        [format!(".min({}1)", 3), format!(".min({}3)", 6)]
+    }
+
+    /// **Every line of `src` that clamps a lane onto the desk's edge**: a
+    /// `.min(31)`, a `.min(63)`, or a `.min(` whose argument ends in
+    /// `CHANNELS - 1`, however the constant is qualified. Comment lines are
+    /// the history of the defect and are skipped.
+    fn lane_clamps(name: &str, src: &str) -> Vec<String> {
+        let needles = clamp_needles();
+        let edge = format!("CHANNELS - {}", 1);
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| {
+                needles.iter().any(|n| l.contains(n.as_str()))
+                    || l.match_indices(".min(").any(|(at, _)| {
+                        let arg = &l[at + ".min(".len()..];
+                        arg.split(')').next().is_some_and(|a| a.trim_end().ends_with(&edge))
+                    })
+            })
+            .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim()))
+            .collect()
+    }
+
+    /// **No engine walk clamps a lane onto the desk's edge.** The ban scan of
+    /// W2-engine-lanesets: every `.min(31)`, `.min(63)` and
+    /// `min(CHANNELS - 1)` went in one change, because a release build has no
+    /// overflow check and the clamp is the worse of the two failures: `1 <<
+    /// 32` wraps onto lane 0, and `.min(31)` folds lane 40 onto lane 31, so
+    /// arming one arms the other. Every engine file is read whole, its tests
+    /// included. The host (`desktop.rs`) and the UI crate keep their own
+    /// clamps until the lanes that own them; this scan is the engine's.
+    #[test]
+    fn no_engine_walk_clamps_a_lane_onto_another() {
+        let files: [(&str, &str); 8] = [
+            ("instrument.rs", include_str!("instrument.rs")),
+            ("rt_bench.rs", include_str!("rt_bench.rs")),
+            ("laneset.rs", include_str!("laneset.rs")),
+            ("desk_plan.rs", include_str!("desk_plan.rs")),
+            ("lane_bank.rs", include_str!("lane_bank.rs")),
+            ("rt_alloc.rs", include_str!("rt_alloc.rs")),
+            ("render_golden.rs", include_str!("render_golden.rs")),
+            ("rtwork.rs", include_str!("rtwork.rs")),
+        ];
+        let found: Vec<String> = files.iter().flat_map(|(n, s)| lane_clamps(n, s)).collect();
+        assert!(
+            found.is_empty(),
+            "a lane clamp is back; a lane past the edge must be refused by a LaneSet, \
+             never folded onto the last lane:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// **The scan bites**: each spelling it bans is found in a planted line,
+    /// qualified or not, and a comment that quotes one is not. Without this
+    /// a scan that matched nothing would pass the suite forever.
+    #[test]
+    fn the_clamp_scan_finds_every_spelling_it_bans() {
+        let [low, high] = clamp_needles();
+        for line in [
+            format!("let bit = 1u32 << ch{low};"),
+            format!("if mask & (1 << lane{high}) != 0 {{"),
+            format!("let lane = strip.min(CHANNELS - {});", 1),
+            format!("strip: clip.lane.min(tangent_ui::recorder::CHANNELS - {}),", 1),
+        ] {
+            assert_eq!(lane_clamps("planted", &line).len(), 1, "missed: {line}");
+        }
+        let quoted = format!("    // it was `1 << n{low}`, which folded the lanes");
+        assert!(lane_clamps("comment", &quoted).is_empty(), "a comment was flagged");
+        assert!(lane_clamps("fine", "let n = frames.min(out.len());").is_empty());
+    }
+
+    /// Operands a Renderer or Shared walk shifts by that are not lanes: a
+    /// note's pitch or key indexes a 128-bit pitch word, which is as wide as
+    /// MIDI and never grows with the desk.
+    const NOT_LANES: [&str; 2] = ["pitch", "key"];
+
+    /// **Every line inside an `impl Renderer` or `impl Shared` block that
+    /// builds a bit by shifting over a bare variable** that is not a pitch:
+    /// `1u32 << d`, `1 << lane`, `!(1u64 << ch)`. That is a lane mask
+    /// spelled in a walk, which the clamp scan cannot see because it has no
+    /// `.min`. A parenthesised operand (`(pad & 63)`) is a word index that
+    /// already says how it wraps; a constant (`STRIPS`) has no lane to grow
+    /// past. A top-level impl ends at its first column-zero `}`.
+    fn walk_lane_shifts(name: &str, src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for (i, l) in src.lines().enumerate() {
+            if !inside {
+                inside = l.starts_with("impl Renderer {") || l.starts_with("impl Shared {");
+                continue;
+            }
+            if l == "}" {
+                inside = false;
+                continue;
+            }
+            if l.trim_start().starts_with("//") {
+                continue;
+            }
+            let hit = l.match_indices("<<").any(|(at, _)| {
+                let rhs = l[at + 2..].trim_start();
+                let var: String =
+                    rhs.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                var.starts_with(|c: char| c.is_ascii_lowercase()) && !NOT_LANES.contains(&var.as_str())
+            });
+            if hit {
+                out.push(format!("{name}:{}: {}", i + 1, l.trim()));
+            }
+        }
+        out
+    }
+
+    /// **No Renderer or Shared walk tests a lane against a word.** The
+    /// sibling of the clamp scan: `route_transfer` kept a `u32` path and done
+    /// mask tested with `1u32 << d` after every other walk had gone to a
+    /// LaneSet, and nothing caught it because the spelling has no `.min`.
+    /// A lane is asked of a LaneSet, a per-lane flag, or (for the strip-space
+    /// mute and solo words the plan has yet to replace) [`word_bit`].
+    #[test]
+    fn no_renderer_walk_shifts_a_lane_into_a_word() {
+        let found = walk_lane_shifts("instrument.rs", include_str!("instrument.rs"));
+        assert!(
+            found.is_empty(),
+            "a lane mask is back in a walk; past the word a release build wraps \
+             the shift onto lane 0:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// **The shift scan bites**: a lane shift inside either impl is found,
+    /// and a pitch, a parenthesised word index, a constant, a comment and
+    /// a shift outside the impls are not.
+    #[test]
+    fn the_shift_scan_finds_a_lane_mask_in_a_walk() {
+        let planted = "impl Renderer {\n    fn f(&self) {\n        let bit = 1u32 << d;\n        \
+                       out &= !(1 << lane);\n        told |= 1u128 << pitch;\n        \
+                       x & (1u64 << (pad & 63));\n        m & !(1u64 << STRIPS);\n        \
+                       // it was `1u32 << d`\n    }\n}\nfn g() { let b = 1u32 << d; }\n\
+                       impl Shared {\n    fn h(&self, ch: usize) -> u64 { 1u64 << ch }\n}\n";
+        let found = walk_lane_shifts("planted", planted);
+        assert_eq!(found.len(), 3, "the scan found {found:?}");
+        assert!(found[0].ends_with("let bit = 1u32 << d;"), "{found:?}");
+        assert!(found[1].ends_with("out &= !(1 << lane);"), "{found:?}");
+        assert!(found[2].contains("1u64 << ch"), "{found:?}");
+    }
+
+    /// **`route_transfer` answers, bit for bit, what its `u32` masks did**,
+    /// over random route tables with cycles, self-routes, hardware routes,
+    /// muted gains and a target past the desk, every lane's gain, pan and
+    /// direct share set. The oracle is the walk as it stood, so a flag that
+    /// answered for another lane's (the wrap this replaced) or a cycle cut at
+    /// a different lane moves some lane's transfer and fails here: aliasing
+    /// `done` onto sixteen lanes failed it in round 0.
+    #[test]
+    fn route_transfer_answers_what_its_masks_did() {
+        fn oracle(
+            routes: &[(usize, usize, bool, bool, f32)],
+            gain: &[f32; CHANNELS],
+            direct: &[f32; CHANNELS],
+            pan: &[f32; CHANNELS],
+        ) -> [[f32; 2]; CHANNELS] {
+            #[allow(clippy::too_many_arguments)]
+            fn walk(
+                routes: &[(usize, usize, bool, bool, f32)],
+                gain: &[f32; CHANNELS],
+                direct: &[f32; CHANNELS],
+                pan: &[f32; CHANNELS],
+                d: usize,
+                path: u32,
+                t: &mut [[f32; 2]; CHANNELS],
+                done: &mut u32,
+            ) -> [f32; 2] {
+                let bit = 1u32.checked_shl(d as u32).expect("the oracle is a 32-lane word");
+                if *done & bit != 0 {
+                    return t[d];
+                }
+                if path & bit != 0 {
+                    return [0.0; 2];
+                }
+                let mut on = [0.0f32; 2];
+                for &(from, target, hardware, _, g) in routes {
+                    if from != d || hardware || g <= 0.0 || target >= CHANNELS {
+                        continue;
+                    }
+                    let next = walk(routes, gain, direct, pan, target, path | bit, t, done);
+                    on[0] += g * next[0];
+                    on[1] += g * next[1];
+                }
+                let (pl, pr) = pan_gains(pan[d]);
+                t[d] = [gain[d] * pl * (direct[d] + on[0]), gain[d] * pr * (direct[d] + on[1])];
+                *done |= bit;
+                t[d]
+            }
+            let mut t = [[0.0f32; 2]; CHANNELS];
+            let mut done = 0u32;
+            for d in 0..CHANNELS {
+                walk(routes, gain, direct, pan, d, 0, &mut t, &mut done);
+            }
+            t
+        }
+
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let r = e.offline.as_mut().expect("renderer");
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut cycles = 0;
+        for round in 0..300 {
+            let n = (next(MAX_ROUTES as u64 + 1) as usize).min(MAX_ROUTES);
+            let mut routes = Vec::with_capacity(n);
+            for _ in 0..n {
+                let from = next(CHANNELS as u64) as usize;
+                // Dense in the low lanes so cycles are common, and now and
+                // then the top lane or a target past the desk.
+                let target = match next(16) {
+                    0 => CHANNELS - 1,
+                    1 => CHANNELS + next(4) as usize,
+                    _ => next(6) as usize,
+                };
+                let hardware = next(10) == 0;
+                let g = match next(8) {
+                    0 => 0.0,
+                    _ => next(1000) as f32 / 500.0,
+                };
+                routes.push((from, target, hardware, false, g));
+            }
+            let mut gain = [1.0f32; CHANNELS];
+            let mut direct = [1.0f32; CHANNELS];
+            let mut pan = [0.0f32; CHANNELS];
+            for d in 0..CHANNELS {
+                gain[d] = next(1500) as f32 / 1000.0;
+                direct[d] = if next(3) == 0 { 0.0 } else { 1.0 };
+                pan[d] = next(2001) as f32 / 1000.0 - 1.0;
+                r.lane_gain[d] = gain[d];
+                r.route_direct[d] = direct[d];
+                r.shared.set_channel_pan(d, pan[d]);
+            }
+            r.route_n = routes.len();
+            for (i, route) in routes.iter().enumerate() {
+                r.route_cache[i] = *route;
+            }
+            cycles += usize::from(routes.iter().any(|&(f, t, h, _, g)| {
+                !h && g > 0.0 && routes.iter().any(|&(f2, t2, h2, _, g2)| {
+                    !h2 && g2 > 0.0 && f2 == t && t2 == f
+                })
+            }));
+            let want = oracle(&routes, &gain, &direct, &pan);
+            let got = r.route_transfer();
+            for d in 0..CHANNELS {
+                for side in 0..2 {
+                    assert_eq!(
+                        got[d][side].to_bits(),
+                        want[d][side].to_bits(),
+                        "round {round} lane {d} side {side}: {} against {}",
+                        got[d][side],
+                        want[d][side]
+                    );
+                }
+            }
+        }
+        assert!(cycles > 20, "too few tables had a cycle to prove the path flags: {cycles}");
+    }
+
+    /// **`auto_key` files every automation bay where `param_slot` does**, for
+    /// every lane the automation can name and every bay number past the end.
+    /// Two spellings of one rule (the identity kernel's, keyed by `SeatBay`,
+    /// and the engine's, keyed by flat seat) that must never drift: a drift
+    /// moves somebody's curve onto another plugin. Compared through the
+    /// frozen V32 seat map, which is the space `param_slot` answers in.
+    #[test]
+    fn auto_key_files_every_bay_where_param_slot_does() {
+        use tangent_ui::desk_id::{auto_key, Node, TrackId};
+        use tangent_ui::desk_legacy::{encode_v32, identity_ids, unbind, V32_CHANNELS};
+        assert_eq!(CHANNELS, V32_CHANNELS, "the engine's lanes are the V32 rows until W3");
+        let ids = identity_ids(V32_CHANNELS);
+        let mut filed = 0;
+        for lane in 0..64usize {
+            let node = if lane == MASTER_AUTO_LANE {
+                Node::Master
+            } else {
+                Node::Track(TrackId(lane as u32))
+            };
+            for bay in 0..INSERTS * 3 {
+                let want = auto_key(node, bay)
+                    .and_then(|sb| {
+                        let owner = unbind(sb.seat.node, &ids)?;
+                        encode_v32(owner, sb.seat.rack, sb.bay)
+                    })
+                    .map(|flat| (flat / INSERTS, flat % INSERTS));
+                assert_eq!(
+                    param_slot(lane, bay),
+                    want,
+                    "lane {lane} bay {bay}: the engine and the identity kernel disagree"
+                );
+                filed += usize::from(want.is_some());
+            }
+        }
+        assert_eq!(filed, (CHANNELS + 1) * INSERTS * 2, "not every real bay was compared");
+    }
+
+    /// **The desk words decode to exactly their bits, and buy nothing.**
+    /// Every word, against a bit test of the word it came from, over random
+    /// words and both edges; `midi_off` decodes as its complement (a strip
+    /// listens when its bit is CLEAR); and a lane the word has no bit for is
+    /// in no set. The decode runs at the head of every chunk on the audio
+    /// thread, so it is counted too.
+    #[test]
+    fn the_desk_words_decode_to_exactly_their_bits_and_buy_nothing() {
+        let shared = Shared::new();
+        let mut desk = DeskLanes::new();
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for round in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let w = match round {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1 << 63 | 1,
+                _ => x,
+            };
+            let lo = w as u32;
+            shared.armed.store(lo, Ordering::Relaxed);
+            shared.drum_strips.store(lo.rotate_left(3), Ordering::Relaxed);
+            shared.builtin_strips.store(lo.rotate_left(7), Ordering::Relaxed);
+            shared.keys_strips.store(lo.rotate_left(11), Ordering::Relaxed);
+            shared.frozen.store(lo.rotate_left(17), Ordering::Relaxed);
+            shared.midi_off.store(w, Ordering::Relaxed);
+            shared.auto_suspend.store(w.rotate_left(5), Ordering::Relaxed);
+            let ((), counted) = crate::rt_alloc::count_allocs(|| desk.decode(&shared));
+            assert_eq!(counted.here, 0, "decoding the desk words allocated");
+            let bit32 = |m: u32, l: usize| l < 32 && m & (1 << l) != 0;
+            let bit64 = |m: u64, l: usize| l < 64 && m & (1 << l) != 0;
+            for lane in 0..200usize {
+                assert_eq!(desk.armed.contains(lane), bit32(lo, lane), "armed {lane}");
+                assert_eq!(desk.drums.contains(lane), bit32(lo.rotate_left(3), lane), "drums {lane}");
+                assert_eq!(desk.builtins.contains(lane), bit32(lo.rotate_left(7), lane), "dx7 {lane}");
+                assert_eq!(desk.keys.contains(lane), bit32(lo.rotate_left(11), lane), "keys {lane}");
+                assert_eq!(desk.frozen.contains(lane), bit32(lo.rotate_left(17), lane), "frozen {lane}");
+                assert_eq!(desk.midi_on.contains(lane), lane < 64 && !bit64(w, lane), "midi {lane}");
+                assert_eq!(desk.suspend.contains(lane), bit64(w.rotate_left(5), lane), "suspend {lane}");
+            }
+        }
+    }
+
+    /// **A clip on a lane past the desk plays on no lane.** It was filed
+    /// under `strip.min(CHANNELS - 1)` and played on the last lane: a clip
+    /// on lane 40 came out of lane 31's strip, at lane 31's fader, through
+    /// lane 31's plugins. Rendered through the public engine, beside a real
+    /// clip on lane 31 whose stem must come out exactly as it does alone.
+    #[test]
+    fn a_clip_past_the_desk_plays_on_no_lane_and_lands_on_none() {
+        let flat_clip = |strip: usize, level: f32| Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![level; 48_000],
+                rate: 48_000,
+                source: PathBuf::from("stray.wav"),
+            }),
+            strip,
+            start: 0,
+            offset: 0,
+            len: 24_000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        };
+        let render = |strays: &[usize]| -> (Vec<f32>, Vec<f32>) {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("an offline engine");
+            let mut clips = vec![flat_clip(CHANNELS - 1, 0.25)];
+            clips.extend(strays.iter().map(|&s| flat_clip(s, 0.5)));
+            e.set_clips(clips);
+            e.set_stems(true);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let (mut out, mut master, mut stems) = (vec![0.0f32; 512 * 2], Vec::new(), Vec::new());
+            for _ in 0..8 {
+                e.render_offline(&mut out);
+                master.extend_from_slice(&out);
+                e.drain_stems(&mut stems);
+            }
+            (master, stems)
+        };
+        let (alone_master, alone_stems) = render(&[]);
+        assert!(alone_master.iter().any(|v| *v != 0.0), "lane {} made no sound", CHANNELS - 1);
+        for strays in [&[CHANNELS][..], &[40], &[63, 64, 200]] {
+            let (master, stems) = render(strays);
+            let same = |a: &[f32], b: &[f32]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            assert!(
+                same(&master, &alone_master),
+                "a clip on lane {strays:?} reached the master; it was folded onto a real lane"
+            );
+            assert!(same(&stems, &alone_stems), "a clip on lane {strays:?} reached a stem");
+        }
+    }
+
+    /// **The master's two racks ask the master's MIDI bit**, and the Fx bus
+    /// its own. The master's second rack is a seat far past the strips, and
+    /// `at.min(63)` read whatever bit 63 of the word held: with the host's
+    /// usual word (a `u32` widened, so bit 63 clear) the master's extra rack
+    /// heard every note whatever the master's own bit said.
+    #[test]
+    fn the_master_racks_ask_the_masters_own_midi_bit() {
+        use tangent_ui::recorder::{MASTER_EXTRA_SEAT, MASTER_SEAT};
+        assert_eq!(chain_strip(MASTER_EXTRA_SEAT), STRIPS);
+        assert_eq!(chain_strip(MASTER_SEAT), STRIPS);
+        assert_eq!(chain_strip(Strip::Fx.index()), Strip::Fx.index());
+        assert!(MASTER_EXTRA_SEAT >= DESK_WORD_LANES, "the extra seat has a bit of its own now");
+        let shared = Shared::new();
+        // The master's bit set (deaf), bit 63 clear: the case the clamp
+        // answered wrongly.
+        shared.midi_off.store(1u64 << STRIPS, Ordering::Relaxed);
+        let desk = DeskLanes::read(&shared);
+        assert!(!desk.midi_on.contains(chain_strip(MASTER_EXTRA_SEAT)));
+        assert!(desk.midi_on.contains(chain_strip(Strip::Fx.index())));
     }
 }

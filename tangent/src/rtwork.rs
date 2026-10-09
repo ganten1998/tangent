@@ -691,6 +691,11 @@ impl LanePool {
     /// The thirty-two-lane form the engine was written against, kept so that
     /// no caller changes in the same commit as the pool. It goes once the
     /// engine walks a lane list of its own.
+    ///
+    /// It does since W2-engine-lanesets (`mix_channels` claims through
+    /// `run_list`), so only this file's own tests call it; C6 keeps it as
+    /// the shim until W4, and the lint is told so rather than the shim cut.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn run(&self, lanes: u32, work: &(dyn Fn(usize) + Sync)) {
         // On the stack: this is the audio thread, and the mask has at most
         // as many lanes as it has bits.
@@ -942,7 +947,8 @@ impl Drop for MarkGone<'_> {
 /// gets the core rather than the spinner. See [`Barrier`].
 const SPINS_BEFORE_YIELD: u32 = 2_000;
 
-/// The set bits of `lanes`, low to high.
+/// The set bits of `lanes`, low to high. `run`'s alone; see its note.
+#[cfg_attr(not(test), allow(dead_code))]
 fn lane_iter(lanes: u32) -> impl Iterator<Item = usize> {
     (0..u32::BITS as usize).filter(move |ch| lanes & (1u32 << ch) != 0)
 }
