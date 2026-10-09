@@ -927,7 +927,7 @@ mod tests {
                 m.push((4, AutoMode::Write));
                 // The master's lane is bit 32: past a u32, which is the
                 // aliasing `auto_suspend_mask` was widened to stop.
-                m.push((tangent_ui::arrangement_panel::MASTER_LANE, AutoMode::Touch));
+                m.push((tangent_ui::arrangement_panel::LaneId::Master.auto_lane(), AutoMode::Touch));
             },
             none,
         );
