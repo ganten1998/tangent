@@ -457,6 +457,15 @@ pub enum Dialog {
         /// the app fills it, once, on the first frame the host can answer
         /// for the new system. See `TangentApp::tend_stale_outputs`.
         outputs_stale: bool,
+        /// **The system `outputs` was listed FOR** (`None`: the platform's
+        /// default): the one the settings name, which is not always
+        /// `system`. During an ASIO fallback `system` is the stand-in that
+        /// is running and the list is still ASIO's drivers, because a name
+        /// saved from this row opens under the SETTING's system. Everything
+        /// the row says about its names asks this, not `system`: the ASIO
+        /// line was gated on the running one and vanished over a list of
+        /// ASIO drivers, under a lit WASAPI chip.
+        listed_for: Option<String>,
         /// The rates the selected input device offers.
         rates: Vec<u32>,
         /// How many inputs the selected device has, so the channel row can say
@@ -2749,6 +2758,16 @@ const MAKER_MAX: usize = 46;
 /// one with no hardware), which can be a wrapper such as ASIO4ALL - and the
 /// chip that reads as "whatever the OS uses" was lit over it.
 const ASIO_OWN_OUTPUT: &str = "under ASIO, the system's own is the first driver that answers";
+
+/// **What Setup's OUTPUT row is during an ASIO fallback**: the ASIO drivers,
+/// under the lit chip of `stand_in`, the system playing in ASIO's place. A
+/// driver picked from it is saved for ASIO and tried there, which is the
+/// way out of the fallback - but read under a lit WASAPI chip the list
+/// looked like WASAPI's, and "the system's own" beside it like WASAPI's
+/// default.
+fn asio_list_under_stand_in(stand_in: &str) -> String {
+    format!("ASIO's drivers, for when ASIO opens again; {stand_in} is standing in")
+}
 
 /// `s`, cut to `max` characters with an ellipsis when it was longer.
 ///
@@ -9556,6 +9575,7 @@ fn show_on(
             outputs,
             output,
             outputs_stale,
+            listed_for,
             rates,
             input_channels,
             exposed,
@@ -10166,7 +10186,28 @@ fn show_on(
                                 // The comment above is no use to the person
                                 // at the panel, who saw "the system's own"
                                 // lit and believed it was their interface.
-                                if system.as_deref() == Some("ASIO") {
+                                // Asked of the system the LIST is for, not
+                                // the one running: see `listed_for`.
+                                if listed_for.as_deref() == Some("ASIO") {
+                                    // **A list under another system's chip
+                                    // says whose it is.** Only during an ASIO
+                                    // fallback can they differ with names in
+                                    // the row, and ASIO is the one system
+                                    // whose list is its own there (the
+                                    // registry's, read whatever is running).
+                                    // Any other chosen system lists through
+                                    // the host that answers, so naming it
+                                    // would name the wrong list.
+                                    if let Some(stand_in) = system
+                                        .as_deref()
+                                        .filter(|running| *running != "ASIO")
+                                    {
+                                        ui.label(
+                                            RichText::new(asio_list_under_stand_in(stand_in))
+                                                .font(plain(10.0))
+                                                .color(dim),
+                                        );
+                                    }
                                     ui.label(
                                         RichText::new(ASIO_OWN_OUTPUT)
                                             .font(plain(10.0))
@@ -15888,6 +15929,7 @@ at: None,
             ],
             output: None,
             outputs_stale: false,
+            listed_for: Some("ASIO".to_owned()),
             rates: Vec::new(),
             input_channels: 0,
             exposed: Vec::new(),
@@ -15953,6 +15995,7 @@ at: None,
             outputs: Vec::new(),
             output: None,
             outputs_stale: false,
+            listed_for: None,
             rates: Vec::new(),
             input_channels: 0,
             exposed: Vec::new(),
@@ -15999,6 +16042,7 @@ at: None,
             outputs: Vec::new(),
             output: Some("Komplete Audio 6 MK2".to_owned()),
             outputs_stale: false,
+            listed_for: None,
             rates: Vec::new(),
             input_channels: 0,
             exposed: Vec::new(),
@@ -16045,6 +16089,7 @@ at: None,
                 ],
                 output: output.map(str::to_owned),
                 outputs_stale: false,
+                listed_for: None,
                 rates: Vec::new(),
                 input_channels: 0,
                 exposed: Vec::new(),
@@ -16111,20 +16156,27 @@ at: None,
     /// answers - so the chip that reads as "whatever the OS uses" is, there,
     /// ASIO4ALL or FL Studio ASIO as often as the interface: the Komplete
     /// Audio 6 owner saw it lit and believed he had chosen his box. Said
-    /// under the row while ASIO is the system running, and not otherwise.
+    /// under the row while its list is ASIO's, and not otherwise.
+    ///
+    /// **Including during an ASIO fallback**, where the lit chip is the
+    /// stand-in and the list is still ASIO's drivers: the line was asked of
+    /// the RUNNING system, so it vanished there, and the row read as
+    /// WASAPI's list with WASAPI's default beside it. The row now names the
+    /// stand-in too, and only then.
     #[test]
     fn under_asio_the_output_row_says_what_the_systems_own_is() {
-        let says_it = |system: &str| {
+        let row = |running: &str, listed_for: Option<&str>| {
             let mut slot = Slot::new(Dialog::AudioSetup {
                 status: crate::recorder::AudioStatus::default(),
                 buffer: None,
                 ahead: 0.0,
                 rate: None,
                 systems: vec!["ASIO".to_owned(), "WASAPI".to_owned()],
-                system: Some(system.to_owned()),
+                system: Some(running.to_owned()),
                 outputs: vec!["ASIO4ALL v2".to_owned(), "Komplete Audio 6 MK2".to_owned()],
                 output: None,
                 outputs_stale: false,
+                listed_for: listed_for.map(str::to_owned),
                 rates: Vec::new(),
                 input_channels: 0,
                 exposed: Vec::new(),
@@ -16132,10 +16184,29 @@ at: None,
                 alias: String::new(),
                 output_path: crate::ports::OutputPath::default(),
             });
-            slot.says(ASIO_OWN_OUTPUT)
+            let stand_in = slot.says(&asio_list_under_stand_in(running));
+            (slot.says(ASIO_OWN_OUTPUT), stand_in)
         };
-        assert!(says_it("ASIO"), "under ASIO the row does not say what the system's own is");
-        assert!(!says_it("WASAPI"), "the ASIO line is drawn under a system that has a default");
+        assert_eq!(
+            row("ASIO", Some("ASIO")),
+            (true, false),
+            "under ASIO the row does not say what the system's own is"
+        );
+        assert_eq!(
+            row("WASAPI", Some("WASAPI")),
+            (false, false),
+            "the ASIO line is drawn under a system that has a default"
+        );
+        assert_eq!(
+            row("WASAPI", None),
+            (false, false),
+            "the ASIO line is drawn over the platform default's list"
+        );
+        assert_eq!(
+            row("WASAPI", Some("ASIO")),
+            (true, true),
+            "an ASIO fallback's driver list reads as the stand-in's"
+        );
     }
 
     /// **The buffer chip and the readout above it cannot disagree about who
@@ -16194,6 +16265,7 @@ at: None,
             outputs: Vec::new(),
             output: None,
             outputs_stale: false,
+            listed_for: None,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),
@@ -16295,6 +16367,7 @@ at: None,
             outputs: Vec::new(),
             output: None,
             outputs_stale: false,
+            listed_for: None,
             rates: Vec::new(),
             input_channels: 2,
             exposed: Vec::new(),
@@ -16377,6 +16450,7 @@ at: None,
             outputs: Vec::new(),
             output: None,
             outputs_stale: false,
+            listed_for: None,
             rates: Vec::new(),
             input_channels: 20,
             exposed: Vec::new(),
