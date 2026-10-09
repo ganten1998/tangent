@@ -10,6 +10,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **Send to Device: the master out on a second output device too.** While
+  Tangent plays through your interface, the same mix can also go to a
+  virtual cable (VB-Audio's CABLE Input on Windows, BlackHole or Loopback on
+  a Mac), so OBS, Discord or anything else that records an input can pick it
+  up as a microphone. It sits beside Stream to OBS in the recorder band's
+  cog, under SEND, and opens a window to pick the device and switch it on.
+
+  On Windows the send always opens the cable through WASAPI, so it works
+  while the interface itself plays through ASIO. The two devices keep their
+  own clocks, and the send trims its rate by a fraction of a cent to stay in
+  step with the cable; when the two run at different sample rates it
+  converts between them, and the window says so, since matching the rates
+  gives the cleanest copy. If the cable goes away or stops, the send turns
+  itself off with a notice and the interface plays on untouched; Retry in
+  the window starts it again. The cog's SEND chip shows what the send is
+  doing: on, missing, stopped or failed.
+
 ### Fixed
 
 - **The launch clean-up no longer deletes a folder that holds anything
