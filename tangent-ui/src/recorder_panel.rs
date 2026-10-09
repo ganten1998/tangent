@@ -4245,8 +4245,15 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
         // clips. The import invitation died with the backing track: audio
         // arrives by dropping it on a lane, and an empty box that begs for
         // a file it can no longer mean is worse than a quiet one.
-        let row_h = r.height() / crate::recorder::CHANNELS as f32;
-        for i in 0..crate::recorder::CHANNELS {
+        //
+        // EIGHT, as a literal of its own: this is decoration, and it was
+        // drawn `CHANNELS` deep, so it changed whenever the desk's capacity
+        // did (thirty-two hairline stripes in a 40-point box is a grey wash,
+        // not eight lanes). A desk with no fixed width has no number to
+        // borrow here anyway.
+        const EMPTY_FIELD_ROWS: usize = 8;
+        let row_h = r.height() / EMPTY_FIELD_ROWS as f32;
+        for i in 0..EMPTY_FIELD_ROWS {
             if i % 2 == 1 {
                 let y = r.top() + row_h * i as f32;
                 painter.rect_filled(
