@@ -304,15 +304,33 @@ pub trait AudioSetup: Send {
     /// WASAPI nor ASIO lit.
     fn active_system(&self) -> Option<String>;
 
-    /// **Every audio OUTPUT the host the streams open through offers**, in
-    /// the backend's own order, or empty when they cannot be reached. That
-    /// host follows the process-wide system (`tangent_record::audio::system`),
-    /// not the setting, so during an ASIO fallback it is the stand-in's.
-    /// Under ASIO, every registered driver by name, read from the registry
-    /// with none loaded, so the list is the same whether or not a stream
-    /// holds one; a driver listed there with no hardware behind it fails at
-    /// the open, which falls back. Asked when the panel OPENS, like
-    /// [`Self::systems`] and [`Self::rates`], and never per frame.
+    /// **Every audio OUTPUT the system named `system` offers** (`None`: the
+    /// platform's default), in the backend's own order, empty when they
+    /// cannot be reached - or `None` when this host cannot answer for THAT
+    /// system yet.
+    ///
+    /// **Asked by the system, because the list is the CHOSEN system's.**
+    /// The host lists through the process-wide system
+    /// (`tangent_record::audio::system`), and the desktop moves that a frame
+    /// after the setting: a Setup panel asking straight after a SYSTEM press
+    /// got the old system's names, and a no-argument question could not say
+    /// so. Unanswerable is `None`, never another system's list, so a panel
+    /// cannot offer a WASAPI endpoint as an ASIO output - which ASIO cannot
+    /// open.
+    ///
+    /// **Under ASIO it is always answerable**: every registered driver by
+    /// name, read from the registry with none loaded, so the list is the
+    /// same whether or not a stream holds one, and whether or not the
+    /// process is standing in on the platform default after a fallback - the
+    /// moment somebody most needs to pick their interface's driver. A driver
+    /// listed there with no hardware behind it fails at the open, which
+    /// falls back.
+    ///
+    /// Asked when the panel OPENS, like [`Self::systems`] and
+    /// [`Self::rates`], and once a frame only while an open panel waits on a
+    /// switch (`Dialog::AudioSetup::outputs_stale`) - so a `None` answer must
+    /// cost nothing: no enumeration until the host agrees, after which the
+    /// panel stops asking.
     ///
     /// **This exists because ASIO has no default.** cpal's ASIO host
     /// implements `default_output_device` as, verbatim, "ASIO has no concept
@@ -322,7 +340,7 @@ pub trait AudioSetup: Send {
     /// and never the interface, with no control anywhere to say otherwise.
     /// Reported by a user whose Komplete Audio 6 MK2 was invisible here while
     /// FL Studio offered it from a dropdown.
-    fn outputs(&self) -> Vec<String>;
+    fn outputs(&self, system: Option<&str>) -> Option<Vec<String>>;
 
     /// The rates the input device now selected will actually open at.
     ///
