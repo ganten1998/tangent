@@ -5942,7 +5942,7 @@ impl TangentApp {
     /// What a mixer control reads now, 0..=1, for a drag to start from.
     fn mixer_value(&self, hit: crate::mixer_panel::Hit) -> f32 {
         use crate::mixer_panel::Hit as H;
-        let view = self.mixer_view();
+        let view = self.mixer_view_of(hit.column());
         match hit {
             // A button, not a value: it opens a panel.
             H::MetFile => 0.0,
@@ -6437,7 +6437,7 @@ impl TangentApp {
             // what the readout says — the owner's rule for every dial.
             H::Db(i) => {
                 let seed = {
-                    let view = self.mixer_view();
+                    let view = self.mixer_view_of(i);
                     view.strips
                         .get(i)
                         .map(|st| {
@@ -6480,7 +6480,7 @@ impl TangentApp {
                     // default in place is how somebody gets to "x - 3 vox"
                     // without retyping the half the app already knows.
                     _ => self
-                        .mixer_view()
+                        .mixer_view_of(i)
                         .strips
                         .get(i)
                         .map_or(String::new(), |v| v.name.to_owned()),
@@ -7334,7 +7334,26 @@ impl TangentApp {
     /// the whole desk): O(desk), and never on the per-frame road, which asks
     /// [`Self::mixer_view_in`] with the rect it will draw into.
     fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
-        self.mixer_view_ranks(None)
+        let index = self.desk_index();
+        let rows = index.shown().iter().map(|r| *r as usize).collect();
+        self.mixer_view_rows(0, rows)
+    }
+
+    /// **One column's strip, for reading what it says**: a value a drag
+    /// starts from, the figure a typed field opens on. Built whether or not
+    /// the strip is drawn, because a selection can span a SHUT folder's
+    /// children and a drag on one strip moves its partners by what each
+    /// reads now; the dense view leaves hidden strips out, and a partner it
+    /// could not find would read as zero and be moved to the delta alone.
+    /// Never laid out: its rank is a guess when the strip is hidden.
+    fn mixer_view_of(&self, col: recorder::Column) -> crate::mixer_panel::MixerView<'_> {
+        match col.row() {
+            Some(row) => {
+                let first = self.desk_index().rank_of(row).unwrap_or(0);
+                self.mixer_view_rows(first, vec![row])
+            }
+            None => self.mixer_view_rows(0, Vec::new()),
+        }
     }
 
     /// **The desk as a layout at `rect` will place it**: the strips in the
@@ -7342,21 +7361,20 @@ impl TangentApp {
     /// What paint, hit-test and the screen reader build every frame, so
     /// each is O(visible) however long the desk is.
     pub(crate) fn mixer_view_in(&self, rect: Rect) -> crate::mixer_panel::MixerView<'_> {
+        let index = self.desk_index();
         let ranks = crate::mixer_panel::track_window(
             rect,
             self.mixer_visible(),
-            self.desk_index().shown_len(),
+            index.shown_len(),
             self.mixer_scroll_px,
         );
-        self.mixer_view_ranks(Some(ranks))
+        let rows = index.window(ranks.start, ranks.len()).iter().map(|r| *r as usize).collect();
+        self.mixer_view_rows(ranks.start, rows)
     }
 
-    /// The one builder behind both: the strips of the drawn tracks whose
-    /// ranks are in `ranks` (all of them for `None`).
-    fn mixer_view_ranks(
-        &self,
-        ranks: Option<std::ops::Range<usize>>,
-    ) -> crate::mixer_panel::MixerView<'_> {
+    /// The one builder behind all three: the strips of these track `rows`
+    /// (in row order), the first of which ranks `first` among the drawn.
+    fn mixer_view_rows(&self, first: usize, rows: Vec<usize>) -> crate::mixer_panel::MixerView<'_> {
         use crate::recorder::{Strip, StripRef};
         let g = self.settings.knobs().gains;
         let desk = self.desk();
@@ -7524,13 +7542,7 @@ impl TangentApp {
         };
         let master = StripRef::MASTER_INDEX;
         let shown = index.shown_len();
-        let ranks = ranks.unwrap_or(0..shown);
-        let first = ranks.start.min(shown);
-        let tracks: Vec<_> = index
-            .window(first, ranks.end.saturating_sub(first))
-            .iter()
-            .map(|row| strip(Strip::Channel(*row as usize)))
-            .collect();
+        let tracks: Vec<_> = rows.into_iter().map(|row| strip(Strip::Channel(row))).collect();
         crate::mixer_panel::MixerView {
             // **What the click is playing**, for its own button. The chosen
             // file's name; the bundled click has no path, so it says what it
@@ -28325,7 +28337,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         use crate::recorder::StripRef;
         let g = self.settings.knobs().gains;
         let desk = self.desk();
-        // Borrowed, not copied: see `mixer_view_ranks`.
+        // Borrowed, not copied: see `mixer_view_rows`.
         let peaks = &self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         let master = StripRef::MASTER_INDEX;
@@ -81547,6 +81559,37 @@ mod views_windowed_tests {
                 }
             }
         }
+    }
+
+    /// **A drag moves a selected partner inside a SHUT folder by the same
+    /// travel, from where that partner stands.** The partner is not drawn,
+    /// so the windowed desk does not carry it; a value read through the
+    /// drawn strips found nothing, read zero, and set the partner's fader
+    /// to the delta alone. The value read builds the one strip it asks
+    /// about (`mixer_view_of`), drawn or not.
+    #[test]
+    fn a_fader_drag_moves_a_partner_hidden_in_a_shut_folder_by_its_own_travel() {
+        use crate::mixer_panel::Hit as H;
+        let mut a = app();
+        for n in 0..4 {
+            a.add_bare_track(n);
+        }
+        a.toggle_folder(1);
+        a.set_in_folder(2, true);
+        a.apply_mixer_hit(H::Fader(recorder::Column::Track(2)), 0.6);
+        a.apply_mixer_hit(H::Fader(recorder::Column::Track(0)), 0.3);
+        a.select_track(0, egui::Modifiers::NONE);
+        a.select_track(2, egui::Modifiers::COMMAND);
+        a.toggle_folder_shut(1);
+        assert!(a.lane_hidden(2), "the partner is not hidden; the test proves nothing");
+        let before = a.mixer_value(H::Fader(recorder::Column::Track(2)));
+        assert!((before - 0.6).abs() < 1e-3, "a hidden strip's fader reads {before}");
+        a.apply_mixer_hit(H::Fader(recorder::Column::Track(0)), 0.4);
+        let after = a.mixer_value(H::Fader(recorder::Column::Track(2)));
+        assert!(
+            (after - 0.7).abs() < 1e-3,
+            "the hidden partner went to {after}, not 0.6 + 0.1"
+        );
     }
 
     fn frame(ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>) {
