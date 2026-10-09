@@ -92,6 +92,48 @@ impl Size {
     }
 }
 
+/// **The width rungs past the document ladder**: a desk of 128 rows (XXL)
+/// and of 512 (XXXL).
+///
+/// The document ladder stops at thirty-two lanes because the desk did; these
+/// rungs measure what a desk that grows by appending costs the VIEWS, which
+/// is the question the windowing answers (docs/design/unlimited-tracks.md,
+/// section 10). No document of that width can be opened on this desk yet,
+/// so the rungs are a synthetic [`DeskIndex`] (`DeskIndex::synthetic`): a
+/// MIDI track on every row, a folder of three every eighth row, a clip on
+/// each. The views build their window from it exactly as the app builds
+/// one from its own index, so what is measured is the panels' own work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wide {
+    Xxl,
+    Xxxl,
+}
+
+impl Wide {
+    pub(crate) const ALL: [Wide; 2] = [Wide::Xxl, Wide::Xxxl];
+
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Wide::Xxl => "XXL",
+            Wide::Xxxl => "XXXL",
+        }
+    }
+
+    /// How many rows the desk has.
+    pub(crate) fn rows(self) -> usize {
+        match self {
+            Wide::Xxl => 128,
+            Wide::Xxxl => 512,
+        }
+    }
+
+    /// The rung's desk: every folder open, or every folder shut (which
+    /// takes three rows in every eight out of the drawn order).
+    pub(crate) fn index(self, shut: bool) -> crate::desk_index::DeskIndex {
+        crate::desk_index::DeskIndex::synthetic(self.rows(), 8, shut)
+    }
+}
+
 /// The takes' sample rate. Every take Tangent records is 48 kHz.
 pub(crate) const RATE: u32 = 48_000;
 /// The fixture's tempo: 120 in 4/4, so a bar is exactly two seconds and the

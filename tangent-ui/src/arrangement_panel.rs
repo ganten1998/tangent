@@ -28,7 +28,7 @@
 //! vertically zooms (the app's half — the panel only names the surface).
 
 use crate::mixer_panel::STRIP_COLORS;
-use crate::recorder::{ChannelKind, CHANNELS};
+use crate::recorder::{ChannelKind, Column, StripRef, VISIBLE_MAX};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One lane's header, as the painter sees it. Lane N IS channel N — name,
@@ -199,7 +199,7 @@ pub struct ClipView<'a> {
 /// cannot disagree about what is inside.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoMarquee {
-    pub lane: usize,
+    pub lane: LaneId,
     pub slot: usize,
     pub t0: f64,
     pub t1: f64,
@@ -409,9 +409,144 @@ pub struct MarkerView {
     pub selected: bool,
 }
 
+/// **The lanes a view carries, by row.**
+///
+/// It was `[LaneView; CHANNELS]`: every lane of the desk built every frame,
+/// with its name, its input chip and its six bays, whether it was on screen
+/// or thirty rows under it. The desk stops being a fixed width (docs/design/
+/// unlimited-tracks.md, section 10), so a view now carries the WINDOW the
+/// layout will place: the drawn rows from the scroll down, as many as can
+/// show, each with the row it is. Rows run in order (folders are
+/// positional, and a shut folder only removes rows), so a lookup by row is
+/// a binary search and a walk is O(visible).
+pub struct Lanes<'a> {
+    lanes: Vec<(usize, LaneView<'a>)>,
+}
+
+impl<'a> Lanes<'a> {
+    /// The lanes of these rows, in row order.
+    pub fn new(lanes: Vec<(usize, LaneView<'a>)>) -> Self {
+        debug_assert!(lanes.windows(2).all(|w| w[0].0 < w[1].0), "rows out of order");
+        Self { lanes }
+    }
+
+    /// Every lane from row 0, one per row: a whole desk, for a test or a
+    /// picture of the whole song.
+    pub fn dense(lanes: Vec<LaneView<'a>>) -> Self {
+        Self { lanes: lanes.into_iter().enumerate().collect() }
+    }
+
+    fn slot(&self, row: usize) -> Option<usize> {
+        self.lanes.binary_search_by_key(&row, |(r, _)| *r).ok()
+    }
+
+    /// The lane of a row, when this view carries it.
+    pub fn get(&self, row: usize) -> Option<&LaneView<'a>> {
+        self.slot(row).map(|k| &self.lanes[k].1)
+    }
+
+    /// [`Self::get`], to change.
+    pub fn get_mut(&mut self, row: usize) -> Option<&mut LaneView<'a>> {
+        self.slot(row).map(|k| &mut self.lanes[k].1)
+    }
+
+    /// Every lane carried, with its row, top to bottom.
+    pub fn rows(&self) -> impl Iterator<Item = (usize, &LaneView<'a>)> {
+        self.lanes.iter().map(|(r, l)| (*r, l))
+    }
+
+    /// Every lane carried, top to bottom.
+    pub fn iter(&self) -> impl Iterator<Item = &LaneView<'a>> {
+        self.lanes.iter().map(|(_, l)| l)
+    }
+
+    /// Every lane carried, to change.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut LaneView<'a>> {
+        self.lanes.iter_mut().map(|(_, l)| l)
+    }
+
+    /// How many lanes were BUILT for this view: what the bounds tests hold
+    /// to the visible count.
+    pub fn len(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Whether the view carries no lane at all.
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+}
+
+impl<'a> std::ops::Index<usize> for Lanes<'a> {
+    type Output = LaneView<'a>;
+    /// Panics on a row this view does not carry, as the array did past its
+    /// end. Tests index; the panel itself asks [`Lanes::get`].
+    fn index(&self, row: usize) -> &LaneView<'a> {
+        self.get(row).unwrap_or_else(|| panic!("row {row} is not in this view"))
+    }
+}
+
+impl<'a> std::ops::IndexMut<usize> for Lanes<'a> {
+    fn index_mut(&mut self, row: usize) -> &mut LaneView<'a> {
+        self.get_mut(row).unwrap_or_else(|| panic!("row {row} is not in this view"))
+    }
+}
+
+/// **A lane of the timeline, by what it is**: a track's row, or the master.
+///
+/// It replaces two numbers that meant "the master" by being one and two
+/// past the channels (`MASTER_LANE` and `MASTER_COLUMN`), which moved every
+/// time the desk grew and made every comparison against them a width test
+/// in disguise. A row is a row and the master is the master; where a stored
+/// automation lane is needed, [`LaneId::auto_lane`] asks [`StripRef`], the
+/// one home of that arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LaneId {
+    /// The lane of the track on this row.
+    Row(usize),
+    /// The master's row, above the tracks.
+    Master,
+}
+
+impl LaneId {
+    /// The track row, or `None` for the master.
+    pub fn row(self) -> Option<usize> {
+        match self {
+            LaneId::Row(r) => Some(r),
+            LaneId::Master => None,
+        }
+    }
+
+    /// The lane the automation store files this lane's curves under.
+    pub fn auto_lane(self) -> usize {
+        let strip = match self {
+            LaneId::Row(r) => StripRef::Row(r),
+            LaneId::Master => StripRef::Master,
+        };
+        // A row and the master always have one; see `StripRef::auto_lane`.
+        strip.auto_lane().unwrap_or(usize::MAX)
+    }
+
+    /// The lane a stored automation lane is: the master's own, or a row.
+    pub fn from_auto_lane(lane: usize) -> LaneId {
+        match StripRef::from_auto_lane(lane) {
+            Some(StripRef::Master) => LaneId::Master,
+            _ => LaneId::Row(lane),
+        }
+    }
+
+    /// Which of the two alternating grounds this lane's automation rows
+    /// stand on. The master's rows took lane thirty-two's, the even one,
+    /// when they were addressed as that lane, and keep it.
+    fn ground(self) -> usize {
+        self.row().map_or(0, |r| r % 2)
+    }
+}
+
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
-    pub lanes: [LaneView<'a>; CHANNELS],
+    /// The lanes the layout will place: see [`Lanes`].
+    pub lanes: Lanes<'a>,
     /// The MASTER's level — linear, as the desk's fader sits.
     pub master_gain: f32,
     /// What it is making right now, for the slim meter beside the knob.
@@ -473,7 +608,7 @@ pub struct ArrangeView<'a> {
     /// master is not one of them — it is a bus, with its own row above them
     /// and its own strip on the desk. Everything else about these rows is a
     /// track's: the same `AutoView`, the same header, the same curve, the
-    /// same gestures. They are addressed as lane [`MASTER_LANE`] so that one
+    /// same gestures. They are addressed as [`LaneId::Master`] so that one
     /// `RowKind::Automation` still covers every automation row in the
     /// timeline and the drawing, hit-testing and editing do not fork.
     pub master_automation: Vec<AutoView<'a>>,
@@ -562,13 +697,13 @@ pub enum Hit {
     Solo(usize),
     /// One of the MASTER row's six bays: `(column, slot)`.
     ///
-    /// Its own variant rather than `HdrBay(MASTER_COLUMN, ..)`, because every
-    /// `HdrBay` handler reads its first field as a strip index — and the
-    /// master's column number is a perfectly valid one belonging to somebody
-    /// else, so overloading it would have silently edited another rack's
-    /// plugins. The slot is in STRIP order; `recorder::seat_bay` turns it into
-    /// the rack it actually lives in.
-    BusBay(usize, usize),
+    /// Its own variant rather than an `HdrBay` on the master's number, because
+    /// every `HdrBay` handler reads its first field as a strip index — and the
+    /// master's old column number was a perfectly valid one belonging to
+    /// somebody else, so overloading it would have silently edited another
+    /// rack's plugins. The slot is in STRIP order; `recorder::seat_bay` turns
+    /// it into the rack it actually lives in.
+    BusBay(Column, usize),
     /// The header's gain knob — draggable, vertical, the mixer fader's twin.
     Gain(usize),
     /// A clip's body: select it, and a drag MOVES it along its lane.
@@ -596,7 +731,7 @@ pub enum Hit {
     /// A point on an automation curve, by lane and by index into that
     /// curve's points. Grabbed to drag, or pressed to select.
     /// `(lane, row, point)`.
-    AutoPoint(usize, usize, usize),
+    AutoPoint(LaneId, usize, usize),
     /// **The MASTER row's field**, carrying the time under the pointer.
     ///
     /// It is a bus and has no clips, so its whole width was dead ground —
@@ -607,23 +742,23 @@ pub enum Hit {
     /// Empty room on an automation lane: `(lane, seconds, value)`. A press
     /// here MAKES a point, which is how every DAW draws one.
     /// `(lane, row, seconds, value)`.
-    AutoLane(usize, usize, f64, f64),
+    AutoLane(LaneId, usize, f64, f64),
     /// The sub-lane's own header: which parameter it shows.
     /// One automation ROW's header — `(lane, row)`.
     /// **Ø** — invert this track's polarity.
     Phase(usize),
-    AutoParamPick(usize, usize),
+    AutoParamPick(LaneId, usize),
     /// **×** on an automation row: stop showing this lane.
-    AutoClose(usize, usize),
+    AutoClose(LaneId, usize),
     /// The record dot on an automation row: arm it to write.
-    AutoArm(usize, usize),
+    AutoArm(LaneId, usize),
     /// **B**: bypass this curve without deleting it.
-    AutoBypass(usize, usize),
+    AutoBypass(LaneId, usize),
     /// The dial on an automation row — sets the control itself.
-    AutoDial(usize, usize),
+    AutoDial(LaneId, usize),
     /// The header's fold arrow: show or hide this lane's automation.
     /// The **A** button on a track's header: open the automation menu.
-    AutoMenu(usize),
+    AutoMenu(LaneId),
     /// **T** — send this track's MIDI to the theory view, or stop.
     ToTheory(usize),
     /// A point on the tempo curve, by index. Grabbed to drag.
@@ -662,8 +797,8 @@ pub enum Hit {
     HdrAdd(usize),
     /// A BUS row's level — the master's or the click's. Carries the MIXER
     /// COLUMN, so the drag goes through the desk's own fader hit rather
-    /// than a second road to the same number. See [`Bus::column`].
-    BusGain(usize),
+    /// than a second road to the same number.
+    BusGain(Column),
 }
 
 impl Hit {
@@ -710,11 +845,6 @@ const AUTO_LANE_SHARE: f32 = 0.5;
 /// is no waveform to look at. Every point it does not take is a point the
 /// tracks get back.
 const MASTER_ROW_SHARE: f32 = 0.5;
-
-/// The MIXER COLUMN the master is, so its level goes through the desk's own
-/// fader hit rather than a second road to the same number. See
-/// `recorder::Column::desk_index`, where the convention is written down.
-pub const MASTER_COLUMN: usize = CHANNELS + 1;
 
 /// The ruler's height in points. Short — it is a scale, not a band.
 ///
@@ -831,11 +961,11 @@ pub enum RowKind {
     /// The tempo and meter map, above the tracks. One row, whatever the
     /// song's shape: tempo is a property of the SONG and not of a channel.
     Tempo,
-    /// An automation curve under the track it belongs to.
-    /// An automation curve under the track it belongs to. `usize` is the
-    /// channel; the second is WHICH of its open rows, counting down from the
-    /// track — a lane can show several parameters at once now.
-    Automation(usize, usize),
+    /// An automation curve under the track it belongs to. The first field is
+    /// whose (a track's row, or the master); the second is WHICH of its open
+    /// rows, counting down from the track — a lane can show several
+    /// parameters at once now.
+    Automation(LaneId, usize),
     /// **The MASTER, above the tracks.**
     ///
     /// The desk draws a strip for it and the timeline drew none, so a
@@ -862,39 +992,25 @@ pub enum RowKind {
 /// the title roughly one character.
 pub const FOLDER_INDENT: f32 = 10.0;
 
-/// **The lane number the MASTER's automation rows answer to.**
-///
-/// One past the channels, so it can never collide with one, and so a single
-/// `RowKind::Automation(lane, slot)` still describes every automation row on
-/// the timeline. The alternative was a second row kind, which would have
-/// forked the layout, the paint, the hit test, the selection, the clipboard
-/// and the keyboard — six places to keep in step for one bus.
-pub const MASTER_LANE: usize = CHANNELS;
-
 /// The `AutoView` for a row, wherever it lives.
 ///
 /// One lookup, because `lanes` holds the channels and the master's rows sit
 /// beside it — and a caller that reached for `lanes[lane]` directly would
-/// silently find nothing for the master and draw an empty row.
+/// silently find nothing for the master and draw an empty row. The master
+/// is [`LaneId::Master`], one `RowKind::Automation` still describes every
+/// automation row on the timeline, and nothing forks.
 pub fn auto_view_of<'a>(
     view: &'a ArrangeView<'a>,
-    lane: usize,
+    lane: LaneId,
     slot: usize,
 ) -> Option<&'a AutoView<'a>> {
-    if lane == MASTER_LANE {
-        return view.master_automation.get(slot);
+    match lane {
+        LaneId::Master => view.master_automation.get(slot),
+        // The CHANNELS' own table. Deliberately spelled out rather than
+        // routed back through this function — that is infinite recursion,
+        // and was.
+        LaneId::Row(row) => view.lanes.get(row).and_then(|l| l.automation.get(slot)),
     }
-    // The CHANNELS' own table. Deliberately spelled out rather than routed
-    // back through this function — that is infinite recursion, and was.
-    view.lanes.get(lane).and_then(|l| l.automation.get(slot))
-}
-
-/// How many automation rows a lane is showing, master included.
-fn auto_rows_of(view: &ArrangeView<'_>, lane: usize) -> usize {
-    if lane == MASTER_LANE {
-        return view.master_automation.len();
-    }
-    view.lanes.get(lane).map_or(0, |l| l.automation.len())
 }
 
 /// **How much of a folder's row counts as its bottom EDGE** — the strip a
@@ -972,10 +1088,62 @@ pub struct Layout {
     /// rather than computed twice, so the two cannot disagree about where a
     /// row is — which is the failure a parallel layout would have.
     pub rows: Vec<Row>,
-    pub lane_rows: [Rect; CHANNELS],
-    pub header_rows: [HeaderRow; CHANNELS],
+    pub lane_rows: ByRow<Rect>,
+    pub header_rows: ByRow<HeaderRow>,
     /// The master's header cells. `NONE` when the row is hidden.
     pub master_row: BusRow,
+    /// **The lane scrollbar** down the lanes' right edge, `LaneBar::NONE`
+    /// when every lane fits. See [`LaneBar`].
+    pub lane_bar: LaneBar,
+}
+
+/// **A thin scrollbar down the lanes: where the window stands among the
+/// tracks, and a handle to move it.**
+///
+/// The wheel over the headers was the only way down a desk taller than the
+/// window, and nothing said how many lanes were below. A desk that grows by
+/// appending needs both (docs/design/unlimited-tracks.md, section 10). The
+/// track is every row of the desk, the thumb the rows on screen; it stands
+/// right of the lanes, where every timeline keeps it, and a press on it is
+/// the bar's (see [`lane_bar_grab`]).
+///
+/// **Beside the lanes, never on them.** It was laid inside the lanes'
+/// right edge, and the press the bar claims first took the last few points
+/// of every lane: a clip running off the window's right edge is clamped
+/// there, so its right trim zone and fade-out corner sat wholly under the
+/// bar, and a press meant to trim scrolled the lanes instead. The bar has
+/// its own gutter now ([`LANE_GUTTER`]), taken out of the lanes area while
+/// the bar shows, so nothing a lane draws or answers lies under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LaneBar {
+    /// Every row of the desk, laid down the lanes' right edge.
+    pub track: Rect,
+    /// The rows on screen, where they stand.
+    pub thumb: Rect,
+    /// The scroll, in rows, that puts the thumb at the bottom.
+    pub max_rows: usize,
+}
+
+impl LaneBar {
+    /// No bar: every lane fits.
+    pub const NONE: Self = Self { track: Rect::NOTHING, thumb: Rect::NOTHING, max_rows: 0 };
+}
+
+/// The bar's width and its shortest thumb.
+const LANE_BAR_W: f32 = 5.0;
+const LANE_BAR_MIN: f32 = 18.0;
+/// **The bar's gutter**: the strip right of the lanes it stands in, one
+/// point clear of the lanes and of the window's edge.
+pub const LANE_GUTTER: f32 = LANE_BAR_W + 2.0;
+
+/// **Whether the lane scrollbar shows**: the desk is taller than the window
+/// of lanes. Kept beside [`lane_window_start`], whose clamps it reads, so
+/// the frame (which reserves the gutter) and the layout (which draws the
+/// bar) cannot disagree.
+pub fn lane_bar_shown(visible_lanes: usize, active: usize) -> bool {
+    let active = active.max(1);
+    let (_, visible) = lane_window_start(0, visible_lanes, active);
+    visible < active
 }
 
 
@@ -1132,6 +1300,80 @@ impl BusRow {
     }
 }
 
+/// **Something per placed row, looked up by row.** Only the rows the layout
+/// placed are in it, so a walk is O(visible); a row it did not place answers
+/// the same "not here" its slot in the old full-width array held (`NOTHING`,
+/// `HeaderRow::NONE`) when indexed, and `None` from [`ByRow::get`].
+#[derive(Debug, Clone)]
+pub struct ByRow<T>(Vec<(usize, T)>);
+
+impl<T> Default for ByRow<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> ByRow<T> {
+    /// What the layout placed for a row.
+    pub fn get(&self, row: usize) -> Option<&T> {
+        self.0
+            .binary_search_by_key(&row, |(r, _)| *r)
+            .ok()
+            .map(|k| &self.0[k].1)
+    }
+
+    /// Every placed row, top to bottom, with what was placed for it.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.0.iter().map(|(r, t)| (*r, t))
+    }
+
+    /// The first placed row, top down, whose entry answers `pred`.
+    pub fn find_row(&self, mut pred: impl FnMut(&T) -> bool) -> Option<usize> {
+        self.0.iter().find(|(_, t)| pred(t)).map(|(r, _)| *r)
+    }
+
+    /// How many rows were placed.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no row was placed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+static NO_RECT: Rect = Rect::NOTHING;
+static NO_HEADER: HeaderRow = HeaderRow::NONE;
+
+impl std::ops::Index<usize> for ByRow<Rect> {
+    type Output = Rect;
+    fn index(&self, row: usize) -> &Rect {
+        self.get(row).unwrap_or(&NO_RECT)
+    }
+}
+
+impl std::ops::Index<usize> for ByRow<HeaderRow> {
+    type Output = HeaderRow;
+    fn index(&self, row: usize) -> &HeaderRow {
+        self.get(row).unwrap_or(&NO_HEADER)
+    }
+}
+
+/// **The rows a timeline scrolled to `lane_scroll` places**: the first row
+/// it lays out, and how many TRACK rows it can show at most.
+///
+/// The layout's own arithmetic, shared with the app so the window of lanes
+/// it builds is the window the layout reads: the scroll is a ROW and is
+/// clamped so the last `visible` rows of the desk can always fill the view.
+/// Rect-free, because the rows that do not fit are dropped by height in the
+/// layout and the window only needs to cover the most that could fit.
+pub fn lane_window_start(lane_scroll: usize, visible_lanes: usize, active: usize) -> (usize, usize) {
+    let active = active.max(1);
+    let visible = visible_lanes.clamp(1, active).min(VISIBLE_MAX);
+    (lane_scroll.min(active.saturating_sub(visible)), visible)
+}
+
 impl Layout {
     /// The row a point falls in, if any.
     pub fn row_at(&self, pos: Pos2) -> Option<Row> {
@@ -1260,8 +1502,11 @@ pub struct Frame {
 
 impl Layout {
     /// See [`Frame`]. `header_w` is `ArrangeView::header_w`: a dragged width,
-    /// or `None` for the automatic share.
-    pub fn frame(rect: Rect, header_w: Option<f32>) -> Frame {
+    /// or `None` for the automatic share. `lane_bar` is [`lane_bar_shown`]
+    /// for the view: the bar's gutter comes out of the lanes, the ruler and
+    /// the chip strip with them, so a time read off the ruler and one read
+    /// off a lane are the same span.
+    pub fn frame(rect: Rect, header_w: Option<f32>, lane_bar: bool) -> Frame {
         if !rect.is_positive() {
             return Frame {
                 header: Rect::NOTHING,
@@ -1308,9 +1553,12 @@ impl Layout {
         // the playhead to the start, which keeps the generous
         // back-to-bar-one target the gutter used to provide.
         let field_x = rect.left() + header_w + GRIP_W;
+        // Never left of the field's start: a window too narrow for the
+        // gutter keeps an empty field, not an inverted one.
+        let field_r = if lane_bar { (rect.right() - LANE_GUTTER).max(field_x) } else { rect.right() };
         let ruler = Rect::from_min_max(
             Pos2::new(field_x, rect.top()),
-            Pos2::new(rect.right(), rect.top() + ruler_h),
+            Pos2::new(field_r, rect.top() + ruler_h),
         );
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
@@ -1332,7 +1580,7 @@ impl Layout {
         };
         let lanes_area = Rect::from_min_max(
             Pos2::new(field_x, rect.top() + ruler_h),
-            rect.max,
+            Pos2::new(field_r, rect.bottom()),
         );
         let grip = Rect::from_min_max(
             Pos2::new(rect.left() + header_w, rect.top()),
@@ -1355,21 +1603,34 @@ impl Layout {
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
                 rows: Vec::new(),
-                lane_rows: [Rect::NOTHING; CHANNELS],
-                header_rows: [HeaderRow::NONE; CHANNELS],
+                lane_rows: ByRow::default(),
+                header_rows: ByRow::default(),
                 master_row: BusRow::NONE,
+                lane_bar: LaneBar::NONE,
             };
         }
         // The frame first — see [`Frame`] for why it is its own step.
         let Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h } =
-            Self::frame(rect, view.header_w);
+            Self::frame(rect, view.header_w, lane_bar_shown(view.visible_lanes, view.active));
         // **Eight lanes show; the rest scroll.** The desk grew past what
         // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
         // and `view.lane_scroll` chooses which window shows. A lane outside
         // the window is `NOTHING` — not drawn, not hit, and clips on it
         // resolve to nothing through `clip_rect`'s `is_positive` filter.
-        let active = view.active.clamp(1, CHANNELS);
-        let visible = view.visible_lanes.clamp(1, active);
+        let active = view.active.max(1);
+        let (first, visible) = lane_window_start(view.lane_scroll, view.visible_lanes, active);
+        // The lanes this layout can place: the drawn rows from `first` down,
+        // never past the desk. The view carries a window that starts here
+        // (or a whole desk, for a picture of the song); a lane inside a SHUT
+        // folder is not laid out at all: no row, so nothing is drawn,
+        // nothing is hit, and its clips resolve to nothing through
+        // `clip_rect`'s own `is_positive` filter — the same road a
+        // scrolled-off lane already takes.
+        let placeable = || {
+            view.lanes
+                .rows()
+                .filter(move |(i, l)| *i >= first && *i < active && !l.hidden)
+        };
         // **The bus rows are ADDED to the stack, not taken out of it.**
         //
         // The master and the click are half a track each — one track's
@@ -1378,7 +1639,6 @@ impl Layout {
         // lane showed none at all. `visible` still means TRACKS; the pair
         // costs every track a slice of its height instead, which is the same
         // bargain an open automation row already makes.
-        let first = view.lane_scroll.min(active.saturating_sub(visible));
         // **Automation rows shrink the tracks until they have cost a whole
         // one, and then a track leaves.**
         //
@@ -1407,20 +1667,19 @@ impl Layout {
             } else {
                 0.0
             };
-            ((first..CHANNELS)
-                .filter(|i| !view.lanes.get(*i).is_some_and(|l| l.hidden))
+            (placeable()
                 .take(shown)
-                .map(|i| view.lanes.get(i).map_or(0, |l| l.automation.len()) as f32)
+                .map(|(_, l)| l.automation.len() as f32)
                 .sum::<f32>()
                 + master)
                 * AUTO_LANE_SHARE
         };
         // Settles: evicting a track can only REMOVE automation from the
         // count, which can only let tracks back in, so `shown` walks down
-        // and stops. Bounded by the channel count regardless.
+        // and stops. Bounded by the window regardless.
         let mut shown = visible;
         let mut auto_share = auto_of(shown);
-        for _ in 0..CHANNELS {
+        for _ in 0..=visible {
             let want = visible.saturating_sub(auto_share.floor() as usize).max(1);
             if want >= shown {
                 break;
@@ -1448,7 +1707,7 @@ impl Layout {
         // A row that would hang off the bottom of the area is `NOTHING`, the
         // same as a scrolled-off lane always was — not drawn, not hit, and
         // clips on it resolve to nothing through `clip_rect`'s filter.
-        let mut rows: Vec<Row> = Vec::with_capacity(CHANNELS + 1);
+        let mut rows: Vec<Row> = Vec::with_capacity(2 * visible + 4);
         let mut y = lanes_area.top();
         let push = |kind: RowKind, h: f32, y: &mut f32, rows: &mut Vec<Row>| {
             let bottom = *y + h;
@@ -1503,67 +1762,83 @@ impl Layout {
                 }
             }
             // **Its automation hangs under it**, exactly as a track's does,
-            // and by the same row kind — see `MASTER_LANE`.
+            // and by the same row kind — see `LaneId::Master`.
             for slot in 0..view.master_automation.len() {
                 push(
-                    RowKind::Automation(MASTER_LANE, slot),
+                    RowKind::Automation(LaneId::Master, slot),
                     lane_h * AUTO_LANE_SHARE,
                     &mut y,
                     &mut rows,
                 );
             }
         }
-        for i in first..active {
-            // A track inside a SHUT folder is not laid out at all: no row, so
-            // nothing is drawn, nothing is hit, and its clips resolve to
-            // nothing through `clip_rect`'s own `is_positive` filter — the
-            // same road a scrolled-off lane already takes.
-            if view.lanes.get(i).is_some_and(|l| l.hidden) {
-                continue;
-            }
+        // **Only as many tracks as could ever fit**, plus one: the rows past
+        // the window's height were pushed as `NOTHING` and never drawn, so a
+        // desk of any length lays out in O(visible). `shown` cannot exceed
+        // `visible`, and the one past it is the row that proves the stack
+        // ends flush.
+        let mut lane_rows = Vec::with_capacity(visible + 1);
+        let mut header_rows = Vec::with_capacity(visible + 1);
+        for (i, lane) in placeable().take(visible + 1) {
+            let at = rows.len();
             push(RowKind::Track(i), lane_h, &mut y, &mut rows);
+            // **A rank lookup, not a search**: the row just pushed is this
+            // lane's, so its rectangles are read where they were written
+            // rather than found again by a walk over every row.
+            let row = rows[at];
+            lane_rows.push((i, row.lane));
+            header_rows.push((
+                i,
+                if row.header.is_positive() {
+                    Self::header_row(
+                        row.header,
+                        lane.used,
+                        if lane.in_folder { FOLDER_INDENT } else { 0.0 },
+                        lane.is_folder,
+                    )
+                } else {
+                    HeaderRow::NONE
+                },
+            ));
             // One row per parameter this lane is showing, in the order the
             // view lists them — which is the order the menu offers them, so
             // the rows and the menu read the same way down.
-            let shown = auto_rows_of(view, i);
-            for slot in 0..shown {
+            for slot in 0..lane.automation.len() {
                 push(
-                    RowKind::Automation(i, slot),
+                    RowKind::Automation(LaneId::Row(i), slot),
                     lane_h * AUTO_LANE_SHARE,
                     &mut y,
                     &mut rows,
                 );
             }
         }
-
-        let lane_of = |want: usize| {
-            rows.iter()
-                .find(|r| r.kind == RowKind::Track(want))
-                .map_or(Rect::NOTHING, |r| r.lane)
-        };
-        let header_of = |want: usize| {
-            rows.iter()
-                .find(|r| r.kind == RowKind::Track(want))
-                .map_or(Rect::NOTHING, |r| r.header)
-        };
         let master_row = rows
             .iter()
             .find(|r| r.kind == RowKind::Master)
             .filter(|r| r.header.is_positive())
             .map_or(BusRow::NONE, |r| BusRow::of(r.header));
-        let lane_rows = std::array::from_fn(lane_of);
-        let header_rows = std::array::from_fn(|i| {
-            let row = header_of(i);
-            let Some(lane) = view.lanes.get(i).filter(|_| row.is_positive()) else {
-                return HeaderRow::NONE;
-            };
-            Self::header_row(
-                row,
-                lane.used,
-                if lane.in_folder { FOLDER_INDENT } else { 0.0 },
-                lane.is_folder,
-            )
-        });
+        let lane_rows = ByRow(lane_rows);
+        let header_rows = ByRow(header_rows);
+        // **The bar, when the desk is taller than the window**: the thumb is
+        // the window's share of the rows, at the scroll's share of its range.
+        let max_rows = active.saturating_sub(visible);
+        let lane_bar = if max_rows > 0 && lanes_area.is_positive() {
+            // In the gutter the frame left for it, one point off the lanes.
+            let track = Rect::from_min_max(
+                Pos2::new(lanes_area.right() + 1.0, lanes_area.top()),
+                Pos2::new(lanes_area.right() + 1.0 + LANE_BAR_W, lanes_area.bottom()),
+            );
+            let h = (track.height() * visible as f32 / active as f32)
+                .clamp(LANE_BAR_MIN.min(track.height()), track.height());
+            let y = track.top() + (track.height() - h) * (first as f32 / max_rows as f32);
+            LaneBar {
+                track,
+                thumb: Rect::from_min_size(Pos2::new(track.left(), y), Vec2::new(LANE_BAR_W, h)),
+                max_rows,
+            }
+        } else {
+            LaneBar::NONE
+        };
         // **The toolbar, in the corner cell** — the room above the track
         // list, before the ruler's first tick. Four small controls: the
         // click, the magnet, the tempo lane's switch, and the grid box the
@@ -1642,6 +1917,7 @@ impl Layout {
             lane_rows,
             header_rows,
             master_row,
+            lane_bar,
         }
     }
 
@@ -3248,24 +3524,24 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
     // **The bus rows first**, before the tracks: they sit above them and a
     // press on one must not fall through to the lane beneath.
     if l.master_row.automation.is_positive() && l.master_row.automation.contains(pos) {
-        return Some(Hit::AutoMenu(MASTER_LANE));
+        return Some(Hit::AutoMenu(LaneId::Master));
     }
     if l.master_row.knob.is_positive() && l.master_row.knob.contains(pos) {
-        return Some(Hit::BusGain(MASTER_COLUMN));
+        return Some(Hit::BusGain(Column::Master));
     }
     for (b, cell) in l.master_row.bays.iter().enumerate() {
         if cell.is_positive() && cell.contains(pos) {
-            return Some(Hit::BusBay(MASTER_COLUMN, b));
+            return Some(Hit::BusBay(Column::Master, b));
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
             (row.mute, Hit::Mute(i)),
             (row.phase, Hit::Phase(i)),
             (row.solo, Hit::Solo(i)),
             (row.theory, Hit::ToTheory(i)),
-            (row.automation, Hit::AutoMenu(i)),
+            (row.automation, Hit::AutoMenu(LaneId::Row(i))),
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
@@ -3522,7 +3798,7 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
         }
         return Some(Hit::ClipBody(clip.id));
     }
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         if row.is_positive() && row.contains(pos) {
             return Some(Hit::Lane(i, time_at_in(l, view, pos.x)));
         }
@@ -3537,6 +3813,61 @@ pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit>
     None
 }
 
+
+/// **The lane a hovering file would land on**, where it is drawn, or
+/// `None` when no file hovers or its lane is not on screen.
+///
+/// By ROW: `drop_lane` is the lane the drop lands on, which is what the
+/// layout's rows are keyed by. It was read relative to the scroll
+/// (`drop_lane - lane_scroll` into the rows), so a scrolled timeline lit a
+/// lane `lane_scroll` rows away from the one the file would land on, and
+/// usually lit nothing at all.
+pub fn drop_lane_rect(l: &Layout, view: &ArrangeView<'_>) -> Option<Rect> {
+    view.drop_lane
+        .and_then(|target| l.lane_rows.get(target).copied())
+        .filter(|r| r.is_positive())
+}
+
+/// **A press on the lane scrollbar**: where on the thumb the hand took it,
+/// or `None` when the press is not on the bar. A press on the thumb keeps
+/// its grip; a press beside it centres the thumb under the hand, so the
+/// lanes jump to where it was pressed. The whole gutter and a little past
+/// the window's edge, because five points is a line to look at and not a
+/// target to hit; never a point of the lanes, which belong to the clips,
+/// nodes and points drawn there (see [`LaneBar`]).
+pub fn lane_bar_grab(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<f32> {
+    let l = Layout::new(rect, view);
+    let bar = l.lane_bar;
+    if !bar.track.is_positive() {
+        return None;
+    }
+    let band = Rect::from_min_max(
+        Pos2::new(l.lanes_area.right(), bar.track.top()),
+        Pos2::new(bar.track.right() + 3.0, bar.track.bottom()),
+    );
+    // Strictly right of the lanes: their last point is a lane's.
+    if pos.x <= l.lanes_area.right() || !band.contains(pos) {
+        return None;
+    }
+    Some(if bar.thumb.y_range().contains(pos.y) {
+        pos.y - bar.thumb.top()
+    } else {
+        bar.thumb.height() * 0.5
+    })
+}
+
+/// **The lane scroll with the hand at `pos`**, holding the thumb `grab`
+/// points below its top: the first row shown, clamped to the desk. `None`
+/// when there is no bar.
+pub fn lane_bar_scroll(rect: Rect, view: &ArrangeView<'_>, pos: Pos2, grab: f32) -> Option<usize> {
+    let bar = Layout::new(rect, view).lane_bar;
+    let travel = bar.track.height() - bar.thumb.height();
+    if !bar.track.is_positive() || travel <= 0.0 {
+        return None;
+    }
+    let t = ((pos.y - grab - bar.track.top()) / travel).clamp(0.0, 1.0);
+    Some((t * bar.max_rows as f32).round() as usize)
+}
 
 /// **Every DISCRETE control on the timeline, in reading order.**
 ///
@@ -3576,10 +3907,10 @@ pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     ] {
         push(r, hit);
     }
-    push(l.master_row.automation, Hit::AutoMenu(MASTER_LANE));
-    push(l.master_row.knob, Hit::BusGain(MASTER_COLUMN));
+    push(l.master_row.automation, Hit::AutoMenu(LaneId::Master));
+    push(l.master_row.knob, Hit::BusGain(Column::Master));
     for (b, cell) in l.master_row.bays.iter().enumerate() {
-        push(*cell, Hit::BusBay(MASTER_COLUMN, b));
+        push(*cell, Hit::BusBay(Column::Master, b));
     }
     for row in &l.rows {
         match row.kind {
@@ -3606,7 +3937,7 @@ pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     (hdr.collapse, Hit::HdrCollapse(i)),
                     (hdr.arm, Hit::Arm(i)),
                     (hdr.theory, Hit::ToTheory(i)),
-                    (hdr.automation, Hit::AutoMenu(i)),
+                    (hdr.automation, Hit::AutoMenu(LaneId::Row(i))),
                     (hdr.add, Hit::HdrAdd(i)),
                     (hdr.name, Hit::HdrName(i)),
                     (hdr.input, Hit::HdrInput(i)),
@@ -3700,17 +4031,21 @@ pub fn a11y_nodes_from(
     // The name a person would use for a row, whether or not it is a track
     // yet. Never an empty string — a node labelled "" is a node a reader
     // announces as nothing at all.
-    let who = |i: usize| -> String {
-        // The bus first: `MASTER_LANE` is one PAST the lanes array, so the
-        // lookup below finds nothing there and the fallback would name the
-        // master "Track 17" — which is what a reader heard on every master
-        // automation row. The same word the bus row's own labels use.
-        if i == MASTER_LANE {
-            return "Master".to_owned();
-        }
+    let who_row = |i: usize| -> String {
         match view.lanes.get(i) {
             Some(l) if !l.name.is_empty() => l.name.to_owned(),
             _ => format!("Track {}", i + 1),
+        }
+    };
+    // The bus has a word of its own: when the master was addressed as the
+    // lane one past the channels, the row lookup found nothing there and
+    // the fallback named it "Track 17", which is what a reader heard on
+    // every master automation row. The same word the bus row's own labels
+    // use.
+    let who = |lane: LaneId| -> String {
+        match lane {
+            LaneId::Master => "Master".to_owned(),
+            LaneId::Row(i) => who_row(i),
         }
     };
     // Where a clip sits, in the bars the ruler prints — never in seconds.
@@ -3770,10 +4105,12 @@ pub fn a11y_nodes_from(
                     _ => "Unnamed marker, go to it".to_owned(),
                 },
             ),
+            // By NAME, like every other header control: "Track 3" read a
+            // renamed track by its seat.
             Hit::Phase(i) => Node::toggle(
                 id,
                 r,
-                &format!("Track {} polarity invert", i + 1),
+                &format!("{} polarity invert", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.phase),
             ),
             // `who(i)`, not "track {i+1}": the hardcoded number called the
@@ -3822,39 +4159,39 @@ pub fn a11y_nodes_from(
             Hit::Arm(i) => Node::toggle(
                 id,
                 r,
-                format!("{} record arm", who(i)),
+                format!("{} record arm", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.armed),
             ),
             Hit::Mute(i) => Node::toggle(
                 id,
                 r,
-                format!("{} mute", who(i)),
+                format!("{} mute", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.muted),
             ),
             Hit::Solo(i) => Node::toggle(
                 id,
                 r,
-                format!("{} solo", who(i)),
+                format!("{} solo", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.soloed),
             ),
             Hit::ToTheory(i) => Node::toggle(
                 id,
                 r,
-                format!("{} sends its MIDI to the theory view", who(i)),
+                format!("{} sends its MIDI to the theory view", who_row(i)),
                 view.lanes.get(i).is_some_and(|l| l.to_theory),
             ),
             Hit::HdrCollapse(i) => Node::toggle(
                 id,
                 r,
-                format!("{} shows its tracks", who(i)),
+                format!("{} shows its tracks", who_row(i)),
                 !view.lanes.get(i).is_some_and(|l| l.folder_shut),
             ),
             Hit::HdrAdd(i) => Node::button(id, r, format!("Add a track at row {}", i + 1)),
-            Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who(i)), who(i)),
+            Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who_row(i)), who_row(i)),
             Hit::HdrInput(i) => Node::readout(
                 id,
                 r,
-                format!("{} input", who(i)),
+                format!("{} input", who_row(i)),
                 match view.lanes.get(i) {
                     Some(l) if !l.input.is_empty() => l.input.clone(),
                     _ => "none".to_owned(),
@@ -3869,7 +4206,7 @@ pub fn a11y_nodes_from(
                 Node::readout(
                     id,
                     r,
-                    format!("{} insert {}", who(i), bay + 1),
+                    format!("{} insert {}", who_row(i), bay + 1),
                     match (what.is_empty(), off) {
                         (true, _) => "empty".to_owned(),
                         (false, true) => format!("{what}, bypassed"),
@@ -3877,7 +4214,7 @@ pub fn a11y_nodes_from(
                     },
                 )
             }
-            Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who(i))),
+            Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who_row(i))),
             // The two rows above the tracks. Their level is the desk's own,
             // so it reads in the desk's own words.
             Hit::BusBay(_, slot) => {
@@ -3917,7 +4254,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} volume", who(i)),
+                    format!("{} volume", who_row(i)),
                     f64::from(g),
                     0.0,
                     1.0,
@@ -3932,7 +4269,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} send", who(i)),
+                    format!("{} send", who_row(i)),
                     f64::from(s),
                     0.0,
                     1.0,
@@ -3945,7 +4282,7 @@ pub fn a11y_nodes_from(
                 Node::slider(
                     id,
                     r,
-                    format!("{} pan", who(i)),
+                    format!("{} pan", who_row(i)),
                     f64::from(p),
                     -1.0,
                     1.0,
@@ -3964,7 +4301,7 @@ pub fn a11y_nodes_from(
                     continue;
                 };
                 let name = if c.name.is_empty() { "Untitled" } else { c.name };
-                let mut says = format!("{}, {}", bars(c.start_s, c.len_s), who(c.lane));
+                let mut says = format!("{}, {}", bars(c.start_s, c.len_s), who_row(c.lane));
                 if c.midi {
                     says.push_str(", MIDI");
                 }
@@ -4836,8 +5173,8 @@ fn bar_step(view: &ArrangeView<'_>, width: f32) -> u32 {
 /// moves is the contents. One function because THREE callers need the same
 /// rect — the paint, the hit test and the tab order — and a hit test that
 /// disagrees with the paint is a control you can see and cannot press.
-fn auto_cells(view: &ArrangeView<'_>, lane: usize, header: Rect) -> AutoHeader {
-    let indent = if view.lanes.get(lane).is_some_and(|l| l.in_folder) {
+fn auto_cells(view: &ArrangeView<'_>, lane: LaneId, header: Rect) -> AutoHeader {
+    let indent = if lane.row().and_then(|r| view.lanes.get(r)).is_some_and(|l| l.in_folder) {
         FOLDER_INDENT
     } else {
         0.0
@@ -5025,7 +5362,7 @@ fn draw_auto_headers(
 /// moved away from it on purpose. A seam that kept the lane's figure was a
 /// line at 1.01:1 against the surface under it on half the themes: drawn,
 /// and not there.
-fn auto_seam(p: &Ink, lane: usize) -> Color32 {
+fn auto_seam(p: &Ink, lane: LaneId) -> Color32 {
     separate(auto_ground(p, lane), 0.22)
 }
 
@@ -5036,7 +5373,7 @@ fn auto_header_seam(p: &Ink) -> Color32 {
     separate(shade(p.hdr_face, 0.92), 0.22)
 }
 
-fn auto_ground(p: &Ink, lane: usize) -> Color32 {
+fn auto_ground(p: &Ink, lane: LaneId) -> Color32 {
     // Character first, then DISTANCE. The blend gives the row the ruler's
     // hue so it reads as a strip about something other than a track; on the
     // themes whose ruler already sits near the lane that blend alone changed
@@ -5052,7 +5389,7 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     //
     // Two answers per frame, not one per row per loop: the base is the
     // lane's stripe, and there are two stripes. `ink` derives both.
-    p.auto_ground[lane % 2]
+    p.auto_ground[lane.ground()]
 }
 
 /// **The colour a detected attack is marked in.** Amber, and not the
@@ -5250,7 +5587,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     painter.rect_filled(rect, 0.0, p.wood);
 
     // ── the lanes' field, striped so eight rows read as eight ─────────────
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         painter.rect_filled(*row, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
     }
     // **An automation row takes the ground of the track it belongs to**, a
@@ -5494,7 +5831,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // ── every channel boundary wears a SEAM — header through field, one
     // line, drawn over the grid so it survives the lines running through
     // it. Empty lanes keep the stronger slot treatment below. ─────────────
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         let left = l
             .header_rows
             .get(i)
@@ -5512,20 +5849,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     //
     // Drawn UNDER the clips and over the field, so it reads as the lane
     // lighting up rather than as something laid on top of the music.
-    if let Some(target) = view.drop_lane {
-        if let Some(row) = target
-            .checked_sub(view.lane_scroll)
-            .and_then(|i| l.lane_rows.get(i))
-            .filter(|r| r.is_positive())
-        {
-            painter.rect_filled(*row, 0.0, p.select.gamma_multiply(0.16));
-            painter.rect_stroke(
-                *row,
-                0.0,
-                Stroke::new(1.5_f32, p.select.gamma_multiply(0.85)),
-                egui::StrokeKind::Inside,
-            );
-        }
+    if let Some(row) = drop_lane_rect(&l, view) {
+        painter.rect_filled(row, 0.0, p.select.gamma_multiply(0.16));
+        painter.rect_stroke(
+            row,
+            0.0,
+            Stroke::new(1.5_f32, p.select.gamma_multiply(0.85)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     // ── the automation curves ─────────────────────────────────────────────
@@ -5545,9 +5876,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let Some(auto) = auto_view_of(view, lane, slot) else {
             continue;
         };
-        let (cr, cg, cb) = STRIP_COLORS[view
-            .lanes
-            .get(lane)
+        let (cr, cg, cb) = STRIP_COLORS[lane
+            .row()
+            .and_then(|r| view.lanes.get(r))
             .map_or(0, |v| v.color)
             .min(STRIP_COLORS.len() - 1)];
         // The same surface the row was filled with — one function, so the
@@ -5994,13 +6325,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // out the first time a clip on it is drawn and read back for the rest:
     // the dead-zone guard is a contrast walk of up to fifty steps, and a
     // lane full of clips paid it once per clip.
-    let mut lane_ink: [Option<(Color32, Color32)>; CHANNELS] = [None; CHANNELS];
+    // Keyed by row, and only for the lanes that have a clip on screen, so
+    // a desk of any length pays for what it draws.
+    let mut lane_ink: std::collections::HashMap<usize, (Color32, Color32)> =
+        std::collections::HashMap::new();
     for clip in view.clips {
         let r = clip_rect_in(&l, view, clip);
         if !r.is_positive() {
             continue;
         }
-        let (color, clip_ink) = match lane_ink.get(clip.lane).copied().flatten() {
+        let (color, clip_ink) = match lane_ink.get(&clip.lane).copied() {
             Some(pair) => pair,
             None => {
                 // Through the dead-zone guard, like the strip and the header
@@ -6028,9 +6362,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // staff, wave, fades, handles — takes this ink, so the clip
                 // cannot half-agree with itself.
                 let pair = (color, on_ink(color));
-                if let Some(slot) = lane_ink.get_mut(clip.lane) {
-                    *slot = Some(pair);
-                }
+                lane_ink.insert(clip.lane, pair);
                 pair
             }
         };
@@ -6252,7 +6584,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // mute clearly off reads as a fault, so the lane says it plainly. The
     // FOLDER dims too: it is silent for the same reason and a group half
     // dimmed would look like a bug in the dimming.
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
             continue;
         };
@@ -6261,7 +6593,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_filled(*row, 0.0, Color32::from_black_alpha(96));
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
             continue;
         };
@@ -6283,7 +6615,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         painter.rect_filled(row.lane, 0.0, FROST_TINT);
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         if !view.lanes.get(i).is_some_and(|v| v.frozen) || !row.panel.is_positive() {
             continue;
         }
@@ -6577,7 +6909,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             }
         }
     }
-    for (i, row) in l.header_rows.iter().enumerate() {
+    for (i, row) in l.header_rows.iter() {
         let Some(lane) = view.lanes.get(i) else { continue };
         // The strip's own colour as a plate behind the header, the mixer's
         // rule: any colour, and the text still reads. Through the dead-zone
@@ -7251,6 +7583,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
     }
 
+    // ── the lane scrollbar, over the lanes' right edge ────────────────────
+    if l.lane_bar.track.is_positive() {
+        painter.rect_filled(l.lane_bar.track, LANE_BAR_W * 0.5, p.face.gamma_multiply(0.18));
+        painter.rect_filled(l.lane_bar.thumb, LANE_BAR_W * 0.5, p.face.gamma_multiply(0.7));
+    }
+
     // ── the EMPTY SLOTS' borders, LAST — nothing may paint over them ──────
     // Third round on these, and the lesson was paint ORDER, not ink: the
     // header section begins by filling its whole column with wood, and the
@@ -7259,7 +7597,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // drawn. Painted here, on top of everything, each unoccupied slot is
     // one channel-shaped box — header through field — in faded face ink
     // that reads on both palettes.
-    for (i, row) in l.lane_rows.iter().enumerate() {
+    for (i, row) in l.lane_rows.iter() {
         if view.lanes.get(i).is_some_and(|lane| lane.used) {
             continue;
         }
@@ -7659,6 +7997,7 @@ mod tests {
         }
     }
     use super::*;
+    use crate::recorder::CHANNELS;
 
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
@@ -8399,7 +8738,7 @@ ArrangeView {
             time_sel: None,
             selected_channel: None,
             selected_tracks: &[],
-            lanes: std::array::from_fn(|i| a_lane(i < 3)),
+            lanes: Lanes::dense((0..CHANNELS).map(|i| a_lane(i < 3)).collect()),
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
             active: CHANNELS,
@@ -9013,7 +9352,7 @@ ArrangeView {
             let row = l
                 .rows
                 .iter()
-                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .find(|x| x.kind == RowKind::Automation(LaneId::Row(0), 0))
                 .expect("no automation row")
                 .lane;
             let out = ctx.run(
@@ -9114,7 +9453,7 @@ ArrangeView {
         // row and pressing it must not move the playhead.
         assert_eq!(
             hit_test(r, &v, l.master_row.knob.center()),
-            Some(Hit::BusGain(MASTER_COLUMN)),
+            Some(Hit::BusGain(Column::Master)),
             "the master fader was swallowed by the field"
         );
 
@@ -9156,7 +9495,7 @@ ArrangeView {
             let row = l
                 .rows
                 .iter()
-                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .find(|x| x.kind == RowKind::Automation(LaneId::Row(0), 0))
                 .unwrap_or_else(|| panic!("no automation row at {hh}"));
             let cells = auto_header(row.header);
             let out = ctx.run(
@@ -9307,10 +9646,12 @@ ArrangeView {
         assert!(knob.is_positive(), "the master's row has no level");
         assert_eq!(
             hit_test(rect(), &v, knob.center()),
-            Some(Hit::BusGain(MASTER_COLUMN)),
+            Some(Hit::BusGain(Column::Master)),
             "the master's level cannot be pressed"
         );
-        assert_eq!(MASTER_COLUMN, CHANNELS + 1);
+        // (It answers the master's COLUMN by name: it was `CHANNELS + 1`, a
+        // number that moved whenever the desk grew, pinned here by an
+        // equality that is now the type itself.)
 
         // **Hidden, and the tracks take the room back.** Not removed: a
         // session always has an output.
@@ -9565,7 +9906,7 @@ ArrangeView {
     }
 
     /// **The master's automation rows say "Master", not "Track 17".** The
-    /// bus is addressed as lane `MASTER_LANE`, one past the lanes array, so
+    /// bus was addressed as the lane one past the lanes array, so
     /// every label site that indexed `lanes` or printed `i + 1` directly
     /// misnamed it to a reader — and the param row went further, reading a
     /// bound parameter as "none" because the inline lookup found no lane
@@ -9603,7 +9944,9 @@ ArrangeView {
         assert!(has("Hide automation row 1 on Master"), "the close row misnames the bus");
         assert!(has("Automation lane 1 on Master"), "the dial row misnames the bus");
         // And nothing anywhere in the tree calls the bus a track.
-        let ghost = format!("Track {}", MASTER_LANE + 1);
+        // The number a reader heard when the master was the lane one past
+        // the channels.
+        let ghost = format!("Track {}", CHANNELS + 1);
         assert!(
             !nodes.iter().any(|n| n.label.contains(&ghost)),
             "a node still calls the master {ghost}"
@@ -9743,9 +10086,10 @@ ArrangeView {
                 // edge can be SEEN, which is the whole job — a row that
                 // matches its parent stripe is a third stripe in the
                 // alternation rather than a row about something else.
-                for lane in [0usize, 1] {
+                for row in [0usize, 1] {
+                    let lane = LaneId::Row(row);
                     let g = auto_ground(&p, lane);
-                    let parent = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+                    let parent = if row % 2 == 0 { p.lane } else { p.lane_alt };
                     check("automation readout", on_ink(g), g, 4.5);
                     check("automation ground against its lane", g, parent, 1.12);
                     // **The seam between two stacked rows has to be SEEN**,
@@ -10616,7 +10960,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
         // **The point under the pointer is the RIGHT one**, four thousand
@@ -10629,7 +10973,7 @@ selected: false,
         );
         assert_eq!(
             hit_test(rect(), &v, at),
-            Some(Hit::AutoPoint(0, 0, want)),
+            Some(Hit::AutoPoint(LaneId::Row(0), 0, want)),
             "the index came back offset by the cull"
         );
     }
@@ -10660,21 +11004,21 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
         assert!(row.is_positive());
 
         // Straight at the first point.
         let at = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.75));
-        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
         // A little off it, still within the handle's reach.
         let near = Pos2::new(at.x + 2.0, at.y - 2.0);
-        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
         // Well away from both: empty room, and it says WHERE.
         let empty = Pos2::new(x_of(rect(), &v, 4.0), row.center().y);
         match hit_test(rect(), &v, empty) {
-            Some(Hit::AutoLane(0, 0, t, val)) => {
+            Some(Hit::AutoLane(LaneId::Row(0), 0, t, val)) => {
                 assert!((t - 4.0).abs() < 0.2, "the press landed at {t}s");
                 assert!((val - 0.5).abs() < 0.1, "the middle of the row read as {val}");
             }
@@ -10682,7 +11026,7 @@ selected: false,
         }
         // The nearer of two points wins, not the first.
         let second = Pos2::new(x_of(rect(), &v, 6.0), auto_y_of(row, 0.25));
-        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 0, 1)));
+        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(LaneId::Row(0), 0, 1)));
     }
 
     /// **A press just above an automation row does not make a point in it.**
@@ -10716,7 +11060,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row")
             .lane;
 
@@ -10733,13 +11077,13 @@ selected: false,
         // made the lane unusable instead of safe.
         let inside = Pos2::new(x_of(rect(), &v, 20.0), row.center().y);
         assert!(
-            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(0, 0, ..))),
+            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(LaneId::Row(0), 0, ..))),
             "the row stopped accepting presses"
         );
         // A handle overhanging the edge is still grabbable, which is the
         // whole reason the grab area is expanded.
         let handle = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.5));
-        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(0, 0, 0)));
+        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(LaneId::Row(0), 0, 0)));
     }
 
     /// A closed row is not hit at all, and its clips still are.
@@ -10871,7 +11215,7 @@ selected: false,
         let auto = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row");
         assert!(
             (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,
@@ -10921,7 +11265,7 @@ selected: false,
         assert!(
             l.rows
                 .iter()
-                .any(|r| r.kind == RowKind::Automation(0, 0) && r.lane.is_positive()),
+                .any(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0) && r.lane.is_positive()),
             "the automation row itself fell off"
         );
     }
@@ -11073,7 +11417,7 @@ selected: false,
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .find(|r| r.kind == RowKind::Automation(LaneId::Row(0), 0))
             .expect("no automation row");
         assert!(row.header.is_positive(), "the row has no header to carve");
 
@@ -11207,7 +11551,7 @@ selected: false,
         let c = clips();
         let v = a_view(&c);
         let l = Layout::new(rect(), &v);
-        for (i, row) in l.header_rows.iter().enumerate() {
+        for (i, row) in l.header_rows.iter() {
             let cells = [
                 row.number,
                 row.arm,
@@ -13099,6 +13443,234 @@ selected: false,
         }
     }
 
+
+    /// The lane a hit is about, for the bounds test: a track's row, the
+    /// master, or nothing (a clip, the toolbar, the ruler).
+    fn lane_of_hit(hit: Hit) -> Option<LaneId> {
+        Some(match hit {
+            Hit::HdrNumber(i)
+            | Hit::HdrCollapse(i)
+            | Hit::HdrBay(i, _)
+            | Hit::HdrRouting(i)
+            | Hit::Arm(i)
+            | Hit::Mute(i)
+            | Hit::Solo(i)
+            | Hit::Gain(i)
+            | Hit::Send(i)
+            | Hit::Pan(i)
+            | Hit::Phase(i)
+            | Hit::ToTheory(i)
+            | Hit::HdrInput(i)
+            | Hit::HdrName(i)
+            | Hit::HdrAdd(i)
+            | Hit::Lane(i, _) => LaneId::Row(i),
+            Hit::AutoPoint(l, ..)
+            | Hit::AutoLane(l, ..)
+            | Hit::AutoParamPick(l, _)
+            | Hit::AutoClose(l, _)
+            | Hit::AutoArm(l, _)
+            | Hit::AutoBypass(l, _)
+            | Hit::AutoDial(l, _)
+            | Hit::AutoMenu(l) => l,
+            Hit::BusBay(..) | Hit::BusGain(_) | Hit::MasterLane(_) => LaneId::Master,
+            _ => return None,
+        })
+    }
+
+    /// **A view the app's way, from an index**: the window
+    /// `lane_window_start` names, built from the drawn order. What
+    /// `TangentApp::arrange_view` does with its own index.
+    fn windowed<'a>(
+        ix: &crate::desk_index::DeskIndex,
+        clips: &'a [ClipView<'a>],
+        visible: usize,
+        lane_scroll: usize,
+    ) -> ArrangeView<'a> {
+        let mut v = a_view(clips);
+        v.active = ix.extent();
+        v.visible_lanes = visible;
+        v.lane_scroll = lane_scroll.min(ix.extent().saturating_sub(visible));
+        let (first, can) = lane_window_start(v.lane_scroll, visible, v.active);
+        let rows = ix.window(ix.rank_at_or_after(first), can + 1);
+        v.lanes = Lanes::new(rows.iter().map(|r| (*r as usize, a_lane(true))).collect());
+        v
+    }
+
+    /// **A timeline of any length builds, lays out, hit-tests and describes
+    /// only its window.** On the XXL and XXXL rungs (128 and 512 rows,
+    /// folders open and shut), at four zooms and three scrolls: the lanes
+    /// BUILT, the track rows LAID OUT, the lanes the hit test answers for
+    /// and the lanes the screen reader is told about are each bounded by
+    /// what shows plus the pinned master plus two. And the window is the
+    /// right one: the first lane on screen is the first drawn row at the
+    /// scroll, and the last row of the desk shows at the end of the rail.
+    ///
+    /// Revert-check: build `windowed` from every drawn row and the first
+    /// assertion names the 512-row desk.
+    #[test]
+    fn a_timeline_of_any_length_builds_and_lays_out_only_its_window() {
+        use crate::perf_fixtures::Wide;
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        for wide in Wide::ALL {
+            for shut in [false, true] {
+                let ix = wide.index(shut);
+                for visible in [1usize, 4, 8, 64] {
+                    for scroll in [0usize, 77, usize::MAX] {
+                        let v = windowed(&ix, &cs, visible, scroll);
+                        let bound = visible + 1 + 2;
+                        let what = format!(
+                            "{} shut={shut} visible={visible} scroll={scroll}",
+                            wide.tag()
+                        );
+                        assert!(v.lanes.len() <= bound, "{what}: built {} lanes", v.lanes.len());
+                        let l = Layout::new(r, &v);
+                        let tracks = l
+                            .rows
+                            .iter()
+                            .filter(|row| matches!(row.kind, RowKind::Track(_)))
+                            .count();
+                        assert!(tracks <= bound, "{what}: laid out {tracks} track rows");
+                        assert!(l.lane_rows.len() <= bound && l.header_rows.len() <= bound);
+                        let hits = targets_in(&l, &v);
+                        let mut lanes: Vec<LaneId> =
+                            hits.iter().filter_map(|(_, h)| lane_of_hit(*h)).collect();
+                        lanes.sort();
+                        lanes.dedup();
+                        assert!(lanes.len() <= bound, "{what}: {} lanes answer presses", lanes.len());
+                        let nodes = a11y_nodes_from(&v, &hits);
+                        assert!(nodes.len() <= hits.len(), "{what}: more nodes than targets");
+                        // The first lane laid out is the first drawn row at
+                        // the (clamped) scroll.
+                        let first_drawn = ix.row_at(ix.rank_at_or_after(v.lane_scroll));
+                        let first_laid = l
+                            .rows
+                            .iter()
+                            .find_map(|row| match row.kind {
+                                RowKind::Track(i) if row.lane.is_positive() => Some(i),
+                                _ => None,
+                            });
+                        assert_eq!(first_laid, first_drawn, "{what}: the window starts elsewhere");
+                        if scroll == usize::MAX && !shut {
+                            assert!(
+                                l.lane_rows[ix.extent() - 1].is_positive(),
+                                "{what}: the end of the rail does not show the last row"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The lane scrollbar says where the window stands, and moves it.**
+    #[test]
+    fn the_lane_scrollbar_shows_the_window_and_carries_the_lanes() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        let mut v = a_view(&cs);
+        v.visible_lanes = CHANNELS;
+        assert_eq!(Layout::new(r, &v).lane_bar, LaneBar::NONE, "a desk that fits drew a bar");
+        let mut v = a_view(&cs);
+        v.visible_lanes = 8;
+        let l = Layout::new(r, &v);
+        let bar = l.lane_bar;
+        assert!(bar.track.is_positive(), "a desk taller than the window drew no bar");
+        // Beside the lanes, inside the panel: it was pinned ON the lanes,
+        // which is where it took the clips' edge presses (see
+        // `the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge`).
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
+        assert_eq!(bar.max_rows, CHANNELS - 8);
+        let share = 8.0 / CHANNELS as f32;
+        assert!((bar.thumb.height() - bar.track.height() * share).abs() < 0.5);
+        assert!((bar.thumb.top() - bar.track.top()).abs() < 0.5, "unscrolled, not at the top");
+        v.lane_scroll = CHANNELS;
+        let end = Layout::new(r, &v).lane_bar;
+        assert!((end.thumb.bottom() - end.track.bottom()).abs() < 0.5, "not at the bottom");
+        // Grab the thumb and drag it past the end: the last window.
+        let v = a_view(&cs);
+        let v = ArrangeView { visible_lanes: 8, ..v };
+        let grab = lane_bar_grab(r, &v, bar.thumb.center()).expect("the thumb took no press");
+        let far = Pos2::new(bar.thumb.center().x, r.bottom() + 100.0);
+        assert_eq!(lane_bar_scroll(r, &v, far, grab), Some(CHANNELS - 8));
+        let near = Pos2::new(bar.thumb.center().x, r.top() - 100.0);
+        assert_eq!(lane_bar_scroll(r, &v, near, grab), Some(0));
+        // A press in the middle of a lane is never the bar's.
+        assert_eq!(lane_bar_grab(r, &v, l.lane_rows[0].center()), None);
+    }
+
+    /// **The bar stands beside the lanes and takes none of their presses.**
+    /// A clip running off the window's right edge is clamped to the lanes'
+    /// right edge, so its right trim zone and its fade-out corner are the
+    /// last few points of the lanes. With the bar laid on the lanes, and
+    /// claimed before any hit, those points were the bar's: a press to trim
+    /// scrolled the lanes instead.
+    ///
+    /// Revert-check: lay the track back inside `lanes_area.right()` with its
+    /// band at `expand2(2, 0)`, and both presses below are the bar's.
+    #[test]
+    fn the_lane_scrollbar_takes_no_press_from_a_clip_at_the_right_edge() {
+        let mut c = clips();
+        // Lane 0, running far past the window's end.
+        c[0].start_s = 30.0;
+        c[0].len_s = 1.0e4;
+        c[0].max_len_s = f64::INFINITY;
+        let r = rect();
+        let v = ArrangeView { visible_lanes: 8, ..a_view(&c) };
+        let l = Layout::new(r, &v);
+        let bar = l.lane_bar;
+        assert!(bar.track.is_positive(), "fixture: a desk taller than the window drew no bar");
+        assert!(bar.track.left() > l.lanes_area.right(), "the bar is on the lanes");
+        assert!(r.contains_rect(bar.track), "the bar left the panel");
+        let cr = clip_rect_in(&l, &v, &c[0]);
+        assert!(
+            cr.is_positive() && (cr.right() - l.lanes_area.right()).abs() < 0.5,
+            "fixture: the clip is not clamped at the lanes' edge ({cr:?})"
+        );
+        for (p, want) in [
+            (Pos2::new(cr.right() - 1.0, cr.center().y), Hit::ClipRight(1)),
+            (Pos2::new(cr.right() - 0.5, cr.top() + 2.0), Hit::FadeOut(1)),
+        ] {
+            assert_eq!(lane_bar_grab(r, &v, p), None, "the bar took {want:?}'s press at {p:?}");
+            assert_eq!(hit_test(r, &v, p), Some(want), "at {p:?}");
+        }
+        // The bar still takes a press anywhere in its gutter, on the thumb
+        // or beside it, and a little past the window's edge.
+        assert!(lane_bar_grab(r, &v, bar.thumb.center()).is_some(), "the thumb took no press");
+        let beside = Pos2::new(bar.track.center().x, bar.track.bottom() - 2.0);
+        assert!(!bar.thumb.contains(beside), "fixture: the thumb reaches the bottom");
+        assert!(lane_bar_grab(r, &v, beside).is_some(), "the track beside the thumb took no press");
+        let past = Pos2::new(r.right() + 1.0, bar.thumb.center().y);
+        assert!(lane_bar_grab(r, &v, past).is_some(), "the window's edge took no press");
+        // One span of time: the ruler ends where the lanes do, and the
+        // frame the app reads on its own agrees with the layout.
+        assert_eq!(l.ruler.right(), l.lanes_area.right());
+        let f = Layout::frame(r, v.header_w, lane_bar_shown(v.visible_lanes, v.active));
+        assert_eq!(f.lanes_area, l.lanes_area);
+        // No bar, no gutter: a desk that fits keeps every point.
+        let all = ArrangeView { visible_lanes: v.active, ..a_view(&c) };
+        assert_eq!(Layout::new(r, &all).lanes_area.right(), r.right());
+    }
+
+    /// **A hovering file lights the lane it will land on, scrolled or not.**
+    /// `drop_lane` is a ROW; it was read relative to the scroll, so a
+    /// scrolled timeline lit the wrong lane, or none.
+    #[test]
+    fn a_drop_lights_its_own_lane_on_a_scrolled_timeline() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let r = rect();
+        let mut v = a_view(&cs);
+        v.visible_lanes = 8;
+        v.lane_scroll = 10;
+        v.drop_lane = Some(12);
+        let l = Layout::new(r, &v);
+        assert!(l.lane_rows[12].is_positive(), "lane 12 is not on screen at scroll 10");
+        assert_eq!(drop_lane_rect(&l, &v), Some(l.lane_rows[12]), "the drop lit another lane");
+        v.drop_lane = Some(2);
+        let l = Layout::new(r, &v);
+        assert_eq!(drop_lane_rect(&l, &v), None, "a lane scrolled away was lit");
+    }
 }
 
 
