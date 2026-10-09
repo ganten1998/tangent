@@ -1175,7 +1175,11 @@ mod tests {
             curve(MASTER_AUTO_LANE, AutoParam::Gain, &[(0.0, 0.9, Shape::Linear), (0.8, 0.4, Shape::Linear)]),
             curve(0, AutoParam::Plugin { bay: 0, id: trim }, &[(0.0, 0.2, Shape::Linear), (0.7, 0.9, Shape::Linear)]),
         ]);
-        out.push(Corpus { name: "automation", settings: s, doc, live: vec![], kits: vec![], freeze: vec![0] });
+        // The Trim at its defaults, and LIVE: with no live state the export
+        // falls back to the shelf, which is the real home's sidecar outside
+        // the sandbox (see `every_corpus_bay_is_live`).
+        let live = vec![(0, 0, TRIM_PATH, dialled(TRIM_PATH, &[]))];
+        out.push(Corpus { name: "automation", settings: s, doc, live, kits: vec![], freeze: vec![0] });
 
         // A frozen lane: its file plays, its clip and its rack stand down.
         let mut s = blank();
@@ -1354,6 +1358,29 @@ mod tests {
             .collect()
     }
 
+    /// **Every effect bay a corpus desk seats has its state in the live
+    /// engine.** A bay the live engine is not wearing is furnished from the
+    /// shelf (`desk_insert_state` -> `saved_insert_state`), and the shelf is
+    /// `Settings::path().parent()`: the REAL `~/.config/tangent` in a binary
+    /// crate's test, unless the run is sandboxed. A golden recorded in the
+    /// sandbox would then depend on whatever the person running the suite
+    /// last dialled into that bay, and a sidecar that will not load would
+    /// trip `every_corpus_export_has_sound_in_it`'s refusal check. Instrument
+    /// sentinels are not furnished as bays, so they need no state.
+    fn every_corpus_bay_is_live(c: &Corpus, app: &TangentApp) {
+        for i in 0..(crate::instrument::RACK_SEATS * INSERTS) {
+            let (seat, bay) = (i / INSERTS, i % INSERTS);
+            let Some(path) = app.insert(seat, bay).filter(|p| !is_instrument_sentinel(p)) else {
+                continue;
+            };
+            assert!(
+                c.live.iter().any(|(s, b, unit, _)| (*s, *b, *unit) == (seat, bay, path)),
+                "{}: bay ({seat}, {bay}) seats {path} with no live state, so its knobs would come from the real shelf",
+                c.name
+            );
+        }
+    }
+
     /// Every pass of every corpus desk: the master, the wet stems, the dry
     /// stems, and each named freeze, keyed `desk/pass/file`. Rendered once
     /// per test binary and shared by the two tests that read it: a debug
@@ -1368,6 +1395,7 @@ mod tests {
         for c in corpus() {
             let dir = scratch(c.name);
             let app = open(&c, &dir);
+            every_corpus_bay_is_live(&c, &app);
             let live = live_engine(&c);
             let base = tangent_ui::ports::ProjectExportSpec { rate: RATE, ..Default::default() };
             let mut passes: Vec<(String, tangent_ui::ports::ProjectExportSpec, Option<usize>)> = vec![
