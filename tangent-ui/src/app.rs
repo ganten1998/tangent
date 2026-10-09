@@ -7515,6 +7515,7 @@ impl TangentApp {
             track: &self.track,
             scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
+            device_send: &self.device_send_status,
             scope: &self.scope,
             analyzer: &self.analyzer,
             pointer: self.band_pointer,
@@ -28692,14 +28693,43 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// What the device send is doing. Also refreshed into an OPEN send
     /// dialog, the way `set_audio_status` refreshes Setup.
+    ///
+    /// **A send that comes back relists the window's devices.** The window's
+    /// list is a snapshot from when it opened; a device that was missing
+    /// then and is sending now (plugged in, Retry pressed) was still drawn
+    /// as the lit "(not connected)" row under a status reading "Sending
+    /// to" it. Only on that change, never per frame: the list walks every
+    /// WASAPI endpoint.
     pub fn set_device_send_status(&mut self, status: crate::ports::DeviceSendStatus) {
+        let came_back = matches!(status, crate::ports::DeviceSendStatus::Sending { .. });
+        let mut relist = false;
         if let Some(Dialog::DeviceSend { status: live, .. }) = self.dialog.as_mut() {
             if *live != status {
+                relist = came_back && live.retryable();
                 live.clone_from(&status);
             }
         }
         if self.device_send_status != status {
             self.device_send_status = status;
+        }
+        if relist {
+            self.relist_device_send();
+        }
+    }
+
+    /// The open send window's devices, walked again from the send's host.
+    /// For a user's Retry and a send that came back; never per frame.
+    fn relist_device_send(&mut self) {
+        if !matches!(self.dialog, Some(Dialog::DeviceSend { .. })) {
+            return;
+        }
+        let fresh = self
+            .audio_setup
+            .as_ref()
+            .map(|s| s.send_outputs())
+            .unwrap_or_default();
+        if let Some(Dialog::DeviceSend { devices, .. }) = self.dialog.as_mut() {
+            *devices = fresh;
         }
     }
 
@@ -36722,12 +36752,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if host.is_empty() { "127.0.0.1".to_owned() } else { host.to_owned() };
                 self.save_settings();
             }
-            DialogAction::SetDeviceSend { enabled, name } => {
+            DialogAction::SetDeviceSend { enabled, name, relist } => {
                 // A machine setting: saved, never an undo step.
                 self.settings.device_send_enabled = enabled;
                 self.settings.device_send_name = name.trim().to_owned();
                 self.device_send_asks = self.device_send_asks.wrapping_add(1);
                 self.save_settings();
+                if relist {
+                    self.relist_device_send();
+                }
             }
             DialogAction::LoadPlugin { path } => {
                 // Written to settings and nothing else: loading is the host's
@@ -38473,6 +38506,7 @@ impl TangentApp {
                         window: s.lufs_window,
                         ..self.recorder.loudness
                     },
+                    device_send: &self.device_send_status,
                     ..self.recorder.view(
                         s.record_take_name.as_deref().unwrap_or_default(),
                         false,
@@ -59931,11 +59965,87 @@ mod tests {
         app.apply_dialog_action(DialogAction::SetDeviceSend {
             enabled: false,
             name: "  Speakers (Realtek(R) Audio) ".to_owned(),
+            relist: false,
         });
         assert!(!app.device_send_enabled());
         assert_eq!(app.device_send_name().as_deref(), Some("Speakers (Realtek(R) Audio)"));
         assert_eq!(app.device_send_asks(), asks + 1, "an answer is an ask");
         assert_eq!(app.history.len(), undo, "a machine setting became an undo step");
+    }
+
+    /// **The send window's list follows a device that comes back.** Opened
+    /// with the cable missing, the list had no cable in it; plugged in and
+    /// retried, the status read "Sending to CABLE Input" over a lit
+    /// "(not connected)" row until the window was reopened. Retry walks the
+    /// host again, and so does a send that goes from missing to sending.
+    #[test]
+    fn the_send_window_relists_its_devices_when_the_device_comes_back() {
+        use std::sync::{Arc, Mutex};
+        struct Cable(Arc<Mutex<Vec<String>>>);
+        impl crate::ports::AudioSetup for Cable {
+            fn systems(&self) -> Vec<String> {
+                vec!["WASAPI".to_owned()]
+            }
+            fn active_system(&self) -> Option<String> {
+                Some("WASAPI".to_owned())
+            }
+            fn outputs(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn rates(&self) -> Vec<u32> {
+                Vec::new()
+            }
+            fn input_channels(&self) -> u16 {
+                0
+            }
+            fn exposed(&self) -> Vec<(u16, Option<u16>)> {
+                Vec::new()
+            }
+            fn set_exposed(&mut self, _: Vec<(u16, Option<u16>)>) -> Vec<String> {
+                Vec::new()
+            }
+            fn output_path(&self, _: Option<&str>) -> crate::ports::OutputPath {
+                crate::ports::OutputPath::default()
+            }
+            fn send_outputs(&self) -> Vec<String> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let cable = "CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        let speakers = "Speakers (Realtek(R) Audio)".to_owned();
+        let listed = Arc::new(Mutex::new(vec![speakers.clone()]));
+        let devices = |app: &TangentApp| match &app.dialog {
+            Some(Dialog::DeviceSend { devices, .. }) => devices.clone(),
+            _ => panic!("the send window closed"),
+        };
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.settings.device_send_enabled = true;
+        app.settings.device_send_name = cable.clone();
+        app.set_audio_setup(Some(Box::new(Cable(Arc::clone(&listed)))));
+        app.set_device_send_status(crate::ports::DeviceSendStatus::Missing { device: cable.clone() });
+        app.apply_recorder_hit(recorder_panel::Hit::SendToDevice);
+        assert_eq!(devices(&app), vec![speakers.clone()]);
+
+        // Plugged in. Nothing is walked per frame while nothing changes...
+        listed.lock().unwrap().push(cable.clone());
+        app.set_device_send_status(crate::ports::DeviceSendStatus::Missing { device: cable.clone() });
+        assert_eq!(devices(&app).len(), 1, "the list was walked on a frame that changed nothing");
+        // ...and Retry walks it.
+        app.apply_dialog_action(DialogAction::SetDeviceSend {
+            enabled: true,
+            name: cable.clone(),
+            relist: true,
+        });
+        assert!(devices(&app).contains(&cable), "Retry left the list stale");
+
+        // A send that comes back on its own (the host's plug watch) relists too.
+        listed.lock().unwrap().push("BlackHole 2ch".to_owned());
+        app.set_device_send_status(crate::ports::DeviceSendStatus::Sending {
+            device: cable.clone(),
+            engine_rate: 48_000,
+            device_rate: 48_000,
+        });
+        assert_eq!(devices(&app).len(), 3, "a send that came back left the list stale");
     }
 
     /// **A double click puts a knob back, through the app, into settings.**

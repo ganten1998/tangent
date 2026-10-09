@@ -1738,7 +1738,10 @@ pub enum DialogAction {
     },
     /// Persist the device send's settings. Also an ASK: the host retries a
     /// send that failed or found its device missing whenever one arrives.
-    SetDeviceSend { enabled: bool, name: String },
+    /// `relist` (Retry's) also walks the send host's outputs again for the
+    /// open window: the user was told to plug the device in, and a list
+    /// snapshotted before they did would go on calling it not connected.
+    SetDeviceSend { enabled: bool, name: String, relist: bool },
     /// Persist the take summary's "report every take" choice.
     ///
     /// **Its tick went out with the modal box and now has a home again.** The
@@ -13221,6 +13224,7 @@ fn show_on(
                                 action = Some(DialogAction::SetDeviceSend {
                                     enabled: *enabled,
                                     name: name.clone(),
+                                    relist: false,
                                 });
                             }
                             ui.add_space(8.0);
@@ -13251,6 +13255,7 @@ fn show_on(
                                             action = Some(DialogAction::SetDeviceSend {
                                                 enabled: *enabled,
                                                 name: name.clone(),
+                                                relist: false,
                                             });
                                         }
                                     }
@@ -13294,6 +13299,7 @@ fn show_on(
                                     action = Some(DialogAction::SetDeviceSend {
                                         enabled: *enabled,
                                         name: name.clone(),
+                                        relist: false,
                                     });
                                     result.close = true;
                                 }
@@ -13305,6 +13311,7 @@ fn show_on(
                                     action = Some(DialogAction::SetDeviceSend {
                                         enabled: *enabled,
                                         name: name.clone(),
+                                        relist: true,
                                     });
                                 }
                             });
@@ -13316,6 +13323,7 @@ fn show_on(
                 action = Some(DialogAction::SetDeviceSend {
                     enabled: *enabled,
                     name: name.clone(),
+                    relist: false,
                 });
             }
             closed
@@ -14523,7 +14531,21 @@ mod tests {
             reason: "the device went away.".to_owned(),
         };
         assert!(failed.retryable() && !same.retryable());
-        for s in [S::Off, S::NoDevice, S::Waiting, same, differ.clone(), failed] {
+        assert_eq!(
+            failed.line(),
+            "Stopped sending to CABLE Input: the device went away. Press Retry or pick another device."
+        );
+        // A device that never opened never sent, so it is not "stopped".
+        let refused = S::Refused {
+            device: "CABLE Input".to_owned(),
+            reason: "the device is in use.".to_owned(),
+        };
+        assert!(refused.retryable());
+        assert_eq!(
+            refused.line(),
+            "Could not open CABLE Input: the device is in use. Press Retry or pick another device."
+        );
+        for s in [S::Off, S::NoDevice, S::Waiting, same, differ.clone(), failed, refused] {
             let all = format!("{} {}", s.line(), s.rate_warning().unwrap_or_default());
             assert!(!all.contains('\u{2014}'), "an em dash: {all}");
             assert!(!all.contains(".."), "a doubled stop: {all}");

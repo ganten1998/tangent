@@ -3466,6 +3466,30 @@ fn send_wants_open(open: bool, tried: Option<&SendTry>, want: &str, asks: u64) -
     }
 }
 
+/// **The try a running stream's fault leaves behind.**
+///
+/// Keyed by the SETTING's name (`setting`, what [`send_wants_open`] compares
+/// against), and shown by the name cpal resolved (`shown`). The two differ
+/// whenever the setting matched loosely: `devsend::match_name` takes a
+/// case-blind substring, so "CABLE Input (VB-Audio Virtual Cable)" opens a
+/// re-plugged "2- CABLE Input (VB-Audio Virtual Cable)". Keyed by the cpal
+/// name, the try never matched the setting, the send reopened in the same
+/// frame and lowered the "stays off until you retry it" notice, and a device
+/// that faulted as soon as it opened looped at frame rate, an enumeration of
+/// every endpoint each time. `setting` is `None` when the send was switched
+/// off in the same frame, and then nothing will compare against it.
+#[cfg(feature = "recorder")]
+fn send_fault_try(setting: Option<String>, shown: String, asks: u64, reason: String) -> SendTry {
+    SendTry {
+        device: setting.unwrap_or_else(|| shown.clone()),
+        asks,
+        failed: Some(tangent_ui::ports::DeviceSendStatus::Failed {
+            device: shown,
+            reason,
+        }),
+    }
+}
+
 /// **The outputs [`OutputReturn`] looks among**, asked every two seconds
 /// for as long as a stand-in lasts.
 ///
@@ -14772,11 +14796,8 @@ impl DesktopApp {
                     reason.trim_end_matches('.')
                 ),
             );
-            self.device_send_tried = Some(SendTry {
-                device: device.clone(),
-                asks,
-                failed: Some(DeviceSendStatus::Failed { device, reason }),
-            });
+            self.device_send_tried =
+                Some(send_fault_try(self.app.device_send_name(), device, asks, reason));
         }
         let want = enabled.then(|| self.app.device_send_name()).flatten();
         let status = match want {
@@ -14820,7 +14841,7 @@ impl DesktopApp {
                                         "Send to Device could not open {want} ({}).",
                                         reason.trim_end_matches('.')
                                     ),
-                                    DeviceSendStatus::Failed {
+                                    DeviceSendStatus::Refused {
                                         device: want.clone(),
                                         reason,
                                     },
@@ -32368,6 +32389,38 @@ mod tests {").expect("the tests module")];
         assert!(send_wants_open(false, Some(&t), "BlackHole 2ch", 3), "a new device was not tried");
         assert!(!send_wants_open(true, Some(&t), "CABLE Input", 4), "a running send restarted on an ask");
         assert!(send_wants_open(true, Some(&t), "BlackHole 2ch", 3), "a running send kept the old device");
+    }
+
+    /// **A stream that faulted stays off until it is asked**, even when the
+    /// device it opened goes by a different name than the setting. The
+    /// setting "CABLE Input (VB-Audio Virtual Cable)" opens a re-plugged
+    /// "2- CABLE Input (...)" by substring; keyed by that cpal name, the
+    /// fault's try never matched the setting and the send reopened in the
+    /// same frame, at frame rate when the device kept faulting.
+    #[test]
+    fn a_faulted_send_under_a_loose_name_waits_for_an_ask() {
+        use tangent_ui::ports::DeviceSendStatus;
+        let setting = "CABLE Input (VB-Audio Virtual Cable)";
+        let resolved = "2- CABLE Input (VB-Audio Virtual Cable)".to_owned();
+        let t = send_fault_try(Some(setting.to_owned()), resolved.clone(), 7, "the device went away".to_owned());
+        assert!(!send_wants_open(false, Some(&t), setting, 7), "a fault reopened on the next frame");
+        assert!(send_wants_open(false, Some(&t), setting, 8), "Retry did nothing");
+        // Shown by the device it actually was.
+        assert_eq!(
+            t.failed,
+            Some(DeviceSendStatus::Failed {
+                device: resolved.clone(),
+                reason: "the device went away".to_owned(),
+            })
+        );
+        // And the reconcile builds it from the SETTING, not from the stats.
+        let src = include_str!("desktop.rs");
+        let at = src.find("    fn reconcile_device_send(&mut self) {").expect("the reconcile");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        assert!(
+            body.contains("send_fault_try(self.app.device_send_name(), device, asks, reason)"),
+            "the fault branch no longer keys its try by the setting"
+        );
     }
 
     /// **A rebuilt engine hands the device send a fresh tap**, and the send
