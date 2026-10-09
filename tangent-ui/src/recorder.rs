@@ -6770,10 +6770,11 @@ mod strip_ref_tests {
 
     /// The view builders and hit dispatch in `app.rs`: what builds a view,
     /// and what turns a press on one into a change.
-    const APP_VIEW_FNS: [&str; 15] = [
+    const APP_VIEW_FNS: [&str; 16] = [
         "fn mixer_view(&self)",
         "pub(crate) fn mixer_view_in(",
-        "fn mixer_view_ranks(",
+        "fn mixer_view_of(",
+        "fn mixer_view_rows(",
         "fn arrange_view<'a>(",
         "fn arr_lane_window(",
         "fn arr_clip_views(",
