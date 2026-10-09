@@ -83,6 +83,20 @@ if ! cargo check -q -p tangent --no-default-features 2>/dev/null; then
   exit 1
 fi
 
+echo "==> cargo check --manifest-path plugin/Cargo.toml  (the VST3 plugin)"
+# **The plugin is its own workspace, so nothing above builds it.** It links
+# tangent-ui and tangent-core exactly as the desktop does, and every change to
+# their public API (a constructor, a dialog variant, a signature) reaches it;
+# without this leg a change that breaks only the plugin was found at release
+# time, by the plugin build. A compile check: its tests are the shared
+# crates' tests, which ran above.
+cargo check --manifest-path plugin/Cargo.toml
+
+echo "==> scripts/test-census.sh  (no crate loses tests without a ledger)"
+# A test deleted with the code it covered leaves the suite green; the census
+# makes every drop say what replaced it (see the script's header).
+scripts/test-census.sh
+
 echo "==> scripts/check-firewall.sh  (the shared crates cannot reach the host)"
 # **The rest of check-firewall.sh is part of the gate too.** What
 # `tangent-ui` and `tangent-core` may depend on and call, which way the crates

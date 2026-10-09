@@ -1124,10 +1124,11 @@ mod tests {
             eprintln!("compositor did not take the owned-GL path - nothing to protect here");
             return;
         }
-        let app = TangentApp::new(
+        let app = TangentApp::with_license(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
+            tiers::free("shot"),
         );
         for i in 0..4_i64 {
             c.frame(
@@ -1256,10 +1257,11 @@ mod tests {
         // since it would be two hundred points of transport it can never
         // populate — and a camera frame is not something such a host can have
         // in the first place.
-        let app = TangentApp::new(
+        let app = TangentApp::with_license(
             c.context(),
             tangent_ui::settings::Settings::first_launch(),
             tangent_ui::host::Caps::DESKTOP,
+            tiers::free("shot"),
         );
         let out = compose_one(&mut c, &app, Some((&cam, W, H))).expect("composite");
         assert_eq!(
@@ -1331,10 +1333,11 @@ mod tests {
         let path = dir.join("default-layout.mp4");
 
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
-        let app = TangentApp::new(
+        let app = TangentApp::with_license(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
+            tiers::free("shot"),
         );
         let mut enc = Encoder::create(
             &path,
@@ -1437,10 +1440,11 @@ mod tests {
             return;
         };
         let mut c = Compositor::on(device, queue, 160, 120).expect("compositor");
-        let app = TangentApp::new(
+        let app = TangentApp::with_license(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
+            tiers::free("shot"),
         );
         let mut out = Vec::new();
         for i in 0..5_i64 {
@@ -1484,10 +1488,11 @@ mod tests {
         const W: u32 = 64;
         const H: u32 = 64;
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
-        let app = TangentApp::new(
+        let app = TangentApp::with_license(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
+            tiers::free("shot"),
         );
         let once = compose_one(&mut c, &app, None).expect("composite").to_vec();
         assert_eq!(once.len(), (W * H * 4) as usize);
@@ -1602,7 +1607,7 @@ mod cost {
             );
             let mut settings = tangent_ui::settings::Settings::default();
             settings.show_recorder = true;
-            let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+            let app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
             let mut cam = vec![0u8; (w * h * 4) as usize];
             for (i, px) in cam.chunks_exact_mut(4).enumerate() {
                 px[0] = (i % 251) as u8;
@@ -1715,7 +1720,7 @@ mod cost {
         }
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
 
         // A camera frame that is not flat, so nothing can shortcut the upload.
         let mut cam = vec![0u8; (w * h * 4) as usize];
@@ -1882,7 +1887,7 @@ mod shot {
         settings.limiter_mix = 0.75;
         settings.master_gain = 0.7;
         settings.metronome_gain = 0.5;
-        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
         if std::env::var("IVORY_SHOT_METER").is_ok() {
             use tangent_ui::recorder::{Level, Meters};
@@ -2083,7 +2088,7 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.open_arrangement_for_shot();
         let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
@@ -2158,7 +2163,7 @@ mod shot {
         // The bottom lane holds the PEDAL rather than velocity:
         //   IVORY_SHOT_PEDAL=1 IVORY_SHOT=/tmp/x.png ...
         settings.midi_pedal_lane = std::env::var("IVORY_SHOT_PEDAL").is_ok();
-        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.open_midi_editor_for_shot();
         let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
@@ -2231,7 +2236,7 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.open_arrangement_for_shot();
         app.open_drumpad_for_shot();
         let mut shoot = |app: &TangentApp| {
@@ -2303,7 +2308,7 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         app.open_mixer_for_shot();
         let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
@@ -2378,7 +2383,7 @@ mod shot {
             }
         };
         let settings = tangent_ui::settings::Settings::default();
-        let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let app = TangentApp::with_license(c.context(), settings, tangent_ui::host::Caps::DESKTOP, tiers::free("shot"));
         let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 // The app's own black under it, exactly as the host paints
@@ -2477,5 +2482,76 @@ mod shot {
         chunk(&mut png, b"IDAT", &zlib_stored(&raw));
         chunk(&mut png, b"IEND", &[]);
         std::fs::write(path, png).expect("write the png");
+    }
+}
+
+/// **The three tiers a test of this crate can stand at**, each on a licence
+/// store of its own under the temp dir, never the config dir (which on a
+/// developer's machine holds the owner's real key and Konami marker).
+///
+/// The same contract as `tangent_ui::app::tiers`, which this crate cannot
+/// reach: that module is compiled only for tangent-ui's own tests. The store
+/// is `temp_dir()/tangent-lic-<pid>-<thread>-<tag>/license.key`. A free
+/// store's directory is emptied and never created; a cheater's and a
+/// supporter's are created, because their standing is a file in it. It
+/// lives here, beside the compositor's shot tests, because those and the
+/// desktop's tests are the ones in this crate that build a whole app.
+#[cfg(test)]
+pub(crate) mod tiers {
+    use tangent_core::license::LicenseStore;
+
+    /// The committed fixture: a real, signed, perpetual supporter key (name
+    /// Ganten). Spelled out only here, only under cfg(test).
+    const SUPPORTER_KEY: &str = include_str!("../../tests/fixtures/supporter.key");
+
+    pub(crate) fn dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tangent-lic-{}-{:?}-{tag}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    /// A keyless, unmarked install.
+    pub(crate) fn free(tag: &str) -> LicenseStore {
+        let d = dir(tag);
+        let _ = std::fs::remove_dir_all(&d);
+        LicenseStore::load_from(d.join("license.key"))
+    }
+
+    /// A keyless install that typed the code: the marker on disk.
+    pub(crate) fn cheater(tag: &str) -> LicenseStore {
+        let mut s = free(tag);
+        std::fs::create_dir_all(dir(tag)).expect("the cheater's store dir");
+        s.unlock_cheat();
+        s
+    }
+
+    /// A buyer: the fixture key installed, no marker.
+    pub(crate) fn supporter(tag: &str) -> LicenseStore {
+        let mut s = free(tag);
+        std::fs::create_dir_all(dir(tag)).expect("the supporter's store dir");
+        s.install(SUPPORTER_KEY).expect("the committed fixture key did not install");
+        s
+    }
+
+    /// **Each fixture is the tier it says**, in this crate's own build (the
+    /// `license` feature has to be on here too, or the supporter would be
+    /// free and every supporter test in the crate would pass vacuously), and
+    /// a cheater's marker survives a fresh load of its directory.
+    #[test]
+    fn each_fixture_stands_where_it_says() {
+        let free = free("tiers-free");
+        assert!(!free.is_supporter() && !free.cheated() && !free.licensed());
+        let buyer = supporter("tiers-buyer");
+        assert!(buyer.is_supporter() && buyer.licensed() && !buyer.cheated());
+        assert_eq!(buyer.display_name(), Some("Ganten"));
+        let cheat = cheater("tiers-cheat");
+        assert!(cheat.is_supporter() && cheat.cheated() && !cheat.licensed());
+        let again = LicenseStore::load_from(dir("tiers-cheat").join("license.key"));
+        assert!(again.is_supporter(), "a dir holding only the marker reloaded free");
+        for tag in ["tiers-buyer", "tiers-cheat"] {
+            let _ = std::fs::remove_dir_all(dir(tag));
+        }
     }
 }
