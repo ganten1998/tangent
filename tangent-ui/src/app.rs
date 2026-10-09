@@ -26581,7 +26581,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // button on the track's own header already does, so the
                     // menu keeps its door and the row gains one.
                     Some(A::AutoParamPick(n, slot)) => {
-                        self.arr_select_auto_row(n.auto_lane(), slot)
+                        self.arr_select_auto_row(n.auto_lane(), slot);
                     }
                     Some(A::Phase(n)) => {
                         self.touch_track(n);
@@ -26590,7 +26590,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Some(A::AutoClose(n, slot)) => self.arr_close_auto_row(n.auto_lane(), slot),
                     Some(A::AutoArm(n, slot)) => self.arr_toggle_auto_arm(n.auto_lane(), slot),
                     Some(A::AutoBypass(n, slot)) => {
-                        self.arr_toggle_auto_bypass(n.auto_lane(), slot)
+                        self.arr_toggle_auto_bypass(n.auto_lane(), slot);
                     }
                     Some(A::AutoDial(n, slot)) => {
                         let n = n.auto_lane();
