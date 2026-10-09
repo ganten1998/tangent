@@ -35,15 +35,17 @@ Windows and Linux downloads carry their own encoder, so filming a take needs
 nothing installed. There is a native **Stream to OBS** sender too, for going
 live instead of to a file.
 
-**A DAW.** A thirty-two-track desk with a mixer, an arrangement view, a MIDI
-editor and a drum machine. Folders are real buses: a group sums its children
-in the engine and runs its own insert rack over the sum. Automation reaches
-track controls and plugin parameters alike, the tempo lane does ramps and
-steps, clips time-stretch from their edges, audio takes quantize as well as
-MIDI, and delay compensation understands groups. It **hosts your plugins**:
-VST3 on every platform, LV2 on Linux and FreeBSD, editor windows included,
-and a new session opens with the built-in Tangent DX7 armed and set to a tine
-electric piano, so the app makes a sound out of the box.
+**A DAW.** A desk with a mixer, an arrangement view, a MIDI editor and a drum
+machine. The free app holds up to 32 tracks and a supporter key takes the limit
+away; buses, returns, sends and routes have no limit for anyone. Folders are
+real buses: a group sums its children in the engine and runs its own insert
+rack over the sum. Automation reaches track controls and plugin parameters
+alike, the tempo lane does ramps and steps, clips time-stretch from their
+edges, audio takes quantize as well as MIDI, and delay compensation understands
+groups. It **hosts your plugins**: VST3 on every platform, LV2 on Linux and
+FreeBSD, editor windows included, and a new session opens with the built-in
+Tangent DX7 armed and set to a tine electric piano, so the app makes a sound
+out of the box.
 
 It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, and on
 Linux (glibc 2.30+, ALSA, Wayland or X11). It builds and runs on FreeBSD too.
@@ -70,9 +72,10 @@ including the Linux aarch64 tarball and checksums, are on the
   records what was captured, and a take that loses its video still keeps its
   audio and its MIDI. Software monitoring, a metronome, and input trims live
   on the recorder band.
-- **The mixer.** Thirty-two channels plus a master, each with a fader, pan, a
-  send into the effects bus, an insert rack, and meters. Routing goes two
-  ways: a **hardware output** sends a copy of a channel out of your
+- **The mixer.** A strip for every track plus a master, each with a fader,
+  pan, a send into the effects bus, an insert rack, and meters. The free desk
+  holds 32 tracks; with a supporter key there is no track limit. Routing goes
+  two ways: a **hardware output** sends a copy of a channel out of your
   interface's own jacks (a headphone amp, a stage monitor), and a **channel
   route** moves a channel through another channel, which is how you build a
   submix. Folders are buses: a group sums its children and runs its own rack
@@ -145,13 +148,18 @@ the keys).
 
 ## Pay what you can
 
-Tangent is free software (MIT) and free to download. Every feature is in the
-free app. Nothing is time-limited and nothing nags you.
+Tangent is free software (MIT) and free to download. The free app holds up to
+32 tracks, and every feature is in it: recording, video, plugins, export, and
+buses, returns, sends and routes with no limit for anyone. Nothing is
+time-limited and nothing nags you.
 
-A [supporter key](https://ganten.gumroad.com/l/ivory) is a way to say the app
-earned a place in your practice room. It adds a small cosmetic thank-you inside
-the app and nothing else. Pay what you like, and if you cannot afford it, just
-use the app.
+A [supporter key](https://ganten.gumroad.com/l/ivory) takes the track limit
+away, and it is a way to say the app earned a place in your practice room.
+Every key already sold does the same: keys have no expiry and cover every
+version. The limit only ever stops a new track. A project with more than 32
+tracks opens, plays, edits and saves whole on a free install, and only adding
+the next track asks for a key. Pay what you like, and if you cannot afford it,
+just use the app.
 
 ## Support
 
