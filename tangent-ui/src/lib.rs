@@ -60,6 +60,13 @@ pub mod smf_write;
 pub mod arrangement_panel;
 pub mod midi_editor;
 pub mod settings;
+/// Every desk this app ever wrote, lifted onto the frozen 32-wide shape:
+/// the era lifts, their provenance and the legacy global-shelf map.
+pub mod desk_lift;
+/// The era corpus: one literal fixture per desk shape the app has written,
+/// and the scans that keep the lifts off the live constants. Test-only.
+#[cfg(test)]
+mod era_corpus;
 /// Musical time: the tempo map, the meter map, and the two conversions
 /// everything else in the app used to do with a multiply.
 pub mod tempo;
