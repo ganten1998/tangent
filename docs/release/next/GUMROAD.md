@@ -67,14 +67,15 @@ writes a `.wav`, a `.mid` and an `.mp4` of the window itself, with your camera
 already placed in it.
 
 Around that is a recording DAW: a mixer, an arrangement view, a MIDI editor,
-a drum machine, automation, folders that are real buses, and VST3 plugin
-hosting on every platform (LV2 too on Linux and FreeBSD).
+a drum machine, automation, folders that are real buses (each counts as a
+track), and VST3 plugin hosting on every platform (LV2 too on Linux and
+FreeBSD).
 
 ### What is free, and what the key does
 
 **Free, for everyone:**
 
-- up to 32 tracks;
+- up to 32 tracks, folders included;
 - every feature: recording, video, the theory panels, the sheet music, the
   guitar neck, plugins, automation and export;
 - buses, returns, sends and routes, with no limit;

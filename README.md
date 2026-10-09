@@ -38,8 +38,8 @@ live instead of to a file.
 **A DAW.** A desk with a mixer, an arrangement view, a MIDI editor and a drum
 machine. The free app holds up to 32 tracks and a supporter key takes the limit
 away; buses, returns, sends and routes have no limit for anyone. Folders are
-real buses: a group sums its children in the engine and runs its own insert
-rack over the sum. Automation reaches track controls and plugin parameters
+real buses that count as tracks: a group sums its children in the engine and
+runs its own insert rack over the sum. Automation reaches track controls and plugin parameters
 alike, the tempo lane does ramps and steps, clips time-stretch from their
 edges, audio takes quantize as well as MIDI, and delay compensation understands
 groups. It **hosts your plugins**: VST3 on every platform, LV2 on Linux and
@@ -78,8 +78,9 @@ including the Linux aarch64 tarball and checksums, are on the
   two ways: a **hardware output** sends a copy of a channel out of your
   interface's own jacks (a headphone amp, a stage monitor), and a **channel
   route** moves a channel through another channel, which is how you build a
-  submix. Folders are buses: a group sums its children and runs its own rack
-  over the sum, so a compressor in a folder's bay is a bus compressor.
+  submix. Folders are buses that count as tracks: a group sums its children
+  and runs its own rack over the sum, so a compressor in a folder's bay is a
+  bus compressor.
 - **The arrangement.** Audio and MIDI clips on a timeline, groups that drag
   their children with them, automation lanes for track controls and plugin
   parameters (nodes that box-select, copy, paste and make steps), a tempo
