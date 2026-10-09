@@ -1237,9 +1237,15 @@ pub struct TangentApp {
     desk_index: std::cell::RefCell<Option<std::sync::Arc<crate::desk_index::DeskIndex>>>,
     /// The generation the next rebuild of `desk_index` takes.
     desk_index_gen: std::cell::Cell<u64>,
-    /// Set by undo, redo and a load, which replace the desk wholesale: the
-    /// next ask rebuilds whatever the facts say. See `touch_desk_index`.
+    /// Set by whatever may have changed a fact the index reads (a row, a
+    /// clip, a folder, a kind, a plugin, a route): the next ask gathers the
+    /// facts again and rebuilds only if they moved. Clear, the ask is the
+    /// cached `Arc` and nothing else. See `desk_index_dirty`.
     desk_index_stale: std::cell::Cell<bool>,
+    /// Set by undo, redo and a load, which replace the desk wholesale: the
+    /// next ask takes a new generation whatever the facts say. See
+    /// `touch_desk_index`.
+    desk_index_force: std::cell::Cell<bool>,
     /// The UNDO history: whole document states (clips + desk baked in),
     /// shared by the editor, the arrangement and the mixer — one line of
     /// time, whichever surface wrote it. `hist_at` is where NOW stands.
@@ -1580,6 +1586,11 @@ pub struct TangentApp {
     /// pretty-prints in a row can land inside one timestamp tick.
     #[cfg(test)]
     settings_writes: std::cell::Cell<u32>,
+    /// How many times `desk_index` gathered its facts to answer an ask
+    /// (not counting the test-only staleness check). Tests count these to
+    /// pin that an unmarked ask is the cached index and no walk.
+    #[cfg(test)]
+    desk_index_gathers: std::cell::Cell<u32>,
     /// Which insert the open picker is filling, if it is filling one.
     picker_insert: Option<(usize, usize)>,
     /// Every VST3 bundle the host found, for the picker.
@@ -4378,6 +4389,7 @@ impl TangentApp {
             desk_index: std::cell::RefCell::new(None),
             desk_index_gen: std::cell::Cell::new(0),
             desk_index_stale: std::cell::Cell::new(true),
+            desk_index_force: std::cell::Cell::new(false),
             history: Vec::new(),
             saved_state: None,
             pending_after_save: None,
@@ -4455,6 +4467,8 @@ impl TangentApp {
             settings_save_at: std::cell::Cell::new(None),
             #[cfg(test)]
             settings_writes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            desk_index_gathers: std::cell::Cell::new(0),
             picker_insert: None,
             grabbed: None,
             num_edit: None,
@@ -4891,6 +4905,12 @@ impl TangentApp {
     /// reopened tomorrow would silently pick up whatever the standalone was
     /// set to. A plugin's state belongs in its own project file.
     fn save_settings(&self) {
+        // **A single-shot desk edit ends here**: a kind, a folder flag, a
+        // route, a key. Most single-shot edits that move a fact the desk
+        // index reads write the settings at once, so this is the road that
+        // cannot be forgotten for them; a mark is a `Cell` write beside a
+        // file write.
+        self.desk_index_dirty();
         // A write that happens now makes the one that was owed redundant:
         // the file carries the whole struct, faders included.
         self.settings_save_at.set(None);
@@ -5342,6 +5362,8 @@ impl TangentApp {
     /// flag nothing reads: the arrow is only laid out on folders, so reaching
     /// here otherwise means something else is wrong.
     fn toggle_folder_shut(&mut self, ch: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if !self.is_folder(ch) {
             return;
         }
@@ -5359,6 +5381,8 @@ impl TangentApp {
     }
 
     fn set_is_folder(&mut self, ch: usize, on: bool) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         while self.settings.strip_is_folder.len() < recorder::CHANNELS {
             self.settings.strip_is_folder.push(false);
         }
@@ -5422,6 +5446,8 @@ impl TangentApp {
     }
 
     fn set_in_folder(&mut self, ch: usize, on: bool) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         while self.settings.strip_in_folder.len() < recorder::CHANNELS {
             self.settings.strip_in_folder.push(false);
         }
@@ -5442,6 +5468,8 @@ impl TangentApp {
     /// one level deep, so the gesture takes it OUT of its folder first.
 
     fn toggle_folder(&mut self, ch: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if ch >= recorder::CHANNELS {
             return;
         }
@@ -6756,6 +6784,8 @@ impl TangentApp {
     }
 
     fn remove_channel_inner(&mut self, n: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // **A folder takes its membership with it.**
         //
         // Membership is positional — "the nearest folder above me" — so
@@ -6970,6 +7000,8 @@ impl TangentApp {
     /// backing, takes on an audio lane, trims, fades, a selection and the
     /// playhead mid-song — so the picture answers "does this read".
     pub fn open_arrangement_for_shot(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         self.open_mixer_for_shot();
         self.mixer_open = false;
         self.arrangement_open = true;
@@ -9770,6 +9802,7 @@ impl TangentApp {
         self.project_doc = doc;
         self.arrangement = arr;
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.load_drumpad_doc();
         self.reset_automation_session();
         // **Seed the undo baseline HERE too.** Every road into a document
@@ -9793,6 +9826,7 @@ impl TangentApp {
         self.project_doc = std::path::PathBuf::from(p);
         self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.load_drumpad_doc();
         self.undo_reset();
         true
@@ -9833,6 +9867,7 @@ impl TangentApp {
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.load_drumpad_doc();
         self.undo_reset();
     }
@@ -10024,6 +10059,8 @@ impl TangentApp {
         lane: usize,
         start_s: f64,
     ) -> Result<(), String> {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // The same gate as the audio import, first: a .mid on a bare lane
         // makes it a MIDI track.
         let into = lane.min(recorder::CHANNELS - 1);
@@ -10088,6 +10125,8 @@ impl TangentApp {
     /// and a clip the region lands inside is split around it. No overlap
     /// survives a record.
     fn arr_carve(&mut self, lane: usize, t0: f64, t1: f64) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if t1 <= t0 {
             return;
         }
@@ -10167,6 +10206,8 @@ impl TangentApp {
     /// already wrote the WAVs into `media/`; this adds the rows, selects the
     /// last one and saves — one press, one save, however many lanes.
     pub fn add_recorded_clips(&mut self, recorded: Vec<crate::arrangement::RecordedClip>) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if self.project_doc().is_none() {
             return;
         }
@@ -10269,6 +10310,8 @@ impl TangentApp {
     /// `media/` stay: a project keeps its material, the timeline merely
     /// stops standing on it.
     pub fn clear_arrangement(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if self.arrangement.clips.is_empty() {
             return;
         }
@@ -11533,6 +11576,8 @@ impl TangentApp {
     /// changed nothing, when it is refused. Rebinding or clearing the input
     /// of a track that exists is an edit and is never refused.
     fn set_channel_input_spec(&mut self, ch: usize, spec: &str) -> bool {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if !spec.is_empty()
             && ch < recorder::CHANNELS
             && !self.row_counted(ch)
@@ -11662,6 +11707,8 @@ impl TangentApp {
 
     /// Freeze this lane, or thaw it if it is frozen.
     pub fn freeze_toggle(&mut self, lane: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if self.lane_frozen(lane).is_some() {
             self.unfreeze_track(lane);
             return;
@@ -11693,6 +11740,8 @@ impl TangentApp {
     /// rendered file is left in the media folder: undo can refreeze without
     /// a render, and a file nothing points at costs nothing but disk.
     pub fn unfreeze_track(&mut self, lane: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // Not under a realtime export, which is playing the frozen file:
         // see `freezes_held`.
         if self.lane_frozen(lane).is_some() && self.freezes_held() {
@@ -11713,6 +11762,8 @@ impl TangentApp {
     /// disarmed: a take onto a frozen lane would record into clips the
     /// frozen file does not know about. Joins undo through `arr_save_edits`.
     pub fn note_frozen(&mut self, lane: usize, path: String, len_s: f64) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if lane >= recorder::CHANNELS || path.is_empty() || !len_s.is_finite() {
             return;
         }
@@ -11906,6 +11957,8 @@ impl TangentApp {
     /// their saved states), and every clip on its lane. The rows between
     /// shift by one.
     pub fn move_channel(&mut self, from: usize, to: usize) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         use crate::recorder::CHANNELS;
         if from >= CHANNELS || to >= CHANNELS || from == to {
             return;
@@ -11985,6 +12038,8 @@ impl TangentApp {
     /// an order it worked out for itself. Everything that names a lane —
     /// clips, routes, automation, the selection itself — follows.
     fn reorder_channels(&mut self, order: &[usize]) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         use crate::recorder::{CHANNELS, INSERTS, STRIPS};
         if order.len() != CHANNELS {
             return;
@@ -12410,6 +12465,8 @@ impl TangentApp {
     /// an empty row makes a MIDI track there, so that one case asks the gate
     /// first and a refused draw lands nothing.
     fn land_drawn_midi_item(&mut self, lane: usize, t0: f64, t1: f64) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let min_len = (self.arr_grid_s(t0) * 0.5).max(0.05);
         if t1 - t0 < min_len {
             return;
@@ -12474,6 +12531,8 @@ impl TangentApp {
     /// and so does a lane order an export or an arrangement record holds
     /// (`lane_order_held`, which says why).
     fn open_lane_below(&mut self, n: usize) -> Option<usize> {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         use recorder::CHANNELS;
         if n >= CHANNELS {
             return None;
@@ -12587,6 +12646,8 @@ impl TangentApp {
     /// mixer's + all land, and at the cap they used to do nothing at all.
     /// `false` when nothing was added.
     fn add_bare_track(&mut self, n: usize) -> bool {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if n >= recorder::CHANNELS {
             return false;
         }
@@ -12791,6 +12852,8 @@ impl TangentApp {
     }
 
     fn paste_track_inner(&mut self, into: usize, copy: TrackCopy) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let at = recorder::Strip::Channel(into).index();
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
@@ -13633,6 +13696,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.settings.project_path = doc.to_string_lossy().into_owned();
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         // **The session's DESK arrives with it** — kinds, bays, names,
         // faders, tempo. Explicit opens only: the launch reopen goes
         // through `bootstrap_project`, where the settings already ARE this
@@ -13957,6 +14021,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.drumpad_dirty = true;
         true
     }
@@ -14025,6 +14090,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.drumpad_dirty = true;
         self.undo_reset();
         true
@@ -14723,6 +14789,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// MOVE: the clip rides under the same point of the hand — `dt` is the
     /// pointer's distance from its start at the press.
     fn arr_move(&mut self, id: u64, t_at: f64, dt: f64, lane_at: Option<usize>) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let to = self.arr_snap_t(t_at - dt);
         // A GROUP under the hand: every snapshotted clip moves by the
         // grabbed one's deltas — time always, lane relatively, each clip
@@ -15359,6 +15427,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         param: crate::automation::AutoParam,
         index: usize,
     ) -> bool {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let Some(curve) = self.arrangement.automation.get(lane, param) else {
             return false;
         };
@@ -15838,6 +15908,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // node nobody had let go of. A Shift-click that never moves is one
         // moment too, at its release.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_gesture_dirty = true;
         Some(at)
     }
@@ -15914,6 +15985,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.tempo = map;
         // The gesture's moment, at its release - see `arr_put_auto_point`.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_gesture_dirty = true;
         self.arr_tempo_index(at_beat)
     }
@@ -16117,6 +16189,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // hundred-moment history: the whole session's undo, spent carrying
         // one flag. See the release at `arr_gesture_dirty`.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_gesture_dirty = true;
     }
 
@@ -16161,6 +16234,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.set_meter_at_quiet(bar, None);
         self.set_meter_at_quiet(to_bar, Some(sig));
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_gesture_dirty = true;
         // A field open on the chip travels with it, or the next Enter would
         // write the signature back to the bar it just left.
@@ -16753,6 +16827,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_auto_latched.insert(lane);
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
     }
 
     /// A gesture's edits, written down: the document saved atomically, the
@@ -16778,6 +16853,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // of the save, or an undo would compare against a stale one.
         self.arrangement.desk = Some(self.desk_snapshot());
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.undo_commit();
     }
 
@@ -16845,24 +16921,57 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **The desk's shape**, as of now: see `desk_index::DeskIndex`.
     ///
-    /// Gathers the facts it is built from (the folder flags, the kinds, the
-    /// added bits, what keeps a row from being vacant, and the clips on each
-    /// row) and hands back the standing index when they are exactly the ones
-    /// it was built from, a new generation otherwise. Exact rather than
-    /// hashed: a collision would draw a desk that does not exist. The gather
-    /// is a pass over flag words and clip lanes, with no strings and no
-    /// layout; every view then reads what it needs in O(1) per strip.
+    /// **The cached `Arc` and nothing else**, unless something marked it:
+    /// a view build, every hit dispatch's re-build and every per-partner
+    /// value read ask for it, so the ask itself must be O(1) for those to
+    /// be O(visible) (design section 10). It used to gather every row's
+    /// facts and every clip's lane on each ask and compare them with the
+    /// standing index's, which made an idle ask O(desk): two per
+    /// arrangement frame, one more per pointer event, and one per partner
+    /// strip of a fader drag over a selection.
+    ///
+    /// Marked by `desk_index_dirty` at the roads every row, clip, folder,
+    /// kind, plugin, route or kit edit passes through, and once at the top
+    /// of every frame for what changes without a gesture (a take landing).
+    /// A marked ask gathers the facts and rebuilds only when they moved, so
+    /// a mark that changed nothing costs one gather and keeps the
+    /// generation. Undo, redo and a load force a new generation outright
+    /// (`touch_desk_index`).
+    ///
+    /// Under test, an unmarked ask still gathers and compares, and a cached
+    /// index that no longer matches the app is a panic naming the missed
+    /// mark: the whole suite is the check that no road was left off.
     pub fn desk_index(&self) -> std::sync::Arc<crate::desk_index::DeskIndex> {
+        if !self.desk_index_stale.get() && !self.desk_index_force.get() {
+            if let Some(ix) = self.desk_index.borrow().as_ref() {
+                #[cfg(test)]
+                {
+                    let (facts, clips) = self.desk_index_inputs();
+                    assert!(
+                        ix.built_from(&facts, &clips),
+                        "the desk index (generation {}) is stale: an edit reached a row, clip, \
+                         folder, kind, plugin, route or kit fact without `desk_index_dirty`",
+                        ix.generation()
+                    );
+                }
+                return std::sync::Arc::clone(ix);
+            }
+        }
         let (facts, clips) = self.desk_index_inputs();
+        #[cfg(test)]
+        self.desk_index_gathers.set(self.desk_index_gathers.get() + 1);
+        let forced = self.desk_index_force.replace(false);
+        self.desk_index_stale.set(false);
         let mut cached = self.desk_index.borrow_mut();
         if let Some(ix) = cached.as_ref() {
-            if !self.desk_index_stale.get() && ix.built_from(&facts, &clips) {
+            // Exact rather than hashed: a collision would draw a desk that
+            // does not exist.
+            if !forced && ix.built_from(&facts, &clips) {
                 return std::sync::Arc::clone(ix);
             }
         }
         let generation = self.desk_index_gen.get() + 1;
         self.desk_index_gen.set(generation);
-        self.desk_index_stale.set(false);
         let ix = std::sync::Arc::new(crate::desk_index::DeskIndex::build(generation, facts, clips));
         *cached = Some(std::sync::Arc::clone(&ix));
         ix
@@ -16873,18 +16982,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn desk_index_inputs(&self) -> (Vec<crate::desk_index::RowFacts>, Vec<u32>) {
         let rows = self.desk_extent();
         let flag = |v: &[bool], r: usize| v.get(r).copied().unwrap_or(false);
-        // **What keeps a row from being vacant without making it a track**:
-        // a curve, a freeze, a chain plugin. Pedals are not on the list; a
-        // pedal-only row is still vacant (section 4).
+        // **What keeps a row from being vacant without making it a track**
+        // (design section 4's Vacant column, and W2-desk-format's `holds`):
+        // a curve, a freeze, a kit, a chain plugin, and either end of a
+        // route or of a sidechain key. A row whose only content is a route
+        // left behind when its kind was cleared is still wired into the
+        // desk; calling it Vacant would hide the route's end and, once
+        // vacant rows get no engine lane, drop it. Pedals are not on the
+        // list: a pedal-only row is still vacant.
         let mut residue = vec![false; rows];
-        for c in self.arrangement.automation.curves() {
-            if let Some(r) = residue.get_mut(c.lane) {
-                *r = true;
+        let mut mark = |r: usize| {
+            if let Some(slot) = residue.get_mut(r) {
+                *slot = true;
             }
+        };
+        for c in self.arrangement.automation.curves() {
+            mark(c.lane);
         }
         for z in &self.settings.frozen_lanes {
-            if let Some(r) = residue.get_mut(z.lane) {
-                *r = true;
+            mark(z.lane);
+        }
+        for r in &self.settings.routes.0 {
+            mark(r.from);
+            if let crate::routing::Target::Channel(to) = r.target {
+                mark(to);
+            }
+        }
+        // A key's `strip` is in strip space; past the channels it is a bus
+        // or the master, which `mark` ignores because it is past `rows`.
+        for k in &self.settings.insert_keys.0 {
+            mark(k.strip);
+            mark(k.from);
+        }
+        for (r, kit) in self.drumpad_kits.iter().enumerate() {
+            if !kit.is_empty() {
+                mark(r);
             }
         }
         let facts = (0..rows)
@@ -16913,13 +17045,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         (facts, clips)
     }
 
+    /// **Something the index reads may have moved**: the next ask gathers
+    /// the facts again, and keeps the generation when they did not move.
+    /// A `Cell` write, so a road that might not have changed anything marks
+    /// anyway rather than working out whether it did.
+    fn desk_index_dirty(&self) {
+        self.desk_index_stale.set(true);
+    }
+
     /// **Undo, redo and a load replace the desk wholesale**, so the index
     /// takes a new generation on its next ask whatever the facts say. The
     /// facts would catch every change on their own; the explicit bump is
     /// what lets a view cache keyed on the generation trust it across a
     /// restore that happens to land on an identical shape.
     fn touch_desk_index(&self) {
-        self.desk_index_stale.set(true);
+        self.desk_index_force.set(true);
     }
 
     /// **The exact comparison, deliberately.** A wrong "nothing changed"
@@ -17246,6 +17386,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// words are the same walk the fingerprint is — so there is nothing
     /// left to buy by being approximate.
     fn undo_commit(&mut self) {
+        // **Every gesture ends here**, clip edits included, whatever field
+        // it wrote: one moment per gesture is the undo rule, so this is the
+        // road no edit to a row, clip or curve can miss. Before the hold,
+        // because a held batch has changed the desk all the same.
+        self.desk_index_dirty();
         // **A batch is holding its moment**, and every write inside it is
         // part of one thing somebody did. See `begin_one_moment`.
         if self.undo_hold > 0 {
@@ -17528,6 +17673,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // sidecar saves itself by design (see the CHANGELOG's exception) —
         // it is the one piece of a session the owner asked never to lose.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         // Everything that NAMES what may no longer exist stands down —
         // chosen automation nodes too: they are indices into curves this
         // has just replaced, and would light (and delete) other nodes.
@@ -17642,6 +17788,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_save_edits();
     }
 
@@ -17719,6 +17866,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // `audio_clip_passes` and `midi_clip_notes` build from this — so the
         // clips are dirty, exactly as they are for a stretch.
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_save_edits();
     }
 
@@ -17743,6 +17891,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             c.stretch = 1.0;
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_save_edits();
     }
 
@@ -17815,6 +17964,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The anchor carries over when the sources agree on one; a weld of
     /// clips measured against different things is measured against time.
     pub fn finish_audio_glue(&mut self, ids: &[u64], glued: crate::arrangement::GluedAudio) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let anchors: Vec<crate::arrangement::Anchor> = self
             .arrangement
             .clips
@@ -17889,6 +18040,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// this side decides whether the selection can be glued at all and says
     /// why not in the same words.
     fn arr_glue_selection(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
         if let Some(one) = self.arr_selected {
             if !ids.contains(&one) {
@@ -18449,6 +18602,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if (c.gain - g).abs() > 1.0e-9 {
                 c.gain = g;
                 self.clips_dirty = true;
+                self.desk_index_dirty();
             }
         }
     }
@@ -18490,6 +18644,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 c.warp_fit = fit;
                 c.warp_rate = rate;
                 self.clips_dirty = true;
+                self.desk_index_dirty();
             }
         }
     }
@@ -19521,6 +19676,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// relative lanes, clamped. Anywhere goes — a MIDI clip on an audio
     /// channel simply does not sound, which is the neat kind of nothing.
     fn arr_paste(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // Nodes first, and only when the node clipboard is what was filled
         // last — see `auto_clipboard`.
         if self.arr_paste_auto_nodes() {
@@ -19596,6 +19753,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn arr_delete_selected(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // **Chosen nodes first, then a chosen row, then the clips.** Nodes
         // before the row, because Delete closing a lane somebody meant to
         // thin out would take the work with it. The subjects are exclusive -
@@ -19640,6 +19799,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// fade-in, the tail keeps the fade-out, and the seam is clean: two
     /// clips whose samples abut exactly.
     fn arr_split_at_playhead(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         const MIN: f64 = 0.05;
         let t = self.recorder.position_s;
         let targets: Vec<u64> = match self.arr_selected {
@@ -20402,6 +20563,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         if let Some(st) = self.midi_edit.as_mut() {
             st.dirty = true;
         }
@@ -22334,6 +22496,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// drums to the fresh session while launch (whose `project_doc` is still
     /// empty) never loaded the template's kit at all.
     fn load_drumpad_doc_beside(&mut self, doc: Option<&std::path::Path>) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         // **Every lane's kit, from the one sidecar.** See
         // `DrumpadDoc::load_all_beside`: the file's top-level `pads` is the
         // kit a pre-lanes project wrote, and it lands on whichever channel
@@ -23267,6 +23431,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn drumpad_mut(&mut self) -> &mut crate::drumpad::DrumpadDoc {
+        // A kit on a lane is a fact the desk index reads (residue).
+        self.desk_index_dirty();
         let lane = self.drumpad_lane.min(self.drumpad_kits.len().saturating_sub(1));
         &mut self.drumpad_kits[lane]
     }
@@ -30846,6 +31012,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn make_folder(&mut self) -> bool {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         use crate::recorder::CHANNELS;
         let mut sel: Vec<usize> = self
             .selected_tracks
@@ -31596,6 +31764,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The lane the kit lands on is the one the template puts it on, so a
     /// desk whose drums are on track 1 resets its track 1.
     fn reset_kits_to_default(&mut self) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         let shelf = self.project_root().join(TEMPLATE_SHELF).join("default");
         let doc = crate::arrangement::doc_in(&shelf);
         let (kits, lane) = if doc.exists() {
@@ -33472,6 +33642,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         let mid_drag = self.met_drag
             || self
                 .grabbed
@@ -33549,6 +33720,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.clips_dirty = true;
+        self.desk_index_dirty();
         self.arr_gesture_dirty = true;
     }
 
@@ -34006,6 +34178,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// creation gate; cycling, clearing or setting the kind of a row that is
     /// already a track never does.
     pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         if kind.is_some() && n < recorder::CHANNELS && !self.row_counted(n) && !self.admit_tracks(1)
         {
             return;
@@ -34034,6 +34208,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
+        // A chain plugin on a row is a fact the desk index reads (residue),
+        // and every road that seats or empties a bay ends here.
+        self.desk_index_dirty();
         // The WHOLE insert space, not the strips-plus-pads slice it once
         // was: a write to a folder-extra or pedal seat on a vector still at
         // the old length would fall silently past the end.
@@ -34163,6 +34340,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// bay no curve can address (a bus's) cannot carry one, so a curve
     /// arriving there goes, as at any change of tenant; undo brings it back.
     pub fn trade_inserts(&mut self, a: (usize, usize), b: (usize, usize)) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         use crate::automation::{AutoParam, Automation};
         if a == b {
             return;
@@ -36514,6 +36693,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// editor is two clicks in and there is no other way to reach it from a
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
+        // Moves a fact the desk index reads; see `desk_index_dirty`.
+        self.desk_index_dirty();
         match action {
             DialogAction::SetInsertParam { strip, slot, id, value } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
@@ -38759,6 +38940,12 @@ impl TangentApp {
     }
 
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // **Once a frame, the desk index looks again**, for what changes the
+        // desk with no gesture and no settings write: a take landing on a
+        // lane, a drag moving a clip between lanes before its release
+        // commits. A look that finds nothing moved keeps the index; every
+        // ask after it in the frame is the cached `Arc`.
+        self.desk_index_dirty();
         // **Which view is showing, kept where a saved session can reach
         // it.** `desk_view` is handed the settings and nothing else, so the
         // document's copy has to come from there; the flags move in seven
@@ -64589,6 +64776,9 @@ mod tests {
     fn choosing_nodes_by_box_add_or_paste_lets_the_clips_and_the_row_go() {
         let (ctx, mut app) = auto_bench("autoboxclip");
         let id = app.arrangement.add_clip(bench_item(1, 1.0));
+        // A fixture write past every app road, read before any frame: the
+        // mark a gesture or a frame would have made.
+        app.desk_index_dirty();
         let from = auto_at(&app, 1.0, 0.95);
         let via = [auto_at(&app, 3.0, 0.5), auto_at(&app, 5.0, 0.05)];
         let (room, more_room) = (auto_at(&app, 7.0, 0.4), auto_at(&app, 8.0, 0.4));
@@ -81491,6 +81681,128 @@ mod views_windowed_tests {
             let again = a.desk_index();
             assert!(std::sync::Arc::ptr_eq(&after, &again), "{what}: an idle ask rebuilt");
         }
+    }
+
+    /// **An unmarked ask is the cached index and no walk** (section 10:
+    /// build, layout, hit test and a11y are O(visible), so asking for the
+    /// index they read must not be O(desk)). Every view build, a value read
+    /// per partner strip and the scroll range ask for it; none of them
+    /// gathers. A mark is one gather however many asks follow it, and keeps
+    /// the generation when nothing moved; an idle frame is one gather.
+    ///
+    /// Revert-check: make `desk_index` gather on every ask, as it did, and
+    /// the forty view builds below count forty gathers.
+    #[test]
+    fn an_unmarked_ask_for_the_desk_index_walks_nothing() {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (ctx, mut a) = headless_with(Caps::DESKTOP, s);
+        a.dialog = None;
+        for n in 0..12 {
+            a.add_bare_track(n);
+        }
+        a.arrangement.add_clip(clip(3, 1.0));
+        a.undo_commit();
+        a.arrangement_open = true;
+        let run = |a: &mut TangentApp| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| a.frame(ctx),
+            );
+        };
+        run(&mut a);
+        run(&mut a);
+        let ix = a.desk_index();
+        let g0 = a.desk_index_gathers.get();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0));
+        for n in 0..10 {
+            let _ = a.mixer_view_in(rect);
+            let clips = a.arr_clip_views();
+            let _ = a.arrange_view(&clips);
+            let _ = a.mixer_view_of(recorder::Column::Track(n));
+            let _ = a.mixer_shown_channels();
+        }
+        assert_eq!(a.desk_index_gathers.get(), g0, "an unmarked ask walked the desk");
+        assert!(std::sync::Arc::ptr_eq(&ix, &a.desk_index()), "an unmarked ask rebuilt");
+
+        // A mark that moved nothing: one gather, the same index.
+        a.desk_index_dirty();
+        for _ in 0..5 {
+            let _ = a.mixer_view_in(rect);
+        }
+        assert_eq!(a.desk_index_gathers.get(), g0 + 1, "a mark cost more than one gather");
+        assert!(std::sync::Arc::ptr_eq(&ix, &a.desk_index()), "a mark that moved nothing rebuilt");
+
+        // An idle frame looks once, whatever it builds and hit-tests.
+        let g1 = a.desk_index_gathers.get();
+        run(&mut a);
+        assert_eq!(a.desk_index_gathers.get(), g1 + 1, "an idle frame walked the desk more than once");
+        assert!(std::sync::Arc::ptr_eq(&ix, &a.desk_index()), "an idle frame rebuilt");
+
+        // And an edit is seen by the very next ask, in the same frame's
+        // terms: no frame runs between the toggle and the read.
+        a.toggle_folder(5);
+        assert!(a.desk_index().is_folder(5), "the folder was not seen before the next frame");
+        assert!(a.desk_index().generation() > ix.generation());
+    }
+
+    /// **A row that only holds something is never Vacant** (section 4: no
+    /// curve, no kit, no endpoint, not frozen, no chain plugin; and
+    /// W2-desk-format's `classify`, which this class becomes at the merge).
+    /// Either end of a route, either end of a sidechain key, a kit, a
+    /// freeze, a curve and a chain plugin each make an uncounted row a
+    /// Placeholder; a pedal alone does not. The road the finding names: a
+    /// routed track whose kind is cleared keeps its route, so it stays.
+    ///
+    /// Revert-check: drop the route and key marks from `desk_index_inputs`
+    /// and "route from" names Vacant.
+    #[test]
+    fn a_row_that_holds_a_route_key_or_kit_is_not_vacant() {
+        use crate::desk_index::RowClass;
+        use crate::routing::{Route, Target};
+        let mut a = app();
+        a.set_channel_kind(10, Some(recorder::ChannelKind::Midi));
+        assert!(a.settings.routes.add(Route::new(10, Target::Channel(11))));
+        a.set_channel_kind(10, None);
+        assert!(a.settings.routes.add(Route::new(12, Target::Hardware { first: 0, stereo: true })));
+        a.settings.insert_keys.set(13, 0, Some(14));
+        a.drumpad_kits[15].pads[36].path = "media/kick.wav".to_owned();
+        a.note_frozen(16, "media/frozen-17-1.wav".into(), 2.0);
+        a.arrangement.automation.set(crate::automation::Curve::sanitised(
+            17,
+            crate::automation::AutoParam::Gain,
+            vec![crate::automation::Point {
+                at_s: 0.0,
+                value: 0.5,
+                shape: crate::automation::Shape::Linear,
+            }],
+        ));
+        a.set_insert(18, 0, Some("/Library/Audio/Plug-Ins/VST3/x.vst3"));
+        a.set_insert(recorder::amp_pedal_seat(19, 2), 0, Some("/Library/Audio/Plug-Ins/VST3/p.vst3"));
+        // The raw writes above reach no app road; a gesture would end in
+        // its commit, which marks.
+        a.undo_commit();
+        let ix = a.desk_index();
+        for (row, what) in [
+            (10, "route from (its kind cleared)"),
+            (11, "route into"),
+            (12, "route to a jack"),
+            (13, "keyed bay"),
+            (14, "key source"),
+            (15, "kit"),
+            (16, "freeze"),
+            (17, "curve"),
+            (18, "chain plugin"),
+        ] {
+            assert!(!a.row_counted(row), "fixture: row {row} ({what}) is a track");
+            assert_eq!(ix.class(row), RowClass::Placeholder, "row {row}: {what}");
+        }
+        assert_eq!(ix.class(19), RowClass::Vacant, "a pedal-only row is vacant");
+        assert_eq!(ix.class(20), RowClass::Vacant, "an untouched row");
+        assert_eq!(ix.counted(), a.counted_tracks());
     }
 
     /// **The views carry their window and no more**: the desk built for a
