@@ -132,11 +132,45 @@ pub struct MonitorPlan {
     pub channels: u16,
     pub block: u32,
     pub picks: Box<[MonitorPick]>,
+    /// **Today's layout, until the picks are by slot** (W5): how many device
+    /// columns each input reads, and which columns. The renderer's monitor
+    /// still speaks inputs; these carry its two tables down the same ring as
+    /// the ring they describe, so the pair can never be seen half-arrived.
+    pub widths: Box<[u8]>,
+    pub columns: tangent_record::audio::Picks,
+    /// A new layout for the ring already held, and no ring: the renderer
+    /// keeps its ring and takes the tables.
+    pub layout_only: bool,
+    /// Not yet taken in by the renderer. Set by the host; the renderer
+    /// clears it the chunk it reads the plan.
+    pub fresh: bool,
+}
+
+/// **What a spine carries for its owner, beside the lanes**: the per-slot
+/// side tables a renderer sizes by the spine's capacity (its lane sets, its
+/// per-chunk desk views). Generic so the protocol stays provable against a
+/// toy; the renderer's is `instrument::Wide`.
+///
+/// A Grow swaps whole spines, so a table the host built at the new capacity
+/// arrives with the shell; [`Self::carry_into`] moves across whatever must
+/// outlive one chunk (a claim held over from the last one), and must not
+/// allocate.
+pub trait SpineExt {
+    fn carry_into(&self, to: &mut Self);
+}
+
+impl SpineExt for () {
+    fn carry_into(&self, _: &mut Self) {}
 }
 
 /// The callback's lanes and the desk-wide state they share.
+///
+/// **`X` is an addition to the contract's `Spine<L>`** (C7): the per-slot
+/// tables the renderer reads in its walks have to grow with the lanes, and
+/// the only door a Grow has into the callback is this shell. It defaults to
+/// `()`, so `Spine<L>` still names the contract's type.
 #[derive(Debug)]
-pub struct Spine<L> {
+pub struct Spine<L, X = ()> {
     pub lanes: Vec<Option<Box<L>>>,
     pub gens: Vec<u32>,
     pub desk: DeskBuffers,
@@ -149,15 +183,25 @@ pub struct Spine<L> {
     pub captures: Vec<Option<Producer<f32>>>,
     /// Picks whose capture is running: their ring may not be swapped.
     pub capturing: LaneSet,
+    /// The owner's per-slot tables. See [`SpineExt`].
+    pub ext: X,
 }
 
 /// A spine the host built larger, every buffer allocated, for a Grow.
-pub type SpineShell<L> = Spine<L>;
+pub type SpineShell<L, X = ()> = Spine<L, X>;
 
-impl<L> Spine<L> {
+impl<L, X: Default> Spine<L, X> {
     /// A spine with room for `lanes` lanes and `picks` capture picks, all of
     /// it allocated here, on the host, so the callback never has to.
     pub fn with_capacity(lanes: usize, picks: usize) -> Self {
+        Self::with_ext(lanes, picks, X::default())
+    }
+}
+
+impl<L, X> Spine<L, X> {
+    /// [`Spine::with_capacity`] with the owner's tables, which it sized at
+    /// `lanes` itself.
+    pub fn with_ext(lanes: usize, picks: usize, ext: X) -> Self {
         Self {
             lanes: (0..lanes).map(|_| None).collect(),
             gens: vec![0; lanes],
@@ -167,6 +211,7 @@ impl<L> Spine<L> {
             monitor: None,
             captures: (0..picks).map(|_| None).collect(),
             capturing: LaneSet::with_capacity(picks),
+            ext,
         }
     }
 
@@ -175,7 +220,7 @@ impl<L> Spine<L> {
     }
 }
 
-impl<L: SpineLane> Spine<L> {
+impl<L: SpineLane, X> Spine<L, X> {
     /// [`claim_lane`] over this spine's lanes.
     pub fn claim(&self, slot: Slot, gen: u32, round: u64) -> Option<&L> {
         claim_lane(&self.lanes, slot, gen, round)
@@ -203,8 +248,8 @@ pub fn claim_lane<L: SpineLane>(
 }
 
 /// Everything that changes the spine, in one FIFO.
-pub enum EngineOp<L, P> {
-    Grow(Box<SpineShell<L>>),
+pub enum EngineOp<L, P, X = ()> {
+    Grow(Box<SpineShell<L, X>>),
     /// **`Option<Box<L>>`, not the contract's `Box<L>`**: the boxes move into
     /// the spine one by one and the emptied list goes home on the retire
     /// ring, which needs somewhere to leave a hole. The host always fills
@@ -229,7 +274,7 @@ pub enum EngineOp<L, P> {
     },
 }
 
-impl<L, P> std::fmt::Debug for EngineOp<L, P> {
+impl<L, P, X> std::fmt::Debug for EngineOp<L, P, X> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Grow(s) => write!(f, "Grow({})", s.capacity()),
@@ -264,14 +309,15 @@ pub struct ApplyReport {
 ///
 /// Allocates and frees nothing: every value either moves into the spine or
 /// leaves on `retire`, and the host drops what comes back.
-pub fn apply_ops<L, P>(
-    spine: &mut Spine<L>,
+pub fn apply_ops<L, P, X>(
+    spine: &mut Spine<L, X>,
     plan: &mut Box<DeskPlan>,
-    ops: &mut Consumer<EngineOp<L, P>>,
-    retire: &mut Producer<EngineOp<L, P>>,
+    ops: &mut Consumer<EngineOp<L, P, X>>,
+    retire: &mut Producer<EngineOp<L, P, X>>,
 ) -> ApplyReport
 where
     L: SpineLane + Attach<P>,
+    X: SpineExt,
 {
     let mut report = ApplyReport::default();
     loop {
@@ -302,14 +348,15 @@ where
 }
 
 /// One op. Returns what goes home.
-fn apply_one<L, P>(
-    spine: &mut Spine<L>,
+fn apply_one<L, P, X>(
+    spine: &mut Spine<L, X>,
     plan: &mut Box<DeskPlan>,
-    op: EngineOp<L, P>,
+    op: EngineOp<L, P, X>,
     report: &mut ApplyReport,
-) -> Option<EngineOp<L, P>>
+) -> Option<EngineOp<L, P, X>>
 where
     L: SpineLane + Attach<P>,
+    X: SpineExt,
 {
     match op {
         EngineOp::Grow(mut shell) => {
@@ -325,6 +372,7 @@ where
                 shell.gens[i] = spine.gens[i];
             }
             spine.desk.carry_keys_into(&mut shell.desk);
+            spine.ext.carry_into(&mut shell.ext);
             std::mem::swap(&mut spine.monitor, &mut shell.monitor);
             for i in 0..spine.captures.len() {
                 std::mem::swap(&mut spine.captures[i], &mut shell.captures[i]);
@@ -408,7 +456,7 @@ where
 }
 
 /// Every target in range, empty, named once, and carrying a lane.
-fn install_fits<L>(spine: &mut Spine<L>, list: &[(Slot, Option<Box<L>>)]) -> bool {
+fn install_fits<L, X>(spine: &mut Spine<L, X>, list: &[(Slot, Option<Box<L>>)]) -> bool {
     let mut ok = true;
     let mut marked = 0;
     for (slot, lane) in list {
@@ -430,7 +478,7 @@ fn install_fits<L>(spine: &mut Spine<L>, list: &[(Slot, Option<Box<L>>)]) -> boo
 /// **The take-once guarantee, at the door.** A plan that repeats a slot,
 /// names an empty one, or carries a generation the slot does not hold is
 /// refused. O(N) over the plan's lanes; `check` is left empty either way.
-fn plan_is_valid<L: SpineLane>(spine: &mut Spine<L>, plan: &DeskPlan) -> bool {
+fn plan_is_valid<L: SpineLane, X>(spine: &mut Spine<L, X>, plan: &DeskPlan) -> bool {
     let mut ok = true;
     let mut marked = 0;
     for lane in plan.lanes.iter() {
@@ -584,6 +632,7 @@ mod tests {
                         width: 2,
                     }]
                     .into_boxed_slice(),
+                    ..MonitorPlan::default()
                 })))
                 .unwrap();
                 let (cap_tx, _) = RingBuffer::<f32>::new(16);
