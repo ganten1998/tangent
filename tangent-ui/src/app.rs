@@ -17364,7 +17364,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(moment) = self.history.get(at).cloned() else {
             return;
         };
-        self.touch_desk_index();
         let from = self.hist_at;
         self.hist_at = at;
         // **The lanes the moments crossed, for the host to carry the plugins
@@ -81382,8 +81381,8 @@ mod views_windowed_tests {
     /// index, so an idle frame rebuilds nothing.
     ///
     /// Revert-check: drop `clips` from what `desk_index_inputs` gathers and
-    /// the "a clip lands" step names the stale lane; drop the
-    /// `touch_desk_index` in `undo_apply` and "undo" keeps its generation.
+    /// the "a clip lands" step names the stale lane; empty
+    /// `touch_desk_index` and "a fader, undone" keeps its generation.
     #[test]
     fn the_desk_index_follows_every_kind_of_mutation() {
         let mut a = app();
@@ -81441,6 +81440,17 @@ mod views_windowed_tests {
             })),
             ("undo", Box::new(|a| a.undo())),
             ("redo", Box::new(|a| a.redo())),
+            // A gesture the index has no fact about, then its undo: the
+            // facts come back equal and only the restore's own bump moves
+            // the generation, which is what a cache keyed on it relies on.
+            ("a fader, undone", Box::new(|a| {
+                a.apply_mixer_hit(
+                    crate::mixer_panel::Hit::Fader(recorder::Column::Track(4)),
+                    0.2,
+                );
+                a.undo_commit();
+                a.undo();
+            })),
             ("a load", Box::new(|a| {
                 a.arrangement.clips.clear();
                 a.undo_reset();
