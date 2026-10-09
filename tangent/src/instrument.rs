@@ -35636,3 +35636,49 @@ mod lanesets {
         assert!(desk.midi_on.contains(chain_strip(Strip::Fx.index())));
     }
 }
+
+/// **What the desk-structure setters left in `Shared`, read back whole** -
+/// for `engine_bridge`'s harness, which has to prove that the app's desk
+/// reaches the engine the same way after the pushes moved out of
+/// `DesktopApp` as before. Every word those setters write is here, as the
+/// raw value the audio thread reads (masks as words, gains as f32 BITS, the
+/// key and bypass tables as their non-zero cells), so a push that lands one
+/// bit differently is a different readback. Tests only, and a READ: nothing
+/// here can change what the engine plays.
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn desk_readback(&self) -> serde_json::Value {
+        let sh = &self.shared;
+        let ld32 = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        let n = sh.route_count.load(Ordering::Acquire).min(sh.routes.len());
+        let cells = |v: &[AtomicU32]| -> Vec<(usize, u32)> {
+            v.iter()
+                .enumerate()
+                .filter_map(|(i, c)| Some((i, c.load(Ordering::Relaxed))).filter(|(_, x)| *x != 0))
+                .collect()
+        };
+        serde_json::json!({
+            "armed": ld32(&sh.armed),
+            "midi_off": sh.midi_off.load(Ordering::Relaxed),
+            "frozen": ld32(&sh.frozen),
+            "drum_strips": ld32(&sh.drum_strips),
+            "builtin_strips": ld32(&sh.builtin_strips),
+            "keys_strips": ld32(&sh.keys_strips),
+            "auto_suspend": sh.auto_suspend.load(Ordering::Relaxed),
+            "strip_phase": sh.strip_phase.load(Ordering::Relaxed),
+            "muted": sh.muted.load(Ordering::Relaxed),
+            "soloed": sh.soloed.load(Ordering::Relaxed),
+            "send": sh.send.iter().map(ld32).collect::<Vec<_>>(),
+            "folder_of": sh.folder_of.iter().map(|a| a.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "punch": sh.punch.iter().map(|a| a.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "midi_src": sh.midi_src.iter().map(ld32).collect::<Vec<_>>(),
+            "midi_chan": sh.midi_chan.iter().map(ld32).collect::<Vec<_>>(),
+            "routes": sh.routes[..n].iter().map(ld32).collect::<Vec<_>>(),
+            "route_gain": sh.route_gain[..n].iter().map(ld32).collect::<Vec<_>>(),
+            "insert_key_n": sh.insert_key_n.load(Ordering::Relaxed),
+            "insert_key": cells(&sh.insert_key),
+            "insert_bypass": cells(&sh.insert_bypass),
+            "grain": ld32(&sh.grain),
+        })
+    }
+}
