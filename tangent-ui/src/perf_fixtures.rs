@@ -450,6 +450,10 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             tuning: s.fretboard_tuning.clone(),
         }),
         frozen: Some(s.frozen_lanes.clone()),
+        ids: crate::arrangement::RowIds(s.track_ids.clone()),
+        next_id: crate::arrangement::Aside(s.next_track_id),
+        legacy_states: crate::arrangement::Aside(None),
+        dropped: crate::arrangement::Aside(Vec::new()),
     }
 }
 

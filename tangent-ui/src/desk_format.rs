@@ -49,6 +49,85 @@ pub const DESK_FORMAT: u64 = 2;
 /// in the commit that lands the copy-only shelf.
 pub const WRITE_V8: bool = false;
 
+/// [`WRITE_V8`], or a test on this thread that asked for format 2
+/// ([`with_format2`]). Every format-2 side effect reads THIS, so a test can
+/// drive a whole save road (the stamps, the backups, the pending marker,
+/// the drumpad keys) without the const ever being flipped.
+pub fn write_v8_on() -> bool {
+    WRITE_V8 || format2_forced()
+}
+
+/// **Which desk a writer writes.** The production writers ask
+/// [`Format::current`]; the `*_as` entry points take one, which is how a
+/// test reaches format 2 while production still writes today's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// Today's shape: the dense arrays and masks, stamped 22 and 7.
+    Legacy,
+    /// The `desk` object of this module, stamped 23 and 8.
+    V2,
+}
+
+impl Format {
+    /// What the production writers write: [`WRITE_V8`] decides, and nothing
+    /// else.
+    pub fn current() -> Self {
+        if write_v8_on() {
+            Format::V2
+        } else {
+            Format::Legacy
+        }
+    }
+
+    /// The `settings_version` a settings file in this format says. The
+    /// stamp follows the shape: nothing says 23 before it is format 2.
+    pub const fn settings_stamp(self) -> u64 {
+        match self {
+            Format::Legacy => 22,
+            Format::V2 => 23,
+        }
+    }
+
+    /// The `arrangement_version` a document in this format says, the
+    /// floor under a document's own (a higher stamp rides along).
+    pub const fn document_stamp(self) -> u64 {
+        match self {
+            Format::Legacy => 7,
+            Format::V2 => 8,
+        }
+    }
+}
+
+#[cfg(not(test))]
+const fn format2_forced() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORMAT2_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn format2_forced() -> bool {
+    FORMAT2_FORCED.with(std::cell::Cell::get)
+}
+
+/// **`f` run with the format-2 writers on**, on this thread only: what
+/// flipping [`WRITE_V8`] will do, pinned before the flip. Restored on the
+/// way out, a panic included.
+#[cfg(test)]
+pub(crate) fn with_format2<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORMAT2_FORCED.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORMAT2_FORCED.with(|c| c.replace(true)));
+    f()
+}
+
 /// **A desk read**, and every entry that was dropped on the way: the
 /// caller raises one notice naming them.
 #[derive(Debug, Clone, PartialEq)]
