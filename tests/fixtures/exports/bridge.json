@@ -2403,7 +2403,7 @@
     "engine": {
       "armed": 17,
       "midi_off": 4294967295,
-      "frozen": 0,
+      "frozen": 1,
       "drum_strips": 4,
       "builtin_strips": 0,
       "keys_strips": 2,
@@ -2613,7 +2613,7 @@
     "engine": {
       "armed": 17,
       "midi_off": 4294967295,
-      "frozen": 0,
+      "frozen": 1,
       "drum_strips": 4,
       "builtin_strips": 0,
       "keys_strips": 2,
@@ -2823,7 +2823,7 @@
     "engine": {
       "armed": 17,
       "midi_off": 4294967295,
-      "frozen": 0,
+      "frozen": 1,
       "drum_strips": 4,
       "builtin_strips": 0,
       "keys_strips": 2,
@@ -3033,7 +3033,7 @@
     "engine": {
       "armed": 17,
       "midi_off": 4294967295,
-      "frozen": 0,
+      "frozen": 1,
       "drum_strips": 4,
       "builtin_strips": 0,
       "keys_strips": 2,
@@ -3235,7 +3235,7 @@
           1
         ]
       ],
-      "grain": 4294967295
+      "grain": 240
     }
   },
   {
@@ -3243,7 +3243,7 @@
     "engine": {
       "armed": 17,
       "midi_off": 4294967295,
-      "frozen": 0,
+      "frozen": 1,
       "drum_strips": 4,
       "builtin_strips": 0,
       "keys_strips": 2,
@@ -3443,7 +3443,7 @@
           1
         ]
       ],
-      "grain": 4294967295
+      "grain": 240
     }
   },
   {

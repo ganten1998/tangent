@@ -31700,7 +31700,7 @@ mod tests {").expect("the tests module")];
         ] {
             assert!(furnish.contains(needle), "the render lost `{needle}`");
         }
-        let routes = bridge_fn("fn publish_tables(");
+        let routes = bridge_fn("fn publish_freeze_and_grain(");
         assert!(routes.contains("e.set_frozen(frozen_lane_mask("), "the engine is not told what is frozen");
         let push = bridge_fn("impl Bridge {");
         assert!(push.contains("builtin_mask & thawed"), "a frozen built-in still renders");
