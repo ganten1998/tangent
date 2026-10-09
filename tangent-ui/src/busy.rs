@@ -1587,8 +1587,8 @@ mod tests {
     fn every_theme_dresses_the_overlay() {
         let themes = crate::theme::factory();
         assert!(
-            themes.len() >= 19,
-            "the sweep expects the nineteen factory themes, found {}",
+            themes.len() >= 32,
+            "the sweep expects the thirty-two factory themes, found {}",
             themes.len()
         );
         let mut bad: Vec<String> = Vec::new();
@@ -1648,7 +1648,7 @@ mod tests {
                 }
             }
         }
-        assert!(swept >= 19 * 2 * 2, "the sweep covered {swept} dressings");
+        assert!(swept >= 32 * 2 * 2, "the sweep covered {swept} dressings");
         // **Both directions really happen.** The whole reason the veil is
         // measured rather than assumed is that the shipped themes need both:
         // the pale ones dim and the near-black ones haze. If this ever comes
