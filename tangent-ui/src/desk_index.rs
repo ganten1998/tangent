@@ -20,14 +20,14 @@
 //! tests below rather than through an app.
 //!
 //! **When it is rebuilt.** Its [`DeskIndex::generation`] moves whenever its
-//! inputs move: every row, clip, folder, kind or plugin edit changes the
-//! facts it was built from, and undo, redo and a load force a new
-//! generation outright. The app compares the gathered facts against the
-//! ones the standing index was built from (exactly, not by a hash, because
-//! a collision here would draw a desk that does not exist) and rebuilds on
-//! any difference. Gathering is a pass over flag words and clip lanes with
-//! no strings and no layout, cheaper than the one clip walk each frame's
-//! clip views already make.
+//! inputs move, and undo, redo and a load force a new generation outright.
+//! The app does not look on every ask: an ask is the cached index unless
+//! something marked it (the roads every row, clip, folder, kind, plugin,
+//! route or kit edit passes through, and once at the top of each frame).
+//! A marked ask gathers the facts and compares them against the ones the
+//! standing index was built from, exactly rather than by a hash, because a
+//! collision here would draw a desk that does not exist, and rebuilds only
+//! on a difference. See `TangentApp::desk_index`.
 
 use crate::recorder::ChannelKind;
 
@@ -50,8 +50,10 @@ pub struct RowFacts {
     /// Added as a bare track: used, with no kind chosen yet.
     pub added: bool,
     /// Something keeps the row from being vacant without making it a
-    /// counted track: a chain plugin, a curve, a freeze. Pedal-only residue
-    /// is NOT residue (section 4: it stays Vacant and is never reused).
+    /// counted track: a chain plugin, a curve, a freeze, a kit, or either
+    /// end of a route or a sidechain key (section 4's Vacant column, and
+    /// W2-desk-format's `holds`). Pedal-only residue is NOT residue
+    /// (section 4: it stays Vacant and is never reused).
     pub residue: bool,
 }
 
@@ -61,14 +63,23 @@ pub struct RowFacts {
 /// variants; this enum becomes a re-export of it at the wave-2 merge. It is
 /// declared here so this lane does not code against a file another lane is
 /// writing in parallel.
+///
+/// **Section 4's table has a gap, and both lanes fill it the same way.** A
+/// row with no kind that holds a curve, a kit, a freeze, a chain plugin or
+/// a route or key end is not Vacant by the table's Vacant column, and not
+/// the table's Placeholder ("only `in_folder` set"). Calling it Vacant
+/// would hide a sounding plugin or a route's end and, once vacant rows get
+/// no engine lane, drop it. So it is a Placeholder here, exactly as
+/// `desk_model::classify` rules it (`in_folder || curve || kit || frozen ||
+/// holds`), and the two classifiers agree at the swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowClass {
     /// Nothing at all: no kind, not added, no folder flag, no clips and no
     /// residue. Pedal-only residue still counts as Vacant.
     Vacant,
     /// Drawn and given a lane but not counted: only the in-folder flag (the
-    /// indented plus), or residue (a plugin, a curve, a freeze) on a row
-    /// that is not a track.
+    /// indented plus), or residue (a chain plugin, a curve, a freeze, a kit,
+    /// a route or key end) on a row that is not a track.
     Placeholder,
     /// A bus row. No bus kind exists before W7, so nothing is classed
     /// here yet; the variant is the contract's.
