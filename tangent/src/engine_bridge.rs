@@ -9,8 +9,8 @@
 //!   desk on change (the `PushedDesk` gate that used to sit in
 //!   `push_monitor_settings`), and beside them the words a frame has always
 //!   stored whole: the arm and live-MIDI masks, the MIDI routes, the
-//!   punches, the instrument and drum strip masks, the folders, polarity and
-//!   the curves' suspend mask. The faders, the click, the effects and the
+//!   punches, the frozen mask and the render-ahead, the instrument and drum
+//!   strip masks, the folders, polarity and the curves' suspend mask. The faders, the click, the effects and the
 //!   instruments' own instances stay with the host for now: they are atomic
 //!   stores or ring work that no structural edit changes.
 //! - [`furnish_offline`]: a separate OFFLINE engine furnished from the app
@@ -26,7 +26,11 @@
 //! engine and compares what the engine holds after each frame against the
 //! golden `DesktopApp` produced before the move
 //! (`tests/fixtures/exports/bridge.json`), and the export goldens hash every
-//! file a corpus of built-in desks exports (`golden.json`). W4 grows this
+//! file a corpus of built-in desks exports (`golden.json`). **One change
+//! on purpose, after the move**: the frozen mask and the render-ahead are
+//! stored every frame instead of behind the change gate (see
+//! `Bridge::sync`), so `bridge.json` departs from the base recording in
+//! exactly those two words, from the frames that change them. W4 grows this
 //! file into the broker (`TrackId -> Slot`, plans, `full_build`) and holds
 //! it to the same two files.
 
@@ -224,6 +228,7 @@ pub fn furnish_offline_with(
     // a channel sent through another channel's reverb is part of the
     // mix and has to be in the file.
     publish_tables(app, &e);
+    publish_freeze_and_grain(app, &e);
     if probe {
         if !ctx.probe.bypass.is_empty() {
             let mut bypass: Vec<(usize, usize)> = app.insert_bypass().to_vec();
@@ -579,6 +584,14 @@ impl Bridge {
                 desk: self.desk,
             });
         }
+        // **What is frozen, and how far ahead the effects render**, every
+        // frame and NOT behind the gate. Neither is in `PushedDesk`'s key, and
+        // they used to ride inside the table publish, so a freeze (or a thaw,
+        // or a render-ahead change) with nothing else edited never reached a
+        // running engine: a frozen lane's rack went on processing its
+        // already post-rack file, a second time, until some route, key,
+        // bypass, mute, solo or send moved. Each is one atomic store.
+        publish_freeze_and_grain(app, e);
         // **Armed, or alone in the editor** — the whole rule, in one place,
         // tested there. A frozen lane listens to nothing: its rack rests and
         // its file plays, so a note into it would sound through nothing
@@ -669,9 +682,8 @@ fn live_midi_off(app: &TangentApp, armed: u32) -> u64 {
     u64::from(midi_off) | u64::from(frozen_lane_mask(app.frozen_lanes()))
 }
 
-/// **The routing, key and bypass tables, the frozen mask and the
-/// render-ahead**, onto `e`: what the live push publishes on change and an
-/// offline engine is built with.
+/// **The routing, key and bypass tables**, onto `e`: what the live push
+/// publishes on change and an offline engine is built with.
 ///
 /// The routes are pruned against the device that is open: the picker knows
 /// only what the device offered when it opened, and the pruned copy is
@@ -708,6 +720,12 @@ fn publish_tables(app: &TangentApp, e: &Engine) {
     // is stored at the plugin's own address - so unlike the keys above
     // there is no `seat_bay` translation here to get wrong.
     engine_set_insert_bypass(e, app.insert_bypass());
+}
+
+/// **The frozen mask and the render-ahead**, onto `e`: two single words the
+/// live push stores every frame (they are not in the change gate's key, see
+/// `Bridge::sync`) and an offline engine is built with.
+fn publish_freeze_and_grain(app: &TangentApp, e: &Engine) {
     e.set_frozen(frozen_lane_mask(app.frozen_lanes()));
     // **How far ahead a track's effects are rendered.** One store of a
     // frame count; see `Settings::render_ahead_ms` for what it trades.
@@ -979,6 +997,43 @@ mod tests {
         for (g, w) in got.iter().zip(want) {
             assert_eq!(g, w, "the engine holds something else after `{}`", w["step"]);
         }
+    }
+
+    /// **A freeze, a thaw and a render-ahead change each reach a RUNNING
+    /// engine with nothing else on the desk edited.** They used to ride
+    /// inside the table publish, behind a change gate whose key holds
+    /// neither, so the engine's frozen bit waited for some unrelated route,
+    /// key, bypass, mute, solo or send edit: until then a frozen lane's rack
+    /// processed its already post-rack file a second time. A route planted
+    /// behind the gate and still there at the end proves the gate never
+    /// opened, so it is the per-frame store that carried each one.
+    #[test]
+    fn a_freeze_reaches_a_running_engine_with_nothing_else_edited() {
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        bay(&mut s, 1, 0, COMP_PATH);
+        p.sync(&app_with(s.clone()), &mut e);
+        let mut planted = Routes::default();
+        planted.add(Route::new(9, Target::Channel(10)));
+        e.set_routes(&planted);
+        let behind_gate = e.desk_readback()["routes"].clone();
+        let read = |e: &Engine, k: &str| e.desk_readback()[k].clone();
+        assert_eq!(read(&e, "frozen"), serde_json::json!(0));
+
+        s.frozen_lanes.push(FrozenLane { lane: 1, path: "media/f.wav".into(), len_s: 1.0 });
+        p.sync(&app_with(s.clone()), &mut e);
+        assert_eq!(read(&e, "frozen"), serde_json::json!(1 << 1), "a freeze waited for some other edit");
+
+        s.render_ahead_ms = 10.0;
+        p.sync(&app_with(s.clone()), &mut e);
+        assert_eq!(read(&e, "grain"), serde_json::json!(RATE / 100), "a render-ahead change waited for some other edit");
+
+        s.frozen_lanes.clear();
+        p.sync(&app_with(s.clone()), &mut e);
+        assert_eq!(read(&e, "frozen"), serde_json::json!(0), "a thaw waited for some other edit");
+        assert_eq!(read(&e, "routes"), behind_gate, "the change gate opened, so this proves nothing about the per-frame store");
     }
 
     // ── the export goldens ─────────────────────────────────────────────────
@@ -1531,9 +1586,10 @@ mod tests {
     }
 
     /// And the gate's wiring, by scan: inside `Bridge::sync` the table
-    /// publish and `set_desk` sit under the `desk_unchanged` gate, the gate
-    /// is keyed on the bridge's count of engines so a fresh engine is
-    /// primed, and the desk is built once.
+    /// publish and `set_desk` sit under the `desk_unchanged` gate, the
+    /// frozen mask and the render-ahead sit after it (they are not in its
+    /// key), the gate is keyed on the bridge's count of engines so a fresh
+    /// engine is primed, and the desk is built once.
     #[test]
     fn the_sync_publishes_the_tables_under_the_change_gate() {
         let src = include_str!("engine_bridge.rs");
@@ -1545,6 +1601,8 @@ mod tests {
         let desk = body.find("e.set_desk(&self.desk);").expect("set_desk is gone");
         let shut = body[gate..].find("\n        }\n").map(|n| gate + n).expect("the gate's end");
         assert!(gate < tables && tables < shut && gate < desk && desk < shut, "a table publish sits outside the change gate");
+        let words = body.find("publish_freeze_and_grain(app, e);").expect("the frozen mask and the render-ahead are not pushed");
+        assert!(words > shut, "the frozen mask and the render-ahead went back behind the change gate");
         assert!(body[gate..tables].contains("self.epoch"), "the gate is not keyed on the engine");
         assert_eq!(body.matches("app.desk()").count(), 1, "the desk is built more than once a frame");
     }
