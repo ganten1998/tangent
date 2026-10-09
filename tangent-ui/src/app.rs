@@ -80989,3 +80989,16 @@ mod sampler_road_tests {
         );
     }
 }
+
+/// **A door for the HOST's tests onto the automation modes**, which have no
+/// door of their own (see `arr_cycle_auto_mode`): the host's bridge pushes
+/// `auto_suspend_mask` every frame, and a harness that cannot put anything
+/// but the default into that word cannot tell the push from its absence.
+/// Hidden, and named for what it is, rather than `cfg(test)`: a cfg(test)
+/// item in this crate does not exist when the `tangent` crate's tests build.
+impl TangentApp {
+    #[doc(hidden)]
+    pub fn set_arr_auto_mode_for_test(&mut self, lane: usize, mode: crate::automation::AutoMode) {
+        self.arr_auto_modes.insert(lane, mode);
+    }
+}
