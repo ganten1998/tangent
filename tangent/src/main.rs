@@ -105,6 +105,13 @@ mod instrument;
 /// block costs against its deadline, shape by shape. Tests only.
 #[cfg(all(test, feature = "recorder"))]
 mod rt_bench;
+/// A counting allocator for this test binary and the alias harness: what the
+/// callback allocates today, measured before the engine is rebuilt.
+#[cfg(all(test, feature = "recorder"))]
+mod rt_alloc;
+/// Render goldens of today's engine, to the bit, over built-in units.
+#[cfg(all(test, feature = "recorder"))]
+mod render_golden;
 /// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
 /// a drop-in for the handful of midir calls `midi` makes, so the difference is
 /// one `use` and not a second code path. A target gate, not a feature gate —
