@@ -4288,11 +4288,13 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
     // has always had. This is Ableton's overview strip on Tangent's desk;
     // the single wave below remains the face for hosts with no document.
     if !view.scrub.blocks.is_empty() || view.scrub.viewport.is_some() {
-        let lanes = crate::recorder::CHANNELS as f32;
-        let row_h = r.height() / lanes;
+        // As deep as the desk the app says it has (`ScrubView::rows`), never
+        // a capacity constant of this crate's.
+        let rows = view.scrub.rows.max(1);
+        let row_h = r.height() / rows as f32;
         // Faint stripes, so eight rows read as eight even where no clip
         // stands — the arrangement's own lane field in miniature.
-        for i in 0..crate::recorder::CHANNELS {
+        for i in 0..rows {
             if i % 2 == 1 {
                 let y = r.top() + row_h * i as f32;
                 painter.rect_filled(
@@ -4312,7 +4314,7 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
         };
         let played = fraction_of(total, view.position_s).unwrap_or(0.0);
         for (lane, f0, fl, color) in &view.scrub.blocks {
-            let y0 = r.top() + row_h * (*lane).min(crate::recorder::CHANNELS - 1) as f32;
+            let y0 = r.top() + row_h * (*lane).min(rows - 1) as f32;
             let x0 = r.left() + r.width() * f0.clamp(0.0, 1.0);
             let x1 = r.left() + r.width() * (f0 + fl).clamp(0.0, 1.0);
             let block = Rect::from_min_max(

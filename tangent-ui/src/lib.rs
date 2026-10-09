@@ -16,6 +16,9 @@ pub mod chord_strip;
 /// Identity on the desk: tracks, racks and bays named by what they are, not
 /// by where they sit. Pure; see the module for why positions had to go.
 pub mod desk_id;
+/// The desk's shape worked out once: drawn order, ranks, classes, folders
+/// and clip counts, so every view is O(visible).
+pub mod desk_index;
 /// The frozen 32-channel seat map and its one road to identity.
 pub mod desk_legacy;
 pub mod dialogs;
