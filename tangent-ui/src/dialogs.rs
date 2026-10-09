@@ -443,17 +443,19 @@ pub enum Dialog {
         /// neither can.
         system: Option<String>,
         /// Every output the chosen system offers. Snapshotted at open, like
-        /// `systems` and `rates` - see `ports::AudioSetup::outputs`.
+        /// `systems` and `rates`, and once more after a SYSTEM press - see
+        /// `ports::AudioSetup::outputs` and `outputs_stale`.
         outputs: Vec<String>,
         /// The one to open, or `None` for the system's own default.
         output: Option<String>,
-        /// **The OUTPUT list belonged to the LAST system**: raised by a
-        /// SYSTEM press while this panel is open, which empties `outputs` and
-        /// `output` with it. Every name in that list came from the old
-        /// backend, and asking the new one at once would ask the old one
-        /// again - the host only switches a frame later - so the row says
-        /// when the new list comes rather than offering names that cannot
-        /// open. See `DialogAction::SetAudioSystem`.
+        /// **The OUTPUT row waits for the chosen system's list**: raised by
+        /// a SYSTEM press while this panel is open, which empties `outputs`
+        /// and `output` with it, or by a panel opened before the host has
+        /// switched. Every name in the old list came from the old backend,
+        /// and the host only switches a frame later, so the row says the
+        /// list is coming rather than offering names that cannot open - and
+        /// the app fills it, once, on the first frame the host can answer
+        /// for the new system. See `TangentApp::tend_stale_outputs`.
         outputs_stale: bool,
         /// The rates the selected input device offers.
         rates: Vec<u32>,
@@ -10097,9 +10099,7 @@ fn show_on(
                             ui.label(RichText::new("OUTPUT").font(bold(11.0)).color(t.text));
                             if outputs.is_empty() && *outputs_stale {
                                 ui.label(
-                                    RichText::new(
-                                        "the new system's outputs are listed when Setup next opens",
-                                    )
+                                    RichText::new("listing the new system's outputs...")
                                     .font(plain(11.0))
                                     .color(dim),
                                 );
@@ -15964,15 +15964,19 @@ at: None,
         assert!(bare.says("OUTPUT"), "the row vanished with no devices");
         assert!(bare.says("none reported"), "an empty output list said nothing");
 
-        // **And a list a SYSTEM press left behind says when the new one
-        // comes**, rather than "none reported" about a system nobody has
+        // **And a list a SYSTEM press left behind says the new one is
+        // coming**, rather than "none reported" about a system nobody has
         // asked yet. See `outputs_stale`.
         if let Some(Dialog::AudioSetup { outputs_stale, .. }) = bare.dialog.as_mut() {
             *outputs_stale = true;
         }
         assert!(
-            bare.says("the new system's outputs are listed when Setup next opens"),
-            "a list a system press left behind does not say when the new one comes"
+            bare.says("listing the new system's outputs..."),
+            "a list a system press left behind does not say the new one is coming"
+        );
+        assert!(
+            !bare.says("the new system's outputs are listed when Setup next opens"),
+            "the row still sends the person out of Setup for a list that comes on its own"
         );
         assert!(!bare.says("none reported"), "a system not yet asked reads as one with no outputs");
     }
