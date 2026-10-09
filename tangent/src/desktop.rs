@@ -20652,16 +20652,22 @@ fn shift_insert_states_for_v18() {
     }
 }
 
-/// 16 -> today's channels: every seat at or above the old channel block —
+/// 16 -> 32 channels: every seat at or above the old channel block —
 /// drums, click, fx, master, master-extra and all the pad blocks — steps
 /// up by exactly the growth. Uniform because the seat map appends its
 /// classes in order (channels, buses, pads), so one +grow over the old
 /// range is provably right for every old seat >= 16. Highest first, or
 /// the move eats itself. The old map's last seat was 2068 (frozen: the
 /// sixteen-channel era's own arithmetic).
+///
+/// **The growth is the literal 16**, the V32 shape the settings lift lands
+/// on (`desk_lift`), and never `CHANNELS - 16`: the desk's width is about to
+/// stop being a constant at all, and a rename that read it would move every
+/// sixteen-era sidecar somewhere the lifted desk never looks. The same
+/// shuffle is `ShelfShuffles::V20` in `desk_lift::legacy_shelf_seat`.
 #[cfg(feature = "recorder")]
 fn shift_insert_states_for_v20() {
-    let grow = tangent_ui::recorder::CHANNELS - 16;
+    let grow = 16;
     for bay in 0..3 {
         for old in (16..2069).rev() {
             let from = insert_state_path(old, bay);
@@ -20669,6 +20675,37 @@ fn shift_insert_states_for_v20() {
                 let _ = std::fs::rename(&from, insert_state_path(old + grow, bay));
             }
         }
+    }
+}
+
+/// The v20 shuffle reads no live capacity constant: its body is the frozen
+/// sixteen-era arithmetic and nothing else.
+#[cfg(all(test, feature = "recorder"))]
+mod v20_shuffle_is_frozen {
+    #[test]
+    fn the_v20_shelf_shuffle_reads_no_live_constant() {
+        let src = include_str!("desktop.rs");
+        let at = src.find("fn shift_insert_states_for_v20()").expect("the shuffle");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let idents: Vec<&str> = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for banned in [
+            "CHANNELS", "STRIPS", "TOTAL_SEATS", "INSERT_SPACE", "INSERTS", "MASTER_LANE",
+            "MASTER_AUTO_LANE", "INPUTS", "recorder",
+        ] {
+            assert!(
+                !idents.contains(&banned),
+                "shift_insert_states_for_v20 reads the live `{banned}`; freeze it"
+            );
+        }
+        assert!(code.contains("let grow = 16;"), "the growth is not the frozen sixteen");
     }
 }
 

@@ -347,8 +347,14 @@ const V5_MUSICAL_TIME: u64 = 5;
 pub const V7_SPARSE_SEATS: u64 = 7;
 
 /// The seats a document's desk carries as a plain array: every strip and
-/// the master, `(STRIPS + 1) * INSERTS`. See [`V7_SPARSE_SEATS`].
-pub const HEAD_BAYS: usize = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+/// the master, `(35 + 1) * 3`. See [`V7_SPARSE_SEATS`].
+///
+/// **The V32 literal, not `(STRIPS + 1) * INSERTS`.** The head is a FORMAT:
+/// every v7 document and v21 settings file on disk has exactly this many,
+/// and the era lifts key on lengths, so a head that grew with the desk would
+/// make tomorrow's files a length nobody has assigned an era to. Every seat
+/// past it rides the sparse tail, whatever the live desk's width.
+pub const HEAD_BAYS: usize = crate::desk_lift::V32_HEAD_BAYS;
 
 // The sixteen-pad era's desk had exactly 84 bays and the lift that carries
 // it keys on that length alone; a head of that length would be lifted as
@@ -2718,6 +2724,9 @@ impl DeskSnap {
                 .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_str()?.to_owned())))
                 .collect()
         };
+        // The era from the file's own lengths, before anything moves them.
+        let era = crate::desk_lift::era_of_desk(v);
+        let mut phase_v = m.get("phase").and_then(Value::as_u64);
         let (mut names_v, mut colors_v, mut sends_v, mut muted_v, mut soloed_v) = (
             strings("names"),
             m.get("colors")
@@ -2735,12 +2744,14 @@ impl DeskSnap {
             Some(Value::Array(_)) => {
                 let mut dense = strings("inserts");
                 lift_eras(
+                    era,
                     &mut sends_v,
                     &mut colors_v,
                     &mut names_v,
                     &mut dense,
                     &mut muted_v,
                     &mut soloed_v,
+                    &mut phase_v,
                 );
                 dense
                     .into_iter()
@@ -2868,7 +2879,7 @@ impl DeskSnap {
             // "empty", and not a default: the live value stands for a
             // document written before the key, so nothing an old project
             // sounds like changes because a field was added.
-            phase: m.get("phase").and_then(Value::as_u64),
+            phase: phase_v,
             to_theory: m.get("to_theory").and_then(Value::as_array).map(|a| {
                 a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()
             }),
@@ -3139,12 +3150,13 @@ impl DeskSnap {
     }
 }
 
-/// **A desk written in an earlier ERA of the desk's shape, grown to
-/// today's.** Four lifts, each keyed on the LENGTH the file was written at
-/// — the sends count is a strip count, the bay count a seat map — and each
-/// frozen at its era's literals, per the migration rule: this read the live
-/// constants once and went dead the day the desk grew to 24, stranding that
-/// beta window's documents unlifted.
+/// **A desk written in an earlier ERA of the desk's shape, lifted onto the
+/// frozen V32 shape.** The era comes off the LENGTHS the file was written at
+/// (the sends count is a strip count, the bay count a seat map; see
+/// [`crate::desk_lift::era_of_desk`]) and every step is `desk_lift`'s, at
+/// its literals: this read the live constants once and went dead the day
+/// the desk grew to 24, stranding that beta window's documents unlifted,
+/// with their buses and master on channels 24..26.
 ///
 /// Here in the READER, on the dense array as the file holds it, and not in
 /// `apply_desk_snapshot` where they used to run on a clone of every desk
@@ -3152,124 +3164,34 @@ impl DeskSnap {
 /// hold an old-era desk. A property of how the FILE was written belongs
 /// beside the `tracks_added` reconstruction, which is the same kind of
 /// fact. `a_desk_from_any_era_opens_at_todays_seats` pins each era through
-/// the live desk, which is the same observation whichever function lifts.
+/// the live desk, and the era corpus pins every one at literal seats.
+///
+/// A project's insert states live in its own `state/`, named by the era's
+/// seats; the desk ARRAYS relocate here so plugins load at the right seats,
+/// and [`crate::desk_lift::provenance_of_document`] runs this same lift
+/// over bay numbers to say which legacy file holds each one's knobs.
+#[allow(clippy::too_many_arguments)]
 fn lift_eras(
+    era: crate::desk_lift::DeskEra,
     sends: &mut Vec<f64>,
     colors: &mut Vec<i64>,
     names: &mut Vec<String>,
     inserts: &mut Vec<String>,
     muted: &mut u64,
     soloed: &mut u64,
+    phase: &mut Option<u64>,
 ) {
-    // A document saved before the DRUM BUS carries eighteen-strip arrays:
-    // its click, bus and master rows would land one seat early. Frozen at
-    // the era's numbers (16 channels, 18 strips).
-    const V18_CH: usize = 16;
-    if sends.len() == 18 {
-        sends.insert(V18_CH, 0.0);
-        if colors.len() == 19 {
-            colors.insert(V18_CH, 0);
-        }
-        if names.len() == 19 {
-            names.insert(V18_CH, String::new());
-        }
-        if inserts.len() == 19 * crate::recorder::INSERTS {
-            for _ in 0..crate::recorder::INSERTS {
-                inserts.insert(V18_CH * crate::recorder::INSERTS, String::new());
-            }
-        }
-        let move_mask = |mask: u64| -> u64 {
-            let keep = mask & ((1u64 << V18_CH) - 1);
-            let above = mask >> V18_CH;
-            keep | (above << (V18_CH + 1))
-        };
-        *muted = move_mask(*muted);
-        *soloed = move_mask(*soloed);
-    }
-    // **An eight-channel-era document, grown to today's count.** The
-    // settings path does this in `adopt_desk`; a project carries its own
-    // desk snapshot and needs the same lift, or opening a session saved at
-    // eight channels scatters its drums/click/fx/master and every pad's FX
-    // onto the new empty channels. Frozen eight-channel shape: STRIPS 11,
-    // master at 11, pad-insert base 12.
-    const OLD_CH: usize = 8;
-    const OLD_STRIPS: usize = 11;
-    let ins3 = crate::recorder::INSERTS;
-    // A sixteen-pad-era doc first grows its pads to 128 at base 12 — its
-    // pads were keys 36..51 — before the channels widen the base.
-    if inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
-        inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
-        for pad in (0..16usize).rev() {
-            for bay in 0..ins3 {
-                let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
-                let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
-                let moved = std::mem::take(&mut inserts[from]);
-                inserts[to] = moved;
-            }
-        }
-    }
-    if sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
-        let grow = crate::recorder::CHANNELS - OLD_CH;
-        for _ in 0..grow {
-            if OLD_CH <= colors.len() {
-                colors.insert(OLD_CH, 0);
-            }
-            if OLD_CH <= names.len() {
-                names.insert(OLD_CH, String::new());
-            }
-            if OLD_CH <= sends.len() {
-                sends.insert(OLD_CH, 0.0);
-            }
-        }
-        let ins_at = OLD_CH * ins3;
-        for _ in 0..(grow * ins3) {
-            if ins_at <= inserts.len() {
-                inserts.insert(ins_at, String::new());
-            }
-        }
-        let grow_mask = |mask: u64| -> u64 {
-            let keep = mask & ((1u64 << OLD_CH) - 1);
-            let above = mask >> OLD_CH;
-            keep | (above << (OLD_CH + grow))
-        };
-        *muted = grow_mask(*muted);
-        *soloed = grow_mask(*soloed);
-        // Not the global `desk_state_shift_v19` flag: that renames the
-        // global state dir, and a project's insert states live in its own
-        // `state/`. The desk ARRAYS relocate here so plugins load at the
-        // right seats; a moved plugin's saved knobs fall back to defaults,
-        // the same graceful cost every shuffle accepts.
-    }
-    // **A sixteen-channel-era document, grown to twenty-four.** The
-    // 4.82-through-5.0 shape: nineteen sends is its fingerprint. Same fold,
-    // same bargain on the project's own state/ sidecars.
-    const V19_CH: usize = 16;
-    if sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
-        let grow = crate::recorder::CHANNELS - V19_CH;
-        for _ in 0..grow {
-            if V19_CH <= colors.len() {
-                colors.insert(V19_CH, 0);
-            }
-            if V19_CH <= names.len() {
-                names.insert(V19_CH, String::new());
-            }
-            if V19_CH <= sends.len() {
-                sends.insert(V19_CH, 0.0);
-            }
-        }
-        let ins_at = V19_CH * ins3;
-        for _ in 0..(grow * ins3) {
-            if ins_at <= inserts.len() {
-                inserts.insert(ins_at, String::new());
-            }
-        }
-        let grow_mask = |mask: u64| -> u64 {
-            let keep = mask & ((1u64 << V19_CH) - 1);
-            let above = mask >> V19_CH;
-            keep | (above << (V19_CH + grow))
-        };
-        *muted = grow_mask(*muted);
-        *soloed = grow_mask(*soloed);
+    use crate::desk_lift::{lift_bays, lift_strip_mask, lift_strip_rows};
+    *sends = lift_strip_rows(era, std::mem::take(sends), 0.0, false, false);
+    *colors = lift_strip_rows(era, std::mem::take(colors), 0, true, false);
+    *names = lift_strip_rows(era, std::mem::take(names), String::new(), true, false);
+    *inserts = lift_bays(era, std::mem::take(inserts), false);
+    *muted = lift_strip_mask(era, *muted, false);
+    *soloed = lift_strip_mask(era, *soloed, false);
+    // Polarity reached the document only after the desk was 32 wide, so no
+    // older-era document says it; one that did would mean strip space.
+    if let Some(p) = phase.as_mut() {
+        *p = lift_strip_mask(era, *p, false);
     }
 }
 
@@ -3571,6 +3493,11 @@ impl Arrangement {
                 .filter(|s| s.is_finite() && *s >= 0.0)
                 .unwrap_or(0.0)
         };
+        // The desk's era, for the master's automation lane below: the
+        // stamp alone cannot tell the 24-channel window from 32.
+        let era = map
+            .get("desk")
+            .map_or(crate::desk_lift::DeskEra::V32, crate::desk_lift::era_of_desk);
         let desk = map.shift_remove("desk").as_ref().and_then(DeskSnap::from_value);
         // **The version-4 migration, and the document's first real one.**
         //
@@ -3580,16 +3507,17 @@ impl Arrangement {
         // the sort of thing somebody notices as "it sounds wrong" and never
         // reports as a bug.
         let (tempo, meter) = Self::read_maps(&mut map, version, desk.as_ref());
-        let mut automation = Self::read_automation(&mut map);
-        // **The master lane moved when the desk grew.** MASTER_LANE is the
-        // channel count, so documents written at sixteen channels keep
-        // their master curves at lane 16 — an ordinary channel on the
-        // twenty-four desk. Version 6 is the stamp that says "my master is
-        // at today's lane"; anything older is lifted here, at the frozen
-        // literal, per the migration rule.
-        if version < 6 {
-            automation.remap_lane(16, crate::recorder::CHANNELS);
-        }
+        let mut automation = Self::read_automation(&mut map, version, era);
+        // **The master lane moved when the desk grew.** MASTER_LANE was the
+        // channel count, so documents written at sixteen channels keep their
+        // master curves at lane 16 and the 24-channel window's at 24, each an
+        // ordinary channel on the V32 desk. `master_auto_lane` says which,
+        // from the stamp and the era; the lift lands it on V32's master lane,
+        // a literal, per the migration rule. A no-op for a V32 document.
+        automation.remap_lane(
+            crate::desk_lift::master_auto_lane(version, era),
+            crate::desk_lift::V32_MASTER_LANE,
+        );
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -3948,7 +3876,11 @@ impl Arrangement {
     /// document to migrate FROM, so an absent key simply means a song nobody
     /// has automated. Every value is put through `Curve::sanitised` rather
     /// than believed, for the reason that function gives.
-    fn read_automation(map: &mut Map<String, Value>) -> crate::automation::Automation {
+    fn read_automation(
+        map: &mut Map<String, Value>,
+        version: u64,
+        era: crate::desk_lift::DeskEra,
+    ) -> crate::automation::Automation {
         use crate::automation::{AutoParam, Automation, Curve, Point, Shape};
         let Some(Value::Array(list)) = map.shift_remove("automation") else {
             return Automation::default();
@@ -3964,14 +3896,19 @@ impl Arrangement {
                 // does not land at all, and it would be silent.
                 //
                 // **The MASTER is one past the channels and is real.** It is
-                // a bus rather than one of the sixteen, and it keeps its
+                // a bus rather than one of the channels, and it keeps its
                 // curves under `arrangement_panel::MASTER_LANE` — so the
                 // bound is "past the master", not "past the channels", or
                 // the master's automation is silently discarded every time
                 // the document is read back.
-                if lane > crate::recorder::CHANNELS {
-                    return None;
-                }
+                //
+                // **The master of the document's ERA**, at the frozen
+                // literals (`desk_lift::lift_curve_lane`): 32 for a V32
+                // document, exactly the bound this always was; 24 and 16
+                // for the older ones, whose builds never wrote past it.
+                // Only the lane is judged here; `from_map` moves the
+                // master's curves onto V32's master lane.
+                crate::desk_lift::lift_curve_lane(version, era, lane)?;
                 let param = AutoParam::from_key(o.get("param")?.as_str()?)?;
                 let points = o
                     .get("points")?
