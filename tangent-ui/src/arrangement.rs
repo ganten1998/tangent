@@ -2982,10 +2982,7 @@ impl DeskSnap {
             });
         };
         let mut next = read.model.next_id;
-        while ids.len() < crate::desk_lift::V32_CHANNELS {
-            ids.push(crate::desk_id::TrackId(u32::try_from(next).unwrap_or(u32::MAX)));
-            next += 1;
-        }
+        crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, crate::desk_lift::V32_CHANNELS);
         dense.into_snap(&mut d);
         d.ids = RowIds(ids);
         d.next_id = Aside(next);

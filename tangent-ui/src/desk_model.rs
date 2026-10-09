@@ -1164,6 +1164,42 @@ impl DeskModel {
         crate::desk_format::DeskRead { model, dropped: lost }
     }
 
+    /// **A short desk's ids, filled out to `width` rows** (the dense live
+    /// desk, until W6): each row the file never named gets an id NO row of
+    /// this desk holds, and `next` stays above every id minted from it.
+    ///
+    /// Minted from `next` while it fits a u32, which `desk_format::read`
+    /// already keeps above every id it read. Past that the counter is
+    /// spent, and only a hand-made file arranges it: one row at
+    /// `t4294967295` is enough, because the reader raises `next_id` to one
+    /// past it. Clamping to `u32::MAX` there gave every padded row the SAME
+    /// id as each other and as that row, and the two views of the desk then
+    /// parted: `desk_ids` saw duplicates and answered identity, while the
+    /// row signals and the kit writer used them as they were, so several
+    /// lanes wrote one kit key and all but the last kit was lost. So the
+    /// lowest ids no row holds fill the rest. Not refused: the desk reads
+    /// whole, and refusing a song for its counter would cost the song.
+    pub fn pad_ids(ids: &mut Vec<TrackId>, next: &mut u64, width: usize) {
+        let mut free = 0u32;
+        while ids.len() < width {
+            let id = match u32::try_from(*next) {
+                Ok(id) => {
+                    *next += 1;
+                    TrackId(id)
+                }
+                Err(_) => {
+                    // At most `width` ids are held, so this ends long
+                    // before the u32 space does.
+                    while ids.contains(&TrackId(free)) {
+                        free += 1;
+                    }
+                    TrackId(free)
+                }
+            };
+            ids.push(id);
+        }
+    }
+
     /// **The rows as a dense legacy desk**, and the ids in lane order, or
     /// `None` for a desk past 32 rows, which no dense shape can hold.
     ///
