@@ -4208,10 +4208,7 @@ impl Settings {
         // A short desk is the live desk's first rows; the rest are vacant
         // rows the file never named, given ids nothing has held.
         let mut next = read.model.next_id;
-        while ids.len() < crate::recorder::CHANNELS {
-            ids.push(crate::desk_id::TrackId(u32::try_from(next).unwrap_or(u32::MAX)));
-            next += 1;
-        }
+        crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, crate::recorder::CHANNELS);
         dense.into_settings(self);
         self.track_ids = ids;
         self.next_track_id = next;
@@ -5741,12 +5738,20 @@ impl Settings {
         self.strip_sends = fresh.strip_sends;
         self.strip_muted = fresh.strip_muted;
         self.strip_soloed = fresh.strip_soloed;
-        // **The rows' ids go back with the rows**: a fresh desk is the
-        // identity desk a fresh install has. The counter does not go back,
-        // because it only rises: an id this session already handed out is
-        // never handed out again, whatever the rows now are.
-        self.track_ids = fresh.track_ids.clone();
-        self.next_track_id = self.next_track_id.max(fresh.next_track_id);
+        // **The emptied rows are new tracks, so they wear new ids** (design
+        // 3: "a cleared slot that is reused gets a fresh id"). They took the
+        // fresh desk's identity ids 0..31 here, while the counter kept
+        // rising, so an id this session had already handed out, and a
+        // reorder may have put on another row, named a different row again:
+        // anything still keyed by it (a sidecar written earlier this session,
+        // a plugin's state name) would attach to the wrong track. Minted from the counter, which only rises, and
+        // as wide as the fresh desk. A spent counter (a hand-made file) fills
+        // as `pad_ids` does: the lowest ids no reset row holds.
+        let mut next = self.next_track_id.max(fresh.next_track_id);
+        let mut ids = Vec::with_capacity(fresh.track_ids.len());
+        crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, fresh.track_ids.len());
+        self.track_ids = ids;
+        self.next_track_id = next;
         // **Which channels EXIST**, and its absence here is why "Reset
         // Everything" left a channel standing.
         //
@@ -7594,9 +7599,21 @@ mod tests {
         // Comparing the structs closes the class rather than the instance.
         // The bookkeeping is levelled first, for the reason `BOOKKEEPING`
         // gives — a reset is deliberately not a first launch.
+        // **The rows' ids are the one desk field a reset does NOT put back**:
+        // the emptied rows are new tracks and wear ids minted past every id
+        // the session held (design 3), so they are checked for that here and
+        // then levelled with the bookkeeping.
+        assert_eq!(s.track_ids.len(), fresh.track_ids.len());
+        assert!(
+            s.track_ids.iter().all(|id| u64::from(id.0) >= fresh.next_track_id),
+            "a reset row took back an id the session had already handed out"
+        );
+        assert!(s.next_track_id > fresh.next_track_id, "the counter went back");
         let mut levelled = s.clone();
         let mut baseline = fresh.clone();
         for side in [&mut levelled, &mut baseline] {
+            side.track_ids = Vec::new();
+            side.next_track_id = 0;
             side.video_default_applied = true;
             side.shows_default_applied = true;
             side.video_defaults_lowered = false;
@@ -9449,6 +9466,57 @@ mod format2_tests {
         assert_eq!(back.next_track_id, 41);
         let legacy = Settings::from_json(&Value::Object(s.to_map_as(Format::Legacy)).to_string());
         assert_eq!(legacy.track_ids, crate::desk_legacy::identity_ids(crate::recorder::CHANNELS));
+    }
+
+    /// **Reset Desk empties every row in place, and an emptied row is a new
+    /// track** (design 3): it wears an id minted past every id the session
+    /// held, never the identity id a reorder may have put on another row,
+    /// and the counter keeps rising.
+    #[test]
+    fn a_reset_desk_mints_fresh_ids_and_hands_none_back() {
+        use crate::desk_id::TrackId;
+        let mut s = Settings::default();
+        s.track_ids.swap(0, 3);
+        s.track_ids[5] = TrackId(32);
+        s.track_ids[6] = TrackId(33);
+        s.next_track_id = 34;
+        let held: std::collections::BTreeSet<TrackId> =
+            s.track_ids.iter().copied().chain([TrackId(5), TrackId(6)]).collect();
+        s.reset(ResetScope::Desk);
+        let fresh: std::collections::BTreeSet<TrackId> = s.track_ids.iter().copied().collect();
+        assert_eq!(fresh.len(), crate::recorder::CHANNELS, "two reset rows share an id");
+        assert!(fresh.is_disjoint(&held), "a reset row took back an id the session held");
+        assert!(s.track_ids.iter().all(|id| u64::from(id.0) >= 34));
+        assert_eq!(s.next_track_id, 34 + crate::recorder::CHANNELS as u64);
+        assert_eq!(s.desk_ids(), s.track_ids, "the sane view and the raw view parted");
+    }
+
+    /// **A short format-2 desk at a spent counter pads with ids nobody
+    /// holds**: one row at `t4294967295` raises the counter past the u32
+    /// space, and the padded rows used to all be `t4294967295`, that row's
+    /// own id. Every row's id is distinct, the file's rows keep theirs, and
+    /// the raw ids and `desk_ids` agree.
+    #[test]
+    fn a_short_desk_at_a_spent_counter_pads_with_distinct_ids() {
+        use crate::desk_id::TrackId;
+        let mut v = Value::Object(Settings::default().to_map_as(Format::V2));
+        let rows = v["desk"]["rows"].as_array_mut().expect("rows");
+        rows.truncate(4);
+        for (row, id) in rows.iter_mut().zip([u64::from(u32::MAX), 40, 41, 0]) {
+            row["id"] = Value::from(id);
+        }
+        v["desk"]["next_id"] = Value::from(5_000_000_000u64);
+        let back = Settings::from_json(&v.to_string());
+        assert_eq!(&back.track_ids[..4], &[TrackId(u32::MAX), TrackId(40), TrackId(41), TrackId(0)]);
+        let all: std::collections::BTreeSet<TrackId> = back.track_ids.iter().copied().collect();
+        assert_eq!(all.len(), crate::recorder::CHANNELS, "two rows share an id: {:?}", back.track_ids);
+        assert_eq!(back.desk_ids(), back.track_ids, "the sane view fell back to identity");
+        // And the same desk as a document's.
+        let mut doc = Map::new();
+        doc.insert("desk".into(), v["desk"].clone());
+        let a = crate::arrangement::Arrangement::from_json(&Value::Object(doc).to_string());
+        let ids = a.desk.expect("a desk").ids.0;
+        assert_eq!(ids, back.track_ids, "the document's padding is not the settings'");
     }
 
     /// **Sixty-five routes read as sixty-five.** The read stopped at the
