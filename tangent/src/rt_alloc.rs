@@ -37,6 +37,18 @@ struct Counting;
 thread_local! {
     /// `None` when this thread is not the counting one.
     static TOUCHES: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Bytes the counting thread asked for inside its window (see
+    /// [`count_bytes`]): what a build costs, where `TOUCHES` is how often.
+    static ASKED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Add `size` to the counting thread's bytes; nothing on any other thread.
+fn ask(size: usize) {
+    let _ = TOUCHES.try_with(|t| {
+        if t.get().is_some() {
+            let _ = ASKED.try_with(|a| a.set(a.get().saturating_add(size)));
+        }
+    });
 }
 
 /// Whether a window is open: lane hands count only then.
@@ -96,6 +108,7 @@ fn touch() {
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         touch();
+        ask(layout.size());
         // SAFETY: forwarding the caller's own layout.
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -106,11 +119,13 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         touch();
+        ask(new_size);
         // SAFETY: forwarding the caller's own pointer, layout and size.
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         touch();
+        ask(layout.size());
         // SAFETY: forwarding the caller's own layout.
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
@@ -149,6 +164,16 @@ pub fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, Counted) {
     let here = TOUCHES.with(Cell::take).unwrap_or(0);
     let hands = HANDS.load(Ordering::SeqCst);
     (out, Counted { here, hands })
+}
+
+/// **How many bytes `f` asked the allocator for, on this thread**: every
+/// allocation's size and every reallocation's new size, frees not
+/// subtracted. A ceiling on what a build costs (design 7.12 pins an idle
+/// lane at 256 KB), counted rather than estimated from capacities.
+pub fn count_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    ASKED.with(|a| a.set(0));
+    let (out, _) = count_allocs(f);
+    (out, ASKED.with(Cell::get))
 }
 
 /// The smallest of `tries` windows over `f`, element by element.
@@ -260,19 +285,20 @@ mod tests {
     ///
     /// A steady render allocates nothing, on the callback or on the hands. A
     /// monitor ring arriving into an empty seat allocates nothing, and nor
-    /// does a layout arriving for it. The one KNOWN site is a second ring
-    /// arriving: `Renderer`'s `pending_monitor` handoff assigns
-    /// `self.monitor = Some(ring)` and so frees the old `Consumer` on the
-    /// audio thread. W3-slot-engine removes it (the Monitor op retires the
-    /// old plan whole), and this test then pins zero.
+    /// does a layout arriving for it. There was one KNOWN site, a second
+    /// ring arriving: the `pending_monitor` handoff assigned
+    /// `self.monitor = Some(ring)` and so freed the old `Consumer` on the
+    /// audio thread (two frees). W3-slot-engine removed it: the ring and its
+    /// layout arrive as one Monitor op, the ring being let go of is swapped
+    /// into that plan and leaves with it on the retire ring, and this test
+    /// pins zero.
     ///
     /// Asserted as "never grows": each window is held to the figure recorded
     /// here, so a new allocation anywhere in the path fails it.
     #[test]
     fn the_callback_allocates_only_where_it_is_known_to() {
-        /// The pending-monitor handoff dropping the displaced ring: its
-        /// `Consumer` and the ring's shared buffer, two frees.
-        const KNOWN_RING_SWAP: usize = 2;
+        /// The KNOWN list is empty (design W3, done when).
+        const KNOWN_RING_SWAP: usize = 0;
         let mut e = baseline_desk();
         let mut out = vec![0.0f32; 512 * 2];
         // The hand-off rings drain, the delay lines fill, the pool starts.
@@ -314,12 +340,12 @@ mod tests {
             layout.here, 0,
             "a monitor layout arriving allocated: {layout:?}"
         );
-        // A second ring displacing the first: the KNOWN free.
+        // A second ring displacing the first: no longer a free here.
         e.set_monitor(Some((monitor_ring(), 2, [2; INPUTS], 512, picks)));
         let (_, swap) = count_allocs(|| e.render_offline(&mut out));
         assert_eq!(
             swap.here, KNOWN_RING_SWAP,
-            "a monitor ring swap allocated other than the known handoff free: {swap:?}"
+            "a monitor ring swap allocated or freed on the callback: {swap:?}"
         );
         // And then quiet again.
         let (_, after) = least_of(5, || {

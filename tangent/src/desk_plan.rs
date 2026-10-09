@@ -92,7 +92,7 @@ impl std::ops::BitOr for LaneFlags {
 }
 
 /// The four strips that are not rows: their switches, in the lanes' bits
-/// (only MUTED, SOLOED, PHASE and SUSPEND mean anything here).
+/// (only MUTED, SOLOED, PHASE, SUSPEND and MIDI_OFF mean anything here).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpecialFlags {
     pub drums: LaneFlags,
