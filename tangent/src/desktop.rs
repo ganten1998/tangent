@@ -23247,7 +23247,7 @@ mod tests {
             let ctx = egui::Context::default();
             // `PLUGIN` and not `DESKTOP`: `Caps::DESKTOP` sets
             // `persist_global_settings`, and this opens somebody's real work.
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
             app.open_project(&doc);
             let rate = 48_000u32;
             let Ok(mut e) =
@@ -23312,7 +23312,7 @@ mod tests {
         // And the media roots, or the app resolves the owner's own Documents.
         unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         app.open_project(&doc);
         let rate = 48_000u32;
         let Ok(mut e) =
@@ -26848,7 +26848,7 @@ mod tests {
 
         // A fresh session, and a sample loaded onto its sampler.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         let scratch = root.join("Untitled");
         app.adopt_template(&template, &scratch);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
@@ -26873,7 +26873,7 @@ mod tests {
         build_template(&app, Some(scratch.as_path()).filter(|_| real), &stage, &shelf).expect("the template");
         let templated = stage.join("media").join("New.wav").is_file();
         // A session made from that template: the host reads the shelf it adopts.
-        let mut next = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut next = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         let later = root.join("Untitled 2");
         next.adopt_template(&stage, &later);
         next.set_sampler_media(sampler_media_on_shelf(&stage.join("state")));
@@ -28151,7 +28151,7 @@ mod tests {
         let on_disk = std::fs::read(&saved).unwrap();
         // Opened, and turned down since: an edit nobody has saved.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         app.open_project(&saved);
         app.set_clip_gain(clip, 0.5);
         assert!(app.project_dirty_exact(), "the fixture's edit is not unsaved");

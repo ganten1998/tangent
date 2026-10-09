@@ -1080,38 +1080,72 @@ impl ChannelKind {
 // and video together — and keeps it whole; assembling a performance out of
 // the best bars of seven passes is a different program, with an editing
 // timeline this one deliberately does not grow. Play it again instead. Like
-// the fixed desk below, this is a limit you can feel the shape of, not a
+// the take's own shape, this is a limit you can feel the shape of, not a
 // feature that has not arrived yet.
 
-/// How many general channels the desk can CARRY — the capacity every
-/// engine table, settings array and seat index is sized to.
+/// How many general channels this build's desk can CARRY today - the
+/// capacity the engine tables, settings arrays and seat indices are still
+/// sized to.
 ///
-/// **Thirty-two as of 2026-08-31, the owner's word** — the supporter desk
-/// (it was twenty-four for one commit the same evening; the owner went
-/// bigger). It grew from eight (nine columns was the accident of five
-/// slots plus four inputs) to sixteen at 4.82.0, and to thirty-two with
-/// the supporter unlock. What a given INSTALL shows is
-/// [`active_channels`]: sixteen free, the full thirty-two with a key (or
-/// the Konami road).
-/// The engine always runs the full width, so a supporter's session opened
-/// on a free install still SOUNDS whole — a licence must never silence
-/// somebody's music — and the free desk simply cannot start new work past
-/// sixteen. Fixed at each tier, like everything about the desk's shape:
-/// an app whose strips appear and disappear as things load is a desk that
-/// changes shape under your hands, so an unused channel is drawn as a
-/// plus rather than not drawn.
+/// **The principle this number serves is the reverse of the one it was
+/// written for** (docs/design/unlimited-tracks.md, section 2):
+///
+/// The desk is the list of tracks that exist, plus one place to add the
+/// next. It grows by appending and the machine is its only limit: no part
+/// of its shape is a compile-time number. A licence decides how many tracks
+/// an install may CREATE: thirty-two free, no limit with a supporter key or
+/// a certain code. It never hides, silences or truncates a track that
+/// exists: a project with more tracks than this install may create opens
+/// whole, plays whole and saves whole, and only the next new track is
+/// refused. Buses, returns, sends and routes are unlimited on every tier and
+/// are not tracks. Every track, bus and plugin seat has an identity that
+/// does not depend on where it sits, so adding, removing or reordering
+/// tracks renumbers nothing on disk and moves no plugin.
+///
+/// Until that lands this constant is the build's CEILING, not a tier: the
+/// free tier is [`FREE_TRACKS`], asked through [`track_cap`], and the two
+/// happen to agree at thirty-two. A supporter who reaches it is told so
+/// (`TrackRefusal::Ceiling`). It is deleted when the desk becomes a list;
+/// no wider interim value is ever built, because `Shared` and the
+/// stack-held engine tables stop fitting near thirty-five lanes.
 pub const CHANNELS: usize = 32;
 
-/// The free desk: the sixteen the app has always shown without a key.
-pub const FREE_CHANNELS: usize = 16;
+/// **How many tracks a free install may CREATE: thirty-two.**
+///
+/// A count of tracks that exist, never a width: a desk that already holds
+/// more (a supporter's project on another machine, a relocked cheater's
+/// session) opens, plays and saves whole, and only the next new track is
+/// refused. What counts is `TangentApp::counted_tracks`; buses, returns and
+/// sends never do. It was sixteen columns of a thirty-two-wide desk until
+/// the owner made the free desk thirty-two.
+pub const FREE_TRACKS: usize = 32;
 
-/// How many channels this install works at. The one place the paywall's
-/// arithmetic lives: LAYOUT iteration and new-track pickers ask this;
-/// engine capacity, persistence and permutation walks stay at
-/// [`CHANNELS`] so nothing ever truncates somebody's data.
-pub fn active_channels(licensed: bool) -> usize {
-    if licensed { CHANNELS } else { FREE_CHANNELS }
+/// **The creation cap for an install of this standing**: `None` for a
+/// supporter (a key that covers this major, or the Konami marker), which
+/// has no track limit, and [`FREE_TRACKS`] otherwise.
+///
+/// Takes the standing as a bool on purpose: the one caller asks
+/// `LicenseStore::is_supporter`, and a function that cannot see the store
+/// cannot ask it the wrong question (`licensed()`, the "may the code
+/// TOGGLE" question, is not this one).
+pub fn track_cap(supporter: bool) -> Option<usize> {
+    if supporter { None } else { Some(FREE_TRACKS) }
 }
+
+/// **How many strips the desk shows by default on a window with room for
+/// them**, the ceiling `default_mixer_visible` hands its ladder.
+///
+/// A geometry number, not a tier: it was `FREE_CHANNELS`, which made the
+/// default zoom move whenever the free desk did. Sixteen is the owner's
+/// "make the default at full screen or max size 16 in one row".
+pub const DEFAULT_MAX_STRIPS: usize = 16;
+
+/// **The palette's period**: how many colours a palette deals before it
+/// repeats. Track `n` wears slot `n % PALETTE_SLOTS`, so tracks 0..31 keep
+/// the colours they always had and track 32 starts the deal again rather
+/// than reading past the table. Thirty-two because every palette in
+/// `mixer_panel::PALETTES` was built thirty-two deep.
+pub const PALETTE_SLOTS: usize = 32;
 
 /// **Where the limiter's threshold ships**, as a knob position.
 ///
@@ -1150,10 +1184,14 @@ pub const INSERTS: usize = 3;
 
 /// How many inputs of one interface the desk has room for.
 ///
-/// **Must equal `tangent_record::audio::MAX_PICKS`**, which is the same number
-/// counted where the capture happens. This crate cannot reach that one — see
-/// the firewall — so the host asserts they agree.
-pub const INPUTS: usize = CHANNELS;
+/// **`tangent_record::audio::MAX_PICKS`'s twin**, the same number counted
+/// where the capture happens. This crate cannot reach that one (see the
+/// firewall), so the host asserts they agree. A literal rather than
+/// `CHANNELS`, because an input is a property of the interface and not of
+/// the desk: the two only ever agreed by accident, and the day the desk
+/// stops being a fixed width this must not move with it. Both go when the
+/// picks become one per bound track.
+pub const INPUTS: usize = 32;
 
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;
