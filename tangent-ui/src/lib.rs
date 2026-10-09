@@ -18,6 +18,12 @@ pub mod chord_strip;
 pub mod desk_id;
 /// The frozen 32-channel seat map and its one road to identity.
 pub mod desk_legacy;
+/// The desk as the list of tracks that exist, by identity: rows, the
+/// specials, plugins by bay, routes, keys. Pure until W6 makes it live.
+pub mod desk_model;
+/// Format 2: the one desk reader and writer for settings and documents,
+/// and the one switch every format-2 side effect reads.
+pub mod desk_format;
 pub mod dialogs;
 pub mod face;
 pub mod faces;
