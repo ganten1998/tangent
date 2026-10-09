@@ -519,6 +519,70 @@ impl NoteState {
     }
 }
 
+/// **How many counted tracks a moment's desk holds**: `row_counted`'s rule,
+/// asked of a snapshot rather than of the live settings, so the undo
+/// sentinel can compare two moments by the same measure.
+#[cfg(test)]
+fn counted_in(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arrangement) -> usize {
+    (0..recorder::CHANNELS)
+        .filter(|n| {
+            desk.kinds.get(*n).is_some_and(|k| recorder::ChannelKind::from_u8(*k).is_some())
+                || (u64::from(desk.tracks_added) >> n) & 1 == 1
+                || desk.is_folder.get(*n).copied().unwrap_or(false)
+                || arr.clips.iter().any(|c| c.lane == *n)
+        })
+        .count()
+}
+
+/// **Why a gesture that would make a new track was refused**, before it
+/// changed anything (`TangentApp::may_add_tracks`).
+///
+/// Only CREATION is ever refused. A track that exists is never hidden,
+/// silenced or truncated by any of these, on any tier: a desk already past
+/// the cap opens, plays, edits and saves whole, and only the next new track
+/// is turned away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackRefusal {
+    /// A free install at its creation cap: `have` counted tracks against a
+    /// cap of `cap`. `have` can exceed `cap` (a supporter's project opened
+    /// on a free machine), and deleting below the cap makes room again.
+    FreeCap { have: usize, cap: usize },
+    /// The build's own ceiling: a supporter with every row of this build's
+    /// fixed-width desk in use. Exists only until the desk is a list.
+    Ceiling { max: usize },
+    /// The desk's shape is held by a running arrangement record or realtime
+    /// export. MERGE-ME(W6-rows-unlimited): raised by `desk_shape_held`;
+    /// until then the existing holds (`lane_order_held`, `tracks_held`,
+    /// `folders_held`) keep their own lines and this is never returned.
+    Held,
+}
+
+impl TrackRefusal {
+    /// The line the app says, in the owner's words (owner call 9: the code
+    /// is "a certain code" in the app and nowhere else). `asked` is how many
+    /// tracks the gesture wanted and `fit` how many the desk had room for, so
+    /// a batch refused whole says how much of it would have fitted.
+    pub fn line(self, asked: usize, fit: usize) -> String {
+        let room = match (asked, fit) {
+            (0 | 1, _) => String::new(),
+            (_, 0) => format!(" This needed {asked} new tracks and there is room for none."),
+            (_, n) => format!(" This needed {asked} new tracks and there is room for {n}."),
+        };
+        match self {
+            TrackRefusal::FreeCap { cap, .. } => format!(
+                "The free desk holds {cap} tracks. A supporter key (or a certain code) \
+                 removes the limit. Buses, returns and sends are unlimited either way.{room}"
+            ),
+            TrackRefusal::Ceiling { max } => {
+                format!("This build's desk holds {max} tracks.{room}")
+            }
+            TrackRefusal::Held => {
+                "The tracks cannot change shape while a recording or an export runs.".to_owned()
+            }
+        }
+    }
+}
+
 pub struct TangentApp {
     settings: Settings,
     detector: ChordDetector,
@@ -526,6 +590,12 @@ pub struct TangentApp {
     /// wherever it is consulted — never cached as a boolean, so there is no
     /// flag to flip and none to go stale.
     license: tangent_core::license::LicenseStore,
+    /// **A free cap a test chose** (`force_free_cap`), so the paywall's walk
+    /// can be proven at four tracks rather than by building thirty-two on
+    /// every road. A free install's cap only: a supporter's `None` is never
+    /// overridden, which is what lets one walk prove both tiers.
+    #[cfg(test)]
+    forced_free_cap: Option<usize>,
 
     midi_tx: mpsc::Sender<MidiEvent>,
     midi_rx: mpsc::Receiver<MidiEvent>,
@@ -4057,7 +4127,29 @@ impl TangentApp {
     /// only code that knows what it is running inside. The app starts with no
     /// MIDI source at all; a host that picks its own attaches one with
     /// `set_ports`, and one that is handed its notes never does.
-    pub fn new(ctx: &egui::Context, mut settings: Settings, caps: Caps) -> Self {
+    ///
+    /// **Production only.** It reads the licence from the real config dir
+    /// (`LicenseStore::load`), which is the owner's own key and Konami marker
+    /// on a developer's machine, so a test that came through here got a tier
+    /// that depended on whose laptop ran it, and two of them wrote and
+    /// deleted the real `cheat.unlock`. Tests build through
+    /// [`Self::with_license`] with a temp store; a scan
+    /// (`no_test_builds_the_app_through_the_production_door`) holds that.
+    pub fn new(ctx: &egui::Context, settings: Settings, caps: Caps) -> Self {
+        Self::with_license(ctx, settings, caps, tangent_core::license::LicenseStore::load())
+    }
+
+    /// [`Self::new`] with the licence store handed in rather than read from
+    /// the config dir: the one door a test, or any host with its own idea of
+    /// where the licence lives, builds the app through. Everything about the
+    /// tier is derived from `license` from here on (`is_supporter`, live), so
+    /// the store IS the tier.
+    pub fn with_license(
+        ctx: &egui::Context,
+        mut settings: Settings,
+        caps: Caps,
+        license: tangent_core::license::LicenseStore,
+    ) -> Self {
         // Read before `settings` moves into the struct below.
         let analyzer_cfg = crate::analyzer::Config::from_key(&settings.analyzer);
         // **A screen reader takes the dialogs into the canvas.** eframe 0.33
@@ -4092,8 +4184,6 @@ impl TangentApp {
         // behaves exactly like the stock engine until something is taught.
         detector.set_overrides(Some(OverrideStore::load()));
 
-        let license = tangent_core::license::LicenseStore::load();
-
         let (midi_tx, midi_rx) = mpsc::channel();
 
         let welcome = settings.show_welcome.then(|| Dialog::Welcome {
@@ -4118,6 +4208,8 @@ impl TangentApp {
             settings,
             detector,
             license,
+            #[cfg(test)]
+            forced_free_cap: None,
             midi_tx,
             midi_rx,
             ports: None,
@@ -6297,7 +6389,7 @@ impl TangentApp {
                         if self.channel_used(n) {
                             self.open_input_menu(n);
                         } else {
-                            self.add_bare_track(n);
+                            let _ = self.add_bare_track(n);
                         }
                     }
                     // The metronome IS the click switch, here as in the band.
@@ -6771,6 +6863,11 @@ impl TangentApp {
         // an edge ON this track's bays names effects that just unloaded.
         // `Routes::prune`'s discipline, one call.
         let _ = self.settings.insert_keys.drop_channel(n);
+        // **And its ROUTES, both ends**, by the same discipline: a route out
+        // of the deleted row would move the next track made there into a
+        // submix nobody chose, and one into it would fold its source into an
+        // empty row, off the master and out of earshot.
+        let _ = self.settings.routes.drop_channel(n);
         // The bays last, through `set_insert` so the host's reconcile unloads
         // whatever was running in them - the folder-extra seat's included,
         // or a removed folder's second rack stayed loaded invisibly and
@@ -7463,7 +7560,7 @@ impl TangentApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            active: self.active_channels(),
+            active: self.desk_extent(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
             selected: self.selected_channel,
@@ -7879,7 +7976,7 @@ impl TangentApp {
     /// the one no test ever saw.
     ///
     /// The wave is STEPPED (see `heart_wave`) and advances one band every
-    /// `HEART_CYCLE_S / recorder::CHANNELS`: 375 ms at the twelve-second
+    /// `HEART_CYCLE_S / recorder::PALETTE_SLOTS`: 375 ms at the twelve-second
     /// cycle, measured the same way in
     /// `the_wave_moves_and_it_moves_the_other_way`; the cheater's swirl
     /// turns once in ten. A hundred milliseconds still draws every pixel
@@ -7904,7 +8001,9 @@ impl TangentApp {
     /// the graceful shift this replaced; a wave needs edges, so the colour is
     /// chosen whole and the band it belongs to is what moves.
     fn heart_wave(&self, phase: f32, t: f64) -> egui::Color32 {
-        let n = recorder::CHANNELS;
+        // The palette's period, not the desk's width: the wave walks the
+        // palette's colours, and the desk growing must not slow it down.
+        let n = recorder::PALETTE_SLOTS;
         // **The other way.** The wave travelled up and to the left; the
         // owner's call is down and to the right, which is the direction a
         // thing being read moves.
@@ -7918,10 +8017,10 @@ impl TangentApp {
         self.heart_palette_slot(at.rem_euclid(n as f64) as usize % n)
     }
 
-    /// One of the active palette's `recorder::CHANNELS` colours, as a bright
-    /// shade for the heart.
+    /// One of the active palette's `recorder::PALETTE_SLOTS` colours, as a
+    /// bright shade for the heart.
     fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
-        let idx = self.palette().slot(i % recorder::CHANNELS);
+        let idx = self.palette().slot(i % recorder::PALETTE_SLOTS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
         recorder_panel::heart_shade(
             egui::Color32::from_rgb(r, g, b),
@@ -9796,7 +9895,7 @@ impl TangentApp {
     /// Where un-aimed audio lands: the first unused lane, else the first
     /// AUDIO lane. `None` on a desk that is wall-to-wall MIDI.
     fn lane_for_audio(&self) -> Option<usize> {
-        (0..self.active_channels())
+        (0..self.desk_extent())
             .find(|n| self.channel_kind(*n).is_none())
             .or_else(|| {
                 (0..recorder::CHANNELS)
@@ -9816,6 +9915,12 @@ impl TangentApp {
         // place, whichever gesture asked.
         if self.channel_kind(lane) == Some(recorder::ChannelKind::Midi) {
             return Err("a MIDI lane cannot take an audio file".to_owned());
+        }
+        // **A clip on an empty row makes a track**, so the gate is asked
+        // before the copy into `media/` or anything else is touched.
+        let into = lane.min(recorder::CHANNELS - 1);
+        if let Some(line) = self.track_refusal_text(usize::from(!self.row_counted(into))) {
+            return Err(line);
         }
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
@@ -9848,6 +9953,12 @@ impl TangentApp {
         lane: usize,
         start_s: f64,
     ) -> Result<(), String> {
+        // The same gate as the audio import, first: a .mid on a bare lane
+        // makes it a MIDI track.
+        let into = lane.min(recorder::CHANNELS - 1);
+        if let Some(line) = self.track_refusal_text(usize::from(!self.row_counted(into))) {
+            return Err(line);
+        }
         let name = file
             .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
@@ -11342,7 +11453,20 @@ impl TangentApp {
             .unwrap_or("")
     }
 
-    fn set_channel_input_spec(&mut self, ch: usize, spec: &str) {
+    /// Bind one channel's INPUT spec, which is also its kind.
+    ///
+    /// **Binding an input to an empty row is what MAKES a track**, so that
+    /// one case asks the creation gate first and answers `false`, having
+    /// changed nothing, when it is refused. Rebinding or clearing the input
+    /// of a track that exists is an edit and is never refused.
+    fn set_channel_input_spec(&mut self, ch: usize, spec: &str) -> bool {
+        if !spec.is_empty()
+            && ch < recorder::CHANNELS
+            && !self.row_counted(ch)
+            && !self.admit_tracks(1)
+        {
+            return false;
+        }
         while self.settings.channel_inputs.len() < recorder::CHANNELS {
             self.settings.channel_inputs.push(String::new());
         }
@@ -11409,6 +11533,7 @@ impl TangentApp {
         }
         self.save_settings();
         self.undo_commit();
+        true
     }
 
     /// "3" or "1+2", zero-based, into the pick it names. The one parser.
@@ -12073,6 +12198,11 @@ impl TangentApp {
         // into its source's old row. Bus and master destinations sit past
         // the channels and hold still, which `remap_channels` knows.
         self.settings.insert_keys.remap_channels(&inv);
+        // **And the ROUTES, both ends**, which were never on this list: a
+        // reorder moved every track and left the routing table naming rows,
+        // so the moved track sent its audio from, and received it into,
+        // whichever track took its old row. Hardware jacks hold still.
+        self.settings.routes.remap_channels(&inv);
 
         // **And the bypassed bays, through the SEAT permutation.**
         //
@@ -12200,6 +12330,57 @@ impl TangentApp {
         shut
     }
 
+    /// **The MIDI item a shift-drag drew on `lane`**, from `t0` to `t1`,
+    /// taken into the document, and the lane with it if it was nobody's yet.
+    ///
+    /// Its own function so the creation gate can be walked on it: drawing on
+    /// an empty row makes a MIDI track there, so that one case asks the gate
+    /// first and a refused draw lands nothing.
+    fn land_drawn_midi_item(&mut self, lane: usize, t0: f64, t1: f64) {
+        let min_len = (self.arr_grid_s(t0) * 0.5).max(0.05);
+        if t1 - t0 < min_len {
+            return;
+        }
+        if !self.row_counted(lane) && !self.admit_tracks(1) {
+            return;
+        }
+        if self.channel_kind(lane).is_none() {
+            // Drawing a MIDI item on a bare lane makes it a
+            // track — through the spec, the one authority.
+            let _ = self.set_channel_input_spec(lane, "midi:all");
+        }
+        self.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane,
+            path: String::new(),
+            start_s: t0,
+            offset_s: 0.0,
+            len_s: t1 - t0,
+            // **Pinned at the length it was drawn, and a LOOP
+            // from here on.** Dragging the right edge lays down
+            // another pass rather than revealing empty time,
+            // which is what a drawn MIDI item is for: a bar or
+            // two written once and repeated.
+            loop_s: t1 - t0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+            warp: Vec::new(),
+            warp_fit: String::new(),
+            warp_rate: 0,
+        });
+        self.arr_save_edits();
+    }
+
     /// **Open an empty lane directly below `n`**, the rows under it shifting
     /// down a place, and answer where the hole landed.
     ///
@@ -12262,6 +12443,14 @@ impl TangentApp {
     /// **A new empty track directly under `n`** — the track menu's Insert
     /// Track. `false` when there is no free lane below to make room with.
     pub fn insert_track_below(&mut self, n: usize) -> bool {
+        // **The gate before the hold.** The free desk's leak was here: the
+        // spare lane `open_lane_below` spends was searched across the whole
+        // capacity and `add_bare_track` asked only for a valid index, so a
+        // full free desk spent a lane past its cap. Asked before the hold so
+        // a refusal leaves no moment.
+        if !self.admit_tracks(1) {
+            return false;
+        }
         // **ONE moment.** `open_lane_below` reorders the lanes and
         // `reorder_channels` commits; the track that lands in the gap
         // commits too. So one press left two, and the moment between them
@@ -12271,7 +12460,7 @@ impl TangentApp {
             self.commit_undo_moment();
             return false;
         };
-        self.add_bare_track(at);
+        let _ = self.add_bare_track(at);
         self.selected_channel = Some(at);
         self.selected_tracks = vec![at];
         self.save_settings();
@@ -12286,6 +12475,10 @@ impl TangentApp {
     /// track below it."
     pub fn paste_track_below(&mut self, n: usize) -> bool {
         if !self.track_on_clipboard() {
+            return false;
+        }
+        // The same gate `insert_track_below` asks, for the same leak.
+        if !self.admit_tracks(1) {
             return false;
         }
         // The same two-moment gesture `insert_track_below` is: a lane
@@ -12315,9 +12508,17 @@ impl TangentApp {
 
     /// Add a BARE track on channel `n`: it exists, dry (its send at zero),
     /// and says NO INPUT until the chip binds one: the owner's flow.
-    fn add_bare_track(&mut self, n: usize) {
+    ///
+    /// **Asks the creation gate first**, and says why when it refuses: this
+    /// is where Ctrl/Cmd+T, the header's circled plus, `HdrAdd` and the
+    /// mixer's + all land, and at the cap they used to do nothing at all.
+    /// `false` when nothing was added.
+    fn add_bare_track(&mut self, n: usize) -> bool {
         if n >= recorder::CHANNELS {
-            return;
+            return false;
+        }
+        if !self.row_counted(n) && !self.admit_tracks(1) {
+            return false;
         }
         self.settings.tracks_added |= 1 << n;
         // Dry at birth — see the bind's own comment: only the shipped DX7
@@ -12336,6 +12537,7 @@ impl TangentApp {
         // whatever the user did next. Inside a batch - the multi-file
         // import makes a track per file - `begin_one_moment` holds it.
         self.undo_commit();
+        true
     }
 
     /// **Everything a track IS**, taken off one lane and put on another.
@@ -12497,6 +12699,11 @@ impl TangentApp {
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
+        // Always a new track (the refusals above leave only empty rows), so
+        // always asked, and before the hold below.
+        if !self.admit_tracks(1) {
+            return;
+        }
         // **ONE moment for the paste.** A track is a kind, a name, a colour,
         // six bays, a kit and a pile of clips, and `set_insert` and
         // `arr_save_edits` each commit their own - so pasting a track with
@@ -12632,8 +12839,12 @@ impl TangentApp {
     /// back to every device on the way in — a menu row that undoes the thing
     /// it is about to show you.
     fn open_midi_row(&mut self, ch: usize) {
-        if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi) {
-            self.set_channel_input_spec(ch, "midi:all");
+        if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi)
+            && !self.set_channel_input_spec(ch, "midi:all")
+        {
+            // Refused at the cap: no track, so no dialog about its devices.
+            self.input_menu = None;
+            return;
         }
         self.input_menu = None;
         self.open_midi_inputs_dialog(ch);
@@ -12792,25 +13003,32 @@ impl TangentApp {
 
     /// Ctrl+T's landing place: the first channel that is not a track yet.
     fn add_track_first_free(&mut self) {
+        // **At the cap, Ctrl/Cmd+T says why.** It used to search, find no
+        // free slot and do nothing, which reads as a broken key. Asked
+        // before the search, so the answer is the same whichever slot would
+        // have been chosen.
+        if !self.admit_tracks(1) {
+            return;
+        }
         // **The SELECTED slot first, always** - the owner's rule: a hand
         // that selected an empty slot and pressed the chord meant THERE,
         // and ignoring it made the keybind land somewhere off-screen. A
         // used selection falls through to the first free slot AFTER it,
         // then anywhere.
         if let Some(sel) = self.selected_channel {
-            if sel < self.active_channels() && !self.channel_used(sel) {
-                self.add_bare_track(sel);
+            if sel < self.desk_extent() && !self.channel_used(sel) {
+                let _ = self.add_bare_track(sel);
                 return;
             }
             if let Some(n) =
-                (sel + 1..self.active_channels()).find(|n| !self.channel_used(*n))
+                (sel + 1..self.desk_extent()).find(|n| !self.channel_used(*n))
             {
-                self.add_bare_track(n);
+                let _ = self.add_bare_track(n);
                 return;
             }
         }
-        if let Some(n) = (0..self.active_channels()).find(|n| !self.channel_used(*n)) {
-            self.add_bare_track(n);
+        if let Some(n) = (0..self.desk_extent()).find(|n| !self.channel_used(*n)) {
+            let _ = self.add_bare_track(n);
         }
     }
 
@@ -14130,7 +14348,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// accumulator's rail-clear was written to fix once already, and sharing
     /// the function is what stops it being re-introduced by the back door.
     fn arr_scroll_lanes_by_px(&mut self, dpx: f32, lane_h: f32) {
-        let max = self.active_channels().saturating_sub(self.arr_visible());
+        let max = self.desk_extent().saturating_sub(self.arr_visible());
         let lane_h = lane_h.max(1.0);
         self.arr_scroll_acc += dpx;
         while self.arr_scroll_acc >= lane_h {
@@ -14410,7 +14628,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .find(|c| c.id == cid)
                     .map(|c| c.kind);
                 let lane_to = (lane0 as i64 + lane_d)
-                    .clamp(0, self.active_channels() as i64 - 1)
+                    .clamp(0, self.desk_extent() as i64 - 1)
                     as usize;
                 let lane_ok = match kind {
                     Some(crate::arrangement::ClipKind::Midi) => true,
@@ -16489,7 +16707,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// minus every child a shut folder has folded away. What the scroll
     /// range answers to.
     pub fn mixer_shown_channels(&self) -> usize {
-        (0..self.active_channels())
+        (0..self.desk_extent())
             .filter(|n| !self.lane_hidden(*n))
             .count()
             .max(1)
@@ -16833,6 +17051,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// needs the same moment as its saved baseline AND as moment zero, walks
     /// the document once rather than twice.
     fn undo_commit_moment(&mut self, mut state: Moment) {
+        #[cfg(test)]
+        self.cap_sentinel(&state);
         if self
             .history
             .get(self.hist_at)
@@ -16861,6 +17081,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.history.drain(..overflow);
         }
         self.hist_at = self.history.len() - 1;
+    }
+
+    /// **The paywall's tripwire, in every test**: a free app may not END a
+    /// gesture holding more counted tracks than both the moment it stood on
+    /// and its cap.
+    ///
+    /// Every road that makes a track asks `may_add_tracks` first; this is
+    /// what catches the road somebody adds later without asking. It sits on
+    /// the commit because every gesture ends here, and it compares against
+    /// the standing moment rather than against the cap alone because a desk
+    /// may stand ABOVE the cap legitimately (a supporter's project opened
+    /// free) and every edit to it must still commit. The gestures that are
+    /// never gated (open, New, a template, the migrations) arrive through
+    /// `undo_reset`, which empties the history first, so they have no moment
+    /// to be compared with; undo and redo apply moments rather than commit
+    /// them.
+    #[cfg(test)]
+    fn cap_sentinel(&self, state: &Moment) {
+        let Some(cap) = self.track_cap() else {
+            return;
+        };
+        let Some(top) = self.history.get(self.hist_at) else {
+            return;
+        };
+        let was = counted_in(&top.desk, &top.arr);
+        let now = counted_in(&state.desk, &state.arr);
+        assert!(
+            now <= was.max(cap),
+            "a free app ended a gesture with {now} counted tracks, from {was}, \
+             against a cap of {cap}: some road made a track without asking \
+             `may_add_tracks`"
+        );
     }
 
     /// **The commit at a click's release on a row that jumps to the
@@ -19096,23 +19348,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (lo, hi) = pasted.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
             (lo.min(c.lane as i64), hi.max(c.lane as i64))
         });
-        // Bounded by the ACTIVE desk, not the capacity: on a free install
-        // a paste must not invent supporter lanes — but a group copied
-        // FROM those lanes (a wide document opened free) keeps its shape,
-        // because active_channels already widens for a document that
-        // carries them.
-        let edge = self.active_channels() as i64 - 1;
+        // Bounded by the desk's extent, which no longer reads the licence:
+        // the tier is a creation cap, asked below, not a width.
+        let edge = self.desk_extent() as i64 - 1;
         let lane_d = if lo <= hi {
             lane_d.clamp(-lo, (edge - hi).max(-lo))
         } else {
             lane_d
         };
+        let landing = |c: &crate::arrangement::ArrClip| {
+            (c.lane as i64 + lane_d).clamp(0, edge) as usize
+        };
+        // **A clip landing on an empty row MAKES a track there** (a row with
+        // clips counts), so a paste that lands on rows nobody is using asks
+        // the creation gate for each of them, whole, before anything lands.
+        let mut new_rows: Vec<usize> = pasted
+            .iter()
+            .map(landing)
+            .filter(|lane| !self.row_counted(*lane))
+            .collect();
+        new_rows.sort_unstable();
+        new_rows.dedup();
+        if !self.admit_tracks(new_rows.len()) {
+            return;
+        }
         let mut fresh = Vec::new();
         for mut c in pasted {
             c.start_s += at;
-            c.lane = (c.lane as i64 + lane_d)
-                .clamp(0, self.active_channels() as i64 - 1)
-                as usize;
+            c.lane = landing(&c);
             c.id = 0;
             fresh.push(self.arrangement.add_clip(c));
         }
@@ -25779,7 +26042,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // stale value above the new max, and wheel-up
                             // went dead for that many notches.
                             self.arr_lane_scroll = self.arr_lane_scroll.min(
-                                self.active_channels()
+                                self.desk_extent()
                                     .saturating_sub(self.arr_visible()),
                             );
                             // Per notch: debounced, see `save_settings_soon`.
@@ -26303,7 +26566,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     // The circled plus: a bare track, on the spot.
                     Some(A::HdrAdd(n)) => {
-                        self.add_bare_track(n);
+                        let _ = self.add_bare_track(n);
                     }
                     // **No arm for `HdrName` here**, and its absence is the
                     // point. There was one — "a single press on the NAME
@@ -27300,44 +27563,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The MIDI item the shift-drag drew, taken into the document —
             // and the lane with it, if it was nobody's yet.
             if let Some((lane, t0, t1)) = self.arr_pending.take() {
-                let min_len = (self.arr_grid_s(t0) * 0.5).max(0.05);
-                if t1 - t0 >= min_len {
-                    if self.channel_kind(lane).is_none() {
-                        // Drawing a MIDI item on a bare lane makes it a
-                        // track — through the spec, the one authority.
-                        self.set_channel_input_spec(lane, "midi:all");
-                    }
-                    self.arrangement.add_clip(crate::arrangement::ArrClip {
-                        pedal: Vec::new(),
-                        kind: crate::arrangement::ClipKind::Midi,
-                        notes: Vec::new(),
-                        lane,
-                        path: String::new(),
-                        start_s: t0,
-                        offset_s: 0.0,
-                        len_s: t1 - t0,
-                        // **Pinned at the length it was drawn, and a LOOP
-                        // from here on.** Dragging the right edge lays down
-                        // another pass rather than revealing empty time,
-                        // which is what a drawn MIDI item is for: a bar or
-                        // two written once and repeated.
-                        loop_s: t1 - t0,
-                        fade_in_s: 0.0,
-                        fade_out_s: 0.0,
-                        name: "MIDI".to_owned(),
-                        id: 0,
-                        extra: Default::default(),
-                        anchor: Default::default(),
-                        follow_tempo: false,
-                        stretch: 1.0,
-                        stretch_mode: String::new(),
-                        gain: 1.0,
-                        warp: Vec::new(),
-                        warp_fit: String::new(),
-                        warp_rate: 0,
-                    });
-                    self.arr_save_edits();
-                }
+                self.land_drawn_midi_item(lane, t0, t1);
             }
             // **A motionless click on the resize strip sends the playhead
             // HOME** — the strip doubles as the back-to-bar-one target the
@@ -27876,7 +28102,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
-            active: self.active_channels(),
+            active: self.desk_extent(),
             // **The master's row.** Its level and colour come from the same
             // place the desk's own strip reads, so the two views cannot
             // disagree about how loud the master is or what it looks like.
@@ -28090,7 +28316,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }),
             lane_scroll: self
                 .arr_lane_scroll
-                .min(self.active_channels().saturating_sub(self.arr_visible())),
+                .min(self.desk_extent().saturating_sub(self.arr_visible())),
             visible_lanes: self.arr_visible(),
             clips,
             header_w: self.arr_header_w_pt(),
@@ -30120,6 +30346,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         files: &[std::path::PathBuf],
         at: f64,
     ) -> Vec<String> {
+        // **The whole pick is admitted, or none of it.** The first file
+        // lands on `lane` (a new track only if that row is empty) and every
+        // file after it makes a track of its own, so this is exactly how
+        // many the gesture creates; asked before the hold, so a refused pick
+        // leaves no moment and no half-import, and the line says how many
+        // would have fitted.
+        if !files.is_empty() {
+            let first = lane.min(recorder::CHANNELS - 1);
+            let k = files.len() - 1 + usize::from(!self.row_counted(first));
+            if let Some(line) = self.track_refusal_text(k) {
+                return vec![line];
+            }
+        }
         // **One moment for the whole pick.** The panel is multi-select on
         // purpose - four stems in one gesture - and each file goes through
         // `import_audio_at`, which is a complete edit that commits. Without
@@ -30142,7 +30381,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut lane = lane.min(recorder::CHANNELS - 1);
         for (i, path) in files.iter().enumerate() {
             if i > 0 {
-                let Some(free) = (0..self.active_channels()).find(|n| !self.channel_used(*n))
+                let Some(free) = (0..self.desk_extent()).find(|n| !self.channel_used(*n))
                 else {
                     errors.push(format!(
                         "no empty track left for {}",
@@ -30155,7 +30394,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // A bare lane becomes a track: the media has to land on something
             // that draws, arms and can be turned down.
             if !self.channel_used(lane) {
-                self.add_bare_track(lane);
+                let _ = self.add_bare_track(lane);
             }
             let landed = if Self::is_midi_path(path) {
                 self.import_midi_at(path, lane, at)
@@ -30398,6 +30637,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if self.folders_held() {
                 return false;
             }
+            // **A folder is a counted row** (owner call 2), so an empty slot
+            // becoming one is a new track as far as the cap is concerned.
+            if !self.row_counted(n) && !self.admit_tracks(1) {
+                return false;
+            }
             self.set_is_folder(n, true);
             // A folder is a ROW, so it has to exist as one: without this it
             // is a flag on a slot nothing draws.
@@ -30426,9 +30670,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.lane_order_held() {
             return false;
         }
+        // **The folder spends a row**, so it is a new counted track: asked
+        // before the search, the reorder and the hold below.
+        if !self.admit_tracks(1) {
+            return false;
+        }
         // A spare row to BE the folder, taken from the bottom so the search
         // never disturbs anything above the group.
-        let Some(free) = (0..self.active_channels())
+        let Some(free) = (0..self.desk_extent())
             .rev()
             .find(|n| !self.channel_used(*n) && !(top..=bottom).contains(n))
         else {
@@ -30440,9 +30689,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The "only if no dialog is open" guard went with the box: a
             // notification does not displace anything, so a refusal is no
             // longer silently thrown away for arriving while a picker is up.
+            // Past the gate, so the desk has room for another track; what it
+            // lacks is a free row OUTSIDE the chosen run, every spare one
+            // sitting between the tracks being grouped. The line used to say
+            // "all 16 rows are in use", which stopped being true of any desk.
             self.notify(
                 crate::notify::Kind::Error,
-                "No free channel to hold the folder: all 16 rows are in use. \
+                "No free row outside the selection to hold the folder. \
                  Remove a track to make room.",
             );
             return false;
@@ -31985,24 +32238,109 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// because the setting is the thing they asked for and this is only the
     /// room the screen happens to have.
 
-    /// How many channels THIS install works at, the paywall's one number:
-    /// the full twenty-four with a key (or the Konami road), sixteen free -
-    /// except that a DOCUMENT already carrying wider work overrides the
-    /// gate, because a licence question must never hide somebody's music.
-    /// The engine always runs full capacity either way; this gates layout
-    /// and the pickers that start new work.
-    pub fn active_channels(&self) -> usize {
-        use crate::recorder::{CHANNELS, FREE_CHANNELS};
-        if self.license.is_supporter() {
-            return CHANNELS;
+    /// **How far the desk reaches**: how many rows the views lay out, the
+    /// pickers search and the scroll rails run to. Never reads the licence.
+    ///
+    /// It was `active_channels`, the paywall's number: sixteen free, the full
+    /// width with a key, and wider on a free install only once a DOCUMENT
+    /// already carried work past sixteen. The tier is a creation cap now
+    /// ([`Self::may_add_tracks`]), so the extent is simply the desk: every
+    /// row this build carries, on every tier. When the desk becomes a list
+    /// this is its length.
+    pub fn desk_extent(&self) -> usize {
+        recorder::CHANNELS
+    }
+
+    /// **The creation cap this install stands at**: `None` for a supporter,
+    /// the free count otherwise. Reads `is_supporter()` and nothing else
+    /// about the licence, live, so a Konami unlock lifts it on the very next
+    /// gesture. `licensed()` is a different question ("may the code TOGGLE
+    /// rather than brand") and a gate that asked it would cap every cheater;
+    /// `gate_reads_only_is_supporter` holds that.
+    pub fn track_cap(&self) -> Option<usize> {
+        let cap = recorder::track_cap(self.license.is_supporter());
+        #[cfg(test)]
+        let cap = cap.map(|c| self.forced_free_cap.unwrap_or(c));
+        cap
+    }
+
+    /// **Does row `n` count against the cap?** MIDI, AUDIO, a bare added
+    /// track, a folder, or any row with clips. A Placeholder (only the
+    /// folder indent set: the indented plus) and a Vacant row do not, and
+    /// neither will a bus.
+    fn row_counted(&self, n: usize) -> bool {
+        self.channel_used(n) || self.is_folder(n)
+    }
+
+    /// How many tracks this desk holds, by `row_counted`. Folders count
+    /// (owner call 2): a folder row can carry clips of its own, and
+    /// `make_folder` spends a row.
+    pub fn counted_tracks(&self) -> usize {
+        (0..recorder::CHANNELS).filter(|n| self.row_counted(*n)).count()
+    }
+
+    /// **The one creation gate**: may a gesture that makes `k` new counted
+    /// tracks go ahead?
+    ///
+    /// Asked by every road that can make a track, BEFORE it changes anything
+    /// and before it takes an undo hold, so a refusal leaves the desk and the
+    /// history exactly as they were. A batch is all or nothing. `k == 0`
+    /// (an edit to a track that already exists) is never refused, whatever
+    /// the count: a desk past the cap is edited, reordered and saved freely,
+    /// and only grows once it is back under.
+    ///
+    /// Never asked by open, revert, undo, redo, a template, New, Reset, the
+    /// migrations, persistence, export, freeze, the engine or the drawing.
+    pub fn may_add_tracks(&self, k: usize) -> Result<(), TrackRefusal> {
+        if k == 0 {
+            return Ok(());
         }
-        let doc_wide = self
-            .arrangement
-            .clips
-            .iter()
-            .any(|c| c.lane >= FREE_CHANNELS)
-            || (FREE_CHANNELS..CHANNELS).any(|ch| self.channel_used(ch));
-        if doc_wide { CHANNELS } else { FREE_CHANNELS }
+        let have = self.counted_tracks();
+        if let Some(cap) = self.track_cap() {
+            if have + k > cap {
+                return Err(TrackRefusal::FreeCap { have, cap });
+            }
+        }
+        let max = self.desk_extent();
+        if have + k > max {
+            return Err(TrackRefusal::Ceiling { max });
+        }
+        Ok(())
+    }
+
+    /// [`Self::may_add_tracks`], saying the refusal out loud. The roads that
+    /// answer `()` ask this; the ones that answer `Result` ask
+    /// [`Self::track_refusal_text`] and hand the line back to the caller that
+    /// already reports their errors.
+    fn admit_tracks(&mut self, k: usize) -> bool {
+        match self.track_refusal_text(k) {
+            None => true,
+            Some(line) => {
+                self.notify(crate::notify::Kind::Error, line);
+                false
+            }
+        }
+    }
+
+    /// The refusal line for a gesture of `k` new tracks, or `None` when it
+    /// may go ahead.
+    fn track_refusal_text(&self, k: usize) -> Option<String> {
+        let refusal = self.may_add_tracks(k).err()?;
+        let fit = match refusal {
+            TrackRefusal::FreeCap { have, cap } => cap.saturating_sub(have),
+            TrackRefusal::Ceiling { max } => max.saturating_sub(self.counted_tracks()),
+            TrackRefusal::Held => 0,
+        };
+        Some(refusal.line(k, fit))
+    }
+
+    /// **Force the free cap down for a test**, so every road can be walked
+    /// to the cap and past it without building thirty-two tracks. A free
+    /// install's cap only: a supporter stays uncapped, so the same walk
+    /// proves that a supporter is not refused (until the build's ceiling).
+    #[cfg(test)]
+    pub(crate) fn force_free_cap(&mut self, cap: usize) {
+        self.forced_free_cap = Some(cap);
     }
 
     /// **The window the two auto counts are measured against.**
@@ -32051,7 +32389,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 mixer_run_w(pane),
             )
         };
-        want.clamp(1, self.active_channels())
+        want.clamp(1, self.desk_extent())
     }
     fn arr_visible(&self) -> usize {
         // Zero is the auto sentinel; see `mixer_visible` and
@@ -32066,7 +32404,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 arr_timeline_h(&self.settings, pane),
             )
         };
-        want.clamp(1, self.active_channels())
+        want.clamp(1, self.desk_extent())
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -32485,7 +32823,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // made the two panels disagree about the same switch.
             A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0),
             A::HdrCollapse(n) => self.toggle_folder_shut(n),
-            A::HdrAdd(n) => self.add_bare_track(n),
+            A::HdrAdd(n) => {
+                let _ = self.add_bare_track(n);
+            }
             A::HdrRouting(n) => {
                 self.touch_track(n);
                 self.dialog = Some(self.routing_dialog(n, None));
@@ -33412,7 +33752,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Set it, saving. The kind lives BESIDE the channel — fader, send,
     /// colour, name and bays all stay put when it cycles.
+    ///
+    /// **A kind on an empty row makes a track**, so that one change asks the
+    /// creation gate; cycling, clearing or setting the kind of a row that is
+    /// already a track never does.
     pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
+        if kind.is_some() && n < recorder::CHANNELS && !self.row_counted(n) && !self.admit_tracks(1)
+        {
+            return;
+        }
         if let Some(slot) = self.settings.channel_kinds.get_mut(n) {
             *slot = recorder::ChannelKind::as_u8(kind);
             self.save_settings();
@@ -35313,7 +35661,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.menu_state = None;
                 self.save_settings();
             }
-            MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
+            // **The card knows the standing**, read now: a Konami unlock
+            // earlier in the session is a supporter's About.
+            MenuAction::ShowAbout => {
+                self.dialog = Some(Dialog::About {
+                    supporter: self.license.is_supporter(),
+                });
+            }
             MenuAction::Reset(scope) => self.ask_before_resetting(scope),
             // **A press advances the choice and the file remembers it** —
             // except the two verbs, which are about this session's picture
@@ -36820,6 +37174,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // third-party code and `Instance::create` can take seconds.
                 // The host notices the change by watching `insert()`.
                 if let Some((strip, at)) = self.picker_insert.take() {
+                    // **A plugin picked onto an empty row makes it a MIDI
+                    // track** (the bind below), so the creation gate is
+                    // asked before the bay is written: a refused pick loads
+                    // nothing rather than leaving a plugin on a row that is
+                    // not a track.
+                    let makes_track = path.is_some()
+                        && strip < recorder::CHANNELS
+                        && self.channel_kind(strip).is_none()
+                        && !self.row_counted(strip);
+                    if makes_track && !self.admit_tracks(1) {
+                        return;
+                    }
                     self.set_insert(strip, at, path.as_deref());
                     // **An instrument on a bare channel binds MIDI: ALL.**
                     // The input is the kind now, and a synth nobody can
@@ -36828,7 +37194,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         && strip < recorder::CHANNELS
                         && self.channel_kind(strip).is_none()
                     {
-                        self.set_channel_input_spec(strip, "midi:all");
+                        let _ = self.set_channel_input_spec(strip, "midi:all");
                     }
                     // **And the face opens itself.** Load-then-hunt-for-the-
                     // click was the old shape: pick a plugin, then find the
@@ -37672,7 +38038,7 @@ fn default_mixer_visible(pane: Vec2) -> usize {
     // lands on the ladder — the owner's dozen at 100% is a 1490-point pane,
     // twelve strips, untouched. A supporter's upper sixteen scroll into
     // view, which is what the scroll is for.
-    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, recorder::FREE_CHANNELS)
+    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, recorder::DEFAULT_MAX_STRIPS)
 }
 /// **What a host without capture devices can never show**, turned off.
 ///
@@ -42232,6 +42598,903 @@ impl TangentApp {
     }
 }
 
+/// **The three tiers a test can stand at**, each on a licence store of its
+/// own under the temp dir: never the config dir, which on a developer's
+/// machine holds the owner's real key and Konami marker.
+///
+/// The store path is `temp_dir()/tangent-lic-<pid>-<thread>-<tag>/license.key`
+/// (the contract every crate's fixtures share). A FREE store's directory is
+/// emptied and never created, so nothing on disk can make it anything but
+/// free, and nothing is left behind by the thousands of apps the suite
+/// builds; a cheater's and a supporter's are created, because their standing
+/// is a file in it.
+#[cfg(test)]
+pub(crate) mod tiers {
+    use tangent_core::license::LicenseStore;
+
+    /// The committed fixture: a real, signed, perpetual supporter key (name
+    /// Ganten), whose only power is to be a supporter key. Spelled out only
+    /// here, only under cfg(test); `the_fixture_key_is_read_only_by_tests`
+    /// holds that.
+    const SUPPORTER_KEY: &str = include_str!("../../tests/fixtures/supporter.key");
+
+    pub(crate) fn dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tangent-lic-{}-{:?}-{tag}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    /// A keyless, unmarked install.
+    pub(crate) fn free(tag: &str) -> LicenseStore {
+        let d = dir(tag);
+        let _ = std::fs::remove_dir_all(&d);
+        LicenseStore::load_from(d.join("license.key"))
+    }
+
+    /// A keyless install that typed the code: the marker on disk.
+    pub(crate) fn cheater(tag: &str) -> LicenseStore {
+        let mut s = free(tag);
+        std::fs::create_dir_all(dir(tag)).expect("the cheater's store dir");
+        s.unlock_cheat();
+        assert!(dir(tag).join("cheat.unlock").exists(), "the marker was not written");
+        s
+    }
+
+    /// A buyer: the fixture key installed, no marker.
+    pub(crate) fn supporter(tag: &str) -> LicenseStore {
+        let mut s = free(tag);
+        std::fs::create_dir_all(dir(tag)).expect("the supporter's store dir");
+        s.install(SUPPORTER_KEY).expect("the committed fixture key did not install");
+        s
+    }
+}
+
+/// **The paywall: one creation gate, three tiers, every road.**
+///
+/// Proven at a forced free cap of four (`force_free_cap`) so each road is
+/// walked to the cap and one past it without building thirty-two tracks per
+/// road. The free install is refused on every road with the line, and the
+/// refusal changes nothing (the desk's words, the history and the count are
+/// as they were); a supporter and a cheater on the same walk are admitted,
+/// and are only stopped by the build's own ceiling.
+#[cfg(test)]
+mod paywall_tests {
+    use super::*;
+    use tangent_core::license::LicenseStore;
+
+    /// Settings never written anywhere: these apps exist to be refused.
+    const QUIET: Caps = Caps {
+        persist_global_settings: false,
+        ..Caps::DESKTOP
+    };
+
+    /// The forced free cap every walk below stands at.
+    const CAP: usize = 4;
+
+    fn app_on(store: LicenseStore) -> (egui::Context, TangentApp) {
+        let ctx = egui::Context::default();
+        let app = TangentApp::with_license(&ctx, Settings::default(), QUIET, store);
+        (ctx, app)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Tier {
+        Free,
+        Cheater,
+        Supporter,
+    }
+
+    fn store(tier: Tier, tag: &str) -> LicenseStore {
+        match tier {
+            Tier::Free => tiers::free(tag),
+            Tier::Cheater => tiers::cheater(tag),
+            Tier::Supporter => tiers::supporter(tag),
+        }
+    }
+
+    /// Bring the desk to exactly `n` counted tracks through the ordinary
+    /// road, lowest empty rows first.
+    fn fill_to(app: &mut TangentApp, n: usize) {
+        while app.counted_tracks() < n {
+            let free = (0..recorder::CHANNELS)
+                .find(|r| !app.row_counted(*r))
+                .expect("no empty row to fill");
+            assert!(app.add_bare_track(free), "the fill was refused at {}", app.counted_tracks());
+        }
+        assert_eq!(app.counted_tracks(), n);
+    }
+
+    /// An empty row high on the desk, away from everything `fill_to` uses.
+    fn vacant(app: &TangentApp) -> usize {
+        (0..recorder::CHANNELS)
+            .rev()
+            .find(|r| !app.row_counted(*r))
+            .expect("the desk is full")
+    }
+
+    /// The smallest SMF `smf_read` takes: one note, one track.
+    fn a_midi_file(at: &std::path::Path) {
+        let track: &[u8] = &[
+            0x00, 0x90, 60, 100, // note on
+            0x60, 0x80, 60, 0, // a beat later, off
+            0x00, 0xFF, 0x2F, 0x00, // end of track
+        ];
+        let mut b = Vec::new();
+        b.extend_from_slice(b"MThd");
+        b.extend_from_slice(&6u32.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&96u16.to_be_bytes());
+        b.extend_from_slice(b"MTrk");
+        b.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        b.extend_from_slice(track);
+        std::fs::write(at, b).expect("the midi file");
+    }
+
+    /// What a road answers: the error a `Result` road handed back, if any.
+    type Said = Option<String>;
+
+    /// One road that can make a track: its name, how many tracks it makes
+    /// when admitted, and the gesture itself, aimed by `fx`.
+    struct Road {
+        name: &'static str,
+        makes: usize,
+        go: fn(&mut TangentApp, &Fx) -> Said,
+        /// Whether the road can still make a track on a FULL desk: the ones
+        /// aimed at an empty row cannot, because there is none to aim at.
+        on_full: bool,
+    }
+
+    /// What the roads are aimed with.
+    struct Fx {
+        wav: std::path::PathBuf,
+        wav2: std::path::PathBuf,
+        mid: std::path::PathBuf,
+    }
+
+    fn roads() -> Vec<Road> {
+        vec![
+            Road {
+                name: "Ctrl/Cmd+T",
+                makes: 1,
+                on_full: true,
+                go: |app, _| {
+                    app.add_track_first_free();
+                    None
+                },
+            },
+            Road {
+                name: "the header's plus (HdrAdd)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    let _ = app.add_bare_track(v);
+                    None
+                },
+            },
+            Road {
+                name: "the mixer's +",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.apply_mixer_hit(crate::mixer_panel::Hit::Add(recorder::Column(v)), 0.0);
+                    None
+                },
+            },
+            Road {
+                name: "Insert Track",
+                makes: 1,
+                on_full: true,
+                go: |app, _| {
+                    let _ = app.insert_track_below(0);
+                    None
+                },
+            },
+            Road {
+                name: "Paste Track below",
+                makes: 1,
+                on_full: true,
+                go: |app, _| {
+                    app.copy_track(1);
+                    let _ = app.paste_track_below(0);
+                    None
+                },
+            },
+            Road {
+                name: "paste onto an empty slot (paste_track_at)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    app.copy_track(1);
+                    let v = vacant(app);
+                    app.paste_track_at(v);
+                    None
+                },
+            },
+            Road {
+                name: "paste onto a live slot (paste_track_at)",
+                makes: 1,
+                on_full: true,
+                go: |app, _| {
+                    app.copy_track(1);
+                    app.paste_track_at(0);
+                    None
+                },
+            },
+            Road {
+                name: "Paste Track (paste_track)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    app.copy_track(1);
+                    let v = vacant(app);
+                    app.paste_track(v);
+                    None
+                },
+            },
+            Road {
+                name: "Ctrl+V of a track on an empty slot (arr_paste)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    app.copy_track(1);
+                    let v = vacant(app);
+                    app.selected_channel = Some(v);
+                    app.arr_paste();
+                    None
+                },
+            },
+            Road {
+                name: "Ctrl+V of a clip onto an empty row (arr_paste)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    app.track_clipboard = None;
+                    app.clip_clipboard = vec![clip_at("media/x.wav", 0, 0.0)];
+                    let v = vacant(app);
+                    app.selected_channel = Some(v);
+                    app.arr_paste();
+                    None
+                },
+            },
+            Road {
+                name: "an audio import (import_audio_at)",
+                makes: 1,
+                on_full: false,
+                go: |app, fx| {
+                    let v = vacant(app);
+                    app.import_audio_at(&fx.wav, v, 0.0).err()
+                },
+            },
+            Road {
+                name: "a MIDI import that creates a lane (import_midi_at)",
+                makes: 1,
+                on_full: false,
+                go: |app, fx| {
+                    let v = vacant(app);
+                    app.import_midi_at(&fx.mid, v, 0.0).err()
+                },
+            },
+            Road {
+                name: "a two-file import onto an empty lane (insert_media_files)",
+                makes: 2,
+                on_full: false,
+                go: |app, fx| {
+                    let v = vacant(app);
+                    let errs = app.insert_media_files(v, &[fx.wav.clone(), fx.wav2.clone()], 0.0);
+                    errs.into_iter().next()
+                },
+            },
+            Road {
+                name: "a two-file import onto a live lane (insert_media_files)",
+                makes: 1,
+                on_full: true,
+                go: |app, fx| {
+                    // Aimed at a live lane, so only the second file needs a
+                    // new track: on a full desk that is the one refused.
+                    let errs = app.insert_media_files(2, &[fx.wav.clone(), fx.wav2.clone()], 0.0);
+                    errs.into_iter().next()
+                },
+            },
+            Road {
+                name: "a folder made from an empty slot (make_folder)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.selected_channel = Some(v);
+                    app.selected_tracks = vec![v];
+                    let _ = app.make_folder();
+                    None
+                },
+            },
+            Road {
+                name: "a folder over tracks (make_folder)",
+                makes: 1,
+                on_full: true,
+                go: |app, _| {
+                    app.selected_channel = Some(0);
+                    app.selected_tracks = vec![0, 1];
+                    let _ = app.make_folder();
+                    None
+                },
+            },
+            Road {
+                name: "a kind set on an empty row (set_channel_kind)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.set_channel_kind(v, Some(recorder::ChannelKind::Audio));
+                    None
+                },
+            },
+            Road {
+                name: "an input bound on an empty row (set_channel_input_spec)",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    let _ = app.set_channel_input_spec(v, "0");
+                    None
+                },
+            },
+            Road {
+                name: "the input menu's MIDI row on an empty row",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.open_midi_row(v);
+                    None
+                },
+            },
+            Road {
+                name: "a MIDI item drawn on an empty lane",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.land_drawn_midi_item(v, 0.0, 8.0);
+                    None
+                },
+            },
+            Road {
+                name: "an instrument picked onto an empty row",
+                makes: 1,
+                on_full: false,
+                go: |app, _| {
+                    let v = vacant(app);
+                    app.picker_insert = Some((v, 0));
+                    app.apply_dialog_action(DialogAction::LoadPlugin {
+                        path: Some("/x/Synth.vst3".to_owned()),
+                    });
+                    None
+                },
+            },
+        ]
+    }
+
+    /// The desk as words, the history's shape, and the count: everything a
+    /// refusal must leave alone.
+    fn standing(app: &TangentApp) -> (std::sync::Arc<Vec<u64>>, usize, usize, usize) {
+        (
+            app.undo_state().words,
+            app.history.len(),
+            app.hist_at,
+            app.counted_tracks(),
+        )
+    }
+
+    /// The newest thing the app said, or what the road handed back.
+    fn said(app: &TangentApp, answer: Said) -> String {
+        answer.unwrap_or_else(|| {
+            app.messages.notes().last().map(|n| n.text.clone()).unwrap_or_default()
+        })
+    }
+
+    /// One fresh app per road, at `at` counted tracks, with a project to
+    /// import into and a cap of [`CAP`] forced on.
+    fn walk_app(tier: Tier, tag: &str, root: &std::path::Path, at: usize) -> (egui::Context, TangentApp) {
+        let (ctx, mut app) = app_on(store(tier, tag));
+        app.bootstrap_project(&root.join("Projects"));
+        app.force_free_cap(CAP);
+        fill_to(&mut app, at);
+        app.messages.clear();
+        (ctx, app)
+    }
+
+    fn fixtures(root: &std::path::Path) -> Fx {
+        let fx = Fx {
+            wav: root.join("a.wav"),
+            wav2: root.join("b.wav"),
+            mid: root.join("c.mid"),
+        };
+        std::fs::write(&fx.wav, b"RIFF").expect("a.wav");
+        std::fs::write(&fx.wav2, b"RIFF").expect("b.wav");
+        a_midi_file(&fx.mid);
+        fx
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-paywall-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a temp dir");
+        root
+    }
+
+    /// **A free install refuses the track past its cap on every road**,
+    /// says the line, and changes nothing: no word of the desk, no undo
+    /// moment, no count.
+    ///
+    /// Revert-checked: dropping the gate from any one road turns its row of
+    /// this walk red (the count moves, and the undo sentinel fires first).
+    #[test]
+    fn a_free_install_refuses_every_road_past_its_cap_and_changes_nothing() {
+        let root = scratch("free");
+        let fx = fixtures(&root);
+        let mut bad = Vec::new();
+        for road in roads() {
+            let (_ctx, mut app) = walk_app(Tier::Free, "walk-free", &root, CAP);
+            let before = standing(&app);
+            let answer = (road.go)(&mut app, &fx);
+            let line = said(&app, answer);
+            if standing(&app) != before {
+                bad.push(format!(
+                    "{}: the refusal changed the desk (count {} -> {})",
+                    road.name,
+                    before.3,
+                    app.counted_tracks()
+                ));
+            }
+            if !line.contains("The free desk holds 4 tracks.")
+                || !line.contains("(or a certain code)")
+            {
+                bad.push(format!("{}: said {line:?}, not the line", road.name));
+            }
+            if road.makes > 1 && !line.contains(&format!("This needed {} new tracks", road.makes))
+            {
+                bad.push(format!("{}: a batch was refused without saying how much fits: {line:?}", road.name));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(bad.is_empty(), "the free cap leaked:\n  {}", bad.join("\n  "));
+    }
+
+    /// **One under the cap, every road is open to a free install**, so the
+    /// refusal above is the cap and not a road that never worked.
+    #[test]
+    fn a_free_install_under_its_cap_is_admitted_on_every_road() {
+        let root = scratch("under");
+        let fx = fixtures(&root);
+        let mut bad = Vec::new();
+        for road in roads() {
+            let (_ctx, mut app) = walk_app(Tier::Free, "walk-under", &root, CAP - road.makes);
+            let answer = (road.go)(&mut app, &fx);
+            if app.counted_tracks() != CAP {
+                bad.push(format!(
+                    "{}: made {} tracks, not {} ({:?})",
+                    road.name,
+                    app.counted_tracks() + road.makes - CAP,
+                    road.makes,
+                    said(&app, answer)
+                ));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(bad.is_empty(), "a road does not make its track:\n  {}", bad.join("\n  "));
+    }
+
+    /// **A supporter and a cheater walk the same roads past the free cap**,
+    /// and stop only at the build's ceiling, with that line.
+    #[test]
+    fn supporters_and_cheaters_pass_the_walk_and_meet_only_the_ceiling() {
+        let root = scratch("paid");
+        let fx = fixtures(&root);
+        let mut bad = Vec::new();
+        for tier in [Tier::Supporter, Tier::Cheater] {
+            for road in roads() {
+                let (_ctx, mut app) = walk_app(tier, "walk-paid", &root, CAP);
+                assert_eq!(app.track_cap(), None, "{tier:?} is capped");
+                let answer = (road.go)(&mut app, &fx);
+                if app.counted_tracks() != CAP + road.makes {
+                    bad.push(format!(
+                        "{tier:?} {}: {} tracks after, not {} ({:?})",
+                        road.name,
+                        app.counted_tracks(),
+                        CAP + road.makes,
+                        said(&app, answer)
+                    ));
+                }
+            }
+            // Full: every road that can still make a track meets the
+            // ceiling, says so, and changes nothing.
+            for road in roads().into_iter().filter(|r| r.on_full) {
+                let (_ctx, mut app) =
+                    walk_app(tier, "walk-full", &root, recorder::CHANNELS);
+                let before = standing(&app);
+                let answer = (road.go)(&mut app, &fx);
+                let line = said(&app, answer);
+                if standing(&app) != before {
+                    bad.push(format!("{tier:?} {}: the ceiling changed the desk", road.name));
+                }
+                if !line.contains("This build's desk holds 32 tracks.") {
+                    bad.push(format!("{tier:?} {}: said {line:?} at the ceiling", road.name));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(bad.is_empty(), "the paid walk:\n  {}", bad.join("\n  "));
+    }
+
+    /// **The tier's numbers**: no limit for a supporter, thirty-two free,
+    /// and the free desk's extent is the whole desk on every tier.
+    #[test]
+    fn the_caps_are_none_for_a_supporter_and_thirty_two_free() {
+        assert_eq!(recorder::track_cap(true), None);
+        assert_eq!(recorder::track_cap(false), Some(32));
+        assert_eq!(recorder::FREE_TRACKS, 32);
+        let (_c, free) = app_on(tiers::free("caps-free"));
+        let (_c, cheat) = app_on(tiers::cheater("caps-cheat"));
+        let (_c, buyer) = app_on(tiers::supporter("caps-buyer"));
+        assert_eq!(free.track_cap(), Some(32));
+        assert_eq!(cheat.track_cap(), None);
+        assert_eq!(buyer.track_cap(), None);
+        for app in [&free, &cheat, &buyer] {
+            assert_eq!(app.desk_extent(), recorder::CHANNELS, "the extent read the licence");
+            assert_eq!(app.may_add_tracks(0), Ok(()), "an edit was refused");
+        }
+        // A desk past the cap (a supporter's project opened free) is not
+        // refused an edit, and is refused the next track.
+        let (_c, mut over) = app_on(tiers::free("caps-over"));
+        over.force_free_cap(CAP);
+        over.settings.tracks_added = 0b11_1111;
+        assert_eq!(over.counted_tracks(), 6);
+        assert_eq!(over.may_add_tracks(0), Ok(()));
+        assert_eq!(over.may_add_tracks(1), Err(TrackRefusal::FreeCap { have: 6, cap: CAP }));
+        for tag in ["caps-cheat", "caps-buyer"] {
+            let _ = std::fs::remove_dir_all(tiers::dir(tag));
+        }
+    }
+
+    /// **A desk standing above the cap is edited freely, and gets one more
+    /// track once it is back under** (the downgrade rule: a supporter's
+    /// project on a free machine, a relocked cheater).
+    #[test]
+    fn a_desk_over_the_cap_shrinks_freely_and_grows_once_back_under() {
+        let (_c, mut app) = app_on(tiers::free("over"));
+        app.force_free_cap(CAP);
+        app.settings.tracks_added = 0b11_1111;
+        app.undo_reset();
+        assert_eq!(app.counted_tracks(), 6);
+        assert!(!app.add_bare_track(10), "a desk past the cap grew");
+        // Edits commit (the sentinel stays quiet over a desk already above
+        // the cap), and so do removals.
+        app.commit_mixer_name(recorder::Column(2), "Bass".to_owned());
+        app.remove_channel(5);
+        app.remove_channel(4);
+        assert_eq!(app.counted_tracks(), 4);
+        assert!(!app.add_bare_track(10), "a desk AT the cap grew");
+        app.remove_channel(3);
+        assert!(app.add_bare_track(10), "a desk under the cap was refused");
+        assert!(!app.add_bare_track(11));
+        // Undo and redo cross the boundary freely: they apply moments.
+        app.undo();
+        app.undo();
+        assert_eq!(app.counted_tracks(), 4);
+        app.redo();
+        assert_eq!(app.counted_tracks(), 3);
+    }
+
+    /// **The sentinel bites**: a free app that ends a gesture above its cap
+    /// through a road that never asked the gate is a failed test, whatever
+    /// the test was about.
+    #[test]
+    #[should_panic(expected = "some road made a track without asking")]
+    fn the_undo_sentinel_catches_a_road_that_skips_the_gate() {
+        let (_c, mut app) = app_on(tiers::free("sentinel"));
+        app.force_free_cap(CAP);
+        fill_to(&mut app, CAP);
+        // A "road" that writes the track straight in, as a new one might.
+        app.settings.tracks_added |= 1 << 20;
+        app.undo_commit();
+    }
+
+    /// Type the code, one key a frame, through the app's own key feed.
+    /// Answers the variant standing after each key, for a failure to name.
+    fn type_konami(ctx: &egui::Context, app: &mut TangentApp) -> Vec<String> {
+        use egui::Key::*;
+        let mut seen = Vec::new();
+        for key in [
+            ArrowUp, ArrowUp, ArrowDown, ArrowDown, ArrowLeft, ArrowRight, ArrowLeft,
+            ArrowRight, B, A, Enter,
+        ] {
+            let press = egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![press],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            seen.push(format!(
+                "{key:?}: {:?}",
+                app.dialog.as_ref().map(std::mem::discriminant)
+            ));
+        }
+        seen
+    }
+
+    /// **The code typed on a free install lifts the cap in the same
+    /// session**: the next gesture is a supporter's.
+    #[test]
+    fn the_konami_code_lifts_the_cap_on_the_next_gesture() {
+        let root = tiers::dir("konami-feed");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the store's home");
+        let ctx = egui::Context::default();
+        // No welcome card: it is a dialog, and a dialog takes the keys.
+        let mut app = TangentApp::with_license(
+            &ctx,
+            Settings { show_welcome: false, ..Settings::default() },
+            QUIET,
+            LicenseStore::load_from(root.join("license.key")),
+        );
+        app.force_free_cap(CAP);
+        fill_to(&mut app, CAP);
+        assert!(!app.add_bare_track(10), "the forced cap did not hold");
+        app.dialog = None;
+        let seen = type_konami(&ctx, &mut app);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Cheated)),
+            "the code did not open the cheat dialog: {seen:?}"
+        );
+        app.apply_dialog_action(DialogAction::AcceptCheat);
+        app.dialog = None;
+        assert_eq!(app.track_cap(), None, "the unlock did not lift the cap");
+        assert!(app.add_bare_track(10), "the next gesture was still refused");
+        assert_eq!(app.counted_tracks(), CAP + 1);
+        assert!(root.join("cheat.unlock").exists(), "the unlock is not durable");
+        // **Repeat**: the code again changes nothing about the standing.
+        app.apply_dialog_action(DialogAction::AcceptCheat);
+        assert!(app.license.cheated() && app.track_cap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A buyer's toggle never changes standing**, either way, and a buyer
+    /// who removes the key while the marker stands is still a supporter.
+    #[test]
+    fn a_buyer_toggling_the_code_stays_a_supporter() {
+        let (_c, mut app) = app_on(tiers::supporter("buyer-toggle"));
+        assert!(app.license.licensed() && !app.license.cheated());
+        app.apply_dialog_action(DialogAction::AcceptCheat);
+        assert!(app.license.cheated(), "the corruption did not go on");
+        assert_eq!(app.track_cap(), None);
+        app.apply_dialog_action(DialogAction::AcceptCheat);
+        assert!(!app.license.cheated(), "the buyer could not take it off");
+        assert_eq!(app.track_cap(), None, "taking the corruption off capped a buyer");
+        app.apply_dialog_action(DialogAction::AcceptCheat);
+        app.license.remove();
+        assert!(app.license.is_supporter(), "the marker did not carry a removed key");
+        assert_eq!(app.track_cap(), None);
+        let _ = std::fs::remove_dir_all(tiers::dir("buyer-toggle"));
+    }
+
+    /// **A directory holding only the marker reloads as a supporter**: the
+    /// Konami road is a real unlock across launches.
+    #[test]
+    fn a_marker_alone_reloads_as_a_supporter() {
+        let _ = tiers::cheater("marker-only");
+        let dir = tiers::dir("marker-only");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the store dir")
+            .map(|e| e.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("cheat.unlock")]);
+        let (_c, app) = app_on(LicenseStore::load_from(dir.join("license.key")));
+        assert!(app.license.is_supporter() && !app.license.licensed());
+        assert_eq!(app.track_cap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Reset Everything relocks a keyless cheater** and starts a new
+    /// session (the reset is the discard): free again, from the next
+    /// gesture, and the marker gone from disk.
+    #[test]
+    fn reset_everything_relocks_a_keyless_cheater() {
+        let (ctx, mut app) = app_on(tiers::cheater("reset-relock"));
+        assert!(app.license.cheated() && app.track_cap().is_none());
+        app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        assert!(!app.license.cheated(), "the reset left the cheat on");
+        assert_eq!(app.project_request, Some(crate::ports::ProjectRequest::NewKeeping));
+        assert_eq!(app.track_cap(), Some(recorder::FREE_TRACKS), "a relocked cheater is uncapped");
+        assert!(!tiers::dir("reset-relock").join("cheat.unlock").exists());
+        let _ = std::fs::remove_dir_all(tiers::dir("reset-relock"));
+    }
+
+    /// **About knows the standing it was opened under.**
+    #[test]
+    fn about_is_opened_with_the_installs_standing() {
+        for (tier, want) in [(Tier::Free, false), (Tier::Cheater, true), (Tier::Supporter, true)] {
+            let tag = "about";
+            let (ctx, mut app) = app_on(store(tier, tag));
+            app.apply_menu_action(&ctx, MenuAction::ShowAbout);
+            assert!(
+                matches!(app.dialog, Some(Dialog::About { supporter }) if supporter == want),
+                "{tier:?} opened About as the wrong standing"
+            );
+            let _ = std::fs::remove_dir_all(tiers::dir(tag));
+        }
+    }
+
+    /// **A reorder carries the routes at both ends, and a delete drops
+    /// the routes into and out of the row.** The key edges have always been
+    /// carried this way; routes were left naming rows.
+    #[test]
+    fn routes_follow_a_reorder_and_leave_with_a_deleted_track() {
+        use crate::routing::{Route, Target};
+        let (_c, mut app) = app_on(tiers::free("routes"));
+        for n in 0..6 {
+            let _ = app.add_bare_track(n);
+        }
+        app.settings.routes.add(Route::new(2, Target::Channel(4)));
+        app.settings.routes.add(Route::new(4, Target::Hardware { first: 2, stereo: true }));
+        app.settings.routes.add(Route::new(5, Target::Channel(2)));
+        // Rows 2 and 4 trade places.
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        order.swap(2, 4);
+        app.reorder_channels(&order);
+        assert_eq!(
+            app.settings.routes.0,
+            vec![
+                Route::new(4, Target::Channel(2)),
+                Route::new(2, Target::Hardware { first: 2, stereo: true }),
+                Route::new(5, Target::Channel(4)),
+            ],
+            "the routes stayed on the rows instead of following their tracks"
+        );
+        // The track now on row 2 leaves, and every route touching it goes:
+        // the one into it and the one out of it. The stranger's stays.
+        app.remove_channel(2);
+        assert_eq!(app.settings.routes.0, vec![Route::new(5, Target::Channel(4))]);
+    }
+
+    // ── scans ────────────────────────────────────────────────────────────
+
+    /// Every `.rs` file under a source dir, with its text.
+    fn sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        for e in std::fs::read_dir(dir).expect("a source dir") {
+            let p = e.expect("an entry").path();
+            if p.is_dir() {
+                sources(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&p).expect("a source file");
+                out.push((p, text));
+            }
+        }
+    }
+
+    fn both_crates() -> Vec<(std::path::PathBuf, String)> {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut all = Vec::new();
+        sources(&here.join("src"), &mut all);
+        sources(&here.join("../tangent/src"), &mut all);
+        assert!(all.len() > 50, "the scan found {} files: it is not reading the crates", all.len());
+        all
+    }
+
+    /// **No test builds the app through the production door**, which reads
+    /// the developer's own licence. The one production call in the host is
+    /// `DesktopApp::new`'s, recognisable by the eframe creation context no
+    /// test has.
+    #[test]
+    fn no_test_builds_the_app_through_the_production_door() {
+        let needle = ["TangentApp", "::new("].concat();
+        let mut hits = Vec::new();
+        for (path, text) in both_crates() {
+            for (i, line) in text.lines().enumerate() {
+                if line.contains(&needle) && !line.contains("&cc.egui_ctx") {
+                    hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(hits.is_empty(), "built through `new`:\n  {}", hits.join("\n  "));
+    }
+
+    /// The body of `fn <name>` in `src`, brace-matched.
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("no fn {name}"));
+        let open = at + src[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} never closes")
+    }
+
+    /// **The gate reads `is_supporter()` and never `licensed()`**, nor the
+    /// key's tier, nor anything else about the licence: a cheater is a
+    /// supporter in every right, and the gate is the place that forgetting it
+    /// would cap one.
+    #[test]
+    fn the_gate_reads_only_is_supporter() {
+        let src = include_str!("app.rs");
+        let cap = body_of(src, "track_cap");
+        assert!(cap.contains("self.license.is_supporter()"), "track_cap no longer asks is_supporter");
+        for name in ["track_cap", "may_add_tracks", "counted_tracks", "row_counted", "desk_extent", "admit_tracks", "track_refusal_text"] {
+            let body = body_of(src, name);
+            for banned in ["licensed()", ".license()", "TIER_", "max_major", "cheated()"] {
+                assert!(!body.contains(banned), "fn {name} reads {banned}");
+            }
+            if name != "track_cap" {
+                assert!(!body.contains("license"), "fn {name} reads the licence itself");
+            }
+        }
+        let rec = body_of(include_str!("recorder.rs"), "track_cap");
+        assert!(!rec.contains("license"), "recorder::track_cap reads the licence");
+    }
+
+    /// **The fixture key is read only by tests**: every `include_str!` of
+    /// it, in either crate, sits in a top-level module behind `#[cfg(test)]`.
+    #[test]
+    fn the_fixture_key_is_read_only_by_tests() {
+        // Spelled in two halves so this scan does not find itself.
+        let include = ["include", "_str!"].concat();
+        let mut found = 0;
+        for (path, text) in both_crates() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !(line.contains(&include) && line.contains("supporter.key")) {
+                    continue;
+                }
+                found += 1;
+                // The enclosing top-level module: the nearest line above
+                // that opens one at column zero.
+                let opener = lines[..i]
+                    .iter()
+                    .rposition(|l| l.starts_with("mod ") || l.starts_with("pub(crate) mod ") || l.starts_with("pub mod "))
+                    .unwrap_or_else(|| panic!("{}:{} is not inside a module", path.display(), i + 1));
+                let attrs = lines[..opener]
+                    .iter()
+                    .rev()
+                    .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+                    .any(|l| l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test"));
+                assert!(
+                    attrs,
+                    "{}:{} reads the fixture key outside a cfg(test) module",
+                    path.display(),
+                    i + 1
+                );
+            }
+        }
+        assert!(found >= 2, "the scan found the fixture {found} times: one per crate expected");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43177,7 +44440,7 @@ mod tests {
         app.commit_view_change();
         let _ = run_frame(&ctx, &mut app);
         let let_go_under_a_question = |ctx: &egui::Context, app: &mut TangentApp, at: Pos2| {
-            app.dialog = Some(Dialog::About);
+            app.dialog = Some(Dialog::About { supporter: false });
             release(ctx, app, at);
             app.dialog = None;
         };
@@ -43247,7 +44510,7 @@ mod tests {
         // The drag in flight, as its last frame left it.
         app.apply_mixer_hit(fader, 0.6);
         app.mixer_grab = Some(MixerGrab { hit: fader, from: at, moved: true, from_value: 0.6 });
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         let_go_under_a_gate(&ctx, &mut app, at);
         assert!(app.mixer_grab.is_none(), "the lost release left the fader's drag standing");
         assert_eq!(app.hist_at, before + 1, "the fader's drag left {} moments", app.hist_at - before);
@@ -43272,7 +44535,7 @@ mod tests {
         app.press_in_fx_panel(screen, fx, at, true);
         assert_eq!(app.fx_drag, Some("chorus_depth"), "fixture: the row was not grabbed");
         assert!((app.effect_param("chorus_depth") - was).abs() > 0.2, "fixture: the press moved nothing");
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         let_go_under_a_gate(&ctx, &mut app, at);
         assert!(app.fx_drag.is_none(), "the lost release left the effect row's drag standing");
         assert_eq!(app.hist_at, before + 1, "the row's drag left {} moments", app.hist_at - before);
@@ -43314,7 +44577,7 @@ mod tests {
             moved: true,
             on_number: false,
         });
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         let_go_under_a_gate(&ctx, &mut app, at);
         assert!(app.drumpad_grab.is_none(), "the lost release left the drum pad's knob standing");
         assert_eq!(app.hist_at, before + 1, "the knob's drag left {} moments", app.hist_at - before);
@@ -49756,7 +51019,7 @@ mod tests {
 
     pub(super) fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
         let ctx = egui::Context::default();
-        let app = TangentApp::new(&ctx, settings, caps);
+        let app = TangentApp::with_license(&ctx, settings, caps, tiers::free("app"));
         (ctx, app)
     }
 
@@ -53474,7 +54737,7 @@ mod tests {
         // app is a free install, so that is the free edge — the paywall's
         // whole point): the shift is shortened so the three lanes keep
         // their spread instead of piling on the bottom.
-        let edge = app.active_channels() - 1;
+        let edge = app.desk_extent() - 1;
         app.recorder.position_s = 40.0;
         app.selected_channel = Some(edge);
         app.arr_paste();
@@ -59672,7 +60935,7 @@ mod tests {
         let bodies: Vec<&str> = bodies.iter().copied().chain([long_name.as_str()]).collect();
         let mut worst = 0usize;
         for body in bodies {
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
             app.set_startup_notice(body.to_owned());
             let st = crate::notify::Style::of(piano::themed_bg(&app.settings));
             let mut placed = None;
@@ -64125,7 +65388,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
         s.show_recorder = true;
-        let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
+        let app = TangentApp::with_license(&ctx, s, Caps::PLUGIN, tiers::free("app"));
         assert!(!app.settings.show_recorder, "no device, no band");
         assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
     }
@@ -64138,7 +65401,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
         s.show_recorder = true;
-        let app = TangentApp::new(&ctx, s, Caps::MINIMAL);
+        let app = TangentApp::with_license(&ctx, s, Caps::MINIMAL, tiers::free("app"));
         assert!(!app.settings.show_recorder);
         assert!(
             app.settings.show_fretboard || !app.settings.show_fretboard,
@@ -67603,7 +68866,7 @@ mod tests {").expect("the tests module")];
         // writers of `self.dialog` have the slot.
         click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
         assert!(app.pedal_stack.is_some(), "the pedal window did not reopen");
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
         assert!(
             app.pedal_stack.is_none(),
@@ -68008,14 +69271,14 @@ mod tests {").expect("the tests module")];
         }
 
         // The control: a question freezes the desk exactly as before.
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         pointer_frame(&ctx, &mut app, Vec::new());
         let (before, after) = pull_the_first_fader(&ctx, &mut app);
         assert!(
             (after - before).abs() < 1e-9,
             "a modal dialog let the fader move: {before} -> {after}"
         );
-        assert!(matches!(app.dialog, Some(Dialog::About)));
+        assert!(matches!(app.dialog, Some(Dialog::About { .. })));
     }
 
     /// **T inside a plugin window cycles the theme ONCE.** The desk and the
@@ -68284,7 +69547,7 @@ mod tests {").expect("the tests module")];
         assert_eq!(app.settings.theme_name, all[(from + 1) % all.len()].name);
         assert!(matches!(app.dialog, Some(Dialog::InsertFace { .. })));
         // A question, and the gate closes as it always did.
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         assert!(app.dialog_blocks_keys(&ctx), "a modal dialog let the shortcuts through");
         assert!(app.dialog_blocks_pointer(&ctx));
     }
@@ -70971,7 +72234,7 @@ mod tests {").expect("the tests module")];
 
         // Under a modal, Escape is the modal's.
         open_take_panel(&ctx, &mut app);
-        app.dialog = Some(Dialog::About);
+        app.dialog = Some(Dialog::About { supporter: false });
         esc(&ctx, &mut app);
         assert!(app.setup_open, "Escape reached the panel under a modal");
     }
@@ -71545,7 +72808,7 @@ mod tests {").expect("the tests module")];
         // where it is. macOS does this the instant the cursor crosses the
         // sill.
         let was = app.arr_lane_scroll;
-        let rail = app.active_channels().saturating_sub(app.arr_visible());
+        let rail = app.desk_extent().saturating_sub(app.arr_visible());
         assert!(was < rail, "the fixture is already at the rail, so the rest \
                              of this test cannot fail");
         pointer_frame(&ctx, &mut app, vec![egui::Event::PointerGone]);
@@ -71593,7 +72856,7 @@ mod tests {").expect("the tests module")];
                 .collect()
         };
         assert!(
-            !drawn_at_press.contains(&(app.active_channels() - 1)),
+            !drawn_at_press.contains(&(app.desk_extent() - 1)),
             "the fixture drew every lane, so there is nothing to scroll to"
         );
         // Straight down the middle of the field, hard against the bottom.
@@ -71611,7 +72874,7 @@ mod tests {").expect("the tests module")];
         for _ in 0..200 {
             hold_frame(&ctx, &mut app, 0.05);
         }
-        let max = app.active_channels().saturating_sub(app.arr_visible());
+        let max = app.desk_extent().saturating_sub(app.arr_visible());
         assert_eq!(app.arr_lane_scroll, max, "the stack ran past its last lane");
         assert_eq!(
             app.arr_scroll_acc, 0.0,
@@ -75972,15 +77235,39 @@ mod folder_tests {
         // And the refusal SPEAKS — a silent no on a full desk was the bug. In
         // the corner now rather than in a modal box, and an error rather than
         // a notice, because it is a refusal of something the user asked for.
+        // A full FREE desk is at its creation cap, and a folder is a counted
+        // row, so what is missing is room under the cap and the line says
+        // that (it said "no free channel" before the cap was a gate).
         let said = full.said().notes();
         assert_eq!(said.len(), 1, "a full desk refused without saying why");
         assert!(
-            said[0].text.contains("free channel"),
+            said[0].text.contains("The free desk holds 32 tracks."),
             "the refusal does not say what is missing: {}",
             said[0].text
         );
         assert_eq!(said[0].kind, crate::notify::Kind::Error);
         assert!(full.dialog.is_none(), "the refusal opened a window");
+
+        // ── room under the cap, but no spare row outside the run ─────────
+        //
+        // The other refusal, and the one the old line was written for: every
+        // empty row sits between the tracks being grouped, so there is a
+        // track's worth of room and nowhere to put the folder.
+        let mut holed = app();
+        for n in (0..CHANNELS).filter(|n| *n != 5) {
+            holed.add_bare_track(n);
+        }
+        holed.selected_tracks = vec![4, 6];
+        holed.selected_channel = Some(4);
+        assert!(!holed.make_folder(), "a folder was made with no row outside its run");
+        let said = holed.said().notes();
+        assert_eq!(said.len(), 1, "the refusal did not speak once");
+        assert!(
+            said[0].text.contains("No free row outside the selection"),
+            "the refusal does not say what is missing: {}",
+            said[0].text
+        );
+        assert!(!holed.settings.strip_is_folder.iter().any(|f| *f), "a refused folder marked a row");
     }
 
     #[test]
@@ -77438,8 +78725,9 @@ mod aspect_snap_tests {
     /// 147-point window and a question nobody is asking. `tracks_added` full,
     /// so the paywall's sixteen is never what a count is measuring: the
     /// licence on the machine running these tests is whatever it is, and a
-    /// document that already carries work on every lane opens the whole desk
-    /// for everybody (see `active_channels`).
+    /// document that already carries work on every lane opened the whole desk
+    /// for everybody under the old `active_channels`; `desk_extent` reads no
+    /// licence at all now, and the full mask is kept for what it measures.
     fn desk_on(w: i64, usable_h: i64, percent: i64) -> Settings {
         let mut s = Settings::first_launch();
         s.show_welcome = false;
@@ -77614,7 +78902,7 @@ mod aspect_snap_tests {
         let s = desk_on(2560, 1378, 100);
         let ctx = egui::Context::default();
         let win = initial_window_size(&s);
-        let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+        let mut app = TangentApp::with_license(&ctx, s, NO_SAVE, tiers::free("app"));
         // The display, and the two things that count as "filling" it. A
         // maximised window keeps the menu bar and the Dock, so it gets the
         // 1378 he reported; full screen takes those too and gets all 1440.
@@ -77642,7 +78930,7 @@ mod aspect_snap_tests {
             let s75 = desk_on(2560, 1378, 75);
             let ctx75 = egui::Context::default();
             let win75 = initial_window_size(&s75);
-            let mut app75 = TangentApp::new(&ctx75, s75, NO_SAVE);
+            let mut app75 = TangentApp::with_license(&ctx75, s75, NO_SAVE, tiers::free("app"));
             app75.arrangement_open = true;
             let (lanes75, _) = painted_lanes(&ctx75, &mut app75, win75, monitor, Fills::No);
             assert_eq!(lanes75, 10, "75% opened {lanes75} lanes, not ten");
@@ -77685,18 +78973,21 @@ mod aspect_snap_tests {
             "the desk opened {strips} strips at 100% on 2560x1378, not the \
              dozen he asked for"
         );
-        // **The whole desk on a full screen, in ONE row.** The fold that
+        // **Sixteen strips on a full screen, in ONE row.** The fold that
         // used to do this — sixteen over sixteen — is gone at the owner's
         // word, because it paid for the extra channels with half of every
         // fader and every meter. `default_mixer_visible` answers it instead:
-        // a window that can carry all sixteen at `ALL_STRIPS_PITCH` opens
-        // showing all sixteen, and this is the shape of window that can.
+        // a window that can carry sixteen at `ALL_STRIPS_PITCH` opens
+        // showing sixteen, and this is the shape of window that can. Pinned
+        // to `DEFAULT_MAX_STRIPS`, a geometry number, and no longer to the
+        // free tier: the free desk is thirty-two now and the full-screen
+        // default did not move with it.
         for (how, pane) in [(Fills::Maximised, usable), (Fills::FullScreen, monitor)] {
             let full_strips = painted_strips(&ctx, &mut app, pane, monitor, how);
             assert_eq!(
                 full_strips,
-                recorder::FREE_CHANNELS,
-                "the filled desk painted {full_strips} strips, not the whole sixteen"
+                recorder::DEFAULT_MAX_STRIPS,
+                "the filled desk painted {full_strips} strips, not the default sixteen"
             );
         }
     }
@@ -77726,7 +79017,7 @@ mod aspect_snap_tests {
         s.mixer_visible = 7;
         let ctx = egui::Context::default();
         let win = initial_window_size(&s);
-        let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+        let mut app = TangentApp::with_license(&ctx, s, NO_SAVE, tiers::free("app"));
         let monitor = Vec2::new(2560.0, 1440.0);
         let usable = Vec2::new(2560.0, 1378.0);
 
@@ -77826,7 +79117,7 @@ mod aspect_snap_tests {
             let s = desk_on(w, h, 100);
             let ctx = egui::Context::default();
             let win = initial_window_size(&s);
-            let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+            let mut app = TangentApp::with_license(&ctx, s, NO_SAVE, tiers::free("app"));
             // `h` IS the usable height here, so maximised and the monitor are
             // the same pane on these rows; the owner's own test is where the
             // maximised/full-screen difference is asked about.
@@ -78214,10 +79505,11 @@ mod dirty_cost_probe {
     /// the comparison that has to read every byte before it can agree.
     fn a_real_session() -> TangentApp {
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(
+        let mut app = TangentApp::with_license(
             &ctx,
             Settings::default(),
             Caps::DESKTOP,
+            tiers::free("app"),
         );
         for lane in 0..8usize {
             for c in 0..16usize {
@@ -78425,7 +79717,7 @@ mod perf_probes {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         let _ = ctx.run(Default::default(), |_| {});
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
         // Eight lanes on screen, as the panel's own tests draw and as a
         // desktop window shows: headless, the auto count answers four.
         app.settings.arr_visible = 8;
@@ -78572,7 +79864,7 @@ mod perf_probes {
             let tag = size.tag();
             let doc = fx::write_project(size, &dir.join(tag), false);
             let ctx = egui::Context::default();
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
             let n = reps(size, 5, 5, 3, 2);
             let open = per_call(n, || app.open_project_keeping(&doc, KeepPath::Leave));
             let c = fx::census(&app.arrangement);
@@ -78636,7 +79928,7 @@ mod perf_probes {
             let tag = size.tag();
             let doc = fx::write_project(size, &dir.join(tag), false);
             let ctx = egui::Context::default();
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
             app.open_project_keeping(&doc, KeepPath::Leave);
             let midi = a_midi_clip(&app);
             let n = reps(size, 20, 20, 10, 5);
@@ -78948,7 +80240,7 @@ mod arrange_axis_tests {
             [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
         };
         for size in [Size::S, Size::M, Size::L, Size::XL] {
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
             app.settings.arr_visible = 8;
             app.arrangement = fx::arrangement(size);
             app.arrangement_open = true;
@@ -79034,7 +80326,7 @@ mod arrange_peaks_tests {
     #[test]
     fn a_pyramided_document_is_never_stale_and_a_legacy_clip_reopens_the_road() {
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
         app.settings.arr_visible = 8;
         app.arrangement_open = true;
         app.arrangement_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0)));
@@ -79080,7 +80372,7 @@ mod arrange_peaks_tests {
         app.arr_steer(at.0 + at.1, at.1);
         assert!(app.arr_waves_stale(), "a whole window's pan on the legacy road is stale");
         // A MIDI-only document has nothing to picture and is never stale.
-        let mut midi = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        let mut midi = TangentApp::with_license(&ctx, Settings::default(), Caps::DESKTOP, tiers::free("app"));
         midi.arrangement_open = true;
         midi.arrangement_rect = app.arrangement_rect;
         midi.arrangement.add_clip(ArrClip { kind: ClipKind::Midi, path: String::new(), ..an_audio_clip(0, 1.0) });

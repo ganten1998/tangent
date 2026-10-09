@@ -405,7 +405,16 @@ pub enum Dialog {
         /// The project's own name, so the question names the thing at risk.
         name: String,
     },
-    About,
+    /// **The About card**, which knows the install's standing.
+    ///
+    /// `supporter` is `LicenseStore::is_supporter()` read when the card was
+    /// opened (`MenuAction::ShowAbout`): a key covering this major, or the
+    /// Konami marker. Carried rather than asked at paint time because this
+    /// module cannot see the store, and a card that describes the desk has
+    /// to describe THIS install's desk (`about_lines`).
+    About {
+        supporter: bool,
+    },
     /// **Setup.** What the audio path is doing, and everything that changes it.
     ///
     /// It began as a read-only status card, because every number in it was
@@ -873,7 +882,7 @@ impl Dialog {
             | Dialog::Confirm { .. }
             | Dialog::Automation { .. }
             | Dialog::SaveChanges { .. }
-            | Dialog::About
+            | Dialog::About { .. }
             | Dialog::AudioSetup { .. }
             | Dialog::InputChannels { .. }
             | Dialog::Welcome { .. }
@@ -4193,7 +4202,16 @@ fn vst3_locations() -> &'static str {
 ///   holds the two together) and VST3 everywhere. This line said "LV2/VST3"
 ///   on every platform. `cfg!` and not a probe, as [`encoder_note`] does it:
 ///   a Windows build cross-compiled on a Mac still answers for Windows.
-fn about_lines(caps: crate::host::Caps) -> (&'static str, String) {
+///
+/// `supporter` is the install's standing (see `Dialog::About`). It reaches
+/// here so the line can say what THIS install's desk is: a free desk of
+/// thirty-two tracks, or one with no track limit.
+fn about_lines(caps: crate::host::Caps, supporter: bool) -> (&'static str, String) {
+    // MERGE-ME(W3-copy): the tier's own wording ("32-track desk" free,
+    // "unlimited tracks" with a supporter) is the copy lane's to write; W1
+    // only carries the standing to the card. Until then the line names the
+    // desk's capacity for both, which is true of both.
+    let _ = supporter;
     if !caps.capture_devices {
         return (
             "A piano display with chord intelligence",
@@ -11680,7 +11698,7 @@ fn show_on(
                                     // channels and the two that are not.
                                     let sw = cells_across(
                                         ui.available_width() - 6.0,
-                                        crate::recorder::CHANNELS + 2,
+                                        crate::recorder::PALETTE_SLOTS + 2,
                                         1.0,
                                     )
                                     .clamp(3.0, 12.0);
@@ -11697,7 +11715,9 @@ fn show_on(
                                             Color32::from_rgb(cr, cg, cb),
                                         );
                                     };
-                                    for c in 0..crate::recorder::CHANNELS {
+                                    // The palette's whole deal, which is its
+                                    // own period and not the desk's width.
+                                    for c in 0..crate::recorder::PALETTE_SLOTS {
                                         swatch(ui, pal.slot(c));
                                     }
                                     ui.add_space(6.0);
@@ -11721,9 +11741,9 @@ fn show_on(
                 },
             )
         }
-        Dialog::About => {
+        Dialog::About { supporter } => {
             let t = theme(face);
-            let (tagline, what) = about_lines(placement.caps);
+            let (tagline, what) = about_lines(placement.caps, *supporter);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -17923,7 +17943,7 @@ at: None,
             child_windows: false,
             ..crate::host::Caps::DESKTOP
         };
-        let mut dialog = Some(Dialog::About);
+        let mut dialog = Some(Dialog::About { supporter: false });
         let (painted, action) = run_picker_with(&mut dialog, desktop);
         assert!(action.is_none(), "About asked the app to do something");
         assert!(
@@ -17966,7 +17986,7 @@ at: None,
     /// chord display. It said "Recorder ... LV2/VST3" in both.
     #[test]
     fn about_in_a_build_without_the_recorder_claims_neither_recording_nor_hosting() {
-        let mut dialog = Some(Dialog::About);
+        let mut dialog = Some(Dialog::About { supporter: false });
         let (painted, _) = run_picker(&mut dialog);
         assert!(
             painted.contains("A piano display with chord intelligence"),
@@ -17978,8 +17998,8 @@ at: None,
         assert!(painted.contains("tangentdaw@gmail.com"), "{painted}");
         // Minimal gives up the same two capabilities, so it gets the same card.
         assert_eq!(
-            about_lines(crate::host::Caps::MINIMAL),
-            about_lines(crate::host::Caps::PLUGIN)
+            about_lines(crate::host::Caps::MINIMAL, false),
+            about_lines(crate::host::Caps::PLUGIN, false)
         );
     }
 
@@ -18016,7 +18036,7 @@ at: None,
             "[dependencies]",
             "VST3 is no longer hosted everywhere: About says it is"
         );
-        let (_, desktop) = about_lines(crate::host::Caps::DESKTOP);
+        let (_, desktop) = about_lines(crate::host::Caps::DESKTOP, false);
         assert_eq!(
             desktop.contains("LV2"),
             cfg!(any(target_os = "linux", target_os = "freebsd")),
@@ -22033,7 +22053,7 @@ at: None,
             assert!(!d.is_modal(), "{name} is a plugin window and must not freeze the desk");
         }
         let questions: Vec<(&str, Dialog)> = vec![
-            ("About", Dialog::About),
+            ("About", Dialog::About { supporter: false }),
             ("Cheated", Dialog::Cheated),
             ("CheatFun", Dialog::CheatFun),
             (

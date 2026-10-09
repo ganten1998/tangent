@@ -167,10 +167,9 @@ pub struct MixerView<'a> {
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
-    /// How many channels this install works at — the paywall's number
-    /// (`TangentApp::active_channels`). Capacity stays [`CHANNELS`]; this
-    /// bounds what the desk DRAWS and how far it scrolls, so a free
-    /// install neither shows nor reaches the supporter lanes.
+    /// How far the desk reaches (`TangentApp::desk_extent`): what it DRAWS
+    /// and how far it scrolls. Never a tier: a free install's limit is on
+    /// creating tracks, and every track that exists is drawn and reached.
     pub active: usize,
     pub dark_mode: bool,
     /// Every route on the desk: source channel, label, fader. Each strip
@@ -1177,8 +1176,14 @@ impl Palette {
     /// original run; 17..24 in the palette's extension block. PALETTE_RUN
     /// and not CHANNELS: the run length is table HISTORY, and history does
     /// not grow when the desk does.
+    ///
+    /// **Folded by [`crate::recorder::PALETTE_SLOTS`], not by the desk's
+    /// width**: the palette is thirty-two colours deep whatever the desk
+    /// holds, so track 32 starts the deal again at track 0's colour rather
+    /// than the period moving (and every track's colour with it) the day the
+    /// desk stops being thirty-two wide.
     pub fn slot(&self, i: usize) -> usize {
-        let i = i % CHANNELS;
+        let i = i % crate::recorder::PALETTE_SLOTS;
         if i < PALETTE_RUN {
             self.base + i
         } else if i < PALETTE_RUN + 8 {
@@ -5156,36 +5161,54 @@ mod tests {
         }
     }
 
-    /// **The free desk ends at sixteen, everywhere the layout reaches.**
-    /// The paywall's geometry: with `active` at the free count, the
-    /// supporter lanes are never laid out, the scroll cannot reach them,
-    /// and the fold never fires however big the screen - one scrolling
-    /// row is the free mixer's whole shape, by the owner's word.
+    /// **The free desk is all thirty-two, in one scrolling row.**
+    ///
+    /// It used to end at sixteen: `active` was the paywall's geometry, and
+    /// the supporter lanes were never laid out on a free install. The free
+    /// tier is a CREATION cap now (`recorder::track_cap`), never a width, so
+    /// a free desk lays out every lane the scroll can reach, and the layout's
+    /// own rule - nothing past `active` is laid out, the rail stops at its
+    /// edge - is pinned below at a literal sixteen, which is a view's
+    /// argument rather than anybody's tier.
     #[test]
-    fn a_free_desk_never_shows_or_reaches_the_supporter_lanes() {
+    fn a_free_desk_lays_out_and_reaches_every_lane() {
         let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 800.0));
+        let free = crate::recorder::FREE_TRACKS;
+        assert_eq!(free, 32, "the owner's free desk is thirty-two tracks");
         let mut v = a_view();
-        v.active = crate::recorder::FREE_CHANNELS;
+        v.active = free;
         v.visible = CHANNELS; // asks for everything; the clamp answers
         v.scroll_px = 1.0e9; // and so does the scroll's rail
         let l = Layout::new(tall, &v);
-        for n in crate::recorder::FREE_CHANNELS..CHANNELS {
-            assert!(
-                !l.strips[n].panel.is_positive(),
-                "supporter lane {n} was laid out on a free desk"
-            );
-        }
+        assert!(
+            l.strips[free - 1].panel.is_positive(),
+            "the free desk's last lane was not laid out at the end of the rail"
+        );
         // No fold: every visible channel shares one row.
-        let tops: std::collections::BTreeSet<i64> = (0..crate::recorder::FREE_CHANNELS)
+        let tops: std::collections::BTreeSet<i64> = (0..free)
             .filter(|n| l.strips[*n].panel.is_positive())
             .map(|n| l.strips[n].panel.top().round() as i64)
             .collect();
         assert_eq!(tops.len(), 1, "the free desk folded");
-        // And the scroll's ceiling respects the same edge.
+        // And the scroll's ceiling reaches the free desk's last lane.
         assert_eq!(
-            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, crate::recorder::FREE_CHANNELS),
-            (crate::recorder::FREE_CHANNELS - VISIBLE_CHANNELS) as f32
-                * Layout::metrics(tall, VISIBLE_CHANNELS).1,
+            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, free),
+            (free - VISIBLE_CHANNELS) as f32 * Layout::metrics(tall, VISIBLE_CHANNELS).1,
+        );
+
+        // **The layout still stops at `active`**, whatever asked for more.
+        let edge = 16;
+        let mut v = a_view();
+        v.active = edge;
+        v.visible = CHANNELS;
+        v.scroll_px = 1.0e9;
+        let l = Layout::new(tall, &v);
+        for n in edge..CHANNELS {
+            assert!(!l.strips[n].panel.is_positive(), "lane {n} was laid out past `active`");
+        }
+        assert_eq!(
+            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, edge),
+            (edge - VISIBLE_CHANNELS) as f32 * Layout::metrics(tall, VISIBLE_CHANNELS).1,
         );
     }
 

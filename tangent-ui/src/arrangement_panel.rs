@@ -449,8 +449,8 @@ pub struct ArrangeView<'a> {
     pub lane_scroll: usize,
     /// How many lanes show at once — Shift+wheel over the headers zooms it.
     pub visible_lanes: usize,
-    /// The paywall's number (`TangentApp::active_channels`): how many lanes
-    /// the field draws and the scroll can reach. Capacity stays CHANNELS.
+    /// How far the desk reaches (`TangentApp::desk_extent`): how many lanes
+    /// the field draws and the scroll can reach. Never a tier.
     pub active: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a

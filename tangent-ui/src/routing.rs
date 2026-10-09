@@ -140,6 +140,45 @@ impl Routes {
         before - self.0.len()
     }
 
+    /// **Drop every route touching a deleted channel**: the ones leaving it
+    /// and the ones arriving into it.
+    ///
+    /// `KeyEdges::drop_channel`'s job for routes, called from the same
+    /// track-delete path. Neither end may outlive its track: a route left
+    /// FROM the deleted row would move whatever track is made there next off
+    /// the master and into a submix nobody chose, and one left INTO it would
+    /// fold its source into an empty row and out of earshot. Returns how many
+    /// went, so a caller can tell somebody.
+    pub fn drop_channel(&mut self, channel: usize) -> usize {
+        let before = self.0.len();
+        self.0
+            .retain(|r| r.from != channel && r.target != Target::Channel(channel));
+        before - self.0.len()
+    }
+
+    /// **Follow a channel reorder**: both ends of every channel route move
+    /// through `inv` (`inv[old] = new`), and hardware jacks hold still.
+    ///
+    /// A route names its tracks by row, so a reorder that moved the tracks
+    /// and left this list alone made the moved track route somebody else's
+    /// audio (and receive it). The key edges have been carried this way all
+    /// along; routes were simply never on the list. A permutation cannot make
+    /// two distinct routes equal, so `add`'s no-duplicates rule survives it.
+    /// An index past `inv` is left where it is, as `KeyEdges::remap_channels`
+    /// leaves the buses.
+    pub fn remap_channels(&mut self, inv: &[usize]) {
+        for r in &mut self.0 {
+            if let Some(n) = inv.get(r.from) {
+                r.from = *n;
+            }
+            if let Target::Channel(to) = &mut r.target {
+                if let Some(n) = inv.get(*to) {
+                    *to = *n;
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, index: usize) {
         if index < self.0.len() {
             self.0.remove(index);
@@ -596,6 +635,62 @@ mod tests {
         k.set(3, 2, Some(1)); // untouched, to prove it is not a sweep
         assert_eq!(k.drop_channel(5), 2);
         assert_eq!(k.0, vec![KeyEdge { strip: 3, slot: 2, from: 1 }]);
+    }
+
+    /// **A deleted channel takes its routes at both ends**, and only its
+    /// own: a route out of it, a route into it, and its hardware copy go;
+    /// the neighbours' routes stay exactly as they were.
+    #[test]
+    fn deleting_a_channel_drops_its_routes_into_and_out_of_it() {
+        let mut r = Routes::default();
+        r.add(Route::new(5, Target::Channel(9))); // out of the deleted row
+        r.add(Route::new(2, Target::Channel(5))); // into it
+        r.add(Route::new(5, Target::Hardware { first: 2, stereo: true })); // its jacks
+        r.add(Route::new(3, Target::Channel(9))); // a stranger's, kept
+        r.add(Route::new(4, Target::Hardware { first: 0, stereo: false })); // kept
+        assert_eq!(r.drop_channel(5), 3);
+        assert_eq!(
+            r.0,
+            vec![
+                Route::new(3, Target::Channel(9)),
+                Route::new(4, Target::Hardware { first: 0, stereo: false }),
+            ]
+        );
+        assert_eq!(r.drop_channel(5), 0, "a second delete finds nothing");
+    }
+
+    /// **A reorder carries both ends of a channel route**, and leaves a
+    /// hardware destination on its jacks.
+    #[test]
+    fn a_reorder_carries_both_ends_of_a_route() {
+        let mut r = Routes::default();
+        r.add(Route::new(0, Target::Channel(2)));
+        r.add(Route::new(2, Target::Hardware { first: 4, stereo: true }));
+        r.add(Route::new(7, Target::Channel(0)));
+        // Channels 0 and 2 swap, and 7 moves to 1: inv[old] = new.
+        let mut inv: Vec<usize> = (0..32).collect();
+        inv[0] = 2;
+        inv[2] = 0;
+        inv[7] = 1;
+        inv[1] = 7;
+        r.remap_channels(&inv);
+        assert_eq!(
+            r.0,
+            vec![
+                Route::new(2, Target::Channel(0)),
+                Route::new(0, Target::Hardware { first: 4, stereo: true }),
+                Route::new(1, Target::Channel(2)),
+            ],
+            "the routes did not follow their tracks"
+        );
+        // And back again through the inverse is where they started.
+        let mut back = vec![0usize; 32];
+        for (old, new) in inv.iter().enumerate() {
+            back[*new] = old;
+        }
+        r.remap_channels(&back);
+        assert_eq!(r.0[0], Route::new(0, Target::Channel(2)));
+        assert_eq!(r.0[2], Route::new(7, Target::Channel(0)));
     }
 
     #[test]

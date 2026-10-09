@@ -23284,7 +23284,7 @@ mod tests {
             let ctx = egui::Context::default();
             // `PLUGIN` and not `DESKTOP`: `Caps::DESKTOP` sets
             // `persist_global_settings`, and this opens somebody's real work.
-            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+            let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
             app.open_project(&doc);
             let rate = 48_000u32;
             let Ok(mut e) =
@@ -23349,7 +23349,7 @@ mod tests {
         // And the media roots, or the app resolves the owner's own Documents.
         unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", shelf.join("Tangent Media")) };
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         app.open_project(&doc);
         let rate = 48_000u32;
         let Ok(mut e) =
@@ -26885,7 +26885,7 @@ mod tests {
 
         // A fresh session, and a sample loaded onto its sampler.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         let scratch = root.join("Untitled");
         app.adopt_template(&template, &scratch);
         app.apply_dialog_action(tangent_ui::dialogs::DialogAction::PickSample {
@@ -26910,7 +26910,7 @@ mod tests {
         build_template(&app, Some(scratch.as_path()).filter(|_| real), &stage, &shelf).expect("the template");
         let templated = stage.join("media").join("New.wav").is_file();
         // A session made from that template: the host reads the shelf it adopts.
-        let mut next = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut next = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         let later = root.join("Untitled 2");
         next.adopt_template(&stage, &later);
         next.set_sampler_media(sampler_media_on_shelf(&stage.join("state")));
@@ -28188,7 +28188,7 @@ mod tests {
         let on_disk = std::fs::read(&saved).unwrap();
         // Opened, and turned down since: an edit nobody has saved.
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
         app.open_project(&saved);
         app.set_clip_gain(clip, 0.5);
         assert!(app.project_dirty_exact(), "the fixture's edit is not unsaved");
@@ -30738,8 +30738,19 @@ mod tests {
     /// `IVORY_SETTINGS_PATH` — honoured in every build — beside each of its
     /// app constructions. That was a convention nothing enforced, and the
     /// file that did not follow it is this one. So the convention is a test
-    /// now: every `TangentApp::new` in either file either asks for capabilities
-    /// that cannot persist, or redirects the path first.
+    /// now: every app either file builds, through EITHER door
+    /// (`TangentApp::new` or `TangentApp::with_license`), either asks for
+    /// capabilities that cannot persist, or redirects the path first.
+    ///
+    /// **Both doors, and it must find some.** This scan once looked for
+    /// `TangentApp::new` alone. When the licence work moved every test
+    /// construction to `with_license` (tests may not read the real licence
+    /// store), it matched nothing, its loop never ran, and it stayed green
+    /// over nine `Caps::DESKTOP` screenshot apps it no longer looked at. A
+    /// scan that can pass on zero hits proves nothing, so it now counts what
+    /// it checked and refuses an empty file, and refuses a run that saw no
+    /// `Caps::DESKTOP` site at all: that is the branch the redirect check
+    /// lives on, and the screenshot harness cannot build without it.
     ///
     /// A source scan rather than a runtime assertion, for the reason the
     /// tempo-map test below is one: the thing being pinned is what the NEXT
@@ -30747,9 +30758,18 @@ mod tests {
     /// constructor it calls.
     ///
     /// Revert-check: change the seeding test's `Caps::PLUGIN` to
-    /// `Caps::DESKTOP` and this goes red naming it.
+    /// `Caps::DESKTOP` and this goes red naming it. Run 2026-10-09 on
+    /// `a_sample_loaded_during_a_session_rides_into_its_template_and_duplicate`
+    /// (which sets no redirect) and on composite's `splash` shot with its
+    /// `IVORY_SETTINGS_PATH` misspelt: both red. Narrow `DOORS` back to
+    /// `new(` alone and it goes red on the empty count.
     #[test]
     fn no_test_in_this_crate_writes_the_real_settings_file() {
+        // The constructors, by the text after `TangentApp::`. The paren keeps
+        // `TangentApp::new_whatever` and the associated functions a test
+        // calls by path (`parse_input_spec`, ...) out of the count.
+        const DOORS: [&str; 2] = ["new(", "with_license("];
+        let mut desktop_sites = 0usize;
         for (name, src) in [
             ("desktop.rs", include_str!("desktop.rs")),
             ("composite.rs", include_str!("composite.rs")),
@@ -30760,8 +30780,13 @@ mod tests {
             let Some(tests_at) = tests_at else { continue };
             let body = &src[tests_at..];
             let mut at = 0usize;
-            while let Some(hit) = body[at..].find("TangentApp::new") {
+            let mut sites = 0usize;
+            while let Some(hit) = body[at..].find("TangentApp::") {
                 let abs = at + hit;
+                at = abs + "TangentApp::".len();
+                if !DOORS.iter().any(|d| body[at..].starts_with(d)) {
+                    continue;
+                }
                 // A mention in a comment builds nothing, and neither does
                 // this scan's own spelling of the constructor's name.
                 let line_start = body[..abs].rfind('\n').map_or(0, |n| n + 1);
@@ -30769,12 +30794,13 @@ mod tests {
                     body[f..].starts_with("\n    fn no_test_in_this_crate_writes_the_real_settings_file")
                 });
                 if in_self || body[line_start..abs].trim_start().starts_with("//") {
-                    at = abs + "TangentApp::new".len();
                     continue;
                 }
+                sites += 1;
                 // The call's own argument list, which is where the caps are.
                 let tail = &body[abs..body.len().min(abs + 400)];
                 let desktop = tail.contains("Caps::DESKTOP");
+                desktop_sites += usize::from(desktop);
                 // The redirect is set before the construction, so look back
                 // over the enclosing test rather than forward.
                 //
@@ -30812,9 +30838,20 @@ mod tests {
                      TANGENT_MEDIA_ROOT, so the app it builds resolves the \
                      user's own media folder (byte {abs} of the test module)"
                 );
-                at = abs + "TangentApp::new".len();
             }
+            assert!(
+                sites > 0,
+                "{name}: the scan found no app construction in the test module, \
+                 so it checked nothing. A constructor was renamed or a new door \
+                 added: teach DOORS its name"
+            );
         }
+        assert!(
+            desktop_sites > 0,
+            "no Caps::DESKTOP construction was seen in either file, so the \
+             redirect check never ran; the screenshot harness builds one, so \
+             the scan has lost sight of it"
+        );
     }
 
     /// **A launch stands on the default template, never on the remembered
