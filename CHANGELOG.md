@@ -636,7 +636,7 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   black lead), Overprint (a pink and blue riso zine, the fourth light
   desk), Woodblock (Prussian blue on washi with one vermilion seal),
   Toffee (a cast-resin radio with a jade dial), Confetti (a Memphis
-  sideboard), Lamplight (a green glass desk lamp) and Mauve (a
+  sideboard), Lamplight (a green glass desk lamp) and Ditto (a
   spirit-duplicator handout). Five of them keep their ground dark, as
   Amber and Phosphor do. The existing themes and their slots are
   unchanged, so a saved desk opens exactly as it was, and every new theme
