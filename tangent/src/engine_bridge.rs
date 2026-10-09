@@ -816,17 +816,35 @@ mod tests {
 
     // ── the desk-structure pushes ───────────────────────────────────────────
 
-    /// One scripted edit: a name, the desk after it, and the punches the
-    /// arrangement record would hand the frame.
+    /// One scripted edit: a name, the desk after it, the punches the
+    /// arrangement record would hand the frame, and the lanes' automation
+    /// modes (app state, not settings: see `set_arr_auto_mode_for_test`).
     struct Step {
         name: &'static str,
         settings: Settings,
         punches: [Option<u64>; CHANNELS],
+        modes: Vec<(usize, tangent_ui::automation::AutoMode)>,
     }
 
-    /// Arm, mute, solo, phase, folder, route, key, bypass and freeze, one
-    /// edit at a time on top of the last, over a desk that holds every
-    /// instrument kind the strip masks name.
+    /// The step's app: its settings, then its automation modes.
+    fn step_app(step: &Step) -> TangentApp {
+        let mut app = app_with(step.settings.clone());
+        for &(lane, mode) in &step.modes {
+            app.set_arr_auto_mode_for_test(lane, mode);
+        }
+        app
+    }
+
+    /// Arm, mute, solo, phase, folder, route, key, bypass, a MIDI lane's
+    /// device and channel, the curves' modes and freeze, one edit at a time
+    /// on top of the last, over a desk that holds every instrument kind the
+    /// strip masks name.
+    ///
+    /// **Every word the bridge writes is moved off a fresh engine's value by
+    /// some step.** A word that only ever holds its default reads back the
+    /// same whether the push happened or not, so the MIDI routes (`u32::MAX`
+    /// on a fresh engine) and the suspend mask (zero) each get a step of
+    /// their own, the master's bit 32 included.
     fn steps() -> Vec<Step> {
         let mut s = blank();
         kind(&mut s, &[0, 1, 2], ChannelKind::Midi);
@@ -838,18 +856,19 @@ mod tests {
         bay(&mut s, 4, 1, EQ_PATH);
         s.strip_sends[3] = 0.5;
         let none = [None; CHANNELS];
-        let mut out = vec![Step { name: "desk", settings: s.clone(), punches: none }];
-        let mut edit = |name: &'static str, f: &dyn Fn(&mut Settings), punches| {
-            f(&mut s);
-            out.push(Step { name, settings: s.clone(), punches });
+        let mut modes: Vec<(usize, tangent_ui::automation::AutoMode)> = Vec::new();
+        let mut out = vec![Step { name: "desk", settings: s.clone(), punches: none, modes: modes.clone() }];
+        let mut edit = |name: &'static str, f: &dyn Fn(&mut Settings, &mut Vec<_>), punches| {
+            f(&mut s, &mut modes);
+            out.push(Step { name, settings: s.clone(), punches, modes: modes.clone() });
         };
-        edit("arm", &|s| s.channel_armed = Some(1 << 0 | 1 << 4), none);
-        edit("mute", &|s| s.strip_muted |= 1 << 2, none);
-        edit("solo", &|s| s.strip_soloed |= 1 << 4, none);
-        edit("phase", &|s| s.strip_phase |= 1 << 1 | 1 << 34, none);
+        edit("arm", &|s, _| s.channel_armed = Some(1 << 0 | 1 << 4), none);
+        edit("mute", &|s, _| s.strip_muted |= 1 << 2, none);
+        edit("solo", &|s, _| s.strip_soloed |= 1 << 4, none);
+        edit("phase", &|s, _| s.strip_phase |= 1 << 1 | 1 << 34, none);
         edit(
             "folder",
-            &|s| {
+            &|s, _| {
                 s.strip_is_folder[5] = true;
                 s.strip_in_folder[6] = true;
                 s.strip_in_folder[7] = true;
@@ -859,7 +878,7 @@ mod tests {
         );
         edit(
             "route",
-            &|s| {
+            &|s, _| {
                 s.routes.add(Route::new(3, Target::Channel(4)));
                 s.routes.add(Route::new(6, Target::Hardware { first: 0, stereo: true }));
                 // Past the offline engine's two outputs: pruned at the door.
@@ -867,19 +886,43 @@ mod tests {
             },
             none,
         );
-        edit("route-gain", &|s| s.routes.set_gain(0, 0.5), none);
-        edit("key", &|s| s.insert_keys.set(4, 0, Some(3)), none);
-        edit("bypass", &|s| s.insert_bypass.0.push((4, 1)), none);
+        edit("route-gain", &|s, _| s.routes.set_gain(0, 0.5), none);
+        edit("key", &|s, _| s.insert_keys.set(4, 0, Some(3)), none);
+        edit("bypass", &|s, _| s.insert_bypass.0.push((4, 1)), none);
+        edit(
+            "midi-route",
+            &|s, _| {
+                // The Keys lane hears one named device on wire channel 10. No
+                // ports are open in a test app, so the name resolves to no
+                // source slot at all: `src` 0, which is still off the default.
+                s.channel_midi_inputs = vec![tangent_ui::recorder::MidiInputSel::EVERYTHING; CHANNELS];
+                s.channel_midi_inputs[1] =
+                    tangent_ui::recorder::MidiInputSel { devices: vec!["Keystation".to_owned()], channel: Some(9) };
+            },
+            none,
+        );
+        edit(
+            "auto-modes",
+            &|_, m| {
+                use tangent_ui::automation::AutoMode;
+                m.push((3, AutoMode::Off));
+                m.push((4, AutoMode::Write));
+                // The master's lane is bit 32: past a u32, which is the
+                // aliasing `auto_suspend_mask` was widened to stop.
+                m.push((tangent_ui::arrangement_panel::MASTER_LANE, AutoMode::Touch));
+            },
+            none,
+        );
         edit(
             "freeze",
-            &|s| s.frozen_lanes.push(FrozenLane { lane: 0, path: "media/f.wav".into(), len_s: 1.0 }),
+            &|s, _| s.frozen_lanes.push(FrozenLane { lane: 0, path: "media/f.wav".into(), len_s: 1.0 }),
             none,
         );
         let mut punched = none;
         punched[3] = Some(48_000);
-        edit("punch", &|_| {}, punched);
-        edit("unpunch", &|_| {}, none);
-        edit("render-ahead", &|s| s.render_ahead_ms = 5.0, none);
+        edit("punch", &|_, _| {}, punched);
+        edit("unpunch", &|_, _| {}, none);
+        edit("render-ahead", &|s, _| s.render_ahead_ms = 5.0, none);
         out
     }
 
@@ -897,7 +940,7 @@ mod tests {
         let mut seen: Vec<(String, serde_json::Value)> = Vec::new();
         let mut last = None;
         for step in steps() {
-            let app = app_with(step.settings.clone());
+            let app = step_app(&step);
             p.punch_at(step.punches);
             p.sync(&app, &mut e);
             seen.push((step.name.to_owned(), e.desk_readback()));
