@@ -12206,15 +12206,17 @@ impl Renderer {
 
     /// The mute mask with automation folded in.
     ///
-    /// The mask is a `u32` of bits the desk owns; a curve overrides one bit
+    /// The mask is a `u64` of bits the desk owns; a curve overrides one bit
     /// without disturbing the others, so a lane nobody has automated goes on
-    /// answering to its own button.
+    /// answering to its own button. The bit is [`word_bit`]'s, as every other
+    /// question asked of this strip-space word is: a lane the word has no bit
+    /// for is left alone rather than wrapped onto lane 0.
     fn muted_now(&self, muted: u64) -> u64 {
         let mut out = muted;
         for lane in 0..CHANNELS {
             match self.auto.mute[lane] {
-                Some(true) => out |= 1 << lane,
-                Some(false) => out &= !(1 << lane),
+                Some(true) => out |= word_bit(lane),
+                Some(false) => out &= !word_bit(lane),
                 None => {}
             }
         }
@@ -15737,42 +15739,57 @@ impl Renderer {
     ///
     /// Each channel once, so a desk of routes costs one walk of the table
     /// per channel at most, and nothing allocates.
+    ///
+    /// **`path` and `done` are a flag per lane, not a mask.** They were a
+    /// `u32` tested with `1u32 << d`, which is the spelling W2-engine-lanesets
+    /// removed from every other walk: past the word a release build wraps the
+    /// shift onto lane 0, so lane 32 would read lane 0's `done` and hand back
+    /// lane 0's transfer, or see its own cycle where there is none. The flags
+    /// are as wide as the array they guard, live on the stack because this
+    /// runs on `&self` from inside the room's walk. `path` is set on the way
+    /// down and cleared on the way back, so it holds the lanes on the stack,
+    /// the set the `path | bit` copy carried. (A lane that sets it is `done`
+    /// before it returns and `done` is asked first, so a missed clear would
+    /// change nothing; the clear is there so the flag means what it says.)
+    /// The arithmetic and its order are unchanged.
     fn route_transfer(&self) -> [[f32; 2]; CHANNELS] {
         fn walk(
             r: &Renderer,
             d: usize,
-            path: u32,
+            path: &mut [bool; CHANNELS],
             t: &mut [[f32; 2]; CHANNELS],
-            done: &mut u32,
+            done: &mut [bool; CHANNELS],
         ) -> [f32; 2] {
-            let bit = 1u32 << d;
-            if *done & bit != 0 {
+            if done[d] {
                 return t[d];
             }
-            if path & bit != 0 {
+            if path[d] {
                 return [0.0; 2];
             }
+            path[d] = true;
             let mut on = [0.0f32; 2];
             for i in 0..r.route_n {
                 let (from, target, hardware, _, gain) = r.route_cache[i];
                 if from != d || hardware || gain <= 0.0 || target >= CHANNELS {
                     continue;
                 }
-                let next = walk(r, target, path | bit, t, done);
+                let next = walk(r, target, path, t, done);
                 on[0] += gain * next[0];
                 on[1] += gain * next[1];
             }
+            path[d] = false;
             let (pl, pr) = pan_gains(r.lane_pan(d));
             let g = r.lane_gain[d];
             let direct = r.route_direct[d];
             t[d] = [g * pl * (direct + on[0]), g * pr * (direct + on[1])];
-            *done |= bit;
+            done[d] = true;
             t[d]
         }
         let mut t = [[0.0f32; 2]; CHANNELS];
-        let mut done = 0u32;
+        let mut path = [false; CHANNELS];
+        let mut done = [false; CHANNELS];
         for d in 0..CHANNELS {
-            walk(self, d, 0, &mut t, &mut done);
+            walk(self, d, &mut path, &mut t, &mut done);
         }
         t
     }
@@ -35267,6 +35284,201 @@ mod lanesets {
         let quoted = format!("    // it was `1 << n{low}`, which folded the lanes");
         assert!(lane_clamps("comment", &quoted).is_empty(), "a comment was flagged");
         assert!(lane_clamps("fine", "let n = frames.min(out.len());").is_empty());
+    }
+
+    /// Operands a Renderer or Shared walk shifts by that are not lanes: a
+    /// note's pitch or key indexes a 128-bit pitch word, which is as wide as
+    /// MIDI and never grows with the desk.
+    const NOT_LANES: [&str; 2] = ["pitch", "key"];
+
+    /// **Every line inside an `impl Renderer` or `impl Shared` block that
+    /// builds a bit by shifting over a bare variable** that is not a pitch:
+    /// `1u32 << d`, `1 << lane`, `!(1u64 << ch)`. That is a lane mask
+    /// spelled in a walk, which the clamp scan cannot see because it has no
+    /// `.min`. A parenthesised operand (`(pad & 63)`) is a word index that
+    /// already says how it wraps; a constant (`STRIPS`) has no lane to grow
+    /// past. A top-level impl ends at its first column-zero `}`.
+    fn walk_lane_shifts(name: &str, src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for (i, l) in src.lines().enumerate() {
+            if !inside {
+                inside = l.starts_with("impl Renderer {") || l.starts_with("impl Shared {");
+                continue;
+            }
+            if l == "}" {
+                inside = false;
+                continue;
+            }
+            if l.trim_start().starts_with("//") {
+                continue;
+            }
+            let hit = l.match_indices("<<").any(|(at, _)| {
+                let rhs = l[at + 2..].trim_start();
+                let var: String =
+                    rhs.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                var.starts_with(|c: char| c.is_ascii_lowercase()) && !NOT_LANES.contains(&var.as_str())
+            });
+            if hit {
+                out.push(format!("{name}:{}: {}", i + 1, l.trim()));
+            }
+        }
+        out
+    }
+
+    /// **No Renderer or Shared walk tests a lane against a word.** The
+    /// sibling of the clamp scan: `route_transfer` kept a `u32` path and done
+    /// mask tested with `1u32 << d` after every other walk had gone to a
+    /// LaneSet, and nothing caught it because the spelling has no `.min`.
+    /// A lane is asked of a LaneSet, a per-lane flag, or (for the strip-space
+    /// mute and solo words the plan has yet to replace) [`word_bit`].
+    #[test]
+    fn no_renderer_walk_shifts_a_lane_into_a_word() {
+        let found = walk_lane_shifts("instrument.rs", include_str!("instrument.rs"));
+        assert!(
+            found.is_empty(),
+            "a lane mask is back in a walk; past the word a release build wraps \
+             the shift onto lane 0:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// **The shift scan bites**: a lane shift inside either impl is found,
+    /// and a pitch, a parenthesised word index, a constant, a comment and
+    /// a shift outside the impls are not.
+    #[test]
+    fn the_shift_scan_finds_a_lane_mask_in_a_walk() {
+        let planted = "impl Renderer {\n    fn f(&self) {\n        let bit = 1u32 << d;\n        \
+                       out &= !(1 << lane);\n        told |= 1u128 << pitch;\n        \
+                       x & (1u64 << (pad & 63));\n        m & !(1u64 << STRIPS);\n        \
+                       // it was `1u32 << d`\n    }\n}\nfn g() { let b = 1u32 << d; }\n\
+                       impl Shared {\n    fn h(&self, ch: usize) -> u64 { 1u64 << ch }\n}\n";
+        let found = walk_lane_shifts("planted", planted);
+        assert_eq!(found.len(), 3, "the scan found {found:?}");
+        assert!(found[0].ends_with("let bit = 1u32 << d;"), "{found:?}");
+        assert!(found[1].ends_with("out &= !(1 << lane);"), "{found:?}");
+        assert!(found[2].contains("1u64 << ch"), "{found:?}");
+    }
+
+    /// **`route_transfer` answers, bit for bit, what its `u32` masks did**,
+    /// over random route tables with cycles, self-routes, hardware routes,
+    /// muted gains and a target past the desk, every lane's gain, pan and
+    /// direct share set. The oracle is the walk as it stood, so a flag that
+    /// answered for another lane's (the wrap this replaced) or a cycle cut at
+    /// a different lane moves some lane's transfer and fails here: aliasing
+    /// `done` onto sixteen lanes failed it in round 0.
+    #[test]
+    fn route_transfer_answers_what_its_masks_did() {
+        fn oracle(
+            routes: &[(usize, usize, bool, bool, f32)],
+            gain: &[f32; CHANNELS],
+            direct: &[f32; CHANNELS],
+            pan: &[f32; CHANNELS],
+        ) -> [[f32; 2]; CHANNELS] {
+            #[allow(clippy::too_many_arguments)]
+            fn walk(
+                routes: &[(usize, usize, bool, bool, f32)],
+                gain: &[f32; CHANNELS],
+                direct: &[f32; CHANNELS],
+                pan: &[f32; CHANNELS],
+                d: usize,
+                path: u32,
+                t: &mut [[f32; 2]; CHANNELS],
+                done: &mut u32,
+            ) -> [f32; 2] {
+                let bit = 1u32.checked_shl(d as u32).expect("the oracle is a 32-lane word");
+                if *done & bit != 0 {
+                    return t[d];
+                }
+                if path & bit != 0 {
+                    return [0.0; 2];
+                }
+                let mut on = [0.0f32; 2];
+                for &(from, target, hardware, _, g) in routes {
+                    if from != d || hardware || g <= 0.0 || target >= CHANNELS {
+                        continue;
+                    }
+                    let next = walk(routes, gain, direct, pan, target, path | bit, t, done);
+                    on[0] += g * next[0];
+                    on[1] += g * next[1];
+                }
+                let (pl, pr) = pan_gains(pan[d]);
+                t[d] = [gain[d] * pl * (direct[d] + on[0]), gain[d] * pr * (direct[d] + on[1])];
+                *done |= bit;
+                t[d]
+            }
+            let mut t = [[0.0f32; 2]; CHANNELS];
+            let mut done = 0u32;
+            for d in 0..CHANNELS {
+                walk(routes, gain, direct, pan, d, 0, &mut t, &mut done);
+            }
+            t
+        }
+
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let r = e.offline.as_mut().expect("renderer");
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut cycles = 0;
+        for round in 0..300 {
+            let n = (next(MAX_ROUTES as u64 + 1) as usize).min(MAX_ROUTES);
+            let mut routes = Vec::with_capacity(n);
+            for _ in 0..n {
+                let from = next(CHANNELS as u64) as usize;
+                // Dense in the low lanes so cycles are common, and now and
+                // then the top lane or a target past the desk.
+                let target = match next(16) {
+                    0 => CHANNELS - 1,
+                    1 => CHANNELS + next(4) as usize,
+                    _ => next(6) as usize,
+                };
+                let hardware = next(10) == 0;
+                let g = match next(8) {
+                    0 => 0.0,
+                    _ => next(1000) as f32 / 500.0,
+                };
+                routes.push((from, target, hardware, false, g));
+            }
+            let mut gain = [1.0f32; CHANNELS];
+            let mut direct = [1.0f32; CHANNELS];
+            let mut pan = [0.0f32; CHANNELS];
+            for d in 0..CHANNELS {
+                gain[d] = next(1500) as f32 / 1000.0;
+                direct[d] = if next(3) == 0 { 0.0 } else { 1.0 };
+                pan[d] = next(2001) as f32 / 1000.0 - 1.0;
+                r.lane_gain[d] = gain[d];
+                r.route_direct[d] = direct[d];
+                r.shared.set_channel_pan(d, pan[d]);
+            }
+            r.route_n = routes.len();
+            for (i, route) in routes.iter().enumerate() {
+                r.route_cache[i] = *route;
+            }
+            cycles += usize::from(routes.iter().any(|&(f, t, h, _, g)| {
+                !h && g > 0.0 && routes.iter().any(|&(f2, t2, h2, _, g2)| {
+                    !h2 && g2 > 0.0 && f2 == t && t2 == f
+                })
+            }));
+            let want = oracle(&routes, &gain, &direct, &pan);
+            let got = r.route_transfer();
+            for d in 0..CHANNELS {
+                for side in 0..2 {
+                    assert_eq!(
+                        got[d][side].to_bits(),
+                        want[d][side].to_bits(),
+                        "round {round} lane {d} side {side}: {} against {}",
+                        got[d][side],
+                        want[d][side]
+                    );
+                }
+            }
+        }
+        assert!(cycles > 20, "too few tables had a cycle to prove the path flags: {cycles}");
     }
 
     /// **`auto_key` files every automation bay where `param_slot` does**, for
