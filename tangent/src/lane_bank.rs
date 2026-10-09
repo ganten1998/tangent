@@ -603,9 +603,14 @@ mod tests {
             let (report, counted) = crate::rt_alloc::count_allocs(|| {
                 apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx)
             });
+            // `here`, not `total()`: `apply_ops` runs on the calling thread
+            // and nowhere else, so `here` is all of it. The hands' figure is
+            // keyed by thread name and a neighbour test's pool shares the
+            // names, so counting it here would only let another test's
+            // allocation fail this one. (One window, not `least_of`: the
+            // ops are consumed, so a second window measures nothing.)
             assert_eq!(
-                counted.total(),
-                0,
+                counted.here, 0,
                 "capacity {cap}: {counted:?} for {report:?}"
             );
             assert_eq!(report.applied, 11);
