@@ -963,3 +963,298 @@ fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
     }
     assert!(found.is_empty(), "a second spelling of a real path: {found:#?}");
 }
+
+
+// ── format 2 (W3-persist-v23-v8) ─────────────────────────────────────────
+//
+// The format-2 writers are reached through their `*_as(Format::V2)` entry
+// points: `desk_format::WRITE_V8` is never flipped here.
+
+use crate::desk_format::Format;
+
+/// FNV-1a over a text, for pinning bytes without committing them.
+fn fnv(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// **What the production writers wrote for every fixture at the base**
+/// (8084254), captured there and pinned: the hash and the length of
+/// `Settings::from_json(text).to_json()` and of the document's `to_json()`.
+const PRODUCTION_BYTES: [(&str, u64, usize); 18] = [
+    ("settings-v12.json", 0xf2b5_0d33_d369_311a, 23187),
+    ("settings-v17-pads16.json", 0x33fc_2468_6db6_7d8d, 23168),
+    ("settings-v18.json", 0xf837_b7b6_8d3a_3a1e, 23183),
+    ("settings-v19.json", 0xa10b_eb30_f03d_85f6, 23390),
+    ("settings-v20-27.json", 0x6749_240e_4e50_fe95, 23516),
+    ("settings-v20.json", 0x6501_aca1_728f_9e30, 23670),
+    ("settings-v21.json", 0xce41_8e74_9440_552a, 23238),
+    ("settings-v22.json", 0x4d1e_2fc8_57b0_f9d5, 23327),
+    ("daw-3x.json", 0x9d49_2fab_6cc6_84cd, 23121),
+    ("daw-4x.json", 0x4b0d_518a_9bfd_2fea, 23160),
+    ("daw-5x.json", 0xe3ce_89c6_2404_ec31, 23136),
+    ("doc-v4-11.json", 0x8022_967e_d61c_df02, 3998),
+    ("doc-v5-18.json", 0x034e_4de8_22bc_84c2, 4492),
+    ("doc-v5-19.json", 0x8b14_0bda_8dc1_d662, 4412),
+    ("doc-v6-27.json", 0xecf4_6192_5c48_b856, 4758),
+    ("doc-v6-35.json", 0xa352_fb96_d82a_f0bd, 5108),
+    ("doc-v7.json", 0xdaca_0860_9b93_ff8c, 5334),
+    ("default", 0x4136_3fd9_3a12_4b45, 22805),
+];
+
+/// **Production writes today's bytes**, stamps included, for every fixture
+/// and for the default settings: format 2 is behind the one switch, and
+/// with it off nothing a user's install writes moved by a byte.
+#[test]
+fn production_writes_are_the_bases_bytes() {
+    assert!(!crate::desk_format::WRITE_V8, "the switch is W4's to flip; re-pin this then");
+    let written = SETTINGS
+        .iter()
+        .map(|(n, t)| (*n, Settings::from_json(t).to_json()))
+        .chain(DOCUMENTS.iter().map(|(n, t)| (*n, Arrangement::from_json(t).to_json())))
+        .chain(std::iter::once(("default", Settings::default().to_json())));
+    for ((name, text), (want_name, hash, len)) in written.zip(PRODUCTION_BYTES) {
+        assert_eq!(name, want_name, "the tables are out of step");
+        assert_eq!((fnv(&text), text.len()), (hash, len), "{name} is not the base's bytes");
+    }
+}
+
+/// `observe_settings` without its shuffle line (a format-2 file raises
+/// none: its desk is already V32), with the names and the inputs read as
+/// the desk reads them: a strip or a channel the array stops short of has
+/// no name and no input, which a format-2 row spells as an empty one.
+fn settings_picture(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = observe_settings(text).lines().take(7).map(str::to_owned).collect();
+    let s = Settings::from_json(text);
+    let mut names = s.strip_names;
+    names.resize(V32_STRIPS + 1, String::new());
+    lines[2] = format!("names {}", json(&names));
+    let mut inputs = s.channel_inputs;
+    inputs.resize(V32_CHANNELS, String::new());
+    lines[6] = format!("inputs {}", json(&inputs));
+    lines
+}
+
+fn settings_v2(s: &Settings) -> String {
+    serde_json::to_string_pretty(&Value::Object(s.to_map_as(Format::V2))).expect("json")
+}
+
+fn document_v2(a: &Arrangement) -> String {
+    a.to_json_with_desk_as(a.desk.as_ref(), Format::V2)
+}
+
+/// A document's desk as the model would write it, and its curves: the
+/// picture two reads of one desk must agree on, whichever shape each read.
+fn observe_document_model(text: &str) -> String {
+    let a = Arrangement::from_json(text);
+    let d = a.desk.as_ref().expect("a desk");
+    let curves: Vec<String> =
+        a.automation.curves().iter().map(|c| format!("{}:{}", c.lane, c.param.key())).collect();
+    format!("{}\ncurves {}", crate::desk_model::picture(&d.desk_model().model), curves.join(" "))
+}
+
+/// **Every fixture saves as format 2 and reopens equal** (a fixed point):
+/// the settings files and the DAW blobs as v23, the documents as v8, each
+/// carrying one `desk` object and no legacy desk key, written again from
+/// its own read as the same bytes, and opening to the picture the legacy
+/// file opened to. A document carries its era as `legacy_states`.
+#[test]
+fn every_fixture_saves_as_format_2_and_reopens_equal() {
+    for (name, text) in SETTINGS {
+        let once = settings_v2(&Settings::from_json(text));
+        let v: Value = serde_json::from_str(&once).expect("json");
+        assert_eq!(v["settings_version"], 23, "{name} was not stamped 23");
+        assert!(crate::desk_format::is_format2(&v["desk"]), "{name} has no format-2 desk");
+        for key in ["channel_kinds", "strip_inserts", "strip_names", "routes", "tracks_added"] {
+            assert!(v.get(key).is_none(), "{name} still writes the legacy key {key}");
+        }
+        let twice = settings_v2(&Settings::from_json(&once));
+        assert_eq!(once, twice, "{name} is not a fixed point as v23");
+        assert_eq!(settings_picture(&once), settings_picture(text), "{name} opened differently as v23");
+    }
+    for (name, text) in DOCUMENTS {
+        let legacy = Arrangement::from_json(text);
+        let once = document_v2(&legacy);
+        let v: Value = serde_json::from_str(&once).expect("json");
+        assert_eq!(v["arrangement_version"], 8, "{name} was not stamped 8");
+        assert!(crate::desk_format::is_format2(&v["desk"]), "{name} has no format-2 desk");
+        let era = crate::desk_lift::era_of_desk(&serde_json::from_str::<Value>(text).expect("json")["desk"]);
+        assert_eq!(v["desk"]["legacy_states"], era.name(), "{name} lost its legacy marker");
+        for key in ["kinds", "inserts", "names", "muted", "insert_bypass"] {
+            assert!(v["desk"].get(key).is_none(), "{name} still writes the legacy key {key}");
+        }
+        let back = Arrangement::from_json(&once);
+        assert_eq!(back.desk.as_ref().and_then(|d| d.legacy_states.0), Some(era), "{name}");
+        assert_eq!(document_v2(&back), once, "{name} is not a fixed point as v8");
+        assert_eq!(observe_document_model(&once), observe_document_model(text), "{name} opened differently as v8");
+    }
+}
+
+/// **The master's curves are written by name** in format 2 and read back
+/// as the master, whatever lane the era kept them at: a 27-sends document's
+/// master curve at lane 24 reads as the master (under the lift that knows
+/// the window, which switches on with the copy-only shelf), is written as
+/// `{"target": "master"}`, and reopens on the master's lane.
+#[test]
+fn a_master_curve_is_persisted_as_the_master() {
+    crate::desk_lift::with_v24_lift(|| {
+        let (_, text) = DOCUMENTS.iter().find(|(n, _)| *n == "doc-v6-27.json").expect("fixture");
+        let legacy = Arrangement::from_json(text);
+        let master = crate::desk_lift::V32_MASTER_LANE;
+        let on_master = |a: &Arrangement| a.automation.curves().iter().filter(|c| c.lane == master).count();
+        assert!(on_master(&legacy) > 0, "the fixture's lane-24 curve did not read as the master");
+        let once = document_v2(&legacy);
+        let v: Value = serde_json::from_str(&once).expect("json");
+        let curves = v["automation"].as_array().expect("curves");
+        let named = curves.iter().filter(|c| c["target"] == "master").count();
+        assert_eq!(named, on_master(&legacy), "the master's curves were not written by name");
+        assert!(
+            curves.iter().all(|c| c.get("lane") != Some(&Value::from(master as u64))),
+            "a master curve was written as a lane"
+        );
+        assert_eq!(on_master(&Arrangement::from_json(&once)), on_master(&legacy));
+    });
+}
+
+/// A temp folder for one test, empty.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "tangent-w3-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// **The first format-2 write over a legacy document keeps it**, byte for
+/// byte, as `<doc>.pre-v8`, written once: a second format-2 write, and a
+/// format-2 write over a legacy file that already has a backup, leave the
+/// backup alone; a legacy write makes none.
+#[test]
+fn the_first_format_2_save_keeps_the_legacy_document_once() {
+    for (name, text) in DOCUMENTS {
+        let dir = scratch("pre-v8");
+        let doc = dir.join(crate::arrangement::DOC_NAME);
+        std::fs::write(&doc, text).expect("fixture");
+        let backup = Arrangement::pre_v8_path(&doc);
+        let mut a = Arrangement::load_from(&doc);
+        a.save_to_as(&doc, Format::Legacy);
+        assert!(!backup.exists(), "{name}: a legacy write made a backup");
+        std::fs::write(&doc, text).expect("fixture");
+        a.save_to_as(&doc, Format::V2);
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), text, "{name}: not the original");
+        a.named = !a.named;
+        a.save_to_as(&doc, Format::V2);
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), text, "{name}: rewritten");
+        // A legacy file again, with a backup already standing: the first
+        // backup is the one kept.
+        std::fs::write(&doc, "{\"arrangement_version\": 7, \"clips\": []}").expect("legacy");
+        a.save_to_as(&doc, Format::V2);
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), text, "{name}: overwritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The five dangling entries of design 6.3 (a plugin, a bypass, a route, a
+/// key and a send, each naming a track the desk does not hold), put into a
+/// format-2 `desk` object.
+fn dangle(desk: &mut Value) {
+    let ghost = "t4000";
+    desk["plugins"]
+        .as_object_mut()
+        .expect("plugins")
+        .insert(format!("{ghost}-c0-b0"), Value::from("/ghost.vst3"));
+    desk["bypass"].as_array_mut().expect("bypass").push(Value::from(format!("{ghost}-c0-b1")));
+    desk["routes"]
+        .as_array_mut()
+        .expect("routes")
+        .push(serde_json::json!({"from": "t1", "to": ghost, "gain": 1.0}));
+    desk["keys"]
+        .as_array_mut()
+        .expect("keys")
+        .push(serde_json::json!({"seat": format!("{ghost}-c0-b0"), "from": "t1"}));
+    desk["rows"][0]["sends"]
+        .as_array_mut()
+        .expect("sends")
+        .push(serde_json::json!({"to": ghost, "level": 0.5, "pre": false}));
+}
+
+/// **A dangling entry costs that entry**: a v23 settings file, a DAW blob
+/// and a v8 document each carrying one dangling plugin, bypass, route, key
+/// and send open with exactly those five dropped and said, and write
+/// everything else back byte for byte.
+#[test]
+fn dangling_entries_are_dropped_and_said_and_nothing_else_moves() {
+    for (name, text) in SETTINGS {
+        let clean = settings_v2(&Settings::from_json(text));
+        let mut v: Value = serde_json::from_str(&clean).expect("json");
+        dangle(&mut v["desk"]);
+        let s = Settings::from_json(&v.to_string());
+        let notice = s.desk_notice.clone().expect("no notice was raised");
+        for what in ["plugin", "bypass", "route", "key", "send"] {
+            assert!(notice.contains(what), "{name}: the notice does not name the {what}: {notice}");
+        }
+        assert!(s.desk_refused.is_none() && s.unreadable.is_none(), "{name}: more than the entries went");
+        assert_eq!(settings_v2(&s), clean, "{name}: more than the five entries moved");
+    }
+    for (name, text) in DOCUMENTS {
+        let clean = document_v2(&Arrangement::from_json(text));
+        let mut v: Value = serde_json::from_str(&clean).expect("json");
+        dangle(&mut v["desk"]);
+        let a = Arrangement::from_json(&v.to_string());
+        let dropped = &a.desk.as_ref().expect("the desk read").dropped.0;
+        let mut kinds: Vec<&str> = dropped.iter().map(|d| d.what).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["bypass", "key", "plugin", "route", "send"], "{name}");
+        assert_eq!(document_v2(&a), clean, "{name}: more than the five entries moved");
+    }
+}
+
+/// A format-2 desk the reader must refuse whole: two rows with one id.
+fn refusable(desk: &mut Value) {
+    let first = desk["rows"][0]["id"].clone();
+    desk["rows"][1]["id"] = first;
+}
+
+/// **A refused desk refuses the document's OPEN and touches nothing**, and
+/// a DAW blob keeps it across a save: the blob is the only copy, so the
+/// raw desk rides under `extra["desk_refused"]` while every other setting
+/// is read.
+#[test]
+fn a_refused_desk_refuses_the_open_and_rides_a_daw_blob() {
+    let (_, text) = DOCUMENTS[5];
+    let mut v: Value = serde_json::from_str(&document_v2(&Arrangement::from_json(text))).expect("json");
+    refusable(&mut v["desk"]);
+    let dir = scratch("refused-doc");
+    let doc = dir.join(crate::arrangement::DOC_NAME);
+    let bytes = serde_json::to_string_pretty(&v).expect("json");
+    std::fs::write(&doc, &bytes).expect("doc");
+    assert!(matches!(
+        Arrangement::read_from(&doc),
+        crate::arrangement::LoadOutcome::Refused(why) if why.contains("two rows")
+    ));
+    // A lenient read keeps the raw desk, so even a save cannot lose it.
+    let lenient = Arrangement::load_from(&doc);
+    assert!(lenient.desk.is_none());
+    lenient.save_to_as(&doc, Format::V2);
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&doc).expect("doc")).expect("json");
+    assert_eq!(after["desk"], v["desk"], "a lenient save wrote the refused desk away");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (_, blob) = SETTINGS[10];
+    let mut b: Value = serde_json::from_str(&settings_v2(&Settings::from_json(blob))).expect("json");
+    refusable(&mut b["desk"]);
+    b["theme_name"] = Value::from("Kept Theme");
+    let s = Settings::from_json(&b.to_string());
+    assert_eq!(s.theme_name, "Kept Theme", "a refused desk cost another setting");
+    assert_eq!(s.strip_inserts, Settings::default().strip_inserts, "the desk is not the default desk");
+    assert_eq!(s.extra.get("desk_refused"), Some(&b["desk"]), "the raw desk was not kept");
+    let saved = Settings::from_json(&s.to_json());
+    assert_eq!(saved.extra.get("desk_refused"), Some(&b["desk"]), "a save lost the refused desk");
+}

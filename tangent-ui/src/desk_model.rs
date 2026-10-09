@@ -14,13 +14,13 @@
 //! plugin bay or a route endpoint does so by [`TrackId`] or [`SeatBay`],
 //! which no edit renumbers.
 //!
-//! **Pure and unwired (W2).** Nothing in the app reads or writes this yet.
-//! `desk_format` serialises it; [`DeskModel::from_v22`] and
-//! [`DeskModel::to_v22`] translate to and from the dense 32-wide shape the
-//! live desk still keeps ([`V22Desk`]), so the persistence lane can put a
-//! format-2 file under the live arrays before the arrays go. The adapters
-//! from a `Settings` and a `DeskSnap` are here for the same reason, and W3
-//! owns them from then on.
+//! **Under the live arrays, not yet in place of them (W3).** The settings
+//! file and the document write and read their desk through this model
+//! (`Settings::desk_model`, `DeskSnap::desk_model`, and the inverses
+//! [`V22Desk::into_settings`] and [`V22Desk::into_snap`]), while the live
+//! desk still keeps the dense 32-wide shape ([`V22Desk`]):
+//! [`DeskModel::from_v22`] and [`DeskModel::to_v22`] are the bridge, and a
+//! format-2 file is read onto the dense arrays until W6 retires them.
 //!
 //! **What a row does NOT hold.** Clips and curves live in the arrangement,
 //! keyed by lane, and a kit lives in drumpad.json. Those are the positional
@@ -1532,6 +1532,159 @@ impl V22Desk {
         }
         v.frozen = frozen_dense(d.frozen.as_deref().unwrap_or(&[]));
         v
+    }
+}
+
+impl V22Desk {
+    /// **This dense desk onto a settings' live arrays**: the inverse of
+    /// [`V22Desk::from_settings`], for a format-2 settings file read back
+    /// (W3). Every desk field the settings keep is written, the arm as a
+    /// said mask (`Some`), because a format-2 desk always says.
+    ///
+    /// The freeze is NOT carried: `frozen_lanes` is the document's, never
+    /// the settings file's (see `Settings::frozen_lanes`), so a settings
+    /// desk is written with nothing frozen and read without touching it.
+    pub fn into_settings(self, s: &mut crate::settings::Settings) {
+        let V22Desk {
+            kinds,
+            icons,
+            gains,
+            pans,
+            inputs,
+            midi_inputs,
+            tracks_added,
+            armed,
+            is_folder,
+            in_folder,
+            folder_shut,
+            to_theory,
+            dx7_cartridge,
+            dx7_patch,
+            keys_patch,
+            keys_params,
+            frozen: _,
+            names,
+            colors,
+            sends,
+            muted,
+            soloed,
+            phase,
+            inserts,
+            bypass,
+            routes,
+            keys,
+        } = self;
+        fill(&mut s.channel_kinds, &kinds);
+        fill(&mut s.channel_icons, &icons);
+        fill(&mut s.channel_gains, &gains);
+        fill(&mut s.channel_pans, &pans);
+        s.channel_inputs = inputs;
+        s.channel_midi_inputs = midi_inputs;
+        s.tracks_added = i64::from(tracks_added);
+        s.channel_armed = Some(armed);
+        s.strip_is_folder = is_folder;
+        s.strip_in_folder = in_folder;
+        s.strip_folder_shut = folder_shut;
+        s.strip_to_theory = to_theory;
+        s.strip_dx7_cartridge = dx7_cartridge;
+        s.strip_dx7_patch = dx7_patch;
+        s.strip_keys_patch = keys_patch;
+        s.strip_keys_params = keys_params;
+        s.strip_names = names;
+        fill(&mut s.strip_colors, &colors);
+        fill(&mut s.strip_sends, &sends);
+        s.strip_muted = muted;
+        s.strip_soloed = soloed;
+        s.strip_phase = phase;
+        let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
+        for (bay, path) in inserts {
+            if let Some(slot) = dense.get_mut(bay) {
+                *slot = path;
+            }
+        }
+        s.strip_inserts = dense;
+        s.insert_bypass = crate::settings::BypassBays(bypass.into_iter().collect());
+        s.routes = crate::routing::Routes(routes);
+        s.insert_keys = crate::routing::KeyEdges(keys);
+    }
+
+    /// **This dense desk onto a document snapshot's strip fields**: the
+    /// inverse of [`V22Desk::from_snap`] for a format-2 document read back
+    /// (W3). Every late field comes back `Some`, because a format-2 desk
+    /// says every one: the live desk stands for none of them. The
+    /// snapshot's scalars (levels, tempo, the rack) are the caller's.
+    pub fn into_snap(self, d: &mut crate::arrangement::DeskSnap) {
+        let V22Desk {
+            kinds,
+            icons,
+            gains,
+            pans,
+            inputs,
+            midi_inputs,
+            tracks_added,
+            armed,
+            is_folder,
+            in_folder,
+            folder_shut,
+            to_theory,
+            dx7_cartridge,
+            dx7_patch,
+            keys_patch,
+            keys_params,
+            frozen,
+            names,
+            colors,
+            sends,
+            muted,
+            soloed,
+            phase,
+            inserts,
+            bypass,
+            routes,
+            keys,
+        } = self;
+        d.kinds = kinds;
+        d.icons = icons;
+        d.names = names;
+        d.colors = colors;
+        d.inserts = inserts.into_iter().collect();
+        d.sends = sends;
+        d.muted = muted;
+        d.soloed = soloed;
+        d.gains = gains;
+        d.pans = pans;
+        d.inputs = inputs;
+        d.midi_inputs = midi_inputs;
+        d.tracks_added = tracks_added;
+        d.is_folder = is_folder;
+        d.in_folder = in_folder;
+        d.folder_shut = folder_shut;
+        d.armed = armed;
+        d.phase = Some(phase);
+        d.to_theory = Some(to_theory);
+        d.routes = Some(crate::routing::Routes(routes));
+        d.insert_keys = Some(crate::routing::KeyEdges(keys));
+        d.bypass = Some(crate::settings::BypassBays(bypass.into_iter().collect()));
+        d.instruments = Some(crate::arrangement::Instruments {
+            dx7_cartridge,
+            dx7_patch,
+            keys_patch,
+            keys_params,
+        });
+        // The reader's own rule for a frozen row (`DeskSnap::from_value`):
+        // a freeze with no file is not a freeze.
+        d.frozen = Some(
+            frozen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(lane, f)| {
+                    let f = f?;
+                    (!f.path.is_empty() && f.len_s.is_finite()).then(|| {
+                        crate::arrangement::FrozenLane { lane, path: f.path, len_s: f.len_s.max(0.0) }
+                    })
+                })
+                .collect(),
+        );
     }
 }
 

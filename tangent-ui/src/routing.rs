@@ -282,13 +282,17 @@ impl Routes {
                 }
                 _ => continue,
             };
-            // `add`, not `push`: a hand-edited file with the same route twice
-            // must not produce two faders over one path.
-            out.add(Route {
-                from: from.max(0) as usize,
-                target,
-                gain,
-            });
+            // Not `push`: a hand-edited file with the same route twice must
+            // not produce two faders over one path. **And not `add`
+            // either**, whose cap is for a GESTURE (it refuses a route the
+            // engine would not play, while somebody is there to hear why):
+            // a read that stopped at the cap cut every route past the
+            // sixty-fourth out of the file at the next save, with nobody
+            // told. Every route is read; the cap stays on `add`.
+            let route = Route { from: from.max(0) as usize, target, gain };
+            if !out.0.iter().any(|r| r.from == route.from && r.target == route.target) {
+                out.0.push(route);
+            }
         }
         out
     }

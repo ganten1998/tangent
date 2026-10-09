@@ -47,7 +47,18 @@ pub struct Rgb {
 /// new key is additive and sparse, `channel_inputs` still says everything it
 /// ever said, and a file with no `channel_midi_inputs` derives one from
 /// `channel_inputs` at load whatever its stamp. The bump records the shape.
-const SETTINGS_VERSION: u64 = 22;
+///
+/// **23: the desk is one format-2 `desk` object** (`desk_format`), and the
+/// stamp follows the shape rather than the build: it is 23 only when the
+/// writer really writes format 2, which [`crate::desk_format::WRITE_V8`]
+/// decides. No migration arm, because none is needed: the reader dispatches
+/// on the desk's own `format`, never on this number, so a 23 opens here
+/// whatever it says and a 22 written by this build is the 22 it always was.
+const SETTINGS_VERSION: u64 = if crate::desk_format::WRITE_V8 {
+    crate::desk_format::Format::V2.settings_stamp()
+} else {
+    crate::desk_format::Format::Legacy.settings_stamp()
+};
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -110,6 +121,116 @@ struct LegacyDesk {
 
 /// As many channels as a hand-edited file may claim before we stop reading.
 const LEGACY_MAX_STRIPS: usize = 64;
+
+/// **Every key the legacy writer spells the desk in**: what a format-2 file
+/// carries in its one `desk` object instead. Never written beside a format-2
+/// desk, and consumed unread when one is found beside it (see `from_map`).
+/// `strip_colors` is the v1 spelling of `strip_colors_v2`, read only by the
+/// legacy chain.
+const LEGACY_DESK_KEYS: [&str; 29] = [
+    "channel_armed",
+    "channel_gains",
+    "channel_icons",
+    "channel_inputs",
+    "channel_kinds",
+    "channel_midi_inputs",
+    "channel_pans",
+    "insert_bypass",
+    "insert_keys",
+    "routes",
+    "strip_colors",
+    "strip_colors_v2",
+    "strip_dx7_cartridge",
+    "strip_dx7_patch",
+    "strip_folder_shut",
+    "strip_in_folder",
+    "strip_inserts",
+    "strip_inserts_tail",
+    "strip_is_folder",
+    "strip_keys_params",
+    "strip_keys_params8",
+    "strip_keys_patch",
+    "strip_muted",
+    "strip_names",
+    "strip_phase",
+    "strip_sends",
+    "strip_soloed",
+    "strip_to_theory",
+    "tracks_added",
+];
+
+/// **The legacy settings file, exactly as it was**, written once beside it
+/// before the first format-2 write replaces it (design 6.7): restoring it
+/// hands a release build its desk back whole, because no new build renames
+/// or deletes a legacy plugin-state file either.
+pub const SETTINGS_BACKUP_NAME: &str = "settings.pre-v23.json";
+
+/// **The global shelf's conversion is owed**, and from which shuffles: a
+/// marker in the config dir, written before the first format-2 settings
+/// write unless [`SHELF_DONE_NAME`] stands (design 6.6). It stores the SET a
+/// load raised (`Settings::shelf_shuffles`) rather than the stamp, because
+/// v19, v20 and v24 are raised by the desk's sends length, which the
+/// format-2 file no longer has. The host's `convert_global_shelf` reads it
+/// and removes it after writing [`SHELF_DONE_NAME`].
+pub const SHELF_PENDING_NAME: &str = ".shelf-v23.pending";
+
+/// The global shelf's conversion has run: never write the pending marker
+/// again, so a pstate file deleted later never comes back.
+pub const SHELF_DONE_NAME: &str = ".shelf-v23";
+
+/// Where a format-2 desk the reader refused is kept, beside the settings
+/// file: the first free of this name and `settings.desk-refused-N.json`.
+pub const DESK_REFUSED_NAME: &str = "settings.desk-refused.json";
+
+/// The first name of the `stem.ext`, `stem-2.ext`, ... ladder nothing
+/// stands on yet. `None` after a thousand, which only a folder somebody is
+/// filling on purpose reaches.
+fn first_free_beside(path: &std::path::Path, stem: &str, ext: &str) -> Option<PathBuf> {
+    (1..1_000u32)
+        .map(|n| {
+            if n == 1 {
+                path.with_file_name(format!("{stem}.{ext}"))
+            } else {
+                path.with_file_name(format!("{stem}-{n}.{ext}"))
+            }
+        })
+        .find(|p| !p.exists())
+}
+
+/// **`bytes` at `path`, through a temp file and a rename**, the shape every
+/// file this app owns is written in: a crash leaves the old file or the new
+/// one, never half of either. `false` when it did not land.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
+}
+
+/// **The one line a desk notice says about what the reader dropped**:
+/// how many, and the first few by name. No em dash, it is user copy.
+pub(crate) fn dropped_notice(what: &str, dropped: &[crate::desk_format::Dropped]) -> Option<String> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = dropped.iter().take(5).map(ToString::to_string).collect();
+    let more = dropped.len().saturating_sub(named.len());
+    Some(format!(
+        "{what} named {} that no longer exist{}, so {} left out: {}{}.",
+        if dropped.len() == 1 { "an entry" } else { "entries" },
+        if dropped.len() == 1 { "s" } else { "" },
+        if dropped.len() == 1 { "it was" } else { "they were" },
+        named.join(", "),
+        if more > 0 { format!(" and {more} more") } else { String::new() },
+    ))
+}
 
 /// The desk's shape at settings_version 10, frozen.
 ///
@@ -1842,6 +1963,24 @@ pub struct Settings {
     /// through [`Settings::shelf_shuffles`], and the lift switches on with
     /// that conversion and not before.
     pub desk_state_shift_v24: bool,
+    /// **Which track each desk row is**, in lane order: `track_ids[r]` is
+    /// row r's [`TrackId`](crate::desk_id::TrackId). Identity on any desk
+    /// read from a legacy file (legacy row r is `TrackId(r)` in every era),
+    /// permuted by a reorder, restored by undo, and fresh wherever a row
+    /// becomes a new track. Written only in a format-2 desk; a legacy write
+    /// cannot say it, so a legacy reopen comes back to identity.
+    pub track_ids: Vec<crate::desk_id::TrackId>,
+    /// **The next id to mint**, above every id this desk has held. Only
+    /// rises within a session: a minted id is never handed out twice.
+    pub next_track_id: u64,
+    /// **A format-2 desk this read refused**, kept whole for the caller: the
+    /// file road puts it in `settings.desk-refused.json`, the DAW blob road
+    /// under `extra["desk_refused"]`. Never serialized; taken once.
+    pub desk_refused: Option<crate::desk_format::DeskRefused>,
+    /// **What the desk reader dropped or refused, as one line** for the
+    /// first frame's notice, the `unreadable` bargain: said where somebody
+    /// is looking, not only in a log. Never serialized; taken once.
+    pub desk_notice: Option<String>,
     /// Draw the menu and the dialogs INSIDE the main window, so a screen
     /// reader can reach them.
     ///
@@ -1965,6 +2104,10 @@ impl Default for Settings {
             desk_state_shift_v19: false,
             desk_state_shift_v20: false,
             desk_state_shift_v24: false,
+            track_ids: crate::desk_legacy::identity_ids(crate::recorder::CHANNELS),
+            next_track_id: crate::recorder::CHANNELS as u64,
+            desk_refused: None,
+            desk_notice: None,
             screen_reader_mode: false,
             window_w: None,
             window_h: None,
@@ -2653,7 +2796,10 @@ impl Settings {
         // than not — but their arrangement is gone either way at this point,
         // and a usable app beats a half-empty one.
         let mut s = match Self::load_report(&path) {
-            Ok(s) => s,
+            Ok(mut s) => {
+                s.keep_refused_desk(&path);
+                s
+            }
             Err(why) => {
                 let aside = path.with_extension("json.unreadable");
                 // **Said, in both places.** The log line is for the report
@@ -2811,7 +2957,17 @@ impl Settings {
     /// opens it looking wrong.
     pub fn from_json(text: &str) -> Self {
         match parse_object(text) {
-            Ok(map) => Self::from_map(map),
+            Ok(map) => {
+                let mut s = Self::from_map(map);
+                // **A refused desk rides the blob** (design 6.3): the DAW
+                // session is the only copy, so it is kept under a stranger's
+                // key, which every later save writes back untouched, rather
+                // than in a side file no project would carry.
+                if let Some(refused) = s.desk_refused.take() {
+                    s.extra.insert("desk_refused".into(), refused.raw);
+                }
+                s
+            }
             Err(_) => Self::default(),
         }
     }
@@ -2840,6 +2996,22 @@ impl Settings {
             .shift_remove("settings_version")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        // **A format-2 desk is dispatched on its SHAPE, never on the stamp**
+        // (`desk_format::is_format2`), and every legacy desk key beside it is
+        // consumed unread: a format-2 file never writes one, so one found
+        // here is a stranger's or a hand-edit's, and reading it would run
+        // the era lifts (and raise their shelf shuffles) over a desk that
+        // has none. The legacy chain below then sees no desk at all and
+        // leaves the default standing; `adopt_format2_desk` replaces it.
+        let desk2 = match map.get("desk") {
+            Some(d) if crate::desk_format::is_format2(d) => map.shift_remove("desk"),
+            _ => None,
+        };
+        if desk2.is_some() {
+            for key in LEGACY_DESK_KEYS {
+                let _ = map.shift_remove(key);
+            }
+        }
 
         let take_bool = |map: &mut Map<String, Value>, key: &str, dst: &mut bool| {
             if let Some(v) = map.shift_remove(key) {
@@ -3831,6 +4003,11 @@ impl Settings {
         // the file had; from here on the desk is this build's shape. See
         // `LegacyDesk`.
         s.adopt_desk(desk);
+        if let Some(raw) = desk2 {
+            s.adopt_format2_desk(raw);
+            // The rows said their badges; deriving would paint over them.
+            derive_icons = false;
+        }
         if derive_icons {
             // Now the desk is the FILE's, migrations included — the badge
             // lands on the channel that really holds the drumpad.
@@ -3968,6 +4145,102 @@ impl Settings {
             self.strip_names = names;
             self.strip_names.truncate(crate::recorder::STRIPS + 1);
         }
+    }
+
+    /// **The desk's row ids, sane**: `track_ids` when it is one distinct id
+    /// per live channel, else identity. A desk of any other shape can only
+    /// be a struct built by hand (a test, a reset half done), and the
+    /// identity rule is the one every legacy desk already obeys.
+    pub fn desk_ids(&self) -> Vec<crate::desk_id::TrackId> {
+        let ids = &self.track_ids;
+        let distinct = ids.iter().collect::<std::collections::BTreeSet<_>>().len() == ids.len();
+        if ids.len() == crate::recorder::CHANNELS && distinct {
+            ids.clone()
+        } else {
+            crate::desk_legacy::identity_ids(crate::recorder::CHANNELS)
+        }
+    }
+
+    /// **This settings desk as the format-2 model**: the dense arrays by
+    /// row id, `next_id` at least `next_track_id`. Nothing frozen, because a
+    /// freeze is the document's and the settings file never carried one.
+    pub fn desk_model(&self) -> crate::desk_format::DeskRead {
+        let mut v = crate::desk_model::V22Desk::from_settings(self);
+        v.frozen = vec![None; crate::desk_lift::V32_CHANNELS];
+        let mut read = crate::desk_model::DeskModel::from_v22(&v, &self.desk_ids());
+        read.model.next_id = read.model.next_id.max(self.next_track_id);
+        read
+    }
+
+    /// **A format-2 `desk` object onto this settings' live desk**, under the
+    /// error policy of design 6.3: dropped entries are listed in
+    /// `desk_notice` and everything else reads; a refused desk leaves the
+    /// default desk standing and is kept whole in `desk_refused` for the
+    /// caller to put somewhere (`keep_refused_desk`, or `from_json`'s
+    /// `extra`). Never `unreadable`: one bad desk costs the desk, not the
+    /// colours, the devices and the window somebody also chose.
+    fn adopt_format2_desk(&mut self, raw: Value) {
+        use crate::desk_format::{DeskRefused, Structural};
+        let read = match crate::desk_format::read(&raw) {
+            Ok(read) => read,
+            Err(refused) => {
+                self.desk_refused = Some(refused);
+                return;
+            }
+        };
+        // **The live desk is still 32 wide** (W6 removes the width), so a
+        // desk past it cannot be put on it without hiding rows, and hiding
+        // a track is the one thing a read may never do. It is refused like
+        // a structural fault: kept whole, the default desk standing.
+        let Some((dense, mut ids)) = read.model.to_v22() else {
+            self.desk_refused = Some(DeskRefused {
+                why: Structural::BadShape("more rows than this build's desk holds"),
+                raw,
+            });
+            return;
+        };
+        // A short desk is the live desk's first rows; the rest are vacant
+        // rows the file never named, given ids nothing has held.
+        let mut next = read.model.next_id;
+        while ids.len() < crate::recorder::CHANNELS {
+            ids.push(crate::desk_id::TrackId(u32::try_from(next).unwrap_or(u32::MAX)));
+            next += 1;
+        }
+        dense.into_settings(self);
+        self.track_ids = ids;
+        self.next_track_id = next;
+        self.desk_notice = dropped_notice("The desk in your settings", &read.dropped);
+    }
+
+    /// **A refused desk, kept beside the settings file** as
+    /// `settings.desk-refused.json` (the first free `-N`), with a notice
+    /// saying where. The file road's half of `adopt_format2_desk`; the next
+    /// save then writes the default desk, and the refused one is still on
+    /// disk for somebody to bring back by hand.
+    fn keep_refused_desk(&mut self, path: &std::path::Path) {
+        let Some(refused) = self.desk_refused.take() else {
+            return;
+        };
+        let stem = DESK_REFUSED_NAME.trim_end_matches(".json");
+        let kept = first_free_beside(path, stem, "json").filter(|side| {
+            serde_json::to_string_pretty(&refused.raw)
+                .is_ok_and(|text| write_atomic(side, text.as_bytes()))
+        });
+        log::warn!("settings: the desk could not be read ({})", refused.why);
+        self.desk_notice = Some(match kept {
+            Some(side) => format!(
+                "The desk in your settings could not be read ({}). It was kept as {} \
+                 and a fresh desk opened; every other setting is as you left it.",
+                refused.why,
+                side.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            None => format!(
+                "The desk in your settings could not be read ({}), and it could not be \
+                 kept beside them either. A fresh desk opened; every other setting is \
+                 as you left it.",
+                refused.why
+            ),
+        });
     }
 
     /// **Which in-place global-shelf renames this load raised**, as the set
@@ -4262,6 +4535,47 @@ impl Settings {
     }
 
     fn to_map(&self) -> Map<String, Value> {
+        self.to_map_as(crate::desk_format::Format::current())
+    }
+
+    /// **The file's map in `format`.** Format 2 is today's map with every
+    /// legacy desk key taken out and ONE `desk` object standing where the
+    /// first of them stood, and the stamp that says so: the scalars, the
+    /// strangers in `extra` and their order are the legacy writer's own, so
+    /// the two shapes differ in the desk and nowhere else.
+    pub(crate) fn to_map_as(&self, format: crate::desk_format::Format) -> Map<String, Value> {
+        let legacy = self.to_map_legacy();
+        if format == crate::desk_format::Format::Legacy {
+            return legacy;
+        }
+        let mut desk = Some(crate::desk_format::write(&self.desk_model().model));
+        let mut out = Map::new();
+        for (k, v) in legacy {
+            if LEGACY_DESK_KEYS.contains(&k.as_str()) {
+                if let Some(d) = desk.take() {
+                    out.insert("desk".into(), d);
+                }
+                continue;
+            }
+            match k.as_str() {
+                // A stranger's key of the same name gives way: this file's
+                // `desk` is the one format 2 means.
+                "desk" => {}
+                "settings_version" => {
+                    out.insert(k, Value::from(format.settings_stamp()));
+                }
+                _ => {
+                    out.insert(k, v);
+                }
+            }
+        }
+        if let Some(d) = desk {
+            out.insert("desk".into(), d);
+        }
+        out
+    }
+
+    fn to_map_legacy(&self) -> Map<String, Value> {
         // Python writes its dict in insertion order; replicate that key order,
         // then the additive key, then any preserved unknown keys.
         let mut map = Map::new();
@@ -5060,11 +5374,20 @@ impl Settings {
     }
 
     fn save_to(&self, path: &std::path::Path) {
+        self.save_to_as(path, crate::desk_format::Format::current());
+    }
+
+    /// `save_to` in `format`: the road a test takes to a format-2 file
+    /// without flipping [`crate::desk_format::WRITE_V8`].
+    pub(crate) fn save_to_as(&self, path: &std::path::Path, format: crate::desk_format::Format) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        if format == crate::desk_format::Format::V2 {
+            self.before_first_format2(path);
+        }
         // serde_json pretty-printing indents with 2 spaces, like Python's indent=2.
-        if let Ok(text) = serde_json::to_string_pretty(&Value::Object(self.to_map())) {
+        if let Ok(text) = serde_json::to_string_pretty(&Value::Object(self.to_map_as(format))) {
             // Write-then-rename, the same shape `OverrideStore::save` already
             // uses. A bare `fs::write` truncates first, so a crash or a full
             // disk mid-write leaves a half-written file — and `load_from`
@@ -5088,6 +5411,63 @@ impl Settings {
             } else {
                 let _ = std::fs::remove_file(&tmp);
             }
+        }
+    }
+
+    /// **What has to be on disk before the first format-2 write over
+    /// `path`** (design 6.6 and 6.7), each written once and before the
+    /// settings file changes, so a crash at any point leaves both behind:
+    ///
+    /// * `settings.pre-v23.json`, the legacy file byte for byte;
+    /// * `.shelf-v23.pending`, naming the shuffle set the legacy global
+    ///   shelf needs, unless the conversion already ran (`.shelf-v23`) or a
+    ///   marker already stands (the first one wrote the true set: a later
+    ///   load of the format-2 file raises none).
+    ///
+    /// A format-2 file on disk owes neither: its first write was earlier.
+    /// The Minimal build, which never converts a shelf, still writes the
+    /// marker, so the next full build converts with the right set.
+    fn before_first_format2(&self, path: &std::path::Path) {
+        let on_disk = std::fs::read(path).ok();
+        let parsed = on_disk
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        if parsed
+            .as_ref()
+            .and_then(|v| v.get("desk"))
+            .is_some_and(crate::desk_format::is_format2)
+        {
+            return;
+        }
+        if let Some(bytes) = on_disk.as_deref() {
+            let backup = path.with_file_name(SETTINGS_BACKUP_NAME);
+            if !backup.exists() {
+                write_atomic(&backup, bytes);
+            }
+        }
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        if dir.join(SHELF_DONE_NAME).exists() || dir.join(SHELF_PENDING_NAME).exists() {
+            return;
+        }
+        let was = parsed
+            .as_ref()
+            .and_then(|v| v.get("settings_version"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut marker = Map::new();
+        marker.insert("settings_version".into(), Value::from(was));
+        marker.insert(
+            "shuffles".into(),
+            Value::Array(
+                self.shelf_shuffles()
+                    .names()
+                    .into_iter()
+                    .map(|n| Value::String(n.to_owned()))
+                    .collect(),
+            ),
+        );
+        if let Ok(text) = serde_json::to_string_pretty(&Value::Object(marker)) {
+            write_atomic(&dir.join(SHELF_PENDING_NAME), text.as_bytes());
         }
     }
 
@@ -5355,6 +5735,12 @@ impl Settings {
         self.strip_sends = fresh.strip_sends;
         self.strip_muted = fresh.strip_muted;
         self.strip_soloed = fresh.strip_soloed;
+        // **The rows' ids go back with the rows**: a fresh desk is the
+        // identity desk a fresh install has. The counter does not go back,
+        // because it only rises: an id this session already handed out is
+        // never handed out again, whatever the rows now are.
+        self.track_ids = fresh.track_ids.clone();
+        self.next_track_id = self.next_track_id.max(fresh.next_track_id);
         // **Which channels EXIST**, and its absence here is why "Reset
         // Everything" left a channel standing.
         //
@@ -8914,5 +9300,161 @@ mod perf_probe {
             "the owner's desk did not round trip"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **Format 2 on the settings file's own road** (W3-persist-v23-v8): the
+/// backups and the shelf marker that must exist before the first format-2
+/// write, and the refused desk kept beside the file. Every path is a temp
+/// folder of the test's own; the format-2 writer is reached through
+/// `save_to_as`, never by flipping `WRITE_V8`.
+#[cfg(test)]
+mod format2_tests {
+    use super::*;
+    use crate::desk_format::Format;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-w3-settings-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    fn fixture(name: &str) -> &'static str {
+        crate::era_corpus::SETTINGS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, t)| *t)
+            .expect("fixture")
+    }
+
+    /// **The backup and the shelf marker land before the settings file
+    /// changes**: with the settings write made to fail (its temp name is a
+    /// folder), the file is untouched and both already stand, the marker
+    /// naming the shuffle set the legacy load raised. The next write lands
+    /// format 2 and leaves both alone.
+    #[test]
+    fn the_backup_and_the_pending_marker_come_before_the_first_format_2_write() {
+        let dir = scratch("pending");
+        let path = dir.join("settings.json");
+        let text = fixture("settings-v19.json");
+        std::fs::write(&path, text).expect("fixture");
+        let s = Settings::load_report(&path).expect("reads");
+        let want: Vec<&str> = s.shelf_shuffles().names();
+        assert!(!want.is_empty(), "the fixture raises no shuffle; pick one that does");
+        std::fs::create_dir_all(path.with_extension("json.tmp")).expect("a blocking folder");
+        s.save_to_as(&path, Format::V2);
+        assert_eq!(std::fs::read_to_string(&path).expect("file"), text, "the settings changed first");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(SETTINGS_BACKUP_NAME)).expect("backup"),
+            text,
+            "the backup is not the legacy file"
+        );
+        let marker: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(SHELF_PENDING_NAME)).expect("marker"))
+                .expect("json");
+        assert_eq!(marker["shuffles"], serde_json::json!(want), "the marker names another set");
+        assert_eq!(marker["settings_version"], 19);
+
+        std::fs::remove_dir_all(path.with_extension("json.tmp")).expect("unblock");
+        s.save_to_as(&path, Format::V2);
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("file")).expect("json");
+        assert!(crate::desk_format::is_format2(&on_disk["desk"]), "the write did not land");
+        // A second format-2 write makes no backup and no marker: the
+        // conversion's source set is the FIRST load's, and a load of the
+        // format-2 file raises none.
+        std::fs::write(dir.join(SETTINGS_BACKUP_NAME), "kept").expect("sentinel");
+        std::fs::write(dir.join(SHELF_PENDING_NAME), "kept").expect("sentinel");
+        let again = Settings::load_report(&path).expect("reads");
+        assert!(again.shelf_shuffles().is_empty(), "a format-2 file raised a shuffle");
+        again.save_to_as(&path, Format::V2);
+        assert_eq!(std::fs::read_to_string(dir.join(SETTINGS_BACKUP_NAME)).expect("b"), "kept");
+        assert_eq!(std::fs::read_to_string(dir.join(SHELF_PENDING_NAME)).expect("m"), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **No marker once the conversion has run**, and none from a legacy
+    /// write: a pstate file deleted after the conversion must never come
+    /// back, and the legacy writer has no format-2 side effect at all.
+    #[test]
+    fn the_marker_is_written_only_before_a_conversion_and_only_by_format_2() {
+        let dir = scratch("done");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, fixture("settings-v19.json")).expect("fixture");
+        let s = Settings::load_report(&path).expect("reads");
+        s.save_to_as(&path, Format::Legacy);
+        assert!(!dir.join(SHELF_PENDING_NAME).exists() && !dir.join(SETTINGS_BACKUP_NAME).exists());
+        std::fs::write(dir.join(SHELF_DONE_NAME), "").expect("done");
+        s.save_to_as(&path, Format::V2);
+        assert!(!dir.join(SHELF_PENDING_NAME).exists(), "a marker after the conversion ran");
+        assert!(dir.join(SETTINGS_BACKUP_NAME).exists(), "the backup is not the conversion's");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A refused desk costs the desk and nothing else** on the file road:
+    /// every other setting is kept, the default desk stands, the raw desk
+    /// is kept as `settings.desk-refused.json` (the next free name when one
+    /// already stands), a notice says so, and the file is never set aside
+    /// as unreadable.
+    #[test]
+    fn a_refused_settings_desk_keeps_every_other_setting() {
+        let dir = scratch("refused");
+        let path = dir.join("settings.json");
+        let s = Settings::from_json(fixture("settings-v22.json"));
+        let mut v = Value::Object(s.to_map_as(Format::V2));
+        let first = v["desk"]["rows"][0]["id"].clone();
+        v["desk"]["rows"][1]["id"] = first;
+        v["theme_name"] = Value::from("Kept Theme");
+        v["dark_mode"] = Value::from(true);
+        std::fs::write(&path, serde_json::to_string_pretty(&v).expect("json")).expect("file");
+        std::fs::write(dir.join(DESK_REFUSED_NAME), "an earlier one").expect("taken");
+        let mut read = Settings::load_report(&path).expect("the file reads");
+        read.keep_refused_desk(&path);
+        assert!(read.unreadable.is_none(), "a refused desk cost the file");
+        assert_eq!(read.theme_name, "Kept Theme");
+        assert!(read.dark_mode);
+        let fresh = Settings::default();
+        assert_eq!(read.strip_inserts, fresh.strip_inserts, "the desk is not the default desk");
+        assert_eq!(read.channel_kinds, fresh.channel_kinds);
+        let side = dir.join("settings.desk-refused-2.json");
+        let kept: Value = serde_json::from_str(&std::fs::read_to_string(&side).expect("side file")).expect("json");
+        assert_eq!(kept, v["desk"], "the side file is not the refused desk");
+        assert_eq!(std::fs::read_to_string(dir.join(DESK_REFUSED_NAME)).expect("old"), "an earlier one");
+        let notice = read.desk_notice.expect("no notice");
+        assert!(notice.contains("settings.desk-refused-2.json") && !notice.contains('\u{2014}'), "{notice}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The rows' ids ride a format-2 settings file**: a permuted, minted
+    /// desk reads back with every id on its row and the counter kept. A
+    /// legacy file cannot say them, so it reads back as the identity desk.
+    #[test]
+    fn track_ids_ride_a_format_2_settings_file() {
+        let mut s = Settings::default();
+        s.track_ids.swap(0, 3);
+        s.track_ids[5] = crate::desk_id::TrackId(40);
+        s.next_track_id = 41;
+        let back = Settings::from_json(&Value::Object(s.to_map_as(Format::V2)).to_string());
+        assert_eq!(back.track_ids, s.track_ids);
+        assert_eq!(back.next_track_id, 41);
+        let legacy = Settings::from_json(&Value::Object(s.to_map_as(Format::Legacy)).to_string());
+        assert_eq!(legacy.track_ids, crate::desk_legacy::identity_ids(crate::recorder::CHANNELS));
+    }
+
+    /// **Sixty-five routes read as sixty-five.** The read stopped at the
+    /// gesture's cap and the next save cut the rest out of the file.
+    #[test]
+    fn every_route_in_a_file_is_read() {
+        let routes: Vec<Value> = (0..65)
+            .map(|i| serde_json::json!({"from": i % 32, "kind": "hardware", "first": i, "stereo": false, "gain": 1.0}))
+            .collect();
+        let s = Settings::from_json(&serde_json::json!({"routes": routes}).to_string());
+        assert_eq!(s.routes.0.len(), 65);
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.routes.0.len(), 65, "a save cut the routes past the cap");
     }
 }
