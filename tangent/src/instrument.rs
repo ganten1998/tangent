@@ -13342,8 +13342,21 @@ impl Renderer {
 
     fn publish_latency(&self) {
         let mut max = 0;
-        for walk_at in 0..self.spine.ext.order.len() {
-            let lane = self.spine.ext.order[walk_at] as usize;
+        // **Every lane that can play**: the plan's, when one drives, and
+        // otherwise every lane installed, which is the legacy desk's thirty-
+        // two. Not the chunk's walk order, which is a rank question; this is
+        // one about who is on the desk, and it is asked from tests and from
+        // the head of the chunk alike.
+        let plan_drives = self.plan_drives();
+        for lane in 0..self.spine.capacity() {
+            let on_desk = if plan_drives {
+                self.plan.rank_of(Slot(lane as u32)).is_some()
+            } else {
+                self.spine.lanes.get(lane).is_some_and(Option::is_some)
+            };
+            if !on_desk {
+                continue;
+            }
             // `lane`, emphatically not `STRIPS`. Asking every channel for
             // the MASTER's figure reads plausibly and is wrong twice over:
             // the readout says each of the sixteen costs what the master
@@ -20791,7 +20804,12 @@ impl Engine {
             if bay >= INSERTS || src >= max_src || src as u64 > u64::from(KEY_SOURCE) {
                 continue;
             }
-            if let Some(cell) = self.shared.seat_cell(SeatKind::Key, seat * INSERTS + bay) {
+            // Checked: a seat past every seat is refused by the cell, and a
+            // seat past `usize::MAX / INSERTS` must not overflow on the way.
+            let Some(flat) = seat.checked_mul(INSERTS).and_then(|f| f.checked_add(bay)) else {
+                continue;
+            };
+            if let Some(cell) = self.shared.seat_cell(SeatKind::Key, flat) {
                 cell.store(pack_key(src), Ordering::Relaxed);
                 n += 1;
             }
