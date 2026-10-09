@@ -2964,6 +2964,12 @@ impl Settings {
                 // key, which every later save writes back untouched, rather
                 // than in a side file no project would carry.
                 if let Some(refused) = s.desk_refused.take() {
+                    s.desk_notice = Some(format!(
+                        "The desk saved with this project could not be read ({}). It is kept \
+                         in the project as it was, and a fresh desk opened; every other \
+                         setting is as you left it.",
+                        refused.why
+                    ));
                     s.extra.insert("desk_refused".into(), refused.raw);
                 }
                 s

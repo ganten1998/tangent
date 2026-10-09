@@ -1255,6 +1255,67 @@ fn a_refused_desk_refuses_the_open_and_rides_a_daw_blob() {
     assert_eq!(s.theme_name, "Kept Theme", "a refused desk cost another setting");
     assert_eq!(s.strip_inserts, Settings::default().strip_inserts, "the desk is not the default desk");
     assert_eq!(s.extra.get("desk_refused"), Some(&b["desk"]), "the raw desk was not kept");
+    assert!(s.desk_notice.as_deref().is_some_and(|n| n.contains("could not be read")), "the refusal was not said");
     let saved = Settings::from_json(&s.to_json());
     assert_eq!(saved.extra.get("desk_refused"), Some(&b["desk"]), "a save lost the refused desk");
+}
+
+/// **What the format-2 writers write for every era fixture**, pinned: the
+/// hash and the length of the v23 settings file or DAW blob and of the v8
+/// document this build makes of each, so the format-2 shape cannot drift
+/// under a writer that stays its own fixed point. Pinned as hashes rather
+/// than committed files: each is some seventy kilobytes, nearly all of it
+/// the Keys rack's knobs, and `write_format_2_fixtures` writes them out for
+/// reading. Re-pin only with a deliberate change to the format.
+const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
+    ("settings-v12.json", 0x432f_d744_1b83_4a7d, 69415),
+    ("settings-v17-pads16.json", 0x9acb_8826_ea59_4245, 69631),
+    ("settings-v18.json", 0x41cb_5151_6266_38a2, 69632),
+    ("settings-v19.json", 0x0ff0_f786_81db_ebac, 70932),
+    ("settings-v20-27.json", 0xbee3_aa56_2a6b_446b, 72152),
+    ("settings-v20.json", 0x6c84_131e_295a_79e2, 73277),
+    ("settings-v21.json", 0xd14a_bb30_2ea1_663b, 72084),
+    ("settings-v22.json", 0x3c53_5ed0_cffe_362f, 72119),
+    ("daw-3x.json", 0x32cb_378d_3f9e_5d6e, 68924),
+    ("daw-4x.json", 0x5cb2_3bc0_7ea0_417e, 69320),
+    ("daw-5x.json", 0x221a_f6cd_f561_e43c, 70257),
+    ("doc-v4-11.json", 0x75fe_6a61_d6f4_4f52, 66404),
+    ("doc-v5-18.json", 0xe83f_2527_0597_ca23, 67366),
+    ("doc-v5-19.json", 0x24c8_a60c_df96_8da8, 67363),
+    ("doc-v6-27.json", 0xba6f_3803_9396_0a03, 68492),
+    ("doc-v6-35.json", 0xb19e_49b7_f61b_6f5e, 69099),
+    ("doc-v7.json", 0x70ed_b76d_6ec3_0318, 69323),
+];
+
+/// The format-2 bytes this build writes for every legacy fixture, by name.
+fn written_v2() -> impl Iterator<Item = (&'static str, String)> {
+    SETTINGS
+        .iter()
+        .map(|(n, t)| (*n, settings_v2(&Settings::from_json(t))))
+        .chain(DOCUMENTS.iter().map(|(n, t)| (*n, document_v2(&Arrangement::from_json(t)))))
+}
+
+/// **The v23 and v8 expectations**: every era fixture's format-2 bytes are
+/// the pinned ones.
+#[test]
+fn every_fixture_writes_its_pinned_format_2_bytes() {
+    for ((name, text), (want_name, hash, len)) in written_v2().zip(FORMAT2_BYTES) {
+        assert_eq!(name, want_name, "the tables are out of step");
+        assert_eq!((fnv(&text), text.len()), (hash, len), "{name}: the format-2 bytes drifted");
+    }
+}
+
+/// Writes every fixture's format-2 file into `$TANGENT_ERA_V2_DUMP`, for
+/// reading, or for re-pinning after a deliberate change to the format.
+#[test]
+#[ignore = "writes files; run by hand with TANGENT_ERA_V2_DUMP set"]
+fn write_format_2_fixtures() {
+    let Some(dir) = std::env::var_os("TANGENT_ERA_V2_DUMP") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("dump dir");
+    for (name, text) in written_v2() {
+        std::fs::write(dir.join(name), text).expect("write");
+    }
 }
