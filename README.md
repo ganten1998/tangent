@@ -100,6 +100,11 @@ including the Linux aarch64 tarball and checksums, are on the
 - **Stream to OBS.** A native ReaStream-compatible sender pushes the master
   over localhost UDP to the ReaStream plugin in OBS, so a lesson or a
   performance can go live without an extra audio driver.
+- **Send to Device.** The master can also play out of a second output, such
+  as a virtual cable (VB-Audio CABLE Input, BlackHole, Loopback), for OBS or
+  Discord to record as an input. On Windows it opens the cable through
+  WASAPI even while the interface plays through ASIO, and it keeps the two
+  devices' clocks in step on its own.
 - **Chord detection, 95 chord patterns against all 12 roots.** Triads,
   sevenths, extensions, altered dominants, add and sus chords, 6 and 6/9,
   inversions, slash chords, and rootless voicings, plus **28 scales and
