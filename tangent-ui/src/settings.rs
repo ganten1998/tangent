@@ -435,19 +435,40 @@ fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
 fn move_legacy_pad_racks(inserts: &mut Vec<String>) {
     use crate::desk_lift::{v32_pad_seat, PADS, V32_BAYS, V32_CHANNELS, V32_INSERT_SPACE, V32_PAD_BLOCK};
     // Which channel carries the drumpad, by the same sentinel the engine
-    // reads. Channel 0 already owns the legacy block; nothing to do.
-    let Some(ch) = (1..V32_CHANNELS).find(|c| {
+    // reads, and the LOWEST one, channel 0 included: the question
+    // `load_drumpad_doc_beside` asks to place a pre-lanes kit, so the pad
+    // plugins and the kit they belong to land on the same lane.
+    //
+    // **Channel 0 already owns the legacy block; nothing to do.** The search
+    // used to start at 1, so a desk with drumpads on channels 0 and 3 (a
+    // lanes-era session with two kits) read channel 0's own pad FX as the
+    // pre-lanes block and moved them over channel 3's on every load: both
+    // kits' per-pad plugins gone, the next save making it permanent.
+    let Some(ch) = (0..V32_CHANNELS).find(|c| {
         inserts
             .get(c * V32_BAYS)
             .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
     }) else {
         return;
     };
+    if ch == 0 {
+        return;
+    }
     let legacy = V32_PAD_BLOCK * V32_BAYS;
     let span = PADS * V32_BAYS;
     if inserts.len() < legacy + span
         || inserts[legacy..legacy + span].iter().all(String::is_empty)
     {
+        return;
+    }
+    // **A destination that already holds pad FX is not a pre-lanes file.**
+    // Per-lane pad blocks arrived with the lanes, so a pre-lanes desk has
+    // nothing past the master's extra rack; one that does was written by a
+    // build where the block at 36 was channel 0's own (pad FX left behind
+    // when its drumpad was swapped out), and moving it would write over the
+    // drum lane's real ones.
+    let to = v32_pad_seat(ch, 0) * V32_BAYS;
+    if inserts.get(to..to + span).is_some_and(|d| d.iter().any(|p| !p.is_empty())) {
         return;
     }
     // The destination has to exist before anything is written into it.
@@ -1813,10 +1834,13 @@ pub struct Settings {
     /// (and, after v19, on an eight-channel one), never serialized.
     pub desk_state_shift_v20: bool,
     /// **The 24-channel window grew to 32**: every seat from 24 up stepped
-    /// up 8. Set by `adopt_desk` on a 27-sends desk, never serialized.
+    /// up 8. Set by `adopt_desk` on a 27-sends desk it LIFTED, never
+    /// serialized, and so never set while `desk_lift::V24_LIFT` is off (the
+    /// window then opens unlifted, each plugin beside its own sidecar).
     /// The host has no in-place rename for it and never will (a new build
     /// renames no legacy sidecar); the copy-only shelf conversion reads it
-    /// through [`Settings::shelf_shuffles`].
+    /// through [`Settings::shelf_shuffles`], and the lift switches on with
+    /// that conversion and not before.
     pub desk_state_shift_v24: bool,
     /// Draw the menu and the dialogs INSIDE the main window, so a screen
     /// reader can reach them.
@@ -3878,6 +3902,9 @@ impl Settings {
                 self.desk_state_shift_v20 = true;
             }
             DeskEra::V16 => self.desk_state_shift_v20 = true,
+            // Reached only once `desk_lift::V24_LIFT` is on: until the
+            // copy-only shelf can honour it, `era_of` reads the window as
+            // V32 and nothing here moves.
             DeskEra::V24 => self.desk_state_shift_v24 = true,
             DeskEra::V16NoDrumBus | DeskEra::V32 => {}
         }
@@ -7484,6 +7511,63 @@ mod tests {
         move_legacy_pad_racks(&mut plain.strip_inserts);
         assert_eq!(plain.strip_inserts, before, "an empty pad block was rewritten");
         let _ = DRUM_PADS;
+    }
+
+    /// **A desk with more than one drum lane keeps every lane's pad FX.**
+    /// The drumpad search skipped channel 0, so drumpads on channels 0 and 7
+    /// read channel 0's own pad block (seats 36..163) as the pre-lanes one
+    /// and moved it over channel 7's on every load: channel 7's per-pad
+    /// plugins overwritten, channel 0's emptied. And a drum lane whose own
+    /// block is already furnished is no pre-lanes file either, whatever sits
+    /// at 36. Each of the three is red at the base and at the lane's first
+    /// commit. At the V32 literals, like the function.
+    #[test]
+    fn a_second_drum_lane_never_takes_channel_zeros_pad_fx() {
+        use crate::desk_lift::{v32_pad_seat, V32_BAYS, V32_INSERT_SPACE};
+        let drums = crate::dialogs::DRUMPAD_PATH;
+        let bay = |seat: usize, b: usize| seat * V32_BAYS + b;
+        let desk = |lanes: &[usize]| {
+            let mut d = vec![String::new(); V32_INSERT_SPACE];
+            for ch in lanes {
+                d[ch * V32_BAYS] = drums.to_owned();
+            }
+            d
+        };
+
+        // Channels 0 and 7 both carry a kit, each with its own pad FX.
+        let mut both = desk(&[0, 7]);
+        both[bay(v32_pad_seat(0, 0), 0)] = "/x/A.vst3".to_owned();
+        both[bay(v32_pad_seat(0, 36), 2)] = "/x/A36.vst3".to_owned();
+        both[bay(v32_pad_seat(7, 0), 0)] = "/x/B.vst3".to_owned();
+        let before = both.clone();
+        move_legacy_pad_racks(&mut both);
+        move_legacy_pad_racks(&mut both);
+        assert_eq!(both, before, "a drum lane's pad FX moved onto another's");
+
+        // Channel 0 alone, with nothing on 7's block to lose: still the
+        // identity (channel 0's block is channel 0's).
+        let mut zero_and_three = desk(&[0, 3]);
+        zero_and_three[bay(v32_pad_seat(0, 5), 1)] = "/x/A5.vst3".to_owned();
+        let before = zero_and_three.clone();
+        move_legacy_pad_racks(&mut zero_and_three);
+        assert_eq!(zero_and_three, before, "channel 0's pad FX left for channel 3");
+
+        // Drumpads on 3 and 5 only, channel 0's block holding residue and
+        // channel 3's block its own FX: nothing written over channel 3's.
+        let mut furnished = desk(&[3, 5]);
+        furnished[bay(v32_pad_seat(0, 0), 0)] = "/x/residue.vst3".to_owned();
+        furnished[bay(v32_pad_seat(3, 0), 0)] = "/x/C.vst3".to_owned();
+        let before = furnished.clone();
+        move_legacy_pad_racks(&mut furnished);
+        assert_eq!(furnished, before, "a furnished drum lane's pad FX were overwritten");
+
+        // And the pre-lanes case still moves: one drumpad, on 7, the block
+        // at 36 full and 7's own empty.
+        let mut pre_lanes = desk(&[7]);
+        pre_lanes[bay(v32_pad_seat(0, 36), 0)] = "/x/Kick.vst3".to_owned();
+        move_legacy_pad_racks(&mut pre_lanes);
+        assert_eq!(pre_lanes[bay(v32_pad_seat(7, 36), 0)], "/x/Kick.vst3");
+        assert!(pre_lanes[bay(v32_pad_seat(0, 36), 0)].is_empty());
     }
 
     /// The click's sound is a PATH in the settings file, and the file is the
