@@ -14,9 +14,9 @@
 //!
 //! * The prose surfaces whole: `README.md`, `docs/STORE-CONTENT.md` (the
 //!   store description and the post-purchase page are pasted from it), the
-//!   new release's `GUMROAD.md`, and the `[Unreleased]` section of
-//!   `CHANGELOG.md`. Older Gumroad pages and released changelog sections are
-//!   history and say what was true then.
+//!   newest release's `GUMROAD.md` (in `next/` until the cut renames it), and
+//!   the `[Unreleased]` section of `CHANGELOG.md`. Older Gumroad pages and
+//!   released changelog sections are history and say what was true then.
 //! * The Rust surfaces by their STRING LITERALS outside test code:
 //!   `tangent-ui/src` and `tools/tangent-fulfil/src` (the key email). A
 //!   comment is free to quote the stale line as the reason it was changed,
@@ -29,7 +29,13 @@
 //! * "nothing else" or "nothing more" in a sentence that names the key;
 //! * "stays free" in a sentence that does not name the track limit;
 //! * "Thirty-two channels", "Thirty-two tracks", "-channel mixer" and
-//!   "{}-channel": the desk described by a width, for everybody.
+//!   "{}-channel": the desk described by a width, for everybody;
+//! * on a surface that says buses have no limit, a sentence calling folders
+//!   buses that does not say they count. The README and the store page call a
+//!   folder a real bus (it sums its children and runs a rack over the sum),
+//!   and the free desk's limit counts folders, so "buses ... have no limit
+//!   for anyone" beside "folders are real buses" promises a free user the
+//!   folder past the limit, which the gate then refuses.
 //!
 //! This file is the one place the refused phrases may appear as literals, so
 //! it is the one file the scan skips.
@@ -83,7 +89,49 @@ fn stale(text: &str) -> Vec<String> {
             hits.push(format!("says \"stays free\" without the track limit: {sentence:?}"));
         }
     }
+    if says_buses_are_unlimited(text) {
+        for sentence in sentences(text) {
+            let low = sentence.to_lowercase();
+            let folder_as_bus = calls_folders_buses(&low);
+            // "Count" as a claim that they do: "counted" in "never counted"
+            // is not the word, and a negated count is the opposite claim.
+            let says_they_count = (has_word(&low, "count") || has_word(&low, "counts"))
+                && !["not count", "never count", "n't count"].iter().any(|p| low.contains(p));
+            if folder_as_bus && !says_they_count {
+                hits.push(format!(
+                    "calls folders buses without saying they count, beside \"buses have no limit\": {sentence:?}"
+                ));
+            }
+        }
+    }
     hits
+}
+
+/// Whether `sentence` (lowercase) says a folder IS a bus: "folders are real
+/// buses", "folders that are real buses", "a folder acts as a bus". A
+/// sentence that only names both ("a folder's send to the effects bus", "any
+/// channel, folder, bus or the master") is not the claim, and the changelog
+/// is full of those, so the words between must be a link ("is", "are", "as")
+/// and its fillers, and nothing else.
+fn calls_folders_buses(sentence: &str) -> bool {
+    const FILLER: [&str; 10] = ["is", "are", "as", "that", "a", "real", "also", "act", "acts", "each"];
+    let words: Vec<&str> = sentence.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    words.iter().enumerate().filter(|(_, w)| matches!(**w, "folder" | "folders")).any(|(i, _)| {
+        let rest = &words[i + 1..];
+        let Some(gap) = rest.iter().position(|w| !FILLER.contains(w)) else {
+            return false;
+        };
+        matches!(rest[gap], "bus" | "buses") && rest[..gap].iter().any(|w| matches!(*w, "is" | "are" | "as"))
+    })
+}
+
+/// Whether some sentence of `text` says buses are unlimited or uncounted.
+fn says_buses_are_unlimited(text: &str) -> bool {
+    sentences(text).iter().any(|sentence| {
+        let low = sentence.to_lowercase();
+        has_word(&low, "buses")
+            && ["no limit", "unlimited", "never counted", "not counted"].iter().any(|p| low.contains(p))
+    })
 }
 
 /// `word` in `text` with no letter, digit or hyphen joined to either side,
@@ -313,25 +361,61 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// The `[Unreleased]` section of a Keep-a-Changelog file: from its heading to
-/// the next `## [`.
+/// The changelog section that is still being written: `[Unreleased]` from
+/// its heading to the next `## [`, or, when a cut renamed `[Unreleased]` to
+/// the version (as the 2.3.0 cut did), the newest section, which is where
+/// this copy then lives. Panicking on a missing `[Unreleased]` would refuse a
+/// release for doing what a release does.
 fn unreleased(changelog: &str) -> &str {
-    let start = changelog.find("## [Unreleased]").expect("CHANGELOG.md has no [Unreleased] section");
+    let start = changelog
+        .find("## [Unreleased]")
+        .or_else(|| changelog.find("## ["))
+        .expect("CHANGELOG.md has no `## [` section at all");
     let body = &changelog[start..];
     let end = body[3..].find("\n## [").map_or(body.len(), |e| e + 3);
     &body[..end]
 }
 
-/// The new release's Gumroad page. The older pages under `docs/release/`
-/// stay as the history of what each release's page said.
-const GUMROAD_PAGE: &str = "docs/release/next/GUMROAD.md";
+/// The folder under `docs/release/` that holds the newest release's page,
+/// from the folder names that hold a `GUMROAD.md`.
+///
+/// The page is written in `next/` and its own header says to rename the
+/// folder to the version when the release is cut, so a fixed path to
+/// `next/GUMROAD.md` would turn the release gate red the moment someone did
+/// what the page says. Versions order numerically ("4.10" after "4.4"), and a
+/// name that is not a version ("next") is the unreleased page and sorts above
+/// every version. The older pages stay as the history of what each release's
+/// page said, and are not scanned.
+fn newest_release<'a>(names: &[&'a str]) -> Option<&'a str> {
+    let version = |name: &str| -> Option<Vec<u32>> { name.split('.').map(|p| p.parse().ok()).collect() };
+    names.iter().copied().max_by_key(|name| {
+        let v = version(name);
+        (v.is_none(), v.unwrap_or_default(), name.to_string())
+    })
+}
+
+/// The newest release's Gumroad page, repository-relative. See
+/// [`newest_release`].
+fn gumroad_page(root: &Path) -> String {
+    let dir = root.join("docs/release");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.join("GUMROAD.md").is_file())
+        .filter_map(|p| p.file_name().and_then(|f| f.to_str()).map(str::to_owned))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let newest = newest_release(&refs).expect("docs/release holds no GUMROAD.md page");
+    format!("docs/release/{newest}/GUMROAD.md")
+}
 
 /// **No surface says a key does less than it does.** See the module doc.
 #[test]
 fn no_surface_says_a_key_is_only_a_thank_you() {
     let root = root();
     let mut hits = Vec::new();
-    for doc in ["README.md", "docs/STORE-CONTENT.md", GUMROAD_PAGE] {
+    let gumroad = gumroad_page(&root);
+    for doc in ["README.md", "docs/STORE-CONTENT.md", gumroad.as_str()] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap_or_else(|e| panic!("{doc}: {e}"));
         hits.extend(stale(&text).into_iter().map(|h| format!("{doc}: {h}")));
     }
@@ -371,6 +455,14 @@ fn every_refused_phrase_fails_the_scan_when_planted() {
         "Thirty-two tracks, each with a fader.",
         "Recorder, 32-channel mixer, arrangement.",
         "Recorder, {}-channel mixer.",
+        // The README's shape before it said folders count.
+        "Buses, returns, sends and routes have no limit for anyone. Folders are real buses: a group sums its children.",
+        // The Gumroad description's: the claim and the folder a section apart.
+        "Buses, returns, sends and routes, with no limit. A DAW with folders that are real buses.",
+        // Both in one sentence, and a folder's bay named a bus's.
+        "Folders are buses and buses are never counted.",
+        "Buses are unlimited. A folder acts as a bus over its children.",
+        "Buses have no limit. Folders are buses and do not count.",
     ];
     for plant in plants {
         let page = format!("# Tangent\n\nPlay a chord.\n\n{plant}\n\n- A bullet.\n");
@@ -395,6 +487,16 @@ fn the_new_copy_passes_the_scan() {
         // "nothing else" in a sentence about something other than the key.
         "Folders are buses, and nothing else changes. The key of C is bright.",
         "A keyboard sends notes and nothing else.",
+        // Folders called buses, saying they count, beside the unlimited claim.
+        "Buses, returns, sends and routes have no limit for anyone. Folders are real buses and count as tracks: a group sums its children.",
+        "Buses, returns, sends and routes, with no limit. A DAW with folders that are real buses (each counts as a track).",
+        // Folders called buses on a surface that makes no claim about buses.
+        "Folders are buses: a group sums its children.",
+        // Buses unlimited on a surface that never calls a folder one.
+        "Buses, returns, sends and routes have no limit for anyone. Save into the session's folder.",
+        // Folders and buses named in one sentence, neither called the other.
+        "Buses have no limit. Load it onto any channel, folder, bus or the master.",
+        "Buses have no limit. A track in a folder is heard through the folder's send to the effects bus.",
     ] {
         assert!(stale(good).is_empty(), "{good:?} was refused: {:?}", stale(good));
     }
@@ -443,4 +545,34 @@ fn sentences_end_at_stops_and_markdown_blocks() {
         ],
     );
     assert!(has_word("a key.", "key") && !has_word("keyboard", "key") && !has_word("keep", "key"));
+}
+
+/// **The page scanned is the newest release's, whatever the cut named it.**
+/// `next` is scanned until the release renames it to its version, then that
+/// version's folder is; a version orders numerically, and history is never
+/// chosen over either.
+#[test]
+fn the_gumroad_page_scanned_is_the_newest_releases() {
+    assert_eq!(newest_release(&["4.2", "4.4", "next"]), Some("next"));
+    assert_eq!(newest_release(&["next", "4.4", "4.2"]), Some("next"));
+    // The cut renamed `next` to its version.
+    assert_eq!(newest_release(&["4.2", "4.4", "5.1"]), Some("5.1"));
+    assert_eq!(newest_release(&["4.10", "4.4", "4.2"]), Some("4.10"));
+    assert_eq!(newest_release(&["5.1.0", "5.1"]), Some("5.1.0"));
+    assert_eq!(newest_release(&[]), None);
+    // And the tree as it stands resolves to a page that exists.
+    let root = root();
+    let page = gumroad_page(&root);
+    assert!(root.join(&page).is_file(), "{page} does not exist");
+}
+
+/// **A changelog cut that renamed `[Unreleased]` scans its newest section**
+/// rather than panicking the release gate, and a kept `[Unreleased]` is
+/// still the section scanned, ending at the next version.
+#[test]
+fn the_changelog_section_scanned_survives_a_cut() {
+    let kept = "# Changelog\n\n## [Unreleased]\n\n- new.\n\n## [5.0.0] - 2026-08-31\n\n- old.\n";
+    assert_eq!(unreleased(kept), "## [Unreleased]\n\n- new.\n");
+    let renamed = "# Changelog\n\n## [5.1.0] - 2026-10-09\n\n- new.\n\n## [5.0.0] - 2026-08-31\n\n- old.\n";
+    assert_eq!(unreleased(renamed), "## [5.1.0] - 2026-10-09\n\n- new.\n");
 }
