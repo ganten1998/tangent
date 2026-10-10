@@ -35,7 +35,10 @@
 # (every feature of the binary, on every target, and the plugin, which is
 # its own workspace) are read with dev edges off, and the test build with
 # them on, which must carry it: a check that cannot see the feature where it
-# is would pass for the wrong reason.
+# is would pass for the wrong reason. And since an artifact is whatever the
+# scripts build, no script outside the gate may build a test, bench or
+# example target, which would resolve dev-dependency features into the
+# binary built beside it.
 #
 # Usage:
 #   scripts/check-home.sh run <command> [args...]
@@ -234,6 +237,26 @@ features() {
     echo "  home (and this check cannot see the feature where it must be)" >&2
     fail=1 ;;
   esac
+  # **And the artifacts are what the scripts build.** A cargo build that
+  # also compiles a test, bench or example target is building the
+  # dev-dependencies, so it resolves `test-home` into everything it builds,
+  # the binary it would ship included. No script but the gate's own may ask
+  # for one (`cargo test` is the gate's, and ships nothing).
+  local script found hits=""
+  for script in scripts/*.sh; do
+    case "$script" in scripts/check*.sh | scripts/test-census.sh) continue ;; esac
+    found="$(grep -nE -- '--(all-targets|tests|benches|examples|test|bench|example)([[:space:]=]|$)' "$script" \
+      | grep -vE '^[0-9]+:[[:space:]]*#' | sed "s|^|$script:|" || true)"
+    if [ -n "$found" ]; then
+      hits="$hits$found"$'\n'
+    fi
+  done
+  if [ -n "$hits" ]; then
+    echo "check-home: a script builds a test, bench or example target, so what it builds carries" >&2
+    echo "  test-home:" >&2
+    printf '%s' "$hits" | sed 's/^/    /' >&2
+    fail=1
+  fi
   return "$fail"
 }
 
