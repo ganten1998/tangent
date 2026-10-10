@@ -201,7 +201,7 @@ pub fn least_of<T>(tries: usize, mut f: impl FnMut() -> T) -> (T, Counted) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instrument::{Engine, Placed, CHANNELS, INPUTS};
+    use crate::instrument::{Engine, Placed, CHANNELS};
     use crate::render_golden::{noise, offline};
     use std::path::Path;
     use std::sync::Arc;
@@ -323,7 +323,7 @@ mod tests {
         // A ring arriving where there was none.
         e.set_monitor_on(true);
         let picks = tangent_record::audio::Picks::EVERYTHING;
-        e.set_monitor(Some((monitor_ring(), 2, [2; INPUTS], 512, picks)));
+        e.set_monitor(Some((monitor_ring(), 2, vec![2; 32].into_boxed_slice(), 512, picks.clone())));
         // One-shot windows (each event happens once), so only the callback's
         // own figure is held exactly: the hands' figure is name-keyed and a
         // neighbour's pool could add to a single window. The hands are held
@@ -334,14 +334,14 @@ mod tests {
             "a first monitor ring arriving allocated: {first:?}"
         );
         // A layout arriving for the ring already held.
-        e.set_monitor_layout([1; INPUTS], picks);
+        e.set_monitor_layout(&[1; 32], picks.clone());
         let (_, layout) = count_allocs(|| e.render_offline(&mut out));
         assert_eq!(
             layout.here, 0,
             "a monitor layout arriving allocated: {layout:?}"
         );
         // A second ring displacing the first: no longer a free here.
-        e.set_monitor(Some((monitor_ring(), 2, [2; INPUTS], 512, picks)));
+        e.set_monitor(Some((monitor_ring(), 2, vec![2; 32].into_boxed_slice(), 512, picks)));
         let (_, swap) = count_allocs(|| e.render_offline(&mut out));
         assert_eq!(
             swap.here, KNOWN_RING_SWAP,

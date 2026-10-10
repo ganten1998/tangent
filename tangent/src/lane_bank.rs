@@ -113,37 +113,100 @@ impl DeskBuffers {
     }
 }
 
-/// One input binding the monitor plays: which pick, onto which lane.
+/// **One input of the live stream, by its stable [`PickId`]**: which lane it
+/// plays onto (design 7.5: `(PickId -> slot, gen, width)`), and which device
+/// columns it reads.
+///
+/// The generation is checked at use, like everything slot-bound: a binding
+/// to a lane that has gone, or to a slot now holding another lane, plays on
+/// nobody. **Generation 0 binds the pick to no lane** (a pick that still
+/// drains, and still tees into its capture ring while a record holds it):
+/// no lane is ever minted at 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MonitorPick {
     pub pick: PickId,
     pub slot: Slot,
     pub gen: u32,
+    /// How many device columns the pick reads: 1 for a mono input, 2 for a
+    /// pair, the device's width for the whole device taken as one input, 0
+    /// for a pick that reads nothing (one the device cannot honour).
     pub width: u8,
+    /// **The device columns of its left and right**, a mono pick's twice.
+    /// An addition to the binding the design names: the ring carries whole
+    /// device frames, so a pick's columns are a property of the pick and
+    /// nothing else, and they are worked out once on the host. The callback
+    /// used to walk every pick before this one, per sample, to find them,
+    /// which was free at four picks and is the square of the desk at two
+    /// hundred. A width past two is read as its first pair, which is what
+    /// the monitor has always done with a wide input ("hearing that
+    /// something is arriving, not auditioning a surround mix").
+    pub cols: [u16; 2],
+}
+
+impl MonitorPick {
+    /// The generation that binds a pick to no lane.
+    pub const NO_LANE: u32 = 0;
 }
 
 /// The live input's ring AND its layout, which arrive together. Today they
 /// arrive through two mutexes and the renderer assigns the ring in place,
 /// which frees the old `Consumer` on the audio thread; here the old plan
 /// leaves whole on the retire ring.
+///
+/// **No capture ring rides here** (design A5, "MonitorPlan carries no
+/// rings"): a pick's capture ring is its own `EngineOp::Capture`, swapped
+/// only while the pick is not capturing, so a layout change can never take a
+/// take's ring with it. The one ring here is the monitor's own device ring,
+/// which arrives with the layout that reads it (design 7.4, `Monitor`).
 #[derive(Debug, Default)]
 pub struct MonitorPlan {
     pub ring: Option<Consumer<f32>>,
     pub channels: u16,
     pub block: u32,
+    /// **Every pick of the stream, by PickId**: `picks[p].pick ==
+    /// PickId(p)`, bound or not. The renderer walks them in this order, which
+    /// for a desk that never named an input is the stream's own order, so the
+    /// sums land in the order they always did.
     pub picks: Box<[MonitorPick]>,
-    /// **Today's layout, until the picks are by slot** (W5): how many device
-    /// columns each input reads, and which columns. The renderer's monitor
-    /// still speaks inputs; these carry its two tables down the same ring as
-    /// the ring they describe, so the pair can never be seen half-arrived.
-    pub widths: Box<[u8]>,
+    /// The picks the stream itself honours, in its order: what the IR
+    /// wizard turns a device input into a ring column through.
     pub columns: tangent_record::audio::Picks,
+    /// **Each pick's monitor gain and room share, `[gain, room]`**, as the
+    /// callback leaves them. Sized with `picks` by the host, so a plan of
+    /// more picks than the last brings the room their fades need: the
+    /// callback copies the fades it holds into this table by PickId when it
+    /// takes a new layout in (a pick that keeps its place keeps its fade)
+    /// and swaps the tables, so the old one leaves with the plan.
+    pub fades: Box<[[f32; 2]]>,
+    /// **The frames the renderer reads the ring into, sized for this ring's
+    /// device**, with the ring (empty: keep the one held). It was sized once,
+    /// by the OUTPUT's width, which held 128 frames of a 64-input interface
+    /// per chunk and dropped the rest of every chunk as stale: a monitor
+    /// that played a quarter of what arrived and a capture that kept a
+    /// quarter of the take. A wider device brings a wider scratch, built
+    /// here on the host, and the one it replaces leaves with the plan.
+    pub scratch: Vec<f32>,
     /// A new layout for the ring already held, and no ring: the renderer
     /// keeps its ring and takes the tables.
     pub layout_only: bool,
     /// Not yet taken in by the renderer. Set by the host; the renderer
     /// clears it the chunk it reads the plan.
     pub fresh: bool,
+}
+
+impl MonitorPlan {
+    /// A layout of these picks over `columns`, every fade at rest (gain 0,
+    /// room 1: a pick that is new fades in from silence). The ring and the
+    /// two flags are the caller's.
+    pub fn with_picks(picks: Vec<MonitorPick>, columns: tangent_record::audio::Picks) -> Self {
+        let fades = vec![[0.0, 1.0]; picks.len()].into_boxed_slice();
+        Self {
+            picks: picks.into_boxed_slice(),
+            columns,
+            fades,
+            ..Self::default()
+        }
+    }
 }
 
 /// **What a spine carries for its owner, beside the lanes**: the per-slot
@@ -458,9 +521,9 @@ where
             // with the new ring and the one it replaced leaves in `next`.
             if next.layout_only {
                 if let Some(held) = spine.monitor.as_deref_mut().filter(|h| h.fresh && !h.layout_only) {
-                    std::mem::swap(&mut held.widths, &mut next.widths);
-                    std::mem::swap(&mut held.columns, &mut next.columns);
                     std::mem::swap(&mut held.picks, &mut next.picks);
+                    std::mem::swap(&mut held.columns, &mut next.columns);
+                    std::mem::swap(&mut held.fades, &mut next.fades);
                     return Some(EngineOp::Monitor(next));
                 }
             }
@@ -468,7 +531,15 @@ where
         }
         EngineOp::Capture { pick, ring } => {
             let at = pick.0 as usize;
-            if at >= spine.captures.len() || spine.capturing.contains(at) {
+            // **A capturing pick's ring is never replaced, nor taken** (design
+            // 7.4). A ring arriving where the pick has NONE replaces nothing,
+            // and lands even while the pick captures: the host sends a pick's
+            // ring ahead of the flag that starts its record (design 7.12,
+            // rings are built when they are needed), and a callback can see
+            // the flag in the same pass that brings the ring. Refusing that
+            // would leave a take with nowhere to write.
+            let held = spine.captures.get(at).is_some_and(Option::is_some);
+            if at >= spine.captures.len() || (spine.capturing.contains(at) && held) {
                 report.capture_refused += 1;
                 return Some(EngineOp::Capture { pick, ring });
             }
@@ -655,8 +726,10 @@ mod tests {
                         slot: Slot(1),
                         gen: 7,
                         width: 2,
+                        cols: [0, 1],
                     }]
                     .into_boxed_slice(),
+                    fades: vec![[0.0, 1.0]].into_boxed_slice(),
                     ..MonitorPlan::default()
                 })))
                 .unwrap();
@@ -1000,6 +1073,48 @@ mod tests {
         assert_eq!(r.capture_refused, 0);
     }
 
+    /// **A capturing pick keeps its ring, and a ring for a pick with none
+    /// lands whatever its flag says** (design 7.4 and 7.12). The host sends
+    /// a pick's ring when its track is armed, and the flag that starts a
+    /// record can be read in the very pass that brings it: the slot is empty,
+    /// nothing is replaced, so it lands. A ring that IS there is neither
+    /// replaced nor taken while the flag stands, and goes home once it falls.
+    #[test]
+    fn an_empty_capturing_slot_takes_a_ring_and_a_held_one_stays() {
+        let mut spine: Spine<Toy> = Spine::with_capacity(4, 4);
+        let mut plan = Box::new(DeskPlan::empty());
+        let (mut tx, mut rx, mut rtx, mut rrx) = rings(8);
+        spine.capturing.insert(2);
+        let (first, mut first_rx) = RingBuffer::<f32>::new(4);
+        tx.push(EngineOp::Capture { pick: PickId(2), ring: Some(first) }).unwrap();
+        let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
+        assert_eq!(r.capture_refused, 0, "a ring for an empty capturing slot was refused");
+        assert!(drain(&mut rrx).is_empty(), "nothing was there to send home");
+        // Taken away, or replaced, under the take: refused, and it stays.
+        tx.push(EngineOp::Capture { pick: PickId(2), ring: None }).unwrap();
+        let (other, _) = RingBuffer::<f32>::new(4);
+        tx.push(EngineOp::Capture { pick: PickId(2), ring: Some(other) }).unwrap();
+        let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
+        assert_eq!(r.capture_refused, 2);
+        assert_eq!(drain(&mut rrx).len(), 2, "both refusals go home as they came");
+        assert!(spine.captures[2].as_mut().expect("the take's ring").push(0.5).is_ok());
+        assert_eq!(first_rx.pop().ok(), Some(0.5), "the take's ring is not the one on the spine");
+        // The record over: the ring goes home whole.
+        spine.capturing.remove(2);
+        tx.push(EngineOp::Capture { pick: PickId(2), ring: None }).unwrap();
+        let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
+        assert_eq!(r.capture_refused, 0);
+        assert!(spine.captures[2].is_none());
+        match drain(&mut rrx).as_slice() {
+            [EngineOp::Capture { pick: PickId(2), ring: Some(_) }] => {}
+            other => panic!("{other:?} came home"),
+        }
+        // A pick past the table is refused, flag or none.
+        let (late, _) = RingBuffer::<f32>::new(4);
+        tx.push(EngineOp::Capture { pick: PickId(4), ring: Some(late) }).unwrap();
+        assert_eq!(apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx).capture_refused, 1);
+    }
+
     /// **A ring and the layout pushed after it, applied in one pass, both
     /// arrive** (design 7.4: the monitor ring and its layout travel
     /// together). The layout joins the ring's plan, which the renderer has
@@ -1011,21 +1126,41 @@ mod tests {
         let mut spine: Spine<Toy> = Spine::with_capacity(4, 1);
         let mut plan = Box::new(DeskPlan::empty());
         let (mut tx, mut rx, mut rtx, mut rrx) = rings(8);
+        // A layout of these widths, one pick each, every fade marked with
+        // its width so the fades are seen to travel with their picks.
+        let layout = |widths: &[u8]| {
+            let picks = widths
+                .iter()
+                .enumerate()
+                .map(|(p, w)| MonitorPick {
+                    pick: PickId(p as u32),
+                    slot: Slot(p as u32),
+                    gen: 1,
+                    width: *w,
+                    cols: [0, 1],
+                })
+                .collect();
+            let mut plan = MonitorPlan::with_picks(picks, tangent_record::audio::Picks::EVERYTHING);
+            for (f, w) in plan.fades.iter_mut().zip(widths) {
+                f[0] = f32::from(*w);
+            }
+            plan
+        };
+        let widths = |m: &MonitorPlan| m.picks.iter().map(|p| p.width).collect::<Vec<u8>>();
+        let fades = |m: &MonitorPlan| m.fades.iter().map(|f| f[0] as u8).collect::<Vec<u8>>();
         let (_, ring) = RingBuffer::<f32>::new(16);
         tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
             ring: Some(ring),
             channels: 4,
             block: 64,
-            widths: vec![1, 1].into_boxed_slice(),
             fresh: true,
-            ..MonitorPlan::default()
+            ..layout(&[1, 1])
         })))
         .unwrap();
         tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
-            widths: vec![2, 0].into_boxed_slice(),
             layout_only: true,
             fresh: true,
-            ..MonitorPlan::default()
+            ..layout(&[2, 0, 1])
         })))
         .unwrap();
         let r = apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
@@ -1034,23 +1169,24 @@ mod tests {
         assert!(held.ring.is_some(), "the new device's ring was sent home unused");
         assert!(held.fresh && !held.layout_only);
         assert_eq!((held.channels, held.block), (4, 64));
-        assert_eq!(&held.widths[..], &[2, 0], "the newer layout was lost");
+        assert_eq!(widths(held), vec![2, 0, 1], "the newer layout was lost");
+        assert_eq!(fades(held), vec![2, 0, 1], "the newer layout's fades did not come with it");
         let home = drain(&mut rrx);
         assert_eq!(home.len(), 1);
         match &home[0] {
             EngineOp::Monitor(m) => {
                 assert!(m.ring.is_none(), "a ring went home");
-                assert_eq!(&m.widths[..], &[1, 1], "the displaced tables are the ring's old ones");
+                assert_eq!(widths(m), vec![1, 1], "the displaced tables are the ring's old ones");
+                assert_eq!(fades(m), vec![1, 1], "the displaced fades are the ring's old ones");
             }
             other => panic!("{other:?} came home"),
         }
         // Taken in by the renderer: the next layout displaces the spent plan.
         spine.monitor.as_deref_mut().unwrap().fresh = false;
         tx.push(EngineOp::Monitor(Box::new(MonitorPlan {
-            widths: vec![0, 2].into_boxed_slice(),
             layout_only: true,
             fresh: true,
-            ..MonitorPlan::default()
+            ..layout(&[0, 2])
         })))
         .unwrap();
         apply_ops(&mut spine, &mut plan, &mut rx, &mut rtx);
