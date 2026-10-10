@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use tangent_record::audio::Timebase;
 use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
-use tangent_ui::recorder::{Desk, STRIPS};
+use tangent_ui::recorder::Desk;
 use tangent_ui::routing::{Route, Routes, Target};
 
 use crate::builtin_fx::{
@@ -67,10 +67,11 @@ pub fn offline() -> Engine {
 
 /// Nothing sends, nothing is muted, nothing is soloed.
 pub fn quiet_desk() -> Desk {
+    // Each array as wide as the desk's own type says: no width named here.
     Desk {
-        send: [0.0; STRIPS],
-        muted: [false; STRIPS],
-        soloed: [false; STRIPS],
+        send: std::array::from_fn(|_| 0.0),
+        muted: std::array::from_fn(|_| false),
+        soloed: std::array::from_fn(|_| false),
     }
 }
 
@@ -516,7 +517,7 @@ fn sidechain_key(on: bool) -> Engine {
     // Lane 2 keys the master's comp and reaches nothing else: it is routed
     // into lane 15, whose fader is shut. Lane 1 is the mix.
     let mut e = offline();
-    let master = tangent_ui::recorder::MASTER_SEAT;
+    let master = crate::instrument::MASTER_SEAT;
     seat(
         &mut e,
         master,

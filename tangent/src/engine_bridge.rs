@@ -467,6 +467,59 @@ fn row_bit(word: u64, row: usize) -> bool {
     u32::try_from(row).ok().and_then(|r| 1u64.checked_shl(r)).is_some_and(|b| word & b != 0)
 }
 
+/// **Whether row `row` is armed**, read through [`row_bit`], the one door
+/// onto the app's arm word, so the host asks a row and never builds or
+/// reads a mask of its own.
+pub fn row_armed(app: &TangentApp, row: usize) -> bool {
+    row_bit(u64::from(app.armed_mask()), row)
+}
+
+/// **The plugin path in a bay of a track, by identity**: the app's flat
+/// table read at the bay's seat for the row the track stands on, so the
+/// host names a track's bay and never works out a seat.
+pub fn track_bay(app: &TangentApp, id: TrackId, rack: Rack, bay: u8) -> Option<&str> {
+    let (seat, b) = app_seat_of(app.track_ids(), SeatBay::new(Node::Track(id), rack, bay))?;
+    app.insert(seat, b)
+}
+
+/// [`track_bay`] for the track on row `row`'s first bay: what holds its
+/// instrument.
+pub fn row_instrument(app: &TangentApp, row: usize) -> Option<&str> {
+    track_bay(app, *app.track_ids().get(row)?, Rack::Chain(0), 0)
+}
+
+/// **The node a strip of the app's desk is**, for the roads that still hand
+/// the host a strip (a face, a drop on a column): the frozen strip space
+/// (`decode_v32_strip`) bound to the desk's rows, so a track is named by its
+/// identity and no strip index is turned into a seat by hand.
+pub fn strip_node(app: &TangentApp, strip: usize) -> Option<Node> {
+    bind(decode_v32_strip(strip)?, app.track_ids())
+}
+
+/// **The bay of a strip's displayed slot, by identity** (`desk_id::slot_key`,
+/// the one display-slot resolver: the master's two racks show the other way
+/// round).
+pub fn strip_slot(app: &TangentApp, strip: usize, slot: usize) -> Option<SeatBay> {
+    tangent_ui::desk_id::slot_key(strip_node(app, strip)?, slot)
+}
+
+/// **The plugin path in a bay, by identity**: the app's flat table read at
+/// the bay's seat for the rows as they stand.
+pub fn bay_path(app: &TangentApp, sb: SeatBay) -> Option<&str> {
+    let (seat, bay) = app_seat_of(app.track_ids(), sb)?;
+    app.insert(seat, bay)
+}
+
+/// **Every rack a track has**: its two chains, its pedal board and its pad
+/// racks, as the frozen map gives a track (design Appendix A). What follows a
+/// track wherever its row goes.
+pub fn track_racks() -> impl Iterator<Item = Rack> {
+    let chains = (0..tangent_ui::desk_id::STRIP_RACKS).map(|c| Rack::Chain(c as u16));
+    let pedals = (0..tangent_ui::desk_id::AMP_PEDALS).map(|p| Rack::Pedal(p as u8));
+    let pads = (0..tangent_ui::desk_id::PADS).map(|p| Rack::Pad(p as u8));
+    chains.chain(pedals).chain(pads)
+}
+
 /// **What the host does with a lane whose track has gone**, called by the
 /// bridge while the lane's plugins are alive: the engine, the track and its
 /// lane. The track's bays are named by its identity, so no row is needed.
@@ -751,7 +804,7 @@ impl Bridge {
         }
         gens.sort_unstable_by_key(|(s, _)| *s);
         gens.dedup();
-        SlotAutomation { curves: tangent_ui::automation::Automation::from_curves(curves), gens }
+        SlotAutomation { curves: tangent_ui::automation::Automation::from_curves(curves), gens, master }
     }
 
     /// **The bypassed bays, in engine seats**: the desk keeps them by the
@@ -1236,7 +1289,10 @@ mod tests {
     use tangent_ui::arrangement::{ArrClip, ArrNote, Arrangement, ClipKind, FrozenLane};
     use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
     use tangent_ui::host::Caps;
-    use tangent_ui::recorder::{CHANNELS, INSERTS, STRIPS};
+    // The settings fixtures are legacy desks, as wide as the frozen V32
+    // map: its numbers, never the UI's live desk.
+    use tangent_ui::desk_legacy::{V32_CHANNELS as CHANNELS, V32_STRIPS as STRIPS};
+    use tangent_ui::recorder::INSERTS;
     use tangent_ui::routing::Route;
     use tangent_ui::settings::Settings;
 
@@ -1916,7 +1972,7 @@ mod tests {
 
     /// **Every effect bay a corpus desk seats has its state in the live
     /// engine.** A bay the live engine is not wearing is furnished from the
-    /// shelf (`desk_insert_state` -> `saved_insert_state`), and the shelf is
+    /// shelf (`desk_insert_state` -> `shelf::saved_state`), and the shelf is
     /// `Settings::path().parent()`: the REAL `~/.config/tangent` in a binary
     /// crate's test, unless the run is sandboxed. A golden recorded in the
     /// sandbox would then depend on whatever the person running the suite
