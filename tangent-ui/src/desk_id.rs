@@ -185,6 +185,46 @@ impl SeatBay {
     }
 }
 
+/// **One plugin carried from one bay to another** (C11's
+/// `take_bay_relabels`): what stood at `from` stands at `to` now, the same
+/// unit with the same settings. A gesture's relabels are applied together
+/// (read every source, then write every destination), so a swap is two of
+/// them and neither reads the other's result.
+///
+/// Identity makes a reorder carry nothing, so this is only for the moves
+/// that really are moves between bays: the drum panel's pad swap, the
+/// desk's FX drag and swap (`TangentApp::trade_bays`), and their undo and
+/// redo. A copy or a paste is not one: its source keeps its plugin, so a
+/// relabel's inverse would carry the copy's later settings back over the
+/// source's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BayRelabel {
+    pub from: SeatBay,
+    pub to: SeatBay,
+}
+
+impl BayRelabel {
+    /// The move back.
+    pub const fn inverse(self) -> Self {
+        BayRelabel { from: self.to, to: self.from }
+    }
+}
+
+/// **Two sets of relabels as one**: `first`, then `then` on what `first`
+/// left, as a single set applied together. Each set is a permutation of
+/// bays (a swap names both directions), so their composition is one too:
+/// a bay that comes back where it started drops out.
+pub fn compose_relabels(first: &[BayRelabel], then: &[BayRelabel]) -> Vec<BayRelabel> {
+    let to = |set: &[BayRelabel], sb: SeatBay| set.iter().find(|r| r.from == sb).map_or(sb, |r| r.to);
+    let mut from: Vec<SeatBay> = first.iter().chain(then).map(|r| r.from).collect();
+    from.sort_unstable();
+    from.dedup();
+    from.into_iter()
+        .map(|sb| BayRelabel { from: sb, to: to(then, to(first, sb)) })
+        .filter(|r| r.from != r.to)
+        .collect()
+}
+
 /// **Which bay a strip's DISPLAYED slot is.** Slots 0..2 are the first rack
 /// shown, 3..5 the second.
 ///
