@@ -6337,10 +6337,12 @@ impl Settings {
     /// with the documents filed under video because the takes happened to be
     /// mp4s.
     ///
-    /// `dirs::document_dir` is the right call on all three platforms: it
-    /// reads `FOLDERID_Documents` on Windows and `$XDG_DOCUMENTS_DIR` on
-    /// Linux rather than assuming an English folder name, which is the bug
-    /// in every hardcoded `~/Documents`.
+    /// `tangent_core::config::documents` is the right call on all three
+    /// platforms: it reads `FOLDERID_Documents` on Windows and
+    /// `$XDG_DOCUMENTS_DIR` on Linux rather than assuming an English folder
+    /// name, which is the bug in every hardcoded `~/Documents`. It is the one
+    /// road to a person's home (`tangent_core::config::home`), so a test
+    /// build of any crate gets its scratch folder's `Documents` instead.
     ///
     /// **Never the Desktop and never the bundle directory.** The fallback
     /// when the platform has no documents folder at all is the home
@@ -6379,8 +6381,8 @@ impl Settings {
     /// per-thread test root in the way; it only names a path and creates
     /// nothing.
     fn default_media_root() -> PathBuf {
-        dirs::document_dir()
-            .or_else(dirs::home_dir)
+        tangent_core::config::documents()
+            .or_else(tangent_core::config::home)
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Tangent Media")
     }
@@ -6413,11 +6415,20 @@ impl Settings {
         }
         #[cfg(not(test))]
         {
-            dirs::video_dir()
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Tangent")
+            Self::default_legacy_record_root()
         }
+    }
+
+    /// `Movies/Tangent` (the platform's video folder), through the one road
+    /// to a person's home. Apart from [`Self::legacy_record_root`] for the
+    /// reason [`Self::default_media_root`] is: this crate's per-thread test
+    /// folder stands in front of it there, and the road itself is what a
+    /// test has to see.
+    fn default_legacy_record_root() -> PathBuf {
+        tangent_core::config::videos()
+            .or_else(tangent_core::config::home)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Tangent")
     }
 
     /// **Throw away a `screen_reader_mode` that the app guessed at.**
@@ -7093,6 +7104,32 @@ mod tests {
         let root = Settings::default_media_root();
         assert!(root.ends_with("Tangent Media"), "{}", root.display());
         assert!(!root.to_string_lossy().contains("Staging"), "{}", root.display());
+    }
+
+    /// **The media root and the old take folder are built on the one road
+    /// to a person's home**, and in this crate's test build that road ends in
+    /// a scratch folder: `tangent-core`'s `test-home`, which this crate's
+    /// `[dev-dependencies]` turn on, because `cfg(test)` here does not reach
+    /// the tangent-core these tests link. So the choosers' own answers (the
+    /// ones every other crate's tests and every shipped build get, with no
+    /// per-thread test folder in front of them) are in it too. The paths are
+    /// only named, nothing is created. Revert checks: either chooser back on
+    /// `dirs`, or the dev-dependency without the feature (seen alone through
+    /// `cargo test -p tangent-ui`, since a workspace run unifies the binary's
+    /// line in), fails it.
+    #[test]
+    fn the_media_choosers_build_on_the_one_road_to_a_home() {
+        assert!(tangent_core::config::TEST_HOME, "this crate's tests link a tangent-core without test-home");
+        let home = tangent_core::config::home().expect("a test build always has a home");
+        assert!(
+            home.starts_with(std::env::temp_dir()),
+            "this crate's tests resolve a real home: {}",
+            home.display()
+        );
+        let media = Settings::default_media_root();
+        assert_eq!(media, home.join("Documents").join("Tangent Media"));
+        let takes = Settings::default_legacy_record_root();
+        assert_eq!(takes, home.join("Movies").join("Tangent"));
     }
 
     /// A first launch shows the whole app; a corrupt file does not get

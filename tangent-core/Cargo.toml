@@ -10,6 +10,17 @@ learning = []
 # Offline supporter-license verification. `default-features = false` drops
 # `random`/`std`, so this adds no entropy source, no clock and no socket.
 license = ["dep:ed25519-compact"]
+# **Every home path in a scratch folder: test builds only.** `config::home`
+# (and the config directory, the documents and the video folders built on
+# it) answers `<temp>/tangent-test-home-<pid>` instead of the person's home.
+# This crate's own tests get that from `cfg(test)`; a crate whose tests link
+# this one gets it only from this feature, because `cfg(test)` is per crate.
+# The binary and tangent-ui turn it on from their `[dev-dependencies]` and
+# from nowhere else: resolver 2 gives a dev-dependency's features to a test
+# build alone, so `cargo build` (and every shipped artifact) resolves the real
+# home. `scripts/check-home.sh features` proves that; never name it in a
+# `[dependencies]` line or a feature of a crate that ships.
+test-home = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

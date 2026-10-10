@@ -6332,7 +6332,7 @@ impl DesktopApp {
                 let at = request
                     .start_at
                     .filter(|p| p.is_dir())
-                    .or_else(dirs::home_dir)
+                    .or_else(tangent_core::config::home)
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
                 self.browse_extensions = Vec::new();
                 let (entries, _) = Self::list_dir(&at, &[]);
@@ -9859,7 +9859,7 @@ impl DesktopApp {
         kind: PanelDir,
         intended: Option<std::path::PathBuf>,
     ) -> std::path::PathBuf {
-        let home = || dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let home = || tangent_core::config::home().unwrap_or_else(|| std::path::PathBuf::from("/"));
         let intended = intended.unwrap_or_else(home);
         let was_there = intended.is_dir();
         // **Ours are MADE, remembered ones never are.** A media folder that
@@ -18138,10 +18138,12 @@ fn shorten_home(path: &std::path::Path) -> String {
     // The home directory is read ONCE per process. `dirs::home_dir` walks
     // the environment (and on Windows asks the shell) on every call, and
     // this used to be called five times a frame for five paths that had not
-    // changed since the last settings write.
+    // changed since the last settings write. Through the one road to a home
+    // (`tangent_core::config::home`), like every other reader of it.
     static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let text = path.to_string_lossy().into_owned();
-    let Some(home) = HOME.get_or_init(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()))
+    let Some(home) =
+        HOME.get_or_init(|| tangent_core::config::home().map(|h| h.to_string_lossy().into_owned()))
     else {
         return text;
     };

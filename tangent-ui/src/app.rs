@@ -2931,10 +2931,11 @@ enum MeDrag {
 /// Where the media explorer wakes up: the user's home, or the root.
 fn dirs_home() -> std::path::PathBuf {
     // `dirs` knows every platform's answer — HOME alone left the Windows
-    // tester's explorer starting at the drive root.
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    // tester's explorer starting at the drive root. Asked through the one
+    // road to a home (`tangent_core::config::home`, which keeps HOME as the
+    // fallback this carried), so a test build's explorer opens on its
+    // scratch home and never lists a person's own.
+    tangent_core::config::home().unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
 
