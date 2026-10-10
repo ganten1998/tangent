@@ -15932,10 +15932,17 @@ impl DesktopApp {
         // (a sampler's file, the kit's knobs) is forgotten for those slots.
         if !synced.moved.is_empty() {
             self.clips_owed = true;
-            self.pads_owed = true;
             self.pushed_auto = None;
             Self::forget_moved_slots(&synced.moved, &mut self.sampler_have, &mut self.pushed_pads);
             self.sampler_owed = true;
+        }
+        // **And the kits, which a lane that has just become a drum lane is
+        // owed as well** (`Synced::owes_kits`, W7-join): the drumpad picked
+        // into a track's first bay moved no lane and edited no kit, so with
+        // another kit already landed nothing reloaded and that track's pads
+        // stayed silent until another kit edit or a reopen.
+        if synced.owes_kits() {
+            self.pads_owed = true;
         }
         // The placement facts, fresh each frame so `begin` latches this
         // frame's truth: the playhead (where the take will start on the
