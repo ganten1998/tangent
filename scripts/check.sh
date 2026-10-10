@@ -34,6 +34,29 @@ cd "$ROOT"
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
 
+# `named_leg <at least> <cargo test args...>`: a test run filtered to the
+# tests a leg names, which must PASS at least that many of them.
+#
+# **A filter that matches nothing is green.** `cargo test some::path` with no
+# test under that path reports "0 passed" and exits 0, so a leg that names
+# its tests by filter would turn green the day one of them was renamed or
+# deleted, which is exactly the day it should not. So each named leg says
+# how many tests it is for, and the count that ran is checked against it.
+named_leg() {
+  local want="$1" out ran
+  shift
+  if ! out="$(cargo test "$@" 2>&1)"; then
+    printf '%s\n' "$out"
+    return 1
+  fi
+  printf '%s\n' "$out" | grep -E '^test result:' || true
+  ran="$(printf '%s\n' "$out" | awk '/^test result:/ {s += $4} END {print s + 0}')"
+  if [ "$ran" -lt "$want" ]; then
+    echo "  this leg names $want test(s) and only $ran ran: one was renamed or removed" >&2
+    return 1
+  fi
+}
+
 echo "==> cargo test --workspace"
 # **`--exclude linuxvideo`, because the root `exclude` does not reach it.**
 #
@@ -57,6 +80,19 @@ echo "==> cargo test --workspace"
 # `tangent_ui` behind one in `tangent`. A gate that is going to fail should say
 # how much is failing.
 cargo test --workspace --exclude linuxvideo --no-fail-fast
+
+echo "==> cargo test --release render_golden  (the render goldens, in the profile that ships)"
+# **The shipped builds are release, and every leg above is debug.** The render
+# goldens pin what the engine sounds like to the bit, and for a while they
+# pinned a fact about the PROFILE as well: the optimiser fused the pan law's
+# sine and cosine into one `sincos` call that rounds its last bit its own way,
+# so the `auto-pan` desk hashed one way here and another in the build people
+# run (`instrument::pan_gains` has the measurement and the fix). Rendering
+# them in release too is what keeps "the same bits from both" true. The
+# golden itself is pinned on aarch64 macOS only, which is the machine this
+# gate runs on; elsewhere the desk invariants beside it still run.
+if [ "$(uname -sm)" = "Darwin arm64" ]; then GOLDENS=2; else GOLDENS=1; fi
+named_leg "$GOLDENS" --release -p tangent --bin tangent render_golden::
 
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
 cargo test -p tangent-core

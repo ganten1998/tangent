@@ -26871,16 +26871,41 @@ fn sane_gain(linear: f32) -> f32 {
     }
 }
 
-/// One-pole coefficient for [`GAIN_TAU_SECONDS`] at `rate`.
 /// The pan law: equal power, normalised so CENTRE is unity — a knob at
 /// rest changes nothing, hard sides ride ~3 dB up on the loud side, the
 /// way every desk marked "0 dB centre" does it. `pan` is -1..1.
+///
+/// **The same bits from a debug build and a release one.** The sine is
+/// taken out of line ([`pan_sine`]) because an optimised build sees a `sin`
+/// and a `cos` of one angle in one block and fuses them into a single
+/// `sincos` call (`__sincosf_stret` on Apple), which is another libm entry
+/// point and rounds its own way: over every f32 angle this law can see,
+/// `[0, pi/2]`, the fused pair differs from `sinf`/`cosf` by one ulp at
+/// 828,043 angles for the sine and 272,987 for the cosine, never by more.
+/// Inaudible (one ulp of a gain is about -144 dB), but it made the render
+/// goldens a fact about the PROFILE: the `auto-pan` desk, whose curve
+/// sweeps the angle through many of those values, hashed one way under
+/// `cargo test` and another under `cargo test --release`, and the shipped
+/// builds are release. Out of line, both profiles make the two plain calls
+/// and agree to the bit; check.sh renders the goldens in release to keep it
+/// so.
 fn pan_gains(pan: f32) -> (f32, f32) {
     let t = (pan.clamp(-1.0, 1.0) + 1.0) * (std::f32::consts::PI / 4.0);
     let root2 = std::f32::consts::SQRT_2;
-    (t.cos() * root2, t.sin() * root2)
+    (t.cos() * root2, pan_sine(t) * root2)
 }
 
+/// [`pan_gains`]' sine, never inlined: inlined, it would sit beside the
+/// cosine of the same angle and an optimised build would fuse the two into
+/// one `sincos` call that rounds differently from a debug build's (see
+/// there). `noinline` is an attribute LLVM's inliner never overrides, so
+/// the two stay plain `sinf` and `cosf` calls in every profile.
+#[inline(never)]
+fn pan_sine(t: f32) -> f32 {
+    t.sin()
+}
+
+/// One-pole coefficient for [`GAIN_TAU_SECONDS`] at `rate`.
 fn gain_coefficient(rate: f64) -> f32 {
     if !(rate.is_finite() && rate > 0.0) {
         return 1.0;
