@@ -3700,19 +3700,19 @@ fn kit_shortfall(report: &crate::drumpad::KitEmbedReport) -> String {
     // never fire with a zero in them and no arm has to say "0 samples".
     match (report.unreadable, report.over_ceiling) {
         (n, 0) => format!(
-            "kit saved, but {n} {} could not be read — this kit will only play \
+            "kit saved, but {n} {} could not be read, so this kit will only play \
              on this machine",
             plural(n)
         ),
         (0, n) => format!(
-            "kit saved, but it is past {} MB, so {n} {} stayed out — this kit \
+            "kit saved, but it is past {} MB, so {n} {} stayed out and this kit \
              will only play on this machine",
             crate::drumpad::MAX_KIT_BYTES / (1024 * 1024),
             plural(n)
         ),
         (u, c) => format!(
             "kit saved, but {u} {} could not be read and {c} more were past \
-             {} MB — this kit will only play on this machine",
+             {} MB, so this kit will only play on this machine",
             plural(u),
             crate::drumpad::MAX_KIT_BYTES / (1024 * 1024)
         ),
@@ -11701,7 +11701,7 @@ impl TangentApp {
                     (Some((a, None)), true) => format!("IN {}", a + 1),
                     (Some((a, Some(b))), true) => format!("IN {}/{}", a + 1, b + 1),
                     (Some((a, _)), false) => format!("IN {} \u{b7} NO ROOM", a + 1),
-                    (None, true) => "IN: \u{2014}".to_owned(),
+                    (None, true) => "IN: none".to_owned(),
                     (None, false) => "NO ROOM".to_owned(),
                 }
             }
@@ -11731,7 +11731,7 @@ impl TangentApp {
                     (Some((a, None)), true) => format!("IN {}", a + 1),
                     (Some((a, Some(b))), true) => format!("{}/{}", a + 1, b + 1),
                     (Some((a, _)), false) => format!("IN {a}!", a = a + 1),
-                    (None, true) => "IN \u{2014}".to_owned(),
+                    (None, true) => "IN -".to_owned(),
                     (None, false) => "IN !".to_owned(),
                 }
             }
@@ -14720,7 +14720,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.notify(
                 crate::notify::Kind::Error,
                 "That is the template shelf. Use Save as a Template to put a \
-                 stencil there — saving a project into it makes every new \
+                 stencil there: saving a project into it makes every new \
                  session a copy of this one.",
             );
             return None;
@@ -30052,7 +30052,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn save_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error =
-                "there is no file panel in a plugin — save this kit from the \
+                "there is no file panel in a plugin; save this kit from the \
                  Tangent app"
                     .to_owned();
             return;
@@ -30386,7 +30386,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn load_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error =
-                "there is no file panel in a plugin — load this kit from the \
+                "there is no file panel in a plugin; load this kit from the \
                  Tangent app"
                     .to_owned();
             return;
@@ -39668,7 +39668,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // takes a press in silence is worse than one that is missing.
                 if !self.caps.native_file_dialogs {
                     self.set_bank_note(
-                        "there is no file panel in a plugin — save this bank from \
+                        "there is no file panel in a plugin; save this bank from \
                          the Tangent app"
                             .to_owned(),
                     );

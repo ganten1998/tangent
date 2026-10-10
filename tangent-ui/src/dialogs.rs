@@ -2941,7 +2941,7 @@ fn midi_inputs_body(
         RichText::new(if devices.iter().any(|d| d.on) {
             "ticked devices only"
         } else {
-            "none ticked \u{2014} every device, including ones plugged in later"
+            "none ticked: every device, including ones plugged in later"
         })
         .font(plain(10.0))
         .color(dim),
@@ -2989,7 +2989,7 @@ fn midi_inputs_body(
                 let label = if row.present {
                     row.name.clone()
                 } else {
-                    format!("{}  \u{2014} not connected", row.name)
+                    format!("{} (not connected)", row.name)
                 };
                 let text = RichText::new(label)
                     .font(plain(11.0))
@@ -7011,7 +7011,7 @@ fn draw_ir_result(
     // nothing. See `ports::IrReferenceUse`.
     let ref_note = match r.reference {
         crate::ports::IrReferenceUse::Borrowed => Some((
-            "one return jack brought the loop back — it was used for both channels",
+            "one return jack brought the loop back, and it was used for both channels",
             false,
         )),
         crate::ports::IrReferenceUse::Dropped => Some((
@@ -7151,7 +7151,7 @@ fn draw_ir_result(
     // what left "why is my plate 0.6 seconds" unanswerable.
     ui.label(
         RichText::new(format!(
-            "captured at {:.1} dBFS peak over a {:.0} dBFS floor \u{2014} \
+            "captured at {:.1} dBFS peak over a {:.0} dBFS floor: \
              {:.0} dB of usable range",
             r.capture_peak_db, r.noise_floor_db, r.tail_range_db
         ))
@@ -7186,7 +7186,7 @@ fn draw_ir_result(
         ui.label(
             RichText::new(
                 "This capture folded. The tail slides steadily downward, \
-                 which a decay cannot do — it is the sweep coming back off a \
+                 which a decay cannot do: it is the sweep coming back off a \
                  device that samples lower than this interface, not the \
                  unit's reverb. Go back, set TOP one step LOWER than you \
                  used, and record another - keep stepping down until this \
@@ -7339,7 +7339,7 @@ fn confirm_ir_delete(bay: crate::desk_id::SeatBay, path: &str, loaded: bool) -> 
             // sounds one way today and another way tomorrow. See
             // `desktop::clear_insert_ir`.
             "This is the impulse this bay is playing, and the bay is emptied \
-             with it \u{2014} the sound stops now, not next time this project is \
+             with it: the sound stops now, not next time this project is \
              opened. Any other bay playing the same file is emptied too."
                 .to_owned()
         } else {
@@ -9651,7 +9651,7 @@ fn show_on(
             show_dialog_viewport(
                 ctx,
                 placement,
-                &format!("{who} \u{2014} MIDI Inputs"),
+                &format!("{who} - MIDI Inputs"),
                 Vec2::new(MIDI_INPUTS_W, h),
                 Vec2::new(MIDI_INPUTS_W - 80.0, 220.0),
                 |ui, result| {
@@ -11773,7 +11773,7 @@ fn show_on(
                             }
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new("AUTO-PALETTE — every unpainted slot")
+                                RichText::new("AUTO-PALETTE: every unpainted slot")
                                     .font(bold(10.0))
                                     .color(dim),
                             );
@@ -12741,7 +12741,7 @@ fn show_on(
                                             ))
                                             .on_hover_text(
                                                 "back to the sweep with this loop and \
-                                                 these levels — capture, save, repeat",
+                                                 these levels: capture, save, repeat",
                                             )
                                             .clicked()
                                         {
@@ -12789,7 +12789,7 @@ fn show_on(
                                                     .color(t.text),
                                                 ))
                                                 .on_hover_text(
-                                                    "back to the IR panel \u{2014} its \
+                                                    "back to the IR panel: its \
                                                      presets and its impulse browser, \
                                                      with this capture loaded and \
                                                      scrolled to",
@@ -12935,7 +12935,7 @@ fn show_on(
             show_dialog_viewport(
                 ctx,
                 placement,
-                &format!("{who} \u{2014} Automation"),
+                &format!("{who} - Automation"),
                 Vec2::new(430.0, 460.0),
                 Vec2::new(360.0, 260.0),
                 |ui, result| {
@@ -13146,7 +13146,7 @@ fn show_on(
                             });
                             if *triplet && *swing_pct > 50.0 {
                                 ui.label(
-                                    RichText::new("triplet wins — a swung triplet is two answers to one question")
+                                    RichText::new("triplet wins: a swung triplet is two answers to one question")
                                         .font(bold(9.0))
                                         .color(dim),
                                 );
@@ -13175,7 +13175,7 @@ fn show_on(
                             );
                             ui.label(
                                 RichText::new(if *window_ms <= 0.0 {
-                                    "off — everything moves, ornaments included".to_owned()
+                                    "off: everything moves, ornaments included".to_owned()
                                 } else {
                                     format!(
                                         "anything more than {window_ms:.0} ms from a line is left alone"
@@ -23059,7 +23059,7 @@ mod shot {
                 MIDI_INPUTS_W,
                 (212.0 + devices.len() as f32 * 24.0).min(MIDI_INPUTS_MAX_H),
             ),
-            "Rhodes \u{2014} MIDI Inputs",
+            "Rhodes - MIDI Inputs",
             &surface,
             &mut |ui| {
                 apply_theme(ui.style_mut(), &t);
