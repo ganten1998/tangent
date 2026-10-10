@@ -125,12 +125,11 @@ and before pasting.
 
 ## The 3.0.0 swap: done
 
-The block below hands out the **installers** rather than the archives. At 3.0.0
-that was because each one offered the app and the plugin as separate choices and
-put the plugin where the DAW already looks; the plugin was retired at 4.77.0,
-and the installers carry the app alone now. Those assets first existed at
-3.0.0, published 2026-08-14; `tools/tangent-fulfil/src/main.rs` was swapped at
-the same moment and must be redeployed for a NEW buyer to get them.
+The block below hands out the **installers** rather than the archives: each
+one puts Tangent where it belongs, so there is nothing for a buyer to drag
+anywhere. Those assets first existed at 3.0.0, published 2026-08-14;
+`tools/tangent-fulfil/src/main.rs` was swapped at the same moment and must be
+redeployed for a NEW buyer to get them.
 
 The order that keeps this honest, and the one that was got wrong twice:
 **publish, check, paste, deploy.** Never edit the links in anticipation.
@@ -204,10 +203,10 @@ protected your PC" the first time. Click "More info", then "Run anyway". Windows
 remembers the choice. If you took the .zip instead, unzip it anywhere and run
 tangent.exe.
 
-Linux: extract the archive and run ./install.sh, which needs no root and takes
---app and --uninstall. Or just chmod +x tangent and ./tangent. MIDI goes
-through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or
-newer.
+Linux: extract the archive and run ./install.sh, which needs no root;
+./install.sh --uninstall takes it back out. Or just chmod +x tangent and
+./tangent. MIDI goes through ALSA, so libasound.so.2 needs to be present.
+Requires glibc 2.32 or newer.
 
 The Windows and Linux downloads include tangent-ffmpeg, a small helper program
 built from FFmpeg and used for audio export. FFmpeg is licensed under the GPL.

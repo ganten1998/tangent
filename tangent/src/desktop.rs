@@ -11573,13 +11573,13 @@ impl DesktopApp {
         }
         let mut note = format!("scan: {} VST3 found", report.found.len());
         if let Some(stale) = report.retired_seen.first() {
-            // The retired plugin is CLEANUP, not a plugin — say where it
-            // is and that the installers remove it now, so the user is
-            // never left wondering why another DAW still lists it.
+            // A Tangent.vst3 an older install left behind is CLEANUP, not a
+            // plugin: say where it is and that the installers remove it now,
+            // so the user is never left wondering why another program still
+            // lists it.
             note = format!(
-                "{note}. A retired Tangent plugin is still at {} - Tangent \
-                 no longer ships or loads it; reinstalling Tangent (or \
-                 deleting the bundle) removes it.",
+                "{note}. {} was left by an older install of Tangent; \
+                 reinstalling Tangent or deleting it removes it.",
                 stale.display()
             );
         }

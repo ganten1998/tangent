@@ -4027,19 +4027,6 @@ impl PluginEntry {
     /// whose path has no stem at all — a trailing `..`, a caller's mistake —
     /// falls back to the whole path rather than an unclickable-looking blank
     /// row.
-    /// **This app's OWN VST3, which is not an instrument.**
-    ///
-    /// Tangent ships a plugin that draws the same display inside a DAW. It has
-    /// no audio by design — `AUDIO_IO_LAYOUTS` is empty — so loading it here
-    /// fails, correctly, with "no audio output channels". A Linux tester met it
-    /// as a row called "Tangent" sitting under "Tangent DX7", chose the
-    /// familiar name, and read the failure as the app being broken.
-    ///
-    /// Matched by bundle stem, which is what the picker has: the list is a
-    /// directory listing and opening every module to ask its name is the one
-    /// thing this dialog will not do.
-    pub const OWN_PLUGIN_STEM: &'static str = "Tangent";
-
     pub fn from_bundle(path: &Path) -> PluginEntry {
         Self::from_bundle_with_vendor(path, None, None)
     }
@@ -4063,18 +4050,10 @@ impl PluginEntry {
             .filter(|d| !d.is_empty())
             .or(stem)
             .unwrap_or_else(|| full.clone());
-        // Said in the row rather than hidden from it. The file IS on the disk,
-        // and somebody who has just built it should see it where they put it —
-        // what they should not do is choose it and be told the app is broken.
-        let vendor = if name == Self::OWN_PLUGIN_STEM {
-            "this app's own display plugin - for a DAW, not for here".to_owned()
-        } else {
-            vendor.unwrap_or("").to_owned()
-        };
         PluginEntry {
             name,
             path: full,
-            vendor,
+            vendor: vendor.unwrap_or("").to_owned(),
         }
     }
 }

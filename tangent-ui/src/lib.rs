@@ -1,4 +1,4 @@
-//! Tangent's user interface, shared by the desktop app and the VST3 plugin.
+//! Tangent's user interface, drawn by the desktop app.
 //!
 //! Everything here draws with `egui` and nothing here knows what is hosting it.
 //! See `Cargo.toml` for why the absent dependencies matter more than the

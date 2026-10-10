@@ -20,9 +20,9 @@
 # so packaging is offline after the first run.
 #
 # LICENSING. Both builds are GPL ffmpeg. Tangent invokes the binary as a
-# separate process, which keeps the app MIT (LICENSING.md's reasoning for the
-# GPL plugin applies in reverse). The build's own licence text ships beside it
-# in the artifact, and gen-third-party-licenses.sh names the bundle.
+# separate process, which keeps the app MIT (LICENSING.md sets out why). The
+# build's own licence text ships beside it in the artifact, and
+# gen-third-party-licenses.sh names the bundle.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

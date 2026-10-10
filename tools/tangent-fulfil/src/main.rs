@@ -277,8 +277,7 @@ fn sale_acceptable(
 // every one of them and is the gate.
 //
 // The installers took over at 3.0.0, which is the first release that has them.
-// They are better links than the archives: each offers the app and the VST3
-// plugin as separate choices and puts the plugin where the DAW already looks,
+// They are better links than the archives: each puts Tangent where it belongs,
 // so there is nothing for a buyer to drag anywhere. The swap waited until the
 // assets existed, because a repository whose main branch hands out 404s is one
 // where somebody eventually deploys it. That has happened: this email once
@@ -305,8 +304,7 @@ const DOWNLOAD_LINUX: &str =
 /// limit; now it says the limit (the app's `FREE_TRACKS`, 32), that the key
 /// takes it away, and that buses, returns, sends and routes were never
 /// limited. tangent-ui's `copy_scan.rs` reads this function's literals and
-/// fails on the old wording. The installers stopped offering a VST3 plugin
-/// when it was retired at 4.77.0, so the line saying each one did is gone.
+/// fails on the old wording.
 fn email_body(key: &str) -> String {
     format!(
         "Thank you for supporting Tangent.\n\n\
