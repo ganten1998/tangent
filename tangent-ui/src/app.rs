@@ -1135,11 +1135,12 @@ pub struct TangentApp {
     /// PASTE FX. See `copy_fx`.
     fx_clipboard: Option<(usize, usize)>,
     /// A paste asked the host to copy plugin state from one track to
-    /// another: `(from track, to track)`. Taken once, like `clips_dirty`, by
-    /// whichever form the host asks for; the lane form finds each track's
-    /// row when it is taken, so a reorder between the paste and the take
-    /// cannot send the host to another track's states.
-    insert_state_copy: Option<(crate::desk_id::TrackId, crate::desk_id::TrackId)>,
+    /// another: `(from track, to track, the row holding the source's
+    /// files)`, the last as `TrackCopy::files_at` says. Taken once, like
+    /// `clips_dirty`, by whichever form the host asks for; the lane form
+    /// finds each row when it is taken, so a reorder between the paste and
+    /// the take cannot send the host to another track's states.
+    insert_state_copy: Option<(crate::desk_id::TrackId, crate::desk_id::TrackId, crate::desk_id::TrackId)>,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -1398,14 +1399,17 @@ pub struct TangentApp {
     /// front of a floating dialog by any other means.
     native_panel_up: bool,
     /// The user pressed Default in the patch picker. Taken by the host.
-    /// `Some(strip)` when that strip asked for its default bank back — the
+    /// `Some(track)` when that track asked for its default bank back — the
     /// shelf's `default.syx` if there is one, the shipped cartridge if not.
-    default_bank: Option<usize>,
-    /// Which strip a raised cartridge panel belongs to — the Load bank file
+    /// By identity, and turned into the track's row when the host takes it.
+    default_bank: Option<crate::desk_id::TrackId>,
+    /// Which track a raised cartridge panel belongs to — the Load bank file
     /// panel and the Save bank save panel alike. Remembered here because a
     /// panel is asynchronous and its answer arrives with a path and no
-    /// memory of who asked.
-    cartridge_pick_strip: usize,
+    /// memory of who asked. By identity, so the answer lands on the track
+    /// that asked wherever it stands when the answer comes; `None` until a
+    /// panel was ever raised (row 0, as it always was).
+    cartridge_pick_strip: Option<crate::desk_id::TrackId>,
     file_request: Option<crate::ports::FileRequest>,
     /// The in-app browser's three messages to the host: list this, I chose a
     /// file, I chose a folder. See `Dialog::FileBrowser`.
@@ -2706,6 +2710,14 @@ struct TrackCopy {
     /// taken before a drag reorder sent the host to the states of whatever
     /// track had moved into that row.
     from_id: crate::desk_id::TrackId,
+    /// **Which row holds the source's plugin-state files, by that row's
+    /// id**, for the host's lane form of the insert-state note while plugin
+    /// states are named by lane (W4-integrate names them by track, and the
+    /// lane form goes with it). The source itself while it stands; once it
+    /// is removed - a cut is a copy and then a removal - the row the
+    /// removal emptied in place, which keeps the files and moves with them
+    /// through a reorder, as the source's lane used to be carried by hand.
+    files_at: crate::desk_id::TrackId,
     kind: Option<recorder::ChannelKind>,
     name: String,
     color: i64,
@@ -4494,7 +4506,7 @@ impl TangentApp {
             mixer_rect: None,
             native_panel_up: false,
             default_bank: None,
-            cartridge_pick_strip: 0,
+            cartridge_pick_strip: None,
             file_request: None,
             browse_request: None,
             browsed_file: None,
@@ -6917,6 +6929,13 @@ impl TangentApp {
         // its new id, which is the whole difference from a mint that makes a
         // track (`mint_emptied_row_id`).
         self.mint_emptied_row_id(n);
+        // A copy of the track being removed (a cut) finds its plugin states
+        // on this row's files until the host keeps them by track: the row
+        // keeps them, under its new id. See `TrackCopy::files_at`.
+        let emptied = self.track_id_at(n);
+        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == gone) {
+            copy.files_at = emptied;
+        }
         use crate::recorder::Strip;
         let d = Settings::default();
         let at = Strip::Channel(n).index();
@@ -9401,12 +9420,12 @@ impl TangentApp {
     /// DX7: the bank is on the shelf or in the binary and the host knows how
     /// to reach either, but WHOSE sound changes stopped being obvious.
     pub fn take_default_bank(&mut self) -> Option<usize> {
-        self.default_bank.take()
+        self.default_bank.take().and_then(|id| self.row_of(id))
     }
 
     /// Which strip the cartridge file panel that is up was raised for.
     pub fn cartridge_pick_strip(&self) -> usize {
-        self.cartridge_pick_strip
+        self.cartridge_pick_strip.and_then(|id| self.row_of(id)).unwrap_or(0)
     }
 
     /// Take a pending "choose a folder" request. Same contract.
@@ -9906,6 +9925,9 @@ impl TangentApp {
         self.load_drumpad_doc();
         self.reset_automation_session();
         self.forget_document_tracks();
+        // A desk of another document: nothing aimed at a row of the last
+        // one's may act on this one's.
+        self.on_desk_shape_change();
         // **Seed the undo baseline HERE too.** Every road into a document
         // ends at `undo_reset` — open, save-as, fresh — and this one forgot,
         // which left `history` empty until the FIRST edit committed its own
@@ -12428,8 +12450,10 @@ impl TangentApp {
         self.settings
             .insert_bypass
             .remap_seats(&recorder::seat_order(order));
-        // The desk has its new shape: the aims that named rows let go.
+        // The desk has its new shape: the aims that named rows let go, and
+        // the kit sidecar is written by the rows as they now stand.
         self.on_desk_shape_change();
+        self.kits_follow_rows();
 
         // **And the moment this gesture leaves keeps the order**, so undo
         // can hand the host the way back - see `Moment::perm`. Composed, for
@@ -12735,6 +12759,7 @@ impl TangentApp {
         self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
             from_id: self.track_id_at(n),
+            files_at: self.track_id_at(n),
             kind: self.channel_kind(n),
             name: self
                 .settings
@@ -12979,7 +13004,7 @@ impl TangentApp {
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
         // defaults, which is a different instrument wearing the same name.
-        self.insert_state_copy = Some((copy.from_id, self.track_id_at(into)));
+        self.insert_state_copy = Some((copy.from_id, self.track_id_at(into), copy.files_at));
         self.select_alone(into);
         self.save_settings();
         // No commit here: the hold in `paste_track` is what ends this
@@ -12992,13 +13017,14 @@ impl TangentApp {
     ///
     /// **The rows the two TRACKS stand on now**, asked as the note is taken,
     /// so a reorder between the copy and the paste (or the paste and the
-    /// take) cannot hand the host another track's files. A copy whose
-    /// source track has been removed since has no row to name, and this
-    /// form answers nothing for it; the id form still names the track,
-    /// whose states the host keeps by identity.
+    /// take) cannot hand the host another track's files. A source removed
+    /// since - a cut - stands on no row; its files are on the row its
+    /// removal emptied (`TrackCopy::files_at`), wherever that row is now,
+    /// and nothing when a new track has been made there.
     pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
-        let (from, to) = self.insert_state_copy.take()?;
-        Some((self.row_of(from)?, self.row_of(to)?))
+        let (from, to, files_at) = self.insert_state_copy.take()?;
+        let from = self.row_of(from).or_else(|| self.row_of(files_at))?;
+        Some((from, self.row_of(to)?))
     }
 
     /// **The same note, by identity**: the (from, to) TRACKS, taken once.
@@ -13008,7 +13034,7 @@ impl TangentApp {
     pub fn take_insert_state_copy_ids(
         &mut self,
     ) -> Option<(crate::desk_id::TrackId, crate::desk_id::TrackId)> {
-        self.insert_state_copy.take()
+        self.insert_state_copy.take().map(|(from, to, _)| (from, to))
     }
 
     /// **Every row's id, in lane order**: the desk's rows by identity, for
@@ -13050,7 +13076,12 @@ impl TangentApp {
     fn mint_row_id(&mut self, n: usize) {
         let was = self.track_id_at(n);
         if let Some(now) = self.mint_bare(n) {
+            let kit = self.drumpad_kits.contains_key(&was);
             self.retarget_row(was, now);
+            // A format-2 sidecar names the kit by the id it just left.
+            if kit {
+                self.kits_follow_rows();
+            }
         }
     }
 
@@ -13115,6 +13146,10 @@ impl TangentApp {
         self.arr_auto_hot = self.arr_auto_hot.map(|(o, s, i)| (node(o), s, i));
         for (o, _, _) in &mut self.arr_auto_nodes {
             *o = node(*o);
+        }
+        // The row whose files hold a cut track's states is still that row.
+        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == from) {
+            copy.files_at = to;
         }
     }
 
@@ -13182,22 +13217,24 @@ impl TangentApp {
     /// **The desk changed shape: the transient aims let go** (design 4).
     ///
     /// Every structural edit calls this - the reorder every move, insert
-    /// below, grouping and folder drag goes through, a track's removal, and
-    /// an undo or redo that moved rows. What it clears is what names a ROW
-    /// for the length of one gesture or one open menu: the input menu, a
-    /// strip being named or typed into, the insert menu, a fader or strip
-    /// in a hand, the timeline's drag and its anchors, a drawn item and a
-    /// file drop in flight, a pedal window. Each was a lane the moment
-    /// before, so each would act on whatever track the edit moved into it;
-    /// a menu that closes and a drag that stops are what a hand sees when
-    /// the ground moves under it. The meters' held picture is a row's too,
-    /// so it starts again from the next push, and the route labels are
-    /// rebuilt from the table the edit rewrote.
+    /// below, grouping and folder drag goes through, a track's removal, an
+    /// undo or redo that moved rows - and so does a switch to another
+    /// document's desk. What it clears is what names a ROW for the length
+    /// of one gesture or one open menu: the input menu, a strip being named
+    /// or typed into, the insert menu, a fader or strip in a hand, the
+    /// timeline's drag and its anchors, a drawn item and a file drop in
+    /// flight, a pedal window, a double-click's first half and the
+    /// keyboard's aim. Each was a lane the moment before, so each would act
+    /// on whatever track the edit moved into it; a menu that closes and a
+    /// drag that stops are what a hand sees when the ground moves under it.
+    /// The meters' held picture is a row's too, so it starts again from the
+    /// next push, and the route labels are rebuilt from the table the edit
+    /// rewrote.
     ///
     /// Everything that names a TRACK is keyed by its identity instead and
     /// is untouched here: no structural edit carries it, because none has
-    /// to (`session_lane_fields`, the classification scan, holds both
-    /// lists).
+    /// to. `LANE_FIELDS`, the classification scan's table, holds every
+    /// field of either kind.
     fn on_desk_shape_change(&mut self) {
         self.input_menu = None;
         self.mixer_naming = None;
@@ -13211,7 +13248,26 @@ impl TangentApp {
         self.arr_drop = None;
         self.arr_move_orig.clear();
         self.arr_stretch_orig.clear();
+        // **The OPEN pedal window goes DOWN**, rather than being carried.
+        //
+        // Remapping its seat is the move that looks right and is worse than
+        // doing nothing. The window it is standing on is an open
+        // `Dialog::InsertFace`, which still names its seat by position until
+        // W5 keys it by bay identity, so the face goes on naming whatever
+        // row the edit moved into its seat. Move only the pedal and the two
+        // windows stop describing the same strip: the amp shows whatever
+        // landed in that row while the pedal above it shows the board of
+        // the track that left, with no way for anybody looking at them to
+        // tell. Closing it is the one answer with no disagreement in it: the
+        // second window is the one that can be put down cheaply, and a
+        // window that vanishes when you drag a track is a thing a person can
+        // see and understand.
         self.pedal_stack = None;
+        // A double-click's first half names its row, and the keyboard's aim
+        // names a control on one; both are re-made by the next press and
+        // the next paint, from the desk as it now stands.
+        self.click_moment = None;
+        self.a11y_on = None;
         self.meter_hold = [[0.0; 2]; recorder::STRIPS];
         self.refresh_route_labels();
     }
@@ -14063,6 +14119,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.load_drumpad_doc();
         self.reset_automation_session();
         self.forget_document_tracks();
+        // A desk of another document: nothing aimed at a row of the last
+        // one's may act on this one's.
+        self.on_desk_shape_change();
         self.reconcile_auto_bases();
         // **One settings write per open, here, after everything an open
         // touches has landed** — the path, the desk, whatever the reconcile
@@ -18096,6 +18155,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if self.settings.track_ids != rows_before {
             self.on_desk_shape_change();
+            if !kits_moved {
+                self.kits_follow_rows();
+            }
         }
         // **An AUTO width and lane count come back too.** The apply skips a
         // zero for the open and the template adopt, and an undo through the
@@ -23238,6 +23300,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.drumpad_row(),
             doc,
         );
+    }
+
+    /// **The rows moved, so the kit sidecar follows them.** Today's bytes
+    /// file each kit under its LANE (`lane_kits`, `primary_lane`), and a
+    /// format-2 file under its track's id, so the file has to be written
+    /// again whenever a row moves or a row's id changes, or it names the
+    /// rows as they were: a project saved after a drag reopened with its
+    /// kit on the row the drum track had left, and the drum track silent.
+    /// The reorder never wrote it; an undo across one did, but only because
+    /// the lane-indexed kits it restored differed from the live ones, which
+    /// kits held by track no longer do. Only into a folder that is already
+    /// real, the undo's rule: a scratch's kits live in memory until the
+    /// folder is made, and making it writes them.
+    fn kits_follow_rows(&mut self) {
+        let real = self.project_doc().is_some_and(|d| d.parent().is_some_and(std::path::Path::is_dir));
+        if real && self.drumpad_kits.values().any(|k| !k.is_empty()) {
+            let doc = self.project_doc.clone();
+            self.save_kits_beside(&doc);
+        }
     }
 
     /// One knob's current value, in its own units.
@@ -29332,7 +29413,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // and it makes the saved bank the strip's cartridge. The
                 // strip is the one whose picker raised the panel — remembered
                 // in `cartridge_pick_strip`, since the answer does not say.
-                let strip = self.cartridge_pick_strip;
+                let strip = self.cartridge_pick_strip();
                 self.request_recorder(recorder::RecorderRequest::SaveBank {
                     strip,
                     path: path.to_path_buf(),
@@ -31928,7 +32009,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// is a Save that silently did nothing.
     pub fn ask_bank_replace(&mut self, path: std::path::PathBuf) {
         if !matches!(self.dialog, Some(Dialog::PatchPicker { .. })) {
-            self.open_patch_picker(self.cartridge_pick_strip);
+            self.open_patch_picker(self.cartridge_pick_strip());
         }
         if let Some(Dialog::PatchPicker { question, .. }) = self.dialog.as_mut() {
             *question = Some(dialogs::BankQuestion::Replace(path));
@@ -38285,14 +38366,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // A dialog row, so a gesture, so a moment - the same line
                 // `set_dx7_cartridge_of` takes, which this arm bypasses.
                 self.undo_commit();
-                self.default_bank = Some(slot);
+                self.default_bank = Some(self.track_id_at(slot));
             }
             DialogAction::LoadCartridge { slot } => {
                 if !self.caps.native_file_dialogs {
                     return;
                 }
                 self.native_panel_up = true;
-                self.cartridge_pick_strip = slot;
+                self.cartridge_pick_strip = Some(self.track_id_at(slot));
                 let (from, _) = self.dx7_choice_of(slot);
                 self.file_request = Some(crate::ports::FileRequest {
                     // Where the last one came from, which is where the next one
@@ -38359,7 +38440,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     return;
                 }
                 self.native_panel_up = true;
-                self.cartridge_pick_strip = slot;
+                self.cartridge_pick_strip = Some(self.track_id_at(slot));
                 // `default.syx`, because that is the bank the instrument
                 // opens on: saving over it is how "your chosen bank every
                 // time" is arranged, and the panel says so by suggesting it.
@@ -83002,5 +83083,910 @@ mod persist_tests {
             assert!(saved["desk"].get("legacy_states").is_none(), "the cleared marker was written");
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// **Session state follows its TRACK** (docs/design/unlimited-tracks.md,
+/// section 4 and W4-lane-refs): what the session holds about a track is
+/// keyed by the track's identity, so a reorder, an insert above it and
+/// their undo and redo leave it on the track with nothing carrying it; the
+/// aims that name a ROW let go when the desk changes shape; and a source
+/// scan holds every lane-shaped field of `TangentApp` to a class, so a new
+/// one cannot arrive without somebody deciding which.
+#[cfg(test)]
+mod lane_refs_tests {
+    use super::tests::{headless, headless_with, project_scratch};
+    use super::*;
+    use crate::automation::{AutoMode, AutoParam};
+
+    /// Tracks on rows 0 to 4: the default desk's two, and three added.
+    fn desk() -> TangentApp {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for n in 2..=4 {
+            assert!(app.add_bare_track(n), "fixture: row {n} took no track");
+        }
+        app
+    }
+
+    /// **Everything the session can hold about one track**, put on the
+    /// track on row `n`: the drum panel and its kit, two open automation
+    /// rows, one armed and one bypassed, a Latch that has latched, the last
+    /// point written, the row the hand last pressed and the row copied
+    /// nodes came from.
+    fn dress(app: &mut TangentApp, n: usize) {
+        app.set_drumpad_lane(n);
+        app.kit_at_mut(n).pads[36].path = "media/kick.wav".into();
+        let (gain, pan) = (app.auto_row_at(n, AutoParam::Gain), app.auto_row_at(n, AutoParam::Pan));
+        app.arr_auto_open.extend([gain, pan]);
+        app.arr_auto_armed.insert(gain);
+        app.arr_auto_bypassed.insert(pan);
+        app.arr_auto_modes.insert(gain.0, AutoMode::Latch);
+        app.arr_auto_latched.insert(gain.0);
+        app.arr_auto_last.insert(gain, (2.0, 0.25));
+        app.arr_auto_focus = Some(pan);
+        app.auto_clipboard_from = Some(gain);
+    }
+
+    /// Every piece `dress` puts on a track, by name.
+    const ALL: [&str; 11] = [
+        "drum panel", "kit", "open rows", "armed", "bypassed", "mode", "latch",
+        "suspend bit", "last value", "focus", "clipboard aim",
+    ];
+
+    /// **Which pieces of `dress` row `n`'s track wears**, read the way the
+    /// rest of the app reads them: by lane, through the doors the views,
+    /// the gestures and the host use (the arrangement's own row views, the
+    /// host's `drumpad_lane` and `auto_suspend_mask`), never by poking the
+    /// id-keyed fields with an id.
+    fn worn(app: &TangentApp, n: usize) -> Vec<&'static str> {
+        let views = app.auto_views(n);
+        let view = |p: AutoParam| views.iter().find(|v| v.param == p);
+        let at = |r: Option<AutoRow>| r.and_then(|r| app.auto_row_lane(r));
+        let mut out = Vec::new();
+        let mut wear = |piece: &'static str, on: bool| {
+            if on {
+                out.push(piece);
+            }
+        };
+        wear("drum panel", app.drumpad_lane() == n);
+        wear("kit", app.kit_at(n).pads[36].path == "media/kick.wav");
+        wear("open rows", view(AutoParam::Gain).is_some() && view(AutoParam::Pan).is_some());
+        wear("armed", view(AutoParam::Gain).is_some_and(|v| v.armed));
+        wear("bypassed", view(AutoParam::Pan).is_some_and(|v| v.bypassed));
+        wear("mode", app.arr_auto_mode(n) == AutoMode::Latch);
+        wear("latch", app.arr_auto_writing(n, false));
+        wear("suspend bit", app.auto_suspend_mask() & (1u64 << n) != 0);
+        wear(
+            "last value",
+            app.auto_row(n, AutoParam::Gain).and_then(|r| app.arr_auto_last.get(&r)) == Some(&(2.0, 0.25)),
+        );
+        wear("focus", at(app.arr_auto_focus) == Some((n, AutoParam::Pan)));
+        wear("clipboard aim", at(app.auto_clipboard_from) == Some((n, AutoParam::Gain)));
+        out
+    }
+
+    /// **A reorder, its undo and its redo leave every piece on its track**
+    /// (W4-lane-refs, "Follows its track"). The drum panel and its kit,
+    /// every automation row state - open, armed, bypassed, mode, latch,
+    /// last value, focus, clipboard aim - and the selection, all set on the
+    /// track on row 3, are on row 0 once the track is dragged there, back
+    /// on row 3 after the undo and on row 0 again after the redo. The track
+    /// that took row 3 wears none of it. Nothing carries any of it: the
+    /// reorder used to remap each piece by hand, and a piece added without
+    /// its remap was a moved track wearing another track's state.
+    #[test]
+    fn a_reorder_its_undo_and_its_redo_leave_every_track_state_on_its_track() {
+        let mut app = desk();
+        dress(&mut app, 3);
+        // The kit is document state: its edit is a moment of its own, as
+        // the panel's gestures make it, so the undo below is the reorder's.
+        app.undo_commit();
+        app.set_selected_rows(&[1, 3]);
+        app.set_primary_row(Some(3));
+        app.sel_anchor = app.selected_channel;
+        assert_eq!(worn(&app, 3), ALL, "fixture: the track is not dressed");
+        let mover = app.track_id_at(3);
+
+        app.move_channel(3, 0);
+        assert_eq!(app.row_of(mover), Some(0), "fixture: the track did not move to row 0");
+        assert_eq!(worn(&app, 0), ALL, "the moved track left state behind");
+        assert!(worn(&app, 3).is_empty(), "the track that took row 3 wears {:?}", worn(&app, 3));
+        assert_eq!(app.selected_rows(), vec![2, 0], "the selection stayed on the rows");
+        assert_eq!(app.selected_channel(), Some(0), "the primary stayed on its row");
+        assert_eq!(app.sel_anchor, Some(mover), "the anchor left its track");
+
+        app.undo();
+        assert_eq!(app.row_of(mover), Some(3), "fixture: the undo did not put the track back");
+        assert_eq!(worn(&app, 3), ALL, "the undo left state on the row the track had moved to");
+        assert!(worn(&app, 0).is_empty(), "row 0's own track wears {:?}", worn(&app, 0));
+        assert_eq!(app.selected_rows(), vec![1, 3], "the undo left the selection behind");
+
+        app.redo();
+        assert_eq!(worn(&app, 0), ALL, "the redo left state behind");
+        assert!(worn(&app, 3).is_empty(), "after the redo, row 3 wears {:?}", worn(&app, 3));
+        assert_eq!(app.selected_rows(), vec![2, 0], "the redo left the selection behind");
+    }
+
+    /// **An insert above a track, its undo and its redo leave every piece
+    /// on it**: Insert Track below row 1 pushes the dressed track from row 3
+    /// to row 4, and its state goes with it and back. The insert selects
+    /// the track it made, by identity: the undo takes that track away, and
+    /// with it the selection, which does not land on whatever track now
+    /// stands on its row; the redo brings both back.
+    #[test]
+    fn an_insert_above_its_undo_and_its_redo_leave_every_track_state_on_its_track() {
+        let mut app = desk();
+        dress(&mut app, 3);
+        app.undo_commit();
+        let dressed = app.track_id_at(3);
+        assert!(app.insert_track_below(1), "fixture: no row opened under row 1");
+        assert_eq!(app.row_of(dressed), Some(4), "fixture: the insert did not push the track down");
+        assert_eq!(worn(&app, 4), ALL, "the pushed track left state behind");
+        assert!(worn(&app, 3).is_empty(), "the track pushed to row 3 wears {:?}", worn(&app, 3));
+        let made = app.track_id_at(2);
+        assert_eq!(app.selected_track(), Some(made), "fixture: the insert did not select its track");
+
+        app.undo();
+        assert_eq!(app.row_of(dressed), Some(3), "fixture: the undo did not put the track back");
+        assert_eq!(worn(&app, 3), ALL, "the undo left state on the row below");
+        assert!(worn(&app, 4).is_empty(), "row 4's own track wears {:?}", worn(&app, 4));
+        assert_eq!(app.selected_row(), None, "the selection of an undone track landed on another one");
+
+        app.redo();
+        assert_eq!(worn(&app, 4), ALL, "the redo left state behind");
+        assert_eq!(app.selected_row(), Some(2), "the redo did not bring the made track's selection back");
+    }
+
+    /// **A row an empty slot becomes a track on keeps what was aimed at
+    /// it.** W3 mints such a row a new id (a new track, a new id); the
+    /// selection on the empty slot, the drum panel pointed at it and a kit
+    /// a desk carried on a row with no kind were keyed by the old one, and
+    /// follow the row to the new one (`retarget_row`) rather than being
+    /// orphaned - the kit silently, and for good at the next save. A
+    /// removal mints too and carries nothing: the removed track's kit and
+    /// the panel's aim at it come back with its undo.
+    #[test]
+    fn a_row_given_its_first_kind_keeps_what_was_aimed_at_it() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let row = 6;
+        assert!(!app.row_counted(row), "fixture: row 6 is not empty");
+        app.set_selected_rows(&[row]);
+        app.set_primary_row(Some(row));
+        app.set_drumpad_lane(row);
+        app.kit_at_mut(row).pads[36].path = "media/kick.wav".into();
+        let vacant = app.track_id_at(row);
+
+        app.set_channel_kind(row, Some(recorder::ChannelKind::Midi));
+        app.undo_commit();
+        let made = app.track_id_at(row);
+        assert_ne!(made, vacant, "fixture: a row given a kind kept its id");
+        assert_eq!(app.selected_rows(), vec![row], "the selected slot lost its selection to its new id");
+        assert_eq!(app.selected_row(), Some(row), "the primary was lost to the new id");
+        assert_eq!(app.drumpad_lane(), row, "the drum panel lost the row it was pointed at");
+        assert_eq!(app.kit_at(row).pads[36].path, "media/kick.wav", "the row's kit was orphaned by its new id");
+        assert!(!app.drumpad_kits.contains_key(&vacant), "a kit stayed under an id no row holds");
+
+        app.remove_selected_channels(row);
+        assert_ne!(app.track_id_at(row), made, "fixture: the emptied row kept the removed track's id");
+        assert!(app.kit_at(row).is_empty(), "the removed track's kit stayed on its row");
+        assert_eq!(app.drumpad_lane(), 0, "the panel stayed on a row its track has left");
+        app.undo();
+        assert_eq!(app.track_id_at(row), made, "fixture: the undo did not bring the track back");
+        assert_eq!(app.kit_at(row).pads[36].path, "media/kick.wav", "the undo did not bring the kit back");
+        assert_eq!(app.drumpad_lane(), row, "the panel did not come back with its track");
+    }
+
+    /// **The host's lane forms answer from the tracks** (C11): no
+    /// host-facing signature changed, and each answers with the row its
+    /// track stands on NOW. A track copied, then dragged, then pasted sends
+    /// the host to the row the source stands on, where the copy's lane
+    /// used to send it to the row the source had left - another track's
+    /// plugin states. A source removed before the paste has no row, so the
+    /// lane form says nothing and the id form still names it.
+    #[test]
+    fn the_hosts_lane_forms_answer_where_each_track_stands_now() {
+        let mut app = desk();
+        dress(&mut app, 3);
+        let source = app.track_id_at(3);
+        app.copy_track(3);
+        app.move_channel(3, 0);
+        assert_eq!(app.drumpad_lane(), 0, "the panel's lane form");
+        assert_eq!(app.drumpad_track(), source, "the panel's id form");
+        assert_eq!(
+            app.drumpad_kit_of(0).map(|k| k.pads[36].path.as_str()),
+            Some("media/kick.wav"),
+            "the kit's lane form"
+        );
+        assert_eq!(app.drum_kit_params_of(0), app.drum_kit_params_of_track(source));
+        app.set_primary_row(Some(0));
+        assert_eq!(app.selected_channel(), Some(0), "the selection's lane form");
+        assert_eq!(app.selected_track(), Some(source), "the selection's id form");
+
+        app.paste_track(7);
+        assert_eq!(
+            app.take_insert_state_copy(),
+            Some((0, 7)),
+            "the host was sent to the row the source left, not the row it stands on"
+        );
+        // A CUT: the source is removed, and its states stay on the files of
+        // the row the removal emptied, which carry them wherever that row
+        // goes - here two rows down - and to a track made on it later.
+        app.copy_track(0);
+        app.remove_channel(0);
+        app.move_channel(0, 2);
+        app.paste_track(8);
+        let pasted = app.track_id_at(8);
+        let note = app.insert_state_copy;
+        assert_eq!(note.map(|(f, t, _)| (f, t)), Some((source, pasted)), "the note lost the removed source");
+        assert_eq!(
+            app.take_insert_state_copy(),
+            Some((2, 8)),
+            "a cut track's states were looked for anywhere but the row its removal emptied"
+        );
+        app.insert_state_copy = note;
+        assert_eq!(app.take_insert_state_copy_ids(), Some((source, pasted)), "the id form lost the source");
+        assert!(app.add_bare_track(2), "fixture: the emptied row took no track");
+        app.paste_track(9);
+        assert_eq!(
+            app.take_insert_state_copy(),
+            Some((2, 9)),
+            "a track made on the emptied row took the cut track's files away from the paste"
+        );
+    }
+
+    /// **A dragged drum track reopens with its kit**, in today's bytes and
+    /// in format 2. Today's sidecar files each kit under its LANE, and the
+    /// reorder never wrote it: a project saved after the drag reopened with
+    /// the kit on the row the drum track had left and the drum track silent.
+    /// The kit is written by the rows as they stand after the drag, and
+    /// again after its undo, which with the kits held by track no longer
+    /// differs from the live ones and so would write nothing on its own.
+    #[test]
+    fn a_dragged_drum_track_reopens_with_its_kit_in_either_format() {
+        for format2 in [false, true] {
+            let run = || {
+                let root = project_scratch(if format2 { "lane-refs-kit-v2" } else { "lane-refs-kit" });
+                let (_ctx, mut app) = headless(Caps::DESKTOP);
+                app.bootstrap_project(&root.join("Projects"));
+                let doc = app.project_doc().expect("a project").to_path_buf();
+                app.kit_at_mut(0).pads[36].path = "media/kick.wav".into();
+                app.drumpad_edited();
+                app.save_project_doc();
+                let drums = app.track_id_at(0);
+
+                app.move_channel(0, 3);
+                assert_eq!(app.row_of(drums), Some(3), "fixture: the drum track did not move");
+                app.save_project_doc();
+                let (_c, mut back) = headless(Caps::DESKTOP);
+                back.open_project(&doc);
+                assert_eq!(back.kit_at(3).pads[36].path, "media/kick.wav", "the kit did not reopen on its track (format 2: {format2})");
+                assert!(back.kit_at(0).is_empty(), "the kit reopened on the row its track left (format 2: {format2})");
+
+                app.undo();
+                assert_eq!(app.row_of(drums), Some(0), "fixture: the undo did not put the track back");
+                app.save_project_doc();
+                let (_c, mut again) = headless(Caps::DESKTOP);
+                again.open_project(&doc);
+                assert_eq!(again.kit_at(0).pads[36].path, "media/kick.wav", "the undo's kit did not reopen on its track (format 2: {format2})");
+                assert!(again.kit_at(3).is_empty(), "the undo left the kit on the row (format 2: {format2})");
+                let _ = std::fs::remove_dir_all(&root);
+            };
+            if format2 {
+                crate::desk_format::with_format2(run);
+            } else {
+                run();
+            }
+        }
+    }
+
+    /// **The route labels are the routes' words, after every edit that
+    /// moves the routes**: a route out of a dragged track is drawn from the
+    /// row it moved to, and the undo puts the words back with the table.
+    /// They used to stay as they were until a route was next edited by
+    /// hand - a reorder, a removal, an open and an undo all rewrote the
+    /// table under them.
+    #[test]
+    fn the_route_labels_follow_a_reorder_and_its_undo() {
+        let mut app = desk();
+        assert!(app.settings.routes.add(crate::routing::Route::new(
+            2,
+            crate::routing::Target::Channel(4)
+        )));
+        app.refresh_route_labels();
+        app.undo_commit();
+        let from = |app: &TangentApp| app.route_labels.iter().map(|(f, _, _)| *f).collect::<Vec<_>>();
+        assert_eq!(from(&app), vec![2], "fixture");
+        app.move_channel(2, 0);
+        assert_eq!(app.settings.routes.0[0].from, 0, "fixture: the route did not follow its track");
+        assert_eq!(from(&app), vec![0], "the labels kept the row the track left");
+        app.undo();
+        assert_eq!(from(&app), vec![2], "the undo left the labels on the moved row");
+        // An undo that moves no row but takes a route away: the desk apply's
+        // own rebuild, with no shape change to lean on.
+        assert!(app.settings.routes.add(crate::routing::Route::new(
+            3,
+            crate::routing::Target::Channel(4)
+        )));
+        app.refresh_route_labels();
+        app.undo_commit();
+        assert_eq!(from(&app), vec![2, 3], "fixture");
+        app.undo();
+        assert_eq!(from(&app), vec![2], "the undo of a route left its label standing");
+    }
+
+    /// **A new document lets go of the last one's tracks**: the selection
+    /// names ids, and an id means something only in the document that
+    /// minted it; kept across the switch, it selects whatever track the
+    /// next document gave that id.
+    #[test]
+    fn a_new_project_lets_go_of_the_last_documents_selection() {
+        let root = project_scratch("lane-refs-new");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.set_project_dir(root.join("Projects"));
+        assert!(app.add_bare_track(4), "fixture");
+        app.set_selected_rows(&[1, 4]);
+        app.set_primary_row(Some(4));
+        app.sel_anchor = app.selected_channel;
+        app.new_project();
+        assert!(app.selected_tracks.is_empty(), "the last document's tracks stayed selected");
+        assert_eq!(app.selected_channel, None, "the last document's primary stayed");
+        assert_eq!(app.sel_anchor, None, "the last document's anchor stayed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Everything that names a ROW for one gesture, set on row 2.
+    fn aim(app: &mut TangentApp) {
+        use recorder::Column;
+        app.input_menu = Some(InputMenu {
+            ch: 2,
+            at: Pos2::ZERO,
+            hover: None,
+            rows: [Vec::new(), Vec::new()],
+            devices_offered: false,
+        });
+        app.mixer_naming = Some((Column::Track(2), "name".to_owned()));
+        app.mixer_typing = Some((Column::Track(2), "-6".to_owned()));
+        app.mixer_fx_menu = Some((Column::Track(2), 0));
+        app.mixer_grab = Some(MixerGrab {
+            hit: crate::mixer_panel::Hit::Fader(Column::Track(2)),
+            from: Pos2::ZERO,
+            moved: true,
+            from_value: 0.5,
+        });
+        app.mixer_reorder = Some((2, Pos2::ZERO, true));
+        app.arr_drag = Some(ArrDrag::AutoPoint(2, 0, 0));
+        let pt = crate::automation::Point { at_s: 0.0, value: 0.5, shape: crate::automation::Shape::Linear };
+        app.arr_auto_drag_from = Some(AutoDragFrom {
+            lead: (2, AutoParam::Gain, 0),
+            lead_at: pt,
+            lead_now: (2, AutoParam::Gain, 0),
+            curves: vec![(2, AutoParam::Gain, vec![pt], vec![0])],
+            grab: None,
+            produced: vec![vec![pt]],
+        });
+        app.arr_pending = Some((2, 0.0, 1.0));
+        app.arr_drop = Some((2, 1.0));
+        app.arr_move_orig = vec![(1, 0.0, 2)];
+        app.arr_stretch_orig = vec![crate::arrangement::ArrClip { lane: 2, ..Default::default() }];
+        app.pedal_stack = Some(PedalStack { over: (2, 0), seat: 2, dialog: None });
+        app.click_moment = Some((ClickRow::Keys(2, 0), std::sync::Arc::new(Vec::new())));
+        app.a11y_on = Some(Focused::Desk {
+            hit: crate::mixer_panel::Hit::Fader(Column::Track(2)),
+            travel: None,
+        });
+        app.meter_hold = [[0.5; 2]; recorder::STRIPS];
+    }
+
+    /// The row aims `aim` sets that still stand.
+    fn still_aimed(app: &TangentApp) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut stood = |what: &'static str, on: bool| {
+            if on {
+                out.push(what);
+            }
+        };
+        stood("input menu", app.input_menu.is_some());
+        stood("naming", app.mixer_naming.is_some());
+        stood("typing", app.mixer_typing.is_some());
+        stood("insert menu", app.mixer_fx_menu.is_some());
+        stood("fader in hand", app.mixer_grab.is_some());
+        stood("strip in hand", app.mixer_reorder.is_some());
+        stood("timeline drag", app.arr_drag.is_some());
+        stood("node drag anchor", app.arr_auto_drag_from.is_some());
+        stood("drawn item", app.arr_pending.is_some());
+        stood("file drop", app.arr_drop.is_some());
+        stood("group move", !app.arr_move_orig.is_empty());
+        stood("stretch", !app.arr_stretch_orig.is_empty());
+        stood("pedal window", app.pedal_stack.is_some());
+        stood("double-click half", app.click_moment.is_some());
+        stood("keyboard aim", app.a11y_on.is_some());
+        stood("meter hold", app.meter_hold.iter().flatten().any(|v| *v != 0.0));
+        out
+    }
+
+    /// **A structural edit lets go of every aim that names a ROW**
+    /// (`on_desk_shape_change`): a drag reorder, its undo and a removal
+    /// each leave none standing, because each was aimed at a row that
+    /// holds another track, or none, the moment after.
+    #[test]
+    fn a_structural_edit_lets_go_of_the_aims_that_name_rows() {
+        let mut app = desk();
+        aim(&mut app);
+        assert_eq!(still_aimed(&app).len(), 16, "fixture: {:?}", still_aimed(&app));
+        app.move_channel(3, 0);
+        assert!(still_aimed(&app).is_empty(), "a reorder left {:?}", still_aimed(&app));
+        aim(&mut app);
+        app.undo();
+        assert!(still_aimed(&app).is_empty(), "an undo across a reorder left {:?}", still_aimed(&app));
+        aim(&mut app);
+        app.remove_channel(2);
+        assert!(still_aimed(&app).is_empty(), "a removal left {:?}", still_aimed(&app));
+    }
+
+    /// The body of `fn <name>` in `src`, brace-matched.
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("no fn {name}"));
+        let open = at + src[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} never closes")
+    }
+
+    /// **Every structural edit lets the row aims go, and none carries what
+    /// names a track** (design 4). The reorder that every move, insert,
+    /// grouping and folder drag goes through, a removal, an undo, and the
+    /// two roads into another document call `on_desk_shape_change`; and
+    /// neither the reorder, the lane it opens for an insert, nor an undo
+    /// mentions any field keyed by a track, so a hand-written remap cannot
+    /// come back without failing here.
+    #[test]
+    fn structural_edits_let_row_aims_go_and_carry_no_track_state() {
+        let src = include_str!("app.rs");
+        for f in ["reorder_channels", "remove_channel_inner", "undo_apply", "inhabit_document", "reopen_remembered_project"] {
+            assert!(
+                body_of(src, f).contains("self.on_desk_shape_change();"),
+                "fn {f} changes the desk's shape and lets no row aim go"
+            );
+        }
+        let keyed = [
+            "selected_channel", "selected_tracks", "sel_anchor", "drumpad_lane", "drumpad_kits",
+            "arr_auto_open", "arr_auto_armed", "arr_auto_bypassed", "arr_auto_focus", "arr_auto_modes",
+            "arr_auto_latched", "arr_auto_last", "auto_clipboard_from", "auto_clipboard_rows",
+            "track_clipboard", "insert_state_copy", "carry_automation_rows",
+        ];
+        for f in ["reorder_channels", "open_lane_below", "undo_apply"] {
+            let body = body_of(src, f);
+            for field in keyed {
+                // The kits are document state as well as keyed by track: an
+                // undo puts the moment's back, which is a restore, not a carry.
+                if f == "undo_apply" && field == "drumpad_kits" {
+                    continue;
+                }
+                assert!(
+                    !body.contains(&format!("self.{field}")),
+                    "fn {f} touches `{field}`, which is keyed by track and needs no carrying"
+                );
+            }
+        }
+    }
+
+    // ── the classification scan ──────────────────────────────────────────
+
+    /// **How a lane-shaped `TangentApp` field answers a structural edit**
+    /// (design 4's three classes, and the seat-keyed list it hands to W5).
+    #[derive(Clone, Copy, Debug)]
+    enum Class {
+        /// (a) Keyed by identity: its type names a track or node identity
+        /// (or is a struct of this file whose body does), so no structural
+        /// edit has to carry it.
+        Identity,
+        /// (b) Let go, or rebuilt, by `on_desk_shape_change`, whose body
+        /// must hold this text.
+        Shape(&'static str),
+        /// (c) Not a lane - or one that cannot outlive the gesture, the
+        /// frame or the modal it was set in - and the one-line reason.
+        Exempt(&'static str),
+        /// A SEAT index on design 4's list of seat-keyed fields, keyed by
+        /// `SeatBay` in W5-identity-maps; what it is, and why it holds until
+        /// then.
+        SeatW5(&'static str),
+    }
+
+    use Class::{Exempt, Identity, SeatW5, Shape};
+
+    /// **Every field of `TangentApp` whose type could carry a lane or a
+    /// seat**, and its class. A field whose type names nothing but plain
+    /// values (`bool`, floats, strings, rects, times) and the containers
+    /// around them is not listed; anything else - an integer, a type of
+    /// this crate - is, or the scan fails and names it.
+    const LANE_FIELDS: &[(&str, Class)] = &[
+        // ── (a) keyed by identity ─────────────────────────────────────
+        ("arr_auto_open", Identity),
+        ("arr_auto_armed", Identity),
+        ("arr_auto_bypassed", Identity),
+        ("arr_auto_hot", Identity),
+        ("arr_auto_sel", Identity),
+        ("arr_auto_nodes", Identity),
+        ("auto_clipboard_rows", Identity),
+        ("auto_clipboard_from", Identity),
+        ("arr_auto_focus", Identity),
+        ("arr_auto_modes", Identity),
+        ("arr_auto_latched", Identity),
+        ("arr_auto_last", Identity),
+        ("drumpad_kits", Identity),
+        ("drumpad_lane", Identity),
+        ("track_clipboard", Identity),
+        ("insert_state_copy", Identity),
+        ("rows_closed_since_moment", Identity),
+        ("selected_channel", Identity),
+        ("selected_tracks", Identity),
+        ("sel_anchor", Identity),
+        ("default_bank", Identity),
+        ("cartridge_pick_strip", Identity),
+        // ── (b) let go by `on_desk_shape_change` ─────────────────────────
+        ("input_menu", Shape("self.input_menu = None;")),
+        ("mixer_naming", Shape("self.mixer_naming = None;")),
+        ("mixer_typing", Shape("self.mixer_typing = None;")),
+        ("mixer_fx_menu", Shape("self.mixer_fx_menu = None;")),
+        ("mixer_grab", Shape("self.mixer_grab = None;")),
+        ("mixer_reorder", Shape("self.mixer_reorder = None;")),
+        ("arr_drag", Shape("self.arr_drag = None;")),
+        ("arr_auto_drag_from", Shape("self.arr_auto_drag_from = None;")),
+        ("arr_pending", Shape("self.arr_pending = None;")),
+        ("arr_drop", Shape("self.arr_drop = None;")),
+        ("arr_move_orig", Shape("self.arr_move_orig.clear();")),
+        ("arr_stretch_orig", Shape("self.arr_stretch_orig.clear();")),
+        ("pedal_stack", Shape("self.pedal_stack = None;")),
+        ("click_moment", Shape("self.click_moment = None;")),
+        ("a11y_on", Shape("self.a11y_on = None;")),
+        ("meter_hold", Shape("self.meter_hold = [[0.0; 2]; recorder::STRIPS];")),
+        ("route_labels", Shape("self.refresh_route_labels();")),
+        // ── the seat-keyed fields design 4 lists for W5 ──────────────────
+        ("fx_params", SeatW5("each strip's bays' parameters, pushed by the host by strip")),
+        ("builtin_faces", SeatW5("a built-in's face, by (seat, bay)")),
+        ("builtin_faces_live", SeatW5("the automation's reading of an open face, by (seat, bay)")),
+        ("pending_inserts", SeatW5("knob edits awaiting their echo, by (seat, bay, id)")),
+        ("insert_gr", SeatW5("a compressor's meter, by (seat, bay)")),
+        ("sampler_info", SeatW5("a sampler's file facts, by lane")),
+        ("sampler_load", SeatW5("samples chosen for (seat, bay), queued for the host")),
+        ("preset_sample", SeatW5("a sampler preset's file, held a frame, by (seat, bay)")),
+        ("fx_clipboard", SeatW5("the bay an effect was copied from")),
+        ("open_insert_on_load", SeatW5("the bay whose face opens on its load; a reorder moves it")),
+        ("picker_insert", SeatW5("the bay the picker is filling; a reorder moves it")),
+        ("bay_carry", SeatW5("a bay in a hand, (strip, bay)")),
+        ("arr_fx_menu", SeatW5("a header bay's menu, (lane, bay)")),
+        ("patch_audition", SeatW5("the strip a DX7 patch sounds on")),
+        (
+            "dialog",
+            SeatW5(
+                "InsertFace and InsertKeySource name a seat (W5 keys them by bay); every other \
+                 variant that names a lane is modal, so no edit moves the desk under it",
+            ),
+        ),
+        // ── (c) not a lane, or not one that can outlive its moment ───────
+        ("settings", Exempt("the desk model itself, rewritten in step by every structural edit")),
+        ("detector", Exempt("the chord detector: pitches")),
+        ("license", Exempt("the licence store")),
+        ("forced_free_cap", Exempt("a count of tracks a test forces")),
+        ("midi_tx", Exempt("note events: pitches and velocities")),
+        ("midi_rx", Exempt("note events: pitches and velocities")),
+        ("ports", Exempt("the MIDI port enumerator")),
+        ("audio_devices", Exempt("the audio device enumerator")),
+        ("audio_setup", Exempt("the audio system's questions")),
+        ("cameras", Exempt("the camera enumerator")),
+        ("caps", Exempt("what the host permits")),
+        ("wheel_mixer_zoom", Exempt("wheel intent, in points")),
+        ("wheel_arr_zoom", Exempt("wheel intent, in points")),
+        ("wheel_media", Exempt("wheel intent, in points")),
+        ("auto_clipboard", Exempt("copied points' times and values; their rows are `auto_clipboard_rows`")),
+        ("arr_tempo_hot", Exempt("a tempo point's index")),
+        ("arr_tempo_drag", Exempt("a tempo point's index")),
+        ("arr_tempo_drag_from", Exempt("the tempo map at a drag's press")),
+        ("pending_reset", Exempt("a reset's scope")),
+        ("pending_undo_reset", Exempt("a reset's scope")),
+        ("scratch_warning", Exempt("what the host found in a scratch")),
+        ("manual_barre", Exempt("a barre, by string and fret")),
+        ("barre_drag", Exempt("a string and a fret")),
+        ("notes", Exempt("the notes held, by pitch")),
+        ("manual_notes", Exempt("pitches")),
+        ("manual_positions", Exempt("pitch to string and fret")),
+        ("voicing", Exempt("the fretboard's solver")),
+        ("recorder", Exempt("the band's picture, pushed whole by the host every frame by today's rows")),
+        (
+            "recorder_request",
+            Exempt("requests the host drains after the frame that queued them, before another gesture can move a row"),
+        ),
+        ("dir_request", Exempt("a folder request")),
+        ("arr_lane_scroll", Exempt("a scroll offset into the shown order, not a track: the view stays where it was")),
+        ("decor_remax", Exempt("a frame countdown")),
+        ("konami", Exempt("the code's progress")),
+        ("swing_menu", Exempt("the swing menu's place and field")),
+        ("arrangement", Exempt("the document: its clips and curves carry lanes every structural edit rewrites")),
+        ("save_request", Exempt("a save panel request")),
+        ("midi_export", Exempt("clip ids")),
+        ("project_request", Exempt("a project action for the host")),
+        ("input_chip_key", Exempt("a hash of the settings")),
+        ("media_entries", Exempt("the media explorer's rows")),
+        ("media_scroll", Exempt("the media explorer's scroll")),
+        ("media_drag", Exempt("a media explorer row")),
+        ("media_sel", Exempt("a media explorer row")),
+        ("midi_edit", Exempt("the MIDI editor, open on a clip by its id")),
+        ("drumpad_sel", Exempt("a pad's key")),
+        ("drumpad_down", Exempt("a pad's key")),
+        ("drumpad_grab", Exempt("a pad knob in a hand")),
+        ("drumpad_hover", Exempt("a pad's key")),
+        ("drumpad_status", Exempt("per pad of the panel's kit")),
+        ("drumpad_peaks", Exempt("per pad of the panel's kit")),
+        ("arr_selected", Exempt("a clip id")),
+        ("pad_menu", Exempt("a pad's key")),
+        ("pad_carry", Exempt("a pad's key")),
+        ("drumpad_num", Exempt("a pad knob being typed")),
+        (
+            "desk_state_perm",
+            Exempt("a permutation - the move itself - for the host to carry plugins by; it names no track (W6 deletes it)"),
+        ),
+        (
+            "perm_since_moment",
+            Exempt("a permutation - the move itself - kept for the moment; it names no track (W6 deletes it)"),
+        ),
+        ("arr_multi", Exempt("clip ids")),
+        ("arr_sel_seen", Exempt("clip ids")),
+        ("arr_clip_menu", Exempt("a clip id")),
+        ("arr_flag_menu", Exempt("a marker")),
+        ("arr_marker_sel", Exempt("a marker's index")),
+        ("desk_index", Exempt("the desk's shape, cached and rebuilt from the desk whenever it changes")),
+        ("desk_index_gen", Exempt("a generation")),
+        ("history", Exempt("whole moments, each applied whole")),
+        ("saved_state", Exempt("the saved moment's words")),
+        ("pending_after_save", Exempt("what follows a save prompt")),
+        ("hist_at", Exempt("an index into the history")),
+        ("note_clipboard", Exempt("copied notes")),
+        ("clip_clipboard", Exempt("copied clips: their lanes are a relative layout a paste re-lanes")),
+        ("dialog_serial", Exempt("a counter")),
+        ("view_committed", Exempt("the view, the feel and the view on show")),
+        ("undo_hold", Exempt("a count of held batches")),
+        ("clip_infos", Exempt("clip pictures, by clip id")),
+        ("clip_marks", Exempt("attack marks, by clip id")),
+        ("file_request", Exempt("a file panel request")),
+        ("browsed_file", Exempt("a browsed file")),
+        ("browsed_dir", Exempt("a browsed folder")),
+        ("export_project_spec", Exempt("the export dialog's spec")),
+        ("scope", Exempt("the oscilloscope's ring")),
+        ("analyzer", Exempt("the analyzer")),
+        ("click_pass", Exempt("a frame pass")),
+        ("tapring", Exempt("the insert tap's ring")),
+        ("menu_cache_key", Exempt("an interface's name and width")),
+        ("menu_hover_row", Exempt("a menu row")),
+        ("menu_hover_top", Exempt("a menu row")),
+        ("lcd_drag", Exempt("an LCD cell")),
+        ("input_width", Exempt("the open input's channel count")),
+        ("cartridge", Exempt("the loaded cartridge's names")),
+        ("preset_rows", Exempt("preset files, by unit")),
+        ("preset_loaded", Exempt("a preset's values, by unit")),
+        ("ir_rows", Exempt("the IR shelf")),
+        ("ir_scan_gen", Exempt("a generation")),
+        ("sampler_scan_gen", Exempt("a generation")),
+        ("ir_live", Exempt("the IR wizard's picture")),
+        ("export_override", Exempt("an export spec")),
+        ("settings_writes", Exempt("a test's count")),
+        ("desk_index_gathers", Exempt("a test's count")),
+        ("grabbed", Exempt("a band control: the band has no rows")),
+        ("audio_status", Exempt("the streams' status")),
+        ("setup_shape", Exempt("a panel's shape")),
+        ("dbg_fret_last", Exempt("frets")),
+        ("messages", Exempt("notifications")),
+        ("pressed_on", Exempt("where a press landed")),
+        ("fx_open", Exempt("a band effect's panel")),
+        ("fx_defaults", Exempt("effect defaults")),
+        ("export_progress", Exempt("a render's progress")),
+        ("surface_cover", Exempt("the busy cover")),
+        ("device_outs", Exempt("an output count")),
+        ("device_send_status", Exempt("the device send's status")),
+        ("device_send_asks", Exempt("a count")),
+        ("sounding", Exempt("pitches")),
+        ("clicked", Exempt("pitches")),
+        ("clicked_position", Exempt("a pitch, a string and a fret")),
+        ("ring", Exempt("pitches")),
+        ("ringing", Exempt("pitches")),
+        ("num_edit", Exempt("a band number or a marker's name being typed")),
+        ("menu_state", Exempt("the app menu, whose rows name no lane")),
+        ("track", Exempt("the backing track")),
+        ("pending_welcome", Exempt("only ever the Welcome card")),
+        ("monitor_saved", Exempt("a monitor's width")),
+        ("host_gesture", Exempt("what the host sees of a gesture")),
+        ("snap_refusals", Exempt("a count")),
+        ("inner_size_sends", Exempt("a count")),
+    ];
+
+    /// **The identities a key can be.** A field of class (a) names one of
+    /// these in its type, or is a struct of this file whose body does.
+    const IDENTITIES: [&str; 6] = ["TrackId", "Node", "SeatBay", "SeatKey", "AutoRow", "TrackKits"];
+
+    /// **The seat-keyed fields design 4 hands to W5** ("Seat-keyed fields
+    /// from W5"), the only ones `SeatW5` may name, and the dialog whose
+    /// InsertFace key W5's own file list names.
+    const W5_SEATS: [&str; 15] = [
+        "fx_params", "builtin_faces", "builtin_faces_live", "pending_inserts", "insert_gr",
+        "sampler_info", "sampler_load", "preset_sample", "fx_clipboard", "insert_state_copy",
+        "open_insert_on_load", "picker_insert", "bay_carry", "arr_fx_menu", "patch_audition",
+    ];
+
+    /// **Type names that cannot carry a lane or a seat**: plain values and
+    /// the containers and paths around them. Integers are NOT here: an
+    /// integer is exactly what a lane is.
+    const PLAIN: [&str; 25] = [
+        "bool", "f32", "f64", "String", "str", "Instant", "Duration", "Rect", "Pos2", "Vec2",
+        "Color32", "PathBuf", "Option", "Vec", "HashSet", "HashMap", "BTreeSet", "BTreeMap",
+        "VecDeque", "Cell", "RefCell", "Arc", "Box", "dyn", "static",
+    ];
+
+    /// The module paths a type may be spelled through; never a type.
+    const PATHS: [&str; 10] = ["std", "crate", "collections", "cell", "sync", "path", "time", "egui", "mpsc", "self"];
+
+    /// **`TangentApp`'s fields**, `(name, type)`, from its source: the body
+    /// of the struct, comments and attributes skipped, each field ending at
+    /// its comma.
+    fn tangent_app_fields(src: &str) -> Vec<(String, String)> {
+        let start = src.find("pub struct TangentApp {").expect("the struct");
+        let open = start + src[start..].find('{').expect("its body");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        let mut field = String::new();
+        for line in src[open + 1..end].lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+                continue;
+            }
+            field.push(' ');
+            field.push_str(line);
+            if line.ends_with(',') {
+                let text = field.trim().trim_end_matches(',');
+                if let Some((name, ty)) = text.split_once(':') {
+                    out.push((name.trim().to_owned(), ty.trim().to_owned()));
+                }
+                field.clear();
+            }
+        }
+        out
+    }
+
+    /// The identifiers a type is spelled with.
+    fn words(ty: &str) -> Vec<&str> {
+        ty.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty() && !w.starts_with(|c: char| c.is_ascii_digit()))
+            .collect()
+    }
+
+    /// The body of `struct <name>` in `src`, when this file defines one.
+    fn struct_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = src.find(&format!("\nstruct {name} {{"))?;
+        let open = at + src[at..].find('{')?;
+        let close = open + src[open..].find("\n}")?;
+        Some(&src[open..close])
+    }
+
+    /// **Every problem the scan finds in `src`**: an unclassified
+    /// lane-shaped field, an entry naming no field, an identity field whose
+    /// type names no identity, a shape field `on_desk_shape_change` does not
+    /// let go, a reason left empty, a seat field off W5's list.
+    fn classify(src: &str) -> Vec<String> {
+        let fields = tangent_app_fields(src);
+        let shape = body_of(src, "on_desk_shape_change");
+        let mut problems = Vec::new();
+        for (name, ty) in &fields {
+            let plain = words(ty).iter().all(|w| PLAIN.contains(w) || PATHS.contains(w));
+            if !plain && !LANE_FIELDS.iter().any(|(n, _)| n == name) {
+                problems.push(format!(
+                    "`{name}: {ty}` can carry a lane or a seat and has no class in LANE_FIELDS: \
+                     key it by identity, let `on_desk_shape_change` clear it, or say why it is \
+                     not a lane"
+                ));
+            }
+        }
+        for (name, class) in LANE_FIELDS {
+            let Some((_, ty)) = fields.iter().find(|(n, _)| n == name) else {
+                problems.push(format!("LANE_FIELDS names `{name}`, which TangentApp no longer has"));
+                continue;
+            };
+            match class {
+                Identity => {
+                    let named = |text: &str| words(text).iter().any(|w| IDENTITIES.contains(w));
+                    let through_struct = words(ty)
+                        .iter()
+                        .filter_map(|w| struct_body(src, w))
+                        .any(named);
+                    if !named(ty) && !through_struct {
+                        problems.push(format!("`{name}: {ty}` is called identity-keyed and names no identity"));
+                    }
+                }
+                Shape(text) => {
+                    if !shape.contains(text) {
+                        problems.push(format!("`{name}` is let go by `on_desk_shape_change`, which lacks `{text}`"));
+                    }
+                }
+                Exempt(why) | SeatW5(why) if why.trim().is_empty() => {
+                    problems.push(format!("`{name}` is exempt without a reason"));
+                }
+                SeatW5(_) if *name != "dialog" && !W5_SEATS.contains(name) => {
+                    problems.push(format!("`{name}` is not on design 4's list of seat-keyed fields for W5"));
+                }
+                Exempt(_) | SeatW5(_) => {}
+            }
+        }
+        problems
+    }
+
+    /// **Every lane-shaped field of `TangentApp` has a class** (design 4,
+    /// W4-lane-refs): keyed by identity, let go by `on_desk_shape_change`,
+    /// or not a lane with the reason written down; and the seat-keyed ones
+    /// design 4 hands to W5 are on its list.
+    #[test]
+    fn every_lane_shaped_field_of_the_app_has_a_class() {
+        let problems = classify(include_str!("app.rs"));
+        assert!(problems.is_empty(), "the classification scan:\n  {}", problems.join("\n  "));
+    }
+
+    /// **The scan bites** (its revert check, kept): a field planted with a
+    /// lane in its type and no class fails it by name; so does a class that
+    /// names a field no longer there, an identity-keyed field turned back
+    /// into a lane, and a shape field `on_desk_shape_change` stops clearing.
+    #[test]
+    fn the_classification_scan_fails_a_planted_lane() {
+        let src = include_str!("app.rs");
+        let planted = src.replacen(
+            "pub struct TangentApp {",
+            "pub struct TangentApp {\n    planted_lane: Option<usize>,",
+            1,
+        );
+        let found = classify(&planted);
+        assert!(
+            found.iter().any(|p| p.contains("`planted_lane: Option<usize>`")),
+            "a planted unclassified lane passed the scan: {found:?}"
+        );
+        let gone = src.replacen("    sel_anchor: Option<crate::desk_id::TrackId>,\n", "", 1);
+        assert!(
+            classify(&gone).iter().any(|p| p.contains("`sel_anchor`, which TangentApp no longer has")),
+            "a stale entry passed the scan"
+        );
+        let positional = src.replacen(
+            "    sel_anchor: Option<crate::desk_id::TrackId>,",
+            "    sel_anchor: Option<usize>,",
+            1,
+        );
+        assert!(
+            classify(&positional).iter().any(|p| p.contains("`sel_anchor: Option<usize>` is called identity-keyed")),
+            "a lane in an identity field passed the scan"
+        );
+        let kept = src.replacen("        self.pedal_stack = None;\n", "", 1);
+        assert!(
+            classify(&kept).iter().any(|p| p.contains("`pedal_stack` is let go")),
+            "a shape field the change no longer clears passed the scan"
+        );
     }
 }
