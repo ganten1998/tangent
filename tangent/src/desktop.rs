@@ -8722,10 +8722,10 @@ impl DesktopApp {
                         self.ir.reference = None;
                         self.ir.live.has_reference = false;
                         self.ir.live.capturing = false;
-                        self.ir.live.phase = "capture dropped — try again".to_owned();
+                        self.ir.live.phase = "capture dropped; try again".to_owned();
                         refused = Some(format!(
                             "IR capture: the interface dropped {slipped} frames mid-sweep, \
-                             which smears the result — nothing was kept. Try a larger audio \
+                             which smears the result, so nothing was kept. Try a larger audio \
                              buffer, or use the same device for input and output."
                         ));
                     } else if p.reference {
@@ -8846,7 +8846,7 @@ impl DesktopApp {
                     if outcome.tail_range_db < crate::units::sweep::TRUSTWORTHY_RANGE_DB {
                         warned = Some(format!(
                             "IR capture: only {:.0} dB between the return's peak \
-                             ({:.0} dBFS) and the loop's floor ({:.0} dBFS) — the tail \
+                             ({:.0} dBFS) and the loop's floor ({:.0} dBFS): the tail \
                              is cut inside the decay, so this IR is shorter than the \
                              box. Raise the send level, or the unit's output.",
                             outcome.tail_range_db,
@@ -10248,7 +10248,7 @@ impl DesktopApp {
         }
         let Some(e) = self.recorder.engine.as_ref() else {
             self.app
-                .notify(Kind::Error, "Open the band to record — the audio path is closed.");
+                .notify(Kind::Error, "Open the band to record: the audio path is closed.");
             return;
         };
         if self.app.project_doc().is_none() {
@@ -10260,10 +10260,10 @@ impl DesktopApp {
             self.app.notify(
                 Kind::Error,
                 if armed_unbound {
-                    "The armed channel has NO INPUT — its strip's input menu names \
+                    "The armed channel has NO INPUT: its strip's input menu names \
                      what it records."
                 } else {
-                    "Nothing is armed — R on a channel is what records it."
+                    "Nothing is armed: R on a channel is what records it."
                 },
             );
             return;
@@ -10629,7 +10629,7 @@ impl DesktopApp {
         }
         if self.recorder.engine.is_none() {
             self.app
-                .notify(Kind::Error, "Open the band to export — the audio path is closed.");
+                .notify(Kind::Error, "Open the band to export: the audio path is closed.");
             refuse!();
         }
         let (from_s, until_s) = match span {
@@ -10638,7 +10638,7 @@ impl DesktopApp {
         };
         if until_s <= from_s + 2.0 && self.app.arr_span_s() <= 0.0 {
             self.app
-                .notify(Kind::Error, "Nothing to export — the timeline is empty.");
+                .notify(Kind::Error, "Nothing to export: the timeline is empty.");
             refuse!();
         }
         let root = self.app.record_root();
@@ -10661,7 +10661,7 @@ impl DesktopApp {
         self.app.notify_raise(
             EXPORT_RUNNING,
             Kind::Info,
-            "Exporting — a real pass from the top…",
+            "Exporting: a real pass from the top…",
         );
         // **The pass's own placement, not the last press's.** `begin`
         // latches the facts pushed at the top of this frame - the playhead
@@ -11105,7 +11105,7 @@ impl DesktopApp {
         };
         if span <= 0.0 {
             self.app
-                .notify(Kind::Error, "Nothing to export — the timeline is empty.");
+                .notify(Kind::Error, "Nothing to export: the timeline is empty.");
             refuse!();
         }
         let out_dir = if freeze.is_some() {
@@ -11916,7 +11916,7 @@ impl DesktopApp {
                 self.app.notify(
                     if moved > 0 { Kind::Success } else { Kind::Error },
                     if attacks == 0 {
-                        "nothing to quantize — no attacks found".to_owned()
+                        "nothing to quantize: no attacks found".to_owned()
                     } else {
                         format!("quantized {moved} of {attacks} attacks")
                     },
@@ -28322,7 +28322,8 @@ mod tests {
     #[test]
     fn an_armed_input_waiting_on_its_chain_holds_the_room_shut() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, INSERTS};
+        use tangent_ui::recorder::{AMP_PEDALS, INSERTS};
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let armed_on = |ch: usize| 1u32 << ch;
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
@@ -28392,7 +28393,7 @@ mod tests {
     #[test]
     fn the_mics_wait_for_their_folders_denoiser_and_never_for_the_piano() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::folder_extra_seat;
+        use tangent_ui::desk_legacy::folder_extra_seat;
         let armed = 1u32 << 2 | 1 << 4 | 1 << 6;
         let audio = |ch: usize| matches!(ch, 0 | 4 | 6 | 7);
         let mut parents = [-1i32; CHANNELS];
@@ -28452,7 +28453,8 @@ mod tests {
     #[test]
     fn an_armed_inputs_chain_is_the_racks_its_audio_meets() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip};
+        use tangent_ui::recorder::Strip;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
         let no_routes = |_: usize| 0u32;
@@ -29220,7 +29222,7 @@ mod tests {
     #[test]
     fn a_shelved_state_is_its_bays_wherever_the_row_goes() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat};
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let master = tangent_ui::desk_lift::V32_MASTER;
         let ids = tangent_ui::desk_legacy::identity_ids(CHANNELS);
         let at = |ids: &[tangent_ui::desk_id::TrackId], seat: usize| {
@@ -37623,14 +37625,14 @@ pub fn denoise_test(arg: Option<String>) {
         crate::units::denoise::DenoiseLearn::Taught => {}
         crate::units::denoise::DenoiseLearn::Silent => {
             eprintln!(
-                "learn:    REFUSED — that region is digital silence, not room tone. The \
+                "learn:    REFUSED. That region is digital silence, not room tone. The \
                  profile in force is whatever was there before (here: nothing), so the run \
                  below is a wire. Name a region with the room in it: ,learn=A-B"
             );
         }
         crate::units::denoise::DenoiseLearn::TooShort => {
             eprintln!(
-                "learn:    REFUSED — that region is shorter than the minimum learn pass. \
+                "learn:    REFUSED. That region is shorter than the minimum learn pass. \
                  The run below is a wire."
             );
         }

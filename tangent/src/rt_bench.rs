@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tangent_record::audio::Timebase;
-use tangent_ui::recorder::Desk;
+use tangent_ui::desk_legacy::V32Desk as Desk;
 
 use crate::builtin_fx::{
     ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH, IR_PATH,
@@ -1666,7 +1666,7 @@ fn a_desk_of_folders_is_the_same_grained() {
                     .unwrap_or_else(|| panic!("{path} loaded but bay {bay} reports no tenant"));
             }
         }
-        let mut parents = [-1i32; crate::instrument::CHANNELS];
+        let mut parents = [-1i32; crate::instrument::LEGACY_LANES];
         for child in 1..=children {
             parents[child] = 0;
         }
@@ -1894,7 +1894,7 @@ fn a_lane_with_a_tail_insert_is_the_same_grained() {
         let mut e = audio_desk(with_clips, head);
         if let Some(unit) = tail {
             for lane in 0..lanes {
-                let seat = tangent_ui::recorder::folder_extra_seat(lane);
+                let seat = tangent_ui::desk_legacy::folder_extra_seat(lane);
                 e.load_insert(seat, 0, Some(Path::new(unit)), None)
                     .unwrap_or_else(|err| panic!("{unit} did not load into the tail of lane {lane}: {err}"))
                     .unwrap_or_else(|| panic!("{unit} loaded but the tail bay reports no tenant"));
@@ -2827,7 +2827,7 @@ fn the_pins_that_arrive_mid_roll_do_not_re_run_a_rack() {
         (
             "punched",
             |e, on| {
-                let mut p = [None; crate::instrument::CHANNELS];
+                let mut p = [None; crate::instrument::LEGACY_LANES];
                 if on {
                     p[0] = Some(u64::from(BLOCK as u32) * 150);
                     p[1] = Some(u64::from(BLOCK as u32) * 150);

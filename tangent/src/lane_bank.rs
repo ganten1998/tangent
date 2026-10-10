@@ -239,8 +239,6 @@ pub struct Spine<L, X = ()> {
     pub desk: DeskBuffers,
     /// Scratch for plan validation, one bit per slot, always left empty.
     pub check: LaneSet,
-    /// Per-chunk rank scratch, capacity long, for the walks W3 moves here.
-    pub rank_scratch: Vec<u32>,
     pub monitor: Option<Box<MonitorPlan>>,
     /// One capture ring per pick, by `PickId`.
     pub captures: Vec<Option<Producer<f32>>>,
@@ -255,7 +253,10 @@ pub type SpineShell<L, X = ()> = Spine<L, X>;
 
 impl<L, X: Default> Spine<L, X> {
     /// A spine with room for `lanes` lanes and `picks` capture picks, all of
-    /// it allocated here, on the host, so the callback never has to.
+    /// it allocated here, on the host, so the callback never has to. The
+    /// engine builds its spine with its own tables ([`Spine::with_ext`]);
+    /// this bare one is the tests'.
+    #[cfg(test)]
     pub fn with_capacity(lanes: usize, picks: usize) -> Self {
         Self::with_ext(lanes, picks, X::default())
     }
@@ -270,7 +271,6 @@ impl<L, X> Spine<L, X> {
             gens: vec![0; lanes],
             desk: DeskBuffers::with_capacity(lanes),
             check: LaneSet::with_capacity(lanes),
-            rank_scratch: vec![0; lanes],
             monitor: None,
             captures: (0..picks).map(|_| None).collect(),
             capturing: LaneSet::with_capacity(picks),
@@ -284,7 +284,9 @@ impl<L, X> Spine<L, X> {
 }
 
 impl<L: SpineLane, X> Spine<L, X> {
-    /// [`claim_lane`] over this spine's lanes.
+    /// [`claim_lane`] over this spine's lanes: the tests' road to the claim
+    /// stamp, which the renderer's fork takes through `claim_lane` itself.
+    #[cfg(test)]
     pub fn claim(&self, slot: Slot, gen: u32, round: u64) -> Option<&L> {
         claim_lane(&self.lanes, slot, gen, round)
     }

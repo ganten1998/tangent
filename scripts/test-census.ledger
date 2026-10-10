@@ -1,0 +1,15 @@
+# Late census ledgers: see the header of scripts/test-census.sh.
+#
+# One line per test a commit removed, for commits already in history whose
+# own message carries no ledger the census can read. The full hash keys each
+# line to the one commit it answers for.
+
+# 8f41d5b "the desk is the list of rows that exist, and every edit to it is
+# one of four" (W6-rows-unlimited). Its body listed these under "Census
+# (removed -> replacement)", each entry wrapped over two lines, which the
+# census never matched; the same five, one per line.
+8f41d5b945f5180b2a9a8d9f5572ff5d9c564f1b census(tangent-ui): app undo_and_redo_of_a_reorder_hand_the_host_the_permutation -> undo_and_redo_of_an_insert_keep_every_bay_on_its_track
+8f41d5b945f5180b2a9a8d9f5572ff5d9c564f1b census(tangent-ui): desk_format every_era_fixture_returns_its_dense_desk_through_format_2 -> desk_model a_dense_desk_round_trips_whole and desk_format every_era_fixture_is_its_literal_desk
+8f41d5b945f5180b2a9a8d9f5572ff5d9c564f1b census(tangent-ui): desk_model a_desk_past_thirty_two_rows_has_no_dense_shape -> the_model_holds_rows_past_the_legacy_width
+8f41d5b945f5180b2a9a8d9f5572ff5d9c564f1b census(tangent-ui): settings a_short_desk_at_a_spent_counter_pads_with_distinct_ids -> a_short_desk_at_a_spent_counter_reads_as_its_own_rows
+8f41d5b945f5180b2a9a8d9f5572ff5d9c564f1b census(tangent): engine_bridge a_row_bit_is_its_own_or_none -> a_row_past_the_old_words_carries_its_own_flags

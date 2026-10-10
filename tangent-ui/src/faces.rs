@@ -1745,7 +1745,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
         (Some(path), true) => IrMenuRow {
             label: "Delete".to_owned(),
             live: true,
-            tip: format!("{path}\n\nremove this file from the disk — there is no undo"),
+            tip: format!("{path}\n\nremove this file from the disk; there is no undo"),
             ask: Some(IrMenuAsk::Delete {
                 path: path.clone(),
                 loaded: ir_same(&path, loaded),
@@ -1753,7 +1753,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
         },
         (Some(_), false) => dead(
             "Delete",
-            "Tangent only deletes inside its own IRs folder — copy this\n\
+            "Tangent only deletes inside its own IRs folder: copy this\n\
              impulse home first if you want to manage it here",
         ),
         (None, _) => dead("Delete", "right-click an impulse to delete it"),
@@ -1781,7 +1781,7 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
             // be opened over a folder row — so "this folder" is exactly the
             // word somebody would read as the one they right-clicked.
             tip: format!(
-                "{}\n\nput a copy in {} — a name already there is never\n\
+                "{}\n\nput a copy in {}. A name already there is never\n\
                  written over: the copy is numbered and the app says which\n\
                  name it got",
                 live.ir_clip,
@@ -1789,10 +1789,10 @@ pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMe
             ),
             ask: Some(IrMenuAsk::Paste { into: menu.dir.clone() }),
         },
-        (true, _) => dead("Paste", "nothing copied yet — Copy an impulse first"),
+        (true, _) => dead("Paste", "nothing copied yet: Copy an impulse first"),
         (false, false) => dead(
             "Paste",
-            "Tangent only writes inside its own IRs folder — walk home\n\
+            "Tangent only writes inside its own IRs folder: walk home\n\
              with the IRs chip and paste there",
         ),
     };
@@ -1861,7 +1861,7 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     if l.name.is_positive() {
         face::lcd_glass(ui.painter(), l.name, st);
         let shown = if loaded.is_empty() {
-            "no impulse loaded — click to load one".to_owned()
+            "no impulse loaded: click to load one".to_owned()
         } else {
             std::path::Path::new(&loaded)
                 .file_stem()
@@ -2054,7 +2054,7 @@ fn draw_ir_browser(
         l.browse_up,
         "..",
         "ir-up",
-        "up one folder — the browser goes anywhere on disk",
+        "up one folder: the browser goes anywhere on disk",
         parent != live.ir_dir,
     ) {
         live.ir_dir = parent;
@@ -2070,7 +2070,7 @@ fn draw_ir_browser(
         l.browse_home,
         "IRs",
         "ir-home",
-        "back to the IRs folder — where the Wizard saves and where this opens",
+        "back to the IRs folder, where the Wizard saves and where this opens",
         !at_root && !live.ir_root.is_empty(),
     ) {
         live.ir_dir = live.ir_root.clone();
@@ -2167,7 +2167,7 @@ fn draw_ir_browser(
                     ui.painter(),
                     r.width() - 10.0,
                     if at_root {
-                        "no impulses here yet — the Wizard fills this folder"
+                        "no impulses here yet: the Wizard fills this folder"
                     } else {
                         "no impulses in this folder"
                     },

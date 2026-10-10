@@ -111,12 +111,15 @@ impl LaneSet {
 
     /// Today's `u32` lane mask, as a set of one word. The bridge from the
     /// masks this type replaces, so a walk can be moved over one mask at a
-    /// time and proven bit-exact at each step.
+    /// time and proven bit-exact at each step. The walks are all moved, so
+    /// only the tests that build a set from a word still ask for one.
+    #[cfg(test)]
     pub fn from_u32(mask: u32) -> Self {
         Self::from_u64(u64::from(mask))
     }
 
-    /// Today's `u64` strip mask, as a set of one word.
+    /// Today's `u64` strip mask, as a set of one word. Tests only, as above.
+    #[cfg(test)]
     pub fn from_u64(mask: u64) -> Self {
         Self {
             words: vec![mask].into_boxed_slice(),

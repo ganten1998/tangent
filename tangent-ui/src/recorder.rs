@@ -1285,21 +1285,6 @@ pub fn bays_on(strip: Option<Strip>) -> usize {
     }
 }
 
-/// **The seat map's old names, retired to `desk_legacy` (W5).**
-///
-/// The app names every plugin bay by identity (`desk_id::SeatBay`) and
-/// works out no seat, so the map is the frozen legacy one and lives with the
-/// rest of it. These names stay re-exported for the readers that still
-/// speak it by this path: the engine's legacy shims and its tests, the
-/// host's tests, the render goldens. Each lane that moves its last reader
-/// off a name deletes it here; no live code in this crate may name one
-/// (`no_live_code_works_out_a_seat` holds that).
-pub use crate::desk_legacy::{
-    amp_pedal_of, amp_pedal_seat, bus_extra_of, bus_extra_seat, folder_extra_of, folder_extra_seat,
-    pad_insert_index, pad_rack_index, pedal_owner, rack_owner, seat_bay, BUSES, BUS_EXTRA_SEATS,
-    EXTRA_PAD_SEATS, FOLDER_EXTRA_SEATS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
-};
-
 /// How many pedal seats each channel owns for the amp's pedalboard.
 ///
 /// Seven, the owner's board: comp, wah, drive, chorus, trem, echo, plate —
@@ -1694,11 +1679,6 @@ pub fn missing_from_take(lost: &[Strip]) -> Option<String> {
          mixer is on Tab"
     ))
 }
-
-/// **The strip-space desk**, kept for the readers that still speak strip
-/// space: the engine's legacy shims and the host's take facts. The bridge
-/// reads the desk by what each strip is; see `desk_legacy::V32Desk`.
-pub use crate::desk_legacy::V32Desk as Desk;
 
 impl Default for Gains {
     /// Unity for the sources, and the click **under** them.
@@ -4427,7 +4407,8 @@ mod tests {
     /// pad.
     #[test]
     fn every_channels_pads_have_their_own_seats_and_nothing_moved() {
-        use super::{pad_rack_index, DRUM_PADS, MASTER_EXTRA_SEAT, TOTAL_SEATS};
+        use super::DRUM_PADS;
+        use crate::desk_legacy::{pad_rack_index, MASTER_EXTRA_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
         use crate::desk_legacy::V32_STRIPS as STRIPS;
         // Channel 0 keeps the ORIGINAL block. This is the assertion that
         // stops a saved session's pad plugins from moving.
@@ -4919,9 +4900,8 @@ mod tests {
     /// else's plugin, silently.
     #[test]
     fn the_masters_six_bays_live_in_two_racks_and_nobody_elses_move() {
-        use super::{
-            bays_on, seat_bay, Strip, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT,
-        };
+        use super::{bays_on, Strip, INSERTS};
+        use crate::desk_legacy::{pad_insert_index, seat_bay, V32_INSERT_SPACE as INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT};
         assert_eq!(bays_on(None), INSERTS * 2, "the master lost its second rack");
         assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS * 2);
 
@@ -4970,11 +4950,8 @@ mod tests {
     /// appended seat is distinct from every seat that already existed.
     #[test]
     fn a_folders_six_slots_have_their_own_appended_seats() {
-        use super::{
-            amp_pedal_of, amp_pedal_seat, bays_on, folder_extra_seat, pad_rack_index, seat_bay,
-            Strip, AMP_PEDALS, DRUM_PADS, INSERTS, INSERT_SPACE,
-            MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
-        };
+        use super::{bays_on, Strip, AMP_PEDALS, DRUM_PADS, INSERTS};
+        use crate::desk_legacy::{amp_pedal_of, amp_pedal_seat, folder_extra_seat, pad_rack_index, seat_bay, V32_INSERT_SPACE as INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
         use crate::desk_legacy::V32_STRIPS as STRIPS;
         // The counts: **every channel wears six**, folder or not — the
         // owner's ruling, see `bays_on`. The two buses keep their three; the
@@ -5068,10 +5045,8 @@ mod tests {
     /// all in a spot check.
     #[test]
     fn a_folder_extra_seat_names_its_own_channel_and_nothing_else() {
-        use super::{
-            amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, AMP_PEDALS,
-            MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
-        };
+        use super::AMP_PEDALS;
+        use crate::desk_legacy::{amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, MASTER_EXTRA_SEAT, MASTER_SEAT, V32_TOTAL_SEATS as TOTAL_SEATS};
         for ch in 0..CHANNELS {
             assert_eq!(
                 folder_extra_of(folder_extra_seat(ch)),
@@ -6518,13 +6493,14 @@ mod strip_ref_tests {
     /// **No live code in this crate works out a seat** (W5-identity-maps:
     /// "no seat arithmetic in tangent-ui outside desk_legacy"). The seat
     /// map's names are spelled only in `desk_legacy`, which IS the frozen
-    /// map, and in the one re-export above that the host's readers still
-    /// reach it by. Every other file names a bay by identity; a host-facing
+    /// map; the re-export this crate kept of them here, for the engine's and
+    /// the host's readers, went in W8 once every reader named `desk_legacy`
+    /// itself, so this file is read whole. Every other file names a bay by identity; a host-facing
     /// `(seat, bay)` crosses through `desk_legacy::bay_at` and `seat_of`,
     /// which are the map, not arithmetic on it. Test modules are left to
     /// their fixtures.
     ///
-    /// Revert-check: put `let (seat, bay) = recorder::seat_bay(n, bay);`
+    /// Revert-check: put `let (seat, bay) = desk_legacy::seat_bay(n, bay);`
     /// back into `apply_arrange_action`'s `HdrBay` arm and this names it.
     #[test]
     fn no_live_code_works_out_a_seat() {
@@ -6544,13 +6520,7 @@ mod strip_ref_tests {
             }
             let text = std::fs::read_to_string(&path).expect("a source file");
             read += 1;
-            let mut code = code_of(&text);
-            if name == "recorder.rs" {
-                // The re-export the host's readers use, and nothing else.
-                let at = code.find("pub use crate::desk_legacy::{").expect("the re-export");
-                let end = at + code[at..].find("};").expect("its end") + 2;
-                code.replace_range(at..end, "");
-            }
+            let code = code_of(&text);
             for hit in seat_names_in(&code) {
                 bad.push(format!("{name}:{hit}"));
             }
@@ -6559,8 +6529,8 @@ mod strip_ref_tests {
         assert!(bad.is_empty(), "live code works out a seat:\n  {}", bad.join("\n  "));
         // And the scan sees what it bans.
         for planted in [
-            "let (seat, bay) = recorder::seat_bay(n, bay);",
-            "self.set_insert(recorder::MASTER_SEAT, 2, None);",
+            "let (seat, bay) = crate::desk_legacy::seat_bay(n, bay);",
+            "self.set_insert(crate::desk_legacy::MASTER_SEAT, 2, None);",
             "let seat = crate::desk_legacy::amp_pedal_seat(ch, 2);",
         ] {
             assert!(!seat_names_in(planted).is_empty(), "the scan is blind to `{planted}`");

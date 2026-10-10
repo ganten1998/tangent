@@ -22,6 +22,15 @@
 //!   comment is free to quote the stale line as the reason it was changed,
 //!   which is this repo's idiom, and an assertion message in a test is not
 //!   something the product says.
+//! * Everything else that ships, by the dash rule alone, since none of it
+//!   says what a key does: every other crate's shipped strings, and what a
+//!   download or an installer carries for a person to read or see (the
+//!   licence pages, the README and the licence notes beside the program, the
+//!   installers' pages and scripts, the FreeBSD package's message, and the
+//!   text the build scripts write into a download). Each file is read as it
+//!   reaches its reader ([`Reads`]): what a person is handed is read whole,
+//!   comments and all; what a program parses or renders is read without the
+//!   comments it drops.
 //!
 //! **What is refused** ([`stale`] is the one rule):
 //!
@@ -30,6 +39,9 @@
 //! * "stays free" in a sentence that does not name the track limit;
 //! * "Thirty-two channels", "Thirty-two tracks", "-channel mixer" and
 //!   "{}-channel": the desk described by a width, for everybody;
+//! * an em dash, anywhere: the owner's rule for published text, because
+//!   the mark has come to read as machine-written and a reader once said so
+//!   of his. A comma, a colon, parentheses or a full stop say the same.
 //! * on a surface that says buses have no limit, a sentence calling folders
 //!   buses that does not say they count. The README and the store page call a
 //!   folder a real bus (it sums its children and runs a rack over the sum),
@@ -60,6 +72,9 @@ const WIDTH_CLAIMS: [&str; 4] = [
     "{}-channel",
 ];
 
+/// The em dash, refused on every surface (see the module doc).
+const EM_DASH: char = '\u{2014}';
+
 /// What is wrong with `text`, one entry per hit, or nothing.
 ///
 /// `text` is one surface's copy: a whole prose file, or one string literal.
@@ -77,6 +92,9 @@ fn stale(text: &str) -> Vec<String> {
         if flat.contains(phrase) {
             hits.push(format!("describes the desk by a width: {phrase:?}"));
         }
+    }
+    for sentence in sentences(text).into_iter().filter(|s| s.contains(EM_DASH)) {
+        hits.push(format!("has an em dash: {sentence:?}"));
     }
     for sentence in sentences(text) {
         let low = sentence.to_lowercase();
@@ -194,20 +212,42 @@ fn sentences(text: &str) -> Vec<String> {
 
 /// Every string literal in `src` outside test code, escapes resolved
 /// enough for prose: `\n` and `\t` are whitespace, a `\` line continuation
-/// joins its lines, `\"` is a quote.
+/// joins its lines, `\"` is a quote. [`lex`]'s literals.
+fn literals(src: &str) -> Vec<String> {
+    lex(src).literals
+}
+
+/// **A source file, lexed for the scans**: its string literals outside
+/// test code ([`literals`]), and its CODE outside test code, which is the
+/// text with every comment, string and char literal and test item blanked
+/// to spaces and every newline kept, so a scan reads only what ships and
+/// still names the line it found something on (`ban_scan`).
+pub(crate) struct Lexed {
+    pub(crate) literals: Vec<String>,
+    pub(crate) code: String,
+}
+
+/// **The one lexer both scans read through.**
 ///
 /// A small lexer rather than a text search, because a text search reads the
 /// comments (where a stale line is quoted on purpose) and cannot tell an
 /// item under `#[cfg(test)]` from one that ships. It knows `//` and nested
 /// `/* */` comments, normal, byte and raw strings, char literals (so `'"'`
-/// opens nothing) and lifetimes. An item under `#[cfg(test)]` is skipped to
-/// its end: the `;` or the `}` that closes its first `{`, counted with
+/// opens nothing) and lifetimes. An item under a test cfg (`#[cfg(test)]`,
+/// or an `all(..)` that needs `test`: `ban_scan::is_test_cfg`) is skipped
+/// to its end: the `;` or the `}` that closes its first `{`, counted with
 /// strings and comments still lexed so a brace inside one is not a brace.
-fn literals(src: &str) -> Vec<String> {
+pub(crate) fn lex(src: &str) -> Lexed {
     let s: Vec<char> = src.chars().collect();
     let n = s.len();
     let at = |i: usize, pat: &str| pat.chars().enumerate().all(|(k, c)| s.get(i + k) == Some(&c));
     let mut out = Vec::new();
+    let mut code = String::with_capacity(src.len());
+    // What a blanked stretch leaves in the code: its newlines, so every
+    // line after it keeps its number.
+    let blank = |code: &mut String, from: usize, to: usize| {
+        code.extend(s[from..to.min(n)].iter().map(|c| if *c == '\n' { '\n' } else { ' ' }));
+    };
     // `Some(depth)` while inside a skipped test item: the depth of `{` /
     // `(` / `[` reached in it, and whether its body has opened.
     let mut skipping: Option<(i32, bool)> = None;
@@ -215,12 +255,15 @@ fn literals(src: &str) -> Vec<String> {
     while i < n {
         let c = s[i];
         if at(i, "//") {
+            let from = i;
             while i < n && s[i] != '\n' {
                 i += 1;
             }
+            blank(&mut code, from, i);
             continue;
         }
         if at(i, "/*") {
+            let from = i;
             let mut depth = 0;
             while i < n {
                 if at(i, "/*") {
@@ -236,12 +279,34 @@ fn literals(src: &str) -> Vec<String> {
                     i += 1;
                 }
             }
+            blank(&mut code, from, i);
             continue;
         }
-        if at(i, "#[cfg(test)]") && skipping.is_none() {
-            skipping = Some((0, false));
-            i += "#[cfg(test)]".len();
-            continue;
+        if at(i, "#[cfg(") && skipping.is_none() {
+            // The attribute whole, to its `]`, strings inside it skipped.
+            let mut j = i + 2;
+            let mut depth = 1;
+            while j < n && depth > 0 {
+                match s[j] {
+                    '"' => {
+                        j += 1;
+                        while j < n && s[j] != '"' {
+                            j += if s[j] == '\\' { 2 } else { 1 };
+                        }
+                    }
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let attr: String = s[i..j.min(n)].iter().collect();
+            if crate::ban_scan::is_test_cfg(&attr) {
+                skipping = Some((0, false));
+                blank(&mut code, i, j);
+                i = j;
+                continue;
+            }
         }
         let ident_before = i > 0 && (s[i - 1].is_alphanumeric() || s[i - 1] == '_');
         // Raw strings: r"..", r#".."#, br"..", with any number of hashes.
@@ -262,7 +327,9 @@ fn literals(src: &str) -> Vec<String> {
                 if skipping.is_none() {
                     out.push(s[start..end.min(n)].iter().collect());
                 }
+                let from = i;
                 i = end + close.chars().count();
+                blank(&mut code, from, i);
                 continue;
             }
         }
@@ -273,6 +340,17 @@ fn literals(src: &str) -> Vec<String> {
                 if s[j] == '\\' && j + 1 < n {
                     match s[j + 1] {
                         'n' | 't' | 'r' => lit.push('\n'),
+                        // `\u{2014}` is the character it names: a dash
+                        // spelled as an escape is still a dash on screen.
+                        'u' if s.get(j + 2) == Some(&'{') => {
+                            let close = (j + 3..n).find(|&k| s[k] == '}').unwrap_or(n);
+                            let hex: String = s[j + 3..close].iter().collect();
+                            if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                                lit.push(ch);
+                            }
+                            j = close + 1;
+                            continue;
+                        }
                         // A line continuation: the newline and the next
                         // line's indent vanish.
                         '\n' => {
@@ -293,10 +371,13 @@ fn literals(src: &str) -> Vec<String> {
             if skipping.is_none() {
                 out.push(lit);
             }
+            let from = i;
             i = j + 1;
+            blank(&mut code, from, i);
             continue;
         }
         if c == '\'' {
+            let from = i;
             if s.get(i + 1) == Some(&'\\') {
                 // '\n', '\'', '\u{..}': past the escaped character, to
                 // the closing quote.
@@ -310,9 +391,13 @@ fn literals(src: &str) -> Vec<String> {
             } else {
                 // A lifetime.
                 i += 1;
+                code.push(if skipping.is_some() { ' ' } else { '\'' });
+                continue;
             }
+            blank(&mut code, from, i);
             continue;
         }
+        let skipped = skipping.is_some();
         if let Some((depth, opened)) = skipping.as_mut() {
             match c {
                 '{' | '(' | '[' => {
@@ -334,9 +419,10 @@ fn literals(src: &str) -> Vec<String> {
                 _ => {}
             }
         }
+        code.push(if skipped && c != '\n' { ' ' } else { c });
         i += 1;
     }
-    out
+    Lexed { literals: out, code }
 }
 
 /// The repository root.
@@ -409,6 +495,237 @@ fn gumroad_page(root: &Path) -> String {
     format!("docs/release/{newest}/GUMROAD.md")
 }
 
+/// **How a shipped file is read: as it reaches the person it is for.**
+///
+/// What a person is HANDED is read whole: a licence, a README, a script the
+/// download asks them to read before they run it, whose comments are part of
+/// what they read. What a program parses or renders is read the way it shows
+/// it: a comment that pkg, makensis, the desktop or the installer's web
+/// view drops never reaches anyone, so it is this repo's to write like every
+/// other comment, while an installer page's `&mdash;` is the mark itself on
+/// the page.
+#[derive(Clone, Copy, Debug)]
+enum Reads {
+    /// Every character.
+    Whole,
+    /// HTML or XML: `<!-- -->` comments and `<style>` and `<script>` blocks
+    /// dropped, character references resolved ([`entities`]).
+    Markup,
+    /// A UCL manifest (pkg-create(8)): a `#` comment outside a quoted string
+    /// or a heredoc value is dropped. pkg parses the file and keeps none.
+    Ucl,
+    /// A file read line by line whose comment lines (starting `;` or `#`)
+    /// its reader drops: the NSIS script, where makensis compiles them away,
+    /// and the desktop entry, where freedesktop's `#` lines are notes.
+    CommentLines,
+}
+
+/// **Every file a download or an installer carries for a person to read or
+/// see**, beside the program and the surfaces the phrase scan reads, with
+/// how each is read. Where each one goes is named beside it; the script
+/// that puts it there is the authority if the two ever disagree.
+///
+/// Not here, each for its reason: the licence texts nobody here wrote
+/// (`LICENSE`'s MIT grant, `LICENSE-GPL-3.0`, the fonts' `OFL.txt`, the
+/// ffmpeg licences fetched beside its binary), which are quoted law and not
+/// ours to reword; and the macOS package's `postinstall`, which prints
+/// nothing and is shown to no one.
+const SHIPPED: [(&str, Reads); 12] = [
+    // The licence page of the macOS installer and of the Windows one (as
+    // LICENSE.txt), and the Linux tarball (build-installer.sh).
+    ("LICENSING.md", Reads::Whole),
+    // README.txt beside the app in the macOS zip and disk image, the Linux
+    // tarballs and the Windows zip.
+    ("docs/ARTIFACT-README.md", Reads::Whole),
+    // Beside the program in every download.
+    ("THIRD-PARTY-LICENSES", Reads::Whole),
+    // The application menu's entry on Linux and FreeBSD.
+    ("assets/tangent.desktop", Reads::CommentLines),
+    // Handed over in the Linux tarballs to be read before it is run; its
+    // usage and its progress lines are what the person sees while it runs.
+    ("installer/linux/install.sh", Reads::Whole),
+    // The same, in the FreeBSD bundles.
+    ("installer/freebsd/install.sh", Reads::Whole),
+    // On the user's PATH from the FreeBSD package, with its measurements in
+    // its comments: "the knowledge ships with the program".
+    ("installer/freebsd/tangent-jack", Reads::Whole),
+    // The FreeBSD package's one-line summary, its description, and the
+    // message pkg prints at the end of the install.
+    ("installer/freebsd/MANIFEST.in", Reads::Ucl),
+    // The macOS installer's first and last pages, and its title and choice.
+    ("installer/macos/welcome.html", Reads::Markup),
+    ("installer/macos/conclusion.html", Reads::Markup),
+    ("installer/macos/distribution.xml.in", Reads::Markup),
+    // The Windows installer's pages, sections and messages.
+    ("installer/windows/tangent.nsi", Reads::CommentLines),
+];
+
+/// The folder every download carries whole: the notice that maps each font
+/// the program embeds to its licence, and the licences, each headed by a
+/// note of ours. Read file by file, so a licence added to it is read without
+/// being listed.
+const FONT_LICENCES: &str = "assets/font-licenses";
+
+/// **Text a build script writes into a download**, read out of the script:
+/// the script, the line the text follows, the line that ends it (matched
+/// whole, as a heredoc's terminator and a function's closing brace stand at
+/// the start of their line), and how it is read.
+const WRITTEN: [(&str, &str, &str, Reads); 3] = [
+    // The app's Info.plist: macOS shows its usage strings when the app first
+    // asks for the camera and the microphone.
+    ("scripts/build-macos.sh", "/Contents/Info.plist\" <<PLIST", "PLIST", Reads::Markup),
+    // README.txt in the FreeBSD bundles.
+    ("scripts/build-freebsd.sh", "write_readme() {", "}", Reads::Whole),
+    // ffmpeg-licenses/SOURCE.txt in the Linux and Windows downloads.
+    ("scripts/fetch-ffmpeg.sh", "provenance() {", "}", Reads::Whole),
+];
+
+/// What of `src` reaches the person it ships to, read as `how` says. Every
+/// newline is kept, so line n of the result is line n of the file.
+fn shipped_text(src: &str, how: Reads) -> String {
+    match how {
+        Reads::Whole => src.to_owned(),
+        Reads::Markup => entities(&markup_shown(src)),
+        Reads::Ucl => ucl_shown(src),
+        Reads::CommentLines => src
+            .split_inclusive('\n')
+            .map(|line| if line.trim_start().starts_with([';', '#']) { blank(line) } else { line.to_owned() })
+            .collect(),
+    }
+}
+
+/// `text` with every character but a newline turned into a space.
+fn blank(text: &str) -> String {
+    text.chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect()
+}
+
+/// Markup without what a renderer never shows: comments, and the insides of
+/// `<style>` and `<script>`. An unclosed one hides the rest of the page, as
+/// it does on the page.
+fn markup_shown(src: &str) -> String {
+    const HIDDEN: [(&str, &str); 3] = [("<!--", "-->"), ("<style", "</style>"), ("<script", "</script>")];
+    // ASCII lowercasing moves no byte, so an offset found in one is the
+    // same offset in the other.
+    let lower = src.to_ascii_lowercase();
+    let mut out = String::with_capacity(src.len());
+    let mut at = 0;
+    while let Some((from, close)) = HIDDEN
+        .iter()
+        .filter_map(|&(open, close)| lower[at..].find(open).map(|i| (at + i, close)))
+        .min_by_key(|&(from, _)| from)
+    {
+        let to = lower[from..].find(close).map_or(src.len(), |i| from + i + close.len());
+        out.push_str(&src[at..from]);
+        out.push_str(&blank(&src[from..to]));
+        at = to;
+    }
+    out.push_str(&src[at..]);
+    out
+}
+
+/// Character references resolved as far as the dash rule needs: the named
+/// em and en dash, and every numeric one (`&#8212;`, `&#x2014;`). Any other
+/// `&` is left as written.
+fn entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let named = tail.find(';').filter(|&end| end <= 12).and_then(|end| {
+            let ch = match &tail[1..end] {
+                "mdash" => Some('\u{2014}'),
+                "ndash" => Some('\u{2013}'),
+                name => {
+                    let number = name.strip_prefix('#')?;
+                    let code = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => number.parse().ok(),
+                    };
+                    code.and_then(char::from_u32)
+                }
+            };
+            ch.map(|c| (c, end))
+        });
+        match named {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A UCL manifest as pkg keeps it: a `#` outside a quoted string starts a
+/// comment that runs to the end of its line, and the lines of a heredoc
+/// value (`message = <<EOM` to a line that is `EOM`) are text, whatever
+/// they start with.
+fn ucl_shown(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut heredoc: Option<&str> = None;
+    for line in src.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        if let Some(tag) = heredoc {
+            if body == tag {
+                heredoc = None;
+            }
+            out.push_str(line);
+            continue;
+        }
+        let (mut quoted, mut escaped) = (false, false);
+        let cut = body
+            .char_indices()
+            .find(|&(_, c)| {
+                let comment = c == '#' && !quoted;
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quoted = !quoted;
+                }
+                comment
+            })
+            .map_or(body.len(), |(i, _)| i);
+        let kept = &body[..cut];
+        // libucl's terminator is capital letters and nothing else.
+        heredoc = kept
+            .split_once("<<")
+            .map(|(_, tag)| tag.trim())
+            .filter(|tag| !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase()));
+        out.push_str(kept);
+        out.push_str(&blank(&line[cut..]));
+    }
+    out
+}
+
+/// The text a build script writes, out of the script: the lines after the
+/// first line that contains `opens`, up to the next line that is exactly
+/// `closes`, and the number of the first of them. `None` when the script
+/// no longer has either.
+fn fragment(src: &str, opens: &str, closes: &str) -> Option<(usize, String)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| l.contains(opens))? + 1;
+    let len = lines[start..].iter().position(|l| *l == closes)?;
+    Some((start + 1, lines[start..start + len].join("\n")))
+}
+
+/// Each line of `text` that has an em dash, as `number: line`, the first
+/// line numbered `first`.
+fn dash_lines(text: &str, first: usize) -> Vec<String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(EM_DASH))
+        .map(|(i, line)| format!("{}: {}", first + i, line.trim()))
+        .collect()
+}
+
 /// **No surface says a key does less than it does.** See the module doc.
 #[test]
 fn no_surface_says_a_key_is_only_a_thank_you() {
@@ -423,8 +740,13 @@ fn no_surface_says_a_key_is_only_a_thank_you() {
     hits.extend(stale(unreleased(&changelog)).into_iter().map(|h| format!("CHANGELOG.md [Unreleased]: {h}")));
     let mut scanned = 0;
     for dir in ["tangent-ui/src", "tools/tangent-fulfil/src"] {
-        for file in rust_files(&root.join(dir)) {
-            if file.file_name().is_some_and(|f| f == "copy_scan.rs") {
+        let files = rust_files(&root.join(dir));
+        // A test-only module is a whole file of assertions and fixtures,
+        // which no user reads: the same reason a `#[cfg(test)]` item is
+        // skipped inside a file.
+        let tests = crate::ban_scan::test_only_files(&files);
+        for file in files {
+            if tests.contains(&file) || file.file_name().is_some_and(|f| f == "copy_scan.rs") {
                 continue;
             }
             scanned += 1;
@@ -437,6 +759,128 @@ fn no_surface_says_a_key_is_only_a_thank_you() {
     // Not a vacuous pass: both trees were found and read.
     assert!(scanned > 50, "the scan read only {scanned} Rust files");
     assert!(hits.is_empty(), "stale supporter copy:\n  {}", hits.join("\n  "));
+}
+
+/// **No string any other crate ships has an em dash** either: the desktop
+/// host's notices ("Nothing is armed...", the export's and the IR
+/// capture's lines), the engine's and the host's errors that reach a
+/// toast, and the plugin's. Only the dash rule: these crates are not where
+/// a key is described, and their literals name device widths ("a
+/// 2-channel input") that the width rule would read as the desk.
+/// `tangent-ui` and the fulfilment email are read whole by the scan above.
+#[test]
+fn no_shipped_string_in_any_crate_has_an_em_dash() {
+    let root = root();
+    let mut hits = Vec::new();
+    let mut read = 0;
+    for dir in ["tangent/src", "tangent-host/src", "tangent-record/src", "tangent-core/src", "plugin/src"] {
+        let mut files = crate::ban_scan::rust_files(&root.join(dir));
+        let tests = crate::ban_scan::test_only_files(&files);
+        // A build script's strings ship when it writes them into the
+        // program: tangent's writes the Windows version resource, whose
+        // FileDescription is the line Task Manager and Properties show.
+        let build = root.join(dir.strip_suffix("/src").expect("a crate's src")).join("build.rs");
+        if build.is_file() {
+            files.push(build);
+        }
+        for file in files.iter().filter(|f| !tests.contains(*f)) {
+            read += 1;
+            let src = std::fs::read_to_string(file).expect("a source file");
+            for lit in literals(&src).into_iter().filter(|l| l.contains(EM_DASH)) {
+                let rel = file.strip_prefix(&root).unwrap_or(file).display().to_string();
+                hits.push(format!("{rel}: {lit:?}"));
+            }
+        }
+    }
+    // Not a vacuous pass: the five trees were found and read.
+    assert!(read > 90, "the scan read only {read} files");
+    assert!(hits.is_empty(), "a shipped string has an em dash:\n  {}", hits.join("\n  "));
+}
+
+/// **Nothing a download or an installer carries has an em dash** either:
+/// the licence pages, the README and the licence notes beside the program,
+/// the installers' pages and scripts, the FreeBSD package's message, and the
+/// text the build scripts write into a download ([`SHIPPED`],
+/// [`FONT_LICENCES`], [`WRITTEN`]). These were never read by a scan, and the
+/// FreeBSD message, the licence page and both macOS installer pages (as
+/// `&mdash;`) each had one. Only the dash rule, as for the other crates:
+/// none of this says what a key does.
+#[test]
+fn nothing_the_downloads_and_installers_carry_has_an_em_dash() {
+    let root = root();
+    let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    let dir = root.join(FONT_LICENCES);
+    let mut licences: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
+        .filter_map(|p| p.file_name().and_then(|f| f.to_str()).map(|f| format!("{FONT_LICENCES}/{f}")))
+        .collect();
+    licences.sort();
+    // Not a vacuous pass: the notice and the six fonts' licences.
+    assert!(licences.len() >= 7, "{FONT_LICENCES} holds only {licences:?}");
+    let files = SHIPPED.iter().map(|&(rel, how)| (rel.to_owned(), how));
+    let mut hits = Vec::new();
+    for (rel, how) in files.chain(licences.into_iter().map(|rel| (rel, Reads::Whole))) {
+        let text = shipped_text(&read(rel.as_str()), how);
+        hits.extend(dash_lines(&text, 1).into_iter().map(|h| format!("{rel}:{h}")));
+    }
+    for (script, opens, closes, how) in WRITTEN {
+        let (first, body) = fragment(&read(script), opens, closes).unwrap_or_else(|| {
+            panic!("{script} no longer writes its text after {opens:?}: point this scan at where it went")
+        });
+        assert!(!body.trim().is_empty(), "{script} has nothing between {opens:?} and {closes:?}");
+        let text = shipped_text(&body, how);
+        hits.extend(dash_lines(&text, first).into_iter().map(|h| format!("{script}:{h}")));
+    }
+    assert!(hits.is_empty(), "text a download carries has an em dash:\n  {}", hits.join("\n  "));
+}
+
+/// **Each kind of shipped file is read as it reaches the person it is
+/// for**: the mark is found wherever it shows, written as itself or as a
+/// character reference, and nowhere a packager, a compiler or a renderer
+/// drops. The scan above passing proves nothing unless this does too.
+#[test]
+fn a_shipped_file_is_read_as_it_reaches_the_person_it_is_for() {
+    const D: char = EM_DASH;
+    // An installer page: a comment and a style sheet are never shown, and
+    // `&mdash;` is the mark on the page.
+    let page = "<html><head><style>\n/* light \u{2014} on light */\n</style></head>\n<!-- a\n\u{2014} b -->\n\
+                <p>one &mdash; two</p>\n<p>&#8212; &#x2014; &#X2014;</p>\n<p>&amp; &ndash; &bogus; & &#xZZ;</p>\n";
+    let shown = shipped_text(page, Reads::Markup);
+    assert_eq!(shown.lines().count(), page.lines().count(), "a line was lost or gained:\n{shown}");
+    assert_eq!(dash_lines(&shown, 1), [format!("6: <p>one {D} two</p>"), format!("7: <p>{D} {D} {D}</p>")]);
+    assert!(shown.contains("<p>&amp; \u{2013} &bogus; & &#xZZ;</p>"), "{shown}");
+    // The FreeBSD manifest: a comment is dropped; a quoted `#` and a
+    // heredoc's line that starts with one are what pkg shows.
+    let manifest = "# a comment \u{2014} dropped\ncomment = \"a # kept \u{2014} here\"\nmessage = <<EOM\n\
+                    # shown \u{2014} too\nEOM\nname = \"x\" # trailing \u{2014} dropped\n";
+    let shown = shipped_text(manifest, Reads::Ucl);
+    assert_eq!(shown.lines().count(), manifest.lines().count(), "a line was lost or gained:\n{shown}");
+    assert_eq!(dash_lines(&shown, 1), [format!("2: comment = \"a # kept {D} here\""), format!("4: # shown {D} too")]);
+    // The Windows installer and the desktop entry: comment lines are
+    // dropped, and what they say is shown.
+    let nsi = "; a comment \u{2014} dropped\n  # another \u{2014} dropped\nMessageBox MB_OK \"one \u{2014} two\"\n";
+    let shown = shipped_text(nsi, Reads::CommentLines);
+    assert_eq!(dash_lines(&shown, 1), [format!("3: MessageBox MB_OK \"one {D} two\"")]);
+    let entry = "[Desktop Entry]\n# a note \u{2014} dropped\nComment=one \u{2014} two\n";
+    let shown = shipped_text(entry, Reads::CommentLines);
+    assert_eq!(dash_lines(&shown, 1), [format!("3: Comment=one {D} two")]);
+    // A script handed over to be read: its comments are read with it.
+    let script = "#!/bin/sh\n# read before running \u{2014} kept\necho done\n";
+    assert_eq!(dash_lines(&shipped_text(script, Reads::Whole), 1), [format!("2: # read before running {D} kept")]);
+    // Text a build script writes: from the line after the opener to the
+    // terminator standing alone (an indented one ends nothing), numbered as
+    // lines of the script.
+    let build = "set -e\ncat > \"$APP/Contents/Info.plist\" <<PLIST\n<!-- a note \u{2014} not shown -->\n\
+                 <string>asks \u{2014} for the camera</string>\n  PLIST\nPLIST\necho after \u{2014}\n";
+    let (first, body) = fragment(build, "/Contents/Info.plist\" <<PLIST", "PLIST").expect("the plist is found");
+    assert_eq!((first, body.lines().count()), (3, 3), "{body}");
+    assert_eq!(
+        dash_lines(&shipped_text(&body, Reads::Markup), first),
+        [format!("4: <string>asks {D} for the camera</string>")]
+    );
+    assert_eq!(fragment(build, "write_readme() {", "}"), None);
 }
 
 /// **Every refused phrase is refused when planted**, on the surface kind it
@@ -463,6 +907,9 @@ fn every_refused_phrase_fails_the_scan_when_planted() {
         "Folders are buses and buses are never counted.",
         "Buses are unlimited. A folder acts as a bus over its children.",
         "Buses have no limit. Folders are buses and do not count.",
+        // The em dash, wherever it stands in a sentence.
+        "A key lifts the limit \u{2014} for every version.",
+        "Thirty-three tracks\u{2014}and more.",
     ];
     for plant in plants {
         let page = format!("# Tangent\n\nPlay a chord.\n\n{plant}\n\n- A bullet.\n");
@@ -497,6 +944,8 @@ fn the_new_copy_passes_the_scan() {
         // Folders and buses named in one sentence, neither called the other.
         "Buses have no limit. Load it onto any channel, folder, bus or the master.",
         "Buses have no limit. A track in a folder is heard through the folder's send to the effects bus.",
+        // A hyphen and an en dash are not the mark the rule is about.
+        "Routing - Channel 3, the 2026\u{2013}2027 season.",
     ] {
         assert!(stale(good).is_empty(), "{good:?} was refused: {:?}", stale(good));
     }
@@ -522,11 +971,24 @@ mod tests {
 #[cfg(test)]
 const TEST_ONLY: &str = "also not shipped";
 const AFTER: &str = "six";
+const ESCAPED: &str = "seven \u{2014} eight";
+#[cfg(all(test, feature = "x"))]
+const GATED: &str = "not shipped either";
+const LAST: &str = "nine";
 "##;
     assert_eq!(
         literals(src),
-        vec!["one", "two \"quoted\"", "three four\nfive", "six"],
+        vec!["one", "two \"quoted\"", "three four\nfive", "six", "seven \u{2014} eight", "nine"],
     );
+    // And the CODE the ban scan reads: the same skips, every line kept.
+    let code = lex(src).code;
+    assert_eq!(code.lines().count(), src.lines().count(), "the code lost or gained a line");
+    for kept in ["const SHIPPED", "const AFTER", "const ESCAPED", "const LAST", "fn a<'x>(q: &'x str)"] {
+        assert!(code.contains(kept), "the code lost `{kept}`:\n{code}");
+    }
+    for gone in ["nothing more", "nested", "not an unlock", "TEST_ONLY", "GATED", "mod tests", "quoted", "eight"] {
+        assert!(!code.contains(gone), "the code kept `{gone}`:\n{code}");
+    }
 }
 
 #[test]

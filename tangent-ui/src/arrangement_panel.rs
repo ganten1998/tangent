@@ -61,13 +61,13 @@ pub struct LaneView<'a> {
     pub stereo: bool,
     /// The three bays' short names — empty for an empty slot.
     /// **Six wide, like the mixer's**: a FOLDER lane fills all six (its
-    /// extra rack, `recorder::folder_extra_seat`), everybody else the first
+    /// extra rack, `Rack::Chain(1)`), everybody else the first
     /// three and blanks.
     pub inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// **Which of those bays are BYPASSED** — kept, loaded, editable, and
     /// not applied, the `AutoView::bypassed` bargain one layer down. Indexed
     /// like `inserts`, so a FOLDER's slots 3..5 answer for its extra rack;
-    /// the app resolves that through `recorder::seat_bay` before it asks.
+    /// the app resolves that through `desk_id::slot_key` before it asks.
     pub bypassed: [bool; crate::recorder::INSERTS * 2],
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
@@ -586,7 +586,7 @@ pub struct ArrangeView<'a> {
     /// The master rack's six short names — empty for an empty bay.
     ///
     /// Six, not three: the master carries two racks. Which of its slots lives
-    /// in which is `recorder::seat_bay`'s business and not this panel's, so
+    /// in which is `desk_id::slot_key`'s business and not this panel's, so
     /// what arrives here is already in strip order, top to bottom.
     pub master_inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// Which of the master's six are bypassed — `LaneView::bypassed` for the
@@ -721,7 +721,7 @@ pub enum Hit {
     /// every `HdrBay` handler reads its first field as a strip index — and the
     /// master's old column number was a perfectly valid one belonging to
     /// somebody else, so overloading it would have silently edited another
-    /// rack's plugins. The slot is in STRIP order; `recorder::seat_bay` turns
+    /// rack's plugins. The slot is in STRIP order; `desk_id::slot_key` turns
     /// it into the rack it actually lives in.
     BusBay(Column, usize),
     /// The header's gain knob — draggable, vertical, the mixer fader's twin.

@@ -34,6 +34,29 @@ cd "$ROOT"
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
 
+# `named_leg <at least> <cargo test args...>`: a test run filtered to the
+# tests a leg names, which must PASS at least that many of them.
+#
+# **A filter that matches nothing is green.** `cargo test some::path` with no
+# test under that path reports "0 passed" and exits 0, so a leg that names
+# its tests by filter would turn green the day one of them was renamed or
+# deleted, which is exactly the day it should not. So each named leg says
+# how many tests it is for, and the count that ran is checked against it.
+named_leg() {
+  local want="$1" out ran
+  shift
+  if ! out="$(cargo test "$@" 2>&1)"; then
+    printf '%s\n' "$out"
+    return 1
+  fi
+  printf '%s\n' "$out" | grep -E '^test result:' || true
+  ran="$(printf '%s\n' "$out" | awk '/^test result:/ {s += $4} END {print s + 0}')"
+  if [ "$ran" -lt "$want" ]; then
+    echo "  this leg names $want test(s) and only $ran ran: one was renamed or removed" >&2
+    return 1
+  fi
+}
+
 echo "==> cargo test --workspace"
 # **`--exclude linuxvideo`, because the root `exclude` does not reach it.**
 #
@@ -57,6 +80,74 @@ echo "==> cargo test --workspace"
 # `tangent_ui` behind one in `tangent`. A gate that is going to fail should say
 # how much is failing.
 cargo test --workspace --exclude linuxvideo --no-fail-fast
+
+echo "==> cargo test --release  (the render and export goldens, in the profile that ships)"
+# **The shipped builds are release, and every leg above is debug.** The render
+# goldens pin what the engine sounds like to the bit, and for a while they
+# pinned a fact about the PROFILE as well: the optimiser fused the pan law's
+# sine and cosine into one `sincos` call that rounds its last bit its own way,
+# so the `auto-pan` desk hashed one way here and another in the build people
+# run (`instrument::pan_gains` has the measurement and the fix). Rendering
+# them in release too is what keeps "the same bits from both" true, and the
+# export goldens (the WAV bytes an export writes, through the same engine)
+# ride along in the same binary. The hashes are pinned on aarch64 macOS only,
+# which is the machine this gate runs on; elsewhere the desk invariants
+# beside them still run.
+if [ "$(uname -sm)" = "Darwin arm64" ]; then GOLDENS=3; else GOLDENS=1; fi
+named_leg "$GOLDENS" --release -p tangent --bin tangent -- \
+  render_golden:: engine_bridge::tests::every_corpus_export_is_the_file_it_was
+
+echo "==> the ban scans  (no live code names the fixed desk, no surface undersells a key)"
+# **Every source scan the unlimited desk left, by name.** Each wave of that
+# work (docs/design/unlimited-tracks.md) took something away (the desk's
+# width, strip space, the seat arithmetic, the in-place shelf renames, a
+# second road to the licence) and kept a scan that refuses it back, beside
+# the code it guards. They already ran in the suite above; this leg names
+# them, so deleting or renaming one turns the gate red here instead of
+# quietly retiring the ban (`named_leg` counts them). `ban_scan` is the
+# tree-wide one over every crate's shipped code, `copy_scan` the phrase scan
+# over every surface that says what a key does, and the dash rule over
+# everything else that ships: every crate's strings, and what a download or
+# an installer carries for a person to read.
+named_leg 24 -p tangent-ui --lib -- --exact \
+  ban_scan::no_live_code_names_the_fixed_desk \
+  ban_scan::every_banned_name_and_clamp_fails_the_scan_when_planted \
+  ban_scan::every_exemption_names_what_is_still_there \
+  ban_scan::test_only_modules_are_found_from_their_declarations \
+  copy_scan::no_surface_says_a_key_is_only_a_thank_you \
+  copy_scan::every_refused_phrase_fails_the_scan_when_planted \
+  copy_scan::no_shipped_string_in_any_crate_has_an_em_dash \
+  copy_scan::nothing_the_downloads_and_installers_carry_has_an_em_dash \
+  copy_scan::a_shipped_file_is_read_as_it_reaches_the_person_it_is_for \
+  era_corpus::the_lifts_read_no_live_constant \
+  era_corpus::nothing_but_the_choosers_spells_the_real_config_or_media_path \
+  settings::tests::the_historical_migrations_do_not_read_todays_constants \
+  recorder::strip_ref_tests::no_view_code_does_strip_index_arithmetic \
+  recorder::strip_ref_tests::no_live_code_works_out_a_seat \
+  recorder::strip_ref_tests::no_live_code_reads_strip_space \
+  app::paywall_tests::the_gate_reads_only_is_supporter \
+  app::paywall_tests::the_fixture_key_is_read_only_by_tests \
+  app::paywall_tests::no_test_builds_the_app_through_the_production_door \
+  app::lane_refs_tests::every_lane_shaped_field_of_the_app_has_a_class \
+  app::lane_refs_tests::the_classification_scan_fails_a_planted_lane \
+  app::width_tests::persistence_and_drawing_never_read_the_licence \
+  app::save_tests::a_save_writes_the_desk_the_session_shows \
+  copy_scan::the_lexer_reads_shipped_literals_only \
+  copy_scan::the_new_copy_passes_the_scan
+named_leg 13 -p tangent --bin tangent -- --exact \
+  instrument::lanesets::no_engine_walk_clamps_a_lane_onto_another \
+  instrument::lanesets::the_clamp_scan_finds_every_spelling_it_bans \
+  instrument::lanesets::no_renderer_walk_shifts_a_lane_into_a_word \
+  instrument::lanesets::the_shift_scan_finds_a_lane_mask_in_a_walk \
+  instrument::stack_budget::the_key_snapshot_is_not_a_lane_field \
+  engine_bridge::tests::the_desktop_pushes_the_desk_only_through_the_bridge \
+  desktop::tests::the_host_reads_none_of_the_uis_desk_width_constants \
+  desktop::tests::the_host_works_out_no_seat_and_builds_no_lane_mask \
+  desktop::tests::a_reorder_sends_the_engine_nothing_but_the_plan \
+  desktop::tests::a_reorder_moves_no_state_file \
+  konami_e2e::the_engine_and_the_shelf_never_read_the_licence \
+  shelf::tests::no_new_build_path_renames_or_deletes_a_legacy_sidecar \
+  slot_gaps::no_host_road_names_a_bay_by_the_frozen_maps_seat
 
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
 cargo test -p tangent-core
