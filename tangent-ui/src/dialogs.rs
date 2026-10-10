@@ -768,20 +768,24 @@ pub enum Dialog {
     },
     /// Pick which channel keys one insert bay's sidechain — the routing
     /// window's sibling, one step instead of two because there is only one
-    /// kind of source. The keyed bay by its identity, like `InsertFace`'s;
-    /// the sources by the rows they stand on, which hold still while this
-    /// modal window is open.
+    /// kind of source. The keyed bay and every source by identity: this is
+    /// a plugin window (`is_modal`), so the desk stays live under it, and a
+    /// source named by its row would be whatever track a drag left there.
+    /// The app redraws the list whenever the desk changes shape
+    /// (`on_desk_shape_change`), so the rows it shows are the rows as they
+    /// stand.
     InsertKeySource {
         bay: crate::desk_id::SeatBay,
-        /// What the bay listens to now, so the picker can grey it and the
-        /// "No sidechain" row can say whether it is already the state.
-        current: Option<usize>,
-        /// Channels worth keying from: index and name. Used channels only —
-        /// an empty channel is a key that never ducks — and never the
-        /// destination itself. Folders ARE offered, unlike the routing
-        /// picker's list: a group's stem holds the group's whole mix, and
-        /// ducking to the drum bus is the classic ask.
-        channels: Vec<(usize, String)>,
+        /// The track the bay listens to now, so the picker can grey it and
+        /// the "No sidechain" row can say whether it is already the state.
+        current: Option<crate::desk_id::Node>,
+        /// Channels worth keying from: the track, the row it stands on and
+        /// its name. Used channels only — an empty channel is a key that
+        /// never ducks — and never the destination itself. Folders ARE
+        /// offered, unlike the routing picker's list: a group's stem holds
+        /// the group's whole mix, and ducking to the drum bus is the classic
+        /// ask.
+        channels: Vec<(crate::desk_id::Node, usize, String)>,
         /// What has been typed to narrow the list. See [`picker_rows`].
         filter: String,
     },
@@ -1993,10 +1997,10 @@ pub enum DialogAction {
     FaceSavePreset { bay: crate::desk_id::SeatBay, name: String },
     /// Load a preset file into whatever the open face controls.
     FaceLoadPreset { unit: String, path: String },
-    /// Point one bay's sidechain key at a channel, or take it off with
-    /// `None`: the bay by identity, the source by the row the modal picker
-    /// listed it on, which the app turns into its track as it lands.
-    SetInsertKeySource { bay: crate::desk_id::SeatBay, from: Option<usize> },
+    /// Point one bay's sidechain key at a track, or take it off with
+    /// `None`: both ends by identity, so a drag under the open picker
+    /// cannot turn the choice into another track.
+    SetInsertKeySource { bay: crate::desk_id::SeatBay, from: Option<crate::desk_id::Node> },
     /// The amp face's pedal chip: open the insert picker over pedal
     /// `pedal` of the board the face's bay wears. `bay` is the face's own;
     /// the app resolves whose board it is on its side of the wall.
@@ -7449,6 +7453,20 @@ pub fn picker_rows(channels: &[(usize, String)], filter: &str) -> Vec<(usize, St
         .collect()
 }
 
+/// [`picker_rows`] for the key picker, whose sources are tracks by
+/// identity: each shown by the row it stands on and its name, as every
+/// picker shows a channel, and answered by the track.
+pub fn key_source_rows(
+    channels: &[(crate::desk_id::Node, usize, String)],
+    filter: &str,
+) -> Vec<(crate::desk_id::Node, String)> {
+    let rows: Vec<(usize, String)> = channels.iter().map(|(_, at, name)| (*at, name.clone())).collect();
+    picker_rows(&rows, filter)
+        .into_iter()
+        .filter_map(|(at, shown)| Some((channels.iter().find(|(_, row, _)| *row == at)?.0, shown)))
+        .collect()
+}
+
 /// The field a picker's list is narrowed with, focused when the list first
 /// shows so the hand that opened it can start typing at once.
 fn picker_filter(ui: &mut egui::Ui, filter: &mut String, font: FontId, text: Color32) {
@@ -12315,17 +12333,16 @@ fn show_on(
                                             from: None,
                                         });
                                     }
-                                    for (idx, shown) in picker_rows(channels, filter) {
-                                        let idx = &idx;
+                                    for (source, shown) in key_source_rows(channels, filter) {
                                         // The current source is greyed, the
                                         // routing picker's no-duplicates
                                         // grammar: saying "already this" before
                                         // the click beats a click that does
                                         // nothing.
-                                        if row(ui, &shown, now != Some(*idx)) {
+                                        if row(ui, &shown, now != Some(source)) {
                                             action = Some(DialogAction::SetInsertKeySource {
                                                 bay,
-                                                from: Some(*idx),
+                                                from: Some(source),
                                             });
                                         }
                                     }
