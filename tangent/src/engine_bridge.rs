@@ -3093,6 +3093,77 @@ mod tests {
         );
     }
 
+    /// **A key to a comp on a bus, and a key from a bus, are wired by
+    /// identity at any row** (W7-join item 2, the bridge's half of a key to
+    /// a bus; the sound is `slot_gaps`' and the engine's door
+    /// `gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`). Rows
+    /// 1, 31, 32, 33, 40 and 200 are buses, each with a comp in its first
+    /// bay keyed from row 150; row 7's comp is keyed from bus 120. Every bus
+    /// is a BUS lane, and the plan carries each key as an `InKey` on that
+    /// lane's own first rack, from its source's lane, and no other key. A
+    /// reorder that moves every subject hands the engine the same keys on
+    /// the same lanes.
+    #[test]
+    fn a_key_to_or_from_a_bus_is_wired_by_identity_at_any_row() {
+        const BUSES: [usize; 6] = [1, 31, 32, 33, 40, 200];
+        let mut s = blank();
+        let mut next = s.next_track_id;
+        while s.rows.len() < 201 {
+            s.rows.push(tangent_ui::desk_model::TrackRow::vacant(TrackId(next as u32)));
+            next += 1;
+        }
+        s.next_track_id = next;
+        kind(&mut s, &BUSES, ChannelKind::Bus);
+        kind(&mut s, &[120], ChannelKind::Bus);
+        kind(&mut s, &[7, 150], ChannelKind::Audio);
+        let comp = |s: &Settings, n: usize| SeatBay::new(row(s, n), Rack::Chain(0), 0);
+        let mut keyed: Vec<(SeatBay, Node)> = BUSES.iter().map(|&b| (comp(&s, b), row(&s, 150))).collect();
+        keyed.push((comp(&s, 7), row(&s, 120)));
+        for &(sb, from) in &keyed {
+            s.plugins.insert(sb, COMP_PATH.to_owned());
+            s.insert_keys.set(sb, Some(from));
+        }
+        let mut app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        let wired = |p: &Bridge| -> Vec<InKey> {
+            let mut want: Vec<InKey> = keyed
+                .iter()
+                .map(|&(sb, from)| {
+                    let (addr, bay) = p.engine_bay(sb).expect("the comp's bay");
+                    let RackOwner::Lane(at) = addr.owner else { panic!("{sb} is no lane's bay") };
+                    assert_eq!(Some(at), sb.seat.node.track().and_then(|id| p.lane_of(id)).map(|l| l.slot), "{sb} is wired to another lane");
+                    let from = p.lane_of(from.track().expect("a track")).expect("the source's lane").slot;
+                    InKey { seat: addr.plan_seat().expect("a plan seat"), bay: bay as u8, from }
+                })
+                .collect();
+            want.sort_by_key(|k| (k.seat, k.bay, k.from));
+            want
+        };
+        let played = |p: &Bridge| -> Vec<InKey> {
+            let mut got = p.published_for_test().expect("a plan").keys.clone();
+            got.sort_by_key(|k| (k.seat, k.bay, k.from));
+            got
+        };
+        let plan = p.published_for_test().expect("a plan");
+        for b in BUSES.into_iter().chain([120]) {
+            let at = p.lane(b).expect("a bus lane").slot;
+            assert!(
+                plan.lanes.iter().any(|l| l.slot == at && l.flags.contains(LaneFlags::BUS)),
+                "row {b}'s bus is not a BUS lane"
+            );
+        }
+        assert_eq!(played(&p), wired(&p), "the plan's keys are not the desk's");
+        // Row 200 dragged to the top: every subject moves a row, and every key
+        // stays on its own lanes.
+        let before = played(&p);
+        app.move_channel(200, 0);
+        p.sync(&app, &mut e);
+        assert_eq!(played(&p), wired(&p), "the plan's keys are not the desk's after a reorder");
+        assert_eq!(played(&p), before, "a reorder moved a key in the plan");
+    }
+
     /// **A lane that becomes a drum lane is owed its kit, the frame it does**
     /// (W7-join item 4, `Synced::drummed`). On a fresh engine every drum
     /// lane is new to it; a steady frame owes nothing; the drumpad picked
