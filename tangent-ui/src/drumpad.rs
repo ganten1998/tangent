@@ -2294,4 +2294,90 @@ mod track_kit_tests {
         assert_eq!(std::fs::read(DrumpadDoc::sidecar(&doc)).expect("ids"), want);
         let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
     }
+
+    /// **The kits held by track write the file W3 defined** (W4-lane-refs):
+    /// in either format, the map read off by the rows' ids is byte for
+    /// byte the lane-ordered writer's file for the same rows. A kit whose
+    /// track is on no row is not written, and the panel's lane is the
+    /// file's primary.
+    #[test]
+    fn the_map_writes_the_lane_writers_bytes_in_either_format() {
+        let ids = [TrackId(0), TrackId(40), TrackId(7), TrackId(3)];
+        let by_lane = vec![kit("a"), DrumpadDoc::default(), kit("c"), kit("d")];
+        let mut map: TrackKits = DrumpadDoc::keyed(&ids, by_lane.clone());
+        map.insert(TrackId(99), kit("stranger"));
+        for format in [Format::Legacy, Format::V2] {
+            let doc = scratch("map-bytes");
+            DrumpadDoc::save_all_beside_as(&by_lane, &ids, 2, &doc, format);
+            let want = std::fs::read(DrumpadDoc::sidecar(&doc)).expect("lanes");
+            DrumpadDoc::save_track_kits_as(&map, &ids, 2, &doc, format);
+            let got = std::fs::read(DrumpadDoc::sidecar(&doc)).expect("map");
+            assert_eq!(got, want, "the map wrote other bytes than the lanes ({format:?})");
+            assert!(
+                !String::from_utf8_lossy(&got).contains("stranger"),
+                "a kit on no row was written ({format:?})"
+            );
+            let (back, primary) = DrumpadDoc::load_track_kits(&doc, &ids, None);
+            assert_eq!(back.len(), 3, "the empty kit took an entry, or a kit was lost ({format:?})");
+            assert_eq!(back.get(&TrackId(7)), Some(&kit("c")), "({format:?})");
+            assert_eq!(primary, Some(TrackId(7)), "the panel's track was not read back ({format:?})");
+            let _ = std::fs::remove_dir_all(doc.parent().expect("dir"));
+        }
+    }
+
+    /// **The undo timeline's kits, by track**: the compact form round trips,
+    /// its fingerprint walks beside it (a change to a kit moves both, a
+    /// change the compaction drops moves neither), and a key that is not a
+    /// canonical track id is no kit at all.
+    #[test]
+    fn the_compact_form_by_track_round_trips_and_its_fingerprint_follows_it() {
+        let mark = |kits: &TrackKits| {
+            let mut f = Fingerprint::new();
+            DrumpadDoc::hash_tracks_into(kits, &mut f);
+            f.finish()
+        };
+        let mut kits = TrackKits::new();
+        kits.insert(TrackId(3), kit("a"));
+        kits.insert(TrackId(41), kit("b"));
+        let mut silent = DrumpadDoc::default();
+        silent.master = 0.5;
+        kits.insert(TrackId(5), silent);
+        kits.insert(TrackId(6), DrumpadDoc::default());
+        let text = DrumpadDoc::compact_tracks(&kits);
+        let back = DrumpadDoc::from_compact_tracks(&text);
+        assert_eq!(DrumpadDoc::compact_tracks(&back), text, "the compact form is not a fixed point");
+        assert_eq!(mark(&back), mark(&kits), "a round trip moved the fingerprint");
+        assert!(DrumpadDoc::same_tracks(&back, &kits), "the round trip changed a kit");
+        assert!(!back.contains_key(&TrackId(6)), "an empty kit came back as an entry");
+
+        let mut moved = kits.clone();
+        moved.entry(TrackId(41)).or_default().pads[40].path = "media/snare.wav".into();
+        assert_ne!(DrumpadDoc::compact_tracks(&moved), text, "fixture");
+        assert_ne!(mark(&moved), mark(&kits), "a pad loaded and the fingerprint stood still");
+        let mut renamed = kits.clone();
+        let k = renamed.remove(&TrackId(41)).expect("fixture");
+        renamed.insert(TrackId(42), k);
+        assert_ne!(mark(&renamed), mark(&kits), "a kit moved to another track and the fingerprint stood still");
+        let mut dropped = kits.clone();
+        dropped.entry(TrackId(3)).or_default().version = 9;
+        assert_eq!(mark(&dropped), mark(&kits), "what the compaction drops moved the fingerprint");
+
+        let strays = serde_json::json!({ "3": {"master": 0.5, "pads": {}}, "t03": {"master": 0.5, "pads": {}} });
+        assert!(DrumpadDoc::from_compact_tracks(&strays.to_string()).is_empty(), "a lane or a padded id read as a track");
+        assert!(DrumpadDoc::from_compact_tracks("not json").is_empty());
+    }
+
+    /// **An entry that IS the empty kit and no entry are the same kits**:
+    /// a panel opened on a track and left as it was makes one, and an undo
+    /// that compared the maps with `==` rewrote the sidecar for nothing.
+    #[test]
+    fn an_empty_entry_and_no_entry_are_the_same_kits() {
+        let mut a = TrackKits::new();
+        a.insert(TrackId(1), kit("a"));
+        let mut b = a.clone();
+        b.insert(TrackId(2), DrumpadDoc::default());
+        assert!(DrumpadDoc::same_tracks(&a, &b) && DrumpadDoc::same_tracks(&b, &a));
+        b.insert(TrackId(2), kit("b"));
+        assert!(!DrumpadDoc::same_tracks(&a, &b) && !DrumpadDoc::same_tracks(&b, &a));
+    }
 }
