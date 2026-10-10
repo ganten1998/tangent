@@ -674,6 +674,11 @@ pub struct Bridge {
     leaving: Vec<Leaving>,
     /// This frame's rows, in order: each row's track and its lane.
     rows: Vec<(TrackId, Option<LaneAt>)>,
+    /// **The tracks whose lane was a drum lane at the last sync**: the
+    /// drumpad in the track's first bay and a lane to play it on. A track
+    /// that joins the set has a lane that has just become a drum lane, and
+    /// is owed its kit ([`Synced::drummed`]).
+    drums: BTreeSet<TrackId>,
     /// The inputs of the last plan the engine took, for the change test.
     published: Option<PlanInputs>,
     /// The bypass table last stored, by the engine's names.
@@ -712,6 +717,26 @@ pub struct Synced {
     /// and the host's record of them is owed back, or the reconcile reads
     /// every bay of it as wanted and not loaded and reloads them in place.
     pub reclaimed: Vec<Forgotten>,
+    /// **The lanes that have just become drum lanes**: the drumpad arrived
+    /// in their track's first bay (a pick, a paste, a swap, an undo: every
+    /// road), or the lane arrived under a track that holds it. Each is owed
+    /// its track's kit (design 7.13: "Attach(Pads) then Attach(Kit)"). A
+    /// lane's kit goes to it only while it holds the drumpad, so one that
+    /// took it now holds no kit, or one older than its track's.
+    pub drummed: Vec<Slot>,
+}
+
+impl Synced {
+    /// **Whether this frame owes the drum lanes their kits again**: a lane
+    /// came or went (`moved`), or one became a drum lane (`drummed`). The
+    /// host's other two reasons, a kit edited and a delivery that did not
+    /// all land, are its own (`take_drumpad_dirty`, `pads_retry`). A track
+    /// that took the drumpad was owed none: no lane moved, no kit was
+    /// edited, the last delivery had landed whole, and its pads were silent
+    /// until another kit edit or a reopen.
+    pub fn owes_kits(&self) -> bool {
+        !self.moved.is_empty() || !self.drummed.is_empty()
+    }
 }
 
 impl Bridge {
@@ -1052,6 +1077,7 @@ impl Bridge {
         });
         synced.moved.extend(self.install(app, e, &laned));
         self.attach_pads(app, e, &laned);
+        synced.drummed = self.note_drums(app, &laned);
         self.rows = ids.iter().map(|id| (*id, self.lanes.get(id).map(|h| h.at))).collect();
         // ── the lanes due home: faded out under a plan the callback took,
         // or at once on an engine nobody is listening to ──
@@ -1139,6 +1165,8 @@ impl Bridge {
         self.leaving.clear();
         self.published = None;
         self.bypass = None;
+        // A fresh engine holds no kit: every drum lane is a new one to it.
+        self.drums.clear();
         for (row, id) in app.track_ids().iter().enumerate() {
             let Ok(s) = u32::try_from(row) else { break };
             let slot = Slot(s);
@@ -1249,6 +1277,28 @@ impl Bridge {
                 self.stats.attaches += 1;
             }
         }
+    }
+
+    /// **The lanes that became drum lanes since the last sync** (W7-join):
+    /// each laned track whose first bay holds the drumpad now and did not
+    /// then. Rebuilt whole every frame from the desk, so a track whose
+    /// drumpad leaves and comes back (an undo, a swap there and back) is
+    /// owed its kit again on its return, by then perhaps edited while its
+    /// lane was not a drum lane and was handed none. A track waiting for its
+    /// lane joins when the lane arrives, which `moved` already owes.
+    fn note_drums(&mut self, app: &TangentApp, rows: &[(usize, TrackId)]) -> Vec<Slot> {
+        let now: BTreeSet<TrackId> = rows
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| self.lanes.contains_key(id))
+            .filter(|id| track_bay(app, *id, Rack::Chain(0), 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .collect();
+        let drummed = now
+            .difference(&self.drums)
+            .filter_map(|id| self.lanes.get(id).map(|h| h.at.slot))
+            .collect();
+        self.drums = now;
+        drummed
     }
 
     /// The lanes whose row holds `sentinel` in its first bay: on the live
@@ -3042,6 +3092,41 @@ mod tests {
             got.iter().all(|c| c.curve.param == AutoParam::SendTo { to: bus }),
             "a curve that names no bus on this desk became a send curve"
         );
+    }
+
+    /// **A lane that becomes a drum lane is owed its kit, the frame it does**
+    /// (W7-join item 4, `Synced::drummed`). On a fresh engine every drum
+    /// lane is new to it; a steady frame owes nothing; the drumpad picked
+    /// into a track's first bay owes that track's lane its kit, once, and
+    /// owes it again when it leaves and comes back, as an undo or a swap
+    /// there and back brings it. Before, the pick moved no lane and edited
+    /// no kit, so with another kit landed the host reloaded nothing.
+    #[test]
+    fn a_lane_that_takes_the_drumpad_is_owed_its_kit_the_frame_it_does() {
+        let mut s = blank();
+        kind(&mut s, &[0, 1, 2], ChannelKind::Midi);
+        let first_bay = |s: &Settings, n: usize| SeatBay::new(row(s, n), Rack::Chain(0), 0);
+        s.plugins.insert(first_bay(&s, 0), tangent_ui::dialogs::DRUMPAD_PATH.to_owned());
+        s.plugins.insert(first_bay(&s, 1), tangent_ui::dialogs::KEYS_PATH.to_owned());
+        let bay_1 = first_bay(&s, 1);
+        let mut app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        let fresh = p.sync(&app, &mut e);
+        let lane = |p: &Bridge, n: usize| p.lane(n).expect("a lane").slot;
+        assert_eq!(fresh.drummed, vec![lane(&p, 0)], "a fresh engine's drum lane is not owed its kit");
+        let steady = p.sync(&app, &mut e);
+        assert!(steady.drummed.is_empty() && !steady.owes_kits(), "a steady frame owes kits: {steady:?}");
+        app.set_plugin(bay_1, Some(tangent_ui::dialogs::DRUMPAD_PATH));
+        let picked = p.sync(&app, &mut e);
+        assert!(picked.moved.is_empty(), "fixture: the pick moved a lane, which owes the kits on its own");
+        assert_eq!(picked.drummed, vec![lane(&p, 1)], "the lane that took the drumpad is not owed its kit");
+        assert!(picked.owes_kits());
+        assert!(p.sync(&app, &mut e).drummed.is_empty(), "the pick was owed twice");
+        app.set_plugin(bay_1, Some(tangent_ui::dialogs::KEYS_PATH));
+        assert!(p.sync(&app, &mut e).drummed.is_empty(), "a lane that let the drumpad go was owed a kit");
+        app.set_plugin(bay_1, Some(tangent_ui::dialogs::DRUMPAD_PATH));
+        assert_eq!(p.sync(&app, &mut e).drummed, vec![lane(&p, 1)], "the drumpad back is not owed its kit again");
     }
 
     /// **Both offline builders are one builder, and the host pushes no desk

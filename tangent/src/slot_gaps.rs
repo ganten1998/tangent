@@ -29,7 +29,9 @@
 //! each cross one) had no road from the desk until W7-buses-ui gave the
 //! bridge buses; the engine held them at these widths
 //! (`slot_engine::gaps`, `slot_engine::buses`), and since W7-join the
-//! desk's half of each runs here too.
+//! desk's half of each runs here too. So does a kit owed the frame its
+//! track takes the drumpad, which the frame's own rule decides
+//! (`Synced::owes_kits`).
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
 //! directory of the test's own (`composite::tiers`), every project and every
@@ -196,10 +198,11 @@ fn open_saved(tag: &str, settings: Settings, path: &Path) -> TangentApp {
 /// **What the host keeps between frames**, for its own roads to keep here:
 /// the reconcile's ledger and displaced shelf, the live shelf it seats bays
 /// from (this test's own, `<scratch>/state`), the engine's sentence, the
-/// samplers' record and cache, the kits' cache and the knobs each kit was
-/// last told, and the curves the engine was last handed. [`Host::frame`]
-/// runs a frame over them through `DesktopApp`'s own functions, so a road
-/// of the host's that stops at the thirty-second row stops here too.
+/// samplers' record and cache, the kits' cache, the knobs each kit was last
+/// told and whether a kit delivery is owed a retry, and the curves the
+/// engine was last handed. [`Host::frame`] runs a frame over them through
+/// `DesktopApp`'s own functions, so a road of the host's that stops at the
+/// thirty-second row stops here too.
 #[derive(Default)]
 struct Host {
     shelf: PathBuf,
@@ -210,6 +213,7 @@ struct Host {
     sampler_cache: HashMap<PathBuf, Decoded>,
     pad_cache: HashMap<PathBuf, Decoded>,
     pushed_pads: BTreeMap<usize, DrumKitParams>,
+    kits_retry: bool,
     pushed_auto: Option<tangent_ui::automation::Automation>,
 }
 
@@ -235,16 +239,21 @@ impl Host {
     ///   written down and forgotten (`forget_lane`) and one taken back
     ///   reclaimed (`reclaim_lanes`), what the host keeps per slot forgotten
     ///   for a lane that came or went (`forget_moved_slots`, and the curves
-    ///   it last handed over), and the kits' knobs (`push_pad_knobs`);
+    ///   it last handed over), the kits the sync owes, and the kits' knobs
+    ///   (`push_pad_knobs`);
     /// - `push_automation`'s: the curves, the sends' own among them
     ///   (`push_curves`), when they changed;
     /// - `after_frame`'s reconcile: the bays the desk wants
     ///   (`bays_wanted`), the next one owed a load (`next_owed_bay`) and its
     ///   load (`load_bay`), one a frame, the frames run back to back until
     ///   none is owed;
-    /// - `run_warm`'s: the kits (`deliver_kits`) and the samplers' files
-    ///   (`deliver_samples`). The host runs these when they are owed; every
-    ///   frame here is one whose desk moved, so every frame owes them.
+    /// - `after_frame`'s kits owed by a retry or an edit
+    ///   (`take_drumpad_dirty`), and `run_warm`'s: the kits (`deliver_kits`)
+    ///   when owed, a delivery that did not all land owed again, and the
+    ///   samplers' files (`deliver_samples`). The host runs the samplers'
+    ///   when they are owed; every frame here is one whose desk moved, so
+    ///   every frame owes them. The kits keep the host's own rule, which is
+    ///   what decides whether a track that takes the drumpad hears its kit.
     fn frame(&mut self, app: &mut TangentApp, e: &mut Engine, p: &mut Bridge) {
         let synced = {
             let (ledger, shelf) = (&mut self.ledger, &self.shelf);
@@ -255,6 +264,7 @@ impl Host {
         if !synced.moved.is_empty() {
             self.pushed_auto = None;
         }
+        let mut kits_owed = synced.owes_kits();
         if synced.primed {
             self.pushed_pads.clear();
         }
@@ -282,7 +292,10 @@ impl Host {
         }
         assert!(settled, "the reconcile never ran out of bays to load");
         assert!(self.error.is_none(), "a bay would not load: {:?}", self.error);
-        DesktopApp::deliver_kits(Some(&mut *e), p, app, &mut self.pad_cache);
+        kits_owed |= std::mem::take(&mut self.kits_retry) || app.take_drumpad_dirty();
+        if kits_owed {
+            self.kits_retry = !DesktopApp::deliver_kits(Some(&mut *e), p, app, &mut self.pad_cache);
+        }
         DesktopApp::deliver_samples(Some(&mut *e), p, app, &mut self.sampler_have, &mut self.sampler_cache);
         e.settle_offline();
     }
@@ -555,6 +568,60 @@ fn a_pad_effect_waits_for_its_tracks_kit_and_is_heard_past_slot_31_as_on_row_1()
     }
     cleanup(&dry_dir, &tags[..1]);
     cleanup(&dir, &tags[1..]);
+}
+
+/// **A track that takes the drumpad hears its kit from the next frame, past
+/// slot 31 as on row 1, live and in the export** (W7-join item 4). Row 2 is
+/// a drum track from the start, and its kit has landed, so no delivery is
+/// owed a retry; every subject is a MIDI track with the keyboard in its
+/// first bay and a kit of its own in the sidecar (a project reopened, or an
+/// engine rebuilt, after the drumpad was swapped out). The drumpad is picked
+/// into each subject's first bay and the host runs one frame by its own rule
+/// for when kits are owed: every subject's kit plays its clip at row 2's
+/// level, live as in the export. The pick marked no kit owed: no lane came
+/// or went, no kit was edited, and the last delivery had landed whole, so
+/// `reload_pads` never ran and each subject's pads stayed silent live until
+/// another kit edit or a reopen, while the export, which attaches every
+/// drum lane's kit itself, played them.
+#[test]
+fn a_track_that_takes_the_drumpad_hears_its_kit_from_the_next_frame_past_slot_31_as_on_row_1() {
+    const TAG: &str = "gaps-drum-pick";
+    let dir = scratch("drum-pick");
+    wav(&dir.join("media").join("pad.wav"), 0.25, false);
+    let mut s = wide_desk();
+    let mut doc = Arrangement::default();
+    let rows: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
+    for &row in &rows {
+        s.rows[row].kind = Some(RowKind::Midi);
+        let first = if row == CONTROL { DRUMPAD_PATH } else { KEYS_PATH };
+        s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), first.to_owned());
+        doc.add_clip(notes(row, DRUM_PAD_BASE + 36));
+    }
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    save_kits(&s, &rows, &path);
+    let firsts: Vec<SeatBay> = SUBJECTS.iter().map(|r| bay_of(&s, *r, Rack::Chain(0), 0)).collect();
+    let mut host = Host::at(&dir);
+    let mut app = open_saved(TAG, s, &path);
+    let (mut e, mut p) = live(&mut app, &mut host);
+    assert!(!host.kits_retry, "fixture: row 2's kit did not land, so a retry would deliver every kit anyway");
+    // The drumpad picked into every subject's first bay, and one frame.
+    for sb in firsts {
+        app.set_plugin(sb, Some(DRUMPAD_PATH));
+    }
+    host.frame(&mut app, &mut e, &mut p);
+    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+    for (road, got) in [("live", levels(&mut e, &p, &rows)), ("export", levels(&mut x, &xb, &rows))] {
+        let control = got[rows.len() - 1];
+        assert!(control > 0.02, "{road}: row 2's kit is silent ({control})");
+        for (row, level) in SUBJECTS.iter().zip(&got) {
+            assert!(
+                (level - control).abs() <= 0.02 * control,
+                "{road}: row {row}'s kit plays at {level} the frame after its track took the drumpad, row 2's at {control}"
+            );
+        }
+    }
+    cleanup(&dir, &[TAG]);
 }
 
 // ── a sampler bay's file ────────────────────────────────────────────────────
@@ -1222,9 +1289,12 @@ fn no_host_road_names_a_bay_by_the_frozen_maps_seat() {
 /// `next_owed_bay`, the sampler reload is `deliver_samples`, the kits'
 /// reload `deliver_kits`, their knobs `push_pad_knobs`, a lane that came or
 /// went is forgotten by `forget_moved_slots` (and the curves last handed
-/// over with it), the curves go by `push_curves`, and a face's knob is set
-/// by `set_insert_param`. A road the frame took by other lines would leave
-/// this suite proving a function nothing calls.
+/// over with it), the curves go by `push_curves`, a face's knob is set by
+/// `set_insert_param`, and the kits are owed by the sync's own answer
+/// (`Synced::owes_kits`), a retry or an edit. A road the frame took by other
+/// lines would leave this suite proving a function nothing calls, and a
+/// rule for when the kits are owed that the frame did not keep would leave
+/// it proving a rule nothing keeps.
 #[test]
 fn the_frame_runs_the_roads_this_suite_drives() {
     let whole = include_str!("desktop.rs");
@@ -1241,11 +1311,12 @@ fn the_frame_runs_the_roads_this_suite_drives() {
         "Self::load_bay(",
         "Self::set_insert_param(",
         "self.push_automation();",
+        "if std::mem::take(&mut self.recorder.pads_retry) || self.app.take_drumpad_dirty() {",
     ] {
         assert!(frame.contains(road), "the frame no longer takes `{road}`");
     }
     let push = body_of("fn push_monitor_settings(&mut self)");
-    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs(", "self.pushed_auto = None;"] {
+    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs(", "self.pushed_auto = None;", "if synced.owes_kits() {"] {
         assert!(push.contains(road), "the frame's push no longer takes `{road}`");
     }
     assert!(
