@@ -10558,6 +10558,14 @@ impl Renderer {
             &mut self.ops,
             &mut self.retire,
         );
+        // **And again for the tee, over the table as the ops left it.** A
+        // Grow in this pass may have widened it (a pick past the old table,
+        // armed and pressed in one frame), and the shell carries only the
+        // flags the old table could hold: read once more, the new pick's
+        // first block is in its take. The same words, a load per word.
+        if report.applied > 0 {
+            load_flags(&mut self.spine.capturing, &self.shared.arr_capture);
+        }
         if report.plan_refused > 0 {
             self.shared.plan_refused.fetch_add(report.plan_refused, Ordering::Relaxed);
         }
@@ -18466,6 +18474,10 @@ struct HostCapture {
     leaving: bool,
 }
 
+/// **Stem taps in flight at once**, either way: see the rings in
+/// `start_inner`.
+const STEM_TAPS: usize = 8;
+
 /// **Frames of the live input a renderer can read in one chunk**, per
 /// device channel: room for the largest chunk at the slowest varispeed with
 /// the device's block in flight beside it, as the scratch has always been
@@ -19592,8 +19604,11 @@ impl Engine {
         // hundred megabytes on every engine, recording or not. A pick's ring
         // is built when its track is armed (`sync_capture_rings`) and the
         // stem ring when an export arms its stems (`arm_stems`).
-        let (stems_to_audio, stems_incoming) = RingBuffer::<Option<StemTap>>::new(2);
-        let (stems_retiring, stems_from_audio) = RingBuffer::<Option<StemTap>>::new(2);
+        // Deeper than the click's two: an export can arm and disarm, and an
+        // offline engine has no callback taking taps in between, so the host
+        // never has to wait on, or drop, a tap it sends.
+        let (stems_to_audio, stems_incoming) = RingBuffer::<Option<StemTap>>::new(STEM_TAPS);
+        let (stems_retiring, stems_from_audio) = RingBuffer::<Option<StemTap>>::new(STEM_TAPS);
         // The scope's third of a second of stereo.
         let (scope_tx, scope_rx) = RingBuffer::<f32>::new(1 << 15);
         // The INSERT tap: the scope's own third of a second, which is >= 2x
@@ -41137,7 +41152,11 @@ mod memory_inputs {
                 e.drain_capture(far_pick, &mut took);
             }
             assert_eq!(table.pick_of(TrackId(far as u32)), Some(far_pick), "a reorder moved the far pick");
-            assert!(!took.is_empty() && took.iter().all(|v| *v == level(far % DEV)), "{lanes}: the far pick's take is not its input");
+            // Every block from the one its ring arrived in: at a thousand
+            // lanes that ring came with a Grow of the pick table in the
+            // same pass, and the flags were read again over the wider table.
+            assert_eq!(took.len(), 5 * BLOCK * 2, "{lanes}: the far pick's take is missing blocks");
+            assert!(took.iter().all(|v| *v == level(far % DEV)), "{lanes}: the far pick's take is not its input");
             e.set_capturing(&[]);
             e.sync_capture_rings(&[]).expect("the rings go home");
             assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: the rings going home allocated");
