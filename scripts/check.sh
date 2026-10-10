@@ -106,8 +106,10 @@ echo "==> the ban scans  (no live code names the fixed desk, no surface undersel
 # them, so deleting or renaming one turns the gate red here instead of
 # quietly retiring the ban (`named_leg` counts them). `ban_scan` is the
 # tree-wide one over every crate's shipped code, `copy_scan` the phrase scan
-# over every surface that says what a key does.
-named_leg 22 -p tangent-ui --lib -- --exact \
+# over every surface that says what a key does, and the dash rule over
+# everything else that ships: every crate's strings, and what a download or
+# an installer carries for a person to read.
+named_leg 24 -p tangent-ui --lib -- --exact \
   ban_scan::no_live_code_names_the_fixed_desk \
   ban_scan::every_banned_name_and_clamp_fails_the_scan_when_planted \
   ban_scan::every_exemption_names_what_is_still_there \
@@ -115,6 +117,8 @@ named_leg 22 -p tangent-ui --lib -- --exact \
   copy_scan::no_surface_says_a_key_is_only_a_thank_you \
   copy_scan::every_refused_phrase_fails_the_scan_when_planted \
   copy_scan::no_shipped_string_in_any_crate_has_an_em_dash \
+  copy_scan::nothing_the_downloads_and_installers_carry_has_an_em_dash \
+  copy_scan::a_shipped_file_is_read_as_it_reaches_the_person_it_is_for \
   era_corpus::the_lifts_read_no_live_constant \
   era_corpus::nothing_but_the_choosers_spells_the_real_config_or_media_path \
   settings::tests::the_historical_migrations_do_not_read_todays_constants \

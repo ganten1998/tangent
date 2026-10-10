@@ -22,6 +22,15 @@
 //!   comment is free to quote the stale line as the reason it was changed,
 //!   which is this repo's idiom, and an assertion message in a test is not
 //!   something the product says.
+//! * Everything else that ships, by the dash rule alone, since none of it
+//!   says what a key does: every other crate's shipped strings, and what a
+//!   download or an installer carries for a person to read or see (the
+//!   licence pages, the README and the licence notes beside the program, the
+//!   installers' pages and scripts, the FreeBSD package's message, and the
+//!   text the build scripts write into a download). Each file is read as it
+//!   reaches its reader ([`Reads`]): what a person is handed is read whole,
+//!   comments and all; what a program parses or renders is read without the
+//!   comments it drops.
 //!
 //! **What is refused** ([`stale`] is the one rule):
 //!
@@ -486,6 +495,237 @@ fn gumroad_page(root: &Path) -> String {
     format!("docs/release/{newest}/GUMROAD.md")
 }
 
+/// **How a shipped file is read: as it reaches the person it is for.**
+///
+/// What a person is HANDED is read whole: a licence, a README, a script the
+/// download asks them to read before they run it, whose comments are part of
+/// what they read. What a program parses or renders is read the way it shows
+/// it: a comment that pkg, makensis, the desktop or the installer's web
+/// view drops never reaches anyone, so it is this repo's to write like every
+/// other comment, while an installer page's `&mdash;` is the mark itself on
+/// the page.
+#[derive(Clone, Copy, Debug)]
+enum Reads {
+    /// Every character.
+    Whole,
+    /// HTML or XML: `<!-- -->` comments and `<style>` and `<script>` blocks
+    /// dropped, character references resolved ([`entities`]).
+    Markup,
+    /// A UCL manifest (pkg-create(8)): a `#` comment outside a quoted string
+    /// or a heredoc value is dropped. pkg parses the file and keeps none.
+    Ucl,
+    /// A file read line by line whose comment lines (starting `;` or `#`)
+    /// its reader drops: the NSIS script, where makensis compiles them away,
+    /// and the desktop entry, where freedesktop's `#` lines are notes.
+    CommentLines,
+}
+
+/// **Every file a download or an installer carries for a person to read or
+/// see**, beside the program and the surfaces the phrase scan reads, with
+/// how each is read. Where each one goes is named beside it; the script
+/// that puts it there is the authority if the two ever disagree.
+///
+/// Not here, each for its reason: the licence texts nobody here wrote
+/// (`LICENSE`'s MIT grant, `LICENSE-GPL-3.0`, the fonts' `OFL.txt`, the
+/// ffmpeg licences fetched beside its binary), which are quoted law and not
+/// ours to reword; and the macOS package's `postinstall`, which prints
+/// nothing and is shown to no one.
+const SHIPPED: [(&str, Reads); 12] = [
+    // The licence page of the macOS installer and of the Windows one (as
+    // LICENSE.txt), and the Linux tarball (build-installer.sh).
+    ("LICENSING.md", Reads::Whole),
+    // README.txt beside the app in the macOS zip and disk image, the Linux
+    // tarballs and the Windows zip.
+    ("docs/ARTIFACT-README.md", Reads::Whole),
+    // Beside the program in every download.
+    ("THIRD-PARTY-LICENSES", Reads::Whole),
+    // The application menu's entry on Linux and FreeBSD.
+    ("assets/tangent.desktop", Reads::CommentLines),
+    // Handed over in the Linux tarballs to be read before it is run; its
+    // usage and its progress lines are what the person sees while it runs.
+    ("installer/linux/install.sh", Reads::Whole),
+    // The same, in the FreeBSD bundles.
+    ("installer/freebsd/install.sh", Reads::Whole),
+    // On the user's PATH from the FreeBSD package, with its measurements in
+    // its comments: "the knowledge ships with the program".
+    ("installer/freebsd/tangent-jack", Reads::Whole),
+    // The FreeBSD package's one-line summary, its description, and the
+    // message pkg prints at the end of the install.
+    ("installer/freebsd/MANIFEST.in", Reads::Ucl),
+    // The macOS installer's first and last pages, and its title and choice.
+    ("installer/macos/welcome.html", Reads::Markup),
+    ("installer/macos/conclusion.html", Reads::Markup),
+    ("installer/macos/distribution.xml.in", Reads::Markup),
+    // The Windows installer's pages, sections and messages.
+    ("installer/windows/tangent.nsi", Reads::CommentLines),
+];
+
+/// The folder every download carries whole: the notice that maps each font
+/// the program embeds to its licence, and the licences, each headed by a
+/// note of ours. Read file by file, so a licence added to it is read without
+/// being listed.
+const FONT_LICENCES: &str = "assets/font-licenses";
+
+/// **Text a build script writes into a download**, read out of the script:
+/// the script, the line the text follows, the line that ends it (matched
+/// whole, as a heredoc's terminator and a function's closing brace stand at
+/// the start of their line), and how it is read.
+const WRITTEN: [(&str, &str, &str, Reads); 3] = [
+    // The app's Info.plist: macOS shows its usage strings when the app first
+    // asks for the camera and the microphone.
+    ("scripts/build-macos.sh", "/Contents/Info.plist\" <<PLIST", "PLIST", Reads::Markup),
+    // README.txt in the FreeBSD bundles.
+    ("scripts/build-freebsd.sh", "write_readme() {", "}", Reads::Whole),
+    // ffmpeg-licenses/SOURCE.txt in the Linux and Windows downloads.
+    ("scripts/fetch-ffmpeg.sh", "provenance() {", "}", Reads::Whole),
+];
+
+/// What of `src` reaches the person it ships to, read as `how` says. Every
+/// newline is kept, so line n of the result is line n of the file.
+fn shipped_text(src: &str, how: Reads) -> String {
+    match how {
+        Reads::Whole => src.to_owned(),
+        Reads::Markup => entities(&markup_shown(src)),
+        Reads::Ucl => ucl_shown(src),
+        Reads::CommentLines => src
+            .split_inclusive('\n')
+            .map(|line| if line.trim_start().starts_with([';', '#']) { blank(line) } else { line.to_owned() })
+            .collect(),
+    }
+}
+
+/// `text` with every character but a newline turned into a space.
+fn blank(text: &str) -> String {
+    text.chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect()
+}
+
+/// Markup without what a renderer never shows: comments, and the insides of
+/// `<style>` and `<script>`. An unclosed one hides the rest of the page, as
+/// it does on the page.
+fn markup_shown(src: &str) -> String {
+    const HIDDEN: [(&str, &str); 3] = [("<!--", "-->"), ("<style", "</style>"), ("<script", "</script>")];
+    // ASCII lowercasing moves no byte, so an offset found in one is the
+    // same offset in the other.
+    let lower = src.to_ascii_lowercase();
+    let mut out = String::with_capacity(src.len());
+    let mut at = 0;
+    while let Some((from, close)) = HIDDEN
+        .iter()
+        .filter_map(|&(open, close)| lower[at..].find(open).map(|i| (at + i, close)))
+        .min_by_key(|&(from, _)| from)
+    {
+        let to = lower[from..].find(close).map_or(src.len(), |i| from + i + close.len());
+        out.push_str(&src[at..from]);
+        out.push_str(&blank(&src[from..to]));
+        at = to;
+    }
+    out.push_str(&src[at..]);
+    out
+}
+
+/// Character references resolved as far as the dash rule needs: the named
+/// em and en dash, and every numeric one (`&#8212;`, `&#x2014;`). Any other
+/// `&` is left as written.
+fn entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let named = tail.find(';').filter(|&end| end <= 12).and_then(|end| {
+            let ch = match &tail[1..end] {
+                "mdash" => Some('\u{2014}'),
+                "ndash" => Some('\u{2013}'),
+                name => {
+                    let number = name.strip_prefix('#')?;
+                    let code = match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => number.parse().ok(),
+                    };
+                    code.and_then(char::from_u32)
+                }
+            };
+            ch.map(|c| (c, end))
+        });
+        match named {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A UCL manifest as pkg keeps it: a `#` outside a quoted string starts a
+/// comment that runs to the end of its line, and the lines of a heredoc
+/// value (`message = <<EOM` to a line that is `EOM`) are text, whatever
+/// they start with.
+fn ucl_shown(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut heredoc: Option<&str> = None;
+    for line in src.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        if let Some(tag) = heredoc {
+            if body == tag {
+                heredoc = None;
+            }
+            out.push_str(line);
+            continue;
+        }
+        let (mut quoted, mut escaped) = (false, false);
+        let cut = body
+            .char_indices()
+            .find(|&(_, c)| {
+                let comment = c == '#' && !quoted;
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quoted = !quoted;
+                }
+                comment
+            })
+            .map_or(body.len(), |(i, _)| i);
+        let kept = &body[..cut];
+        // libucl's terminator is capital letters and nothing else.
+        heredoc = kept
+            .split_once("<<")
+            .map(|(_, tag)| tag.trim())
+            .filter(|tag| !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase()));
+        out.push_str(kept);
+        out.push_str(&blank(&line[cut..]));
+    }
+    out
+}
+
+/// The text a build script writes, out of the script: the lines after the
+/// first line that contains `opens`, up to the next line that is exactly
+/// `closes`, and the number of the first of them. `None` when the script
+/// no longer has either.
+fn fragment(src: &str, opens: &str, closes: &str) -> Option<(usize, String)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| l.contains(opens))? + 1;
+    let len = lines[start..].iter().position(|l| *l == closes)?;
+    Some((start + 1, lines[start..start + len].join("\n")))
+}
+
+/// Each line of `text` that has an em dash, as `number: line`, the first
+/// line numbered `first`.
+fn dash_lines(text: &str, first: usize) -> Vec<String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(EM_DASH))
+        .map(|(i, line)| format!("{}: {}", first + i, line.trim()))
+        .collect()
+}
+
 /// **No surface says a key does less than it does.** See the module doc.
 #[test]
 fn no_surface_says_a_key_is_only_a_thank_you() {
@@ -534,8 +774,15 @@ fn no_shipped_string_in_any_crate_has_an_em_dash() {
     let mut hits = Vec::new();
     let mut read = 0;
     for dir in ["tangent/src", "tangent-host/src", "tangent-record/src", "tangent-core/src", "plugin/src"] {
-        let files = crate::ban_scan::rust_files(&root.join(dir));
+        let mut files = crate::ban_scan::rust_files(&root.join(dir));
         let tests = crate::ban_scan::test_only_files(&files);
+        // A build script's strings ship when it writes them into the
+        // program: tangent's writes the Windows version resource, whose
+        // FileDescription is the line Task Manager and Properties show.
+        let build = root.join(dir.strip_suffix("/src").expect("a crate's src")).join("build.rs");
+        if build.is_file() {
+            files.push(build);
+        }
         for file in files.iter().filter(|f| !tests.contains(*f)) {
             read += 1;
             let src = std::fs::read_to_string(file).expect("a source file");
@@ -548,6 +795,92 @@ fn no_shipped_string_in_any_crate_has_an_em_dash() {
     // Not a vacuous pass: the five trees were found and read.
     assert!(read > 90, "the scan read only {read} files");
     assert!(hits.is_empty(), "a shipped string has an em dash:\n  {}", hits.join("\n  "));
+}
+
+/// **Nothing a download or an installer carries has an em dash** either:
+/// the licence pages, the README and the licence notes beside the program,
+/// the installers' pages and scripts, the FreeBSD package's message, and the
+/// text the build scripts write into a download ([`SHIPPED`],
+/// [`FONT_LICENCES`], [`WRITTEN`]). These were never read by a scan, and the
+/// FreeBSD message, the licence page and both macOS installer pages (as
+/// `&mdash;`) each had one. Only the dash rule, as for the other crates:
+/// none of this says what a key does.
+#[test]
+fn nothing_the_downloads_and_installers_carry_has_an_em_dash() {
+    let root = root();
+    let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    let dir = root.join(FONT_LICENCES);
+    let mut licences: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "txt"))
+        .filter_map(|p| p.file_name().and_then(|f| f.to_str()).map(|f| format!("{FONT_LICENCES}/{f}")))
+        .collect();
+    licences.sort();
+    // Not a vacuous pass: the notice and the six fonts' licences.
+    assert!(licences.len() >= 7, "{FONT_LICENCES} holds only {licences:?}");
+    let files = SHIPPED.iter().map(|&(rel, how)| (rel.to_owned(), how));
+    let mut hits = Vec::new();
+    for (rel, how) in files.chain(licences.into_iter().map(|rel| (rel, Reads::Whole))) {
+        let text = shipped_text(&read(rel.as_str()), how);
+        hits.extend(dash_lines(&text, 1).into_iter().map(|h| format!("{rel}:{h}")));
+    }
+    for (script, opens, closes, how) in WRITTEN {
+        let (first, body) = fragment(&read(script), opens, closes).unwrap_or_else(|| {
+            panic!("{script} no longer writes its text after {opens:?}: point this scan at where it went")
+        });
+        assert!(!body.trim().is_empty(), "{script} has nothing between {opens:?} and {closes:?}");
+        let text = shipped_text(&body, how);
+        hits.extend(dash_lines(&text, first).into_iter().map(|h| format!("{script}:{h}")));
+    }
+    assert!(hits.is_empty(), "text a download carries has an em dash:\n  {}", hits.join("\n  "));
+}
+
+/// **Each kind of shipped file is read as it reaches the person it is
+/// for**: the mark is found wherever it shows, written as itself or as a
+/// character reference, and nowhere a packager, a compiler or a renderer
+/// drops. The scan above passing proves nothing unless this does too.
+#[test]
+fn a_shipped_file_is_read_as_it_reaches_the_person_it_is_for() {
+    const D: char = EM_DASH;
+    // An installer page: a comment and a style sheet are never shown, and
+    // `&mdash;` is the mark on the page.
+    let page = "<html><head><style>\n/* light \u{2014} on light */\n</style></head>\n<!-- a\n\u{2014} b -->\n\
+                <p>one &mdash; two</p>\n<p>&#8212; &#x2014; &#X2014;</p>\n<p>&amp; &ndash; &bogus; & &#xZZ;</p>\n";
+    let shown = shipped_text(page, Reads::Markup);
+    assert_eq!(shown.lines().count(), page.lines().count(), "a line was lost or gained:\n{shown}");
+    assert_eq!(dash_lines(&shown, 1), [format!("6: <p>one {D} two</p>"), format!("7: <p>{D} {D} {D}</p>")]);
+    assert!(shown.contains("<p>&amp; \u{2013} &bogus; & &#xZZ;</p>"), "{shown}");
+    // The FreeBSD manifest: a comment is dropped; a quoted `#` and a
+    // heredoc's line that starts with one are what pkg shows.
+    let manifest = "# a comment \u{2014} dropped\ncomment = \"a # kept \u{2014} here\"\nmessage = <<EOM\n\
+                    # shown \u{2014} too\nEOM\nname = \"x\" # trailing \u{2014} dropped\n";
+    let shown = shipped_text(manifest, Reads::Ucl);
+    assert_eq!(shown.lines().count(), manifest.lines().count(), "a line was lost or gained:\n{shown}");
+    assert_eq!(dash_lines(&shown, 1), [format!("2: comment = \"a # kept {D} here\""), format!("4: # shown {D} too")]);
+    // The Windows installer and the desktop entry: comment lines are
+    // dropped, and what they say is shown.
+    let nsi = "; a comment \u{2014} dropped\n  # another \u{2014} dropped\nMessageBox MB_OK \"one \u{2014} two\"\n";
+    let shown = shipped_text(nsi, Reads::CommentLines);
+    assert_eq!(dash_lines(&shown, 1), [format!("3: MessageBox MB_OK \"one {D} two\"")]);
+    let entry = "[Desktop Entry]\n# a note \u{2014} dropped\nComment=one \u{2014} two\n";
+    let shown = shipped_text(entry, Reads::CommentLines);
+    assert_eq!(dash_lines(&shown, 1), [format!("3: Comment=one {D} two")]);
+    // A script handed over to be read: its comments are read with it.
+    let script = "#!/bin/sh\n# read before running \u{2014} kept\necho done\n";
+    assert_eq!(dash_lines(&shipped_text(script, Reads::Whole), 1), [format!("2: # read before running {D} kept")]);
+    // Text a build script writes: from the line after the opener to the
+    // terminator standing alone (an indented one ends nothing), numbered as
+    // lines of the script.
+    let build = "set -e\ncat > \"$APP/Contents/Info.plist\" <<PLIST\n<!-- a note \u{2014} not shown -->\n\
+                 <string>asks \u{2014} for the camera</string>\n  PLIST\nPLIST\necho after \u{2014}\n";
+    let (first, body) = fragment(build, "/Contents/Info.plist\" <<PLIST", "PLIST").expect("the plist is found");
+    assert_eq!((first, body.lines().count()), (3, 3), "{body}");
+    assert_eq!(
+        dash_lines(&shipped_text(&body, Reads::Markup), first),
+        [format!("4: <string>asks {D} for the camera</string>")]
+    );
+    assert_eq!(fragment(build, "write_readme() {", "}"), None);
 }
 
 /// **Every refused phrase is refused when planted**, on the surface kind it

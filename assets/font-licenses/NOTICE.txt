@@ -1,5 +1,5 @@
-Font licences — Tangent
-=======================
+Font licences: Tangent
+======================
 
 Tangent's executable statically embeds TEN font files:
 

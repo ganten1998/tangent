@@ -165,7 +165,7 @@ PLUGINS
   not "parameter 7". Bays are on every channel.
 
 A MIDI KEYBOARD
-  Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so
+  Plug it in and Tangent finds it: MIDI is read straight from /dev/umidi, so
   no server or daemon is involved. The device nodes are world-readable by
   default, so no group membership or devfs rule is needed.
 
