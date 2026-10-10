@@ -6756,6 +6756,12 @@ pub(crate) struct LaneBody {
     /// The pre-fader send's own gate, slewed like a fader: the strip's mute,
     /// solo and polarity still reach a pre-fader send, its level does not.
     pre_gate: f32,
+    /// **Where that gate stood at the head of this chunk**, set as the send
+    /// buffers clear. A legacy destination's arrivals are gated in its
+    /// route-phase run, after the fold already slewed the gate over its
+    /// own audio: started from here, they take the same gate frame for
+    /// frame, and the gate moves once a frame, not twice.
+    pre_gate_from: f32,
 }
 
 /// **What a post-fork node decided this chunk** (design 7.8), worked out in
@@ -6836,6 +6842,7 @@ impl Lane {
                 send_pre: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 send_post: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 pre_gate: 0.0,
+                pre_gate_from: 0.0,
             }),
         }
     }
@@ -17491,7 +17498,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     let (Some(kind), true) = (prep.kind, prep.live) else {
         return;
     };
-    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate, node, .. } = body;
+    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate, pre_gate_from, node, .. } = body;
     let [own, extra] = chains;
     let own_seat = lane_seat(slot, CHAIN_OWN);
     let extra_seat = lane_seat(slot, CHAIN_EXTRA);
@@ -17526,7 +17533,13 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             );
         }
         let g = prep.gain;
-        let mut pg = *pre_gate;
+        // The gate from the chunk's head, not from where the fold left it:
+        // the fold already walked it over these frames for the strip's own
+        // audio, and walking it on from there would open (or close) the
+        // arrivals a chunk early. Same start, same target, same frames: the
+        // fold's own figure, frame for frame, and where it ends is where the
+        // fold left it.
+        let mut pg = *pre_gate_from;
         for f in 0..frames {
             let x0 = post[0][f];
             let x1 = post.get(1).map_or(x0, |c| c[f]);
@@ -18500,6 +18513,7 @@ impl Renderer {
                 let n = frames.min(c.len());
                 c[..n].fill(0.0);
             }
+            b.pre_gate_from = b.pre_gate;
         }
     }
 
@@ -18774,7 +18788,7 @@ impl Renderer {
                 samples: &self.sampler_samples,
                 key_prev: &self.spine.desk.key_prev,
                 key_prev_frames: self.spine.desk.key_prev_frames,
-                stride: self.spine.lanes.len() * 2,
+                stride: self.stride(),
                 coeff: self.gain_coeff,
             };
             let lanes: &[Option<Box<Lane>>] = &self.spine.lanes;
@@ -41144,6 +41158,51 @@ mod slot_engine {
                 rms(&pre_muted),
                 rms(&post_muted)
             );
+        }
+
+        /// **A destination's pre-fader send gate moves once a frame**: lane 1
+        /// plays its own clip, takes lane 0's route (a legacy destination),
+        /// and sends pre-fader into bus 40, its gate opening from shut over
+        /// the first blocks. What the route adds to the bus is lane 0's
+        /// audio times that one slew, frame by frame. A destination that
+        /// walked the gate on from where its fold left it would open its
+        /// arrivals a chunk early, and its own audio after them.
+        #[test]
+        fn a_destinations_pre_fader_send_gate_moves_once_a_frame() {
+            let render = |routed: bool| -> (Vec<f32>, Vec<f32>, f32) {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                if routed {
+                    inputs.routes = vec![route(0, 1, 1.0)];
+                }
+                inputs.sends = vec![send(1, 40, 1.0, true)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, 0, 0x0a11), clip_at(&e, 1, 0x0b22)]);
+                let coeff = e.offline.as_ref().expect("a renderer").gain_coeff;
+                let (_, stems) = roll(&mut e, 4);
+                assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
+                let width = e.stem_frame_width() / 2;
+                (column(&stems, width, 0), column(&stems, width, 40), coeff)
+            };
+            let (track, alone, coeff) = render(false);
+            let (_, both, _) = render(true);
+            assert!(track[..BLOCK * 2].iter().any(|v| *v != 0.0), "the routed track was silent while the gate opened");
+            let (pl, pr) = pan_gains(0.0);
+            let mut g = 0.0f32;
+            for f in 0..track.len() / 2 {
+                g += (1.0 - g) * coeff;
+                for (c, p) in [(0, pl), (1, pr)] {
+                    let i = f * 2 + c;
+                    let want = track[i] * g * p;
+                    let got = both[i] - alone[i];
+                    let tol = 1e-5 * (both[i].abs() + alone[i].abs() + want.abs()) + 1e-9;
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "frame {f}, side {c}: the route added {got} to the bus, want {want} (gate {g})"
+                    );
+                }
+            }
+            assert!(g > 0.9, "the gate never opened: {g}");
         }
 
         /// **The click and the drum bus send like any strip**: the click's
