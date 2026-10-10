@@ -3160,8 +3160,9 @@ pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
     // **A document's legacy bytes are Tangent's own file** (design 6.7): the
     // first format-2 save keeps them beside the document, so a scratch that
     // was ever saved over a legacy one carries them, and a sweep that read
-    // them as somebody's work would keep every such scratch for ever.
-    let pre_v8 = [crate::arrangement::DOC_NAME, crate::arrangement::DOC_NAME_LEGACY]
+    // them as somebody's work would keep every such scratch for ever. The
+    // kit sidecar's are kept the same way (`DrumpadDoc::keep_pre_v8`).
+    let pre_v8 = [crate::arrangement::DOC_NAME, crate::arrangement::DOC_NAME_LEGACY, crate::drumpad::FILE_NAME]
         .map(|d| format!("{d}{}", crate::arrangement::PRE_V8_SUFFIX));
     entries.into_iter().all(|e| {
         let Ok(e) = e else {
