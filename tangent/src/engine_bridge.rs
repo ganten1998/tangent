@@ -1398,16 +1398,39 @@ pub struct PickEntry {
 /// **Held**: a pick a running record took at its press keeps the input it
 /// was reading and is given to no other track until the record lets it go,
 /// whatever happens to its track meanwhile (design A5: the record is bound by
-/// identity).
+/// identity). It feeds the track that recorded through it for as long as
+/// that is an audio track with no other pick, so the track hears what it
+/// takes. In EITHER mode, and across a change of mode: a desk that names its
+/// first input mid-take, or stops naming its last, turns explicit or ordinal
+/// around the held picks and renumbers none of them. The design holds
+/// input-binding changes for a record's length (`desk_shape_held`, W6); the
+/// table keeps its own promise without that hold.
 #[derive(Clone, Debug, Default)]
 pub struct PickTable {
     /// Explicit mode: every track that names an input, and its pick.
     named: BTreeMap<TrackId, PickId>,
-    /// The picks a record holds, with the input each was reading.
-    held: BTreeMap<PickId, Option<tangent_record::audio::ChannelPick>>,
+    /// The picks a record holds, each with what it fed and read at the press.
+    held: BTreeMap<PickId, HeldPick>,
     /// This frame's answer, by PickId: `picks[p].pick == PickId(p)`.
     picks: Vec<PickEntry>,
     explicit: bool,
+}
+
+/// **What a held pick keeps** ([`PickTable::hold`]): the track it fed at the
+/// press, and what it read there, the whole device included.
+///
+/// The input, never its columns: the columns are worked out against the
+/// device as it is open ([`pick_columns`]), and the monitor ring carries
+/// whole device frames whatever the stream's picks say, so a held pick reads
+/// the same columns for as long as its record's device is open. It kept only
+/// `from`, which for the whole device is `None`: the pick a record took on a
+/// stream opened whole was rebuilt as reading NOTHING the moment the desk
+/// named an input anywhere, and the take stopped growing with no word said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeldPick {
+    track: Option<TrackId>,
+    from: Option<tangent_record::audio::ChannelPick>,
+    whole: bool,
 }
 
 impl PickTable {
@@ -1432,6 +1455,15 @@ impl PickTable {
                 if self.named.contains_key(&r.id) {
                     continue;
                 }
+                // **A track a record holds a pick for names its input on
+                // that pick**: the record keeps reading what it read at the
+                // press, and when it lets go the track's own binding is
+                // there, on the pick it had. A fresh one would have been a
+                // second pick for one track, both on its lane.
+                if let Some(p) = self.held.iter().find(|(_, h)| h.track == Some(r.id)).map(|(p, _)| *p) {
+                    self.named.insert(r.id, p);
+                    continue;
+                }
                 let Some(free) = (0..u32::MAX).find(|p| !used.contains(p)) else { break };
                 if free as usize >= tangent_ui::desk_id::MAX_ROWS {
                     break;
@@ -1444,25 +1476,47 @@ impl PickTable {
             for (id, pick) in &self.named {
                 entries[pick.0 as usize] = (Some(*id), wanted.get(id).copied(), false);
             }
-            // A held pick reads what it read when the record began, and feeds
-            // its track only while the track still names it.
-            for (pick, from) in &self.held {
-                let at = pick.0 as usize;
-                if let Some(e) = entries.get_mut(at) {
-                    let track = e.0.filter(|id| self.named.get(id) == Some(pick));
-                    *e = (track, *from, false);
-                }
-            }
         } else {
-            // Ordinal: nothing named, nothing kept by name.
+            // Ordinal: nothing named, nothing kept by name. **Around the
+            // held picks**: each stays its own track's (below), and every
+            // other audio row takes the next pick nobody holds, in row
+            // order, each pick reading the stream at its own place. With
+            // nothing held that is the walk it always was, the k-th audio
+            // row on pick k. It ignored the held picks, so a desk that
+            // stopped naming its last input mid-take had the record's pick
+            // read whatever the stream held at its place, and a frame later
+            // that was the band's own channel (`devices::audio_selection`):
+            // another microphone in the take.
             self.named.clear();
             let honoured = stream.picks.clone().fitted(dev.max(1));
-            let audio: Vec<TrackId> = rows.iter().filter(|r| r.audio).map(|r| r.id).collect();
             let stream_n = if honoured.is_empty() { usize::from(dev > 0) } else { honoured.len() };
-            let n = audio.len().max(stream_n);
-            for p in 0..n {
+            let holders: BTreeSet<TrackId> = self.held.values().filter_map(|h| h.track).collect();
+            let mut free = rows.iter().filter(|r| r.audio && !holders.contains(&r.id)).map(|r| r.id).peekable();
+            let past_held = self.held.keys().next_back().map_or(0, |p| p.0 as usize + 1);
+            let mut p = 0usize;
+            while p < stream_n.max(past_held) || free.peek().is_some() {
                 let whole = honoured.is_empty() && p == 0 && dev > 0;
-                entries.push((audio.get(p).copied(), honoured.get(p), whole));
+                let track = if self.held.contains_key(&PickId(p as u32)) { None } else { free.next() };
+                entries.push((track, honoured.get(p), whole));
+                p += 1;
+            }
+        }
+        // **A held pick reads what it read at the press, in either mode**,
+        // the whole device included, and feeds the track it fed there while
+        // that is still an audio track with no other pick: what a track
+        // monitors through its record is what the record takes. A track
+        // removed meanwhile is fed by nothing, and its pick still reads, so
+        // the tee still writes the take (`Renderer::mix_monitor` tees by
+        // PickId before it asks the binding).
+        if !self.held.is_empty() {
+            let audio: BTreeSet<TrackId> = rows.iter().filter(|r| r.audio).map(|r| r.id).collect();
+            for (pick, h) in &self.held {
+                if let Some(e) = entries.get_mut(pick.0 as usize) {
+                    let track = h
+                        .track
+                        .filter(|id| audio.contains(id) && self.named.get(id).is_none_or(|p| p == pick));
+                    *e = (track, h.from, h.whole);
+                }
             }
         }
         self.picks = entries
@@ -1475,12 +1529,19 @@ impl PickTable {
             .collect();
     }
 
-    /// **A record takes these picks**: each keeps the input it reads now, and
-    /// none is given to another track, until [`Self::release`].
+    /// **A record takes these picks**: each keeps the track it feeds now and
+    /// the input it reads now, the whole device included (a pick that names
+    /// no input and reads columns: see [`PickEntry::from`]), and none is
+    /// given to another track, until [`Self::release`].
     pub fn hold(&mut self, picks: &[PickId]) {
         for p in picks {
-            let from = self.picks.get(p.0 as usize).and_then(|e| e.from);
-            self.held.insert(*p, from);
+            let e = self.picks.get(p.0 as usize);
+            let held = HeldPick {
+                track: e.and_then(|e| e.track),
+                from: e.and_then(|e| e.from),
+                whole: e.is_some_and(|e| e.from.is_none() && e.width > 0),
+            };
+            self.held.insert(*p, held);
         }
     }
 
@@ -3212,6 +3273,130 @@ mod tests {
         rows.push(row(4, Some(Mono(0)), false));
         t.bind(&rows, &s);
         assert_eq!(t.pick_of(TrackId(4)), Some(held), "a released pick is not free again");
+    }
+
+    /// **A pick a record holds on a stream opened whole keeps reading the
+    /// whole device when the desk names its first input mid-take**, and
+    /// keeps feeding the track recording through it (design A5). The desk
+    /// turns explicit around it: the new binding takes another pick, the
+    /// stream narrows to that binding (the device stays open), and the held
+    /// pick reads the whole device's first pair throughout. It was held as
+    /// `None`, which for a pick that is not the whole device reads nothing:
+    /// width 0, which the tee skips, and the take stopped growing unsaid.
+    #[test]
+    fn a_held_whole_device_pick_reads_the_whole_device_when_the_desk_names_an_input() {
+        use ChannelPick::Mono;
+        let mut t = PickTable::default();
+        let whole = stream(4);
+        let mut rows = vec![row(1, None, true), row(2, None, false)];
+        t.bind(&rows, &whole);
+        assert!(!t.explicit());
+        let held = t.pick_of(TrackId(1)).expect("a pick");
+        let e = t.picks()[held.0 as usize];
+        assert_eq!((e.from, e.width, e.cols), (None, 4, [0, 1]), "the first pick of a stream opened whole");
+        t.hold(&[held]);
+        // Track 2 names input 2 mid-take: the desk is explicit now.
+        rows[1].spec = Some(Mono(1));
+        t.bind(&rows, &whole);
+        assert!(t.explicit());
+        let narrowed = InputStream { device_channels: Some(4), picks: Picks::from_slice(&t.stream_picks()) };
+        assert_eq!(t.stream_picks(), vec![Mono(1)], "the stream is not narrowed to the binding");
+        for s in [&whole, &narrowed] {
+            t.bind(&rows, s);
+            let e = t.picks()[held.0 as usize];
+            assert_eq!(
+                (e.track, e.from, e.width, e.cols),
+                (Some(TrackId(1)), None, 4, [0, 1]),
+                "the held pick no longer reads the whole device for its track"
+            );
+            let other = t.pick_of(TrackId(2)).expect("the new binding's pick");
+            assert_ne!(other, held, "a held pick was given to the track that named an input");
+            assert_eq!(t.picks()[other.0 as usize].cols, [1, 1]);
+        }
+        // The recording track names an input of its own mid-take: it is
+        // bound on the pick it holds, which still reads what the record reads.
+        rows[0].spec = Some(Mono(3));
+        t.bind(&rows, &narrowed);
+        assert_eq!(t.pick_of(TrackId(1)), Some(held), "the recording track has another pick");
+        assert_eq!(t.picks()[held.0 as usize].width, 4, "the held pick took the binding before the record let go");
+        // Released, the same pick reads the track's own binding.
+        t.release(&[held]);
+        t.bind(&rows, &narrowed);
+        let e = t.picks()[held.0 as usize];
+        assert_eq!((e.track, e.from, e.cols), (Some(TrackId(1)), Some(Mono(3)), [3, 3]));
+    }
+
+    /// **A pick a record holds keeps its input and its track when the desk
+    /// stops naming inputs mid-take** (design A5). The desk turns ordinal
+    /// around it, and the stream, the desk naming nothing, goes back to the
+    /// band's own channel (`devices::audio_selection`): every other audio
+    /// row takes a pick nobody holds, in row order, each reading the stream
+    /// at its place, and the held pick reads input 3 throughout. The ordinal
+    /// walk ignored the held picks: the record's pick read the stream's
+    /// first input, the band's channel a frame later, and the rest of the
+    /// take was another microphone.
+    #[test]
+    fn a_held_pick_keeps_its_input_when_the_desk_stops_naming_inputs() {
+        use ChannelPick::Mono;
+        let mut t = PickTable::default();
+        let mut rows = vec![row(1, None, false), row(2, Some(Mono(2)), true), row(3, None, false)];
+        let named = InputStream { device_channels: Some(4), picks: Picks::from_slice(&[Mono(2)]) };
+        t.bind(&rows, &named);
+        let held = t.pick_of(TrackId(2)).expect("a pick");
+        t.hold(&[held]);
+        // Its input set to none: nothing on the desk names one now.
+        rows[1].spec = None;
+        let band = InputStream { device_channels: Some(4), picks: Picks::from_slice(&[Mono(0)]) };
+        for s in [&named, &band] {
+            t.bind(&rows, s);
+            assert!(!t.explicit());
+            assert!(t.stream_picks().is_empty(), "an ordinal desk tells the stream its inputs");
+            let e = t.picks()[held.0 as usize];
+            assert_eq!(
+                (e.track, e.from, e.width, e.cols),
+                (Some(TrackId(2)), Some(Mono(2)), 1, [2, 2]),
+                "the held pick left its input or its track"
+            );
+            assert_eq!(picks_of(&t, &[1, 2, 3]), vec![Some(1), Some(0), Some(2)], "a held pick was given away");
+        }
+        assert_eq!(t.picks()[1].from, None, "a pick past the band's one input reads it");
+        // Released: the ordinal walk, the k-th audio row on pick k.
+        t.release(&[held]);
+        t.bind(&rows, &band);
+        assert_eq!(picks_of(&t, &[1, 2, 3]), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(t.picks()[0].from, Some(Mono(0)));
+    }
+
+    /// **On a desk that never named an input, a held pick stays its track's
+    /// and keeps its input** (design A5), where the ordinal walk numbers
+    /// every other pick by place: a track inserted above the recording one
+    /// takes the next pick nobody holds, and the band's inputs changed
+    /// mid-take move every pick but the held one. Released, the walk is the
+    /// one it always was.
+    #[test]
+    fn an_ordinal_held_pick_stays_its_tracks_through_an_insert_above_and_new_band_inputs() {
+        use ChannelPick::Mono;
+        let mut t = PickTable::default();
+        let first = InputStream { device_channels: Some(8), picks: Picks::from_slice(&[Mono(4), Mono(5)]) };
+        let mut rows = vec![row(1, None, true), row(2, None, false)];
+        t.bind(&rows, &first);
+        assert_eq!(picks_of(&t, &[1, 2]), vec![Some(0), Some(1)]);
+        let held = PickId(0);
+        t.hold(&[held]);
+        rows.insert(0, row(9, None, false));
+        let moved = InputStream { device_channels: Some(8), picks: Picks::from_slice(&[Mono(6), Mono(7)]) };
+        for s in [&first, &moved] {
+            t.bind(&rows, s);
+            assert_eq!(t.pick_of(TrackId(1)), Some(held), "the recording track lost its pick");
+            let e = t.picks()[held.0 as usize];
+            assert_eq!((e.from, e.cols), (Some(Mono(4)), [4, 4]), "the held pick reads another input");
+            assert_eq!(picks_of(&t, &[9, 2]), vec![Some(1), Some(2)], "the others do not take the free picks in row order");
+        }
+        assert_eq!(t.picks()[1].from, Some(Mono(7)), "a free pick does not read the stream at its place");
+        t.release(&[held]);
+        t.bind(&rows, &moved);
+        assert_eq!(picks_of(&t, &[9, 1, 2]), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(t.picks()[0].from, Some(Mono(6)));
     }
 
     /// **Today's assignment, transcribed** (`push_monitor_settings` at the
