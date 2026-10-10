@@ -13370,6 +13370,34 @@ impl TangentApp {
         // back), and a window that vanishes when you edit the desk is a
         // thing a person can see and understand.
         self.pedal_stack = None;
+        // **An open key picker is drawn again from the desk as it stands**:
+        // it is a plugin window, so the desk changes under it, and its list
+        // labels each source by the row it stands on. Its bay and its
+        // sources are tracks, so nothing it holds goes stale; only the rows
+        // it shows would. A picker whose own track has left goes down:
+        // there is nothing left to key.
+        if let Some(Dialog::InsertKeySource { bay, filter, .. }) = &self.dialog {
+            let (bay, filter) = (*bay, filter.clone());
+            let here = bay.seat.node.track().is_none_or(|id| self.row_of(id).is_some());
+            self.dialog = here.then(|| match self.key_picker_dialog(bay) {
+                Dialog::InsertKeySource { bay, current, channels, .. } => {
+                    Dialog::InsertKeySource { bay, current, channels, filter }
+                }
+                other => other,
+            });
+        }
+        // **And an open instrument window goes down**: the Keys sound, the
+        // DX7 patch list and its editor are plugin windows too, and they
+        // name their instrument by the ROW it stands on, which after this
+        // edit may hold another track or none. Put down for the pedal
+        // window's reason; a press on the instrument opens it again on the
+        // track where it now stands.
+        if matches!(
+            self.dialog,
+            Some(Dialog::KeysPatch { .. } | Dialog::PatchPicker { .. } | Dialog::PatchEditor { .. })
+        ) {
+            self.dialog = None;
+        }
         // A double-click's first half names its row, and the keyboard's aim
         // names a control on one; both are re-made by the next press and
         // the next paint, from the desk as it now stands.
@@ -14408,6 +14436,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.preset_sample = None;
         self.sampler_load.clear();
         self.pending_inserts.clear();
+        // A face or a key picker open on one of the last document's bays.
+        if matches!(self.dialog, Some(Dialog::InsertFace { .. } | Dialog::InsertKeySource { .. })) {
+            self.dialog = None;
+        }
     }
 
     /// **On open, a lone base node and its control are made to agree.**
@@ -30322,18 +30354,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// never sounds is a compressor that never ducks, silently).
     fn key_picker_dialog(&self, sb: crate::desk_id::SeatBay) -> Dialog {
         // Named as the desk names them, for the name-first rows: see
-        // `routing_dialog`.
-        // The rows by where they stand: the picker is modal, so they hold
-        // still while it is open, and its answer is turned back into a
-        // track before it is kept.
+        // `routing_dialog`. Each source is its TRACK, with the row it
+        // stands on for the label: the picker is a plugin window, so the
+        // desk can change under it, and `on_desk_shape_change` draws the
+        // list again when it does.
         let own = sb.seat.node;
         let channels = (0..self.desk_extent())
             .filter(|n| self.row_node(*n) != own && self.channel_used(*n))
-            .map(|n| (n, self.channel_display_name(n).to_owned()))
+            .map(|n| (self.row_node(n), n, self.channel_display_name(n).to_owned()))
             .collect();
         Dialog::InsertKeySource {
             bay: sb,
-            current: self.settings.insert_keys.get(sb).and_then(|n| self.row_of(n.track()?)),
+            current: self.settings.insert_keys.get(sb),
             channels,
             filter: String::new(),
         }
@@ -37879,9 +37911,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // A settings write and nothing else — the `SetRouteGain`
                 // pattern, not a request: the bridge publishes the whole key
                 // table beside the routes every frame, so the engine hears
-                // about it the same way it hears about a fader. The source
-                // is the track on the row the modal picker named.
-                let from = from.map(|row| self.row_node(row));
+                // about it the same way it hears about a fader. Both ends
+                // by identity; the picker is not modal, so an end whose
+                // track left the desk since the list was drawn keys nothing
+                // (the redraw on a shape change takes it off the list, and
+                // this is the belt to that).
+                let on_desk = |n: crate::desk_id::Node| n.track().is_none_or(|id| self.row_of(id).is_some());
+                if !on_desk(bay.seat.node) || from.is_some_and(|n| !on_desk(n)) {
+                    return;
+                }
                 self.settings.insert_keys.set(bay, from);
                 self.save_settings();
                 // One bay, one choice: the window answered its question.
@@ -77389,7 +77427,7 @@ mod folder_tests {
         let offered = |a: &TangentApp| -> Vec<usize> {
             match a.key_picker_dialog(bay) {
                 Dialog::InsertKeySource { channels, .. } => {
-                    channels.into_iter().map(|(n, _)| n).collect()
+                    channels.into_iter().map(|(_, row, _)| row).collect()
                 }
                 _ => panic!("not the key picker"),
             }
@@ -77401,19 +77439,70 @@ mod folder_tests {
 
         // The choice lands in settings — and only closes the window.
         a.open_key_picker(bay);
-        a.apply_dialog_action(DialogAction::SetInsertKeySource { bay, from: Some(2) });
+        a.apply_dialog_action(DialogAction::SetInsertKeySource { bay, from: Some(a.row_node(2)) });
         assert_eq!(a.settings.insert_keys.get(bay), Some(a.row_node(2)));
         assert!(a.dialog.is_none(), "the picker answered and stayed open");
         // The picker reopened on that bay greys what is current.
         match a.key_picker_dialog(bay) {
             Dialog::InsertKeySource { current, .. } => {
-                assert_eq!(current, Some(2));
+                assert_eq!(current, Some(a.row_node(2)));
             }
             _ => panic!("not the key picker"),
         }
         // And "No sidechain" is the way off.
         a.apply_dialog_action(DialogAction::SetInsertKeySource { bay, from: None });
         assert_eq!(a.settings.insert_keys.get(bay), None);
+    }
+
+    /// **The key picker stays on its tracks while the desk moves under it**
+    /// (W5-identity-maps). It is a plugin window, so a drag can happen while
+    /// it is open: its list is drawn again from the desk as it stands, its
+    /// choice names a track rather than a row (so the drag cannot turn the
+    /// choice into whoever moved onto the row it was listed on), and a
+    /// removal of the bay's own track puts the window down.
+    #[test]
+    fn the_key_picker_follows_the_desk_while_it_is_open() {
+        let mut a = app();
+        for n in [0usize, 1, 2, 3] {
+            a.add_bare_track(n);
+        }
+        let bay = a.row_bay(0, 1).expect("a bay");
+        let source = a.row_node(3);
+        a.open_key_picker(bay);
+        let listed = |a: &TangentApp| match &a.dialog {
+            Some(Dialog::InsertKeySource { channels, .. }) => {
+                channels.iter().map(|(n, row, _)| (*n, *row)).collect::<Vec<_>>()
+            }
+            _ => panic!("the picker closed"),
+        };
+        assert!(listed(&a).contains(&(source, 3)), "fixture: the source is not offered");
+        // Row 3 dragged to row 1 with the picker open.
+        a.move_channel(3, 1);
+        assert_eq!(a.row_node(1), source, "fixture: the drag");
+        assert!(listed(&a).contains(&(source, 1)), "the picker still lists the source on the row it left");
+        a.apply_dialog_action(DialogAction::SetInsertKeySource { bay, from: Some(source) });
+        assert_eq!(a.settings.insert_keys.get(bay), Some(source), "the choice keyed somebody else");
+        // The bay's own track leaves: the window goes with it.
+        a.open_key_picker(bay);
+        let own = bay.seat.node.track().and_then(|id| a.row_of(id)).expect("on the desk");
+        a.remove_channel(own);
+        assert!(a.dialog.is_none(), "the picker stayed open on a bay that is gone");
+    }
+
+    /// **An instrument window goes down when the desk changes shape.** The
+    /// Keys sound, the DX7 patch list and its editor are plugin windows that
+    /// name their instrument by the row it stands on; left open across a
+    /// drag they would turn whatever track moved onto that row.
+    #[test]
+    fn an_instrument_window_goes_down_when_the_desk_changes_shape() {
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        a.open_keys_picker(2);
+        assert!(matches!(a.dialog, Some(Dialog::KeysPatch { slot: 2, .. })), "fixture: no Keys window");
+        a.move_channel(2, 0);
+        assert!(a.dialog.is_none(), "the Keys window stayed on row 2, which holds another track now");
     }
 
     /// **The IR wizard opens on the device the host pushed, and its four
@@ -84539,9 +84628,11 @@ mod lane_refs_tests {
         (
             "dialog",
             Exempt(
-                "InsertFace and InsertKeySource name their bay by identity (`SeatBay`), which \
-                 an enum of dialogs.rs keeps out of this scan's sight; every other variant that \
-                 names a lane is modal, so no edit moves the desk under it",
+                "InsertFace and InsertKeySource name their bay (and the key picker its \
+                 sources) by identity, which an enum of dialogs.rs keeps out of this scan's \
+                 sight, and `on_desk_shape_change` redraws the key picker; the Keys and DX7 \
+                 windows name their instrument's row and `on_desk_shape_change` puts them \
+                 down; every other variant that names a lane is modal",
             ),
         ),
         ("detector", Exempt("the chord detector: pitches")),
