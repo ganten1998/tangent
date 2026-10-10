@@ -1695,8 +1695,16 @@ fn run(rect: Rect, visible: usize, shown: usize, scroll_px: f32) -> Option<Run> 
     // RANK among the drawn tracks, so collapsing a folder closes the gap
     // instead of leaving invisible pillars; `shown` is how many there are.
     let shown = shown.max(1);
-    let visible = visible.clamp(1, VISIBLE_MAX).min(fits_across).min(shown);
-    let (unit, pitch) = Layout::metrics(rect, visible);
+    // **Sized by the count asked for, never by the track count** (design
+    // section 10). A desk shorter than the count shows its strips at the
+    // width the count gives them and leaves the rest of the run empty; it
+    // used to divide the run among the tracks there were, which never
+    // showed while every desk drew thirty-two columns and, once vacant rows
+    // were hidden, stretched a fresh desk's two strips and its add across
+    // the whole window.
+    let asked = visible.clamp(1, VISIBLE_MAX).min(fits_across);
+    let visible = asked.min(shown);
+    let (unit, pitch) = Layout::metrics(rect, asked);
     // **Pixels, then a window with a remainder.** The scroll lands wherever
     // the wheel left it; the first fully-or-partly visible column and how
     // much of it hangs off the left edge both fall out of one division. One
@@ -1811,10 +1819,9 @@ impl Layout {
     /// are not columns and must not add scroll range; the app counts them
     /// out before asking (see `mixer_shown_channels`).
     pub fn max_scroll_px(rect: Rect, visible: usize, shown: usize) -> f32 {
-        let shown = shown.max(1);
-        let visible = visible.clamp(1, shown);
-        let (_, pitch) = Self::metrics(rect, visible);
-        (shown.saturating_sub(visible)) as f32 * pitch
+        // The run's own arithmetic, so the wheel's rail and the layout's are
+        // one number (`run` sizes by the count asked for).
+        run(rect, visible, shown, 0.0).map_or(0.0, |r| r.max_px)
     }
 
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
