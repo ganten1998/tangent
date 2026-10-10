@@ -526,13 +526,49 @@ pub enum Strip {
 
 /// What feeds a general channel, or nothing yet.
 ///
-/// Plain data the settings hold as a number: 0 unused, 1 MIDI, 2 AUDIO. A
-/// channel that is `None` here is a column with a plus in it — drawn, so the
-/// desk never changes shape, but not yet a track.
+/// Plain data the settings hold as a number: 0 unused, 1 MIDI, 2 AUDIO, 3 a
+/// BUS. A channel that is `None` here is a column with a plus in it — drawn,
+/// so the desk never changes shape, but not yet a track.
+///
+/// **A bus is a kind of row, not a track** (docs/design/unlimited-tracks.md,
+/// section 9): nothing feeds it from outside the desk. It has no input chip,
+/// never hears MIDI and holds no clips; what reaches it is what other strips
+/// route or send into it, its rack runs once over that, and it goes on to
+/// the master or wherever it is routed. It is never counted against the
+/// free cap, on any tier. The byte is append-only, like the other two: a
+/// desk that names a bus and a build that never heard of one read it as no
+/// kind, which is the safe direction to fail in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
     Midi,
     Audio,
+    Bus,
+}
+
+/// **What a new bus row is FOR**, which is only what it is called.
+///
+/// One kind of row underneath ([`ChannelKind::Bus`]): its rack runs once
+/// over whatever reaches it, by a route (which MOVES a strip into it) or a
+/// send (which COPIES one). A desk calls the first a bus and the second a
+/// return, and a person looking for "the reverb return" should find a strip
+/// that says so, so the word is the one thing the two gestures differ in.
+/// Nothing is stored: a renamed return is simply a bus with another name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusRole {
+    /// A submix that strips are ROUTED into.
+    Bus,
+    /// A return that strips SEND to.
+    Return,
+}
+
+impl BusRole {
+    /// The word its first name starts with: "Bus 2", "Return 1".
+    pub const fn word(self) -> &'static str {
+        match self {
+            BusRole::Bus => "Bus",
+            BusRole::Return => "Return",
+        }
+    }
 }
 
 /// **Which lanes are shut off from LIVE MIDI**, one flag per row, set = shut
@@ -1054,47 +1090,54 @@ pub fn wanted_midi_devices(sels: &[MidiInputSel], kinds: &[Option<ChannelKind>])
 }
 
 impl ChannelKind {
-    /// The settings byte, and back. See `Settings::channel_kinds`.
+    /// The settings byte, and back. See `Settings::channel_kinds`. The
+    /// same bytes as `desk_model::RowKind`, which is the one table.
     pub fn from_u8(n: u8) -> Option<Self> {
-        match n {
-            1 => Some(ChannelKind::Midi),
-            2 => Some(ChannelKind::Audio),
-            _ => None,
-        }
+        crate::desk_model::RowKind::from_byte(n).and_then(Self::of_row)
     }
 
     pub fn as_u8(kind: Option<Self>) -> u8 {
-        match kind {
-            None => 0,
-            Some(ChannelKind::Midi) => 1,
-            Some(ChannelKind::Audio) => 2,
-        }
+        crate::desk_model::RowKind::byte(kind.map(Self::row_kind))
     }
 
     /// **What a row of this kind is** (`desk_model::RowKind`): the same
-    /// two kinds, by name rather than by byte.
+    /// three kinds, by name rather than by byte.
     pub const fn row_kind(self) -> crate::desk_model::RowKind {
         match self {
             ChannelKind::Midi => crate::desk_model::RowKind::Midi,
             ChannelKind::Audio => crate::desk_model::RowKind::Audio,
+            ChannelKind::Bus => crate::desk_model::RowKind::Bus,
         }
     }
 
-    /// [`Self::row_kind`]'s inverse. A bus row is no channel kind: it has
-    /// no input, hears no MIDI and takes no clips (design section 9).
+    /// [`Self::row_kind`]'s inverse: one kind for one kind, a bus included,
+    /// so a bus row reads as a bus wherever the app asks a row its kind.
+    /// Never `None` since buses have a kind of their own (W7-buses-ui); an
+    /// `Option` still, so the callers written while a bus read as no kind
+    /// (`kind.and_then(of_row)`) read on unchanged.
     pub const fn of_row(kind: crate::desk_model::RowKind) -> Option<Self> {
-        match kind {
-            crate::desk_model::RowKind::Midi => Some(ChannelKind::Midi),
-            crate::desk_model::RowKind::Audio => Some(ChannelKind::Audio),
-            crate::desk_model::RowKind::Bus => None,
-        }
+        Some(match kind {
+            crate::desk_model::RowKind::Midi => ChannelKind::Midi,
+            crate::desk_model::RowKind::Audio => ChannelKind::Audio,
+            crate::desk_model::RowKind::Bus => ChannelKind::Bus,
+        })
     }
 
-    /// The other one — the icon's click.
+    /// **Whether this is a kind a TRACK has**: MIDI or AUDIO, the two a
+    /// counted row is fed by. A bus is a row of the desk and no track.
+    pub const fn is_track(self) -> bool {
+        matches!(self, ChannelKind::Midi | ChannelKind::Audio)
+    }
+
+    /// The other one — the icon's click. A bus has no other: what feeds
+    /// it is the desk, never an input, so the click does not turn it into a
+    /// track behind somebody's back (that is a counted track made, and it
+    /// asks the creation gate: `TangentApp::set_channel_kind`).
     pub fn cycled(self) -> Self {
         match self {
             ChannelKind::Midi => ChannelKind::Audio,
             ChannelKind::Audio => ChannelKind::Midi,
+            ChannelKind::Bus => ChannelKind::Bus,
         }
     }
 }

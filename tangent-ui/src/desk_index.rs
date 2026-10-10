@@ -117,7 +117,12 @@ impl DeskIndex {
         let class: Vec<RowClass> = (0..n)
             .map(|row| {
                 let f = &facts[row];
-                if f.kind.is_some() || f.added || f.folder || clips[row] > 0 {
+                // A bus first, whatever else it carries: it is drawn and
+                // laned like a track and never counted (`DeskModel::class`'s
+                // order, which this mirrors).
+                if f.kind == Some(ChannelKind::Bus) {
+                    RowClass::Bus
+                } else if f.kind.is_some() || f.added || f.folder || clips[row] > 0 {
                     RowClass::Counted
                 } else if f.in_folder || f.residue {
                     RowClass::Placeholder
@@ -353,6 +358,7 @@ mod tests {
                     kind: match (bits >> 5) & 3 {
                         0 => Some(ChannelKind::Midi),
                         1 => Some(ChannelKind::Audio),
+                        2 => Some(ChannelKind::Bus),
                         _ => None,
                     },
                     added: bits & 128 != 0,
@@ -397,7 +403,9 @@ mod tests {
                     // Section 4's classes, from the facts directly.
                     let f = facts[row];
                     let counted = f.kind.is_some() || f.added || f.folder || clips[row] > 0;
-                    let want = if counted {
+                    let want = if f.kind == Some(ChannelKind::Bus) {
+                        RowClass::Bus
+                    } else if counted {
                         RowClass::Counted
                     } else if f.in_folder || f.residue {
                         RowClass::Placeholder
@@ -435,12 +443,17 @@ mod tests {
             row(RowFacts::default()),
             // 6: a chain plugin left on a removed track: drawn, not counted.
             row(RowFacts { residue: true, ..RowFacts::default() }),
+            // 7: a bus: drawn and laned, and never counted, whatever it
+            // carries (a bus holds no clips, and a stray count of them
+            // would still not make it a track).
+            row(RowFacts { kind: Some(ChannelKind::Bus), added: true, ..RowFacts::default() }),
         ];
-        let ix = DeskIndex::build(1, facts, vec![0, 0, 0, 0, 0, 2, 0]);
+        let ix = DeskIndex::build(1, facts, vec![0, 0, 0, 0, 0, 2, 0, 1]);
         use RowClass::*;
-        let got: Vec<RowClass> = (0..7).map(|r| ix.class(r)).collect();
-        assert_eq!(got, vec![Vacant, Counted, Placeholder, Counted, Counted, Counted, Placeholder]);
+        let got: Vec<RowClass> = (0..8).map(|r| ix.class(r)).collect();
+        assert_eq!(got, vec![Vacant, Counted, Placeholder, Counted, Counted, Counted, Placeholder, Bus]);
         assert_eq!(ix.counted(), 4);
+        assert!(!ix.hidden(7), "a bus is drawn");
         // Past the desk is nothing.
         assert_eq!(ix.class(99), Vacant);
     }

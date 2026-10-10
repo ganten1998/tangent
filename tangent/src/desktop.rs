@@ -16114,7 +16114,8 @@ impl DesktopApp {
                     .audio_ordinal(ch)
                     .and_then(|k| self.recorder.input_names.get(k))
                     .is_some_and(|n| !n.is_empty()),
-                None => false,
+                // A bus is no source: what it plays is other strips'.
+                Some(tangent_ui::recorder::ChannelKind::Bus) | None => false,
             };
             // Heard by what the strip is (`TangentApp::strip_heard`): its
             // own mute, its folder's, and the desk's solos.

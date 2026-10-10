@@ -119,10 +119,12 @@ impl RowKind {
 }
 
 /// **One send: a copy of a strip into a return or a bus.** Today's send
-/// knob is the entry `to: Fx, pre: false`; any number of others may follow
-/// once buses exist (W7). A strip with the knob at zero carries no entry,
-/// because a send at nothing is not a send, and a vacant row should not
-/// write one.
+/// knob is the entry `to: Fx, pre: false`; any number of others follow it,
+/// one per bus row and side of the fader ([`put_send`]). A strip with the
+/// knob at zero carries no Fx entry, because a send at nothing is not a
+/// send, and a vacant row should not write one. A send to a BUS is kept at
+/// zero: somebody made it on purpose and turns it up from there, and taking
+/// it away is a gesture of its own ([`take_send`]).
 ///
 /// Named as the contract names it; it shadows `std::marker::Send` only
 /// inside a module that imports it bare.
@@ -153,6 +155,43 @@ pub fn set_fx_send_level(sends: &mut Vec<Send>, level: f64) {
         (None, true) => sends.push(Send { to: Node::Fx, level, pre: false }),
         (None, false) => {}
     }
+}
+
+/// **A strip's send to `to` on one side of its fader**, when it has one.
+/// One per `(to, pre)`: the reader folds a second into the first, so the
+/// pair is a send's whole address on its strip.
+pub fn send_of(sends: &[Send], to: Node, pre: bool) -> Option<&Send> {
+    sends.iter().find(|s| s.to == to && s.pre == pre)
+}
+
+/// **Set a strip's send to `to` on one side of its fader to `level`**,
+/// adding it at the end when there is none (a strip lists its sends in the
+/// order they were made, and a bus sums them in that order). Answers
+/// whether anything changed. A level that is not a number is no level.
+pub fn put_send(sends: &mut Vec<Send>, to: Node, pre: bool, level: f64) -> bool {
+    if !level.is_finite() {
+        return false;
+    }
+    let level = level.max(0.0);
+    match sends.iter_mut().find(|s| s.to == to && s.pre == pre) {
+        Some(s) if s.level.to_bits() == level.to_bits() => false,
+        Some(s) => {
+            s.level = level;
+            true
+        }
+        None => {
+            sends.push(Send { to, level, pre });
+            true
+        }
+    }
+}
+
+/// **Take a strip's send to `to` on one side of its fader away.** Answers
+/// whether there was one.
+pub fn take_send(sends: &mut Vec<Send>, to: Node, pre: bool) -> bool {
+    let before = sends.len();
+    sends.retain(|s| !(s.to == to && s.pre == pre));
+    before != sends.len()
 }
 
 /// The DX7's cartridge and patch on one row. `cart` is a path, empty for
@@ -420,8 +459,9 @@ pub enum RowClass {
     /// indented plus), or residue (a chain plugin, a curve, a freeze, a kit,
     /// a route or key end) on a row that is not a track.
     Placeholder,
-    /// A bus row. No bus kind exists before W7, so nothing is classed
-    /// here yet; the variant is the contract's.
+    /// A bus row (`RowKind::Bus`, W7): a strip that takes routes and sends
+    /// and runs its rack once over them. Drawn and given a lane, and never
+    /// counted on any tier (design section 9).
     Bus,
     /// A track: MIDI, AUDIO, bare added, a folder, or any row with clips.
     Counted,
@@ -2288,6 +2328,64 @@ mod tests {
         }
         assert_eq!(m.folder_of(m.rows.len()), None);
         assert_eq!(m.orphans(), vec![t(0), t(7)]);
+    }
+
+    /// **A strip keeps one send per bus and side of its fader**, in the
+    /// order they were made, and a send to a bus turned down to nothing is
+    /// still there to be turned up again.
+    #[test]
+    fn a_strip_keeps_one_send_per_bus_and_side_and_a_send_at_zero_is_kept() {
+        let bus = Node::Track(t(9));
+        let other = Node::Track(t(10));
+        let mut sends = vec![Send { to: Node::Fx, level: 0.5, pre: false }];
+        assert!(put_send(&mut sends, bus, false, 0.7), "a new send is a change");
+        assert!(!put_send(&mut sends, bus, false, 0.7), "the same level again changes nothing");
+        assert!(put_send(&mut sends, bus, true, 0.2), "the other side of the fader is a send of its own");
+        assert!(put_send(&mut sends, other, false, 1.0));
+        assert_eq!(
+            sends.iter().map(|s| (s.to, s.pre)).collect::<Vec<_>>(),
+            vec![(Node::Fx, false), (bus, false), (bus, true), (other, false)],
+            "sends are kept in the order they were made, which is the order a bus sums them"
+        );
+        // Down to nothing and still there: a bus send is taken away only
+        // by its own gesture, unlike the knob's Fx entry.
+        assert!(put_send(&mut sends, bus, false, 0.0));
+        assert_eq!(send_of(&sends, bus, false).map(|s| s.level), Some(0.0));
+        assert!(!put_send(&mut sends, bus, false, f64::NAN), "a level that is not a number is no level");
+        assert!(put_send(&mut sends, bus, false, 0.5));
+        assert!(put_send(&mut sends, bus, false, -3.0));
+        assert_eq!(send_of(&sends, bus, false).map(|s| s.level), Some(0.0), "a level is never below nothing");
+        assert!(!put_send(&mut sends, bus, false, -1.0), "below nothing is nothing, which it already is");
+        assert!(take_send(&mut sends, bus, false));
+        assert!(!take_send(&mut sends, bus, false), "a send taken twice was there once");
+        assert_eq!(send_of(&sends, bus, true).map(|s| s.level), Some(0.2), "its other side stays");
+        assert_eq!(fx_send_level(&sends), 0.5, "the knob is untouched by sends to buses");
+    }
+
+    /// **A bus row taken off the desk takes every send into it**, from the
+    /// rows and the specials alike, and hands them to its caller for the
+    /// undo; the sends to anything else stay where they are.
+    #[test]
+    fn removing_a_bus_takes_every_send_into_it_and_no_other() {
+        let mut m = DeskModel::empty();
+        for id in 0..4 {
+            let mut r = TrackRow::vacant(t(id));
+            r.kind = Some(if id >= 2 { RowKind::Bus } else { RowKind::Audio });
+            m.append(r).expect("append");
+        }
+        let (a, b) = (Node::Track(t(2)), Node::Track(t(3)));
+        for r in 0..2 {
+            m.rows[r].sends.push(Send { to: a, level: 0.5, pre: r == 1 });
+            m.rows[r].sends.push(Send { to: b, level: 0.25, pre: false });
+        }
+        m.rows[3].sends.push(Send { to: a, level: 1.0, pre: false });
+        m.specials.drums.sends.push(Send { to: a, level: 0.75, pre: false });
+        let out = m.remove_rows(&[2]).expect("remove");
+        assert_eq!(out.sends.len(), 4, "{:?}", out.sends);
+        assert!(m.rows.iter().all(|r| r.sends.iter().all(|s| s.to == b)));
+        assert!(m.specials.drums.sends.is_empty());
+        assert_eq!(m.rows[0].sends, vec![Send { to: b, level: 0.25, pre: false }]);
+        assert!(m.check().is_empty());
     }
 
     /// **Every small desk, every one- and two-row removal**: each kept row
