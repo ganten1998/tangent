@@ -81,18 +81,21 @@ echo "==> cargo test --workspace"
 # how much is failing.
 cargo test --workspace --exclude linuxvideo --no-fail-fast
 
-echo "==> cargo test --release render_golden  (the render goldens, in the profile that ships)"
+echo "==> cargo test --release  (the render and export goldens, in the profile that ships)"
 # **The shipped builds are release, and every leg above is debug.** The render
 # goldens pin what the engine sounds like to the bit, and for a while they
 # pinned a fact about the PROFILE as well: the optimiser fused the pan law's
 # sine and cosine into one `sincos` call that rounds its last bit its own way,
 # so the `auto-pan` desk hashed one way here and another in the build people
 # run (`instrument::pan_gains` has the measurement and the fix). Rendering
-# them in release too is what keeps "the same bits from both" true. The
-# golden itself is pinned on aarch64 macOS only, which is the machine this
-# gate runs on; elsewhere the desk invariants beside it still run.
-if [ "$(uname -sm)" = "Darwin arm64" ]; then GOLDENS=2; else GOLDENS=1; fi
-named_leg "$GOLDENS" --release -p tangent --bin tangent render_golden::
+# them in release too is what keeps "the same bits from both" true, and the
+# export goldens (the WAV bytes an export writes, through the same engine)
+# ride along in the same binary. The hashes are pinned on aarch64 macOS only,
+# which is the machine this gate runs on; elsewhere the desk invariants
+# beside them still run.
+if [ "$(uname -sm)" = "Darwin arm64" ]; then GOLDENS=3; else GOLDENS=1; fi
+named_leg "$GOLDENS" --release -p tangent --bin tangent -- \
+  render_golden:: engine_bridge::tests::every_corpus_export_is_the_file_it_was
 
 echo "==> the ban scans  (no live code names the fixed desk, no surface undersells a key)"
 # **Every source scan the unlimited desk left, by name.** Each wave of that
