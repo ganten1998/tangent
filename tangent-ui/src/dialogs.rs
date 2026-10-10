@@ -103,6 +103,13 @@ pub enum Dialog {
         /// frozen one to thaw). Appended, the struct's law.
         frozen: bool,
         can_freeze: bool,
+        /// **The strip the menu is open on, by what it is**: a track's row,
+        /// or the click, whose menu is the colour rows alone. What the paint
+        /// lands on (`DialogAction::TrackColor`), now that the click's colour
+        /// is no slot of a strip-space array but its own (W5). `lane` is the
+        /// row the row-only parts act on, past the channels for the click.
+        /// Appended, the struct's law.
+        strip: crate::recorder::StripRef,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -1717,8 +1724,9 @@ pub enum DialogAction {
     TrackFreeze(usize),
     /// Put the held track on this EMPTY slot.
     TrackPaste(usize),
-    /// Paint one channel by hand — index into `STRIP_COLORS`.
-    TrackColor(usize, i64),
+    /// Paint one strip by hand — index into `STRIP_COLORS`. By what the
+    /// strip is: a track (which paints its selection with it) or the click.
+    TrackColor(crate::recorder::StripRef, i64),
     /// The lane's badge: 0 auto, 1 drum, 2 guitar, 3 bass.
     TrackIcon(usize, u8),
     /// Choose the auto-palette every unpainted slot wears.
@@ -11230,9 +11238,11 @@ fn show_on(
             midi_clips,
             frozen,
             can_freeze,
+            strip,
         } => {
             let t = theme(face);
             let lane = *lane;
+            let strip = *strip;
             let removable = *removable;
             let midi_clips = *midi_clips;
             let (frozen, can_freeze) = (*frozen, *can_freeze);
@@ -11656,7 +11666,7 @@ fn show_on(
                                         }
                                         if resp.clicked() {
                                             action = Some(DialogAction::TrackColor(
-                                                lane, idx as i64,
+                                                strip, idx as i64,
                                             ));
                                         }
                                     }

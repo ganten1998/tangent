@@ -135,6 +135,28 @@ pub struct Send {
     pub pre: bool,
 }
 
+/// **The level of a strip's send to the effects return**: today's send
+/// knob, the post-fader `Fx` entry, or nothing when it has none.
+pub fn fx_send_level(sends: &[Send]) -> f64 {
+    sends.iter().find(|s| s.to == Node::Fx && !s.pre).map_or(0.0, |s| s.level)
+}
+
+/// **Turn a strip's send knob**: the post-fader `Fx` entry set to `level`,
+/// added where there was none, and taken away at exactly zero (a send at
+/// nothing is not a send; see [`Send`]). Every other send is left alone, so
+/// the knob and a later bus's sends never step on each other.
+pub fn set_fx_send_level(sends: &mut Vec<Send>, level: f64) {
+    let at = sends.iter().position(|s| s.to == Node::Fx && !s.pre);
+    match (at, level.to_bits() != 0) {
+        (Some(i), true) => sends[i].level = level,
+        (Some(i), false) => {
+            sends.remove(i);
+        }
+        (None, true) => sends.push(Send { to: Node::Fx, level, pre: false }),
+        (None, false) => {}
+    }
+}
+
 /// The DX7's cartridge and patch on one row. `cart` is a path, empty for
 /// the bank that ships: `strip_dx7_cartridge`'s own convention.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1050,9 +1072,6 @@ impl DeskModel {
         let mut lost = Vec::new();
         let bit = |mask: u64, at: usize| at < 64 && (mask >> at) & 1 == 1;
         let bit32 = |mask: u32, at: usize| at < 32 && (mask >> at) & 1 == 1;
-        let fx_send = |level: f64| {
-            (level.to_bits() != 0).then_some(Send { to: Node::Fx, level, pre: false })
-        };
         let mut rows = Vec::with_capacity(ids.len());
         for (r, id) in ids.iter().enumerate() {
             let mut row = TrackRow::vacant(*id);
@@ -1083,7 +1102,9 @@ impl DeskModel {
                 let s = encode_v32_strip(LegacyOwner::Row(r as u16)).expect("a V32 row has a strip");
                 row.name = v.names.get(s).cloned().unwrap_or_default();
                 row.color = v.colors.get(s).copied().unwrap_or(0);
-                row.sends.extend(v.sends.get(s).copied().and_then(fx_send));
+                if let Some(level) = v.sends.get(s) {
+                    set_fx_send_level(&mut row.sends, *level);
+                }
                 row.mute = bit(v.muted, s);
                 row.solo = bit(v.soloed, s);
                 row.phase = bit(v.phase, s);
@@ -1091,17 +1112,16 @@ impl DeskModel {
             rows.push(row);
         }
 
+        // The specials at their legacy strips, through the one formulation
+        // of where those are (`desk_legacy`, Appendix A).
         let mut specials = Specials::default();
-        for (node, owner) in SPECIAL_OWNERS {
-            let s = encode_v32_strip(owner).expect("every special has a strip");
-            let sp = specials.get_mut(node).expect("a special");
-            sp.name = v.names.get(s).cloned().unwrap_or_default();
-            sp.color = v.colors.get(s).copied().unwrap_or(0);
-            sp.sends.extend(v.sends.get(s).copied().and_then(fx_send));
-            sp.mute = bit(v.muted, s);
-            sp.solo = bit(v.soloed, s);
-            sp.phase = bit(v.phase, s);
-        }
+        crate::desk_legacy::read_specials(
+            &mut specials,
+            &v.names,
+            &v.colors,
+            &v.sends,
+            (v.muted, v.soloed, Some(v.phase)),
+        );
 
         let seat = |flat: usize| -> Option<SeatBay> {
             let (owner, rack, bay) = decode_v32(flat)?;
@@ -1215,9 +1235,6 @@ impl DeskModel {
         }
         let ids = self.ids();
         let mut v = V22Desk::vacant();
-        let knob = |sends: &[Send]| {
-            sends.iter().find(|s| s.to == Node::Fx && !s.pre).map_or(0.0, |s| s.level)
-        };
         let set = |mask: &mut u64, at: usize, on: bool| {
             if on {
                 *mask |= 1 << at;
@@ -1269,7 +1286,7 @@ impl DeskModel {
             v.is_folder[r] = *folder;
             v.in_folder[r] = *in_folder;
             v.folder_shut[r] = *shut;
-            v.sends[r] = knob(sends);
+            v.sends[r] = fx_send_level(sends);
             v.dx7_cartridge[r] = dx7.cart.clone();
             v.dx7_patch[r] = dx7.patch;
             v.keys_patch[r] = keys.patch;
@@ -1278,18 +1295,13 @@ impl DeskModel {
             }
             v.frozen[r] = frozen.clone();
         }
-        for (node, owner) in SPECIAL_OWNERS {
-            let s = encode_v32_strip(owner).expect("every special has a strip");
-            let sp = self.specials.get(node).expect("a special");
-            v.names[s] = sp.name.clone();
-            v.colors[s] = sp.color;
-            if let Some(slot) = v.sends.get_mut(s) {
-                *slot = knob(&sp.sends);
-            }
-            set(&mut v.muted, s, sp.mute);
-            set(&mut v.soloed, s, sp.solo);
-            set(&mut v.phase, s, sp.phase);
-        }
+        crate::desk_legacy::write_specials(
+            &self.specials,
+            &mut v.names,
+            &mut v.colors,
+            &mut v.sends,
+            (&mut v.muted, &mut v.soloed, &mut v.phase),
+        );
         let flat = |sb: &SeatBay| encode_v32(unbind(sb.seat.node, &ids)?, sb.seat.rack, sb.bay);
         for (sb, path) in &self.plugins {
             if let Some(f) = flat(sb) {
@@ -1323,14 +1335,6 @@ impl DeskModel {
         Some((v, ids))
     }
 }
-
-/// The specials and their legacy owners, in strip order.
-const SPECIAL_OWNERS: [(Node, LegacyOwner); 4] = [
-    (Node::Drums, LegacyOwner::Drums),
-    (Node::Click, LegacyOwner::Click),
-    (Node::Fx, LegacyOwner::Fx),
-    (Node::Master, LegacyOwner::Master),
-];
 
 fn classify(r: &TrackRow, uses: RowUse, holds: bool) -> RowClass {
     if r.kind == Some(RowKind::Bus) {
@@ -1502,12 +1506,15 @@ impl V22Desk {
         fill(&mut v.keys_patch, &s.strip_keys_patch);
         fill(&mut v.keys_params, &s.strip_keys_params);
         v.frozen = frozen_dense(&s.frozen_lanes);
-        fill(&mut v.names, &s.strip_names);
-        fill(&mut v.colors, &s.strip_colors);
-        fill(&mut v.sends, &s.strip_sends);
-        v.muted = s.strip_muted;
-        v.soloed = s.strip_soloed;
-        v.phase = s.strip_phase;
+        // The rows' strip facts and the specials', joined into the strip
+        // space this shape keeps them in (`Settings::strip_space`).
+        let strips = s.strip_space();
+        fill(&mut v.names, &strips.names);
+        fill(&mut v.colors, &strips.colors);
+        fill(&mut v.sends, &strips.sends);
+        v.muted = strips.muted;
+        v.soloed = strips.soloed;
+        v.phase = strips.phase;
         (v.inserts, v.bypass) = dense_bays(&s.plugins, &s.bypass, &ids);
         v.routes = s.routes.to_lanes(&ids).0;
         v.keys = s.insert_keys.to_lanes(&ids).0;
@@ -1524,9 +1531,20 @@ impl V22Desk {
         let mut v = live.clone();
         fill(&mut v.kinds, &d.kinds);
         fill(&mut v.icons, &d.icons);
+        // The rows' strip facts from the front (row r is strip r), then the
+        // specials' at their own strips: a snapshot always says them.
         fill(&mut v.names, &d.names);
         fill(&mut v.colors, &d.colors);
         fill(&mut v.sends, &d.sends);
+        let rows = |mask: u64| crate::desk_legacy::strip_mask_of(mask, |_| false);
+        let (mut muted, mut soloed, mut phase) = (rows(d.muted), rows(d.soloed), rows(d.phase.unwrap_or(0)));
+        crate::desk_legacy::write_specials(
+            &d.specials,
+            &mut v.names,
+            &mut v.colors,
+            &mut v.sends,
+            (&mut muted, &mut soloed, &mut phase),
+        );
         fill(&mut v.gains, &d.gains);
         fill(&mut v.pans, &d.pans);
         fill(&mut v.inputs, &d.inputs);
@@ -1534,14 +1552,17 @@ impl V22Desk {
         fill(&mut v.is_folder, &d.is_folder);
         fill(&mut v.in_folder, &d.in_folder);
         fill(&mut v.folder_shut, &d.folder_shut);
-        v.muted = d.muted;
-        v.soloed = d.soloed;
+        v.muted = muted;
+        v.soloed = soloed;
         v.tracks_added = d.tracks_added;
         v.armed = d.armed;
         let ids = d.ids.rows();
         (v.inserts, _) = dense_bays(&d.plugins, &BTreeSet::new(), &ids);
-        if let Some(p) = d.phase {
-            v.phase = p;
+        // Polarity only when the snapshot says it, the rows' and the
+        // specials' together: they were one mask, and a document from before
+        // the key said neither.
+        if d.phase.is_some() {
+            v.phase = phase;
         }
         if let Some(t) = &d.to_theory {
             fill(&mut v.to_theory, t);
@@ -1621,12 +1642,8 @@ impl V22Desk {
         s.strip_dx7_patch = dx7_patch;
         s.strip_keys_patch = keys_patch;
         s.strip_keys_params = keys_params;
-        s.strip_names = names;
-        fill(&mut s.strip_colors, &colors);
-        fill(&mut s.strip_sends, &sends);
-        s.strip_muted = muted;
-        s.strip_soloed = soloed;
-        s.strip_phase = phase;
+        // Split onto the rows and the specials (`Settings::set_strip_space`).
+        s.set_strip_space(&crate::settings::StripSpace { names, colors, sends, muted, soloed, phase });
         (s.plugins, s.bypass) = identity_bays(inserts, bypass, ids);
         s.routes = crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), ids);
         s.insert_keys = crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), ids);
@@ -1669,14 +1686,16 @@ impl V22Desk {
         } = self;
         d.kinds = kinds;
         d.icons = icons;
-        d.names = names;
-        d.colors = colors;
+        // The rows' strip facts, and the specials' off their own strips.
+        crate::desk_legacy::read_specials(&mut d.specials, &names, &colors, &sends, (muted, soloed, Some(phase)));
+        d.names = crate::desk_legacy::strip_rows(&names);
+        d.colors = crate::desk_legacy::strip_rows(&colors);
         let ids = d.ids.rows().into_owned();
         let (plugins, bypass) = identity_bays(inserts, bypass, &ids);
         d.plugins = plugins;
-        d.sends = sends;
-        d.muted = muted;
-        d.soloed = soloed;
+        d.sends = crate::desk_legacy::strip_rows(&sends);
+        d.muted = crate::desk_legacy::strip_mask_rows(muted);
+        d.soloed = crate::desk_legacy::strip_mask_rows(soloed);
         d.gains = gains;
         d.pans = pans;
         d.inputs = inputs;
@@ -1686,7 +1705,7 @@ impl V22Desk {
         d.in_folder = in_folder;
         d.folder_shut = folder_shut;
         d.armed = armed;
-        d.phase = Some(phase);
+        d.phase = Some(crate::desk_legacy::strip_mask_rows(phase));
         d.to_theory = Some(to_theory);
         d.routes = Some(crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), &ids));
         d.insert_keys = Some(crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), &ids));

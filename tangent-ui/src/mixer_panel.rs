@@ -5746,38 +5746,39 @@ mod tests {
     /// Every instrument slot is a channel, filled or not.
     #[test]
     fn the_desk_has_a_strip_for_every_slot() {
-        let channels = Strip::shown();
-        for n in 0..CHANNELS {
-            assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
-        }
-        // **Drawn: the eight and the click.** BACKING retired with v13;
-        // the drum bus column retired when the drumpad became a lane's
-        // instrument — the kit answers to its lane's strip now, and the
-        // bus row survives only as hidden desk plumbing. Only the effects
-        // return keeps its off-desk life: its three knobs are the band's,
-        // and a soloable bus is a feedback question.
+        // **Drawn: the tracks and the click, then the master.** BACKING
+        // retired with v13; the drum bus column retired when the drumpad
+        // became a lane's instrument — the kit answers to its lane's strip
+        // now, and the bus row survives only as hidden desk plumbing. Only
+        // the effects return keeps its off-desk life: its three knobs are the
+        // band's, and a soloable bus is a feedback question.
         let view = a_view();
-        assert_eq!(
-            view.strips.iter().count(),
-            CHANNELS + 2,
-            "a drawn channel went missing"
-        );
         assert_eq!(
             Column::every(CHANNELS).collect::<Vec<_>>(),
             view.strips.iter().map(|(c, _)| c).collect::<Vec<_>>(),
             "the desk's columns are not every track, the click and the master"
         );
-        assert_eq!(channels.len(), CHANNELS + 1);
-        assert!(!channels.contains(&Strip::Drums), "the retired drum bus came back");
-        assert!(channels.contains(&Strip::Click), "the click lost its column");
-        assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
-        // Every strip owns a distinct place in the arrays, or two of them
-        // would share a send and mute together.
-        let mut seen: Vec<usize> = Strip::all().iter().map(|s| s.index()).collect();
-        let n = seen.len();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), n, "two channels share an index");
+        let drawn: Vec<Strip> = view.strips.iter().filter_map(|(c, _)| c.strip()).collect();
+        for n in 0..CHANNELS {
+            assert_eq!(drawn[n], Strip::Channel(n), "channel {n} has no column");
+        }
+        assert_eq!(drawn.last(), Some(&Strip::Click), "the click lost its column");
+        assert!(!drawn.contains(&Strip::Drums), "the retired drum bus came back");
+        assert!(!drawn.contains(&Strip::Fx), "the bus is drawn twice");
+        // Every strip keeps settings of its own, or two of them would share
+        // a send and mute together: a row's at its row, a special's among
+        // the specials (W5), each read back as written.
+        let mut s = crate::settings::Settings::default();
+        let every: Vec<crate::recorder::StripRef> = (0..CHANNELS)
+            .map(crate::recorder::StripRef::Row)
+            .chain([crate::recorder::StripRef::Drums, crate::recorder::StripRef::Click, crate::recorder::StripRef::Fx])
+            .collect();
+        for (k, strip) in every.iter().enumerate() {
+            s.set_strip_send(*strip, (k + 1) as f64 / 64.0);
+        }
+        for (k, strip) in every.iter().enumerate() {
+            assert_eq!(s.strip_send(*strip), (k + 1) as f64 / 64.0, "{strip:?} shares its send");
+        }
     }
 
     /// **Three inserts on every channel, and all three can be pressed.**

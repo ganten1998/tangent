@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use tangent_record::audio::Timebase;
 use tangent_ui::app::TangentApp;
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
-use tangent_ui::desk_legacy::{bind, decode_v32_strip, encode_v32_strip, LegacyOwner};
-use tangent_ui::recorder::{ChannelKind, Desk, MidiRoute};
+use tangent_ui::desk_legacy::{bind, decode_v32_strip};
+use tangent_ui::recorder::{ChannelKind, Desk, MidiRoute, StripRef};
 use tangent_ui::routing::Target;
 
 use crate::desk_plan::{InKey, InLane, InRoute, LaneFlags, PlanInputs, RouteEnd, Slot, SpecialFlags};
@@ -674,8 +674,11 @@ pub struct Bridge {
     /// Where an arrangement record is replacing each row's schedule, in
     /// frames, handed in by the host each frame (it owns the record).
     punches: Vec<Option<u64>>,
-    /// The desk the last [`Self::sync`] built, for the host's take facts:
-    /// built ONCE a frame.
+    /// **The strip-space desk the last [`Self::sync`] built, for the host's
+    /// take facts alone** (which strips a take was cut under, `Bridge::desk`):
+    /// built ONCE a frame. The bridge itself reads the desk by what each
+    /// strip is (`plan_inputs`, `store_levels`) and never this; it is relayed
+    /// until the host's take road moves off the strip-space form (C11).
     desk: Desk,
     stats: BridgeStats,
     /// A test's ask to run an offline engine's removals through the live
@@ -999,6 +1002,7 @@ impl Bridge {
             })
             .collect();
         // ── the shape ──
+        // The host's take facts, relayed (see `desk`): nothing below reads it.
         self.desk = app.desk();
         let outs = e.output().channels as usize;
         let inputs = self.plan_inputs(app, outs, shape, &due);
@@ -1220,12 +1224,14 @@ impl Bridge {
         let suspend = app.auto_suspend_mask();
         let parents = app.folder_parents();
         let routes_midi = app.midi_routes();
-        let desk = &self.desk;
+        // **The desk by what each strip is** (W5): a row's mute and solo as
+        // the engine hears them (a folder's reaching its children), the
+        // specials' their own, never an index into a strip-space desk.
         let soloed = |row: usize| {
             freeze.is_none()
-                && (desk.soloed.get(row).copied().unwrap_or(false) || probe.is_some_and(|p| p.solo.contains(&row)))
+                && (app.strip_heard_soloed(StripRef::Row(row)) || probe.is_some_and(|p| p.solo.contains(&row)))
         };
-        let muted = |row: usize| freeze.is_none() && desk.muted.get(row).copied().unwrap_or(false);
+        let muted = |row: usize| freeze.is_none() && app.strip_heard_muted(StripRef::Row(row));
         let mut lanes = Vec::with_capacity(n + self.leaving.len());
         for (row, (id, at)) in self.rows.iter().enumerate() {
             let Some(at) = at else { continue };
@@ -1276,23 +1282,22 @@ impl Bridge {
                 pick: None,
             });
         }
-        // The four strips that are not rows, at their legacy strip bits.
-        let strip = |owner: LegacyOwner| encode_v32_strip(owner).unwrap_or(usize::MAX);
-        let special = |owner: LegacyOwner| {
-            let at = strip(owner);
-            let desk_strip = owner != LegacyOwner::Master;
+        // The four strips that are not rows, by what each is. The master's
+        // own mute is the host's (`set_master_mute`), never a plan flag.
+        let special = |s: StripRef| {
+            let desk_strip = s != StripRef::Master;
             F::default()
-                .with(F::MUTED, desk_strip && freeze.is_none() && desk.muted.get(at).copied().unwrap_or(false))
-                .with(F::SOLOED, desk_strip && freeze.is_none() && desk.soloed.get(at).copied().unwrap_or(false))
-                .with(F::PHASE, row_bit(phase, at))
+                .with(F::MUTED, desk_strip && freeze.is_none() && app.strip_heard_muted(s))
+                .with(F::SOLOED, desk_strip && freeze.is_none() && app.strip_heard_soloed(s))
+                .with(F::PHASE, app.strip_inverted(s))
                 .with(F::MIDI_OFF, !hears)
         };
         let master_lane = tangent_ui::arrangement_panel::LaneId::Master.auto_lane();
         let specials = SpecialFlags {
-            drums: special(LegacyOwner::Drums),
-            click: special(LegacyOwner::Click),
-            fx: special(LegacyOwner::Fx),
-            master: special(LegacyOwner::Master).with(F::SUSPEND, row_bit(suspend, master_lane)),
+            drums: special(StripRef::Drums),
+            click: special(StripRef::Click),
+            fx: special(StripRef::Fx),
+            master: special(StripRef::Master).with(F::SUSPEND, row_bit(suspend, master_lane)),
         };
         // **The wiring, by identity** (`read_desk`): the routing table pruned
         // against the device, and the sidechain keys, in the engine's names.
@@ -1317,10 +1322,10 @@ impl Bridge {
             } else {
                 (gains.channels.get(row).copied().unwrap_or(1.0), app.channel_pan(row))
             };
-            e.set_lane_levels(at.slot, gain, pan, self.desk.send.get(row).copied().unwrap_or(0.0));
+            e.set_lane_levels(at.slot, gain, pan, app.strip_send(StripRef::Row(row)) as f32);
         }
-        let send = |owner| encode_v32_strip(owner).and_then(|i| self.desk.send.get(i).copied()).unwrap_or(0.0);
-        e.set_special_sends(send(LegacyOwner::Drums), send(LegacyOwner::Click));
+        let send = |s: StripRef| app.strip_send(s) as f32;
+        e.set_special_sends(send(StripRef::Drums), send(StripRef::Click));
         // **Every keyboard lane's own state, every frame.** A patch is a flag
         // the engine compares per block, and three atomic stores per lane
         // per frame is what every fader already costs.
@@ -1429,7 +1434,7 @@ mod tests {
         let mut s = Settings::default();
         s.channel_kinds = [0; CHANNELS];
         s.plugins.clear();
-        s.strip_sends = [0.0; STRIPS];
+        s.strip_sends = [0.0; CHANNELS];
         s.channel_armed = Some(0);
         s.strip_muted = 0;
         s.strip_soloed = 0;
@@ -1512,7 +1517,17 @@ mod tests {
         edit("arm", &|s, _| s.channel_armed = Some(1 << 0 | 1 << 4), none.clone());
         edit("mute", &|s, _| s.strip_muted |= 1 << 2, none.clone());
         edit("solo", &|s, _| s.strip_soloed |= 1 << 4, none.clone());
-        edit("phase", &|s, _| s.strip_phase |= 1 << 1 | 1 << 34, none.clone());
+        edit(
+            "phase",
+            &|s, _| {
+                s.strip_phase |= 1 << 1;
+                // The effects return's polarity is its own switch now (the
+                // specials left strip space, W5): bit 34 of the old mask,
+                // and the same bit of the engine's.
+                s.set_strip_switch(StripRef::Fx, tangent_ui::settings::StripSwitch::Phase, true);
+            },
+            none.clone(),
+        );
         edit(
             "folder",
             &|s, _| {
@@ -2639,6 +2654,48 @@ mod tests {
         reconcile(&mut e, &p, &before, &mut displaced, &shelf, &[a, b], &rebuild);
         assert_eq!(e.save_insert_state_at(at_a.0, at_a.1), Some(dial), "the comp plays in its own bay without its dial");
         let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
+    }
+
+    /// **The specials reach the engine by what each is** (W5-identity-maps:
+    /// the specials left strip space, and the Strip/Desk pair no longer
+    /// feeds the bridge). Each special's own mute, solo, polarity and send,
+    /// set on the desk by identity and nothing else, lands on that special's
+    /// bits of the plan the engine holds (the engine's own words keep the
+    /// specials at strips 32 to 35, `desk_legacy::v32_strip`) and on its send
+    /// cell; a row's mute lands on its own lane's bit, and nothing lands on
+    /// anybody else's.
+    #[test]
+    fn the_specials_reach_the_engine_by_what_each_is() {
+        use tangent_ui::desk_legacy::v32_strip;
+        use tangent_ui::settings::StripSwitch as W;
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        s.set_strip_switch(StripRef::Click, W::Mute, true);
+        s.set_strip_switch(StripRef::Fx, W::Solo, true);
+        s.set_strip_switch(StripRef::Drums, W::Phase, true);
+        s.set_strip_switch(StripRef::Master, W::Phase, true);
+        s.set_strip_switch(StripRef::Row(1), W::Mute, true);
+        s.set_strip_send(StripRef::Drums, 0.375);
+        s.set_strip_send(StripRef::Click, 0.25);
+        s.set_strip_send(StripRef::Row(0), 0.5);
+        assert_eq!((s.strip_muted, s.strip_soloed, s.strip_phase), (1 << 1, 0, 0), "fixture: a special sat in a row's mask");
+        let app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        let words = e.desk_readback();
+        let at = |sr: StripRef| v32_strip(sr).expect("a strip the engine keeps");
+        let bit = |sr: StripRef| 1u64 << at(sr);
+        assert_eq!(words["muted"].as_u64(), Some(bit(StripRef::Click) | bit(StripRef::Row(1))), "the mutes");
+        assert_eq!(words["soloed"].as_u64(), Some(bit(StripRef::Fx)), "the solos");
+        assert_eq!(words["strip_phase"].as_u64(), Some(bit(StripRef::Drums) | bit(StripRef::Master)), "the polarity");
+        let send = |sr: StripRef| {
+            words["send"][at(sr)].as_u64().and_then(|b| u32::try_from(b).ok()).map(f32::from_bits)
+        };
+        assert_eq!(send(StripRef::Drums), Some(0.375), "the drum bus's send");
+        assert_eq!(send(StripRef::Click), Some(0.25), "the click's send");
+        assert_eq!(send(StripRef::Row(0)), Some(0.5), "row 0's send");
+        assert_eq!(e.plan_refused_for_test(), 0);
     }
 
     /// **An FX swap's undo and redo carry each unit with what it was dialled
