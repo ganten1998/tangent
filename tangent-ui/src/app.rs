@@ -959,6 +959,18 @@ pub struct TangentApp {
     /// paths resolve against it too, except in a scratch whose folder is not
     /// real yet - see `clip_doc`.
     project_doc: std::path::PathBuf,
+    /// **The rows of the document as it lies on disk at `project_doc`**,
+    /// by id: the rows an open of that file stands on, as this session last
+    /// read it or wrote it, or `None` while it has read or written none
+    /// there with a desk in it (a scratch, a document with no desk).
+    ///
+    /// The kit sidecar saves itself between saves (`drumpad_save`) and the
+    /// document does not, so the sidecar files kits by these rows rather
+    /// than the live ones: by the live ones, an unsaved drag and a pad edit
+    /// reopened the document with its drum track silent. Set only by the
+    /// roads that read or write the document (`note_doc_rows`), so no
+    /// structural edit touches it, and each switch replaces it.
+    doc_rows: Option<Vec<crate::desk_id::TrackId>>,
     /// **Where a not-yet-real project's MEDIA still lives** — the folder its
     /// document was adopted from, or `None` for a project that owns its own.
     ///
@@ -4408,6 +4420,7 @@ impl TangentApp {
             menu_ate_press: false,
             arrangement: crate::arrangement::Arrangement::default(),
             project_doc: std::path::PathBuf::new(),
+            doc_rows: None,
             media_source: None,
             made_real_here: std::cell::Cell::new(false),
             clips_dirty: false,
@@ -9936,6 +9949,7 @@ impl TangentApp {
         };
         self.project_doc = doc;
         self.arrangement = arr;
+        self.note_doc_rows();
         self.say_desk_dropped();
         self.clips_dirty = true;
         self.desk_index_dirty();
@@ -9965,6 +9979,7 @@ impl TangentApp {
         };
         self.project_doc = std::path::PathBuf::from(p);
         self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
+        self.note_doc_rows();
         self.clips_dirty = true;
         self.desk_index_dirty();
         self.load_drumpad_doc();
@@ -10004,6 +10019,7 @@ impl TangentApp {
         arr.save_to(&doc);
         self.arrangement = arr;
         self.project_doc = doc.clone();
+        self.note_doc_rows();
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
@@ -10818,6 +10834,26 @@ impl TangentApp {
         }
     }
 
+    /// **The rows a desk snapshot stands the desk on**: its own ids when
+    /// they are one distinct id per channel, else the identity desk by the
+    /// identity rule (every legacy document). One rule for the apply and
+    /// for `doc_rows`, which names the rows an open of the file stands on.
+    fn snapshot_rows(d: &crate::arrangement::DeskSnap) -> Vec<crate::desk_id::TrackId> {
+        let n = recorder::CHANNELS;
+        let said = d.ids.len() == n
+            && d.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
+        if said { d.ids.0.clone() } else { crate::desk_legacy::identity_ids(n) }
+    }
+
+    /// **The document at `project_doc` lies on disk as `arrangement`
+    /// holds it**, just read from there or written there: its rows are the
+    /// ones the kit sidecar files kits by until the next read or write
+    /// (`doc_rows`). A document with no desk names no rows: an open of it
+    /// stands on whatever desk is live, and so does the sidecar.
+    fn note_doc_rows(&mut self) {
+        self.doc_rows = self.arrangement.desk.as_ref().map(Self::snapshot_rows);
+    }
+
     /// Put a document's desk on the settings — the live desk — clamped the
     /// way every settings read is. The host is told to reload the bays with
     /// the states the project carries.
@@ -10844,11 +10880,7 @@ impl TangentApp {
         // the snapshot's, so an open lands on the document's own counter.
         // Undo keeps the higher of the two (`undo_apply`), so an id handed
         // out and undone is not handed out again.
-        let n = recorder::CHANNELS;
-        let said = d.ids.len() == n
-            && d.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
-        self.settings.track_ids =
-            if said { d.ids.0.clone() } else { crate::desk_legacy::identity_ids(n) };
+        self.settings.track_ids = Self::snapshot_rows(d);
         self.settings.next_track_id = self
             .settings
             .track_ids
@@ -12467,10 +12499,10 @@ impl TangentApp {
         self.settings
             .insert_bypass
             .remap_seats(&recorder::seat_order(order));
-        // The desk has its new shape: the aims that named rows let go, and
-        // the kit sidecar is written by the rows as they now stand.
+        // The desk has its new shape: the aims that named rows let go. The
+        // kit sidecar is not written: it files kits by the rows of the
+        // document on disk, which only a save moves (`drumpad_save`).
         self.on_desk_shape_change();
-        self.kits_follow_rows();
 
         // **And the moment this gesture leaves keeps the order**, so undo
         // can hand the host the way back - see `Moment::perm`. Composed, for
@@ -13099,12 +13131,10 @@ impl TangentApp {
     fn mint_row_id(&mut self, n: usize) {
         let was = self.track_id_at(n);
         if let Some(now) = self.mint_bare(n) {
-            let kit = self.drumpad_kits.contains_key(&was);
+            // The kit sidecar is not written: a format-2 file names the kit
+            // by the id the document on disk still gives the row, until a
+            // save writes both (`drumpad_save`).
             self.retarget_row(was, now);
-            // A format-2 sidecar names the kit by the id it just left.
-            if kit {
-                self.kits_follow_rows();
-            }
         }
     }
 
@@ -13879,6 +13909,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // template can never be edited in place through this session.
         self.arrangement.named = false;
         self.project_doc = dir.join(crate::arrangement::DOC_NAME);
+        // A home with no document on disk yet: the kits are filed by the
+        // live rows until a save writes one (`doc_rows`).
+        self.doc_rows = None;
         self.settings.project_path = self.project_doc.to_string_lossy().into_owned();
         // **The template's kit, now that the session is aimed at its own
         // home.** The open above read the stencil without inhabiting it, so
@@ -14126,8 +14159,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.say_desk_dropped();
         // A stencil is read but never inhabited: the session keeps whatever
         // home it had, and `adopt_template` gives it a scratch a line later.
+        // The home's document on disk is the one just read otherwise, and
+        // its rows are what the kit sidecar files kits by (`doc_rows`).
         if !on_shelf {
             self.project_doc = doc.clone();
+            self.note_doc_rows();
         }
         if keep == KeepPath::Write {
             self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -14570,6 +14606,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.named = true;
         self.arrangement.save_to(&doc);
         self.project_doc = doc.clone();
+        self.note_doc_rows();
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         // The kit's sidecar is part of the project and copies with it — its
@@ -18183,8 +18220,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // A plain write: this IS the undo, so it must not commit a moment
             // of its own — that would push the state we just travelled
             // to onto the top of the stack and make redo unreachable. After
-            // the desk, whose rows the sidecar is written by: each kit goes
-            // under the row its track stands on in THIS moment.
+            // the desk, so the tracks the moment holds are the ones on its
+            // rows: each kit goes under the row the document on disk gives
+            // its track (`drumpad_save`), which no undo moves.
             //
             // **And only into a folder that is already real.** An undo is not
             // a thing worth keeping: undoing a track move on a fresh scratch
@@ -18198,9 +18236,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if self.settings.track_ids != rows_before {
             self.on_desk_shape_change();
-            if !kits_moved {
-                self.kits_follow_rows();
-            }
         }
         // **An AUTO width and lane count come back too.** The apply skips a
         // zero for the open and the template adopt, and an undo through the
@@ -18335,6 +18370,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.mark_project_saved();
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
             self.arrangement.save_to(&doc);
+            // **And the kit sidecar with it, by the rows just written.**
+            // Today's bytes file each kit under its LANE, and a save is what
+            // moves the document's rows on disk: the save never wrote the
+            // sidecar, so a project saved after a drag reopened with the kit
+            // on the row the drum track had left and the drum track silent.
+            // Between saves the sidecar files kits by the rows this wrote
+            // (`drumpad_save`), never by rows the document has not saved.
+            // An absent sidecar and an empty one read alike, so a desk with
+            // no kit and no sidecar writes none.
+            if crate::drumpad::DrumpadDoc::sidecar(&doc).exists()
+                || self.drumpad_kits.values().any(|k| !k.is_empty())
+            {
+                self.save_kits_beside(&doc);
+            }
+            self.note_doc_rows();
         }
     }
 
@@ -23205,8 +23255,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         kit.pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
-        self.materialize_project_dir();
-        self.save_kits_beside(&doc);
+        self.drumpad_save();
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -23246,8 +23295,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         kit.pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
-        self.materialize_project_dir();
-        self.save_kits_beside(&doc);
+        self.drumpad_save();
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -23347,18 +23395,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The kit sidecar, saving itself** - after every kit edit, and an
+    /// undo that moved the kits - beside the project's document: the
+    /// owner's one exception to "nothing saves itself", because a kit is
+    /// hours of sample assignment.
+    ///
+    /// **Filed by the rows of the document on disk** (`doc_rows`), not the
+    /// live ones. The document is written only by a save, so between saves
+    /// the live rows can stand in another order or hold tracks it does not:
+    /// filed by them, a drag and a pad edit with no save left the kit under
+    /// the row the drum track had moved to, and the document reopened with
+    /// the drum track silent and the kit on the track standing there on
+    /// disk. Each track's kit goes under the row the document gives the
+    /// track, so the two files on disk always describe one desk; see
+    /// `DrumpadDoc::save_track_kits_on`. A save writes both by the rows as
+    /// they stand (`save_project_doc`).
     fn drumpad_save(&mut self) {
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
             // The kit saves itself, so the kit is a REAL thing: the folder
             // is born here if it never was.
             self.materialize_project_dir();
-            self.save_kits_beside(&doc);
+            let live = &self.settings.track_ids;
+            crate::drumpad::DrumpadDoc::save_track_kits_on(
+                &self.drumpad_kits,
+                live,
+                self.doc_rows.as_deref().unwrap_or(live),
+                Some(self.drumpad_track()),
+                &doc,
+            );
         }
     }
 
-    /// **The kit sidecar beside `doc`**: every track's kit off the map, by
-    /// the rows they stand on now, the panel's row as the file's primary.
-    /// The one writer every road that saves a kit goes through.
+    /// **The kit sidecar beside `doc`, a document written with the live
+    /// desk** - a save, a Save As, a template - or a folder with no document
+    /// yet: every track's kit off the map, by the rows they stand on now,
+    /// the panel's row as the file's primary (row 0 when it stands on none).
     fn save_kits_beside(&self, doc: &std::path::Path) {
         crate::drumpad::DrumpadDoc::save_track_kits(
             &self.drumpad_kits,
@@ -23366,25 +23437,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.drumpad_row().unwrap_or(0),
             doc,
         );
-    }
-
-    /// **The rows moved, so the kit sidecar follows them.** Today's bytes
-    /// file each kit under its LANE (`lane_kits`, `primary_lane`), and a
-    /// format-2 file under its track's id, so the file has to be written
-    /// again whenever a row moves or a row's id changes, or it names the
-    /// rows as they were: a project saved after a drag reopened with its
-    /// kit on the row the drum track had left, and the drum track silent.
-    /// The reorder never wrote it; an undo across one did, but only because
-    /// the lane-indexed kits it restored differed from the live ones, which
-    /// kits held by track no longer do. Only into a folder that is already
-    /// real, the undo's rule: a scratch's kits live in memory until the
-    /// folder is made, and making it writes them.
-    fn kits_follow_rows(&mut self) {
-        let real = self.project_doc().is_some_and(|d| d.parent().is_some_and(std::path::Path::is_dir));
-        if real && self.drumpad_kits.values().any(|k| !k.is_empty()) {
-            let doc = self.project_doc.clone();
-            self.save_kits_beside(&doc);
-        }
     }
 
     /// One knob's current value, in its own units.
@@ -83437,11 +83489,10 @@ mod lane_refs_tests {
 
     /// **A dragged drum track reopens with its kit**, in today's bytes and
     /// in format 2. Today's sidecar files each kit under its LANE, and the
-    /// reorder never wrote it: a project saved after the drag reopened with
+    /// save never wrote it: a project saved after the drag reopened with
     /// the kit on the row the drum track had left and the drum track silent.
-    /// The kit is written by the rows as they stand after the drag, and
-    /// again after its undo, which with the kits held by track no longer
-    /// differs from the live ones and so would write nothing on its own.
+    /// The save writes it by the rows it writes the document with, after the
+    /// drag and after its undo.
     #[test]
     fn a_dragged_drum_track_reopens_with_its_kit_in_either_format() {
         for format2 in [false, true] {
@@ -83470,6 +83521,142 @@ mod lane_refs_tests {
                 again.open_project(&doc);
                 assert_eq!(again.kit_at(0).pads[36].path, "media/kick.wav", "the undo's kit did not reopen on its track (format 2: {format2})");
                 assert!(again.kit_at(3).is_empty(), "the undo left the kit on the row (format 2: {format2})");
+                let _ = std::fs::remove_dir_all(&root);
+            };
+            if format2 {
+                crate::desk_format::with_format2(run);
+            } else {
+                run();
+            }
+        }
+    }
+
+    /// **An unsaved drag leaves the kit on disk with the document on
+    /// disk**, in today's bytes and in format 2. The document is written
+    /// only by a save and the kit sidecar saves itself, so the sidecar used
+    /// to run ahead of it: the drag rewrote it by the moved rows, and the
+    /// project, closed without saving (or lost to a crash) and reopened,
+    /// put the kit on whatever track stands on the drum track's new row in
+    /// the old document, with the drum track silent - and the next save
+    /// made that permanent. Neither the drag, its undo, nor a pad edited
+    /// after it may file a kit by rows the document has not saved; the save
+    /// then writes both by the rows as they stand.
+    #[test]
+    fn an_unsaved_drag_leaves_the_kit_on_disk_with_the_document() {
+        for format2 in [false, true] {
+            let run = || {
+                let root = project_scratch(if format2 { "lane-refs-unsaved-v2" } else { "lane-refs-unsaved" });
+                let (_ctx, mut app) = headless(Caps::DESKTOP);
+                app.bootstrap_project(&root.join("Projects"));
+                let doc = app.project_doc().expect("a project").to_path_buf();
+                app.kit_at_mut(0).pads[36].path = "media/kick.wav".into();
+                app.drumpad_edited();
+                app.save_project_doc();
+                let drums = app.track_id_at(0);
+                let reopened = || {
+                    let (_c, mut back) = headless(Caps::DESKTOP);
+                    back.open_project(&doc);
+                    back
+                };
+
+                app.move_channel(0, 3);
+                assert_eq!(app.row_of(drums), Some(3), "fixture: the drum track did not move");
+                let back = reopened();
+                assert_eq!(back.kit_at(0).pads[36].path, "media/kick.wav", "an unsaved drag moved the kit on disk off its track (format 2: {format2})");
+                assert!(back.kit_at(3).is_empty(), "an unsaved drag filed the kit under the row it moved to (format 2: {format2})");
+
+                // A pad edited after the drag: the kit saves itself, by the
+                // rows of the document on disk.
+                app.set_drumpad_lane(3);
+                app.kit_at_mut(3).pads[38].path = "media/snare.wav".into();
+                app.drumpad_edited();
+                let back = reopened();
+                assert_eq!(back.kit_at(0).pads[36].path, "media/kick.wav", "a pad edit after the drag moved the kit on disk (format 2: {format2})");
+                assert_eq!(back.kit_at(0).pads[38].path, "media/snare.wav", "the pad edit itself never reached the disk (format 2: {format2})");
+                assert!(back.kit_at(3).is_empty(), "a pad edit after the drag filed the kit by the moved rows (format 2: {format2})");
+                assert_eq!(back.drumpad_lane(), 0, "the panel's track reopened on another row (format 2: {format2})");
+
+                // Back across the pad edit and the drag, and forward across
+                // the drag again: the rows move, the kits do not.
+                app.undo();
+                app.undo();
+                assert_eq!(app.row_of(drums), Some(0), "fixture: the undo did not put the track back");
+                app.redo();
+                assert_eq!(app.row_of(drums), Some(3), "fixture: the redo did not move the track again");
+                let back = reopened();
+                assert_eq!(back.kit_at(0).pads[36].path, "media/kick.wav", "a redo of the drag filed the kit by its rows (format 2: {format2})");
+                assert!(back.kit_at(3).is_empty(), "a redo of the drag moved the kit on disk (format 2: {format2})");
+                // And forward across the pad edit: the kits move, by the
+                // document's rows.
+                app.redo();
+                let back = reopened();
+                assert_eq!(back.kit_at(0).pads[38].path, "media/snare.wav", "a redo of the pad edit filed the kit by the moved rows (format 2: {format2})");
+
+                app.save_project_doc();
+                let back = reopened();
+                assert_eq!(back.kit_at(3).pads[38].path, "media/snare.wav", "the save left the kit behind its track (format 2: {format2})");
+                assert!(back.kit_at(0).is_empty(), "the save kept the kit on the row the track left (format 2: {format2})");
+
+                // A session that OPENED the document files by its rows too.
+                let (_c, mut opened) = headless(Caps::DESKTOP);
+                opened.open_project(&doc);
+                opened.move_channel(3, 5);
+                opened.set_drumpad_lane(5);
+                opened.kit_at_mut(5).pads[40].path = "media/tom.wav".into();
+                opened.drumpad_edited();
+                let back = reopened();
+                assert_eq!(back.kit_at(3).pads[40].path, "media/tom.wav", "an opened session filed the kit by its unsaved rows (format 2: {format2})");
+                assert!(back.kit_at(5).is_empty(), "an opened session filed the kit by the moved rows (format 2: {format2})");
+                let _ = std::fs::remove_dir_all(&root);
+            };
+            if format2 {
+                crate::desk_format::with_format2(run);
+            } else {
+                run();
+            }
+        }
+    }
+
+    /// **A row given its first kind keeps its kit on disk until the
+    /// save**, in today's bytes and in format 2. The row is minted a new id,
+    /// and the document on disk still names it by the old one: a format-2
+    /// sidecar rewritten under the new id at the mint, or by a pad edited
+    /// after it, reopened the unsaved document with the kit dropped (no row
+    /// it names), and the next write deleted it from disk.
+    #[test]
+    fn a_row_given_a_kind_keeps_its_kit_on_disk_until_the_save() {
+        for format2 in [false, true] {
+            let run = || {
+                let root = project_scratch(if format2 { "lane-refs-mint-v2" } else { "lane-refs-mint" });
+                let (_ctx, mut app) = headless(Caps::DESKTOP);
+                app.bootstrap_project(&root.join("Projects"));
+                let doc = app.project_doc().expect("a project").to_path_buf();
+                let row = 6;
+                assert!(!app.row_counted(row), "fixture: row 6 is not empty");
+                app.set_drumpad_lane(row);
+                app.kit_at_mut(row).pads[36].path = "media/kick.wav".into();
+                app.drumpad_edited();
+                app.save_project_doc();
+                let vacant = app.track_id_at(row);
+                let reopened = || {
+                    let (_c, mut back) = headless(Caps::DESKTOP);
+                    back.open_project(&doc);
+                    back
+                };
+
+                app.set_channel_kind(row, Some(recorder::ChannelKind::Midi));
+                assert_ne!(app.track_id_at(row), vacant, "fixture: the row kept its id");
+                let back = reopened();
+                assert_eq!(back.kit_at(row).pads[36].path, "media/kick.wav", "the mint dropped the kit from disk (format 2: {format2})");
+
+                app.kit_at_mut(row).pads[38].path = "media/snare.wav".into();
+                app.drumpad_edited();
+                let back = reopened();
+                assert_eq!(back.kit_at(row).pads[38].path, "media/snare.wav", "a pad edit after the mint filed the kit by an id the document does not hold (format 2: {format2})");
+
+                app.save_project_doc();
+                let back = reopened();
+                assert_eq!(back.kit_at(row).pads[38].path, "media/snare.wav", "the save lost the kit (format 2: {format2})");
                 let _ = std::fs::remove_dir_all(&root);
             };
             if format2 {
@@ -83782,7 +83969,7 @@ mod lane_refs_tests {
             "selected_channel", "selected_tracks", "sel_anchor", "drumpad_lane", "drumpad_kits",
             "arr_auto_open", "arr_auto_armed", "arr_auto_bypassed", "arr_auto_focus", "arr_auto_modes",
             "arr_auto_latched", "arr_auto_last", "auto_clipboard_from", "auto_clipboard_rows",
-            "track_clipboard", "insert_state_copy", "carry_automation_rows",
+            "track_clipboard", "insert_state_copy", "carry_automation_rows", "doc_rows",
         ];
         for f in ["reorder_channels", "open_lane_below", "undo_apply"] {
             let body = body_of(src, f);
@@ -83847,6 +84034,7 @@ mod lane_refs_tests {
         ("drumpad_lane", Identity),
         ("track_clipboard", Identity),
         ("insert_state_copy", Identity),
+        ("doc_rows", Identity),
         ("rows_closed_since_moment", Identity),
         ("selected_channel", Identity),
         ("selected_tracks", Identity),
