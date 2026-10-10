@@ -598,6 +598,32 @@ struct Gate {
     job: Mutex<Job>,
 }
 
+/// **The most workers one pool starts**, whatever the machine offers.
+///
+/// Reconsidered for unlimited tracks (W7-scale-and-budgets) and KEPT, on a
+/// measurement and a risk. The number was born beside a thirty-two-bit lane
+/// mask, and nothing here depends on it any more: the claim is a cursor and
+/// `done` a count. What it still decides:
+///
+/// * **No machine it has been measured on reaches it.** The live pool is
+///   the performance cores less one (four on the M5 Pro this was measured
+///   on) and a bounce's is every core less one (fourteen); the tester boxes
+///   the fan-out was swept on are four threads.
+/// * **A bounce would use more on a bigger machine.** 1,024 lanes, each a
+///   plate, export pool of plain threads, 128-frame blocks: serial 6,922
+///   us a block, then 3,759 / 2,710 / 1,948 / 1,587 / 1,285 us at 1, 2, 4,
+///   8 and 14 peers, still 1.23x from eight to fourteen with the last six
+///   on efficiency cores (`docs/PERF-UNLIMITED.md`). A 32-core machine is
+///   capped at half its cores for a bounce, unmeasured.
+/// * **A wider LIVE pool is a bet that can turn the fork off.** The fork
+///   needs every worker real-time and in the device's workgroup
+///   (`ready() >= width()`), and the workgroup names a width of its own
+///   (`os_workgroup_max_parallel_threads`, ten here). Whether a join past
+///   it is refused, which would leave the pool never ready and every block
+///   on one thread, has not been tried. Any raise belongs to bounces
+///   alone, measured on a machine that has the cores.
+const MAX_WORKERS: usize = 16;
+
 /// **A pool of real-time threads that render lanes.**
 ///
 /// Persistent, because a thread spawned per block would allocate a stack on
@@ -627,7 +653,7 @@ impl LanePool {
     /// fail - which is also why an offline fan-out works on the platforms
     /// where the live one cannot get a real-time grant at all.
     pub fn new(width: usize, wg: Option<Arc<Workgroup>>, plan: Option<RtPlan>) -> Self {
-        let width = width.clamp(1, 16);
+        let width = width.clamp(1, MAX_WORKERS);
         let gate = Arc::new(Gate {
             round: Mutex::new(0),
             wake: Condvar::new(),
