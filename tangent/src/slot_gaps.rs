@@ -2,12 +2,22 @@
 //! a desk two hundred and one rows wide, its subjects on rows 1, 31, 32, 33,
 //! 40 and 200, each given the same part, and each part made to behave on
 //! every subject as it does on row 1, LIVE (an engine driven by the
-//! [`Bridge`], its lanes on their rows' slots, furnished down the host's
-//! own roads) and in an EXPORT (`full_build_with`, the one builder an
-//! export, a freeze and the probe come through, handed the live engine as
-//! the host hands it). The engine's own doors are held at the same widths
-//! by `instrument::slot_engine::gaps`; what this file adds is every road
-//! from the desk to them.
+//! [`Bridge`], its lanes on their rows' slots, furnished by the host's own
+//! functions: [`Host::frame`]) and in an EXPORT (`full_build_with`, the one
+//! builder an export, a freeze and the probe come through, handed the live
+//! engine as the host hands it). The engine's own doors are held at the
+//! same widths by `instrument::slot_engine::gaps`; what this file adds is
+//! every road from the desk to them.
+//!
+//! **The live roads are `DesktopApp`'s, not copies of them.** `DesktopApp`
+//! cannot be built in a test, so each road the frame takes to these parts is
+//! a function of what it touches, which the frame calls with its own fields
+//! and [`Host`] with its own: the bridge's sync and what the host forgets
+//! and takes back with it, the reconcile's walk and its load of one bay
+//! (`next_owed_bay`, `load_bay`), the kits and their knobs (`deliver_kits`,
+//! `push_pad_knobs`), the samplers' files (`deliver_samples`), and a face's
+//! knob (`set_insert_param`). A copy of those here stayed green while the
+//! road it copied could stop at the thirty-second row.
 //!
 //! The parts: a drum lane's pad effect, a sampler bay's file, a built-in
 //! face (its push, its knobs and the automation's overlay on it), a
@@ -16,30 +26,33 @@
 //! the faces' roads stop at the thirty-second row.
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
-//! directory of the test's own (`composite::tiers`), every project is under
-//! the temp dir, and the apps run with the global settings file off
-//! (`persist_global_settings`), as `konami_e2e`'s do.
+//! directory of the test's own (`composite::tiers`), every project and every
+//! live shelf is under the temp dir, and the apps run with the global
+//! settings file off (`persist_global_settings`), as `konami_e2e`'s do.
 //!
 //! [`Bridge`]: crate::engine_bridge::Bridge
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use tangent_record::audio::Timebase;
 use tangent_ui::app::TangentApp;
 use tangent_ui::arrangement::{ArrClip, ArrNote, Arrangement, ClipKind};
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
 use tangent_ui::desk_model::{RowKind, TrackRow};
-use tangent_ui::dialogs::DialogAction;
+use tangent_ui::dialogs::{DialogAction, DRUMPAD_PATH};
+use tangent_ui::drumpad::DrumpadDoc;
 use tangent_ui::host::Caps;
-use tangent_ui::recorder::{RecorderRequest, StripRef};
+use tangent_ui::recorder::{DrumKitParams, RecorderRequest, StripRef, DRUM_PAD_BASE};
 use tangent_ui::settings::Settings;
 
 use crate::builtin_fx::{COMP_PATH, EQ_PATH, SAMPLER_PATH, TRIM_PATH};
 use crate::composite::tiers;
 use crate::desk_plan::{SendFrom, SendTo, Slot};
+use crate::desktop::{BayRoad, Decoded, DesktopApp, InsertLedger};
 use crate::engine_bridge::{full_build_with, BuildFor, Bridge, Built, Furnish};
-use crate::instrument::{Engine, LanePart, PadKit};
+use crate::instrument::Engine;
+use crate::shelf::DisplacedShelf;
 
 const RATE: u32 = 48_000;
 
@@ -172,30 +185,109 @@ fn open_saved(tag: &str, settings: Settings, path: &Path) -> TangentApp {
     app
 }
 
-/// **The live engine, as the host furnishes it**: the bridge's shape (each
-/// row's lane on its own slot, which the subjects' slots depend on), each
-/// drum lane's own kit and knobs (`reload_pads`' road and the frame's pad
-/// push), and the document's clips, placed as the export places them and
-/// stamped with their lanes by the bridge as `reload_clips` stamps them.
-/// Its bays are seated by the caller, as the reconcile seats them
-/// ([`seat`]).
-fn live(app: &TangentApp) -> (Engine, Bridge) {
+// ── the host, by its own roads ──────────────────────────────────────────────
+
+/// **What the host keeps between frames**, for its own roads to keep here:
+/// the reconcile's ledger and displaced shelf, the live shelf it seats bays
+/// from (this test's own, `<scratch>/state`), the engine's sentence, the
+/// samplers' record and cache, the kits' cache and the knobs each kit was
+/// last told. [`Host::frame`] runs a frame over them through `DesktopApp`'s
+/// own functions, so a road of the host's that stops at the thirty-second
+/// row stops here too.
+#[derive(Default)]
+struct Host {
+    shelf: PathBuf,
+    ledger: InsertLedger,
+    displaced: DisplacedShelf,
+    error: Option<String>,
+    sampler_have: BTreeMap<usize, Option<(PathBuf, u8)>>,
+    sampler_cache: HashMap<PathBuf, Decoded>,
+    pad_cache: HashMap<PathBuf, Decoded>,
+    pushed_pads: BTreeMap<usize, DrumKitParams>,
+}
+
+impl Host {
+    /// A host whose live shelf is `dir/state`.
+    fn at(dir: &Path) -> Self {
+        Self {
+            shelf: dir.join("state"),
+            ..Self::default()
+        }
+    }
+
+    /// **A bay's saved state on this host's shelf**, as a save leaves it:
+    /// what the reconcile seats the bay with.
+    fn shelve(&self, sb: SeatBay, path: &str, blob: &[u8]) {
+        assert!(crate::shelf::write_state_in(&self.shelf, sb, path, blob), "fixture: {sb}'s state did not land");
+    }
+
+    /// **One host frame**, each step `DesktopApp`'s own function, in the
+    /// frame's order:
+    ///
+    /// - `push_monitor_settings`'s: the bridge's sync, a lane leaving
+    ///   written down and forgotten (`forget_lane`) and one taken back
+    ///   reclaimed (`reclaim_lanes`), what the host keeps per slot forgotten
+    ///   for a lane that came or went (`forget_moved_slots`), and the kits'
+    ///   knobs (`push_pad_knobs`);
+    /// - `after_frame`'s reconcile: the bays the desk wants
+    ///   (`bays_wanted`), the next one owed a load (`next_owed_bay`) and its
+    ///   load (`load_bay`), one a frame, the frames run back to back until
+    ///   none is owed;
+    /// - `run_warm`'s: the kits (`deliver_kits`) and the samplers' files
+    ///   (`deliver_samples`). The host runs these when they are owed; every
+    ///   frame here is one whose desk moved, so every frame owes them.
+    fn frame(&mut self, app: &mut TangentApp, e: &mut Engine, p: &mut Bridge) {
+        let synced = {
+            let (ledger, shelf) = (&mut self.ledger, &self.shelf);
+            p.sync_with(app, e, &mut |e, id, lane| DesktopApp::forget_lane(ledger, shelf, e, id, lane))
+        };
+        DesktopApp::reclaim_lanes(&mut self.ledger, &synced);
+        DesktopApp::forget_moved_slots(&synced.moved, &mut self.sampler_have, &mut self.pushed_pads);
+        if synced.primed {
+            self.pushed_pads.clear();
+        }
+        DesktopApp::push_pad_knobs(e, p, app, &mut self.pushed_pads);
+        let mut settled = false;
+        for _ in 0..10_000 {
+            let wanted = DesktopApp::bays_wanted(app, p);
+            let (Some(at), _) = DesktopApp::next_owed_bay(&wanted, &self.ledger) else {
+                settled = true;
+                break;
+            };
+            let road = BayRoad {
+                app: &mut *app,
+                bridge: &*p,
+                engine: Some(&mut *e),
+                ledger: &mut self.ledger,
+                displaced: &mut self.displaced,
+                shelf: &self.shelf,
+                restoring: false,
+                error: &mut self.error,
+            };
+            DesktopApp::load_bay(road, at, wanted.get(&at).cloned());
+            e.settle_offline();
+        }
+        assert!(settled, "the reconcile never ran out of bays to load");
+        assert!(self.error.is_none(), "a bay would not load: {:?}", self.error);
+        DesktopApp::deliver_kits(Some(&mut *e), p, app, &mut self.pad_cache);
+        DesktopApp::deliver_samples(Some(&mut *e), p, app, &mut self.sampler_have, &mut self.sampler_cache);
+        e.settle_offline();
+    }
+}
+
+/// **The live engine, as the host furnishes it**: a frame of [`Host`]'s (the
+/// bridge's shape, each row's lane on its own slot, which the subjects'
+/// slots depend on; every bay the desk seats, from the host's shelf; each
+/// drum lane's kit and knobs; each sampler's file), and the document's
+/// clips, placed as the export places them and stamped with their lanes by
+/// the bridge as `reload_clips` stamps them.
+fn live(app: &mut TangentApp, host: &mut Host) -> (Engine, Bridge) {
     let mut e = Engine::offline(RATE, Timebase::new()).expect("a live engine");
     let mut p = Bridge::new();
-    p.sync(app, &mut e);
+    host.frame(app, &mut e, &mut p);
     for (row, id) in app.track_ids().iter().enumerate() {
         let at = p.lane_of(*id).map(|l| l.slot);
         assert_eq!(at, Some(Slot(row as u32)), "fixture: row {row}'s lane is not its own slot");
-    }
-    for (row, lane) in p.lanes_holding(app, tangent_ui::dialogs::DRUMPAD_PATH) {
-        let mut kit = PadKit::default();
-        for (i, path) in app.drumpad_paths_of(row).iter().enumerate() {
-            let Some(path) = path else { continue };
-            let clip = tangent_record::decode::decode(path, RATE).unwrap_or_else(|err| panic!("row {row}'s pad {i}: {err}"));
-            kit.pads[i] = Some(Arc::new(clip));
-        }
-        e.attach(lane.slot, lane.gen, LanePart::Kit(Box::new(kit))).expect("the kit goes");
-        e.set_pad_params(lane.slot, &app.drum_kit_params_of(row));
     }
     let doc = app.clip_doc().expect("a project");
     let (placed, midi, unread) = crate::desktop::export_clip_placement(app.arrangement(), &app.frozen_lanes(), RATE, |rel| {
@@ -206,19 +298,6 @@ fn live(app: &TangentApp) -> (Engine, Bridge) {
     e.set_midi_slotted(p.slot_midi(midi));
     e.settle_offline();
     (e, p)
-}
-
-/// **Seat `path` with `blob` in bay `sb` of the live engine**, by the road
-/// the reconcile takes (`bays_wanted`: the bay's identity through the
-/// bridge to its rack; then `load_insert_at`), and land it. A bay whose
-/// rack the engine has no seat for loads as `Ok(None)` there, and nothing
-/// is seated: that is a failure here.
-fn seat(e: &mut Engine, p: &Bridge, sb: SeatBay, path: &str, blob: &[u8]) {
-    let (rack, bay) = p.engine_bay(sb).unwrap_or_else(|| panic!("{sb}: no engine bay"));
-    e.load_insert_at(rack, bay, Some(Path::new(path)), Some(blob))
-        .unwrap_or_else(|err| panic!("{sb}: {path} did not load: {err}"))
-        .unwrap_or_else(|| panic!("{sb}: {path} was seated nowhere"));
-    e.settle_offline();
 }
 
 /// **The export's engine**: `full_build_with` handed the live engine and its
@@ -279,50 +358,66 @@ fn cleanup(dir: &Path, tags: &[&str]) {
 /// Row 2: a drum track like the subjects, with no pad effect on any desk.
 const CONTROL: usize = 2;
 
+/// **The kits of `rows`, in the sidecar beside the document at `path`**:
+/// pad 36 a steady tone at half its gain, a knob of the lane's own
+/// (`set_pad_params` keeps a kit's pads by its lane) that the frame's push
+/// (`push_pad_knobs`) has to tell every lane: a kit it missed plays the pad
+/// at unity, twice row 1's level. Not the kit's fader: that is one number
+/// for every kit (the drumpad's master), which any lane's push sets for all.
+fn save_kits(s: &Settings, rows: &[usize], path: &Path) {
+    let mut kits: Vec<DrumpadDoc> = (0..ROWS).map(|_| Default::default()).collect();
+    for &row in rows {
+        kits[row].pads[36].path = "media/pad.wav".to_owned();
+        kits[row].pads[36].params.gain = 0.5;
+    }
+    let ids: Vec<TrackId> = s.rows.iter().map(|r| r.id).collect();
+    DrumpadDoc::save_all_beside_ids(&kits, &ids, SUBJECTS[0], path);
+}
+
 /// **The kit desk**: every subject and [`CONTROL`] a drum track (the
 /// drumpad in its first bay, its own kit in the project's sidecar), the
 /// kit's pad 36 a steady tone struck by a clip; and with `trim`, a Trim at
-/// its floor (-24 dB) on pad 36's first bay of every subject, seated live
-/// as the reconcile seats it. Answers the app and the live engine.
+/// its floor (-24 dB) on pad 36's first bay of every subject, its state on
+/// the host's shelf, seated by the reconcile. Answers the app and the live
+/// engine.
 fn kit_desk(tag: &str, dir: &Path, trim: bool) -> (TangentApp, Engine, Bridge) {
     wav(&dir.join("media").join("pad.wav"), 0.25, false);
     let mut s = wide_desk();
     let mut doc = Arrangement::default();
-    let mut kits: Vec<tangent_ui::drumpad::DrumpadDoc> = (0..ROWS).map(|_| Default::default()).collect();
-    for row in SUBJECTS.into_iter().chain([CONTROL]) {
+    let rows: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
+    for &row in &rows {
         s.rows[row].kind = Some(RowKind::Midi);
-        s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), tangent_ui::dialogs::DRUMPAD_PATH.to_owned());
+        s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), DRUMPAD_PATH.to_owned());
         if trim && row != CONTROL {
             s.plugins.insert(bay_of(&s, row, Rack::Pad(36), 0), TRIM_PATH.to_owned());
         }
-        kits[row].pads[36].path = "media/pad.wav".to_owned();
-        doc.add_clip(notes(row, tangent_ui::recorder::DRUM_PAD_BASE + 36));
+        doc.add_clip(notes(row, DRUM_PAD_BASE + 36));
     }
-    let ids: Vec<TrackId> = s.rows.iter().map(|r| r.id).collect();
     let path = tangent_ui::arrangement::doc_in(dir);
     doc.save_to(&path);
-    tangent_ui::drumpad::DrumpadDoc::save_all_beside_ids(&kits, &ids, SUBJECTS[0], &path);
-    let app = open_saved(tag, s, &path);
-    let (mut e, p) = live(&app);
+    save_kits(&s, &rows, &path);
+    let mut host = Host::at(dir);
     if trim {
         let floor = state(TRIM_PATH, &[(0, 0.0)], &[]);
         for row in SUBJECTS {
-            let sb = SeatBay::new(Node::Track(app.track_ids()[row]), Rack::Pad(36), 0);
-            seat(&mut e, &p, sb, TRIM_PATH, &floor);
+            host.shelve(bay_of(&s, row, Rack::Pad(36), 0), TRIM_PATH, &floor);
         }
     }
+    let mut app = open_saved(tag, s, &path);
+    let (e, p) = live(&mut app, &mut host);
     (app, e, p)
 }
 
 /// **A pad effect on a drum track past slot 31 is heard as on row 1, live
 /// and in the export** (W7-slot-gaps item 1). A Trim at -24 dB on each
 /// subject's pad 36 cuts that subject's kit by the 24 dB it cuts row 1's
-/// by: on the live engine, the bay seated through the bridge as the
-/// reconcile seats it, and on the export's, the bay furnished from the live
-/// one's knobs. The control drum track, with no pad effect, is not moved.
-/// Past slot 31 a pad's rack had no seat, so the bay was seated nowhere
-/// live (`load_insert_at` answered `Ok(None)`), refused in the export, and
-/// the kit played dry both ways.
+/// by: on the live engine, the bay seated by the host's reconcile, and on
+/// the export's, the bay furnished from the live one's knobs. Every kit
+/// plays at row 1's level, its pad's gain told by the frame's push; the control
+/// drum track, with no pad effect, is not moved. Past slot 31 a pad's rack
+/// had no seat, so the bay was seated nowhere live (`load_insert_at`
+/// answered `Ok(None)`), refused in the export, and the kit played dry both
+/// ways.
 #[test]
 fn a_pad_effect_on_a_track_past_slot_31_is_heard_as_on_row_1_live_and_in_the_export() {
     let tags = ["gaps-pads-dry", "gaps-pads-cut"];
@@ -339,7 +434,13 @@ fn a_pad_effect_on_a_track_past_slot_31_is_heard_as_on_row_1_live_and_in_the_exp
     for (road, dry, cut) in &roads {
         let ratio = |i: usize| cut[i] / dry[i];
         for (i, row) in rows.iter().enumerate() {
-            assert!(dry[i] > 0.05, "{road}: the kit on row {row} is silent ({})", dry[i]);
+            assert!(dry[i] > 0.02, "{road}: the kit on row {row} is silent ({})", dry[i]);
+            assert!(
+                (dry[i] - dry[0]).abs() <= 0.02 * dry[0],
+                "{road}: the kit on row {row} plays at {}, row 1's at {}: its knobs did not reach it",
+                dry[i],
+                dry[0]
+            );
         }
         let reference = ratio(0);
         assert!((reference - 0.063).abs() < 0.01, "{road}: row 1's pad effect left its kit at {reference} of itself, not -24 dB");
@@ -357,13 +458,22 @@ fn a_pad_effect_on_a_track_past_slot_31_is_heard_as_on_row_1_live_and_in_the_exp
 // ── a sampler bay's file ────────────────────────────────────────────────────
 
 /// **A sampler bay plays its file on a track past slot 31 as on row 1, live
-/// and in the export** (W7-slot-gaps item 2). Every subject a MIDI track
-/// with the sampler in its first bay, its state naming `media/tone.wav`,
-/// and a note at the root key. The host's walk over the engine's sampler
-/// bays (`DesktopApp::sampler_bays_of`, which the live reload and the
-/// export's `mirror_sampler_samples` both read) reaches every subject's
-/// lane, and the lane keeps the file handed to it, so each plays at row 1's
-/// level on both engines. The walk read the legacy thirty-two and the
+/// and in the export, and lets it go as row 1's does** (W7-slot-gaps item
+/// 2). Every subject a MIDI track with the sampler in its first bay, its
+/// state on the host's shelf naming `media/tone.wav`, and a note at the root
+/// key. The host's reload (`deliver_samples`, over its walk of the engine's
+/// sampler bays, `sampler_bays_of`, which the export's
+/// `mirror_sampler_samples` reads too) reaches every subject's lane, the
+/// lane keeps the file handed to it, and the face is told, so each plays at
+/// row 1's level on both engines. Every face is told in the frame the lanes
+/// arrive: the host marked every lane it installed owed a file
+/// (`forget_moved_slots`), and handed each an empty one first, a round trip
+/// apiece, so on this desk row 200's file waited behind a hundred and
+/// sixty-nine of them (the offline ring holds thirty-four a frame). Then
+/// each sampler is taken out of its
+/// bay: the reconcile empties the bay, and the reload lets the lane's file
+/// go (its record by slot, `sampler_have`, is what wants nothing there now)
+/// and tells the face so. The walk read the legacy thirty-two, and the
 /// renderer's file table was thirty-two long: past them the bay played
 /// silence both ways.
 #[test]
@@ -378,25 +488,39 @@ fn a_sampler_on_a_track_past_slot_31_plays_its_file_as_on_row_1_live_and_in_the_
         s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), SAMPLER_PATH.to_owned());
         doc.add_clip(notes(row, crate::instrument::SAMPLER_ROOT_KEY));
     }
-    let app = open(TAG, s, &doc, &dir);
-    let (mut e, p) = live(&app);
     let root = crate::instrument::SAMPLER_ROOT_KEY.to_string();
     let blob = state(SAMPLER_PATH, &[], &[("sample_path", "media/tone.wav"), ("root_key", &root)]);
-    for row in SUBJECTS {
-        let sb = SeatBay::new(Node::Track(app.track_ids()[row]), Rack::Chain(0), 0);
-        seat(&mut e, &p, sb, SAMPLER_PATH, &blob);
+    let mut host = Host::at(&dir);
+    let samplers: Vec<SeatBay> = SUBJECTS.iter().map(|r| bay_of(&s, *r, Rack::Chain(0), 0)).collect();
+    for sb in &samplers {
+        host.shelve(*sb, SAMPLER_PATH, &blob);
     }
-    // The live hand-off: the host's own walk over the engine's bays, each
-    // file decoded and handed to its lane.
-    crate::desktop::mirror_sampler_samples(&mut e, RATE, app.kit_doc().as_deref());
-    e.settle_offline();
-    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
-    for (road, got) in [("live", levels(&mut e, &p, &SUBJECTS)), ("export", levels(&mut x, &xb, &SUBJECTS))] {
-        let want = got[0];
-        assert!(want > 0.05, "{road}: row 1's sampler is silent ({want})");
-        for (row, level) in SUBJECTS.iter().zip(&got) {
-            assert!((level - want).abs() <= 0.02 * want, "{road}: row {row}'s sampler played {level}, row 1's {want}");
+    let mut app = open(TAG, s, &doc, &dir);
+    let (mut e, mut p) = live(&mut app, &mut host);
+    let face = |app: &TangentApp, sb: SeatBay| app.sampler_info(sb.seat.node).name.clone();
+    for (row, sb) in SUBJECTS.iter().zip(&samplers) {
+        assert_eq!(face(&app, *sb), "tone.wav", "row {row}'s sampler face was not told its file");
+    }
+    {
+        let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+        for (road, got) in [("live", levels(&mut e, &p, &SUBJECTS)), ("export", levels(&mut x, &xb, &SUBJECTS))] {
+            let want = got[0];
+            assert!(want > 0.05, "{road}: row 1's sampler is silent ({want})");
+            for (row, level) in SUBJECTS.iter().zip(&got) {
+                assert!((level - want).abs() <= 0.02 * want, "{road}: row {row}'s sampler played {level}, row 1's {want}");
+            }
         }
+    }
+    // Every sampler taken out of its bay, and a frame.
+    for sb in &samplers {
+        app.set_plugin(*sb, None);
+    }
+    host.frame(&mut app, &mut e, &mut p);
+    for (row, sb) in SUBJECTS.iter().zip(&samplers) {
+        let lane = p.lane(*row).expect("a lane");
+        let gone = host.sampler_have.get(&(lane.slot.0 as usize)).cloned().flatten();
+        assert_eq!(gone, None, "row {row}'s lane is still recorded holding {gone:?} with its sampler gone");
+        assert_eq!(face(&app, *sb), "", "row {row}'s sampler face still shows the file of a sampler taken out");
     }
     cleanup(&dir, &[TAG]);
 }
@@ -408,17 +532,15 @@ const FREQ: u32 = 22;
 const GAIN: u32 = 23;
 
 /// **What the host does with what the app asked of it**, for the face's
-/// requests: a knob turned is set on the bay's unit through the bridge and
-/// the face pushed back (the host's `SetInsertParam` arm); everything else
-/// is dropped. Answers the `(bay, id, value)` of each knob turned.
+/// requests: a knob turned goes down the host's own `SetInsertParam` road
+/// (`DesktopApp::set_insert_param`: set on the bay's unit through the
+/// bridge, and the face pushed back); everything else is dropped. Answers
+/// the `(bay, id, value)` of each knob turned.
 fn serve(app: &mut TangentApp, e: &mut Engine, p: &Bridge) -> Vec<(SeatBay, u32, f32)> {
     let mut turned = Vec::new();
     while let Some(r) = app.take_recorder_request() {
         if let RecorderRequest::SetInsertParam { bay, id, value } = r {
-            if let Some(at) = p.engine_bay(bay) {
-                e.set_insert_param_at(at.0, at.1, id, value);
-                crate::desktop::push_builtin_faces(app, e, (bay.seat, at.0));
-            }
+            DesktopApp::set_insert_param(app, p, Some(&mut *e), bay, id, value);
             turned.push((bay, id, value));
         }
     }
@@ -436,10 +558,11 @@ fn knob(face: &tangent_ui::ports::BuiltinFace, id: u32) -> Option<f32> {
 /// in its second bay and a curve on that EQ's fifth node's frequency.
 /// Through the host's roads, as the frame composes them:
 ///
-/// - the reconcile's face push (`push_builtin_faces`, by the rack's
-///   identity) gives the app every subject's face, row 1's face;
+/// - the reconcile's load (`load_bay`) seats each EQ and pushes its face by
+///   the rack's identity (`push_builtin_faces`), so the app has every
+///   subject's face, row 1's face;
 /// - a knob turned on it asks the host by the bay
-///   (`RecorderRequest::SetInsertParam`), and the host sets it;
+///   (`RecorderRequest::SetInsertParam`), and the host's own arm sets it;
 /// - with the face open, the frame's walk (`open_live_faces`: the open
 ///   faces by identity, the curve matched by identity) evaluates its
 ///   overlay, which wears the curve's value and is handed back for the bay;
@@ -490,16 +613,12 @@ fn a_built_in_face_past_slot_31_draws_takes_its_knobs_and_wears_its_overlay_as_o
     let curved: Vec<_> = app.engine_automation().curves().iter().map(|c| c.lane).collect();
     let want: Vec<_> = SUBJECTS.iter().map(|r| tangent_ui::automation::AutoLane::Row(*r)).collect();
     assert_eq!(curved, want, "fixture: the curves did not open on their rows");
-    let (mut e, p) = live(&app);
+    // Every EQ seated by the host's reconcile, at its defaults (no state on
+    // the shelf), its face pushed with the load.
+    let mut host = Host::at(&dir);
+    let (mut e, p) = live(&mut app, &mut host);
     let ids = app.track_ids();
     let eq = |row: usize| SeatBay::new(Node::Track(ids[row]), Rack::Chain(0), 1);
-    let blob = state(EQ_PATH, &[], &[]);
-    for row in SUBJECTS {
-        seat(&mut e, &p, eq(row), EQ_PATH, &blob);
-        // The reconcile's push, by the rack's identity.
-        let (rack, _) = p.engine_bay(eq(row)).expect("an engine bay");
-        crate::desktop::push_builtin_faces(&mut app, &e, (eq(row).seat, rack));
-    }
     let auto = app.engine_automation();
     let reference = app.bay_face(eq(SUBJECTS[0])).cloned().expect("row 1's EQ face was never pushed");
     assert_eq!(reference.path, EQ_PATH);
@@ -596,58 +715,31 @@ fn squeeze(app: &TangentApp, e: &mut Engine, p: &Bridge, rows: &[usize]) -> (Vec
     (gr, levels)
 }
 
-/// **A key from row 150 reaches a comp past slot 31 as it reaches row 1's,
-/// live and in the export, and no other comp** (W7-slot-gaps item 4). Every
-/// subject and row 2 hold a hard comp over a quiet tone of their own (a
-/// lane with nothing to play runs no rack, so a comp on one squeezes
-/// nothing to read); the desk's key (`insert_keys`, by the comp's bay and
-/// the source's track) is drawn from row 150, past the old desk, to one
-/// subject at a time, and a loud clip plays on row 150. The keyed comp
-/// squeezes its track as row 1's does when it is the keyed one, on both
-/// engines, and every other comp holds still and leaves its track at row
-/// 2's level. Keys past slot 31 needed no fix: this proves them through the
-/// bridge, both ways. The key to a BUS is proved at the engine
-/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`): the
-/// bridge makes no lane a bus until W7-buses-ui.
-#[test]
-fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
-    let dir = scratch("keys");
-    wav(&dir.join("media").join("loud.wav"), 0.9, true);
-    wav(&dir.join("media").join("soft.wav"), 0.01, false);
-    let comps: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
-    let mut doc = Arrangement::default();
-    doc.add_clip(audio(150, "loud.wav"));
-    for &row in &comps {
-        doc.add_clip(audio(row, "soft.wav"));
-    }
-    let path = tangent_ui::arrangement::doc_in(&dir);
-    doc.save_to(&path);
+/// **Hold the comps of `comps` to a key from row 150, one subject at a
+/// time** (the last of `comps` the control): the keyed comp squeezes its
+/// row as row 1's does, on both engines, and every other comp holds still
+/// and leaves its row at the control's level. `desk` builds each keyed desk
+/// (its key drawn to the subject at `k`) with the comps' states on the
+/// host's shelf; each desk's licence store is named `<prefix>-<row>`.
+/// Answers those names.
+fn hold_keys(prefix: &str, comps: &[usize], path: &Path, dir: &Path, desk: &dyn Fn(usize, &Host) -> Settings) -> Vec<String> {
     let control = comps.len() - 1;
     let mut squeezed = Vec::new();
     let mut tags = Vec::new();
     for (k, keyed) in SUBJECTS.into_iter().enumerate() {
-        let tag = format!("gaps-keys-{keyed}");
-        let mut s = wide_desk();
-        for &row in &comps {
-            s.rows[row].kind = Some(RowKind::Audio);
-            s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), COMP_PATH.to_owned());
-        }
-        s.rows[150].kind = Some(RowKind::Audio);
-        let from = Node::Track(s.rows[150].id);
-        s.insert_keys.set(bay_of(&s, keyed, Rack::Chain(0), 0), Some(from));
-        let app = open_saved(&tag, s, &path);
-        let (mut e, mut p) = live(&app);
-        for &row in &comps {
-            seat(&mut e, &p, SeatBay::new(Node::Track(app.track_ids()[row]), Rack::Chain(0), 0), COMP_PATH, &hard_comp());
-        }
-        p.sync(&app, &mut e);
+        let tag = format!("{prefix}-{keyed}");
+        let mut host = Host::at(dir);
+        let s = desk(k, &host);
+        let mut app = open_saved(&tag, s, path);
+        let (mut e, mut p) = live(&mut app, &mut host);
+        host.frame(&mut app, &mut e, &mut p);
         let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
-        for (road, (gr, lv)) in [("live", squeeze(&app, &mut e, &p, &comps)), ("export", squeeze(&app, &mut x, &xb, &comps))] {
-            assert!(lv[control] > 0.005, "{road}: row 2's quiet tone is silent ({})", lv[control]);
+        for (road, (gr, lv)) in [("live", squeeze(&app, &mut e, &p, comps)), ("export", squeeze(&app, &mut x, &xb, comps))] {
+            assert!(lv[control] > 0.005, "{road}: the control's quiet tone is silent ({})", lv[control]);
             for (j, row) in comps.iter().enumerate() {
                 if j == k {
                     assert!(gr[j] > 6.0, "{road}: a key from row 150 squeezed row {row}'s comp only {:.2} dB", gr[j]);
-                    assert!(lv[j] < 0.7 * lv[control], "{road}: row {row}'s keyed comp left its track at {}, row 2 at {}", lv[j], lv[control]);
+                    assert!(lv[j] < 0.7 * lv[control], "{road}: row {row}'s keyed comp left its row at {}, the control at {}", lv[j], lv[control]);
                     squeezed.push((road, keyed, gr[j]));
                 } else {
                     assert!(gr[j] < 0.5, "{road}: the key for row {keyed} squeezed row {row}'s comp {:.2} dB", gr[j]);
@@ -665,6 +757,49 @@ fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
             assert!((g - reference).abs() <= 0.05 * reference, "{road}: row {keyed}'s keyed comp squeezed {g:.2} dB, row 1's {reference:.2}");
         }
     }
+    tags
+}
+
+/// **A key from row 150 reaches a comp past slot 31 as it reaches row 1's,
+/// live and in the export, and no other comp** (W7-slot-gaps item 4). Every
+/// subject and row 2 hold a hard comp over a quiet tone of their own (a
+/// lane with nothing to play runs no rack, so a comp on one squeezes
+/// nothing to read), seated by the host's reconcile from its shelf; the
+/// desk's key (`insert_keys`, by the comp's bay and the source's track) is
+/// drawn from row 150, past the old desk, to one subject at a time, and a
+/// loud clip plays on row 150. The keyed comp squeezes its track as row 1's
+/// does when it is the keyed one, on both engines, and every other comp
+/// holds still and leaves its track at row 2's level. Keys past slot 31
+/// needed no fix: this proves them through the bridge, both ways. The key
+/// to a BUS is held at the engine
+/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`): the
+/// bridge makes no row a bus until W7-buses-ui.
+#[test]
+fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
+    let dir = scratch("keys");
+    wav(&dir.join("media").join("loud.wav"), 0.9, true);
+    wav(&dir.join("media").join("soft.wav"), 0.01, false);
+    let comps: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
+    let mut doc = Arrangement::default();
+    doc.add_clip(audio(150, "loud.wav"));
+    for &row in &comps {
+        doc.add_clip(audio(row, "soft.wav"));
+    }
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    let desk = |k: usize, host: &Host| {
+        let mut s = wide_desk();
+        for &row in &comps {
+            s.rows[row].kind = Some(RowKind::Audio);
+            s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), COMP_PATH.to_owned());
+            host.shelve(bay_of(&s, row, Rack::Chain(0), 0), COMP_PATH, &hard_comp());
+        }
+        s.rows[150].kind = Some(RowKind::Audio);
+        let from = Node::Track(s.rows[150].id);
+        s.insert_keys.set(bay_of(&s, SUBJECTS[k], Rack::Chain(0), 0), Some(from));
+        s
+    };
+    let tags = hold_keys("gaps-keys", &comps, &path, &dir, &desk);
     let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
     cleanup(&dir, &tags);
 }
@@ -711,12 +846,12 @@ fn gains(e: &Engine) -> Vec<u32> {
 /// knob, each at its own level, is its lane's post-fader Fx entry at that
 /// level in the plan the live bridge publishes and in the export's; row 7,
 /// at nothing, carries none. Then every knob turned (the same desk with the
-/// knobs elsewhere, synced through the same bridge, which is all a frame
-/// after a drag is) publishes no plan, and the playing plan's gains are
-/// bit for bit those of a plan built at the new levels; the export carries
-/// the new levels. And a knob taken to nothing republishes without its
-/// entry. Before, a plan carried no send of a strip's at all, and the knob
-/// reached the return only beside the plan.
+/// knobs elsewhere, a host frame over it, which is all a frame after a drag
+/// is) publishes no plan, and the playing plan's gains are bit for bit
+/// those of a plan built at the new levels; the export carries the new
+/// levels. And a knob taken to nothing republishes without its entry.
+/// Before, a plan carried no send of a strip's at all, and the knob reached
+/// the return only beside the plan.
 #[test]
 fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_export() {
     let tags = ["gaps-sends", "gaps-sends-turned", "gaps-sends-fresh", "gaps-sends-shut"];
@@ -734,8 +869,9 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
         SUBJECTS.iter().zip(knobs).map(|(r, v)| (Slot(*r as u32), *v as f32)).collect()
     };
 
-    let app = open_saved(tags[0], send_desk(&first), &path);
-    let (mut e, mut p) = live(&app);
+    let mut host = Host::at(&dir);
+    let mut app = open_saved(tags[0], send_desk(&first), &path);
+    let (mut e, mut p) = live(&mut app, &mut host);
     assert_eq!(fx_entries(&p), entries(&first), "the live plan does not carry each knob as its strip's Return 0 entry");
     {
         let Built { bridge: xb, .. } = export(&app, (&e, &p));
@@ -745,12 +881,12 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
     e.render_offline(&mut out);
 
     // Every knob turned: no plan, and the playing plan holds the new levels.
-    let moved = open_saved(tags[1], send_desk(&turned), &path);
+    let mut moved = open_saved(tags[1], send_desk(&turned), &path);
     let plans = p.stats().plans;
-    p.sync(&moved, &mut e);
+    host.frame(&mut moved, &mut e, &mut p);
     e.render_offline(&mut out);
     assert_eq!(p.stats().plans, plans, "a knob turned published a plan of its own");
-    let (mut fresh, _fresh_bridge) = live(&open_saved(tags[2], send_desk(&turned), &path));
+    let (mut fresh, _fresh_bridge) = live(&mut open_saved(tags[2], send_desk(&turned), &path), &mut Host::at(&dir));
     fresh.render_offline(&mut out);
     assert_eq!(gains(&e), gains(&fresh), "the playing plan's gains are not a plan's built at the turned knobs");
     {
@@ -761,8 +897,8 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
     // Row 200's knob to nothing: its entry goes, by a plan.
     let mut shut = turned.clone();
     shut[SUBJECTS.len() - 1] = 0.0;
-    let shut_app = open_saved(tags[3], send_desk(&shut), &path);
-    p.sync(&shut_app, &mut e);
+    let mut shut_app = open_saved(tags[3], send_desk(&shut), &path);
+    host.frame(&mut shut_app, &mut e, &mut p);
     assert_eq!(p.stats().plans, plans + 1, "a knob taken to nothing published no plan");
     let mut want = entries(&turned);
     want.pop();
@@ -862,4 +998,32 @@ fn no_host_road_names_a_bay_by_the_frozen_maps_seat() {
     );
     assert!(!cut.contains("legacy_bay") && !cut.contains("gated"), "the cut keeps a gated fn: {cut}");
     assert!(cut.contains("fn kept()"), "the cut takes what follows a gated one-liner: {cut}");
+}
+
+/// **Every frame the host runs goes down the roads [`Host::frame`] drives**:
+/// the frame's reconcile loads its bay through `load_bay` and walks through
+/// `next_owed_bay`, the sampler reload is `deliver_samples`, the kits'
+/// reload `deliver_kits`, their knobs `push_pad_knobs`, a lane that came or
+/// went is forgotten by `forget_moved_slots`, and a face's knob is set by
+/// `set_insert_param`. A road the frame took by other lines would leave
+/// this suite proving a function nothing calls.
+#[test]
+fn the_frame_runs_the_roads_this_suite_drives() {
+    let whole = include_str!("desktop.rs");
+    let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+    // Each method to its own closing brace, the first at the impl's indent.
+    let body_of = |name: &str| {
+        let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+        &src[at..at + src[at..].find("\n    }\n").expect("its end")]
+    };
+    let frame = body_of("fn after_frame(&mut self");
+    for road in ["Self::bays_wanted(&self.app, &self.bridge)", "Self::next_owed_bay(&wanted,", "Self::load_bay(", "Self::set_insert_param("] {
+        assert!(frame.contains(road), "the frame no longer takes `{road}`");
+    }
+    let push = body_of("fn push_monitor_settings(&mut self)");
+    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs("] {
+        assert!(push.contains(road), "the frame's push no longer takes `{road}`");
+    }
+    assert!(body_of("fn reload_sampler(&mut self)").contains("Self::deliver_samples("), "the sampler reload goes another road");
+    assert!(body_of("fn reload_pads(&mut self)").contains("Self::deliver_kits("), "the kits' reload goes another road");
 }
