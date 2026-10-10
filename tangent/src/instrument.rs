@@ -7521,14 +7521,19 @@ pub enum EngineBusy {
 }
 
 /// The host's record of a slot: the generation of the lane it sent there,
-/// whether that lane is on its way home, and whether it has been sent its
-/// node line (`LanePart::Line`), which it then keeps for its life.
+/// whether that lane is on its way home, whether it has been sent its node
+/// line (`LanePart::Line`), which it then keeps for its life, and whether it
+/// has its pad bank (`banked`: built with one, as every legacy lane and a
+/// `LaneSpec::drum` lane are, or sent one, `LanePart::Pads`), which it keeps
+/// the same way. A pad's rack past slot 31 lives in that bank, so a lane
+/// without one has nowhere to seat a pad's plugin (`make_pad_rack`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HostSlot {
     gen: u32,
     live: bool,
     leaving: bool,
     lined: bool,
+    banked: bool,
 }
 
 /// Test doors onto a lane's body, by slot. A slot with no lane is a test
@@ -21254,14 +21259,21 @@ impl Engine {
     /// rack does, and `Rack::swap` seats it the block the rack lands.
     ///
     /// `Ok(false)` for a seat that is no pad of a lane the host has live
-    /// (a lane gone, or going): there is nothing to seat it in. `Err` when
-    /// the op ring is full: the callback has stalled, and the load says so
-    /// rather than seating a plugin nowhere.
+    /// (a lane gone, or going), or of a lane with no pad bank yet (not a
+    /// drum lane, `HostSlot::banked`): there is nothing to seat it in. Such a
+    /// rack went home on arrival with the plugin pushed into it, and the
+    /// plugin was built for nothing and dropped there; the host that asked
+    /// heard it was seated, so the pad played dry once the bank came, for
+    /// good (W7-slot-gaps). Now nothing is built, the load answers that it
+    /// seated nothing, and the bridge offers no such bay until the bank is
+    /// sent (`Bridge::engine_bay`). `Err` when the op ring is full: the
+    /// callback has stalled, and the load says so rather than seating a
+    /// plugin nowhere.
     fn make_pad_rack(&mut self, seat: usize) -> Result<bool, String> {
         let Some((slot, pad)) = sparse_pad_of_seat(seat) else {
             return Ok(false);
         };
-        let Some(h) = self.host_slots.get(slot).copied().filter(|h| h.live && !h.leaving) else {
+        let Some(h) = self.host_slots.get(slot).copied().filter(|h| h.live && !h.leaving && h.banked) else {
             return Ok(false);
         };
         let (Ok(pad), Ok(at)) = (u8::try_from(pad), u32::try_from(slot)) else {
@@ -21387,7 +21399,7 @@ impl Engine {
             self.keys_have.remove(&slot);
             let gen = self.mint_gen();
             list.push((slot, Some(self.build_lane(at, gen, spec))));
-            self.host_slots[at] = HostSlot { gen, live: true, leaving: false, lined: false };
+            self.host_slots[at] = HostSlot { gen, live: true, leaving: false, lined: false, banked: spec.drum };
             gens.push(gen);
         }
         let op = crate::lane_bank::EngineOp::Install(list.into_boxed_slice());
@@ -21434,6 +21446,11 @@ impl Engine {
     /// **A part for a lane, behind its Install** (design 7.5 rule 2). The
     /// callback checks the generation and sends a part for any other lane
     /// straight home.
+    ///
+    /// **A pad bank sent to the lane the host holds there is noted**
+    /// (`HostSlot::banked`): from here on a pad's rack can be made for that
+    /// lane (`make_pad_rack`), and it reaches the callback behind the bank,
+    /// on the same ring.
     pub fn attach(&mut self, slot: Slot, gen: u32, part: LanePart) -> Result<(), EngineBusy> {
         // **What the callback sent home since the host last spoke, dropped
         // first**, here, where the host already is: it keeps the retire
@@ -21442,8 +21459,13 @@ impl Engine {
         if self.ops_tx.borrow().slots() < 1 {
             return Err(EngineBusy::Busy);
         }
+        let bank = matches!(part, LanePart::Pads(_));
         let op = crate::lane_bank::EngineOp::Attach { slot, gen, part };
-        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)
+        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)?;
+        if let Some(h) = self.host_slots.get_mut(slot.0 as usize).filter(|h| bank && h.live && h.gen == gen) {
+            h.banked = true;
+        }
+        Ok(())
     }
 
     /// **The desk's shape, as one validated plan** (design 7.6). Built here
@@ -22618,6 +22640,7 @@ impl Engine {
                     live: true,
                     leaving: false,
                     lined: false,
+                    banked: true,
                 };
                 CHANNELS
             ],
@@ -41306,7 +41329,14 @@ mod slot_engine {
                     .load_insert_at(pad_rack, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
                     .expect("a pad rack load")
                     .is_some();
-                assert!(seated, "slot {slot}'s pad rack took no plugin");
+                // Below slot 32 a pad's rack is the frozen bank's, there with
+                // or without the lane's bank. Past it the rack lives in the
+                // lane's bank, so a lane with none has nowhere to seat the
+                // plugin: the load builds nothing and says so, where it used
+                // to answer "seated" for a rack that went home with the
+                // plugin in it (W7-slot-gaps).
+                let room = attach || slot < CHANNELS;
+                assert_eq!(seated, room, "slot {slot}'s pad rack, with the bank {attach}: seated {seated}");
                 let inputs = plan(&e, 40, &|x| if x == slot { LaneFlags::DRUM } else { LaneFlags::MIDI_OFF });
                 e.publish_plan(&inputs).expect("the plan goes");
                 e.set_stems(true);
@@ -43640,7 +43670,23 @@ mod slot_engine {
         /// one past it is given its bank here, and its pad's rack by the load
         /// (`Engine::make_pad_rack`).
         fn pad_desk(cut: Option<usize>) -> Vec<Vec<f32>> {
+            pad_desk_at(cut, false)
+        }
+
+        /// [`pad_desk`], and with `early` the Trim loaded onto `cut`'s pad
+        /// once BEFORE its lane has a bank as well: past the frozen map that
+        /// load builds nothing and seats nothing, and says so.
+        fn pad_desk_at(cut: Option<usize>, early: bool) -> Vec<Vec<f32>> {
             let mut e = wide(WIDTH);
+            if let (true, Some(slot)) = (early, cut) {
+                let pad = RackAddr { owner: RackOwner::Lane(Slot(slot as u32)), rack: (LANE_RACKS + 36) as u16 };
+                let seated = e
+                    .load_insert_at(pad, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&trim_state(0.0)))
+                    .expect("the ring has room");
+                e.settle_offline();
+                assert!(seated.is_none(), "lane {slot}'s pad took a plugin with no bank to hold its rack");
+                assert!(e.insert_at(pad, 0).is_none(), "lane {slot}'s pad holds a plugin with no bank");
+            }
             let mut notes = Vec::new();
             for &slot in &SLOTS {
                 let s = Slot(slot as u32);
@@ -43695,6 +43741,35 @@ mod slot_engine {
                 let want = *reference.get_or_insert(ratio);
                 assert!((ratio - 0.063).abs() < 0.01, "lane {a}'s pad effect cut its kit to {ratio} of itself");
                 assert!((ratio - want).abs() <= 1e-3 * want, "lane {a}'s pad effect is not lane 1's: {ratio} against {want}");
+                for (j, &b) in SLOTS.iter().enumerate() {
+                    if j != i {
+                        assert_eq!(bits(&cut[j]), bits(&plain[j]), "lane {a}'s pad effect reached lane {b}");
+                    }
+                }
+            }
+        }
+
+        /// **A pad's plugin for a lane past slot 31 with no pad bank is
+        /// built for nothing and seated nowhere, and the load says so; once
+        /// the bank is sent the same load seats it, and the pad is cut as
+        /// lane 1's is** (W7-slot-gaps, after review). A lane past the frozen
+        /// map keeps its pad racks in its bank, so a rack made for a lane
+        /// with none went home on arrival with the plugin pushed into it,
+        /// while the load answered that the plugin was seated, and the host
+        /// wrote it down as loaded. Each subject past 31, installed as a
+        /// plain lane, takes the Trim before its bank (`pad_desk_at`'s early
+        /// load: `Ok(None)`, the bay empty), then its bank, its kit and the
+        /// same load, and its kit is cut by lane 1's 24 dB and no other
+        /// subject's moves.
+        #[test]
+        fn a_pad_load_onto_a_lane_with_no_bank_seats_nothing_until_its_bank_comes() {
+            let plain = pad_desk(None);
+            let reference = rms(&pad_desk(Some(SLOTS[0]))[0]) / rms(&plain[0]);
+            assert!((reference - 0.063).abs() < 0.01, "lane 1's pad effect cut its kit to {reference} of itself");
+            for (i, &a) in SLOTS.iter().enumerate().filter(|(_, s)| **s >= CHANNELS) {
+                let cut = pad_desk_at(Some(a), true);
+                let ratio = rms(&cut[i]) / rms(&plain[i]);
+                assert!((ratio - reference).abs() <= 1e-3 * reference, "lane {a}'s pad effect, loaded before its bank, cut its kit to {ratio} of itself, lane 1's to {reference}");
                 for (j, &b) in SLOTS.iter().enumerate() {
                     if j != i {
                         assert_eq!(bits(&cut[j]), bits(&plain[j]), "lane {a}'s pad effect reached lane {b}");

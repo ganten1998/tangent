@@ -772,9 +772,28 @@ impl Bridge {
     /// **The engine's name for a bay, by identity**: a track's through its
     /// lane, a special's as it always was. `None` for a track with no lane
     /// (gone, or waiting for one).
+    ///
+    /// **And `None` for a pad's bay while its track's lane has no pad bank**
+    /// (`Held::pads`: a lane installed for a track whose first bay was not
+    /// the drumpad). The bay is not wanted anywhere until the bank is sent
+    /// (`attach_pads`), and from that frame the reconcile finds it wanted
+    /// and not loaded, and seats it. It used to be wanted at once: the load
+    /// went to a lane with nowhere to put a pad's rack past slot 31, the
+    /// plugin went home with the rack, and the ledger still said it was
+    /// seated, so when the drumpad came back the kit played that pad dry,
+    /// live, for good, while an export built the lane with its bank and
+    /// played it through its effect (W7-slot-gaps). A pad of a lane of the
+    /// frozen map has its rack in the frozen bank either way; it waits for
+    /// the bank too, as it can be heard through nothing else.
     pub fn engine_bay(&self, sb: SeatBay) -> Option<EngineBay> {
         match sb.seat.node {
-            Node::Track(id) => lane_bay(self.lanes.get(&id)?.at.slot, sb.seat.rack, sb.bay),
+            Node::Track(id) => {
+                let h = self.lanes.get(&id)?;
+                if matches!(sb.seat.rack, Rack::Pad(_)) && !h.pads {
+                    return None;
+                }
+                lane_bay(h.at.slot, sb.seat.rack, sb.bay)
+            }
             node => special_bay(node, sb.seat.rack, sb.bay),
         }
     }
@@ -789,7 +808,9 @@ impl Bridge {
     /// **The bay the engine names `at`, by identity**: the inverse of
     /// [`Self::engine_bay`], for what the engine reports by its racks. A
     /// lane's rack is its track's wherever the row is; one whose slot no
-    /// track holds (a lane on its way home) is nobody's.
+    /// track holds (a lane on its way home) is nobody's. A pad's rack is
+    /// named whether or not its lane has its bank yet: one with none holds
+    /// nothing to report.
     pub fn bay_at_engine(&self, at: EngineBay) -> Option<SeatBay> {
         let (addr, bay) = at;
         let node = match addr.owner {
@@ -1207,7 +1228,9 @@ impl Bridge {
 
     /// **A lane that has just become a drum lane gets its pad bank**,
     /// attached behind its Install (design 7.13: "Attach(Pads) then
-    /// Attach(Kit). Nothing reloads").
+    /// Attach(Kit). Nothing reloads"). From the frame it is sent the track's
+    /// pad bays have their engine names ([`Self::engine_bay`]), so the
+    /// reconcile seats each pad's effects then, behind the bank on the ring.
     fn attach_pads(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) {
         for (_, id) in rows {
             let Some(h) = self.lanes.get_mut(id) else { continue };
