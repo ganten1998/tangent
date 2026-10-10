@@ -6744,24 +6744,62 @@ pub(crate) struct LaneBody {
     post: Vec<Vec<f32>>,
     /// What the node decided this chunk, for its run and its publish.
     node: NodePrep,
-    /// **This strip's signal for its sends**, pre- and post-fader, filled
-    /// only while the plan has it sending (`PostTable::sends_out`): the
-    /// lane fold, the room and the kit add their share, a node writes its
-    /// own, and every return that gathers one of its sends reads them. Kept
-    /// apart from the stem column because a send may be tapped earlier on
-    /// the lane's compensation line than the strip's own output (see
-    /// `DelayLine::run_tapped`).
+    /// **This strip's signal for its sends to buses**, pre- and post-fader,
+    /// filled only while the plan has it sending to one
+    /// (`PostTable::sends_out`): the lane fold, the room and the kit add
+    /// their share, a node writes its own, and every bus that gathers one of
+    /// its sends reads them. Kept apart from the stem column because a send
+    /// may be tapped earlier on the lane's compensation line than the
+    /// strip's own output (see `DelayLine::run_tapped`), or held back by a
+    /// node's line (`NodeLine`). A send to Return 0 is never read here: it
+    /// is summed where the strip's knob was, on its own frame (`InSend`).
     send_pre: Vec<Vec<f32>>,
     send_post: Vec<Vec<f32>>,
     /// The pre-fader send's own gate, slewed like a fader: the strip's mute,
     /// solo and polarity still reach a pre-fader send, its level does not.
+    /// **Walked once a chunk, for every strip that sends pre-fader, by one
+    /// pass** (`Renderer::clear_send_buffers`), whether or not anything of the
+    /// strip renders: a kit-only drum lane or a live input on a lane with
+    /// nothing to play folds nothing, and a gate only the fold walked stayed
+    /// shut on them for ever, and kept whatever a mute last left it at.
     pre_gate: f32,
-    /// **Where that gate stood at the head of this chunk**, set as the send
-    /// buffers clear. A legacy destination's arrivals are gated in its
-    /// route-phase run, after the fold already slewed the gate over its
-    /// own audio: started from here, they take the same gate frame for
-    /// frame, and the gate moves once a frame, not twice.
+    /// **Where that gate stood at the head of this chunk.** Every pass that
+    /// reads it (the fold, the room, the kit, a node's run) replays the walk
+    /// from here, frame by frame, toward the same target: same start, same
+    /// target, same frames, so each takes the one gate, frame for frame.
     pre_gate_from: f32,
+    /// **A node's pre-fader share into Return 0 this chunk**, at its own
+    /// way out's timing, written by its run when the plan carries such an
+    /// entry for it and summed into `aux` by its publish (`InSend`).
+    node_fx: Vec<Vec<f32>>,
+    /// **What of a folder's own row its fold passes**, slewed toward
+    /// silence while the folder only carries something else's audio
+    /// through a solo (`PostTable::row_quiet`), and back. Unity on every
+    /// desk with no bus, where it never moves.
+    row_gate: f32,
+    /// **A node's compensation line between its two ways out**, while it
+    /// sends to a bus: the plan's own publish attaches one to every folder
+    /// and bus that does (`Engine::publish_plan`), so a lane that never
+    /// becomes such a node pays nothing for it. See `run_node`.
+    node_line: Option<Box<NodeLine>>,
+}
+
+/// **A node's delay between its own way out and its sends** (design 9: a
+/// bus destination gets PDC on its paths): one stereo ring over the node's
+/// signal after its racks, read where its shorter path needs it. Attached,
+/// never built with a lane (`LanePart::Line`).
+pub struct NodeLine(DelayLine);
+
+impl NodeLine {
+    pub fn new() -> Self {
+        Self(DelayLine::new())
+    }
+}
+
+impl Default for NodeLine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// **What a post-fork node decided this chunk** (design 7.8), worked out in
@@ -6782,17 +6820,25 @@ struct NodePrep {
     target: f32,
     gain: f32,
     pan: (f32, f32),
-    /// Its Fx send knob, post-fader, published into `aux` with the mix.
+    /// Its post-fader share into Return 0 (its knob, or its plan entries:
+    /// `InSend`), published into `aux` with the mix.
     send: f32,
-    /// Its share into the master: `route_direct` for a destination and a
-    /// bus, a folder's "no folder above it".
+    /// Its share into the master: a destination's `route_direct`, a
+    /// folder's and a bus's `PostTable::direct`.
     direct: f32,
     /// Copy a dry stem through the run (folders and buses).
     dry: bool,
-    /// Fill its send buffers, and whether any send is pre-fader.
+    /// Fill its send buffers (it sends to a bus).
     sends: bool,
     /// Where its pre-fader send gate is heading.
     pre_target: f32,
+    /// Its pre-fader Return 0 entries, summed (`InSend`).
+    fx_pre: f32,
+    /// **Its two ways out's delays**, when it sends to a bus and holds its
+    /// line: the shorter of its own way out and its send path waits for the
+    /// longer, which its feeders were compensated for. One is always zero.
+    wait_main: u32,
+    wait_send: u32,
     /// Its racks take the sidechain key (a bus runs its racks once a chunk,
     /// so it is the one pass that may feed them).
     keyed: bool,
@@ -6843,6 +6889,9 @@ impl Lane {
                 send_post: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
                 pre_gate: 0.0,
                 pre_gate_from: 0.0,
+                node_fx: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+                row_gate: 1.0,
+                node_line: None,
             }),
         }
     }
@@ -6897,6 +6946,8 @@ impl Lane {
             + rows(&b.post)
             + rows(&b.send_pre)
             + rows(&b.send_post)
+            + rows(&b.node_fx)
+            + b.node_line.as_ref().map_or(0, |l| size_of::<NodeLine>() + pdc(&l.0))
             + b.notes.capacity() * size_of::<Note>()
             + b.controls.capacity() * size_of::<Control>()
             + pdc(&b.pdc)
@@ -6936,6 +6987,11 @@ pub enum LanePart {
     /// goes straight home.
     #[allow(dead_code, reason = "owner call 1 decides whether a lane takes a third chain")]
     Chain { index: u16, rack: Box<Rack> },
+    /// **A node's compensation line** (W6-engine-buses-sends): sent by
+    /// `Engine::publish_plan` itself, ahead of the plan that makes the lane
+    /// a folder or a bus sending to a bus, so no bridge has to know about
+    /// it. A lane that already holds one keeps it, and the one sent home.
+    Line(Box<NodeLine>),
 }
 
 /// **A drum lane's own pad state**: the voices that are sounding, the
@@ -7042,6 +7098,15 @@ impl crate::lane_bank::Attach<LanePart> for Lane {
                 b.kit.replace(kit).map(LanePart::Kit)
             }
             refused @ LanePart::Chain { .. } => Some(refused),
+            // A line already seated keeps its delay running: the new one
+            // goes home unused rather than reset a node mid-song.
+            LanePart::Line(line) => match b.node_line {
+                Some(_) => Some(LanePart::Line(line)),
+                None => {
+                    b.node_line = Some(line);
+                    None
+                }
+            },
         }
     }
 }
@@ -7233,12 +7298,14 @@ pub enum EngineBusy {
 }
 
 /// The host's record of a slot: the generation of the lane it sent there,
-/// and whether that lane is on its way home.
+/// whether that lane is on its way home, and whether it has been sent its
+/// node line (`LanePart::Line`), which it then keeps for its life.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HostSlot {
     gen: u32,
     live: bool,
     leaving: bool,
+    lined: bool,
 }
 
 /// Test doors onto a lane's body, by slot. A slot with no lane is a test
@@ -7630,9 +7697,22 @@ struct Wide {
     /// racks run once, in the route phase, over what arrives.
     buses: LaneSet,
     /// **The strips whose send buffers are filled this chunk**, by slot
-    /// (`PostTable::sends_out`), and those with a pre-fader send among them.
+    /// (`PostTable::sends_out`: a send to a bus), and those with a
+    /// pre-fader send to a bus among them.
     sends_out: LaneSet,
     sends_pre: LaneSet,
+    /// **The strips the plan carries a Return 0 entry for**, by slot, and
+    /// each one's summed entry levels this chunk, post- and pre-fader
+    /// (`Renderer::latch_fx_entries`). Such a strip is heard in the return
+    /// through its entries and not its knob (`InSend`).
+    fx_has: LaneSet,
+    fx_post: Box<[f32]>,
+    fx_pre: Box<[f32]>,
+    /// **The bus-aware transfer's figures**, by `desk_plan::carry_at`
+    /// (two per rank): what one unit landing at each node becomes at the
+    /// master and at Return 0, filled at most once a chunk, when the room
+    /// has an input to keep out of the speakers on a desk with a bus.
+    carry: Box<[[f32; 4]]>,
     /// **The nodes that finish in the route phase**, by slot: the buses and
     /// the late folders. Their stem columns are taken after it.
     late_nodes: LaneSet,
@@ -7725,6 +7805,10 @@ impl Wide {
             buses: set(),
             sends_out: set(),
             sends_pre: set(),
+            fx_has: set(),
+            fx_post: vec![0.0; lanes].into_boxed_slice(),
+            fx_pre: vec![0.0; lanes].into_boxed_slice(),
+            carry: vec![[0.0; 4]; lanes * 2].into_boxed_slice(),
             late_nodes: set(),
             // **Grown once, here.** Sixteen parameters a bay is more than any
             // song has ever automated on one effect, and the whole table is
@@ -7813,10 +7897,14 @@ impl crate::lane_bank::SpineExt for Wide {
             (&self.buses, &mut to.buses),
             (&self.sends_out, &mut to.sends_out),
             (&self.sends_pre, &mut to.sends_pre),
+            (&self.fx_has, &mut to.fx_has),
             (&self.late_nodes, &mut to.late_nodes),
         ] {
             carry_set(from, into);
         }
+        carry_rows(&self.fx_post, &mut to.fx_post);
+        carry_rows(&self.fx_pre, &mut to.fx_pre);
+        carry_rows(&self.carry, &mut to.carry);
         for (from, into) in self.probe_sets.iter().zip(&mut to.probe_sets) {
             carry_set(from, into);
         }
@@ -8583,13 +8671,15 @@ impl CurveOwners<'_> {
 }
 
 /// **One send's level, as a curve** (design 9: send automation works per
-/// return). `AutoParam::Send` stays the Fx knob's and rides the lane's own
-/// curves; a send of the plan's (to a bus, or a pre-fader Fx entry) is named
-/// by its two ends, as the plan names it, and its curve's points are read
-/// as that send's level, 0..1, whatever the curve's own `lane` and `param`
-/// say. `gen` is the source lane's generation, checked at use (design 7.5):
-/// a curve drawn for a lane that has gone plays on nobody. The drum bus and
-/// the click have none and ignore it.
+/// return). A send of the plan's is named by its two ends, as the plan names
+/// it, and its curve's points are read as that send's level, 0..1, whatever
+/// the curve's own `lane` and `param` say. `gen` is the source lane's
+/// generation, checked at use (design 7.5): a curve drawn for a lane that has
+/// gone plays on nobody. The drum bus and the click have none and ignore it.
+/// **`AutoParam::Send` stays the Fx send**: it rides the lane's own curves
+/// and drives the strip's Return 0 entries (or its knob, with none), and
+/// wins over a curve here naming one of those entries, as it would over the
+/// knob; `AutoParam::SendTo` is what W7 maps onto these.
 #[derive(Clone, Debug)]
 pub struct SendCurve {
     pub from: crate::desk_plan::SendFrom,
@@ -9995,6 +10085,11 @@ struct Renderer {
     /// there is nothing left to subtract from. The input's own send is
     /// closed with the room, and the share of it its FOLDERS send is taken
     /// off the bus before the bus runs (`folder_send_gain`).
+    ///
+    /// **On a desk with a bus** both follow every way out through gains, a
+    /// bus folded into a folder or heading a run included (`carry_held`),
+    /// and the input's own sends to buses close with the room as its knob
+    /// does: a bus processes, so past it nothing could be taken back out.
     input_dry: Vec<f32>,
     /// Whether the room and the take differ this block — in CONTENT, because
     /// monitoring is withholding an input, or in TREATMENT, because a live
@@ -10115,6 +10210,18 @@ struct Renderer {
     /// here. Filled by the bare kit's fold only while such a send exists.
     drums_send: [Vec<Vec<f32>>; 2],
     drums_sends: bool,
+    /// **The bare drum bus's pre-fader gate**, walked once a chunk as a
+    /// lane's is (`LaneBody::pre_gate`): its mute and solo reach its
+    /// pre-fader sends. No polarity: its own way out has none either.
+    drums_gate: f32,
+    drums_gate_from: f32,
+    /// **The drum bus's and the click's Return 0 entries this chunk**,
+    /// `[post, pre]`, when the plan carries any: they replace those strips'
+    /// knobs as a lane's entries replace its own (`InSend`).
+    fx_drums: Option<[f32; 2]>,
+    fx_click: Option<[f32; 2]>,
+    /// **Whether `Wide::carry` holds this chunk's figures** yet.
+    carry_ready: bool,
     /// **A sending lane's tap off its compensation line**, and each frame's
     /// fader, for the send writes beside the fold: one lane at a time, so
     /// one pair serves the desk (`fx_in`'s argument).
@@ -11730,12 +11837,6 @@ impl Renderer {
                     0.0
                 }
             };
-            // Read here rather than through a closure: a closure over
-            // `self.shared` borrows the whole of `self`, and the mixing below
-            // needs `self` mutably.
-            let send_of =
-                |sh: &Shared, strip: Strip| sh.send_cell(strip).map_or(0.0, |g| Shared::f32_of(g).clamp(0.0, 1.0));
-
             // **The slots did their own folding.** Each instrument is a channel
             // with its own fader, its own send and its own mute — see
             // `sum_slots`, which is where the summing and the sending are one
@@ -11802,7 +11903,10 @@ impl Renderer {
             } else {
                 0.0
             };
-            let click_send = send_of(&self.shared, Strip::Click);
+            // Its knob, or its plan entries when the plan carries any: the
+            // click is one voice, so a pre-fader entry takes it as it is.
+            let click_send = self.fx_send(Strip::Click);
+            let click_fx_pre = self.fx_pre_send(Strip::Click);
             let mut click_peak = 0.0f32;
             for i in 0..n {
                 let frame_index = done + i;
@@ -11908,6 +12012,9 @@ impl Renderer {
                 for c in 0..TAP_CHANNELS {
                     if let Some(v) = self.aux.get_mut(at + c) {
                         *v += click * click_send;
+                        if click_fx_pre != 0.0 {
+                            *v += click * click_fx_pre;
+                        }
                     }
                 }
             }
@@ -12057,12 +12164,12 @@ impl Renderer {
                 // **The route phase of the plan's post-fork graph**: the
                 // legacy destinations, the buses and the late folders, level
                 // by level, the cycle tail last and one node at a time, the
-                // sums in the sends pass's order. Then the plan's own sends
-                // into Return 0, before it runs.
+                // sums in the sends pass's order. The plan's own sends into
+                // Return 0 are in `aux` already, each where its strip's knob
+                // would have been (`InSend`).
                 if (self.plan.routes.first_level as usize) < self.plan.levels.0.len() {
                     self.run_post_phase(true, n);
                 }
-                self.gather_fx_sends(n);
             } else {
                 #[cfg(test)]
                 self.shim_route_pass(n, stride);
@@ -13223,11 +13330,10 @@ impl Renderer {
             // all of them or it holds in none — the two it was missing from
             // are what made a grouped track static and play at half level.
             let is_folder = self.spine.ext.folder_is.get(lane).copied().unwrap_or(false);
-            let send = if is_folder {
-                0.0
-            } else {
-                lane_send_of(&self.auto, &self.shared, Strip::Channel(lane))
-            };
+            // Its knob, or its plan entries when the plan carries any: one
+            // road into Return 0 (`InSend`).
+            let send = if is_folder { 0.0 } else { self.fx_send(Strip::Channel(lane)) };
+            let fx_pre = if is_folder { 0.0 } else { self.fx_pre_send(Strip::Channel(lane)) };
             let (pan_l, pan_r) = if is_folder {
                 (1.0, 1.0)
             } else {
@@ -13515,27 +13621,42 @@ impl Renderer {
             // "100 percent a volume jump on a send added". Every path a lane
             // reaches the master by has to answer to the same switch.
             let direct = self.spine.ext.route_direct.get(strip.index()).copied().unwrap_or(1.0);
-            // See `folder_chain_gain`: the room's subtrahend for a grouped
-            // strip is what its folders will make of it, not the raw input,
-            // and for a folder's own strip that starts with its own fold.
-            let chain = self.folder_chain_gain(lane);
-            // **And for a ROUTED strip, what its routes make of it**, because
-            // that is where it reaches the mix instead (`route_transfer`).
-            // Routed away, nothing of it goes straight out, so its straight
-            // share is only what its folders fold, and none for a loose strip:
-            // the subtrahend was `chain` alone, as if it went direct, so a
-            // withheld input routed to a bus turned down or muted came out of
-            // the room inverted. A folder's own input keeps the old reckoning.
-            let base = if self.spine.ext.folders[lane] >= 0 { chain } else { [0.0; 2] };
-            let planned = if !is_folder && self.plan_drives() { self.plan_routed_held(lane, base) } else { None };
-            #[cfg(test)]
-            let planned = planned.or_else(|| {
-                (!is_folder && !self.plan_drives()).then(|| self.shim_routed_held(lane, base, &mut transfer)).flatten()
-            });
-            let held = planned.unwrap_or(chain);
-            // And what the folders above it send of it - see
-            // `folder_send_gain`.
-            let folder_sent = self.folder_send_gain(lane);
+            // **On a desk with a bus, every way out at once** (`carry_held`):
+            // a bus inside a folder, or heading a run, reaches the master
+            // through its fold, which the transfer below cannot see (it reads
+            // such a bus as closed), so an input routed into one was never
+            // kept out of the speakers at all; and a folder's or a bus's own
+            // sends carry the withheld share on. A desk with no bus keeps the
+            // reckoning below, figure for figure.
+            let carried = (self.plan_drives() && self.plan.post.buses).then(|| self.carry_held(lane, is_folder, direct));
+            let (held, folder_sent) = match carried {
+                Some(h) => h,
+                None => {
+                    // See `folder_chain_gain`: the room's subtrahend for a
+                    // grouped strip is what its folders will make of it, not
+                    // the raw input, and for a folder's own strip that starts
+                    // with its own fold.
+                    let chain = self.folder_chain_gain(lane);
+                    // **And for a ROUTED strip, what its routes make of it**,
+                    // because that is where it reaches the mix instead
+                    // (`route_transfer`). Routed away, nothing of it goes
+                    // straight out, so its straight share is only what its
+                    // folders fold, and none for a loose strip: the
+                    // subtrahend was `chain` alone, as if it went direct, so a
+                    // withheld input routed to a bus turned down or muted came
+                    // out of the room inverted. A folder's own input keeps the
+                    // old reckoning.
+                    let base = if self.spine.ext.folders[lane] >= 0 { chain } else { [0.0; 2] };
+                    let planned = if !is_folder && self.plan_drives() { self.plan_routed_held(lane, base) } else { None };
+                    #[cfg(test)]
+                    let planned = planned.or_else(|| {
+                        (!is_folder && !self.plan_drives()).then(|| self.shim_routed_held(lane, base, &mut transfer)).flatten()
+                    });
+                    // And what the folders above it send of it - see
+                    // `folder_send_gain`.
+                    (planned.unwrap_or(chain), self.folder_send_gain(lane))
+                }
+            };
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -13546,6 +13667,10 @@ impl Renderer {
                 // The room's share of THIS input: the monitoring switch and
                 // the strip's own mute, both slewed.
                 let heard_now = room * room_in;
+                // Kept for the strip's sends below, which close with it.
+                if let Some(v) = self.fold_g.get_mut(i) {
+                    *v = heard_now;
+                }
                 // How much of this frame the room is NOT being given.
                 let keep_out = 1.0 - heard_now;
                 withheld = withheld.max(keep_out);
@@ -13607,17 +13732,44 @@ impl Renderer {
             // pan for a pre-fader send. On the live path the strip's fader
             // stands AHEAD of its rack (see `monitor_fades`), so a live
             // input's pre-fader send carries that fader; its mute and solo
-            // reach it through the strip's gate as the timeline's do.
-            if !is_folder && self.spine.ext.sends_out.contains(lane) {
-                if let Some(l) = self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
-                    let b = l.body_mut();
-                    let pg = b.pre_gate;
-                    for i in 0..n {
-                        for c in 0..TAP_CHANNELS {
-                            let x = self.fx_in.get(c).map_or(0.0, |v| v[i]);
+            // reach it through the strip's gate as the timeline's do,
+            // replayed frame by frame from where it stood at the chunk's head.
+            //
+            // **Closed with the room, as its knob's share is**: a bus is a
+            // processing return on its way to the speakers, and past its
+            // racks nothing can take a withheld input back out, so a channel
+            // nobody may hear does not reach one, pre-fader or post, and its
+            // pre-fader Return 0 entry closes the same way. The take loses
+            // them with the room, as it loses the knob's reverb: the effects
+            // that were not audible are not in the take either.
+            let sends = !is_folder && self.spine.ext.sends_out.contains(lane);
+            if sends || fx_pre != 0.0 {
+                let gate_to = send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, lane);
+                let gate_from = self.spine.lanes.get(lane).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate_from);
+                let coeff = self.gain_coeff;
+                let mut bufs = if sends {
+                    self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut).map(|l| {
+                        let b = l.body_mut();
+                        (&mut b.send_pre, &mut b.send_post)
+                    })
+                } else {
+                    None
+                };
+                let mut pg = gate_from;
+                for i in 0..n {
+                    pg += (gate_to - pg) * coeff;
+                    let heard_now = self.fold_g.get(i).copied().unwrap_or(0.0);
+                    for c in 0..TAP_CHANNELS {
+                        let x = self.fx_in.get(c).map_or(0.0, |v| v[i]);
+                        if let Some((pre, post)) = bufs.as_mut() {
                             let src = x * if c == 0 { pan_l } else { pan_r };
-                            b.send_post[c][i] += src;
-                            b.send_pre[c][i] += x * pg;
+                            post[c][i] += src * heard_now;
+                            pre[c][i] += x * pg * heard_now;
+                        }
+                        if fx_pre != 0.0 {
+                            if let Some(a) = self.aux.get_mut(i * TAP_CHANNELS + c) {
+                                *a += x * pg * fx_pre * heard_now;
+                            }
                         }
                     }
                 }
@@ -13840,6 +13992,20 @@ impl Renderer {
             self.spine.ext.param_lanes.insert(ch);
         }
         self.auto = automation_now(&self.automation, suspend, &whose, secs);
+        // **`AutoParam::Send` stays the Fx send** (design 9): a strip whose
+        // knob the plan carries as Return 0 entries has its curve drive
+        // them, as it drove the knob (`InSend`), and wins over a send curve
+        // naming the same entry, as the knob's own curve would.
+        for k in 0..self.plan.sends.into.row(0).len() {
+            let i = self.plan.sends.into.row(0)[k] as usize;
+            let Some(crate::desk_plan::PlanSendFrom::Lane(r)) = self.plan.sends.sends.get(i).map(|s| s.from) else {
+                continue;
+            };
+            let Some(slot) = self.plan.lanes.get(r as usize).map(|l| l.slot.0 as usize) else { continue };
+            if let (Some(v), Some(cell)) = (self.auto.send.get(slot).copied().flatten(), self.plan.sends.auto.get_mut(i)) {
+                *cell = Some(v);
+            }
+        }
         // **The master's own curve**, read at the lane the list files it
         // under (`AutoList::master`, the UI's `LaneId::Master.auto_lane()`).
         // Suspended by the same rule a channel is: a fader being HELD is the
@@ -14404,6 +14570,20 @@ impl Renderer {
     }
 
     fn mix_pads(&mut self, frames: usize, muted: u64, soloed: u64) {
+        // **The bare drum bus's pre-fader gate, walked once a chunk**, as
+        // every lane's is (`clear_send_buffers`), and before anything below
+        // can return early: its mute and solo reach its pre-fader sends. It
+        // was a constant unity, which played a muted bare bus into every
+        // bus it sends to pre-fader.
+        {
+            let to = if strip_is_heard(Strip::Drums, muted, soloed) { 1.0 } else { 0.0 };
+            self.drums_gate_from = self.drums_gate;
+            let mut g = self.drums_gate;
+            for _ in 0..frames {
+                g += (to - g) * self.gain_coeff;
+            }
+            self.drums_gate = g;
+        }
         // A kit arriving — and the displaced one going BACK, by the racks'
         // own protocol: no room to return it, no swap this block. The voices
         // are silenced across a swap; see `PadVoice::silence`.
@@ -14597,8 +14777,21 @@ impl Renderer {
         // Through the accessor like every other control, even though the
         // drum BUS sits past the sixteen channels a curve can name: it falls
         // through to the atomic, and going round it is how the other three
-        // sites came to be missed.
-        let bus_send = self.lane_send(bus_strip);
+        // sites came to be missed. Its plan entries, when the plan carries
+        // any, in place of the knob (`InSend`).
+        let bus_send = self.fx_send(bus_strip);
+        let bus_fx_pre = self.fx_pre_send(bus_strip);
+        // **The strip's pre-fader gate**, replayed from where it stood at
+        // the head of the chunk (`clear_send_buffers`; the bare bus's in
+        // `mix_pads`): the kit's pre-fader sends answer to its mute and solo
+        // as a lane's own audio does, whether or not the lane renders.
+        let (gate_from, gate_to) = match drum_lane {
+            Some(ch) => (
+                self.spine.lanes.get(ch).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate_from),
+                send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, ch),
+            ),
+            None => (self.drums_gate_from, if heard { 1.0 } else { 0.0 }),
+        };
         // The knobs, read once per chunk like the channel gains: they are
         // published at human speed. The clamps are the audio thread refusing
         // to trust numbers it did not make; the setter sanitised them too.
@@ -14914,6 +15107,7 @@ impl Renderer {
         // drums played EARLY against everything else by up to the whole
         // compensation. Same formula as the channel loop's, for the same
         // reason: wait for what this audio does not pay on its way out.
+        let mut kit_tapped = false;
         {
             let own = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, bus_rack);
             let folded = drum_lane.map_or(0, |c| self.spine.ext.folder_lat[c]);
@@ -14927,6 +15121,18 @@ impl Renderer {
             .unwrap_or(0);
             // The lane's own lines, in its pad bank; the bare drumpad bus's
             // on the renderer, as it has no lane.
+            // **And its sends' own read point**, as the lane's own audio has
+            // one (`run_lane_pdc`): a drum lane sending across a bus whose
+            // path is not its own way out's reads the kit for those sends
+            // off the same line, at the send path's delay, into `fold_tap`.
+            let tap = drum_lane
+                .filter(|&ch| !self.spine.ext.folder_is[ch] && self.spine.ext.sends_out.contains(ch))
+                .map(|ch| {
+                    let through = self.spine.ext.send_lat.get(ch).copied().unwrap_or(0);
+                    let max = self.shared.max_latency.load(Ordering::Relaxed);
+                    usize::try_from(max.saturating_sub(own).saturating_sub(through)).unwrap_or(0)
+                })
+                .filter(|t| *t != wait);
             let (line, dry_line) = match drum_lane {
                 Some(ch) => match self
                     .spine
@@ -14941,7 +15147,13 @@ impl Renderer {
                 None => (Some(&mut self.bare_pad_pdc), Some(&mut self.bare_pad_dry_pdc)),
             };
             if let Some(line) = line {
-                line.run(&mut self.fx_in, frames, wait);
+                match tap {
+                    Some(t) => {
+                        line.run_tapped(&mut self.fx_in, frames, wait, &mut self.fold_tap, t);
+                        kit_tapped = true;
+                    }
+                    None => line.run(&mut self.fx_in, frames, wait),
+                }
             }
             // The dry copy skipped `own`, so its ring is `own` longer — the
             // same correction the channel walk makes, argued at `dry_pdc`.
@@ -14984,6 +15196,7 @@ impl Renderer {
         let is_folder = drum_lane.is_some_and(|ch| self.spine.ext.folder_is[ch]);
         let (bus_l, bus_r) = if is_folder { (1.0, 1.0) } else { (bus_l, bus_r) };
         let bus_send = if is_folder { 0.0 } else { bus_send };
+        let bus_fx_pre = if is_folder { 0.0 } else { bus_fx_pre };
         // The kit's smoothed fader lives in its lane's pad bank (the bare
         // drumpad borrows lane 0's, as it borrows its kit); a lane with no
         // bank has no kit, so nothing to smooth and nothing to fold.
@@ -15047,32 +15260,46 @@ impl Renderer {
         }
         // **The kit's share of its strip's sends**, beside the fold above and
         // the same products: post-fader its `l` and `r` again, pre-fader its
-        // sum before the fader, through the strip's gate. The bare drum bus,
-        // which is no lane, keeps its own pair (`drums_send`).
-        if sends {
-            let gate = drum_lane
-                .and_then(|ch| self.spine.lanes.get(ch).and_then(Option::as_deref))
-                .map_or(1.0, |l| l.peek().pre_gate);
-            let (pre, post) = match drum_lane {
-                Some(ch) => match self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) {
-                    Some(l) => {
-                        let b = l.body_mut();
-                        (&mut b.send_pre, &mut b.send_post)
+        // sum before the fader, through the strip's gate frame by frame. The
+        // bare drum bus, which is no lane, keeps its own pair (`drums_send`).
+        // A pre-fader Return 0 entry is summed here too, on the kit's own
+        // frame, as its knob's share is above.
+        if sends || bus_fx_pre != 0.0 {
+            let mut bufs = if sends {
+                match drum_lane {
+                    Some(ch) => match self.spine.lanes.get_mut(ch).and_then(Option::as_deref_mut) {
+                        Some(l) => {
+                            let b = l.body_mut();
+                            Some((&mut b.send_pre, &mut b.send_post))
+                        }
+                        None => None,
+                    },
+                    None => {
+                        let [pre, post] = &mut self.drums_send;
+                        Some((pre, post))
                     }
-                    None => return,
-                },
-                None => {
-                    let [pre, post] = &mut self.drums_send;
-                    (pre, post)
                 }
+            } else {
+                None
             };
+            let mut pg = gate_from;
             for f in 0..frames {
+                pg += (gate_to - pg) * coeff;
                 let g = self.fold_g.get(f).copied().unwrap_or(0.0);
                 for c in 0..TAP_CHANNELS {
                     let x = self.fx_in.get(c).map_or(0.0, |b| b[f]);
-                    let pan = if c == 0 { bus_l } else { bus_r };
-                    post[c][f] += x * g * pan;
-                    pre[c][f] += x * gate;
+                    if let Some((pre, post)) = bufs.as_mut() {
+                        // Off the send's own read point, when it has one.
+                        let s = if kit_tapped { self.fold_tap.get(c).map_or(0.0, |b| b[f]) } else { x };
+                        let pan = if c == 0 { bus_l } else { bus_r };
+                        post[c][f] += s * g * pan;
+                        pre[c][f] += s * pg;
+                    }
+                    if bus_fx_pre != 0.0 {
+                        if let Some(a) = self.aux.get_mut(f * TAP_CHANNELS + c) {
+                            *a += x * pg * bus_fx_pre;
+                        }
+                    }
                 }
             }
         }
@@ -17043,11 +17270,15 @@ impl Renderer {
                 };
                 // Unity, centre and no send for a folder: the fold owns all
                 // three, and doing them here as well is doing them twice.
+                // A strip's send into Return 0 is its plan entries' when the
+                // plan carries any, else its knob: one road (`InSend`).
                 let send = if is_folder {
                     0.0
                 } else {
-                    self.lane_send(Strip::Channel(ch))
+                    self.fx_send(Strip::Channel(ch))
                 };
+                let fx_pre = if is_folder { 0.0 } else { self.fx_pre_send(Strip::Channel(ch)) };
+                let pre_target = send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, ch);
                 let (pan_l, pan_r) = if is_folder {
                     (1.0, 1.0)
                 } else {
@@ -17135,31 +17366,35 @@ impl Renderer {
                 }
                 // **This row's share of the strip's sends**, beside the fold
                 // and not inside it, so the fold's own arithmetic is the line
-                // it always was. Post-fader is the fold's own `l` and `r`, the
-                // same products from the same frame's fader, off the tap's
-                // read point when the send has one; pre-fader is the same
-                // signal before the fader, through the strip's mute, solo and
-                // polarity (its gate, slewed as a fader is).
-                if sends {
-                    let heard = self.spine.ext.heard.get(ch).copied().unwrap_or(false);
-                    let pre_target = match (heard, self.spine.ext.desk.phase.contains(ch)) {
-                        (false, _) => 0.0,
-                        (true, true) => -1.0,
-                        (true, false) => 1.0,
-                    };
+                // it always was. To a bus: post-fader is the fold's own `l`
+                // and `r`, the same products from the same frame's fader, off
+                // the tap's read point when the send has one; pre-fader is the
+                // same signal before the fader, through the strip's mute, solo
+                // and polarity (its gate, walked once a chunk by
+                // `clear_send_buffers` and replayed here from where it stood).
+                // To Return 0 pre-fader: the stage itself, never the tap, so
+                // the return hears the strip on the frame its knob would.
+                if sends || fx_pre != 0.0 {
                     let src = if tapped { &self.fold_tap } else { &self.lane_stage };
-                    let mut pg = lane.pre_gate;
+                    let mut pg = lane.pre_gate_from;
                     for f in 0..frames {
                         pg += (pre_target - pg) * coeff;
-                        let s0 = src.first().map_or(0.0, |b| b[f]);
-                        let s1 = src.get(1).map_or(0.0, |b| b[f]);
-                        let g = self.fold_g.get(f).copied().unwrap_or(0.0);
-                        lane.send_pre[0][f] += s0 * pg;
-                        lane.send_pre[1][f] += s1 * pg;
-                        lane.send_post[0][f] += s0 * g * pan_l;
-                        lane.send_post[1][f] += s1 * g * pan_r;
+                        if sends {
+                            let s0 = src.first().map_or(0.0, |b| b[f]);
+                            let s1 = src.get(1).map_or(0.0, |b| b[f]);
+                            let g = self.fold_g.get(f).copied().unwrap_or(0.0);
+                            lane.send_pre[0][f] += s0 * pg;
+                            lane.send_pre[1][f] += s1 * pg;
+                            lane.send_post[0][f] += s0 * g * pan_l;
+                            lane.send_post[1][f] += s1 * g * pan_r;
+                        }
+                        if fx_pre != 0.0 {
+                            for c in 0..TAP_CHANNELS {
+                                let x = self.lane_stage.get(c).map_or(0.0, |b| b[f]);
+                                aux[f * TAP_CHANNELS + c] += x * pg * fx_pre;
+                            }
+                        }
                     }
-                    lane.pre_gate = pg;
                 }
             }
             if let Some(cell) = self.spine.lanes.get_mut(ch) {
@@ -17498,7 +17733,7 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
     let (Some(kind), true) = (prep.kind, prep.live) else {
         return;
     };
-    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate, pre_gate_from, node, .. } = body;
+    let LaneBody { chains, board, post, dry, send_pre, send_post, channel_gain, pre_gate_from, node, node_fx, node_line, .. } = body;
     let [own, extra] = chains;
     let own_seat = lane_seat(slot, CHAIN_OWN);
     let extra_seat = lane_seat(slot, CHAIN_EXTRA);
@@ -17533,12 +17768,11 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             );
         }
         let g = prep.gain;
-        // The gate from the chunk's head, not from where the fold left it:
-        // the fold already walked it over these frames for the strip's own
-        // audio, and walking it on from there would open (or close) the
-        // arrivals a chunk early. Same start, same target, same frames: the
-        // fold's own figure, frame for frame, and where it ends is where the
-        // fold left it.
+        // The gate from the chunk's head (`clear_send_buffers` walked it
+        // once): the fold replayed it over these frames for the strip's own
+        // audio, and walking it on from where that ended would open (or
+        // close) the arrivals a chunk early. Same start, same target, same
+        // frames: the fold's own figure, frame for frame.
         let mut pg = *pre_gate_from;
         for f in 0..frames {
             let x0 = post[0][f];
@@ -17557,7 +17791,6 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
                 send_post[1][f] += r;
             }
         }
-        *pre_gate = pg;
         node.peak = [0.0; 2];
         return;
     }
@@ -17635,10 +17868,34 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
             u64::MAX,
         );
     }
+    // **The node's two ways out, apart** (design 9: a bus destination gets
+    // PDC on its paths). Its feeders were compensated for the longer of its
+    // own way out and its send path (`settle_plan_pdc`), so what its racks
+    // put out is early for the shorter one by the difference, and waits
+    // for it here, on the node's own line: its own way out read late when
+    // it sends across a bus that looks further ahead than its own path
+    // does, its sends read late when its own path is the longer. Both read
+    // the signal after the racks and before the fader, so the fader, its
+    // pan and the send gate are each applied on the frame they are walked.
+    // A node with no line, or whose two paths agree, reads one stream; its
+    // line, if it has one, rests cleared until they part, so a delay that
+    // comes back starts from silence rather than from a stale ring.
+    let parted = prep.sends && (prep.wait_main | prep.wait_send) != 0;
+    let mut tapped = false;
+    if let Some(line) = node_line.as_deref_mut() {
+        if parted {
+            line.0.run_tapped(post, frames, prep.wait_main as usize, &mut scratch.fx_out, prep.wait_send as usize);
+            tapped = true;
+        } else {
+            line.0.run(post, frames, 0);
+        }
+    }
     // The fader and pan, per frame, exactly as `fold_folders` slews them.
     let target = prep.target;
     let mut peak = [0.0f32; 2];
-    let mut pg = *pre_gate;
+    // The gate from the chunk's head: `clear_send_buffers` walked it once.
+    let mut pg = *pre_gate_from;
+    let gated = prep.sends || prep.fx_pre != 0.0;
     for f in 0..frames {
         *channel_gain += (target - *channel_gain) * desk.coeff;
         let g = *channel_gain;
@@ -17660,15 +17917,28 @@ fn run_node(slot: usize, frames: usize, body: &mut LaneBody, scratch: &mut LaneS
                 c[f] = dr;
             }
         }
-        if prep.sends {
+        if gated {
             pg += (prep.pre_target - pg) * desk.coeff;
-            send_pre[0][f] = x0 * pg;
-            send_pre[1][f] = x1 * pg;
-            send_post[0][f] = l;
-            send_post[1][f] = r;
+        }
+        if prep.sends {
+            // Off the line's send read when the two ways out are apart;
+            // else the very products of the node's own way out.
+            let (s0, s1) = if tapped {
+                (scratch.fx_out[0][f], scratch.fx_out.get(1).map_or(0.0, |c| c[f]))
+            } else {
+                (x0, x1)
+            };
+            send_pre[0][f] = s0 * pg;
+            send_pre[1][f] = s1 * pg;
+            send_post[0][f] = s0 * g * pl;
+            send_post[1][f] = s1 * g * pr;
+        }
+        if prep.fx_pre != 0.0 {
+            // Return 0's pre-fader share, on its own way out's frame.
+            node_fx[0][f] = x0 * pg * prep.fx_pre;
+            node_fx[1][f] = x1 * pg * prep.fx_pre;
         }
     }
-    *pre_gate = pg;
     node.peak = peak;
 }
 
@@ -17681,6 +17951,18 @@ fn node_key<'a>(keyed: bool, desk: &NodeDesk<'a>, io: &'a mut [Vec<f32>]) -> Opt
         stride: desk.stride,
         io,
     })
+}
+
+/// **Where a strip's pre-fader send gate is heading this chunk**: shut for a
+/// strip nobody hears (its mute and solo reach a pre-fader send, its fader
+/// does not), and its polarity when it is heard. One spelling for every pass
+/// that walks or replays the gate, so they all take the same one.
+fn send_gate_target(heard: &[bool], phase: &LaneSet, slot: usize) -> f32 {
+    match (heard.get(slot).copied().unwrap_or(false), phase.contains(slot)) {
+        (false, _) => 0.0,
+        (true, true) => -1.0,
+        (true, false) => 1.0,
+    }
 }
 
 /// A route's gain as the walks read it: today's clamp at the latch, so a
@@ -18267,8 +18549,11 @@ impl Renderer {
         self.spine.ext.buses.clear();
         self.spine.ext.sends_out.clear();
         self.spine.ext.sends_pre.clear();
+        self.spine.ext.fx_has.clear();
         self.spine.ext.late_nodes.clear();
         self.drums_sends = false;
+        self.fx_drums = None;
+        self.fx_click = None;
         self.route_n = self.shared.route_count.load(Ordering::Acquire).min(MAX_ROUTES);
         self.routes_hw = false;
         let mut kept = 0usize;
@@ -18330,10 +18615,13 @@ impl Renderer {
         ext.buses.clear();
         ext.sends_out.clear();
         ext.sends_pre.clear();
+        ext.fx_has.clear();
         ext.late_nodes.clear();
         ext.receives.clear();
         ext.route_direct.fill(1.0);
         self.drums_sends = false;
+        self.fx_drums = None;
+        self.fx_click = None;
     }
 
     /// Whether the shim's table latched a route this chunk: only a test
@@ -18438,6 +18726,77 @@ impl Renderer {
         // The drum bus sends while the plan has it sending.
         self.drums_sends = self.plan.post.drums_sends;
         self.transfer_ready = false;
+        self.carry_ready = false;
+        self.latch_fx_entries();
+    }
+
+    /// **Each strip's Return 0 entries this chunk** (`InSend`): which strips
+    /// the plan carries one for, and their levels summed, post- and
+    /// pre-fader, each at `send_level` (its curve, `AutoParam::Send`
+    /// included, else its cell). A strip held here is heard in the return
+    /// through these and not through its knob; a strip the plan carries none
+    /// for keeps its knob, so a plan with no entry plays today's desk.
+    fn latch_fx_entries(&mut self) {
+        use crate::desk_plan::PlanSendFrom;
+        self.spine.ext.fx_has.clear();
+        self.fx_drums = None;
+        self.fx_click = None;
+        for k in 0..self.plan.sends.into.row(0).len() {
+            let i = self.plan.sends.into.row(0)[k] as usize;
+            let Some(s) = self.plan.sends.sends.get(i).copied() else { continue };
+            let level = self.send_level(i);
+            let side = usize::from(s.pre);
+            match s.from {
+                PlanSendFrom::Lane(r) => {
+                    let Some(slot) = self.plan.lanes.get(r as usize).map(|l| l.slot.0 as usize) else { continue };
+                    let ext = &mut self.spine.ext;
+                    let (Some(post), Some(pre)) = (ext.fx_post.get_mut(slot), ext.fx_pre.get_mut(slot)) else { continue };
+                    // A slot the set has no bit for is no strip of the desk's;
+                    // a strip's first entry this chunk starts its sums afresh.
+                    let fresh = !ext.fx_has.contains(slot);
+                    if !ext.fx_has.insert(slot) {
+                        continue;
+                    }
+                    if fresh {
+                        *post = 0.0;
+                        *pre = 0.0;
+                    }
+                    if s.pre {
+                        *pre += level;
+                    } else {
+                        *post += level;
+                    }
+                }
+                PlanSendFrom::Drums => self.fx_drums.get_or_insert([0.0; 2])[side] += level,
+                PlanSendFrom::Click => self.fx_click.get_or_insert([0.0; 2])[side] += level,
+            }
+        }
+    }
+
+    /// **A strip's post-fader share into Return 0 this chunk**: its plan
+    /// entries' when the plan carries any for it (`InSend`), else its knob,
+    /// its `AutoParam::Send` curve first. Every site that sums a strip into
+    /// `aux` asks this, so a strip is heard in the return once, by one road.
+    fn fx_send(&self, strip: Strip) -> f32 {
+        let entry = match strip {
+            Strip::Channel(s) => self.spine.ext.fx_has.contains(s).then(|| self.spine.ext.fx_post.get(s).copied().unwrap_or(0.0)),
+            Strip::Drums => self.fx_drums.map(|e| e[0]),
+            Strip::Click => self.fx_click.map(|e| e[0]),
+            Strip::Fx => None,
+        };
+        entry.unwrap_or_else(|| self.lane_send(strip))
+    }
+
+    /// **A strip's pre-fader share into Return 0 this chunk**: its plan's
+    /// pre-fader entries, summed, or nothing. Taken where its post-fader
+    /// share is, from its signal before its fader and through its gate.
+    fn fx_pre_send(&self, strip: Strip) -> f32 {
+        match strip {
+            Strip::Channel(s) if self.spine.ext.fx_has.contains(s) => self.spine.ext.fx_pre.get(s).copied().unwrap_or(0.0),
+            Strip::Drums => self.fx_drums.map_or(0.0, |e| e[1]),
+            Strip::Click => self.fx_click.map_or(0.0, |e| e[1]),
+            _ => 0.0,
+        }
     }
 
     /// **Fill the stem tap's held chunk**: every column but the late ones
@@ -18493,9 +18852,21 @@ impl Renderer {
         }
     }
 
-    /// **Zero the send buffers of every strip the plan has sending**, and
-    /// the bare drum bus's, for this chunk's frames. No allocation: each
+    /// **Zero the send buffers of every strip the plan has sending to a
+    /// bus**, and the bare drum bus's, for this chunk's frames; and **walk
+    /// every sending strip's pre-fader gate over the chunk, once**, whether
+    /// or not anything of the strip renders this chunk. No allocation: each
     /// buffer is a lane's own, bought with it.
+    ///
+    /// The gate moved only where the fold (or a node's run) slewed it, so a
+    /// strip that folds nothing kept the gate it had: a kit-only drum lane,
+    /// or a live input on a lane with nothing else to play, never opened its
+    /// pre-fader send, and one that stopped rendering kept whatever its last
+    /// mute or solo had left. Walked here, by one pass, toward the target
+    /// every reader asks (`send_gate_target`), it moves once a frame for
+    /// every strip, and each reader (the fold, the room, the kit, a node's
+    /// run) replays it from `pre_gate_from`: same start, same target, same
+    /// frames, the one gate.
     fn clear_send_buffers(&mut self, frames: usize) {
         if self.drums_sends {
             for side in &mut self.drums_send {
@@ -18505,15 +18876,27 @@ impl Renderer {
                 }
             }
         }
-        let (sends, lanes) = (&self.spine.ext.sends_out, &mut self.spine.lanes);
-        for slot in sends.iter() {
+        let coeff = self.gain_coeff;
+        let Wide { sends_out, fx_has, heard, desk, .. } = &self.spine.ext;
+        let lanes = &mut self.spine.lanes;
+        // Each strip once: those sending to a bus, then those with only a
+        // Return 0 entry.
+        for slot in sends_out.iter().chain(fx_has.iter().filter(|s| !sends_out.contains(*s))) {
             let Some(lane) = lanes.get_mut(slot).and_then(Option::as_deref_mut) else { continue };
             let b = lane.body_mut();
-            for c in b.send_pre.iter_mut().chain(b.send_post.iter_mut()) {
-                let n = frames.min(c.len());
-                c[..n].fill(0.0);
+            if sends_out.contains(slot) {
+                for c in b.send_pre.iter_mut().chain(b.send_post.iter_mut()) {
+                    let n = frames.min(c.len());
+                    c[..n].fill(0.0);
+                }
             }
+            let target = send_gate_target(heard, &desk.phase, slot);
             b.pre_gate_from = b.pre_gate;
+            let mut g = b.pre_gate;
+            for _ in 0..frames {
+                g += (target - g) * coeff;
+            }
+            b.pre_gate = g;
         }
     }
 
@@ -18586,7 +18969,7 @@ impl Renderer {
                 if l.flags.contains(crate::desk_plan::LaneFlags::BUS) {
                     lat = lat.saturating_add(me.pedal_latency(s));
                 }
-                lat.saturating_add(me.spine.ext.pdc_rank.get(t).map_or(0, |p| p[0]))
+                lat.saturating_add(me.node_out_lat(t))
             };
             let main = self.plan.post.pdc_main.row(r).iter().map(|t| pay(self, *t)).max().unwrap_or(0);
             let send = self.plan.post.pdc_send.row(r).iter().map(|t| pay(self, *t)).max().unwrap_or(0);
@@ -18594,7 +18977,10 @@ impl Renderer {
         }
         for r in 0..n {
             let s = self.plan.lanes[r].slot.0 as usize;
-            let [main, send] = self.spine.ext.pdc_rank[r];
+            let send = self.spine.ext.pdc_rank[r][1];
+            // A node with its line holds its own way out back to its send
+            // path's, so what lands in it (its row included) pays the longer.
+            let main = self.node_out_lat(r);
             if let Some(c) = self.spine.ext.folder_lat.get_mut(s) {
                 *c = main;
             }
@@ -18602,6 +18988,39 @@ impl Renderer {
                 *c = send;
             }
         }
+    }
+
+    /// **What a node's output pays on its way out**, settled down the
+    /// compensation order: its own way out's path (`pdc_rank[0]`), or, for
+    /// a folder or a bus that sends to a bus and holds its line, the longer
+    /// of that and its send path, since its line holds the shorter one back
+    /// to the longer (`run_node`). Its feeders wait for that much, so its
+    /// send lands with everything else across a bus that looks further
+    /// ahead than its own way out does. Without its line (the publish that
+    /// sends it is still on the ring) it pays as it always did.
+    fn node_out_lat(&self, rank: usize) -> u32 {
+        let [main, send] = self.spine.ext.pdc_rank.get(rank).copied().unwrap_or([0, 0]);
+        if self.node_lined(rank) {
+            main.max(send)
+        } else {
+            main
+        }
+    }
+
+    /// **Whether a rank is a folder or a bus sending to a bus, holding the
+    /// line its two ways out are kept apart by** (`NodeLine`).
+    fn node_lined(&self, rank: usize) -> bool {
+        use crate::desk_plan::NodeKind as K;
+        let post = &self.plan.post;
+        let node = post.fold.contains(rank) || matches!(post.route.get(rank).copied().flatten(), Some(K::Bus | K::LateFolder));
+        node && post.sends_out.contains(rank)
+            && self.plan.lanes.get(rank).is_some_and(|l| {
+                self.spine
+                    .lanes
+                    .get(l.slot.0 as usize)
+                    .and_then(Option::as_deref)
+                    .is_some_and(|x| x.gen == l.gen && x.peek().node_line.is_some())
+            })
     }
 
     /// **Gather one node's input into its own `post`**, and decide what its
@@ -18624,7 +19043,13 @@ impl Renderer {
         }
         let folds = kind != K::Dest;
         let heard = self.spine.ext.heard.get(slot).copied().unwrap_or(false);
-        let phase = self.spine.ext.desk.phase.contains(slot);
+        let sends = self.spine.ext.sends_out.contains(slot);
+        // **Its two ways out's delays**, for a folder or a bus that sends to
+        // a bus and holds its line (see `run_node`): the shorter path waits
+        // for the longer, which `settle_plan_pdc` compensated its feeders for
+        // because the line is there.
+        let lined = folds && self.node_lined(rank);
+        let [main_lat, send_lat] = if lined { self.spine.ext.pdc_rank.get(rank).copied().unwrap_or([0, 0]) } else { [0, 0] };
         let mut prep = NodePrep {
             kind: Some(kind),
             live: true,
@@ -18632,29 +19057,35 @@ impl Renderer {
             target: if heard { self.lane_gain(slot) } else { 0.0 },
             gain: self.spine.ext.lane_gain.get(slot).copied().unwrap_or(0.0),
             pan: pan_gains(self.lane_pan(slot)),
-            send: if folds { self.lane_send(Strip::Channel(slot)) } else { 0.0 },
+            // Its knob, or its plan entries when the plan carries any: one
+            // road into Return 0 (`InSend`).
+            send: if folds { self.fx_send(Strip::Channel(slot)) } else { 0.0 },
+            fx_pre: if folds { self.fx_pre_send(Strip::Channel(slot)) } else { 0.0 },
             direct: match kind {
-                // A folder reaches the master when no folder holds it,
-                // whatever it is routed to (`fold_folders`' `to_master`).
-                K::Folder | K::LateFolder => {
-                    if me.parent.is_none() {
+                // A folder reaches the master when no folder holds it and
+                // its group is moved into no bus (`PostTable::direct`):
+                // whatever else it is routed to, as `fold_folders`' own
+                // `to_master` had it. A bus when nothing holds it and it is
+                // routed to no lane, a run of its own or not.
+                K::Folder | K::LateFolder | K::Bus => {
+                    if self.plan.post.direct.contains(rank) {
                         1.0
                     } else {
                         0.0
                     }
                 }
-                K::Dest | K::Bus => self.spine.ext.route_direct.get(slot).copied().unwrap_or(1.0),
+                K::Dest => self.spine.ext.route_direct.get(slot).copied().unwrap_or(1.0),
             },
             dry: folds && self.stems_dry,
-            sends: self.spine.ext.sends_out.contains(slot),
-            pre_target: match (heard, phase) {
-                (false, _) => 0.0,
-                (true, true) => -1.0,
-                (true, false) => 1.0,
-            },
+            sends,
+            pre_target: send_gate_target(&self.spine.ext.heard, &self.spine.ext.desk.phase, slot),
+            wait_main: send_lat.saturating_sub(main_lat),
+            wait_send: main_lat.saturating_sub(send_lat),
             keyed: kind == K::Bus && self.keys_live,
             peak: [0.0; 2],
         };
+        let coeff = self.gain_coeff;
+        let quiet_row = self.plan.post.row_quiet.contains(rank);
         // **THE-FOLD's claim**: one board per channel per chunk, taken here
         // where the walk is serial (`claim_board`); a folder's and a bus's
         // board run in the node's run, over the sum.
@@ -18664,8 +19095,7 @@ impl Renderer {
             return false;
         };
         let live = {
-            let body = boxed.body_mut();
-            let post = &mut body.post;
+            let LaneBody { post, row_gate, .. } = boxed.body_mut();
             for c in post.iter_mut().take(TAP_CHANNELS) {
                 c[..frames].fill(0.0);
             }
@@ -18675,12 +19105,31 @@ impl Renderer {
                 // Its own row first: a folder is a strip, and a clip
                 // standing on it belongs to the group. A bus has no row of
                 // its own to stand on.
-                if kind != K::Bus {
+                //
+                // **Unless the folder only CARRIES** through a solo
+                // (`PostTable::row_quiet`): heard to pass a bus or a soloed
+                // bus's feeder on to the master, it passes that and not what
+                // stands on its own row, which fades out as a muted strip
+                // does, and back. At unity, which every desk with no bus
+                // always is, the row is added as it always was.
+                let to = if quiet_row { 0.0 } else { 1.0 };
+                if kind != K::Bus && *row_gate == 1.0 && to == 1.0 {
                     for (c, dst) in post.iter_mut().enumerate().take(TAP_CHANNELS) {
                         for (f, d) in dst.iter_mut().enumerate().take(frames) {
                             *d += at(slot, f, c);
                         }
                     }
+                } else if kind != K::Bus {
+                    let mut g = *row_gate;
+                    for f in 0..frames {
+                        g += (to - g) * coeff;
+                        for (c, dst) in post.iter_mut().enumerate().take(TAP_CHANNELS) {
+                            dst[f] += at(slot, f, c) * g;
+                        }
+                    }
+                    // A slew never quite lands: back within a hair of unity
+                    // the row goes back onto its exact road.
+                    *row_gate = if to == 1.0 && (1.0 - g).abs() < 1.0e-6 { 1.0 } else { g };
                 }
                 // Its children ascending by rank, those this chunk walks.
                 for &k in self.plan.post.kids.row(rank) {
@@ -18914,6 +19363,12 @@ impl Renderer {
                     aux[f * TAP_CHANNELS + 1] += r * prep.send;
                 }
             }
+            // Its pre-fader Return 0 entries, beside its knob's share
+            // (`run_node` made them on its own way out's frame).
+            if prep.fx_pre != 0.0 && kind != K::Dest {
+                aux[f * TAP_CHANNELS] += b.node_fx[0][f];
+                aux[f * TAP_CHANNELS + 1] += b.node_fx[1][f];
+            }
         }
     }
 
@@ -18988,50 +19443,6 @@ impl Renderer {
         }
     }
 
-    /// **The plan's sends into Return 0**, into `aux` before the return
-    /// runs: each at its level, from its strip's send buffer, in the host's
-    /// order. Beside the strips' send knobs, which the lane fold already
-    /// added (see `InSend`).
-    fn gather_fx_sends(&mut self, frames: usize) {
-        use crate::desk_plan::PlanSendFrom;
-        for k in 0..self.plan.sends.into.row(0).len() {
-            let i = self.plan.sends.into.row(0)[k] as usize;
-            let Some(s) = self.plan.sends.sends.get(i).copied() else { continue };
-            let level = self.send_level(i);
-            if level == 0.0 {
-                continue;
-            }
-            let want = frames * TAP_CHANNELS;
-            match s.from {
-                PlanSendFrom::Click => {
-                    let Some(aux) = self.aux.get_mut(..want) else { continue };
-                    for f in 0..frames {
-                        let v = self.click_out.get(f).copied().unwrap_or(0.0) * level;
-                        aux[f * TAP_CHANNELS] += v;
-                        aux[f * TAP_CHANNELS + 1] += v;
-                    }
-                }
-                from => {
-                    let src: Option<&[Vec<f32>]> = match from {
-                        PlanSendFrom::Lane(t) => self.plan.lanes.get(t as usize).and_then(|l| {
-                            let ts = l.slot.0 as usize;
-                            let lane = self.spine.lanes.get(ts)?.as_deref().filter(|x| x.gen == l.gen)?;
-                            let b = lane.peek();
-                            Some(if s.pre { &b.send_pre[..] } else { &b.send_post[..] })
-                        }),
-                        _ => Some(&self.drums_send[usize::from(!s.pre)][..]),
-                    };
-                    let (Some(src), Some(aux)) = (src, self.aux.get_mut(..want)) else { continue };
-                    for f in 0..frames {
-                        for c in 0..TAP_CHANNELS {
-                            aux[f * TAP_CHANNELS + c] += src[c][f] * level;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// **What the routes make of a unit reaching each lane**, by rank, into
     /// `Wide::transfer`, at most once a chunk: `RouteTable::transfer`, the
     /// plan's flat list of today's recursion, over each lane's clip gain and
@@ -19084,6 +19495,89 @@ impl Renderer {
             held[1] += gain * t[1];
         }
         Some(held)
+    }
+
+    /// **The bus-aware transfer's figures for this chunk**, into
+    /// `Wide::carry`, at most once a chunk (`PostTable::carry_into`): each
+    /// node's own law as it stands, a legacy destination's at its clip gain
+    /// as the sends pass folds its arrivals (`lane_gain`), every other node's
+    /// at its slewed fader (`fader_now`, which `folder_chain_gain` reads too),
+    /// and its own sends into Return 0, its knob or its entries.
+    fn fill_carry(&mut self) {
+        if self.carry_ready {
+            return;
+        }
+        self.carry_ready = true;
+        let mut out = std::mem::take(&mut self.spine.ext.carry);
+        {
+            let side = |r: usize, dest: bool| -> crate::desk_plan::CarrySide {
+                let Some(s) = self.plan.lanes.get(r).map(|l| l.slot.0 as usize) else {
+                    return crate::desk_plan::CarrySide::default();
+                };
+                let gate = self.spine.lanes.get(s).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate);
+                crate::desk_plan::CarrySide {
+                    gain: if dest { self.spine.ext.lane_gain.get(s).copied().unwrap_or(0.0) } else { self.fader_now(s) },
+                    pan: pan_gains(self.lane_pan(s)),
+                    gate,
+                    fx_post: if dest { 0.0 } else { self.fx_send(Strip::Channel(s)) },
+                    fx_pre: if dest { 0.0 } else { self.fx_pre_send(Strip::Channel(s)) },
+                }
+            };
+            let level = |via: crate::desk_plan::CarryVia| match via {
+                crate::desk_plan::CarryVia::Parent => 1.0,
+                crate::desk_plan::CarryVia::Route(e) => {
+                    self.plan.routes.edges.get(e as usize).map_or(0.0, |x| sane_route_gain(self.plan.gain(x.gain)))
+                }
+                crate::desk_plan::CarryVia::Post(i) | crate::desk_plan::CarryVia::Pre(i) => self.send_level(i as usize),
+            };
+            let len = (self.plan.lanes.len() * 2).min(out.len());
+            self.plan.post.carry_into(side, level, &mut out[..len]);
+        }
+        self.spine.ext.carry = out;
+    }
+
+    /// **What the room must keep out of a withheld input on a desk with a
+    /// bus**, per side: `(master, Return 0)`, through gains, by every way
+    /// the strip's output leaves it (its own way out at `direct`, its folder
+    /// or the bus heading its run, its live routes), each node on from there
+    /// by its figure (`fill_carry`). A folder's own input lands in its own
+    /// gather and passes what its row gate passes. The strip's OWN sends are
+    /// not here: they are closed with the room where they are made.
+    fn carry_held(&mut self, lane: usize, is_folder: bool, direct: f32) -> ([f32; 2], [f32; 2]) {
+        use crate::desk_plan::{carry_at, RouteTo};
+        let Some(rank) = u32::try_from(lane).ok().and_then(|s| self.plan.rank_of(Slot(s))) else {
+            return ([direct; 2], [0.0; 2]);
+        };
+        self.fill_carry();
+        let fig = |r: u32| {
+            let fold = self.plan.post.fold.contains(r as usize);
+            self.spine.ext.carry.get(carry_at(r, fold)).copied().unwrap_or([0.0; 4])
+        };
+        let mut held = [[0.0f32; 2]; 2];
+        let mut add = |g: f32, v: [f32; 4]| {
+            held[0][0] += g * v[0];
+            held[0][1] += g * v[1];
+            held[1][0] += g * v[2];
+            held[1][1] += g * v[3];
+        };
+        if is_folder {
+            let gate = self.spine.lanes.get(lane).and_then(Option::as_deref).map_or(1.0, |l| l.peek().row_gate);
+            add(gate, fig(rank));
+        } else {
+            add(1.0, [direct, direct, 0.0, 0.0]);
+            if let Some(p) = self.plan.lanes.get(rank as usize).and_then(|l| l.parent) {
+                add(1.0, fig(p));
+            }
+            for e in self.plan.routes.edges.iter() {
+                let (RouteTo::Lane(t), true) = (e.to, e.live) else { continue };
+                if e.from == rank {
+                    let gain = sane_route_gain(self.plan.gain(e.gain));
+                    let v = self.spine.ext.carry.get(carry_at(t, false)).copied().unwrap_or([0.0; 4]);
+                    add(gain, v);
+                }
+            }
+        }
+        (held[0], held[1])
     }
 
     /// Where lane `ch`'s fader has slewed to, unity for a slot with no lane.
@@ -19155,11 +19649,20 @@ impl Renderer {
             if a >= self.spine.capacity() || hops > self.spine.capacity() {
                 break;
             }
+            // A folder's pre-fader Return 0 entries take its group ahead of
+            // its fader and through its gate (`InSend`).
+            let pre = self.fx_pre_send(Strip::Channel(a));
+            if pre != 0.0 {
+                let gate = self.spine.lanes.get(a).and_then(Option::as_deref).map_or(0.0, |l| l.peek().pre_gate);
+                sent[0] += path[0] * gate * pre;
+                sent[1] += path[1] * gate * pre;
+            }
             let (pl, pr) = pan_gains(self.lane_pan(a));
             let fg = self.fader_now(a);
             path[0] *= fg * pl;
             path[1] *= fg * pr;
-            let send = self.lane_send(Strip::Channel(a));
+            // Its knob, or its post-fader entries when the plan carries any.
+            let send = self.fx_send(Strip::Channel(a));
             sent[0] += path[0] * send;
             sent[1] += path[1] * send;
             up = self.spine.ext.folders.get(a).copied().unwrap_or(-1);
@@ -19796,6 +20299,10 @@ pub struct Engine {
     /// the callback refuses. A plan coming home on the retire ring takes its
     /// twin with it (`drain_retired_ops`).
     plan_shadows: Vec<DeskPlan>,
+    /// **Node lines a publish had no room for** on the op ring, by the lane
+    /// they are for: sent by `retire_tick` (and `settle_offline`) as room
+    /// comes, forgotten for a lane that has gone home first.
+    lines_owed: Vec<(Slot, u32)>,
     /// A monitor plan the op ring had no room for, sent by `retire_tick`.
     monitor_pending: RefCell<Option<Box<crate::lane_bank::MonitorPlan>>>,
     /// What the monitor was last told, whole. See [`MonitorShadow`].
@@ -20269,7 +20776,7 @@ impl Engine {
             self.keys_have.remove(&slot);
             let gen = self.mint_gen();
             list.push((slot, Some(self.build_lane(at, gen, spec))));
-            self.host_slots[at] = HostSlot { gen, live: true, leaving: false };
+            self.host_slots[at] = HostSlot { gen, live: true, leaving: false, lined: false };
             gens.push(gen);
         }
         let op = crate::lane_bank::EngineOp::Install(list.into_boxed_slice());
@@ -20361,11 +20868,74 @@ impl Engine {
         // next publish numbers on from the plan.
         shadow.gen = plan.gen;
         let gen = plan.gen;
+        // **A node's line, ahead of the plan that needs it** (`NodeLine`):
+        // every folder and bus this plan has sending to a bus, whose lane
+        // was never sent one, gets one on the ring before the plan, so the
+        // callback seats the line and then plays the plan, in one block. A
+        // lane keeps its line for its life; only such a lane pays for one.
+        let lines: Vec<(Slot, u32)> = {
+            use crate::desk_plan::NodeKind as K;
+            let post = &plan.post;
+            (0..plan.lanes.len())
+                .filter(|&r| {
+                    (post.fold.contains(r) || matches!(post.route.get(r).copied().flatten(), Some(K::Bus | K::LateFolder)))
+                        && post.sends_out.contains(r)
+                })
+                .map(|r| (plan.lanes[r].slot, plan.lanes[r].gen))
+                .filter(|(s, g)| self.host_slots.get(s.0 as usize).is_some_and(|h| h.live && h.gen == *g && !h.lined))
+                .collect()
+        };
+        // **The plan never waits for a line**: one place on the ring is kept
+        // for it, and a line that does not fit is owed and sent as the ring
+        // has room (`retire_tick`, `settle_offline`). Until its line lands a
+        // node is compensated as it always was (`node_out_lat`), so a session
+        // that makes a hundred such nodes at once publishes at once.
+        for (slot, lane_gen) in lines {
+            let sent = self.ops_tx.borrow().slots() > 1 && self.send_line(slot, lane_gen);
+            if !sent && !self.lines_owed.contains(&(slot, lane_gen)) {
+                self.lines_owed.push((slot, lane_gen));
+            }
+        }
         if self.ops_tx.borrow_mut().push(crate::lane_bank::EngineOp::Plan(Box::new(plan))).is_err() {
             return Err(EngineBusy::Busy);
         }
         self.plan_shadows.push(shadow);
         Ok(gen)
+    }
+
+    /// **Send the lane at `slot` its node line** (`LanePart::Line`), and
+    /// note on the host's record that it has one. False when the ring is
+    /// full and nothing was sent.
+    fn send_line(&mut self, slot: Slot, lane_gen: u32) -> bool {
+        let part = LanePart::Line(Box::new(NodeLine::new()));
+        let op = crate::lane_bank::EngineOp::Attach { slot, gen: lane_gen, part };
+        if self.ops_tx.borrow_mut().push(op).is_err() {
+            return false;
+        }
+        if let Some(h) = self.host_slots.get_mut(slot.0 as usize) {
+            h.lined = true;
+        }
+        true
+    }
+
+    /// **The node lines a publish could not fit**, as many as the ring has
+    /// room for now; one for a lane that has since gone home is forgotten.
+    /// Answers whether it sent any.
+    fn send_owed_lines(&mut self) -> bool {
+        let owed = std::mem::take(&mut self.lines_owed);
+        let mut sent = false;
+        for (slot, lane_gen) in owed {
+            let due = self.host_slots.get(slot.0 as usize).is_some_and(|h| h.live && h.gen == lane_gen && !h.lined);
+            if !due {
+                continue;
+            }
+            if self.ops_tx.borrow().slots() > 0 && self.send_line(slot, lane_gen) {
+                sent = true;
+            } else {
+                self.lines_owed.push((slot, lane_gen));
+            }
+        }
+        sent
     }
 
     /// **The gains of the plan the callback is PLAYING**, for a reader;
@@ -20554,12 +21124,20 @@ impl Engine {
     /// installed directly"). A live engine is left alone: its callback is
     /// the only thing that may touch its spine.
     pub fn settle_offline(&mut self) {
-        if let Some(r) = self.offline.as_mut() {
-            r.apply_queued_ops();
-            r.take_stem_tap();
+        loop {
+            if let Some(r) = self.offline.as_mut() {
+                r.apply_queued_ops();
+                r.take_stem_tap();
+            }
+            self.drain_retired_ops();
+            while self.stems_from_audio.borrow_mut().pop().is_ok() {}
+            // **The node lines a publish had no room for**, all of them, on
+            // an engine nobody is listening to: each batch the ring holds is
+            // taken in above before the next is sent.
+            if self.offline.is_none() || self.lines_owed.is_empty() || !self.send_owed_lines() {
+                break;
+            }
         }
-        self.drain_retired_ops();
-        while self.stems_from_audio.borrow_mut().pop().is_ok() {}
     }
 
     /// **An offline engine with room for `lanes` slots from the start**:
@@ -21258,6 +21836,11 @@ impl Engine {
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
+            drums_gate: 0.0,
+            drums_gate_from: 0.0,
+            fx_drums: None,
+            fx_click: None,
+            carry_ready: false,
             fold_tap: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fold_g: vec![0.0; MAX_BLOCK as usize],
             ui_held: Vec::with_capacity(1024),
@@ -21386,12 +21969,14 @@ impl Engine {
                     gen: LEGACY_GEN,
                     live: true,
                     leaving: false,
+                    lined: false,
                 };
                 CHANNELS
             ],
             next_gen: LEGACY_GEN,
             slot_capacity: CHANNELS,
             plan_shadows: Vec::new(),
+            lines_owed: Vec::new(),
             monitor_pending: RefCell::new(None),
             monitor_shadow: RefCell::new(MonitorShadow::default()),
             maps_to_audio,
@@ -23709,6 +24294,10 @@ impl Engine {
         let parked = self.monitor_pending.borrow_mut().take();
         if let Some(parked) = parked {
             self.send_monitor(*parked);
+        }
+        // The node lines a publish had no room for (`publish_plan`).
+        if !self.lines_owed.is_empty() {
+            self.send_owed_lines();
         }
         // The sampler's displaced files, dropped HERE. `set_sampler_sample`
         // waits only briefly for its own retiree; anything that arrived
@@ -28046,6 +28635,11 @@ mod tests {
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
+            drums_gate: 0.0,
+            drums_gate_from: 0.0,
+            fx_drums: None,
+            fx_click: None,
+            carry_ready: false,
             fold_tap: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fold_g: vec![0.0; MAX_BLOCK as usize],
             ui_held: Vec::with_capacity(1024),
@@ -41257,9 +41851,9 @@ mod slot_engine {
             assert!(track.iter().any(|v| *v != 0.0), "the track was silent");
         }
 
-        /// **A plan's own send into Return 0 is gathered beside the knobs**
-        /// (a pre-fader Fx entry, owner call 10): a track with its knob at
-        /// zero and its fader shut sends pre-fader into the effects, and the
+        /// **A plan's own send into Return 0 reaches the effects** (a
+        /// pre-fader Fx entry, owner call 10): a track with its knob at zero
+        /// and its fader shut sends pre-fader into the effects, and the
         /// return carries it; without the entry the master is silent.
         #[test]
         fn a_plan_send_into_return_zero_reaches_the_effects() {
@@ -41398,12 +41992,22 @@ mod slot_engine {
             }
             inputs.routes = pairs.iter().take(1000).map(|&(f, t)| route(f, t, 0.5)).collect();
             inputs.sends = (0..50).map(|k| send(k, 100 + k, 0.5, k % 2 == 0)).collect();
+            // A bus and a folder sending across a bus that looks ahead, so
+            // their lines ride the ring ahead of the plan and run apart in
+            // the steady blocks; and Return 0 entries from a track and from
+            // the folder, so each is summed where its strip's knob would be.
+            inputs.sends.push(send(100, 101, 0.5, false));
+            inputs.sends.push(send(150, 102, 0.5, true));
+            inputs.sends.push(InSend { from: SendFrom::Lane(Slot(0)), to: SendTo::Fx, level: 0.5, pre: true });
+            inputs.sends.push(InSend { from: SendFrom::Lane(Slot(150)), to: SendTo::Fx, level: 0.5, pre: true });
             for c in 150..159 {
                 inputs.lanes[c + 1].parent = Some(Slot(c as u32));
             }
             for &b in &buses[..8] {
                 unit(&mut e, b, 0, 0, crate::builtin_fx::PLATE_PATH, None);
             }
+            unit(&mut e, 101, 0, 1, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+            unit(&mut e, 102, 0, 1, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
             // The pool's first fork is warmed outside the window: its gate's
             // first wake is the platform's to set up, once, and no op's.
             e.set_offline_fanout(true);
@@ -41415,10 +42019,575 @@ mod slot_engine {
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "a thousand-route plan's block allocated");
             assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
+            {
+                let r = e.offline.as_ref().expect("a renderer");
+                for s in [100usize, 150] {
+                    assert!(r.lane_body(s).node_line.is_some(), "node {s} sends to a bus and holds no line");
+                }
+                assert!(r.lane_body(0).node_line.is_none(), "a track that only sends was sent a line");
+            }
             assert_eq!(counted_block(&mut e), 0, "a steady block of forked level runs allocated");
             assert!(e.offline.as_ref().expect("a renderer").level_forks > 0, "no level forked");
             e.set_level_fork(false);
             assert_eq!(counted_block(&mut e), 0, "a steady block of walked level runs allocated");
+        }
+
+        // ── one road into Return 0 ──────────────────────────────────────
+
+        /// **A strip's Return 0 entry IS its knob, never a send beside it**
+        /// (design 9: today's knob becomes the Fx entry, and `AutoParam::Send`
+        /// stays the Fx send). One track feeds the effects at half: by its
+        /// knob alone; by a post-fader entry at half with the knob shut; by
+        /// that entry with the knob ALSO at half, as a bridge that carries
+        /// the knob as the entry and leaves the knob standing sends it; and
+        /// by an entry at nine tenths that a flat `AutoParam::Send` curve at
+        /// half drives. All four are one sound, bit for bit: the entry is
+        /// summed where the knob was, from the same frame, so the return
+        /// never hears the strip twice and the knob's curve moves the entry.
+        /// The track also sends to a bus that looks ahead, which reads it
+        /// off its compensation line earlier than its own way out: the
+        /// entry is not read there.
+        #[test]
+        fn a_strips_return_entry_is_its_knob_and_never_beside_it() {
+            use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+            let render = |knob: f32, entry: Option<f32>, curve: Option<f64>| -> Vec<u32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.sends = vec![send(0, 40, 1.0, false)];
+                if let Some(level) = entry {
+                    inputs.sends.push(InSend { from: SendFrom::Lane(Slot(0)), to: SendTo::Fx, level, pre: false });
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_lane_levels(Slot(0), 1.0, 0.0, knob);
+                if let Some(v) = curve {
+                    let mut curves = Automation::default();
+                    curves.set(Curve::sanitised(0, AutoParam::Send, vec![Point { at_s: 0.0, value: v, shape: Shape::Hold }]));
+                    let gen = e.lane_gen(Slot(0)).expect("a lane");
+                    e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(0), gen)], master: MASTER_AUTO_LANE });
+                }
+                e.set_effects(crate::effects::Sends { reverb: 0.8, ..crate::effects::Sends::default() });
+                e.set_fx_return(1.0);
+                e.set_clips_slotted(vec![clip_at(&e, 0, 0x0f0f)]);
+                let (master, _) = roll(&mut e, 10);
+                assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
+                bits(&master)
+            };
+            let knob = render(0.5, None, None);
+            assert!(knob.iter().any(|v| f32::from_bits(*v) != 0.0), "the desk is silent");
+            assert_ne!(knob, render(0.0, None, None), "the knob carried nothing to the return, so this proves nothing");
+            assert_eq!(render(0.0, Some(0.5), None), knob, "the entry is not the knob's sound");
+            assert_eq!(render(0.5, Some(0.5), None), knob, "the return heard the strip twice: its knob beside its entry");
+            assert_eq!(render(0.9, Some(0.9), Some(0.5)), knob, "AutoParam::Send did not drive the entry");
+        }
+
+        /// **A pre-fader Return 0 entry is heard on its strip's own frame**,
+        /// never off its send tap (Return 0 is no bus, and a bus's path delay
+        /// is not the return's). An impulse on a track whose fader is shut
+        /// reaches the effects only through its pre-fader entry; giving the
+        /// same track a silent send into a bus that looks ahead, which moves
+        /// its send tap to that bus's delay, must move nothing the return
+        /// makes of it. A second track's send keeps the bus's lookahead in
+        /// the desk's alignment either way.
+        #[test]
+        fn a_pre_fader_return_entry_is_heard_on_its_strips_own_frame() {
+            let render = |tapped: bool| -> Vec<u32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.sends = vec![
+                    send(1, 40, 0.5, false),
+                    InSend { from: SendFrom::Lane(Slot(0)), to: SendTo::Fx, level: 1.0, pre: true },
+                ];
+                if tapped {
+                    inputs.sends.push(send(0, 40, 0.0, false));
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_lane_levels(Slot(0), 0.0, 0.0, 0.0);
+                e.set_effects(crate::effects::Sends { reverb: 0.8, ..crate::effects::Sends::default() });
+                e.set_fx_return(1.0);
+                e.set_clips_slotted(vec![impulse_at(&e, 0, 4_000)]);
+                let (master, _) = roll(&mut e, 16);
+                assert!(e.shared.max_latency.load(Ordering::Relaxed) > 100, "the bus's lookahead is not in the desk's alignment");
+                bits(&master)
+            };
+            let plain = render(false);
+            assert!(plain.iter().any(|v| f32::from_bits(*v) != 0.0), "the entry carried nothing to the return");
+            assert_eq!(render(true), plain, "the return heard the entry off the bus's send tap");
+        }
+
+        /// **A folder's pre-fader Return 0 entry carries its group** ahead of
+        /// its fader: folder 10, its fader and knob shut, holds track 11; its
+        /// entry puts the group into the effects, and without it the master
+        /// falls silent as the fader closes.
+        #[test]
+        fn a_folders_pre_fader_return_entry_carries_its_group() {
+            let render = |entry: bool| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.lanes[11].parent = Some(Slot(10));
+                if entry {
+                    inputs.sends = vec![InSend { from: SendFrom::Lane(Slot(10)), to: SendTo::Fx, level: 1.0, pre: true }];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_lane_levels(Slot(10), 0.0, 0.0, 0.0);
+                e.set_effects(crate::effects::Sends { reverb: 0.8, ..crate::effects::Sends::default() });
+                e.set_fx_return(1.0);
+                e.set_clips_slotted(vec![clip_at(&e, 11, 0x1011)]);
+                let (master, _) = roll(&mut e, 16);
+                master[master.len() - BLOCK * 4..].to_vec()
+            };
+            let (on, off) = (rms(&render(true)), rms(&render(false)));
+            assert!(on > 1e-3, "the folder's entry carried nothing to the return ({on})");
+            assert!(off < 1e-2 * on, "the group reached the master with its fader shut and no entry ({off})");
+        }
+
+        // ── the pre-fader gate ──────────────────────────────────────────
+
+        /// A kit whose pad 0 holds a steady half for a second.
+        fn half_kit() -> PadKit {
+            let mut kit = PadKit::default();
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.5; 48_000 * 2],
+                rate: 48_000,
+                source: PathBuf::new(),
+            }));
+            kit
+        }
+
+        /// **A kit-only drum lane's pre-fader send opens, and its mute shuts
+        /// it** (the gate moved only where the fold slewed it, and a drum lane
+        /// with nothing but its kit renders nothing and folds nothing, so its
+        /// gate stayed shut for ever). Its kit, struck by a clip, reaches bus
+        /// 40 through a pre-fader send, and once the gate has opened the bus
+        /// carries the kit as the lane's own column does (both at unity), on
+        /// every frame of a block and not only on its last; muted, nothing.
+        #[test]
+        fn a_kit_only_drum_lanes_pre_fader_send_opens_and_its_mute_shuts_it() {
+            let render = |muted: bool| -> (Vec<f32>, Vec<f32>) {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.lanes[3].flags = if muted { F::DRUM | F::MUTED } else { F::DRUM };
+                inputs.sends = vec![send(3, 40, 1.0, true)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_lane_levels(Slot(3), 1.0, 0.0, 0.0);
+                e.set_lane_levels(Slot(40), 1.0, 0.0, 0.0);
+                let gen = e.lane_gen(Slot(3)).expect("a lane");
+                e.attach(Slot(3), gen, LanePart::Kit(Box::new(half_kit()))).expect("the kit goes");
+                e.set_midi_slotted(vec![SlotPlacedMidi {
+                    slot: Slot(3),
+                    gen,
+                    placed: PlacedMidi {
+                        strip: 3,
+                        start: 0,
+                        len: 48_000,
+                        notes: Arc::new(vec![ClipNote { at: 0, dur: 24_000, key: PAD_BASE, vel: 100 }]),
+                        pedal: Arc::new(Vec::new()),
+                    },
+                }]);
+                let (_, stems) = roll(&mut e, 16);
+                assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+                let width = e.stem_frame_width() / 2;
+                (column(&stems, width, 40), column(&stems, width, 3))
+            };
+            let (open, kit) = render(false);
+            // The last block, by which the gate has had fifteen to open.
+            let tail = |v: &[f32]| v[v.len() - BLOCK * 2..].to_vec();
+            assert!(rms(&tail(&open)) > 1e-2, "the kit's pre-fader send never opened");
+            let worst = tail(&open).iter().zip(&tail(&kit)).fold(0.0f32, |m, (b, k)| m.max((b - k).abs()));
+            assert!(f64::from(worst) < 1e-3 * rms(&tail(&kit)).max(1e-9), "the bus carried the kit through a gate that is not open ({worst})");
+            assert!(render(true).0.iter().all(|v| v.abs() < 1e-6), "a muted kit sent pre-fader");
+        }
+
+        /// **The bare drum bus's pre-fader send answers to its mute** (its
+        /// gate was a constant unity): struck with the drum bus muted, bus 40
+        /// hears nothing of it; unmuted, it does.
+        #[test]
+        fn a_muted_bare_drum_bus_sends_nothing_pre_fader() {
+            let render = |muted: bool| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.specials = SpecialFlags { drums: if muted { F::MUTED } else { F::default() }, ..SpecialFlags::default() };
+                inputs.sends = vec![InSend { from: SendFrom::Drums, to: SendTo::Lane(Slot(40)), level: 1.0, pre: true }];
+                e.publish_plan(&inputs).expect("the plan goes");
+                assert!(e.set_pad_kit(0, half_kit()), "the kit went nowhere");
+                // One block for the kit to land, so the strike finds it.
+                let mut out = vec![0.0f32; BLOCK * 2];
+                e.render_offline(&mut out);
+                e.send_midi(0, &[0x99, PAD_BASE, 100]);
+                let (_, stems) = roll(&mut e, 4);
+                column(&stems, e.stem_frame_width() / 2, 40)
+            };
+            assert!(render(false).iter().any(|v| v.abs() > 1e-3), "the drum bus's pre-fader send never reached the bus");
+            assert!(render(true).iter().all(|v| *v == 0.0), "a muted drum bus sent pre-fader");
+        }
+
+        // ── the room ────────────────────────────────────────────────────
+
+        /// **A live input on lane `lane`**: a one-input device, pick 0
+        /// playing onto that lane at its generation. Answers the device's
+        /// end of the ring.
+        fn plug(e: &mut Engine, lane: usize) -> Producer<f32> {
+            use crate::lane_bank::{MonitorPick, MonitorPlan};
+            let (tx, rx) = RingBuffer::<f32>::new(1 << 16);
+            let picks = tangent_record::audio::Picks::EVERYTHING;
+            e.set_monitor(Some((rx, 1, vec![1].into_boxed_slice(), BLOCK as u32, picks.clone())));
+            let gen = e.lane_gen(Slot(lane as u32)).expect("a lane");
+            let pick = MonitorPick { pick: PickId(0), slot: Slot(lane as u32), gen, width: 1, cols: [0, 0] };
+            let plan = MonitorPlan { layout_only: true, ..MonitorPlan::with_picks(vec![pick], picks) };
+            e.set_monitor_plan(plan).expect("never refused");
+            tx
+        }
+
+        /// Play `blocks` blocks, a block of a 440 Hz tone at half into the
+        /// input ahead of each: the speakers' output, the take and the stems.
+        fn play_live(e: &mut Engine, tx: &mut Producer<f32>, blocks: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            e.set_stems(true);
+            let mut tap = e.take_recorder_tap().expect("the take's tap");
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let (mut room, mut take, mut stems) = (Vec::new(), Vec::new(), Vec::new());
+            let mut n = 0u32;
+            for _ in 0..blocks {
+                for _ in 0..BLOCK {
+                    let _ = tx.push((n as f32 * std::f32::consts::TAU * 440.0 / 48_000.0).sin() * 0.5);
+                    n += 1;
+                }
+                e.render_offline(&mut out);
+                room.extend_from_slice(&out);
+                tap.drain(&mut take);
+                e.drain_stems(&mut stems);
+            }
+            (room, take, stems)
+        }
+
+        /// **A live input's sends open with the room and close with it**. An
+        /// armed lane with nothing else to play folds nothing, so a gate the
+        /// fold alone walked never opened its pre-fader send; and its sends
+        /// took the whole input whatever the room was given, so with
+        /// monitoring off it reached the speakers through a bus (a processing
+        /// return, past whose racks nothing takes it back out). Monitoring
+        /// on: bus 40 carries it pre-fader, once the gate is open as the
+        /// lane's own column does (both at unity), on every frame of a block;
+        /// bus 41 post-fader. Monitoring off: the speakers hear nothing,
+        /// though the take holds the input.
+        #[test]
+        fn a_live_inputs_sends_open_with_the_room_and_close_with_it() {
+            let render = |monitoring: bool| -> (Vec<f32>, Vec<f32>, [Vec<f32>; 3]) {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[40, 41]);
+                inputs.lanes[0].flags = F::ARMED | F::MIDI_OFF;
+                inputs.sends = vec![send(0, 40, 1.0, true), send(0, 41, 1.0, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_lane_levels(Slot(0), 1.0, 0.0, 0.0);
+                e.set_lane_levels(Slot(40), 1.0, 0.0, 0.0);
+                unit(&mut e, 41, 0, 0, crate::builtin_fx::PLATE_PATH, None);
+                let mut tx = plug(&mut e, 0);
+                e.set_monitor_on(monitoring);
+                let (room, take, stems) = play_live(&mut e, &mut tx, 12);
+                let width = e.stem_frame_width() / 2;
+                (room, take, [column(&stems, width, 0), column(&stems, width, 40), column(&stems, width, 41)])
+            };
+            let tail = |v: &[f32]| v[v.len() - BLOCK * 4..].to_vec();
+            let (_, _, [own, pre, post]) = render(true);
+            assert!(rms(&tail(&pre)) > 1e-2, "the live input's pre-fader send never opened");
+            let worst = tail(&pre).iter().zip(&tail(&own)).fold(0.0f32, |m, (b, k)| m.max((b - k).abs()));
+            assert!(f64::from(worst) < 1e-3 * rms(&tail(&own)).max(1e-9), "the bus carried the input through a gate that is not open ({worst})");
+            assert!(rms(&tail(&post)) > 1e-3, "the live input's post-fader send carried nothing");
+            let (room, take, [_, pre, post]) = render(false);
+            assert!(rms(&tail(&take)) > 1e-2, "the take lost the input, so this proves nothing");
+            let leak = room.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(leak < 1e-6, "a withheld input reached the speakers through a bus (peak {leak})");
+            assert!(pre.iter().chain(&post).all(|v| *v == 0.0), "a withheld input reached a bus");
+        }
+
+        /// **A withheld input routed into a bus the master reaches only
+        /// through a fold stays out of the speakers**: a bus inside a folder
+        /// (the late folder carries it out) and a bus heading a run of its
+        /// own. The room's subtrahend read the legacy transfer, to which such
+        /// a bus is closed, so it took nothing out and the speakers heard the
+        /// input through the bus with monitoring off. The take is the
+        /// control: the route really does carry the input there.
+        #[test]
+        fn a_withheld_input_routed_into_a_folded_bus_stays_out_of_the_room() {
+            for (what, folder, child) in [("a bus in a folder", Some(36usize), None), ("a bus heading a run", None, Some(38usize))] {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[37]);
+                inputs.lanes[0].flags = F::ARMED | F::MIDI_OFF;
+                if let Some(f) = folder {
+                    inputs.lanes[37].parent = Some(Slot(f as u32));
+                }
+                if let Some(c) = child {
+                    inputs.lanes[c].parent = Some(Slot(37));
+                }
+                inputs.routes = vec![route(0, 37, 1.0)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.lane_shared(Slot(37)).expect("a lane").gain.store(0.5f32.to_bits(), Ordering::Relaxed);
+                let mut tx = plug(&mut e, 0);
+                e.set_monitor_on(false);
+                let (room, take, _) = play_live(&mut e, &mut tx, 12);
+                let tail = |v: &[f32]| v[v.len() - BLOCK * 4..].to_vec();
+                assert!(rms(&tail(&take)) > 1e-2, "{what}: the route never carried the input, so this proves nothing");
+                let leak = tail(&room).iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                assert!(leak < 1e-5, "{what}: a withheld input reached the speakers through the bus (peak {leak})");
+                // And the transfer that keeps it out is worked out on the
+                // callback without asking for memory (design 11.5).
+                for k in 0..BLOCK {
+                    let _ = tx.push((k as f32 * 0.01).sin() * 0.5);
+                }
+                assert_eq!(counted_block(&mut e), 0, "{what}: the room's transfer allocated on the callback");
+            }
+        }
+
+        // ── ways out ────────────────────────────────────────────────────
+
+        /// **A bus heading a folder run reaches the master** (`closed` holds
+        /// every folder, and a bus with children is one, so its own way out
+        /// read zero and everything it gathered was lost): bus 5 holds track 6
+        /// and takes track 7's route. Both are heard through it; muted, it is
+        /// silent.
+        #[test]
+        fn a_bus_heading_a_folder_run_is_heard_at_the_master() {
+            let render = |flags: LaneFlags| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[5]);
+                inputs.lanes[5].flags = F::BUS | flags;
+                inputs.lanes[6].parent = Some(Slot(5));
+                inputs.routes = vec![route(7, 5, 1.0)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, 6, 0x0606), clip_at(&e, 7, 0x0707)]);
+                let (master, _) = roll(&mut e, 12);
+                master[master.len() - BLOCK * 4..].to_vec()
+            };
+            assert!(rms(&render(F::default())) > 1e-2, "nothing the bus gathered reached the master");
+            assert!(rms(&render(F::MUTED)) < 1e-4, "a muted bus let its run through");
+        }
+
+        /// **A folder routed into a bus is heard once, through the bus**: the
+        /// group is MOVED there as a track routed into one is, where it went
+        /// straight out as well and played twice. With the bus at unity and
+        /// empty, the master is the folder's own sound either way.
+        #[test]
+        fn a_folder_routed_into_a_bus_is_heard_once() {
+            let render = |routed: bool| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[10]);
+                inputs.lanes[4].parent = Some(Slot(3));
+                inputs.lanes[5].parent = Some(Slot(3));
+                if routed {
+                    inputs.routes = vec![route(3, 10, 1.0)];
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(vec![clip_at(&e, 4, 0x0404), clip_at(&e, 5, 0x0505)]);
+                let (master, _) = roll(&mut e, 8);
+                master[master.len() - BLOCK * 4..].to_vec()
+            };
+            let (once, routed) = (rms(&render(false)), rms(&render(true)));
+            assert!(once > 1e-2, "the folder is silent");
+            let ratio = routed / once;
+            assert!((ratio - 1.0).abs() < 1e-3, "the folder routed into a bus came out at {ratio} of itself");
+        }
+
+        /// **PDC aligns what a folder or a bus sends across a bus that looks
+        /// ahead** (design 9: a bus destination gets PDC on its paths). A
+        /// node's feeders wait for the longer of its own way out and its send
+        /// path, and its line holds the shorter back. Each case carries an
+        /// impulse that a loose track carries too, and every column named
+        /// lands on the loose track's frame: an early folder sending into a
+        /// lookahead bus; a bus sending into one; and a folder inside a
+        /// folder that looks ahead, sending into a bus that does not (its own
+        /// way out is the longer, so its send waits).
+        #[test]
+        fn pdc_aligns_what_a_folder_or_a_bus_sends_across_a_lookahead_bus() {
+            // The impulse rides track 11; the loose track is 1.
+            let render = |case: usize| -> (Vec<usize>, usize, u32) {
+                let mut e = wide(41);
+                let (buses, watch): (Vec<usize>, Vec<usize>) = match case {
+                    0 => (vec![40], vec![10, 40]),
+                    1 => (vec![39, 40], vec![39, 40]),
+                    _ => (vec![40], vec![9, 40]),
+                };
+                let mut inputs = bus_plan(&e, 41, &buses);
+                match case {
+                    // Folder 10 { 11 } sends into bus 40, which looks ahead.
+                    0 => {
+                        inputs.lanes[11].parent = Some(Slot(10));
+                        inputs.sends = vec![send(10, 40, 1.0, false)];
+                    }
+                    // Track 11 is routed into bus 39, which sends into 40.
+                    1 => {
+                        inputs.routes = vec![route(11, 39, 1.0)];
+                        inputs.sends = vec![send(39, 40, 1.0, false)];
+                    }
+                    // Folder 9 looks ahead and holds folder 10 { 11 }, which
+                    // sends into bus 40.
+                    _ => {
+                        inputs.lanes[10].parent = Some(Slot(9));
+                        inputs.lanes[11].parent = Some(Slot(10));
+                        inputs.sends = vec![send(10, 40, 1.0, false)];
+                    }
+                }
+                e.publish_plan(&inputs).expect("the plan goes");
+                let ahead = if case == 2 { 9 } else { 40 };
+                unit(&mut e, ahead, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+                e.set_clips_slotted(vec![impulse_at(&e, 1, 4_000), impulse_at(&e, 11, 4_000)]);
+                let (_, stems) = roll(&mut e, 16);
+                let width = e.stem_frame_width() / 2;
+                let cols: Vec<Vec<f32>> = watch.iter().map(|&s| column(&stems, width, s)).collect();
+                for (s, c) in watch.iter().zip(&cols) {
+                    assert!(c.iter().any(|v| *v != 0.0), "case {case}: column {s} is silent");
+                }
+                let max = e.shared.max_latency.load(Ordering::Relaxed);
+                (cols.iter().map(|c| peak_at(c)).collect(), peak_at(&column(&stems, width, 1)), max)
+            };
+            for case in 0..3 {
+                let (peaks, loose, max) = render(case);
+                assert!(max > 100, "case {case}: the lookahead is not in the desk's alignment ({max})");
+                for p in peaks {
+                    assert_eq!(p, loose, "case {case}: a node's column is not aligned with a loose track");
+                }
+            }
+        }
+
+        /// **A kit's send across a bus that looks ahead lands with everything
+        /// else**: a drum lane reads its kit for its sends off the kit's own
+        /// line at the send path's delay, as the lane's own audio is read off
+        /// its line (`run_lane_pdc`). A one-frame pad struck at frame 4000 on
+        /// drum lane 3, sending into a bus with the denoise's lookahead, and
+        /// the same impulse on a loose track: the bus and the drum lane land
+        /// on the loose track's frame.
+        #[test]
+        fn pdc_aligns_a_kits_send_across_a_lookahead_bus() {
+            let mut e = wide(41);
+            let mut inputs = bus_plan(&e, 41, &[40]);
+            inputs.lanes[3].flags = F::DRUM;
+            inputs.sends = vec![send(3, 40, 1.0, false)];
+            e.publish_plan(&inputs).expect("the plan goes");
+            unit(&mut e, 40, 0, 0, crate::builtin_fx::DENOISE_PATH, Some(lookahead()));
+            let gen = e.lane_gen(Slot(3)).expect("a lane");
+            let mut kit = PadKit::default();
+            let mut click = vec![0.0f32; 4_800 * 2];
+            click[0] = 0.25;
+            click[1] = 0.25;
+            kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip { samples: click, rate: 48_000, source: PathBuf::new() }));
+            e.attach(Slot(3), gen, LanePart::Kit(Box::new(kit))).expect("the kit goes");
+            e.set_midi_slotted(vec![SlotPlacedMidi {
+                slot: Slot(3),
+                gen,
+                placed: PlacedMidi {
+                    strip: 3,
+                    start: 0,
+                    len: 48_000,
+                    notes: Arc::new(vec![ClipNote { at: 4_000, dur: 2_400, key: PAD_BASE, vel: 127 }]),
+                    pedal: Arc::new(Vec::new()),
+                },
+            }]);
+            e.set_clips_slotted(vec![impulse_at(&e, 1, 4_000)]);
+            let (_, stems) = roll(&mut e, 16);
+            let width = e.stem_frame_width() / 2;
+            let (loose, kit, bus) = (column(&stems, width, 1), column(&stems, width, 3), column(&stems, width, 40));
+            assert!(e.shared.max_latency.load(Ordering::Relaxed) > 100, "the bus's lookahead is not in the desk's alignment");
+            assert!(bus.iter().any(|v| *v != 0.0) && kit.iter().any(|v| *v != 0.0), "the kit or the bus is silent");
+            assert_eq!(peak_at(&kit), peak_at(&loose), "the kit's own way out is not aligned with a loose track");
+            assert_eq!(peak_at(&bus), peak_at(&loose), "the kit's send landed off the loose track's frame");
+        }
+
+        /// **A plan never waits for its nodes' lines**: seventy folders, each
+        /// sending to a bus, need more lines than the op ring holds at once.
+        /// The plan goes at once, the lines the ring had no room for are
+        /// owed and follow as it drains, and once settled every one of those
+        /// folders holds its line and plays the plan.
+        #[test]
+        fn a_plan_never_waits_for_its_nodes_lines() {
+            let mut e = wide(150);
+            let mut inputs = bus_plan(&e, 150, &[149]);
+            for k in 0..70usize {
+                inputs.lanes[2 * k + 1].parent = Some(Slot((2 * k) as u32));
+            }
+            inputs.sends = (0..70).map(|k| send(2 * k, 149, 0.5, false)).collect();
+            let gen = e.publish_plan(&inputs).expect("the plan waited for its lines");
+            assert!(!e.lines_owed.is_empty(), "every line fitted, so this proves nothing");
+            // The callback takes what the ring holds, then the host's frame
+            // sends what it owed, as a live engine's would (`retire_tick`).
+            e.offline.as_mut().expect("a renderer").apply_queued_ops();
+            e.retire_tick();
+            e.offline.as_mut().expect("a renderer").apply_queued_ops();
+            let r = e.offline.as_ref().expect("a renderer");
+            assert_eq!(r.plan.gen, gen, "the plan never arrived");
+            for k in 0..70usize {
+                assert!(r.lane_body(2 * k).node_line.is_some(), "folder {} never got its line", 2 * k);
+            }
+            assert!(e.lines_owed.is_empty(), "lines are still owed after the engine settled");
+            assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
+            assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+        }
+
+        // ── solo ────────────────────────────────────────────────────────
+
+        /// **A folder that only carries a bus through a solo keeps its own
+        /// row silent** (it was heard whole, so a clip standing on it played
+        /// through another strip's solo): late folder 36 holds bus 37, which
+        /// the soloed track 0 sends into, and a clip of its own. The solo
+        /// hears track 0 and its send through the bus and the folder, and
+        /// not the folder's own clip.
+        #[test]
+        fn a_folder_carrying_a_bus_through_a_solo_keeps_its_own_row_silent() {
+            let render = |row_clip: bool| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[37]);
+                inputs.lanes[37].parent = Some(Slot(36));
+                inputs.lanes[0].flags = F::SOLOED;
+                inputs.sends = vec![send(0, 37, 1.0, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                let mut clips = vec![clip_at(&e, 0, 0x3000)];
+                if row_clip {
+                    clips.push(clip_at(&e, 36, 0x3636));
+                }
+                e.set_clips_slotted(clips);
+                let (master, _) = roll(&mut e, 12);
+                master[master.len() - BLOCK * 2..].to_vec()
+            };
+            let without = render(false);
+            assert!(rms(&without) > 1e-2, "the soloed track is silent");
+            let with = render(true);
+            let diff: Vec<f32> = with.iter().zip(&without).map(|(a, b)| a - b).collect();
+            assert!(
+                rms(&diff) < 1e-3 * rms(&without),
+                "the carrying folder's own clip played through the solo ({})",
+                rms(&diff)
+            );
+        }
+
+        /// **A soloed bus hears its feeders whole, wherever they sit** (design
+        /// 9): a feeder in a folder is heard through that folder, as a loose
+        /// one is heard straight out, while the folder's own row and its
+        /// other child stay silent. Bus 40 is soloed; track 0 (loose) and
+        /// track 11 (in folder 10) send to it, at nothing, so what is heard of
+        /// them is their own way out; track 12 shares folder 10, and the
+        /// folder has a clip of its own.
+        #[test]
+        fn a_soloed_buss_feeder_in_a_folder_is_heard_through_it() {
+            let render = |clips: &[usize]| -> Vec<f32> {
+                let mut e = wide(41);
+                let mut inputs = bus_plan(&e, 41, &[40]);
+                inputs.lanes[40].flags = F::BUS | F::SOLOED;
+                inputs.lanes[11].parent = Some(Slot(10));
+                inputs.lanes[12].parent = Some(Slot(10));
+                inputs.sends = vec![send(0, 40, 0.0, false), send(11, 40, 0.0, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                e.set_clips_slotted(clips.iter().map(|&s| clip_at(&e, s, 0x4000 + s as u32)).collect());
+                let (master, _) = roll(&mut e, 12);
+                master[master.len() - BLOCK * 2..].to_vec()
+            };
+            let close = |a: &[f32], b: &[f32]| {
+                let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+                rms(&d) <= 1e-3 * rms(b).max(1e-9)
+            };
+            let loose = render(&[0]);
+            assert!(rms(&loose) > 1e-2, "the loose feeder was not heard");
+            let feeders = render(&[0, 11]);
+            assert!(!close(&feeders, &loose), "the feeder in a folder was not heard through its folder");
+            let all = render(&[0, 10, 11, 12]);
+            assert!(close(&all, &feeders), "the carrying folder's own clip, or its other child, played through the bus's solo");
         }
     }
 }
