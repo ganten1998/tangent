@@ -3,7 +3,7 @@
 //! `app`, in a file of its own, so it reads the app's private roads the way
 //! its `tests` module does.
 
-use super::tests::{headless, project_scratch};
+use super::tests::{headless, headless_with, project_scratch};
 use super::*;
 
 /// **The function `at` falls in**: the nearest `fn` above it, by name.
@@ -306,5 +306,152 @@ fn a_removed_drum_tracks_kit_leaves_the_disk_with_the_save_and_not_before() {
     );
     app.undo();
     assert_eq!(kick(&app), kicked, "the undo of a saved removal did not bring the kit back");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A release build's project, in `dir`**: a legacy document and a kit
+/// sidecar in the shape a release build writes (the panel's kit at the top
+/// level, every lane's under `lane_kits`, `primary_lane`), with a kit on
+/// lane 2. Answers the two files' bytes.
+fn a_release_builds_project(dir: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    use crate::drumpad::DrumpadDoc;
+    std::fs::create_dir_all(dir.join("media")).expect("the project");
+    let doc = crate::arrangement::doc_in(dir);
+    let text = include_str!("../../tests/fixtures/eras/doc-v7.json").as_bytes().to_vec();
+    std::fs::write(&doc, &text).expect("the legacy document");
+    let mut kit = DrumpadDoc::default();
+    kit.pads[36].path = "media/kick.wav".to_owned();
+    kit.save_beside(&doc);
+    let sidecar = DrumpadDoc::sidecar(&doc);
+    let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar).expect("the kit")).expect("json");
+    let top = legacy.clone();
+    legacy["primary_lane"] = 2.into();
+    legacy["lane_kits"] = serde_json::json!({ "2": top });
+    let kit_bytes = serde_json::to_vec_pretty(&legacy).expect("json");
+    std::fs::write(&sidecar, &kit_bytes).expect("the legacy kit");
+    (text, kit_bytes)
+}
+
+/// **The way back a folder keeps for a release build**: each file's
+/// `.pre-v8` when a format-2 write replaced it, the file itself while it is
+/// still the release build's (no format-2 write reached it).
+fn way_back(dir: &std::path::Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let kept = |file: &std::path::Path, format2: &dyn Fn(&serde_json::Value) -> bool| {
+        let mut backup = file.as_os_str().to_owned();
+        backup.push(crate::arrangement::PRE_V8_SUFFIX);
+        std::fs::read(std::path::PathBuf::from(backup)).ok().or_else(|| {
+            std::fs::read(file)
+                .ok()
+                .filter(|b| serde_json::from_slice::<serde_json::Value>(b).ok().is_some_and(|v| !format2(&v)))
+        })
+    };
+    let doc = crate::arrangement::doc_in(dir);
+    (
+        kept(&doc, &|v| v.get("desk").is_some_and(crate::desk_format::is_format2)),
+        kept(&crate::drumpad::DrumpadDoc::sidecar(&doc), &|v| v.get("track_kits").is_some()),
+    )
+}
+
+/// **Every road that first writes a release build's project in format 2
+/// keeps the way back, kit included** (W5-save-gaps 3, design 6.7: "restoring
+/// `<doc>.pre-v8` hands a release build its project back whole"): Save,
+/// Save As into an existing folder (the release build's project written
+/// over), the kit sidecar saving itself after a pad edit, and the template
+/// seeding of a stock template. After each, the folder holds the release
+/// build's document and kit sidecar byte for byte, as a `.pre-v8` where a
+/// format-2 write replaced it, and the two restored into a folder of their
+/// own open in a release build's readers with the kit on lane 2 and the
+/// panel there. And the launch's reclaim of a scratch never takes a release
+/// build's kit that is not the template's (`fresh_project_dir` steps past
+/// it), so no road deletes one where no backup was kept. (Save As Template
+/// is the host's, and its test is `desktop`'s.)
+#[test]
+fn every_first_format_2_write_keeps_a_release_builds_kit_to_go_back_to() {
+    use crate::drumpad::{DrumpadDoc, FILE_NAME};
+    let root = project_scratch("save-gaps-kit-backup");
+    let restores = |what: &str, dir: &std::path::Path, want: &(Vec<u8>, Vec<u8>)| {
+        let (doc, kit) = way_back(dir);
+        assert_eq!(doc.as_deref(), Some(want.0.as_slice()), "{what}: the release build's document is not kept");
+        assert_eq!(kit.as_deref(), Some(want.1.as_slice()), "{what}: the release build's kit sidecar is not kept");
+        let back = root.join(format!("restored {what}"));
+        std::fs::create_dir_all(&back).expect("a restore");
+        std::fs::write(back.join(crate::arrangement::DOC_NAME), &want.0).expect("restored document");
+        std::fs::write(back.join(FILE_NAME), &want.1).expect("restored kit");
+        let (kits, panel) = DrumpadDoc::load_all_beside(&crate::arrangement::doc_in(&back), recorder::CHANNELS, None);
+        assert_eq!((kits[2].pads[36].path.as_str(), panel), ("media/kick.wav", Some(2)), "{what}: the restored kit is not on lane 2");
+        let reopened = crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(&back));
+        assert!(
+            matches!(&reopened, crate::arrangement::LoadOutcome::Loaded(a) if a.desk.as_ref().is_some_and(|d| d.legacy_states.0.is_some())),
+            "{what}: the restored document is not the release build's"
+        );
+    };
+    let kicked = |app: &TangentApp| app.kit_at(2).pads[36].path.clone();
+
+    // Save, in place.
+    let song = root.join("Song");
+    let want = a_release_builds_project(&song);
+    let (_c1, mut app) = headless(Caps::DESKTOP);
+    app.open_project(&crate::arrangement::doc_in(&song));
+    assert_eq!(kicked(&app), "media/kick.wav", "fixture: the kit did not open on lane 2");
+    app.save_project_doc();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(DrumpadDoc::sidecar(&crate::arrangement::doc_in(&song))).expect("kit")).expect("json");
+    assert!(saved.get("track_kits").is_some(), "fixture: the save did not write the kit in format 2");
+    restores("Save", &song, &want);
+
+    // Save As over a release build's project in an existing folder.
+    let theirs = root.join("Theirs");
+    let want = a_release_builds_project(&theirs);
+    let (_c2, mut app) = headless_with(Caps::DESKTOP, Settings { project_subdir: false, ..Settings::default() });
+    app.bootstrap_project(&root.join("Projects"));
+    app.kit_at_mut(2).pads[38].path = "media/snare.wav".into();
+    assert!(app.save_project_as(&theirs), "the Save As was refused");
+    assert_eq!(crate::arrangement::doc_in(&theirs), app.project_doc().expect("the copy").to_path_buf(), "fixture: the copy is not in the folder");
+    restores("Save As into an existing folder", &theirs, &want);
+
+    // The kit sidecar saving itself, a pad edited before any save.
+    let edited = root.join("Edited");
+    let want = a_release_builds_project(&edited);
+    let (_c3, mut app) = headless(Caps::DESKTOP);
+    app.open_project(&crate::arrangement::doc_in(&edited));
+    app.set_drumpad_lane(2);
+    app.kit_at_mut(2).pads[40].path = "media/tom.wav".into();
+    app.drumpad_edited();
+    restores("a pad edit", &edited, &want);
+    app.save_project_doc();
+    restores("a pad edit, then Save", &edited, &want);
+
+    // The template seeding of a stock template a release build wrote.
+    let template = root.join("Templates").join("default");
+    std::fs::create_dir_all(template.join("media")).expect("the template");
+    let mut stock = crate::arrangement::Arrangement::default();
+    stock.desk = Some(TangentApp::template_desk());
+    stock.save_to_as(&crate::arrangement::doc_in(&template), crate::desk_format::Format::Legacy);
+    let want_doc = std::fs::read(crate::arrangement::doc_in(&template)).expect("the stock document");
+    let (_, want_kit) = {
+        let scratch = root.join("kit-only");
+        let pair = a_release_builds_project(&scratch);
+        std::fs::write(template.join(FILE_NAME), &pair.1).expect("the template's kit");
+        pair
+    };
+    let (_c4, app) = headless(Caps::DESKTOP);
+    app.seed_template(&template);
+    let reseeded: serde_json::Value = serde_json::from_slice(&std::fs::read(crate::arrangement::doc_in(&template)).expect("doc")).expect("json");
+    assert!(crate::desk_format::is_format2(&reseeded["desk"]), "fixture: the stock template was not reseeded in format 2");
+    restores("the template seeding", &template, &(want_doc, want_kit.clone()));
+
+    // The launch's reclaim steps past a release build's scratch whose kit is
+    // not the template's, and leaves every file of it as it was.
+    let projects = root.join("Reclaim");
+    let scratch = projects.join("Untitled");
+    let want = a_release_builds_project(&scratch);
+    // An unnamed scratch with no clips: what a reclaim weighs by its kit.
+    let mut clipless: serde_json::Value = serde_json::from_slice(&want.0).expect("json");
+    clipless["clips"] = serde_json::json!([]);
+    let clipless = serde_json::to_vec_pretty(&clipless).expect("json");
+    std::fs::write(crate::arrangement::doc_in(&scratch), &clipless).expect("the scratch's document");
+    let want = (clipless, want.1);
+    let fresh = fresh_project_dir(&projects);
+    assert_ne!(fresh, scratch, "the reclaim handed back a scratch holding a release build's own kit");
+    restores("the launch's reclaim", &scratch, &want);
     let _ = std::fs::remove_dir_all(&root);
 }

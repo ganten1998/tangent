@@ -16568,7 +16568,12 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// marker, because nothing legacy is left in it to fall back to. The
 /// folder's own document is not copied either: the session's is written in
 /// its place from memory, and a legacy one copied first would have that
-/// write keep it in the template as a `.pre-v8` of its own.
+/// write keep it in the template as a `.pre-v8` of its own. Nor is its kit
+/// sidecar, for the same reason (W5-save-gaps): the session's kits are
+/// written in its place (`write_kit_into`), and a release build's
+/// `drumpad.json` copied first was kept by that format-2 write as the
+/// template's own `drumpad.json.pre-v8` (`DrumpadDoc::keep_pre_v8`), a
+/// backup of another project's kits that no template should carry.
 #[cfg(feature = "recorder")]
 fn build_template(
     app: &TangentApp,
@@ -16580,7 +16585,12 @@ fn build_template(
         copy_dir_skipping(src, stage, &|rel| {
             let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let document = rel.parent().is_some_and(|p| p.as_os_str().is_empty())
-                && [tangent_ui::arrangement::DOC_NAME, tangent_ui::arrangement::DOC_NAME_LEGACY].contains(&name.as_str());
+                && [
+                    tangent_ui::arrangement::DOC_NAME,
+                    tangent_ui::arrangement::DOC_NAME_LEGACY,
+                    tangent_ui::drumpad::FILE_NAME,
+                ]
+                .contains(&name.as_str());
             document
                 || (rel.starts_with("state") && name.starts_with("insert-state-"))
                 || name.ends_with(".pre-v8")
@@ -27563,6 +27573,61 @@ mod tests {
         let disposable = tangent_ui::app::holds_only_scratch(&untitled);
         let _ = std::fs::remove_dir_all(&root);
         assert!(disposable, "a scratch holding the kit's backup reads as somebody's work");
+    }
+
+    /// **A template built from a release build's project carries no backup
+    /// of its kit** (W5-save-gaps 3; design 6.7: "Save As Template never
+    /// copies one"). The copy of a real folder took its `drumpad.json`, and
+    /// the template's kit, written over it from memory in format 2
+    /// (`write_kit_into`), kept the copied release-build file as the
+    /// template's own `drumpad.json.pre-v8`: another project's kits, in the
+    /// stencil every New is made from. The copy leaves the kit sidecar out
+    /// as it leaves the document out; the template's kit is the session's,
+    /// in format 2, the kit on lane 2 included, and the project's own files
+    /// are as the release build left them.
+    #[test]
+    fn a_template_built_from_a_release_builds_project_keeps_no_backup_of_its_kit() {
+        use tangent_ui::arrangement::{doc_in, PRE_V8_SUFFIX};
+        use tangent_ui::drumpad::{DrumpadDoc, FILE_NAME};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-tpl-kit-backup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("media")).expect("media/");
+        let doc = doc_in(&song);
+        std::fs::write(&doc, include_str!("../../tests/fixtures/eras/doc-v5-19.json")).expect("the legacy document");
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36].path = "media/kick.wav".to_owned();
+        kit.save_beside(&doc);
+        let sidecar = DrumpadDoc::sidecar(&doc);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar).expect("kit")).expect("json");
+        let top = legacy.clone();
+        legacy["primary_lane"] = 2.into();
+        legacy["lane_kits"] = serde_json::json!({ "2": top });
+        let legacy = serde_json::to_vec_pretty(&legacy).expect("json");
+        std::fs::write(&sidecar, &legacy).expect("the release build's kit");
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        app.open_project(&doc);
+        assert_eq!(app.drumpad_kit_of(2).map(|k| k.pads[36].path.clone()).as_deref(), Some("media/kick.wav"), "fixture: no kit on lane 2");
+
+        let stage = root.join(".Rig.writing");
+        build_template(&app, Some(&song), &stage, &root.join("shelf")).expect("the template");
+        let backup = stage.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}")).exists();
+        let staged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stage.join(FILE_NAME)).expect("the template's kit")).expect("json");
+        let project_kit = std::fs::read(&sidecar).expect("the project's kit");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!backup, "the template kept a backup of the project's kit as its own");
+        assert_eq!(
+            staged["track_kits"]["t2"]["pads"][36]["path"].as_str(),
+            Some("media/kick.wav"),
+            "the template's kit is not the session's, in format 2: {staged}"
+        );
+        assert_eq!(project_kit, legacy, "building the template touched the project's kit");
     }
 
     /// **Save As Template writes the template, never the session.** From a
