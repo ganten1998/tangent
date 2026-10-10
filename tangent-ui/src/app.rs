@@ -8092,8 +8092,9 @@ impl TangentApp {
     }
 
     /// How long the supporter heart's wave takes to walk the whole palette:
-    /// one colour per channel, `recorder::CHANNELS` of them (thirty-two since
-    /// the desk grew), so one twelve-second lap is thirty-two bands.
+    /// one colour per palette slot, `recorder::PALETTE_SLOTS` of them
+    /// (thirty-two, the width the fixed desk once had), so one
+    /// twelve-second lap is thirty-two bands.
     ///
     /// **Fast enough to read as a wave.** The first pass took twenty-four
     /// seconds on the reasoning that a thing in the corner of a window
@@ -10136,9 +10137,19 @@ impl TangentApp {
                 file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             ));
         };
+        let rows_before = self.desk_extent();
         let Some(lane) = self.lane_or_new(lane) else {
             return Err("the desk is holding its shape; the file stays in media/".to_owned());
         };
+        // **A new track is a new identity** (design section 3: add, insert,
+        // paste and import mint, and a reused row takes a fresh id). A clip
+        // landing on a row that was no track makes one, so the row is
+        // minted first, as a kind or an input on it is, and whatever its old
+        // id named follows it (`mint_row_id`). A row appended for the drop
+        // was minted as it was made.
+        if lane < rows_before && !self.row_counted(lane) {
+            self.mint_row_id(lane);
+        }
         self.arrangement.add_clip(clip_at(&rel, lane, start_s.max(0.0)));
         // Through the one save that also makes this a MOMENT undo can
         // reach; the desk rides along as everywhere else.
@@ -10178,8 +10189,14 @@ impl TangentApp {
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
         };
+        // **ONE moment for the drop**: the row it lands on, the binding
+        // that makes that row a MIDI track (which commits a moment of its
+        // own) and the clip. Two, and the first Ctrl+Z took the clip back
+        // and left the track it had made: one gesture, one moment.
+        self.begin_one_moment();
         // Below the last row, a row is made for it.
         let Some(lane) = self.lane_or_new(lane) else {
+            self.commit_undo_moment();
             return Err("the desk is holding its shape".to_owned());
         };
         // A .mid landing on a BARE lane makes it a MIDI track — the
@@ -10214,6 +10231,7 @@ impl TangentApp {
         });
         let _ = doc;
         self.arr_save_edits();
+        self.commit_undo_moment();
         Ok(())
     }
 
@@ -11549,9 +11567,9 @@ impl TangentApp {
             Some(recorder::ChannelKind::Midi) => {
                 self.channel_midi_sel(ch).chip_text(&self.midi_ports_seen)
             }
-            // **And a channel PAST THE CAP says so.** The desk carries four
-            // audio inputs (`recorder::INPUTS`, which must equal
-            // `tangent_record::audio::MAX_PICKS`) and `audio_ordinal` is
+            // **And a channel PAST THE CAP says so.** The desk carried four
+            // audio inputs (a constant that had to equal the capture's own
+            // pick count, both gone now) and `audio_ordinal` was
             // positional: the fifth audio channel answers `None` and can
             // never reach a capture channel, whatever its spec says. The
             // chip printed the spec anyway — so a fifth audio track read
@@ -12336,6 +12354,11 @@ impl TangentApp {
         if !self.row_counted(lane) && !self.admit_tracks(1) {
             return;
         }
+        // **ONE moment for the draw**: the lane made a MIDI track (its
+        // binding commits a moment of its own) and the item drawn on it.
+        // It was two, and the first Ctrl+Z took the item back and left a
+        // track nobody had asked for: one gesture, one moment.
+        self.begin_one_moment();
         if self.channel_kind(lane).is_none() {
             // Drawing a MIDI item on a bare lane makes it a
             // track — through the spec, the one authority.
@@ -12371,6 +12394,7 @@ impl TangentApp {
             warp_rate: 0,
         });
         self.arr_save_edits();
+        self.commit_undo_moment();
     }
 
     /// **Open a row for a new track at lane `at`**, and answer where it is
@@ -32981,7 +33005,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **The amp face's pedal chips, indexed by the OWNING track rather
         // than by the rack the amp happens to sit in.**
         //
-        // This used to read `seat < recorder::CHANNELS`, which is the
+        // This used to read a seat against the fixed desk's width, the
         // same test spelled four times across this app and wrong in the
         // same way each time. A FOLDER wears six bays; the last three
         // are seated past every pad block (`folder_extra_seat`), so an
@@ -33665,7 +33689,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 mixer_run_w(pane),
             )
         };
-        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
+        // **On the zoom's own ceiling, never the desk's length** (design
+        // section 10: a strip's size follows the count asked for, never the
+        // track count). This read `desk_extent().min(VISIBLE_MAX)` while the
+        // extent was the fixed thirty-two; once the desk is its rows, a
+        // two-track desk zoomed to eight drew its two strips and the add at a
+        // third of the run each. The layout shows what there is.
+        want.clamp(1, recorder::VISIBLE_MAX)
     }
     fn arr_visible(&self) -> usize {
         // Zero is the auto sentinel; see `mixer_visible` and
@@ -33680,7 +33710,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 arr_timeline_h(&self.settings, pane),
             )
         };
-        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
+        // The zoom's ceiling, not the desk's length: see `mixer_visible`.
+        want.clamp(1, recorder::VISIBLE_MAX)
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -44546,6 +44577,36 @@ mod paywall_tests {
                     None
                 },
             },
+            // **W6's own roads**: media dropped below the last lane makes a
+            // track there (design section 10), the desk growing for it once
+            // no hidden row past the last track is free.
+            Road {
+                name: "an audio file dropped below the last lane",
+                makes: 1,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.import_audio_at(&fx.wav, below, 0.0).err()
+                },
+            },
+            Road {
+                name: "a MIDI file dropped below the last lane",
+                makes: 1,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.import_midi_at(&fx.mid, below, 0.0).err()
+                },
+            },
+            Road {
+                name: "two files dropped below the last lane",
+                makes: 2,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.insert_media_files(below, &[fx.wav.clone(), fx.wav2.clone()], 0.0).into_iter().next()
+                },
+            },
         ]
     }
 
@@ -44718,6 +44779,104 @@ mod paywall_tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         assert!(bad.is_empty(), "the paid walk:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Bring the desk to `n` counted tracks, past its hidden rows too**:
+    /// the lowest empty row while one is left, then Add, which appends; and
+    /// from above, the last track removed until it is there.
+    fn grow_to(app: &mut TangentApp, n: usize) {
+        while app.counted_tracks() > n {
+            let last = (0..app.desk_extent()).rev().find(|r| app.row_counted(*r)).expect("a track to remove");
+            app.remove_channel(last);
+        }
+        while app.counted_tracks() < n {
+            match (0..app.desk_extent()).find(|r| !app.row_counted(*r)) {
+                Some(free) => assert!(app.add_bare_track(free), "the fill was refused at {}", app.counted_tracks()),
+                None => app.add_track(),
+            }
+        }
+        assert_eq!(app.counted_tracks(), n, "the fill overshot");
+    }
+
+    /// **Whether row `row` is drawn once both views are carried to it**: the
+    /// timeline scrolled so its rank leads the window, the desk scrolled by
+    /// its rank's pitch, and each view laid out at `rect`.
+    fn drawn_after_scrolling(app: &mut TangentApp, row: usize, rect: Rect) -> (bool, bool) {
+        let rank = app.desk_index().rank_of(row).unwrap_or_else(|| panic!("row {row} is not drawn at all"));
+        app.arr_lane_scroll = rank;
+        let clips = app.arr_clip_views();
+        let v = app.arrange_view(&clips);
+        let lane = crate::arrangement_panel::Layout::new(rect, &v).lane_rows[row].is_positive();
+        app.mixer_scroll_px = rank as f32 * crate::mixer_panel::Layout::metrics(rect, app.mixer_visible()).1;
+        let v = app.mixer_view_in(rect);
+        let strip = crate::mixer_panel::Layout::new(rect, &v)
+            .strips
+            .get(recorder::Column::Track(row))
+            .is_some_and(|s| s.panel.is_positive());
+        (lane, strip)
+    }
+
+    /// **Tracks 33, 64, 65, 100 and 200, made on every road that can still
+    /// make one when no hidden row is left** (design 11.2 item 1; the same
+    /// milestones played offline are `konami_e2e`'s): a cheater and a
+    /// supporter each make the milestone track, one moment (one undo is the
+    /// desk before the gesture), and the track is drawn once either view is
+    /// scrolled to it.
+    #[test]
+    fn a_cheater_and_a_supporter_make_every_milestone_track_on_every_road() {
+        let root = scratch("milestones");
+        let fx = fixtures(&root);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 700.0));
+        let mut bad = Vec::new();
+        for tier in [Tier::Cheater, Tier::Supporter] {
+            let (_ctx, mut app) = app_on(store(tier, "milestones"));
+            app.bootstrap_project(&root.join("Projects"));
+            app.settings.mixer_visible = 8;
+            app.settings.arr_visible = 8;
+            for m in [33usize, 64, 65, 100, 200] {
+                for road in roads().into_iter().filter(|r| r.on_full) {
+                    grow_to(&mut app, m - road.makes);
+                    app.messages.clear();
+                    let before: Vec<crate::desk_id::TrackId> = app.track_ids();
+                    let answer = (road.go)(&mut app, &fx);
+                    if app.counted_tracks() != m {
+                        bad.push(format!(
+                            "{tier:?} {}: {} tracks, not {m} ({:?})",
+                            road.name,
+                            app.counted_tracks(),
+                            said(&app, answer)
+                        ));
+                        continue;
+                    }
+                    let made: Vec<usize> = app
+                        .track_ids()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| !before.contains(id))
+                        .map(|(r, _)| r)
+                        .filter(|r| app.row_counted(*r))
+                        .collect();
+                    for row in made {
+                        let (lane, strip) = drawn_after_scrolling(&mut app, row, rect);
+                        if !(lane && strip) {
+                            bad.push(format!("{tier:?} {} at {m}: row {row} drawn on the timeline {lane}, on the desk {strip}", road.name));
+                        }
+                    }
+                    // One gesture, one moment: one undo is the desk before it.
+                    app.undo();
+                    if app.track_ids() != before {
+                        bad.push(format!(
+                            "{tier:?} {} at {m}: one undo left {} tracks, not the desk before the gesture",
+                            road.name,
+                            app.counted_tracks()
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(tiers::dir("milestones"));
+        assert!(bad.is_empty(), "the milestones:\n  {}", bad.join("\n  "));
     }
 
     /// **The tier's numbers**: no limit for a supporter, thirty-two free,
@@ -85244,3 +85403,9 @@ mod lane_refs_tests {
 #[cfg(test)]
 #[path = "app_save_tests.rs"]
 mod save_tests;
+
+/// **The desk at every width** (W6-rows-unlimited): the width suites, the
+/// trailing add, the holds and undo across every structural gesture.
+#[cfg(test)]
+#[path = "app_width_tests.rs"]
+mod width_tests;

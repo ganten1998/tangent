@@ -1388,9 +1388,17 @@ impl std::ops::Index<usize> for ByRow<HeaderRow> {
 /// clamped so the last `visible` rows of the desk can always fill the view.
 /// Rect-free, because the rows that do not fit are dropped by height in the
 /// layout and the window only needs to cover the most that could fit.
+///
+/// **The count is the one asked for, never the lane count** (design section
+/// 10: a lane's height follows the count). A desk shorter than the window
+/// is laid out at the height the count gives each lane, its stack ending
+/// where its lanes do; it used to be clamped to the lanes there were, which
+/// never showed while every desk drew thirty-two of them and, once vacant
+/// rows were hidden, made a fresh desk's two lanes and its add a third of
+/// the timeline each.
 pub fn lane_window_start(lane_scroll: usize, visible_lanes: usize, active: usize) -> (usize, usize) {
     let active = active.max(1);
-    let visible = visible_lanes.clamp(1, active).min(VISIBLE_MAX);
+    let visible = visible_lanes.clamp(1, VISIBLE_MAX);
     (lane_scroll.min(active.saturating_sub(visible)), visible)
 }
 
