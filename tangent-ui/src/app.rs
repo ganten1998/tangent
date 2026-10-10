@@ -1295,6 +1295,12 @@ pub struct TangentApp {
     /// forgets what you were doing is worse than one that never asked. See
     /// `ask_before` and `resume_after_save`.
     pending_after_save: Option<AfterSave>,
+    /// **The save prompt's Save went to the host**, and what it interrupted
+    /// carries on when the host says its Save has landed (`host_saved`):
+    /// see `DialogAction::SaveChangesSave`. Only that answer sets it, so a
+    /// Ctrl+S after a Save As panel was cancelled does not quit out from
+    /// under the hand that cancelled it.
+    resume_after_host_save: bool,
     /// **"Don't Save" was the answer**, and the New or Open it let through
     /// must not write the session after all. The host's save-back on the
     /// way out (`switch_project`, the New arm) asks the exact dirt question
@@ -4504,6 +4510,7 @@ impl TangentApp {
             history: Vec::new(),
             saved_state: None,
             pending_after_save: None,
+            resume_after_host_save: false,
             outgoing_discarded: false,
             quit_now: false,
             quit_allowed: false,
@@ -17755,8 +17762,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if next != AfterSave::Quit && self.session_held() {
             return true;
         }
-        // A fresh question; an earlier "Don't Save" answered a different one.
+        // A fresh question; an earlier "Don't Save" answered a different one,
+        // and an earlier Save carries nothing on past it.
         self.outgoing_discarded = false;
+        self.resume_after_host_save = false;
         // **The EXACT comparison, and it stays exact.** This is the one
         // thing standing between an afternoon's work and a keystroke, and it
         // runs once per New/Open/Quit — there is nothing to buy here by
@@ -17874,6 +17883,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The host's cue that the answer was "go", taken once.
     pub fn take_quit_now(&mut self) -> bool {
         std::mem::take(&mut self.quit_now)
+    }
+
+    /// **The host's Save has landed** (`ProjectRequest::Save`: the document,
+    /// then the plugins' states beside it). When the save prompt's Save
+    /// raised it (`DialogAction::SaveChangesSave`), the New, Open, Quit or
+    /// Reset Template it interrupted carries on now, as it does after the
+    /// panel of a first save; any other Save carries nothing on.
+    pub fn host_saved(&mut self) {
+        if std::mem::take(&mut self.resume_after_host_save) {
+            self.resume_after_save();
+        }
     }
 
     /// Whether the question has been asked and answered "go". Sticky, and
@@ -37838,8 +37858,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.ask_where_to_keep("");
                     return;
                 }
-                self.save_project_doc();
-                self.resume_after_save();
+                // **The host keeps it, as the Project window's Save has it
+                // kept, and the app carries on once the host says it landed**
+                // (`host_saved`). This wrote the document here, and the
+                // plugins' knobs reached the project's `state/` only in the
+                // host's road that came after (the quit's `on_exit`, New's or
+                // Open's save-back): a kill in the frames between left a
+                // plugin seated since the last save at its defaults, with no
+                // record that a mirror was owed. The host's Save writes that
+                // record before the document (design 6.6) and settles it once
+                // it has mirrored, so a relaunch finishes what a kill cut short.
+                self.resume_after_host_save = true;
+                self.project_request = Some(crate::ports::ProjectRequest::Save);
             }
             DialogAction::SaveChangesSaveAs => {
                 // The panel is asynchronous, so the pending action WAITS —
@@ -37865,6 +37895,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SaveChangesCancel => {
                 // The whole point of the answer: nothing happens.
                 self.pending_after_save = None;
+                self.resume_after_host_save = false;
             }
             // The browser asks; the host reads the disk and hands the rows
             // back through `set_browser`.
