@@ -2536,6 +2536,31 @@ mod tests {
         take_handoffs(e);
     }
 
+    /// **The host's half of a carry** (`DesktopApp`'s relabel block): what
+    /// was written outranks anything shelved for it there, and every bay
+    /// written is rebuilt.
+    fn land(written: Vec<(SeatBay, String)>, displaced: &mut crate::shelf::DisplacedShelf) -> Vec<SeatBay> {
+        for (sb, bundle) in &written {
+            displaced.remove(&(*sb, bundle.clone()));
+        }
+        written.into_iter().map(|(sb, _)| sb).collect()
+    }
+
+    /// **One host frame over `bays`**: the relabels the app handed over,
+    /// carried and landed, then the reconcile.
+    fn host_frame(
+        app: &mut TangentApp,
+        p: &Bridge,
+        e: &mut Engine,
+        displaced: &mut crate::shelf::DisplacedShelf,
+        shelf: &Path,
+        bays: &[SeatBay],
+    ) {
+        let relabels = app.take_bay_relabels();
+        let rebuild = land(carry_relabels(app, p, Some(e), displaced, &relabels, shelf), displaced);
+        reconcile(e, p, app, displaced, shelf, bays, &rebuild);
+    }
+
     /// One block rendered, so the callback takes every instance handed to a
     /// bay's ring and retires the one it replaced: a bay's ring is two deep,
     /// and a test that seats one bay three times without a callback between
@@ -2587,15 +2612,6 @@ mod tests {
         e.load_insert_at(at_b.0, at_b.1, Some(Path::new(EQ_PATH)), Some(dialled(EQ_PATH, &[(0, 0.8)]).as_slice()))
             .expect("the EQ loads");
         take_handoffs(&mut e);
-        // The host's half of a carry: what it wrote outranks the shelf, and
-        // what it wrote is rebuilt.
-        let land = |written: Vec<(SeatBay, String)>, displaced: &mut crate::shelf::DisplacedShelf| -> Vec<SeatBay> {
-            for (sb, bundle) in &written {
-                displaced.remove(&(*sb, bundle.clone()));
-            }
-            written.into_iter().map(|(sb, _)| sb).collect()
-        };
-
         // The swap, carried and rebuilt.
         let swap = [BayRelabel { from: a, to: b }, BayRelabel { from: b, to: a }];
         let rebuild = land(carry_relabels(&after, &p, Some(&e), &displaced, &swap, &shelf), &mut displaced);
@@ -2622,6 +2638,73 @@ mod tests {
         let rebuild = land(written, &mut displaced);
         reconcile(&mut e, &p, &before, &mut displaced, &shelf, &[a, b], &rebuild);
         assert_eq!(e.save_insert_state_at(at_a.0, at_a.1), Some(dial), "the comp plays in its own bay without its dial");
+        let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
+    }
+
+    /// **An FX swap's undo and redo carry each unit with what it was dialled
+    /// to since** (W5-identity-maps, after review: an FX drag or swap is a
+    /// bay move, so it is relabels, design 8). A comp and an EQ trade bays
+    /// through the app's own trade, the comp is dialled in its new bay, and
+    /// Ctrl+Z puts the names back. The swap's moment hands the host its
+    /// inverse, so the comp's playing settings are carried home before its
+    /// bay is rebuilt and it comes back dialled. With the trade moving the
+    /// names alone, the undo carried nothing: the comp's bay was rebuilt
+    /// from what the displaced shelf kept of it when it LEFT that bay, and
+    /// the dial was lost. Then Ctrl+Shift+Z swaps them again, dial and all.
+    #[test]
+    fn a_bay_swaps_undo_and_redo_carry_each_units_dial() {
+        let shelf = scratch("bayswap").join("state");
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        let track = row(&s, 1);
+        let (a, b) = (SeatBay::new(track, Rack::Chain(0), 0), SeatBay::new(track, Rack::Chain(0), 1));
+        s.plugins.insert(a, COMP_PATH.to_owned());
+        s.plugins.insert(b, EQ_PATH.to_owned());
+        let mut app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        let (at_a, at_b) = (p.engine_bay(a).expect("bay a"), p.engine_bay(b).expect("bay b"));
+        let mut displaced = crate::shelf::DisplacedShelf::new();
+        e.load_insert_at(at_a.0, at_a.1, Some(Path::new(COMP_PATH)), Some(dialled(COMP_PATH, &[(0, 0.2)]).as_slice()))
+            .expect("the comp loads");
+        e.load_insert_at(at_b.0, at_b.1, Some(Path::new(EQ_PATH)), Some(dialled(EQ_PATH, &[(0, 0.8)]).as_slice()))
+            .expect("the EQ loads");
+        take_handoffs(&mut e);
+        let comp_live = e.save_insert_state_at(at_a.0, at_a.1).expect("the comp's settings");
+        let eq_live = e.save_insert_state_at(at_b.0, at_b.1).expect("the EQ's settings");
+        // The desk before the swap is a moment of its own: the undo returns
+        // there. (Escape closes whatever the first frame opened over it.)
+        key(&mut app, egui::Key::F24, egui::Modifiers::NONE);
+        key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        app.commit_undo_moment();
+        let _ = app.take_bay_relabels();
+
+        app.trade_bays(a, b);
+        host_frame(&mut app, &p, &mut e, &mut displaced, &shelf, &[a, b]);
+        assert_eq!(e.save_insert_state_at(at_b.0, at_b.1), Some(comp_live), "the swap did not carry the comp's settings");
+        assert_eq!(e.save_insert_state_at(at_a.0, at_a.1), Some(eq_live.clone()), "the swap did not carry the EQ's settings");
+        // Dialled where it landed; nothing writes its file.
+        e.load_insert_at(at_b.0, at_b.1, Some(Path::new(COMP_PATH)), Some(dialled(COMP_PATH, &[(0, 0.9), (1, 0.1)]).as_slice()))
+            .expect("the dial");
+        take_handoffs(&mut e);
+        let dial = e.save_insert_state_at(at_b.0, at_b.1).expect("the comp's dial");
+
+        key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert_eq!(app.plugin(a), Some(COMP_PATH), "fixture: the undo did not put the comp's name back");
+        host_frame(&mut app, &p, &mut e, &mut displaced, &shelf, &[a, b]);
+        assert_eq!(
+            e.save_insert_state_at(at_a.0, at_a.1),
+            Some(dial.clone()),
+            "the swap's undo brought the comp home without the dial it was given after the swap"
+        );
+        assert_eq!(e.save_insert_state_at(at_b.0, at_b.1), Some(eq_live.clone()), "the undo lost the EQ's settings");
+
+        key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        assert_eq!(app.plugin(b), Some(COMP_PATH), "fixture: the redo did not swap the names again");
+        host_frame(&mut app, &p, &mut e, &mut displaced, &shelf, &[a, b]);
+        assert_eq!(e.save_insert_state_at(at_b.0, at_b.1), Some(dial), "the redo lost the comp's dial");
+        assert_eq!(e.save_insert_state_at(at_a.0, at_a.1), Some(eq_live), "the redo lost the EQ's settings");
         let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
     }
 

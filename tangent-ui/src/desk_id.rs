@@ -192,8 +192,11 @@ impl SeatBay {
 /// them and neither reads the other's result.
 ///
 /// Identity makes a reorder carry nothing, so this is only for the moves
-/// that really are moves between bays: the drum panel's pad swap, and its
-/// undo and redo.
+/// that really are moves between bays: the drum panel's pad swap, the
+/// desk's FX drag and swap (`TangentApp::trade_bays`), and their undo and
+/// redo. A copy or a paste is not one: its source keeps its plugin, so a
+/// relabel's inverse would carry the copy's later settings back over the
+/// source's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BayRelabel {
     pub from: SeatBay,

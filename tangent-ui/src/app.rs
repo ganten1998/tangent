@@ -12068,9 +12068,9 @@ impl TangentApp {
     }
 
     /// **The plugins a gesture carried between bays**, for the host to carry
-    /// their settings with them (C11): a drum pad swap, or its undo or redo.
-    /// One set, applied together (read every source, then write every
-    /// destination). Taken once.
+    /// their settings with them (C11): a drum pad swap, an FX drag or swap
+    /// (`trade_bays`), or the undo or redo of one. One set, applied together
+    /// (read every source, then write every destination). Taken once.
     pub fn take_bay_relabels(&mut self) -> Vec<crate::desk_id::BayRelabel> {
         std::mem::take(&mut self.bay_relabels)
     }
@@ -12888,6 +12888,15 @@ impl TangentApp {
     /// second copy of the plugin at its factory defaults. The request names
     /// both bays by the host's `(seat, bay)`, worked out from the bays'
     /// identities as the rows stand now.
+    ///
+    /// **A paste is a copy, so it hands the host no relabels** (a move does:
+    /// `trade_bays`). The source keeps its plugin, so the inverse of a
+    /// relabel on the undo would carry the pasted unit's later settings back
+    /// over the source's own. What the undo owes is the bay's previous
+    /// tenant, and the reconcile shelved that tenant's playing settings as
+    /// the paste tore it down (`displaced_states`), which is where the
+    /// rebuild reads it from; the redo finds the pasted unit there the same
+    /// way.
     pub fn paste_fx(&mut self, sb: crate::desk_id::SeatBay) {
         let Some(from) = self.fx_clipboard else {
             return;
@@ -35352,8 +35361,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
-    /// **Two bays trade tenants, and each plugin takes its automation
-    /// along**: the desk's move (one bay empty) and swap, as ONE moment.
+    /// **Two bays trade tenants, and each plugin takes its automation and
+    /// its settings along**: the desk's move (one bay empty) and swap, as
+    /// ONE moment.
     ///
     /// Written one `set_insert` at a time, each bay changes tenant and lets
     /// go of the curves the plugin leaving it drew (see
@@ -35401,6 +35411,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.set_plugin(a, pb.as_deref());
         self.set_plugin(b, pa.as_deref());
+        // **And the plugins themselves move, settings and all** (design 8:
+        // "bay moves become explicit SeatBay relabels"). The trade is handed
+        // to the host as relabels, so each plugin's playing settings follow
+        // it into the other bay (`engine_bridge::carry_relabels`, read every
+        // source, then write every destination), and the moment keeps them,
+        // so its undo and its redo carry the settings back and forth with
+        // the names (`Moment::relabels`), as a pad swap's do. Without them
+        // the host wrote the two files at the gesture and nothing carried
+        // them back: a unit dialled after a swap came home on Ctrl+Z at the
+        // settings it had when it left, read off the displaced shelf under
+        // the bay it had left from. Two units of one bundle trade their
+        // settings this way too, which a trade of names alone never did.
+        if pa.is_some() || pb.is_some() {
+            let set = [
+                crate::desk_id::BayRelabel { from: a, to: b },
+                crate::desk_id::BayRelabel { from: b, to: a },
+            ];
+            self.send_relabels(&set);
+            self.relabels_since_moment = crate::desk_id::compose_relabels(&self.relabels_since_moment, &set);
+        }
         if !carried.is_empty() {
             let mut all = self.arrangement.automation.curves().to_vec();
             for mut c in carried {
@@ -56063,6 +56093,74 @@ mod tests {
         app.undo();
         assert!(app.take_bay_relabels().is_empty(), "an undo past the swap relabelled something");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An FX drag and an FX swap hand the host their bays as relabels,
+    /// and keep them in their moment** (W5-identity-maps, after review;
+    /// design 8: "bay moves become explicit SeatBay relabels"). The desk's
+    /// trade (`trade_bays`, every move and swap road's) used to move the
+    /// NAMES alone: the host wrote the two state files at the gesture and
+    /// nothing carried them on the undo, so a unit dialled after a swap came
+    /// home at the settings it left with. The swap's moment now holds the
+    /// swap, the undo hands over its inverse and the redo the swap again,
+    /// as a pad swap's does; a move to an empty bay is the same pair with
+    /// one side empty; a trade of two empty bays carries nothing, and a
+    /// reorder or a paste is no move at all.
+    #[test]
+    fn a_bay_move_and_a_bay_swap_hand_the_host_relabels_both_ways() {
+        use crate::desk_id::{BayRelabel, Node, Rack, SeatBay};
+        let sorted = |mut v: Vec<BayRelabel>| {
+            v.sort();
+            v
+        };
+        let pair = |a: SeatBay, b: SeatBay| sorted(vec![BayRelabel { from: a, to: b }, BayRelabel { from: b, to: a }]);
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let track = Node::Track(app.track_ids()[2]);
+        let bay = |b: u8| SeatBay::new(track, Rack::Chain(0), b);
+        let (a, b, c) = (bay(0), bay(1), bay(2));
+        app.set_plugin(a, Some("/x/Comp.vst3"));
+        app.set_plugin(b, Some("/x/EQ.vst3"));
+        app.commit_view_change();
+        let _ = app.take_bay_relabels();
+
+        // The swap.
+        app.trade_bays(a, b);
+        let swap = sorted(app.take_bay_relabels());
+        assert_eq!(swap, pair(a, b), "the swap told the host nothing");
+        assert_eq!((app.plugin(a), app.plugin(b)), (Some("/x/EQ.vst3"), Some("/x/Comp.vst3")), "fixture: no swap");
+        app.undo();
+        assert_eq!(app.plugin(a), Some("/x/Comp.vst3"), "fixture: undo did not put the bays back");
+        assert_eq!(
+            sorted(app.take_bay_relabels()),
+            sorted(swap.iter().map(|r| r.inverse()).collect()),
+            "undo put the bay NAMES back and told the host nothing: each unit comes home at the \
+             settings it left with"
+        );
+        app.redo();
+        assert_eq!(sorted(app.take_bay_relabels()), swap, "redo of the swap told the host nothing");
+
+        // The move, onto an empty bay: the same pair, one side empty.
+        app.trade_bays(b, c);
+        let moved = sorted(app.take_bay_relabels());
+        assert_eq!(moved, pair(b, c), "the move told the host nothing");
+        assert_eq!((app.plugin(b), app.plugin(c)), (None, Some("/x/Comp.vst3")), "fixture: no move");
+        app.undo();
+        assert_eq!(
+            sorted(app.take_bay_relabels()),
+            sorted(moved.iter().map(|r| r.inverse()).collect()),
+            "undo of the move told the host nothing"
+        );
+        app.redo();
+        assert_eq!(sorted(app.take_bay_relabels()), moved, "redo of the move told the host nothing");
+
+        // Two empty bays trade nothing, and a moment that carried nothing
+        // hands the host nothing on its undo.
+        let d = bay(1);
+        app.trade_bays(d, SeatBay::new(track, Rack::Chain(1), 0));
+        assert!(app.take_bay_relabels().is_empty(), "a trade of two empty bays relabelled something");
+        app.set_plugin(SeatBay::new(track, Rack::Chain(1), 2), Some("/x/Plate.vst3"));
+        app.undo();
+        assert!(app.take_bay_relabels().is_empty(), "the undo of a seat relabelled something");
     }
 
     /// **A route and a key survive a drag reorder, an insert-below and a
