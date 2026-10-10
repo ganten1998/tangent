@@ -94,6 +94,53 @@ echo "==> cargo test --release render_golden  (the render goldens, in the profil
 if [ "$(uname -sm)" = "Darwin arm64" ]; then GOLDENS=2; else GOLDENS=1; fi
 named_leg "$GOLDENS" --release -p tangent --bin tangent render_golden::
 
+echo "==> the ban scans  (no live code names the fixed desk, no surface undersells a key)"
+# **Every source scan the unlimited desk left, by name.** Each wave of that
+# work (docs/design/unlimited-tracks.md) took something away (the desk's
+# width, strip space, the seat arithmetic, the in-place shelf renames, a
+# second road to the licence) and kept a scan that refuses it back, beside
+# the code it guards. They already ran in the suite above; this leg names
+# them, so deleting or renaming one turns the gate red here instead of
+# quietly retiring the ban (`named_leg` counts them). `ban_scan` is the
+# tree-wide one over every crate's shipped code, `copy_scan` the phrase scan
+# over every surface that says what a key does.
+named_leg 21 -p tangent-ui --lib -- --exact \
+  ban_scan::no_live_code_names_the_fixed_desk \
+  ban_scan::every_banned_name_and_clamp_fails_the_scan_when_planted \
+  ban_scan::every_exemption_names_what_is_still_there \
+  ban_scan::test_only_modules_are_found_from_their_declarations \
+  copy_scan::no_surface_says_a_key_is_only_a_thank_you \
+  copy_scan::every_refused_phrase_fails_the_scan_when_planted \
+  era_corpus::the_lifts_read_no_live_constant \
+  era_corpus::nothing_but_the_choosers_spells_the_real_config_or_media_path \
+  settings::tests::the_historical_migrations_do_not_read_todays_constants \
+  recorder::strip_ref_tests::no_view_code_does_strip_index_arithmetic \
+  recorder::strip_ref_tests::no_live_code_works_out_a_seat \
+  recorder::strip_ref_tests::no_live_code_reads_strip_space \
+  app::paywall_tests::the_gate_reads_only_is_supporter \
+  app::paywall_tests::the_fixture_key_is_read_only_by_tests \
+  app::paywall_tests::no_test_builds_the_app_through_the_production_door \
+  app::lane_refs_tests::every_lane_shaped_field_of_the_app_has_a_class \
+  app::lane_refs_tests::the_classification_scan_fails_a_planted_lane \
+  app::width_tests::persistence_and_drawing_never_read_the_licence \
+  app::save_tests::a_save_writes_the_desk_the_session_shows \
+  copy_scan::the_lexer_reads_shipped_literals_only \
+  copy_scan::the_new_copy_passes_the_scan
+named_leg 13 -p tangent --bin tangent -- --exact \
+  instrument::lanesets::no_engine_walk_clamps_a_lane_onto_another \
+  instrument::lanesets::the_clamp_scan_finds_every_spelling_it_bans \
+  instrument::lanesets::no_renderer_walk_shifts_a_lane_into_a_word \
+  instrument::lanesets::the_shift_scan_finds_a_lane_mask_in_a_walk \
+  instrument::stack_budget::the_key_snapshot_is_not_a_lane_field \
+  engine_bridge::tests::the_desktop_pushes_the_desk_only_through_the_bridge \
+  desktop::tests::the_host_reads_none_of_the_uis_desk_width_constants \
+  desktop::tests::the_host_works_out_no_seat_and_builds_no_lane_mask \
+  desktop::tests::a_reorder_sends_the_engine_nothing_but_the_plan \
+  desktop::tests::a_reorder_moves_no_state_file \
+  konami_e2e::the_engine_and_the_shelf_never_read_the_licence \
+  shelf::tests::no_new_build_path_renames_or_deletes_a_legacy_sidecar \
+  slot_gaps::no_host_road_names_a_bay_by_the_frozen_maps_seat
+
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
 cargo test -p tangent-core
 
