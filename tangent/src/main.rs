@@ -133,6 +133,10 @@ mod render_golden;
 /// docs/design/unlimited-tracks.md, C9.
 #[cfg(feature = "recorder")]
 mod engine_bridge;
+/// The Konami and paywall suite past thirty-two rows, end to end through the
+/// bridge: docs/design/unlimited-tracks.md, 11.2 and W6-rows-unlimited.
+#[cfg(all(test, feature = "recorder"))]
+mod konami_e2e;
 /// The plugin-state shelves, named by identity, and the one copy of the
 /// legacy global shelf into those names. docs/design/unlimited-tracks.md,
 /// section 6.6 and C10.
