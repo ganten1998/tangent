@@ -422,15 +422,15 @@ pub fn dx7_voice(app: &TangentApp, strip: usize) -> crate::dx7::Voice {
 }
 
 /// **Which bus a curve's control is the send to** (`AutoParam::SendTo {
-/// to }`), the decoder [`Bridge::send_curves`] is handed by the live push
-/// and the export. MERGE-ME(W7-buses-ui): that lane appends the variant
-/// (`automation.rs`, key `send:t<id>`), and at the merge this answers
-/// `match param { AutoParam::SendTo { to } => Some(to), _ => None }`. Until
-/// then no control is a send to a bus, which is true of every desk this
-/// base can hold: nothing here can draw a curve on a bus send.
+/// to }`, key `send:t<id>`), the decoder [`Bridge::send_curves`] is handed
+/// by the live push and the export: the one control that names another row.
+/// Every other control's curve rides its own lane's curves, the effects
+/// return's send (`AutoParam::Send`) among them.
 pub fn send_bus_of(param: tangent_ui::automation::AutoParam) -> Option<TrackId> {
-    let _ = param;
-    None
+    match param {
+        tangent_ui::automation::AutoParam::SendTo { to } => Some(to),
+        _ => None,
+    }
 }
 
 /// **Every bay the desk seats, by identity**: the app's own map (C11's
@@ -890,17 +890,22 @@ impl Bridge {
     }
 
     /// **The curves that automate a strip's send to a bus, as the plan's
-    /// send curves** (design 9: send automation works per return;
-    /// W7-slot-gaps, the bridge's half of `AutoParam::SendTo`): each such
-    /// curve on a row becomes a [`SendCurve`] from that row's lane to the
-    /// bus's lane, stamped with the source lane's generation, so the engine
-    /// finds its send by its two ends in whichever plan plays
+    /// send curves** (design 9: send automation works per return): each
+    /// such curve on a row becomes a [`SendCurve`] from that row's lane to
+    /// the bus's lane, stamped with the source lane's generation, so the
+    /// engine finds its send by its two ends in whichever plan plays
     /// (`Engine::set_send_curves`) and a curve drawn for a track that has
     /// gone plays on nobody. `bus_of` reads which bus a curve's control
-    /// names (`AutoParam::SendTo { to }`, the variant W7-buses-ui appends);
-    /// a curve naming none, or a bus with no lane, is no send curve. A send
-    /// to Return 0 is not here: `AutoParam::Send` stays the Fx send, on the
-    /// lane's own curves.
+    /// names ([`send_bus_of`], `AutoParam::SendTo { to }`); a curve naming
+    /// none, or a bus with no lane, is no send curve. A send to Return 0 is
+    /// not here: `AutoParam::Send` stays the Fx send, on the lane's own
+    /// curves.
+    ///
+    /// **Each names the POST-fader send** (`SendCurve::pre` false): the
+    /// app's curve on a send to a bus is that send's alone, and a pre-fader
+    /// send is a cue feed with no curve (`AutoParam::SendTo`). A strip a
+    /// file has sending to one bus from both sides of its fader keeps its
+    /// cue where it was set while the curve rides the other.
     pub fn send_curves(
         &self,
         auto: &tangent_ui::automation::Automation,
@@ -915,6 +920,7 @@ impl Bridge {
                 Some(SendCurve {
                     from: SendFrom::Lane(from.slot),
                     to: SendTo::Lane(to.slot),
+                    pre: false,
                     gen: from.gen,
                     curve: c.clone(),
                 })
@@ -2988,14 +2994,14 @@ mod tests {
 
     /// **A curve on a strip's send to a bus is that send's curve, between
     /// its two lanes, at any row** (W7-slot-gaps item 5, the bridge's half
-    /// of `AutoParam::SendTo`). This base has no control that names a bus
-    /// send (W7-buses-ui appends it), so a decoder stands in for the
-    /// variant: it reads `AutoParam::Send` as a send to row 120's track and
-    /// `AutoParam::Pan` as one to a track the desk does not hold. A curve on
-    /// each of rows 1, 31, 32, 33, 40 and 200 is a [`SendCurve`] from that
-    /// row's lane to row 120's, stamped with the source lane's generation;
-    /// the curve to a track with no lane, the master's and the one the
-    /// decoder names no bus for are none.
+    /// of `AutoParam::SendTo`, decoded by [`send_bus_of`] as the live push
+    /// and the export decode it). A curve on each of rows 1, 31, 32, 33, 40
+    /// and 200 on its send to row 120's bus is a [`SendCurve`] from that
+    /// row's lane to row 120's, stamped with the source lane's generation,
+    /// on the post-fader side its curve belongs to. A curve on a send to a
+    /// track the desk does not hold, the master's, and a control that names
+    /// no bus (the effects return's `Send` rides the lane's own curves) are
+    /// none.
     #[test]
     fn a_send_curve_runs_between_its_two_lanes_at_any_row() {
         const ROWS: [usize; 6] = [1, 31, 32, 33, 40, 200];
@@ -3006,7 +3012,8 @@ mod tests {
             next += 1;
         }
         s.next_track_id = next;
-        kind(&mut s, &[1, 31, 32, 33, 40, 120, 200], ChannelKind::Audio);
+        kind(&mut s, &[1, 31, 32, 33, 40, 200], ChannelKind::Audio);
+        kind(&mut s, &[120], ChannelKind::Bus);
         let app = app_with(s);
         let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
         let mut p = Bridge::new();
@@ -3014,25 +3021,27 @@ mod tests {
         let bus = app.track_ids()[120];
         let gone = TrackId(u32::MAX - 1);
         assert!(app.row_of(gone).is_none(), "fixture: the gone track is on the desk");
-        let decode = |param: AutoParam| match param {
-            AutoParam::Send => Some(bus),
-            AutoParam::Pan => Some(gone),
-            _ => None,
-        };
         let flat = |lane: AutoLane, param| Curve::sanitised(lane, param, vec![Point { at_s: 0.0, value: 0.5, shape: Shape::Hold }]);
-        let mut curves: Vec<Curve> = ROWS.iter().map(|r| flat(AutoLane::Row(*r), AutoParam::Send)).collect();
-        curves.push(flat(AutoLane::Row(40), AutoParam::Pan));
-        curves.push(flat(AutoLane::Row(33), AutoParam::Gain));
-        curves.push(flat(AutoLane::Master, AutoParam::Send));
-        let got = p.send_curves(&Automation::from_curves(curves), &decode);
+        let mut curves: Vec<Curve> = ROWS.iter().map(|r| flat(AutoLane::Row(*r), AutoParam::SendTo { to: bus })).collect();
+        curves.push(flat(AutoLane::Row(40), AutoParam::SendTo { to: gone }));
+        curves.push(flat(AutoLane::Row(33), AutoParam::Send));
+        curves.push(flat(AutoLane::Row(32), AutoParam::Gain));
+        curves.push(flat(AutoLane::Master, AutoParam::SendTo { to: bus }));
+        let got = p.send_curves(&Automation::from_curves(curves), &send_bus_of);
         let to = SendTo::Lane(p.lane_of(bus).expect("the bus's lane").slot);
-        let have: Vec<(SendFrom, SendTo, u32)> = got.iter().map(|c| (c.from, c.to, c.gen)).collect();
+        let have: Vec<(SendFrom, SendTo, bool, u32)> = got.iter().map(|c| (c.from, c.to, c.pre, c.gen)).collect();
         assert_eq!(have.len(), ROWS.len(), "not one send curve a row: {have:?}");
         for row in ROWS {
             let l = p.lane(row).expect("a row's lane");
-            assert!(have.contains(&(SendFrom::Lane(l.slot), to, l.gen)), "row {row}'s curve is no send from its lane to the bus's: {have:?}");
+            assert!(
+                have.contains(&(SendFrom::Lane(l.slot), to, false, l.gen)),
+                "row {row}'s curve is no post-fader send from its lane to the bus's: {have:?}"
+            );
         }
-        assert!(got.iter().all(|c| c.curve.param == AutoParam::Send), "a curve the decoder sent nowhere became a send curve");
+        assert!(
+            got.iter().all(|c| c.curve.param == AutoParam::SendTo { to: bus }),
+            "a curve that names no bus on this desk became a send curve"
+        );
     }
 
     /// **Both offline builders are one builder, and the host pushes no desk

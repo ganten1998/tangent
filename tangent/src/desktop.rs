@@ -16198,23 +16198,42 @@ impl DesktopApp {
     /// every curve on its own track. `pushed_auto` keeps the app's own
     /// picture, by row, which is what the open faces are drawn from.
     fn push_automation(&mut self) {
-        let want = self.app.engine_automation();
-        if self.pushed_auto.as_ref() == Some(&want) {
+        Self::push_curves(self.recorder.engine.as_mut(), &self.bridge, &self.app, &mut self.pushed_auto);
+    }
+
+    /// **The frame's push of the curves**, over what it touches: the engine,
+    /// the bridge that names each row's lane, the app whose curves they are,
+    /// and what the engine was last handed (`pushed`, which a lane that came
+    /// or went clears). The width suite (`slot_gaps`) hands a lane past the
+    /// thirty-second its curves, and a strip's send to a bus its curve, by
+    /// this road and not a copy of it: the suite's live engine had no curve
+    /// at all, so a send's curve that the export played was never heard from
+    /// it.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn push_curves(
+        engine: Option<&mut crate::instrument::Engine>,
+        bridge: &crate::engine_bridge::Bridge,
+        app: &TangentApp,
+        pushed: &mut Option<tangent_ui::automation::Automation>,
+    ) {
+        let want = app.engine_automation();
+        if pushed.as_ref() == Some(&want) {
             return;
         }
-        let slotted = self.bridge.slot_automation(&want);
+        let slotted = bridge.slot_automation(&want);
         // **The sends' own curves, beside them** (`Bridge::send_curves`,
         // W7-slot-gaps): a level drawn on a send to a bus, by the send's two
-        // ends. First, because their ring answers Busy while the last list is
-        // still on its way in, and then this frame pushes neither and the
-        // next asks again, so the two never disagree about which song plays.
-        let sends = self.bridge.send_curves(&want, &crate::engine_bridge::send_bus_of);
-        if let Some(e) = self.recorder.engine.as_mut() {
+        // ends and its side of the fader. First, because their ring answers
+        // Busy while the last list is still on its way in, and then this
+        // frame pushes neither and the next asks again, so the two never
+        // disagree about which song plays.
+        let sends = bridge.send_curves(&want, &crate::engine_bridge::send_bus_of);
+        if let Some(e) = engine {
             if e.set_send_curves(sends).is_err() {
                 return;
             }
             e.set_automation_slotted(slotted);
-            self.pushed_auto = Some(want);
+            *pushed = Some(want);
         }
     }
 

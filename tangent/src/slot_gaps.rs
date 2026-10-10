@@ -26,10 +26,10 @@
 //! map's seats, which is what made the faces' roads stop at the
 //! thirty-second row. The parts that need a BUS on the desk (a key to a
 //! bus, a curve on a send to one, and the mixing leftovers of item 6, which
-//! each cross one) have no road from the desk until W7-buses-ui gives the
-//! bridge buses: the engine holds all three at these widths
-//! (`slot_engine::gaps`, `slot_engine::buses`), and the desk's half of the
-//! first two waits here as MERGE-ME tests.
+//! each cross one) had no road from the desk until W7-buses-ui gave the
+//! bridge buses; the engine held them at these widths
+//! (`slot_engine::gaps`, `slot_engine::buses`), and since W7-join the
+//! desk's half of each runs here too.
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
 //! directory of the test's own (`composite::tiers`), every project and every
@@ -197,9 +197,9 @@ fn open_saved(tag: &str, settings: Settings, path: &Path) -> TangentApp {
 /// the reconcile's ledger and displaced shelf, the live shelf it seats bays
 /// from (this test's own, `<scratch>/state`), the engine's sentence, the
 /// samplers' record and cache, the kits' cache and the knobs each kit was
-/// last told. [`Host::frame`] runs a frame over them through `DesktopApp`'s
-/// own functions, so a road of the host's that stops at the thirty-second
-/// row stops here too.
+/// last told, and the curves the engine was last handed. [`Host::frame`]
+/// runs a frame over them through `DesktopApp`'s own functions, so a road
+/// of the host's that stops at the thirty-second row stops here too.
 #[derive(Default)]
 struct Host {
     shelf: PathBuf,
@@ -210,6 +210,7 @@ struct Host {
     sampler_cache: HashMap<PathBuf, Decoded>,
     pad_cache: HashMap<PathBuf, Decoded>,
     pushed_pads: BTreeMap<usize, DrumKitParams>,
+    pushed_auto: Option<tangent_ui::automation::Automation>,
 }
 
 impl Host {
@@ -233,8 +234,10 @@ impl Host {
     /// - `push_monitor_settings`'s: the bridge's sync, a lane leaving
     ///   written down and forgotten (`forget_lane`) and one taken back
     ///   reclaimed (`reclaim_lanes`), what the host keeps per slot forgotten
-    ///   for a lane that came or went (`forget_moved_slots`), and the kits'
-    ///   knobs (`push_pad_knobs`);
+    ///   for a lane that came or went (`forget_moved_slots`, and the curves
+    ///   it last handed over), and the kits' knobs (`push_pad_knobs`);
+    /// - `push_automation`'s: the curves, the sends' own among them
+    ///   (`push_curves`), when they changed;
     /// - `after_frame`'s reconcile: the bays the desk wants
     ///   (`bays_wanted`), the next one owed a load (`next_owed_bay`) and its
     ///   load (`load_bay`), one a frame, the frames run back to back until
@@ -249,10 +252,14 @@ impl Host {
         };
         DesktopApp::reclaim_lanes(&mut self.ledger, &synced);
         DesktopApp::forget_moved_slots(&synced.moved, &mut self.sampler_have, &mut self.pushed_pads);
+        if !synced.moved.is_empty() {
+            self.pushed_auto = None;
+        }
         if synced.primed {
             self.pushed_pads.clear();
         }
         DesktopApp::push_pad_knobs(e, p, app, &mut self.pushed_pads);
+        DesktopApp::push_curves(Some(&mut *e), p, app, &mut self.pushed_auto);
         let mut settled = false;
         for _ in 0..10_000 {
             let wanted = DesktopApp::bays_wanted(app, p);
@@ -868,7 +875,7 @@ fn hold_keys(prefix: &str, comps: &[usize], path: &Path, dir: &Path, desk: &dyn 
 /// needed no fix: this proves them through the bridge, both ways. The key
 /// to a BUS is held at the engine
 /// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`) and from
-/// the desk by the MERGE-ME test below, which waits for the bridge's buses.
+/// the desk by the bus test below.
 #[test]
 fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
     let dir = scratch("keys");
@@ -906,20 +913,16 @@ fn feeder(i: usize) -> usize {
 
 /// **A key reaches a comp on a BUS past slot 31 as it reaches row 1's, live
 /// and in the export, and no other comp** (W7-slot-gaps item 4, its bus
-/// half). Every subject and row 2 a bus with a hard comp in its first bay,
-/// each fed at unity by a quiet track of its own (rows 101 to 107), and the
-/// desk's key drawn from row 150 to one subject's comp at a time while a
-/// loud clip plays there.
-///
-/// MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send
-/// to one until that lane lands (`RowKind::Bus` reaches no plan flag and
-/// `TrackRow::sends` no `InSend`), so here every bus is an empty lane with
-/// nothing arriving and its comp squeezes nothing. The engine holds a key
-/// to a bus at these widths already
-/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`); this
-/// holds the road from the desk to it. Enable it at that merge.
+/// half, run since W7-join). Every subject and row 2 a bus with a hard comp
+/// in its first bay, each fed at unity by a quiet track of its own (rows 101
+/// to 107), and the desk's key drawn from row 150 to one subject's comp at a
+/// time while a loud clip plays there. The bridge makes each bus row a BUS
+/// lane and carries each feeder's send to it (`Bridge::read_sends`), so
+/// every comp has its feeder's tone to squeeze and the control's to be
+/// measured against; the engine's own door is
+/// `gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`, and this is
+/// the road from the desk to it.
 #[test]
-#[ignore = "MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send to one until that lane lands"]
 fn a_key_reaches_a_comp_on_a_bus_past_slot_31_as_on_row_1_live_and_in_the_export() {
     use tangent_ui::desk_model::Send as DeskSend;
     let dir = scratch("bus-keys");
@@ -1056,30 +1059,21 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
 }
 
 /// **The control a curve on a strip's send to `bus` is drawn on**:
-/// `AutoParam::SendTo { to: bus }`, the variant W7-buses-ui appends.
-/// MERGE-ME(W7-buses-ui): answer `Some(AutoParam::SendTo { to: bus })`.
-fn send_to(bus: TrackId) -> Option<tangent_ui::automation::AutoParam> {
-    let _ = bus;
-    None
+/// `AutoParam::SendTo { to: bus }`, the post-fader send's.
+fn send_to(bus: TrackId) -> tangent_ui::automation::AutoParam {
+    tangent_ui::automation::AutoParam::SendTo { to: bus }
 }
 
 /// **A curve on a strip's send to a bus plays on a track past slot 31 as on
-/// row 1, live and in the export** (W7-slot-gaps item 5, its curves). Every
-/// subject an audio track playing a steady tone into a bus of its own (rows
-/// 101 to 106) by a send at unity, and a curve on that send holding it at a
-/// quarter: each bus hears a quarter of its track, as row 1's does, on both
-/// engines (`Bridge::send_curves`, which the live push and `full_build_with`
-/// both hand the engine). Without the curve a bus hears its track whole.
-///
-/// MERGE-ME(W7-buses-ui): that lane appends `AutoParam::SendTo { to }` (the
-/// control the curve is drawn on: [`send_to`] answers it then, and
-/// `engine_bridge::send_bus_of` reads it, its body spelled out where it
-/// stands) and gives the bridge buses and their sends. The engine half is
-/// held already: the knob as a plan entry above, and
-/// `engine_bridge::tests::a_send_curve_runs_between_its_two_lanes_at_any_row`
-/// with a decoder standing in for the variant. Enable it at that merge.
+/// row 1, live and in the export** (W7-slot-gaps item 5, its curves, run
+/// since W7-join). Every subject an audio track playing a steady tone into a
+/// bus of its own (rows 101 to 106) by a send at unity, and a curve on that
+/// send holding it at a quarter: each bus hears a quarter of its track, as
+/// row 1's does, on both engines (`Bridge::send_curves`, which the live
+/// push and `full_build_with` both hand the engine). Without the curve a
+/// bus hears its track whole. The control the curve is drawn on is
+/// [`send_to`]'s, which `engine_bridge::send_bus_of` reads.
 #[test]
-#[ignore = "MERGE-ME(W7-buses-ui): AutoParam::SendTo and the bridge's sends to a bus land with that lane"]
 fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export() {
     use tangent_ui::automation::{Curve, Point, Shape};
     use tangent_ui::desk_model::Send as DeskSend;
@@ -1107,7 +1101,7 @@ fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export()
     };
     let mut saved = Arrangement::load_from(&path);
     for (row, (_, bus)) in SUBJECTS.into_iter().zip(&buses) {
-        let param = send_to(*bus).expect("MERGE-ME(W7-buses-ui): no control is a send to a bus on this base");
+        let param = send_to(*bus);
         let hold = |at_s| Point { at_s, value: 0.25, shape: Shape::Hold };
         saved.automation.set(Curve::sanitised(row, param, vec![hold(0.0), hold(30.0)]));
     }
@@ -1227,8 +1221,9 @@ fn no_host_road_names_a_bay_by_the_frozen_maps_seat() {
 /// the frame's reconcile loads its bay through `load_bay` and walks through
 /// `next_owed_bay`, the sampler reload is `deliver_samples`, the kits'
 /// reload `deliver_kits`, their knobs `push_pad_knobs`, a lane that came or
-/// went is forgotten by `forget_moved_slots`, and a face's knob is set by
-/// `set_insert_param`. A road the frame took by other lines would leave
+/// went is forgotten by `forget_moved_slots` (and the curves last handed
+/// over with it), the curves go by `push_curves`, and a face's knob is set
+/// by `set_insert_param`. A road the frame took by other lines would leave
 /// this suite proving a function nothing calls.
 #[test]
 fn the_frame_runs_the_roads_this_suite_drives() {
@@ -1240,13 +1235,23 @@ fn the_frame_runs_the_roads_this_suite_drives() {
         &src[at..at + src[at..].find("\n    }\n").expect("its end")]
     };
     let frame = body_of("fn after_frame(&mut self");
-    for road in ["Self::bays_wanted(&self.app, &self.bridge)", "Self::next_owed_bay(&wanted,", "Self::load_bay(", "Self::set_insert_param("] {
+    for road in [
+        "Self::bays_wanted(&self.app, &self.bridge)",
+        "Self::next_owed_bay(&wanted,",
+        "Self::load_bay(",
+        "Self::set_insert_param(",
+        "self.push_automation();",
+    ] {
         assert!(frame.contains(road), "the frame no longer takes `{road}`");
     }
     let push = body_of("fn push_monitor_settings(&mut self)");
-    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs("] {
+    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs(", "self.pushed_auto = None;"] {
         assert!(push.contains(road), "the frame's push no longer takes `{road}`");
     }
+    assert!(
+        body_of("fn push_automation(&mut self)").contains("Self::push_curves(self.recorder.engine.as_mut(), &self.bridge, &self.app, &mut self.pushed_auto)"),
+        "the curves go another road"
+    );
     assert!(body_of("fn reload_sampler(&mut self)").contains("Self::deliver_samples("), "the sampler reload goes another road");
     assert!(body_of("fn reload_pads(&mut self)").contains("Self::deliver_kits("), "the kits' reload goes another road");
 }
