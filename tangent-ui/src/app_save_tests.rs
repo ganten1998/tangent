@@ -236,6 +236,76 @@ fn a_track_added_then_kept_reopens_with_its_kit_on_every_save_road() {
     }
 }
 
+/// **The save prompt's Save of a kept session is the host's Save, and what
+/// it interrupted carries on when the host says it landed** (W5-save-gaps 4,
+/// the quit's road). The prompt wrote the document here, and the plugins'
+/// states reached the project only in the host's road after it (a quit's
+/// `on_exit`, New's or Open's save-back): a kill in the frames between left
+/// a plugin seated since the last save at its defaults. The host's Save owes
+/// the mirror before the document lands. So the answer raises that Save and
+/// carries on at `host_saved`; no other Save carries anything on (a Ctrl+S
+/// after a Save As panel was cancelled must not quit), and a session never
+/// kept is still asked where it goes.
+#[test]
+fn the_prompts_save_of_a_kept_session_is_the_hosts_save_and_carries_on() {
+    use crate::ports::ProjectRequest;
+    use dialogs::DialogAction;
+    let root = project_scratch("save-gaps-prompt");
+    let (ctx, mut app) = headless(Caps::DESKTOP);
+    app.bootstrap_project(&root.join("Projects"));
+    assert!(app.save_project_first(&root.join("Projects").join("Kept.tan")), "fixture: no first save");
+    let doc = app.project_doc().expect("the project").to_path_buf();
+    let on_disk = std::fs::read(&doc).expect("the document");
+
+    // Quit.
+    app.settings.master_gain = 0.3;
+    app.arr_save_edits();
+    assert!(app.intercept_quit(), "quitting a changed session did not ask");
+    app.apply_dialog_action(DialogAction::SaveChangesSave);
+    assert_eq!(app.take_project_request(), Some(ProjectRequest::Save), "the prompt's Save is not the host's");
+    assert_eq!(std::fs::read(&doc).expect("the document"), on_disk, "the prompt wrote the document itself");
+    assert!(!app.take_quit_now(), "it quit before the host's Save landed");
+    app.save_project_doc();
+    app.host_saved();
+    assert!(app.take_quit_now(), "the host's Save did not carry the quit on");
+
+    // New, the same way; and a Save nobody prompted for carries nothing on.
+    app.settings.master_gain = 0.4;
+    app.arr_save_edits();
+    app.apply_menu_action(&ctx, MenuAction::NewProject);
+    app.apply_dialog_action(DialogAction::SaveChangesSave);
+    assert_eq!(app.take_project_request(), Some(ProjectRequest::Save));
+    app.save_project_doc();
+    app.host_saved();
+    assert_eq!(app.take_project_request(), Some(ProjectRequest::New), "the host's Save did not carry New on");
+    app.host_saved();
+    assert_eq!(app.take_project_request(), None, "a second Save carried New on again");
+
+    // Save As from the prompt before an Open, its panel cancelled, then
+    // Ctrl+S: the Open waits for the hand that cancelled it.
+    app.settings.master_gain = 0.5;
+    app.arr_save_edits();
+    app.apply_menu_action(&ctx, MenuAction::OpenProject);
+    assert!(app.take_file_request().is_none(), "fixture: Open did not stop to ask");
+    app.apply_dialog_action(DialogAction::SaveChangesSaveAs);
+    assert!(app.take_save_request().is_some(), "fixture: no Save As panel");
+    app.native_panel_closed();
+    app.save_project_doc();
+    app.host_saved();
+    assert!(app.take_file_request().is_none(), "a Save after a cancelled Save As panel carried the Open on");
+
+    // A session never kept is still asked where it goes.
+    let (_c2, mut fresh) = headless(Caps::DESKTOP);
+    fresh.bootstrap_project(&root.join("Other"));
+    fresh.settings.master_gain = 0.3;
+    fresh.arr_save_edits();
+    assert!(fresh.intercept_quit(), "quitting a changed scratch did not ask");
+    fresh.apply_dialog_action(DialogAction::SaveChangesSave);
+    assert_eq!(fresh.take_project_request(), None, "a scratch's Save went to the host's in-place Save");
+    assert!(fresh.take_save_request().is_some(), "a scratch's Save asked nowhere");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// **A drum track's removal leaves its kit on disk until a save writes the
 /// document without it** (W5-save-gaps 2). The removal took the kit out of
 /// the session and rewrote the sidecar at once, so Don't Save after it

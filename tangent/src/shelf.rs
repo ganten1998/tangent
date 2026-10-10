@@ -241,20 +241,28 @@ fn readable_states(dir: &Path, names: &ShelfNames) -> BTreeMap<SeatBay, PathBuf>
 /// is which states EXIST, and each shelf answers that in one read (see
 /// `what_the_shelf_walk_costs_at_project_open`).
 pub fn mirror_shelf(from: &Path, names: &ShelfNames, to: &Path) {
+    let _ = mirror_whole(from, names, to);
+}
+
+/// [`mirror_shelf`], answering whether the mirror is WHOLE: every state
+/// `from` holds landed in `to`, and every stale one there is gone. What a
+/// save road asks before it may call its debt paid ([`mirror_settled`]).
+pub fn mirror_whole(from: &Path, names: &ShelfNames, to: &Path) -> bool {
     // BOTH read before either is written, so the second read is of the
     // shelf as it arrived rather than of the copies just made.
     let src = readable_states(from, names);
     let dst = shelf_states(to);
+    let mut whole = true;
     for (sb, path) in &src {
         fs_call();
-        if let Ok(bytes) = std::fs::read(path) {
-            write_atomic(&to.join(state_file_name(*sb)), &bytes);
-        }
+        whole &= std::fs::read(path).is_ok_and(|bytes| write_atomic(&to.join(state_file_name(*sb)), &bytes));
     }
     for sb in dst.iter().filter(|sb| !src.contains_key(sb)) {
         fs_call();
-        let _ = std::fs::remove_file(to.join(state_file_name(*sb)));
+        step();
+        whole &= std::fs::remove_file(to.join(state_file_name(*sb))).is_ok() || !to.join(state_file_name(*sb)).is_file();
     }
+    whole
 }
 
 // ── the displaced-state shelf ───────────────────────────────────────────
@@ -456,76 +464,306 @@ fn write_pending(dir: &Path, set: ShelfShuffles) -> bool {
     serde_json::to_string_pretty(&marker).is_ok_and(|text| write_atomic(&dir.join(SHELF_PENDING_NAME), text.as_bytes()))
 }
 
-/// **A mirror the live shelf owes a project's NEW home**, written down
-/// beside the live shelf: see [`owe_mirror`].
-pub const MIRROR_OWED_NAME: &str = ".states-owed.json";
+/// **The mirrors save roads owe a project's `state/`**, one folder each
+/// beside the live shelf (see [`owe_mirror`]): `<seq>/`, holding the record
+/// ([`OWED_RECORD`]: the home, and what its document was before the road
+/// wrote it) and the states the road owes it, as the live shelf held them
+/// when the debt was written down. Paid in `seq` order, oldest first, so the
+/// newest debt to a home is the last word in its `state/`.
+pub const OWED_DIR: &str = ".states-owed";
+
+/// The record in a debt's folder.
+pub const OWED_RECORD: &str = "owed.json";
+
+/// **A debt as the first journal wrote it** (W4-integrate): one record
+/// beside the live shelf, owing the live shelf itself. Read at launch, the
+/// way that journal paid it, and never written again: a debt now carries
+/// its own states (see [`owe_mirror`] for why).
+const SINGLE_OWED_NAME: &str = ".states-owed.json";
+
+/// **One mirror a save road owes**, written down before its document lands:
+/// its folder, to be settled by the same road once it has mirrored
+/// ([`mirror_settled`]).
+#[derive(Debug)]
+#[must_use = "a debt is settled by the road that wrote it down"]
+pub struct OwedMirror {
+    dir: PathBuf,
+}
 
 /// **Write down, BEFORE a save road's document lands in `home`, that the
 /// live shelf in `shelf` is owed to `home`'s `state/`** (design 6.6: "None
 /// of them can leave a plugin at defaults").
 ///
-/// Save As and the first save write the document into a folder that has no
-/// `state/` of its own (a copy brings `media/` and nothing else; a folder
-/// born at the chosen place has nothing at all), and the host mirrors the
-/// live shelf into it only after the document has landed. A process killed
-/// between the two left a project whose plugins all opened at their
-/// defaults, while the knobs sat on the live shelf the next launch replaces
-/// with the template's before anybody can open anything. So the road writes
-/// this first, temp and rename: the home, and what its document was before
-/// the save (its bytes' fingerprint, or nothing), so that the launch that
-/// finds it ([`pay_owed_mirror`]) can tell a document the road wrote from
-/// one it never reached. [`mirror_paid`] takes it away once the road has
-/// mirrored. `false` when it did not land.
-pub fn owe_mirror(shelf: &Path, home: &Path) -> bool {
-    let owed = serde_json::json!({
-        "home": home.to_string_lossy(),
-        "before": doc_fingerprint(home),
-    });
-    serde_json::to_string_pretty(&owed).is_ok_and(|text| write_atomic(&shelf.join(MIRROR_OWED_NAME), text.as_bytes()))
+/// Every save road writes the document first and mirrors the live shelf
+/// into the project's `state/` after it: Save As and the first save into a
+/// folder that has no `state/` yet, Save and the save-backs of an Open, a
+/// New and a quit's prompt in place, where `state/` has nothing for a
+/// plugin seated since the last save. A process killed between the two
+/// left those plugins at their defaults, with the knobs on a live shelf the
+/// next launch replaces with the template's before anybody can open
+/// anything.
+///
+/// So the road writes the debt first: the home, what its document was
+/// before the road (its bytes' fingerprint, or nothing), and **the states
+/// themselves**, the live shelf's files linked (or, where the volume cannot
+/// link, copied) into the debt's own folder, which is built aside and
+/// renamed into place whole. The launch that finds the debt
+/// ([`pay_owed_mirror`]) can then tell a document the road wrote from one
+/// it never reached, and pays from the debt's own files, never from
+/// whatever the live shelf holds by then: a debt that has to wait (its
+/// home on a volume that is away, a mirror that did not land) waits with
+/// the knobs it is owed, across any number of sessions in between. A link
+/// costs no bytes, and stays the old file when the live one is replaced,
+/// because every write to a shelf is temp and rename.
+///
+/// What an earlier road still owes `home` is settled first
+/// ([`settle_owed`]): this road's mirror is newer, and a debt paid after it
+/// would put older knobs over it. A home that cannot be reached (its
+/// folder's folder is not there: a volume unmounted) takes no document from
+/// this road either, and is owed nothing. `None` when nothing was written
+/// down.
+pub fn owe_mirror(shelf: &Path, home: &Path) -> Option<OwedMirror> {
+    if !reachable(home) {
+        return None;
+    }
+    settle_owed(shelf, Some(home));
+    write_debt(shelf, home, doc_fingerprint(home).as_deref(), shelf)
 }
 
-/// The road has mirrored (or wrote nothing): no mirror is owed.
-pub fn mirror_paid(shelf: &Path) {
-    let owed = shelf.join(MIRROR_OWED_NAME);
+/// **The road has mirrored**: a WHOLE mirror (every state landed, every
+/// stale one gone) takes its debt away. Any other leaves the debt owed,
+/// with its states, for the next launch or the next open of the project to
+/// pay; taking it away would drop the mirror in silence. `debt` is the one
+/// [`owe_mirror`] answered (`None`: nothing was owed).
+pub fn mirror_settled(debt: Option<OwedMirror>, whole: bool) {
+    let Some(debt) = debt else { return };
+    if !whole {
+        log::warn!(
+            "plugin states: a save's mirror did not land whole; owed until the next launch ({})",
+            debt.dir.display()
+        );
+        return;
+    }
+    let_go(&debt.dir);
+}
+
+/// What paying the debts came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwedPayment {
+    /// Homes whose `state/` now holds what was owed them.
+    pub paid: Vec<PathBuf>,
+    /// **Homes still owed**, their debts kept with their states: the home
+    /// cannot be reached (a volume that is away), or its mirror did not
+    /// land. Paid at a later launch or open, once it can be.
+    pub kept: Vec<PathBuf>,
+}
+
+/// **The mirrors save roads owed and never made, made now** (see
+/// [`owe_mirror`]): at launch, before anything replaces the live shelf.
+///
+/// A debt is paid only when the road's document LANDED (the home's
+/// document is there and is not the one the road found), because a road
+/// killed before its write owes nothing, and a folder that held somebody
+/// else's project must not be handed this session's states. The payment
+/// is the mirror every save road makes, by identity, from the debt's own
+/// states, and the document's `legacy_states` marker is then cleared if the
+/// folder is whole, as `copy_states_to_project` clears it.
+///
+/// **A home that cannot be reached stays owed** (the owner: "must stay
+/// owed, not be dropped, until it can be paid or the user discards the
+/// project"): a project on a volume that is not mounted has no document to
+/// look at, so whether its road wrote one cannot be told yet, and the debt
+/// waits, states and all. Reachable again, it is paid, or let go when its
+/// document is not the one the road wrote (the road never got there, or
+/// the project was deleted since: discarded). A payment whose mirror does
+/// not land whole is kept too.
+///
+/// A debt in the first journal's form (one record owing the live shelf) is
+/// taken as that journal took it: its states are the live shelf's, which
+/// at launch are still the ones the dying session wrote.
+pub fn pay_owed_mirror(shelf: &Path) -> OwedPayment {
+    adopt_single_record(shelf);
+    settle_owed(shelf, None)
+}
+
+/// **The debts a session can pay while it runs**: [`pay_owed_mirror`]'s
+/// settling, for the open of a project (a volume plugged back in, the
+/// project on it opened before any relaunch). Never the first journal's
+/// record, whose states are the live shelf's: mid-session, that shelf is
+/// this session's.
+pub fn pay_kept_mirrors(shelf: &Path) -> OwedPayment {
+    settle_owed(shelf, None)
+}
+
+/// **Whether a road could write into `home`**: the folder is there, or the
+/// folder it would be made in is. Neither, and the volume it lives on is
+/// away (or it was deleted with the folder holding it).
+fn reachable(home: &Path) -> bool {
     fs_call();
-    let _ = std::fs::remove_file(&owed);
+    home.is_dir() || home.parent().is_some_and(Path::is_dir)
 }
 
-/// **A mirror a save road owed and never made, made now** (see
-/// [`owe_mirror`]): at launch, before anything replaces the live shelf, so
-/// the shelf is still the one the dying session wrote its knobs to. Only
-/// when the road's document LANDED (the home's document is there and is
-/// not the one the road found), because a road killed before its write
-/// owes nothing, and a folder that held somebody else's project must not
-/// be handed this session's states. The mirror is the one every save road
-/// makes, by identity, and the document's `legacy_states` marker is then
-/// cleared if the folder is whole, as `copy_states_to_project` clears it.
-/// Answers the home it paid, if any; the record goes either way.
-pub fn pay_owed_mirror(shelf: &Path) -> Option<PathBuf> {
-    let owed = shelf.join(MIRROR_OWED_NAME);
-    let text = std::fs::read_to_string(&owed).ok()?;
-    let record = serde_json::from_str::<Value>(&text).ok();
-    let home = record
-        .as_ref()
-        .and_then(|v| v.get("home"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let before = record.as_ref().and_then(|v| v.get("before")).and_then(Value::as_str).map(str::to_owned);
-    let paid = home.filter(|home| {
-        let doc = tangent_ui::arrangement::doc_in(home);
-        doc.is_file() && doc_fingerprint(home) != before
-    });
-    if let Some(home) = paid.as_deref() {
-        let state = home.join("state");
-        let _ = std::fs::create_dir_all(&state);
-        mirror_shelf(shelf, &ShelfNames::Pstate, &state);
-        let doc = tangent_ui::arrangement::doc_in(home);
-        if let Some(plugins) = doc_plugins(&doc) {
-            clear_legacy_marker(&doc, &plugins);
+/// **Whether the road's document landed in `home`**: there, and not the
+/// document the road found (`before`).
+fn landed(home: &Path, before: Option<&str>) -> bool {
+    fs_call();
+    tangent_ui::arrangement::doc_in(home).is_file() && doc_fingerprint(home).as_deref() != before
+}
+
+/// **Settle the debts on `shelf`** (every one, or `only` those owed to that
+/// home), oldest first: each landed one is paid from its own states, each
+/// whose home is reachable and whose document never landed is let go, and
+/// the rest wait. A folder a kill left half-built (`.writing`, or no
+/// record) is a debt whose road never reached its document, and goes.
+///
+/// **A home with a debt that waits takes no later debt this time**: the
+/// later one is newer, and paid now and let go, it would leave the older
+/// to be paid over it once that one can be. They wait together and are
+/// paid in order.
+fn settle_owed(shelf: &Path, only: Option<&Path>) -> OwedPayment {
+    let mut out = OwedPayment::default();
+    let owed = shelf.join(OWED_DIR);
+    fs_call();
+    let Ok(entries) = std::fs::read_dir(&owed) else {
+        return out;
+    };
+    let mut debts: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    debts.sort();
+    let mut waiting: BTreeSet<PathBuf> = BTreeSet::new();
+    for entry in debts {
+        let record = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|_| read_record(&entry));
+        let Some((home, before)) = record else {
+            let_go(&entry);
+            continue;
+        };
+        if only.is_some_and(|h| h != home) {
+            continue;
+        }
+        let behind = waiting.contains(&home);
+        let landed = !behind && landed(&home, before.as_deref());
+        let paid = landed && {
+            let state = home.join("state");
+            let _ = std::fs::create_dir_all(&state);
+            mirror_whole(&entry, &ShelfNames::Pstate, &state)
+        };
+        if paid {
+            let doc = tangent_ui::arrangement::doc_in(&home);
+            if let Some(plugins) = doc_plugins(&doc) {
+                clear_legacy_marker(&doc, &plugins);
+            }
+            let_go(&entry);
+            out.paid.push(home);
+        } else if !behind && !landed && reachable(&home) {
+            let_go(&entry);
+        } else {
+            waiting.insert(home.clone());
+            out.kept.push(home);
         }
     }
-    mirror_paid(shelf);
-    paid
+    out
+}
+
+/// A debt's record: its home, and its document's fingerprint before the
+/// road (`None`: it had none). `None` for a record that will not read.
+fn read_record(entry: &Path) -> Option<(PathBuf, Option<String>)> {
+    fs_call();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(entry.join(OWED_RECORD)).ok()?).ok()?;
+    let home = PathBuf::from(v.get("home")?.as_str()?);
+    let before = v.get("before").and_then(Value::as_str).map(str::to_owned);
+    Some((home, before))
+}
+
+/// **A debt's folder, built aside and renamed into place whole**: every
+/// pstate file on `states` linked in (copied where it cannot be linked),
+/// then the record. `None`, and nothing left behind, when any of it did not
+/// land.
+fn write_debt(shelf: &Path, home: &Path, before: Option<&str>, states: &Path) -> Option<OwedMirror> {
+    let owed = shelf.join(OWED_DIR);
+    let seq = next_seq(&owed);
+    let entry = owed.join(format!("{seq:010}"));
+    let building = owed.join(format!("{seq:010}.writing"));
+    let _ = std::fs::remove_dir_all(&building);
+    fs_call();
+    if std::fs::create_dir_all(&building).is_err() {
+        return None;
+    }
+    let record = serde_json::json!({ "home": home.to_string_lossy(), "before": before });
+    let linked = shelf_states(states)
+        .into_iter()
+        .all(|sb| keep_state(&states.join(state_file_name(sb)), &building.join(state_file_name(sb))));
+    let built = linked
+        && serde_json::to_string_pretty(&record).is_ok_and(|text| write_atomic(&building.join(OWED_RECORD), text.as_bytes()))
+        && {
+            step();
+            fs_call();
+            std::fs::rename(&building, &entry).is_ok()
+        };
+    if !built {
+        let _ = std::fs::remove_dir_all(&building);
+        return None;
+    }
+    Some(OwedMirror { dir: entry })
+}
+
+/// **One state into a debt**: a link to the live file when the volume can
+/// make one (no bytes, and still the old file after the live one is
+/// replaced, temp and rename), a copy when it cannot.
+fn keep_state(from: &Path, to: &Path) -> bool {
+    step();
+    fs_call();
+    std::fs::hard_link(from, to).is_ok() || std::fs::read(from).is_ok_and(|bytes| write_atomic(to, &bytes))
+}
+
+/// The next debt's number: one past the highest on `owed`.
+fn next_seq(owed: &Path) -> u64 {
+    fs_call();
+    std::fs::read_dir(owed)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str()?.split('.').next()?.parse::<u64>().ok())
+                .max()
+                .map_or(0, |n| n + 1)
+        })
+        .unwrap_or(0)
+}
+
+/// **A debt goes**: its folder, and with it the links it held (the live
+/// shelf's files are untouched). When the folder will not go, its record
+/// does, so what is left reads as a half-built debt and goes at the next
+/// settling instead of being paid again.
+fn let_go(entry: &Path) {
+    step();
+    fs_call();
+    if std::fs::remove_dir_all(entry).is_err() && entry.exists() {
+        let _ = std::fs::remove_file(entry.join(OWED_RECORD));
+        log::warn!("plugin states: a settled debt could not be cleared ({})", entry.display());
+    }
+}
+
+/// **The first journal's record, taken as that journal took it**: a debt
+/// whose states are the live shelf's, which at launch are still the ones the
+/// dying session wrote, so they go into a debt of their own before anything
+/// replaces them. The record goes once the debt stands, or when it names no
+/// home. Nothing writes one any more.
+fn adopt_single_record(shelf: &Path) {
+    let single = shelf.join(SINGLE_OWED_NAME);
+    fs_call();
+    let Ok(text) = std::fs::read_to_string(&single) else {
+        return;
+    };
+    let record = serde_json::from_str::<Value>(&text).ok();
+    let home = record.as_ref().and_then(|v| v.get("home")).and_then(Value::as_str).map(PathBuf::from);
+    let before = record.as_ref().and_then(|v| v.get("before")).and_then(Value::as_str).map(str::to_owned);
+    let kept = home.is_none_or(|home| write_debt(shelf, &home, before.as_deref(), shelf).is_some());
+    if kept {
+        step();
+        fs_call();
+        let _ = std::fs::remove_file(&single);
+    }
 }
 
 /// **What `home`'s document is**, as a fingerprint of its bytes (FNV-1a,
@@ -638,6 +876,15 @@ fn kill_point() {
         Some(n) => k.set(Some(n - 1)),
         None => {}
     });
+}
+
+/// **One write of the journal that is not a temp and rename** (a link, a
+/// folder renamed into place, a removal): where the crash tests may kill
+/// the process too, before it. Nothing in a build.
+#[inline]
+fn step() {
+    #[cfg(test)]
+    kill_point();
 }
 
 #[cfg(test)]
@@ -786,6 +1033,16 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// **The debts written down on `shelf`**, by their folders' names (a
+    /// half-built one included).
+    fn debts(shelf: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(shelf.join(OWED_DIR))
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
     }
 
     /// The legacy sidecars of a folder, by name, with their bytes.
@@ -1210,23 +1467,46 @@ mod tests {
     /// 6.6, the scan half; every test above audits the files). The legacy
     /// names exist in exactly one place, this module, which only READS
     /// them: every `remove_file` and `rename` in it acts on an identity name,
-    /// a temp or a marker (the conversion's pending one, or the record of a
-    /// mirror a save road owes); and no other host source spells the legacy
-    /// prefix except the template copy that SKIPS such files.
+    /// a temp or a marker (the conversion's pending one, a debt's record,
+    /// the first journal's record), every `remove_dir_all` on a debt's own
+    /// folder (`OWED_DIR`, which holds links and copies of identity files
+    /// and its record, never a legacy sidecar), and a debt's folder is
+    /// renamed only from where it was built; and no other host source
+    /// spells the legacy prefix except the template copy that SKIPS such
+    /// files.
     #[test]
     fn no_new_build_path_renames_or_deletes_a_legacy_sidecar() {
         let me = include_str!("shelf.rs");
         let me = &me[..me.find("\n#[cfg(test)]\nmod tests {").expect("this module")];
-        for (at, _) in me.match_indices("remove_file(").chain(me.match_indices("rename(")) {
+        let line_of = |at: usize| {
             let line = me[..at].rfind('\n').map_or(0, |n| n + 1);
             let end = me[at..].find('\n').map_or(me.len(), |n| at + n);
-            let call = &me[line..end];
+            &me[line..end]
+        };
+        for (at, _) in me.match_indices("remove_file(").chain(me.match_indices("rename(")) {
+            let call = line_of(at);
             assert!(
-                ["state_file_name(", "&tmp", "&pending", "&owed", "tmp, path"].iter().any(|ok| call.contains(ok)),
+                ["state_file_name(", "&tmp", "&pending", "OWED_RECORD", "&single", "&building", "tmp, path"]
+                    .iter()
+                    .any(|ok| call.contains(ok)),
                 "shelf.rs removes or renames something that may be a legacy sidecar: `{}`",
                 call.trim()
             );
         }
+        for (at, _) in me.match_indices("remove_dir_all(") {
+            let call = line_of(at);
+            assert!(
+                ["remove_dir_all(entry)", "remove_dir_all(&building)"].iter().any(|ok| call.contains(ok)),
+                "shelf.rs removes a folder that may not be a debt's: `{}`",
+                call.trim()
+            );
+        }
+        let built = &me[me.find("fn write_debt(").expect("write_debt")..];
+        let built = &built[..built.find("\n}\n").expect("its end")];
+        assert!(
+            built.contains("let entry = owed.join(") && built.contains("let building = owed.join("),
+            "a debt's folder is built or renamed outside `OWED_DIR`"
+        );
         for (at, _) in me.match_indices("legacy_name(") {
             let line = &me[me[..at].rfind('\n').unwrap_or(0)..me[at..].find('\n').map_or(me.len(), |n| at + n)];
             assert!(
@@ -1487,7 +1767,8 @@ mod tests {
             };
             // The road, as `owe_states_to_new_home` and the chore run it.
             let home = app.save_choice_dir(purpose, &target).unwrap_or_else(|| panic!("{tag}: no home"));
-            assert!(owe_mirror(&live, &home), "{tag}: the owed mirror was not written down");
+            let debt = owe_mirror(&live, &home);
+            assert!(debt.is_some(), "{tag}: the owed mirror was not written down");
             app.finish_save_choice(purpose, &target);
             // Killed here: no mirror, no clear.
             let landed = app.project_doc().and_then(Path::parent).map(Path::to_path_buf);
@@ -1499,8 +1780,8 @@ mod tests {
                 "{tag}: fixture: the new home already held every state before the relaunch"
             );
             // The relaunch.
-            assert_eq!(pay_owed_mirror(&live), Some(home.clone()), "{tag}: the relaunch paid no mirror");
-            assert!(!live.join(MIRROR_OWED_NAME).exists(), "{tag}: the owed mirror outlived its payment");
+            assert_eq!(pay_owed_mirror(&live).paid, vec![home.clone()], "{tag}: the relaunch paid no mirror");
+            assert!(debts(&live).is_empty(), "{tag}: the owed mirror outlived its payment");
             let reopened = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home));
             let desk = reopened.desk.as_ref().expect("a desk");
             assert_eq!(desk.legacy_states.0, None, "{tag}: a whole folder kept its marker");
@@ -1525,10 +1806,10 @@ mod tests {
         let before = files(&theirs.join("state"));
         let live = scratch("new-home-early-live");
         assert!(write_state_in(&live, SeatBay::new(Node::Master, Rack::Chain(0), 0), "/x/m.vst3", b"live"), "a state");
-        assert!(owe_mirror(&live, &theirs), "the owed mirror was not written down");
-        assert_eq!(pay_owed_mirror(&live), None, "a mirror was paid for a document the road never wrote");
+        assert!(owe_mirror(&live, &theirs).is_some(), "the owed mirror was not written down");
+        assert_eq!(pay_owed_mirror(&live), OwedPayment::default(), "a mirror was paid for a document the road never wrote");
         assert_eq!(files(&theirs.join("state")), before, "the relaunch wrote into a folder the save never reached");
-        assert!(!live.join(MIRROR_OWED_NAME).exists(), "the record outlived the relaunch");
+        assert!(debts(&live).is_empty(), "the record outlived the relaunch");
         let _ = std::fs::remove_dir_all(&theirs);
         let _ = std::fs::remove_dir_all(&live);
     }
@@ -1574,5 +1855,519 @@ mod tests {
             let _ = std::fs::remove_dir_all(doc.parent().expect("project"));
             let _ = std::fs::remove_dir_all(&live);
         }
+    }
+
+    // ── W5-save-gaps: every save road's debt, and debts that wait ─────────
+
+    /// The two sessions a save road starts from: a kept project, saved in
+    /// its own folder or copied out of it, and a scratch whose folder was
+    /// never written, written for the first time where it stands or moved
+    /// by its first save.
+    #[derive(Clone, Copy, Debug)]
+    enum Session {
+        Kept,
+        NeverWritten,
+    }
+
+    /// The bay a test plugin sits in: row `row`'s own rack, bay `bay`.
+    fn chain_bay(app: &tangent_ui::app::TangentApp, row: usize, bay: u8) -> SeatBay {
+        SeatBay::new(Node::Track(app.track_ids()[row]), Rack::Chain(0), bay)
+    }
+
+    /// **A session for a save road**, in `root`: answers the app and the
+    /// folder it stands in. A kept project holds two
+    /// plugins its last save wrote the states of (`saved <bay>`); a
+    /// never-written scratch was adopted from a template holding them and
+    /// has no folder yet. Either way a third plugin has been seated since,
+    /// whose state the project has nowhere: the one a kill between the
+    /// document and the mirror used to leave at its defaults.
+    fn a_session(
+        road: Session,
+        ctx: &egui::Context,
+        root: &Path,
+    ) -> (tangent_ui::app::TangentApp, PathBuf) {
+        let app = || {
+            tangent_ui::app::TangentApp::with_license(ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("shelf"))
+        };
+        let mut a = app();
+        a.bootstrap_project(&root.join("Projects"));
+        assert!(a.save_project_first(&root.join("Projects").join("Song.tan")), "fixture: no first save");
+        a.set_insert(0, 1, Some("/x/a.vst3"));
+        a.set_insert(1, 1, Some("/x/b.vst3"));
+        a.save_project_doc();
+        let song = root.join("Projects").join("Song");
+        for (row, bundle) in [(0, "/x/a.vst3"), (1, "/x/b.vst3")] {
+            let sb = chain_bay(&a, row, 1);
+            assert!(write_state_in(&song.join("state"), sb, bundle, format!("saved {sb}").as_bytes()), "a saved state");
+        }
+        let (mut session, home) = match road {
+            Session::Kept => (a, song),
+            Session::NeverWritten => {
+                let mut fresh = app();
+                let home = root.join("Projects").join("Untitled");
+                fresh.adopt_template(&song, &home);
+                assert!(!home.exists(), "fixture: the scratch's folder exists");
+                (fresh, home)
+            }
+        };
+        session.set_insert(1, 2, Some("/x/c.vst3"));
+        (session, home)
+    }
+
+    /// **Every save road, by where its document lands**: in place (Save,
+    /// and the save prompt's Save of a quit, a New or an Open, which is the
+    /// host's Save; the save-backs of an Open and a New, writing a
+    /// never-written scratch for the first time), or in a new home (Save As,
+    /// the first save).
+    #[derive(Clone, Copy, Debug)]
+    enum SaveRoad {
+        Save,
+        SaveBack,
+        SaveAs,
+        FirstSave,
+    }
+
+    impl SaveRoad {
+        /// The session the road starts from.
+        fn session(self) -> Session {
+            match self {
+                Self::Save | Self::SaveAs => Session::Kept,
+                Self::SaveBack | Self::FirstSave => Session::NeverWritten,
+            }
+        }
+
+        /// The new home's panel answer, for the roads that move.
+        fn target(self, root: &Path) -> Option<(tangent_ui::ports::SavePurpose, PathBuf)> {
+            use tangent_ui::ports::SavePurpose;
+            match self {
+                Self::SaveAs => Some((SavePurpose::ProjectCopy, root.join("Copy"))),
+                Self::FirstSave => Some((SavePurpose::ProjectFirst, root.join("Projects").join("Kept.tan"))),
+                Self::Save | Self::SaveBack => None,
+            }
+        }
+    }
+
+    /// **A save road, as the host runs it** (`save_project_and_states`, the
+    /// save-backs in `switch_project` and New's arm, the `SaveCopy` and
+    /// `SaveFirst` chores): the knobs onto the live shelf
+    /// (`save_plugin_states`), the debt (`owe_states_to_own_home`,
+    /// `owe_states_to_new_home`), the app's document, the mirror and the
+    /// marker (`copy_states_to_project`), the debt settled. A kill may land
+    /// at any write of the shelf's and just before the document.
+    fn save_road(road: SaveRoad, app: &mut tangent_ui::app::TangentApp, live: &Path, home: &Path, root: &Path) {
+        for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(app)) {
+            write_state_in(live, sb, &bundle, format!("live {sb}").as_bytes());
+        }
+        let debt = owe_mirror(live, home);
+        kill_point();
+        match road.target(root) {
+            Some((purpose, target)) => app.finish_save_choice(purpose, &target),
+            None => app.save_project_doc(),
+        }
+        let state = home.join("state");
+        let _ = std::fs::create_dir_all(&state);
+        let whole = mirror_whole(live, &ShelfNames::Pstate, &state);
+        let doc = tangent_ui::arrangement::doc_in(home);
+        if let Some(plugins) = doc_plugins(&doc) {
+            clear_legacy_marker(&doc, &plugins);
+        }
+        mirror_settled(debt, whole);
+    }
+
+    /// **Somebody else's knobs on the live shelf**: what a later session, or
+    /// the template a launch stands on, leaves there before a debt is paid.
+    fn scramble(live: &Path) {
+        for sb in shelf_states(live) {
+            assert!(write_state_in(live, sb, "/x/a stranger.vst3", b"not yours"), "a stranger's state");
+        }
+    }
+
+    /// Every half-written file under `dir`: a temp, or a debt half-built.
+    fn torn(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for sub in [dir.to_path_buf(), dir.join("state"), dir.join(OWED_DIR)] {
+            out.extend(files(&sub).into_keys().filter(|n| n.ends_with(".tmp")));
+            if let Ok(rd) = std::fs::read_dir(&sub) {
+                out.extend(rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".writing")));
+            }
+        }
+        out
+    }
+
+    /// **A kill at every write of every save road reopens with every
+    /// state** (W5-save-gaps 4). Save, the prompt's Save and the save-backs
+    /// of an Open and a New write the session's document in its own folder,
+    /// Save As and the first save in a new one, and every one of them
+    /// mirrors the knobs after it; the folder's `state/` held nothing of a
+    /// plugin seated since its last save (and a never-written scratch's
+    /// folder, or a new home, had no `state/` at all), so a kill between the
+    /// two reopened those plugins at their defaults, with the knobs on a
+    /// live shelf the relaunch replaces. The road writes its debt first now,
+    /// states and all.
+    ///
+    /// Killed at each write in turn (every state onto the live shelf, the
+    /// debt's links, record and rename, just before the document, every
+    /// state of the mirror and the settling), the relaunch (whose live shelf
+    /// holds a stranger's knobs by then) pays what is owed: when the
+    /// document landed, every plugin it names finds the knobs it was
+    /// playing; when it did not, the project is exactly as its last save
+    /// left it. No debt outlives the relaunch, and nothing is left
+    /// half-written.
+    #[test]
+    fn a_kill_at_every_write_of_every_save_road_reopens_with_every_state() {
+        let ctx = egui::Context::default();
+        for road in [SaveRoad::Save, SaveRoad::SaveBack, SaveRoad::SaveAs, SaveRoad::FirstSave] {
+            let mut at = 0;
+            let mut landed_kills = 0;
+            loop {
+                let tag = format!("{road:?}, killed at write {at}");
+                let root = scratch(&format!("save-road-{road:?}"));
+                let (mut app, own) = a_session(road.session(), &ctx, &root);
+                let home = match road.target(&root) {
+                    Some((purpose, target)) => app.save_choice_dir(purpose, &target).unwrap_or_else(|| panic!("{tag}: no home")),
+                    None => own,
+                };
+                let live = scratch(&format!("save-road-live-{road:?}"));
+                let doc = tangent_ui::arrangement::doc_in(&home);
+                let doc_before = std::fs::read(&doc).ok();
+                let state_before = files(&home.join("state"));
+                KILL_AFTER.with(|k| k.set(Some(at)));
+                let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    save_road(road, &mut app, &live, &home, &root);
+                }))
+                .is_err();
+                KILL_AFTER.with(|k| k.set(None));
+                // The relaunch.
+                scramble(&live);
+                let paid = pay_owed_mirror(&live);
+                assert!(paid.kept.is_empty(), "{tag}: a reachable home's debt was kept: {paid:?}");
+                assert!(debts(&live).is_empty(), "{tag}: a debt outlived the relaunch: {:?}", debts(&live));
+                let landed = std::fs::read(&doc).ok().is_some_and(|now| Some(now) != doc_before);
+                if landed {
+                    landed_kills += usize::from(killed);
+                    let desk = Arrangement::load_from(&doc).desk.expect("a desk");
+                    let plugins = stateful(&desk.desk_model().model.plugins);
+                    assert!(plugins.len() >= 3, "{tag}: fixture: the document names {} plugins", plugins.len());
+                    for (sb, bundle) in plugins {
+                        assert_eq!(
+                            read_state(&home.join("state"), sb, &bundle),
+                            Some(format!("live {sb}").into_bytes()),
+                            "{tag}: {sb} ({bundle}) reopened without the knobs it was playing"
+                        );
+                    }
+                } else {
+                    assert!(killed, "{tag}: a road that ran whole landed no document");
+                    assert_eq!(files(&home.join("state")), state_before, "{tag}: a road that never wrote its document touched the project");
+                }
+                // (A knob's temp the kill cut short may stand on the live
+                // shelf, under no state's name: the next session's knobs
+                // write over it.)
+                assert!(
+                    torn(&home).is_empty() && torn(&live.join(OWED_DIR)).is_empty(),
+                    "{tag}: half-written: {:?} {:?}",
+                    torn(&home),
+                    torn(&live.join(OWED_DIR))
+                );
+                let _ = std::fs::remove_dir_all(&root);
+                let _ = std::fs::remove_dir_all(&live);
+                if !killed {
+                    break;
+                }
+                at += 1;
+            }
+            assert!(at > 8, "{road:?}: fixture: the road made only {at} writes");
+            assert!(landed_kills >= 3, "{road:?}: fixture: only {landed_kills} kills fell between the document and the settling");
+        }
+    }
+
+    /// **A debt whose project cannot be reached stays owed, with its own
+    /// states, until it can be paid or the project is discarded**
+    /// (W5-save-gaps 4: "an owed mirror whose destination volume is
+    /// unmounted at the next launch must stay owed"). A kept project on a
+    /// volume of its own, killed between its document and its mirror; the
+    /// volume is away at the relaunch, which keeps the debt (said, never
+    /// dropped) and stands on a template whose knobs replace the live shelf;
+    /// a second relaunch and an open keep it too. The volume back, the next
+    /// open pays it from the knobs it kept, the stranger's on the live shelf
+    /// notwithstanding, and a kill mid-payment leaves it to the next one.
+    /// A debt to a project deleted while it waited is let go, and writes
+    /// nothing.
+    #[test]
+    fn a_debt_to_a_project_that_cannot_be_reached_waits_with_its_states() {
+        let ctx = egui::Context::default();
+        let root = scratch("away");
+        let vol = root.join("vol");
+        let (mut app, home) = a_session(Session::Kept, &ctx, &vol);
+        let live = scratch("away-live");
+        // Killed after the document, before the mirror.
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(&app)) {
+                write_state_in(&live, sb, &bundle, format!("live {sb}").as_bytes());
+            }
+            let _debt = owe_mirror(&live, &home);
+            app.save_project_doc();
+            panic!("killed before the mirror");
+        }))
+        .is_err();
+        assert!(killed, "fixture: the road was not killed");
+        let away = root.join("vol (away)");
+        std::fs::rename(&vol, &away).expect("the volume goes away");
+        let paid = pay_owed_mirror(&live);
+        assert_eq!(paid, OwedPayment { paid: Vec::new(), kept: vec![home.clone()] }, "the relaunch dropped a debt it could not pay");
+        scramble(&live);
+        assert_eq!(pay_owed_mirror(&live).kept, vec![home.clone()], "a second relaunch dropped the debt");
+        assert_eq!(pay_kept_mirrors(&live).kept, vec![home.clone()], "an open while the volume is away dropped the debt");
+        assert_eq!(debts(&live).len(), 1, "the debt is not one debt");
+        // A road to a home that is away owes it nothing: its document cannot
+        // land there, and a debt written now would read the project's older
+        // document, once the volume is back, as one this road wrote.
+        assert!(owe_mirror(&live, &home).is_none(), "a road owed a mirror to a home it cannot reach");
+        assert_eq!(debts(&live).len(), 1, "a road to a home that is away wrote a debt down");
+
+        std::fs::rename(&away, &vol).expect("the volume comes back");
+        let mut at = 0;
+        loop {
+            KILL_AFTER.with(|k| k.set(Some(at)));
+            let killed = std::panic::catch_unwind(|| pay_kept_mirrors(&live)).is_err();
+            KILL_AFTER.with(|k| k.set(None));
+            if !killed {
+                break;
+            }
+            at += 1;
+        }
+        assert!(at > 2, "fixture: the payment made only {at} writes");
+        assert!(debts(&live).is_empty(), "the paid debt was kept: {:?}", debts(&live));
+        let desk = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home)).desk.expect("a desk");
+        for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+            assert_eq!(
+                read_state(&home.join("state"), sb, &bundle),
+                Some(format!("live {sb}").into_bytes()),
+                "{sb} ({bundle}) came back without the knobs its debt kept"
+            );
+        }
+        assert!(torn(&home).is_empty() && torn(&live).is_empty(), "half-written: {:?} {:?}", torn(&home), torn(&live));
+
+        // Discarded: the project deleted while its debt waited.
+        let (mut app, home) = a_session(Session::Kept, &ctx, &root.join("gone"));
+        for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(&app)) {
+            write_state_in(&live, sb, &bundle, format!("live {sb}").as_bytes());
+        }
+        let _debt = owe_mirror(&live, &home);
+        app.save_project_doc();
+        std::fs::remove_dir_all(&home).expect("the project is deleted");
+        assert_eq!(pay_owed_mirror(&live), OwedPayment::default(), "a debt to a deleted project was paid or kept");
+        assert!(debts(&live).is_empty(), "a debt to a deleted project was kept");
+        assert!(!home.exists(), "paying a deleted project's debt made its folder again");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// **A road whose mirror did not land whole leaves its debt owed**, and
+    /// the next launch pays it: one write of the mirror refused (a full
+    /// disk, a permission), the project's `state/` is short of a plugin, and
+    /// taking the debt away there would drop that state in silence. The
+    /// debt keeps its own states, so the relaunch pays them whatever the
+    /// live shelf holds by then.
+    #[test]
+    fn a_mirror_that_did_not_land_whole_leaves_its_debt_for_the_next_launch() {
+        let ctx = egui::Context::default();
+        let root = scratch("unwhole");
+        let (mut app, home) = a_session(Session::Kept, &ctx, &root);
+        let live = scratch("unwhole-live");
+        for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(&app)) {
+            write_state_in(&live, sb, &bundle, format!("live {sb}").as_bytes());
+        }
+        let debt = owe_mirror(&live, &home);
+        assert!(debt.is_some(), "fixture: no debt was written down");
+        app.save_project_doc();
+        FAIL_WRITE.with(|f| f.set(Some(0)));
+        let whole = mirror_whole(&live, &ShelfNames::Pstate, &home.join("state"));
+        let struck = FAIL_WRITE.with(std::cell::Cell::take).is_none();
+        assert!(struck && !whole, "fixture: the mirror's write was not refused (whole: {whole})");
+        mirror_settled(debt, whole);
+        assert_eq!(debts(&live).len(), 1, "a mirror that did not land took its debt away");
+        scramble(&live);
+        assert_eq!(pay_owed_mirror(&live).paid, vec![home.clone()], "the relaunch did not pay the debt");
+        assert!(debts(&live).is_empty(), "the paid debt was kept");
+        let desk = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home)).desk.expect("a desk");
+        for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+            assert_eq!(read_state(&home.join("state"), sb, &bundle), Some(format!("live {sb}").into_bytes()), "{sb} ({bundle})");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// **A road to a home settles what an earlier road still owes it, before
+    /// it owes its own**: an earlier road's document landed and its mirror
+    /// never ran (killed, its project away at the launch that should have
+    /// paid it), and a later road saves into the same project. The earlier
+    /// debt is settled when the later one is written down, so the next
+    /// launch, a stranger's knobs on the live shelf, owes nothing, and the
+    /// project keeps the later knobs: paid after them, the earlier debt
+    /// would have put the older ones back.
+    #[test]
+    fn a_road_to_a_home_settles_what_an_earlier_road_still_owes_it() {
+        let ctx = egui::Context::default();
+        let root = scratch("supersede");
+        let (mut app, home) = a_session(Session::Kept, &ctx, &root);
+        let live = scratch("supersede-live");
+        let knobs = |app: &tangent_ui::app::TangentApp, word: &str| {
+            for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(app)) {
+                write_state_in(&live, sb, &bundle, format!("{word} {sb}").as_bytes());
+            }
+        };
+        knobs(&app, "older");
+        let earlier = owe_mirror(&live, &home);
+        assert!(earlier.is_some(), "fixture: the earlier road wrote no debt");
+        app.save_project_doc();
+        // Killed: no mirror, no settling.
+        app.set_insert(2, 1, Some("/x/d.vst3"));
+        knobs(&app, "later");
+        let debt = owe_mirror(&live, &home);
+        app.save_project_doc();
+        let whole = mirror_whole(&live, &ShelfNames::Pstate, &home.join("state"));
+        mirror_settled(debt, whole);
+        assert!(debts(&live).is_empty(), "the earlier debt outlived the later road: {:?}", debts(&live));
+        scramble(&live);
+        assert_eq!(pay_owed_mirror(&live), OwedPayment::default(), "the next launch paid an earlier debt over the later knobs");
+        let desk = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home)).desk.expect("a desk");
+        for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+            assert_eq!(read_state(&home.join("state"), sb, &bundle), Some(format!("later {sb}").into_bytes()), "{sb} ({bundle})");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// **Two debts to one home are paid in order, or wait together**: the
+    /// older one's payment did not land (one of its writes refused), so the
+    /// newer one waits behind it rather than being paid and let go, which
+    /// would have left the older to be paid over it at the next launch. The
+    /// next launch pays both, oldest first, and the project keeps the newer
+    /// knobs.
+    #[test]
+    fn two_debts_to_one_home_are_paid_in_order_or_wait_together() {
+        let ctx = egui::Context::default();
+        let root = scratch("in-order");
+        let (mut app, home) = a_session(Session::Kept, &ctx, &root);
+        let live = scratch("in-order-live");
+        let knobs = |app: &tangent_ui::app::TangentApp, word: &str| {
+            for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(app)) {
+                write_state_in(&live, sb, &bundle, format!("{word} {sb}").as_bytes());
+            }
+        };
+        // Two roads killed after their documents, each written down as its
+        // road wrote it (the later road never got to settle the earlier).
+        knobs(&app, "older");
+        let older = write_debt(&live, &home, doc_fingerprint(&home).as_deref(), &live);
+        app.save_project_doc();
+        app.set_insert(2, 1, Some("/x/d.vst3"));
+        knobs(&app, "later");
+        let newer = write_debt(&live, &home, doc_fingerprint(&home).as_deref(), &live);
+        app.save_project_doc();
+        assert!(older.is_some() && newer.is_some() && debts(&live).len() == 2, "fixture: not two debts");
+        scramble(&live);
+        FAIL_WRITE.with(|f| f.set(Some(0)));
+        let first = pay_owed_mirror(&live);
+        FAIL_WRITE.with(|f| f.set(None));
+        assert_eq!(first, OwedPayment { paid: Vec::new(), kept: vec![home.clone(), home.clone()] }, "a newer debt was paid ahead of an older one that waits");
+        assert_eq!(debts(&live).len(), 2, "a debt was let go while an older one to its home waits");
+        let second = pay_owed_mirror(&live);
+        assert_eq!(second.paid, vec![home.clone(), home.clone()], "the next launch did not pay both");
+        assert!(debts(&live).is_empty(), "a paid debt was kept");
+        let desk = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home)).desk.expect("a desk");
+        for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+            assert_eq!(read_state(&home.join("state"), sb, &bundle), Some(format!("later {sb}").into_bytes()), "{sb} ({bundle})");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// **A debt the first journal wrote is paid as that journal paid it**:
+    /// one record beside the live shelf (`.states-owed.json`), owing the
+    /// live shelf itself, which at launch still holds the dying session's
+    /// knobs. Its home's document landed, so the launch mirrors those knobs
+    /// into it and the record goes; one whose document never landed goes
+    /// too, and pays nothing.
+    #[test]
+    fn a_debt_written_by_the_first_journal_is_paid_at_launch() {
+        let ctx = egui::Context::default();
+        let root = scratch("single-record");
+        let (mut app, home) = a_session(Session::Kept, &ctx, &root);
+        let live = scratch("single-record-live");
+        for (sb, bundle) in stateful(&crate::engine_bridge::desk_bays(&app)) {
+            write_state_in(&live, sb, &bundle, format!("live {sb}").as_bytes());
+        }
+        let record = serde_json::json!({ "home": home.to_string_lossy(), "before": doc_fingerprint(&home) });
+        std::fs::write(live.join(SINGLE_OWED_NAME), record.to_string()).expect("the record");
+        app.save_project_doc();
+        assert_eq!(pay_owed_mirror(&live).paid, vec![home.clone()], "the first journal's debt was not paid");
+        assert!(!live.join(SINGLE_OWED_NAME).exists() && debts(&live).is_empty(), "the first journal's debt outlived the launch");
+        let desk = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home)).desk.expect("a desk");
+        for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+            assert_eq!(read_state(&home.join("state"), sb, &bundle), Some(format!("live {sb}").into_bytes()), "{sb} ({bundle})");
+        }
+        // Never landed: let go, nothing written.
+        let before = files(&home.join("state"));
+        let record = serde_json::json!({ "home": home.to_string_lossy(), "before": doc_fingerprint(&home) });
+        std::fs::write(live.join(SINGLE_OWED_NAME), record.to_string()).expect("the record");
+        scramble(&live);
+        assert_eq!(pay_owed_mirror(&live), OwedPayment::default(), "a debt whose document never landed was paid");
+        assert_eq!(files(&home.join("state")), before, "a debt whose document never landed wrote into the project");
+        assert!(!live.join(SINGLE_OWED_NAME).exists() && debts(&live).is_empty(), "the record outlived the launch");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&live);
+    }
+
+    /// **Every road that writes the session's document owes its mirror
+    /// first and settles it after**, in the host (a source scan, because a
+    /// `DesktopApp` cannot be built in a test): each call of the app's
+    /// `save_project_doc` in `desktop.rs` follows the knobs onto the live
+    /// shelf and the debt, and is followed by the mirror and the settling,
+    /// in that order (Save, `switch_project`, New's arm); New settles before
+    /// the template replaces the live shelf; an Open pays what is still
+    /// owed (`pay_kept_mirrors`) before it reads the project's states; the
+    /// host's Save carries a prompt's interrupted action on (`host_saved`)
+    /// after its road. Nothing in the host takes a debt away but the
+    /// settling, and the launch is the one place the first journal's record
+    /// is paid from the live shelf.
+    #[test]
+    fn every_road_that_writes_the_document_owes_its_mirror_first() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let calls: Vec<usize> = src.match_indices("self.app.save_project_doc();").map(|(at, _)| at).collect();
+        assert_eq!(calls.len(), 3, "a road writes the document that this scan does not know");
+        for at in calls {
+            let fn_at = src[..at].rfind("\n    fn ").expect("the road's fn");
+            let road = &src[fn_at..fn_at + src[fn_at + 1..].find("\n    fn ").map_or(src.len() - fn_at, |n| n + 1)];
+            let at = at - fn_at;
+            let name = road.trim_start().trim_start_matches("fn ").split('(').next().unwrap_or("").to_owned();
+            let before = &road[..at];
+            let after = &road[at..];
+            let knobs = before.rfind("self.save_plugin_states();").unwrap_or_else(|| panic!("{name}: no knobs before the document"));
+            let owe = before.rfind("self.owe_states_to_own_home();").unwrap_or_else(|| panic!("{name}: the document lands with no debt"));
+            assert!(knobs < owe, "{name}: the debt is written before the knobs are on the live shelf");
+            let mirror = after.find("self.copy_states_to_project();").unwrap_or_else(|| panic!("{name}: no mirror after the document"));
+            let settled = after.find("crate::shelf::mirror_settled(debt, whole);").unwrap_or_else(|| panic!("{name}: the debt is never settled"));
+            assert!(mirror < settled, "{name}: the debt is settled before the mirror");
+        }
+        let new_arm = &src[src.find("tangent_ui::ports::ProjectRequest::NewDiscarding => {").expect("New's arm")..];
+        let settled = new_arm.find("crate::shelf::mirror_settled(debt, whole);").expect("New settles its debt");
+        let template = new_arm.find("self.app.adopt_template(&template, &dir);").expect("New adopts the template");
+        assert!(settled < template, "New settles its debt after the template replaced the live shelf");
+        let switch = &src[src.find("fn switch_project(").expect("switch_project")..];
+        let pay = switch.find("crate::shelf::pay_kept_mirrors(&crate::shelf::global_dir())").expect("an Open pays what is owed");
+        let open = switch.find("self.app.open_project(doc);").expect("the open");
+        assert!(pay < open, "an Open reads the project's states before paying what is owed it");
+        let save = &src[src.find("tangent_ui::ports::ProjectRequest::Save => {").expect("Save's arm")..];
+        let road = save.find("self.save_project_and_states();").expect("Save's road");
+        let carry = save.find("self.app.host_saved();").expect("Save carries a prompt on");
+        assert!(road < carry, "a prompt's interrupted action carries on before the Save landed");
+        let own = &src[src.find("fn owe_states_to_own_home(").expect("owe_states_to_own_home")..];
+        assert!(
+            own[..own.find("\n    }\n").expect("its end")].contains("crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home)"),
+            "the own home's debt is not written down"
+        );
+        assert!(!src.contains("crate::shelf::mirror_paid("), "a road takes a debt away without asking whether its mirror landed");
+        assert_eq!(src.matches("crate::shelf::pay_owed_mirror(").count(), 1, "the live shelf pays a debt on more than one road");
     }
 }
