@@ -267,10 +267,6 @@ impl Csr {
         }
     }
 
-    pub fn rows(&self) -> usize {
-        self.start.len().saturating_sub(1)
-    }
-
     /// Row `r`, empty past the end rather than a panic: the audio thread
     /// reads these.
     pub fn row(&self, r: usize) -> &[u32] {
@@ -408,7 +404,9 @@ pub struct SendTable {
 
 impl SendTable {
     /// **The sends from `from` to `to`**, by index: usually one, two for a
-    /// strip sending to one return both pre- and post-fader.
+    /// strip sending to one return both pre- and post-fader. The plan's own
+    /// passes walk the table by return; this is the tests' way in by ends.
+    #[cfg(test)]
     pub fn find(&self, ends: (u64, u64)) -> impl Iterator<Item = u32> + '_ {
         let at = self.by_ends.partition_point(|&(f, t, _)| (f, t) < ends);
         self.by_ends[at..]
@@ -2652,7 +2650,6 @@ mod tests {
     struct BusDesk {
         n: usize,
         parents: Vec<i32>,
-        slots: Vec<u32>,
         raw: Vec<(usize, usize, bool, f32)>,
         buses: Vec<bool>,
         sends: Vec<(usize, usize, bool)>,
@@ -2685,7 +2682,7 @@ mod tests {
             level: 0.5,
             pre: false,
         });
-        let d = BusDesk { n, parents, slots, raw, buses: bus, sends };
+        let d = BusDesk { n, parents, raw, buses: bus, sends };
         (d, inputs)
     }
 

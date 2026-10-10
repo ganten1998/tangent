@@ -7702,6 +7702,12 @@ impl TangentApp {
                         .collect(),
                     _ => Vec::new(),
                 },
+                // The row's own identity, which its controls' accessibility
+                // ids are keyed by (`mixer_panel::a11y_key`).
+                id: match s {
+                    Strip::Channel(n) => self.row(n).map(|r| r.id),
+                    _ => None,
+                },
             }
         };
         let master = StripRef::Master;
@@ -7805,6 +7811,7 @@ impl TangentApp {
                     plus: crate::mixer_panel::Plus::Row,
                     // Nothing past the master to send to.
                     sends: Vec::new(),
+                    id: None,
                 },
             },
             any_solo: self.any_solo(),
@@ -33909,17 +33916,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.time_sel.filter(|(a, b)| b > a)
     }
 
-    /// How many mixer channels / arrange lanes / MIDI keys show at once —
-    /// Shift+wheel zooms each, clamped to a legible band. Read from settings
-    /// so the choice survives a relaunch.
-    ///
-    /// **A big window shows more.** Full or tiled, the desk shows every
-    /// channel and the timeline ten tracks — the stored counts are what a
-    /// WINDOW shows, and a screen is not a window. It is a floor rather than
-    /// an override: somebody who has zoomed PAST these keeps what they chose,
-    /// because the setting is the thing they asked for and this is only the
-    /// room the screen happens to have.
-
     /// **How far the desk reaches**: how many rows the views lay out, the
     /// pickers search and the scroll rails run to. Never reads the licence.
     ///
@@ -34062,6 +34058,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// How many mixer strips show at once: Shift+wheel zooms it, up to
+    /// `recorder::VISIBLE_MAX`, and it is read from settings so the choice
+    /// survives a relaunch. ([`Self::arr_visible`] is the same for the
+    /// arrangement's lanes.)
     fn mixer_visible(&self) -> usize {
         // **Zero is the auto sentinel** — the shipped, un-chosen state, the
         // same idiom `arr_header_w` uses. There it means derive the strip
@@ -51773,14 +51773,11 @@ mod tests {
     /// rows beneath shift down rather than being written over.
     ///
     /// The owner: "Need a rightclick option for channels to insert track."
-    /// The desk is thirty-two fixed lanes, so this is a PERMUTATION and not
-    /// a growth — a lane nobody is using is spent to make the gap — and the
-    /// two things worth pinning are which lane gets spent and what happens
-    /// to a folder the gap opens inside.
-    ///
-    /// Revert check performed: take the spare lane from anywhere free rather
-    /// than from below the click, and the track above the insertion moves —
-    /// the wrong direction, and rows the gesture never mentioned.
+    /// The desk grows by the row (`DeskModel::insert_rows`), so what is worth
+    /// pinning is that nothing above the click moves and what happens to a
+    /// folder the gap opens inside. (While the desk was thirty-two fixed
+    /// lanes this was a permutation that spent a lane nobody was using, and
+    /// a spare taken from above the click moved the track above it.)
     #[test]
     fn insert_track_opens_a_row_below_and_pushes_the_rest_down() {
         let root = project_scratch("trackinsert");
@@ -51809,8 +51806,7 @@ mod tests {
 
         // ── and a folder keeps its children ──────────────────────────
         //
-        // The lane that is spent comes from outside every group, so it
-        // arrives carrying "not in a folder". Dropped into the middle of a
+        // A new row arrives carrying "not in a folder". Dropped into the middle of a
         // group that way it is a stranger between two children, and
         // `folder_of`'s walk stops at it — the rows under it fall out of
         // the group they were in. So the new row takes the membership of
@@ -57983,21 +57979,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Every channel can hold an input**, because the capture cap is the
-    /// channel count.
+    /// **Every channel can hold an input**, because there is no capture cap.
     ///
-    /// It was FOUR, and four was a leftover from a desk with four input
-    /// strips (`tangent_record::audio::MAX_PICKS`, where the history is
-    /// written). The desk has thirty-two channels each with its own input
-    /// chip, so a lower cap meant a track that could be bound, armed and
-    /// metered and could never receive a sample — the owner's fifth audio
-    /// track, which is how it was found. No other DAW has one.
+    /// It was FOUR, a leftover from a desk with four input strips, then the
+    /// channel count (`tangent_record::audio::Picks`, where the history is
+    /// written). Every channel has its own input chip, so a cap below the
+    /// desk meant a track that could be bound, armed and metered and could
+    /// never receive a sample — the owner's fifth audio track, which is how
+    /// it was found. No other DAW has one.
     ///
     /// `audio_ordinal` is still positional, and that is still right: the
     /// k-th audio channel takes the k-th column of the capture stream. What
     /// changed is that it cannot run out.
     #[test]
-    fn every_channel_can_take_an_input_because_the_cap_is_the_channel_count() {
+    fn every_channel_can_take_an_input_because_there_is_no_cap() {
         // There is no capture cap left to compare with the desk: the picks
         // are one per bound track (W5-engine-memory-inputs), and `INPUTS`
         // went with the fixed desk (W6). What stands is the walk below.
@@ -82127,12 +82122,12 @@ mod aspect_snap_tests {
     /// collapses: the smallest window in the table still opens four lanes and
     /// four strips, and the 5K still opens sixteen.
     ///
-    /// **What is ASSERTED below is what is PAINTED, which is not always that
-    /// number.** Once the desk has thirty-two channels and a panel tall enough
-    /// for two rows it folds, and a folded desk paints all thirty-two whatever
-    /// the count says — that is why the 4K's and the 5K's windows assert 32
-    /// strips against a derived 16 and 24. The fold is `mixer_panel`'s
-    /// decision and this change does not touch it.
+    /// **What is ASSERTED below is what is PAINTED**, which for a while was
+    /// not that number: a desk of thirty-two channels with a panel tall
+    /// enough for two rows folded, and a folded desk painted all thirty-two
+    /// whatever the count said, so the 4K's and the 5K's windows asserted 32
+    /// strips against a derived 16 and 24. The fold is gone (the owner's one
+    /// row), so what is painted is the count again.
     ///
     /// The claims that have to hold everywhere are the ones after the table:
     /// every answer is a real rung, a bigger window is never given fewer of
