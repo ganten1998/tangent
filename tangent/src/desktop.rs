@@ -10690,6 +10690,13 @@ impl DesktopApp {
                     e.set_stems(false);
                 }
                 self.drain_stem_tap();
+                // **And the ring let go, after that last drain.** This pass
+                // ran on the LIVE engine, which outlives it: the ring held
+                // four seconds of every stem the pass wrote until the next
+                // export replaced it, while the desk sat idle (design 7.12).
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    e.release_stems();
+                }
                 let Some(b) = self.recorder.bounce.take() else {
                     return;
                 };
@@ -23550,6 +23557,25 @@ mod tests {
             tick.contains("land_stems(b.stem_writers, dir, problem.is_none())"),
             "a pass's stems land whether or not it ran whole"
         );
+    }
+
+    /// **A realtime export lets its stem ring go when it ends, after its
+    /// last drain** (design 7.12: memory sized by use). The pass runs on the
+    /// LIVE engine, which outlives it, and the ring was kept for the next
+    /// export: four seconds of every stem the pass wrote, held while the desk
+    /// sat idle. The finish disarms the tap, drains what is left, and only
+    /// then lets the ring go; what that gives back is measured by
+    /// `instrument::memory_inputs::idle_stem_and_capture_memory_stays_flat_as_lanes_are_added`.
+    #[test]
+    fn a_realtime_export_lets_its_stem_ring_go_after_its_last_drain() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("this module")];
+        let at = src.find("fn tick_bounce(&mut self").expect("tick_bounce");
+        let tick = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        let off = tick.find("e.set_stems(false);").expect("the finish no longer disarms the stem tap");
+        let last = off + tick[off..].find("self.drain_stem_tap();").expect("the finish no longer drains the tap's last");
+        let gone = tick.find("e.release_stems();").expect("the finish keeps the stem ring for the next export");
+        assert!(last < gone, "the stem ring is let go before its last drain");
     }
 
     /// **The Export dialog's realtime delivery carries the stems its pass

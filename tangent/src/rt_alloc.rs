@@ -40,6 +40,9 @@ thread_local! {
     /// Bytes the counting thread asked for inside its window (see
     /// [`count_bytes`]): what a build costs, where `TOUCHES` is how often.
     static ASKED: Cell<usize> = const { Cell::new(0) };
+    /// Bytes the counting thread gave back inside its window (see
+    /// [`count_freed`]): what letting something go returns.
+    static FREED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Add `size` to the counting thread's bytes; nothing on any other thread.
@@ -47,6 +50,16 @@ fn ask(size: usize) {
     let _ = TOUCHES.try_with(|t| {
         if t.get().is_some() {
             let _ = ASKED.try_with(|a| a.set(a.get().saturating_add(size)));
+        }
+    });
+}
+
+/// Add `size` to the counting thread's freed bytes; nothing on any other
+/// thread.
+fn give(size: usize) {
+    let _ = TOUCHES.try_with(|t| {
+        if t.get().is_some() {
+            let _ = FREED.try_with(|f| f.set(f.get().saturating_add(size)));
         }
     });
 }
@@ -114,11 +127,13 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         touch();
+        give(layout.size());
         // SAFETY: forwarding the caller's own pointer and layout.
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         touch();
+        give(layout.size());
         ask(new_size);
         // SAFETY: forwarding the caller's own pointer, layout and size.
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
@@ -174,6 +189,17 @@ pub fn count_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
     ASKED.with(|a| a.set(0));
     let (out, _) = count_allocs(f);
     (out, ASKED.with(Cell::get))
+}
+
+/// **How many bytes `f` gave back to the allocator, on this thread**: every
+/// free's size and every reallocation's old size. What letting a thing go
+/// returns (design 7.12: memory sized by use goes when the use does),
+/// counted rather than read off a capacity that a dropped handle no longer
+/// reports while the other end still holds the memory.
+pub fn count_freed<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    FREED.with(|a| a.set(0));
+    let (out, _) = count_allocs(f);
+    (out, FREED.with(Cell::get))
 }
 
 /// The smallest of `tries` windows over `f`, element by element.
