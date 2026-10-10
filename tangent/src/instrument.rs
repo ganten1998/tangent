@@ -4665,6 +4665,37 @@ fn meter_source(armed: bool, heard: [f32; 2], input: [f32; 2]) -> [f32; 2] {
     }
 }
 
+/// **`frames` steps of a fader's one-pole slew, or none when a step would
+/// move nothing.**
+///
+/// Every strip's level is walked to its target one frame at a time, and on
+/// a desk of a thousand tracks that walk was most of what an idle track
+/// cost: 128 multiply-adds a chunk, twice (the lane's own fold gain and the
+/// level a route reads), for a fader nobody had touched in minutes.
+///
+/// **A step that leaves the value's bits where they were leaves every later
+/// step there too**, because each step is the same arithmetic on the same
+/// three numbers. So one step is computed and compared, and the walk runs
+/// only when that step moves the value: bit for bit what the walk itself
+/// would have left, by construction rather than by tolerance. A value that
+/// has not settled (a fader in motion, a mute's fade) walks every frame as
+/// before, and so does one whose step is not a fixed point for any other
+/// reason, a NaN included: the compare is of bits, so the only values it
+/// skips are the ones the walk provably leaves alone.
+///
+/// Answers whether it moved, which is how the decide walk knows a lane's
+/// fader has settled and the lane may rest (`Renderer::fill_active`).
+#[inline]
+fn slew(g: &mut f32, target: f32, coeff: f32, frames: usize) -> bool {
+    if (*g + (target - *g) * coeff).to_bits() == g.to_bits() {
+        return false;
+    }
+    for _ in 0..frames {
+        *g += (target - *g) * coeff;
+    }
+    true
+}
+
 /// **Whether a lane's rack may stop running this block**, advancing the
 /// lane's quiet counter as it decides.
 ///
@@ -6848,6 +6879,13 @@ pub(crate) struct LaneBody {
     /// park rule's counter, zeroed by any reason to be live. See
     /// `RACK_PARK_S` and `VOICE_PARK_S`.
     quiet: u64,
+    /// **Where `Renderer::rest_clock` stood when this lane began to rest**,
+    /// or `u64::MAX` while it is awake. A resting lane is not visited, so
+    /// its quiet counter does not count; the first visit after it wakes adds
+    /// what the visits it missed would have added, so the park rule decides
+    /// exactly what it would have. In the lane's box, not the desk's tables,
+    /// so a Grow (which starts every lane awake) cannot lose it.
+    rest_from: u64,
     /// **Whether its rack put anything above [`PARK_FLOOR`] out last
     /// block**, pre-fader: the `sounding` the park rule reads. Written by
     /// the fold, one block behind the decision that reads it.
@@ -7030,6 +7068,7 @@ impl Lane {
                 pedal_sent: [0; 3],
                 channel_gain: 1.0,
                 quiet: 0,
+                rest_from: u64::MAX,
                 loud: false,
                 audition_on: None,
                 audition_rang: false,
@@ -7721,6 +7760,25 @@ fn lane_rack_with_sample(
     Some((r, sample.as_ref()))
 }
 
+/// **The desk-wide terms a resting lane was proven idle against**
+/// (`Renderer::fill_active`). A lane rests only while every one of these
+/// stands where it stood when it was last visited: a start or a stop, a
+/// loop moved, a new grain, a new fader slew rate, a stems take, varispeed
+/// or the probe each change what a visit would decide, so any change wakes
+/// every resting lane for one visit.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct RestSeen {
+    rolling: bool,
+    loop_a: u64,
+    loop_b: u64,
+    coeff: u32,
+    grain: usize,
+    stems: bool,
+    varispeed: bool,
+    probe: bool,
+    keys: bool,
+}
+
 /// **The renderer's per-slot tables: everything it sizes by the spine's
 /// capacity that is not a lane's own.**
 ///
@@ -7754,6 +7812,24 @@ struct Wide {
     /// pool claims from. Bought at build at the lane count, refilled in
     /// place every chunk.
     wanted: Vec<u32>,
+    /// **The lanes this chunk's walks visit, in RANK order**: `order` less
+    /// the lanes resting (`Renderer::fill_active`). The grain clock, the
+    /// pedal walk, the decide walk and the fold go by it, so a lane with
+    /// nothing to do costs them nothing at all. Bought at build at the lane
+    /// count, as `order` is, and refilled in place every chunk.
+    active: Vec<u32>,
+    /// `active` was filled this chunk. False only if it could not hold the
+    /// walk (it is bought at `order`'s own capacity, so never), and then the
+    /// walks go by `order` and nothing rests.
+    active_ok: bool,
+    /// **The lanes resting**: each one's last visit found nothing to do and
+    /// nothing owed (`Renderer::may_rest`), and nothing it would read has
+    /// changed since (`Renderer::still_resting`). Not carried by a Grow: a
+    /// new shell starts every lane awake.
+    resting: LaneSet,
+    /// The fader target each resting lane settled at, as bits: a move of its
+    /// fader, its mute, its solo or its polarity changes it and wakes it.
+    rest_target: Box<[u32]>,
     /// **Which lanes had a parameter arrive for them this block.**
     ///
     /// A knob turn and a preset load reach the audio thread on `ui_params`,
@@ -8081,6 +8157,10 @@ impl Wide {
             mute_rank: vec![None; lanes].into_boxed_slice(),
             lane_gain: vec![1.0; lanes].into_boxed_slice(),
             wanted: Vec::with_capacity(lanes),
+            active: Vec::with_capacity(lanes),
+            active_ok: false,
+            resting: set(),
+            rest_target: vec![0; lanes].into_boxed_slice(),
             param_lanes: set(),
             curve_lanes: set(),
             midi_routes: vec![tangent_ui::recorder::MidiRoute::default(); lanes].into_boxed_slice(),
@@ -8172,6 +8252,12 @@ impl crate::lane_bank::SpineExt for Wide {
         carry_rows(&self.heard_flat, &mut to.heard_flat);
         carry_rows(&self.lane_gain, &mut to.lane_gain);
         to.wanted.clear();
+        // **Every lane awake in the new shell.** Nothing a resting lane is
+        // owed is kept here (its quiet counter's debt is in its box), so
+        // waking them all costs one visit each and loses nothing.
+        to.active.clear();
+        to.active_ok = false;
+        to.resting.clear();
         carry_rows(&self.midi_routes, &mut to.midi_routes);
         carry_rows(&self.route_direct, &mut to.route_direct);
         carry_rows(&self.folders, &mut to.folders);
@@ -8384,7 +8470,30 @@ const GRAIN_AUTO: u32 = u32::MAX;
 /// A bigger grain is still CHEAPER in total: at 32 frames a 512-frame
 /// grain costs 16.76 s of CPU per twelve seconds against 23.20 s. It is
 /// the PEAK that is worse, and a peak is what a deadline is made of.
+///
+/// **Measured again at scale and kept** (W7-scale-and-budgets,
+/// `docs/PERF-UNLIMITED.md`): 256 lanes of built-in [EQ, comp, plate],
+/// forked. At a 32-frame callback the p99 was 215.8 us off and 205.5,
+/// 201.3 and 202.1 us at 4, 8 and 16 blocks; at 64 frames 333.1 off
+/// and 324.0, 330.4 and 352.2 us at 2, 4 and 8. Built-ins pay little per
+/// block, so a grain moves them a few percent either way and one run of
+/// three readings does not separate the settings; the table above, on
+/// hosted reverbs whose per-instance block cost is the whole story, is
+/// still the measurement that decides, and it was not repeated at scale.
 const GRAIN_AUTO_BLOCKS: usize = 8;
+
+/// **The most refill phases a desk is spread over** (`grain_phases`).
+///
+/// It was the thirty-two-lane desk's width, "past which extra phases only
+/// leave empty slots", and that reason went with the fixed desk: a phase is
+/// a share of the desk's LANES (`slot % phases`), and a desk of a thousand
+/// fills every one. What bounds the phases now is the grain itself: at most
+/// `MAX_BLOCK` frames, so 32 phases is a 16-frame callback's whole grain.
+/// Measured at scale (W7-scale-and-budgets, `docs/PERF-UNLIMITED.md`): 256
+/// lanes of [EQ, comp, plate] at a 32-frame callback, 16 phases, sat beside
+/// 8 and 4 within a few percent, so nothing argued for moving it. The value
+/// is the one the desk's width gave it, so no grain moves.
+const GRAIN_PHASE_CAP: u64 = 32;
 
 /// **The grain to render in, from the stored setting and this callback.**
 ///
@@ -8593,6 +8702,18 @@ impl LaneGrains {
     fn clear(&mut self) {
         self.keys = [GrainKey::default(); GRAIN_SLOTS];
         self.next = 0;
+    }
+
+    /// **Whether nothing in the ring can be read at or after `floor`**:
+    /// every slot empty or ending at or before it. A ring like that answers
+    /// `None` to every `gather` and `covers` a later chunk can ask and puts
+    /// no `newest` end past the playhead, which is what lets a lane holding
+    /// it rest (`Renderer::fill_active`) without the fold or the grain
+    /// clock missing anything.
+    fn dead_before(&self, floor: u64) -> bool {
+        self.keys
+            .iter()
+            .all(|k| k.frames == 0 || k.at.saturating_add(u64::from(k.frames)) <= floor)
     }
 }
 
@@ -10562,6 +10683,26 @@ struct Renderer {
     /// the level-parallel run it compared really was parallel.
     #[cfg(test)]
     level_forks: u64,
+    /// **Whether an idle lane may rest** (`fill_active`): skip the grain
+    /// clock, the pedal walk, the decide walk and the fold while it has
+    /// nothing to do. On by default; `Engine::set_active_list` turns it off,
+    /// which is how a test renders one desk both ways and compares the bits.
+    rest_on: bool,
+    /// **Frames the lane walks have covered**, chunk by chunk: what a resting
+    /// lane's quiet counter is owed when it wakes (`LaneBody::rest_from`).
+    rest_clock: u64,
+    /// **Something every resting lane reads changed this chunk**: an op, a
+    /// plugin, a sample or an instrument arrived, or a clip list or a MIDI
+    /// schedule was swapped. Raised where it happens, taken by `fill_active`.
+    rest_wake: bool,
+    /// The desk-wide terms the resting lanes were proven against last chunk;
+    /// any change wakes them all.
+    rest_seen: RestSeen,
+    /// What this chunk adds to `rest_clock`: the span a resting lane's visit
+    /// would have counted (`fill_active`).
+    rest_inc: u64,
+    /// The lane the insert tap names this chunk, which the grain clock pins.
+    rest_tap: Option<usize>,
     /// **Whether `Wide::transfer` holds this chunk's figures** yet: the
     /// room asks for them at most once a chunk, and only when it has a
     /// routed input.
@@ -11286,6 +11427,9 @@ impl Renderer {
         // first block is in its take. The same words, a load per word.
         if report.applied > 0 {
             load_flags(&mut self.spine.capturing, &self.shared.arr_capture);
+            // A lane installed, removed or given a part, or a new plan: what
+            // a resting lane was proven against may have moved.
+            self.rest_wake = true;
         }
         if report.plan_refused > 0 {
             self.shared.plan_refused.fetch_add(report.plan_refused, Ordering::Relaxed);
@@ -11350,6 +11494,7 @@ impl Renderer {
             let Ok((lane, next)) = self.sampler_incoming.pop() else {
                 break;
             };
+            self.rest_wake = true;
             // **Into the lane's own box, at any slot** (`LaneBody::sample`).
             match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
                 Some(l) => {
@@ -11827,7 +11972,12 @@ impl Renderer {
         // shim's route walk is the one caller left holding a copy.
         #[cfg(test)]
         let stride = self.stride();
-        self.swap_plugins();
+        // **A plugin arriving or leaving wakes the resting lanes**: a rack
+        // that was empty may not be now, and that is half of what decides
+        // whether a lane has anything to run (`fill_active`).
+        if self.swap_plugins() > 0 {
+            self.rest_wake = true;
+        }
         // The sampler's file handoff, in the same breath and for the same
         // reason: once a callback, before a frame is rendered, so a block
         // never begins reading one file and ends reading another.
@@ -14812,6 +14962,9 @@ impl Renderer {
                 };
                 let _ = self.track_retiring.push(old);
                 lane_bounds(&self.clips, &mut self.spine.ext.clip_first);
+                // Which lanes have audio anywhere is a term of every
+                // resting lane's idleness (`has_audio`).
+                self.rest_wake = true;
             }
         }
         // **The punch, once a block, before anything can return early.** Two
@@ -14903,9 +15056,7 @@ impl Renderer {
                 0.0
             };
             if let Some(g) = self.spine.ext.lane_gain.get_mut(lane) {
-                for _ in 0..frames {
-                    *g += (target - *g) * coeff;
-                }
+                slew(g, target, coeff, frames);
             }
         }
     }
@@ -15814,9 +15965,25 @@ impl Renderer {
     ///
     /// `partition_point` and not a scan: this runs once per lane per block,
     /// and a long take's pedal list is not short.
-    fn clip_pedal_level(clips: &[PlacedMidi], gens: &[u32], gen: u32, ch: usize, at: u64) -> [u8; 3] {
+    ///
+    /// **Only this lane's run of the schedule is read** (`first`, the
+    /// schedule's [`lane_bounds`] table): the pedal walk asks this of every
+    /// lane every chunk, and reading the whole list for each made a desk of
+    /// a thousand tracks pay a thousand times the desk's MIDI clips per
+    /// chunk, most of them for lanes holding none. The levels are a `max`,
+    /// so the order the clips are read in moves nothing; `None` reads the
+    /// whole list, filtered by strip as before.
+    fn clip_pedal_level(
+        clips: &[PlacedMidi],
+        gens: &[u32],
+        first: Option<&[u32]>,
+        gen: u32,
+        ch: usize,
+        at: u64,
+    ) -> [u8; 3] {
         let mut out = [0_u8; 3];
-        for (i, mc) in clips.iter().enumerate() {
+        for i in lane_range(first, ch, clips.len()) {
+            let mc = &clips[i];
             if mc.strip != ch || !Schedule::<PlacedMidi>::plays(gens, i, gen) {
                 continue;
             }
@@ -15913,10 +16080,10 @@ impl Renderer {
     /// grain came out WORSE, on a desk where it used less CPU - the
     /// throughput was fine and the work was lumpy.
     ///
-    /// Capped at the lane count, past which extra phases only leave empty
-    /// slots, and at least one, which is the un-staggered behaviour.
+    /// Capped at [`GRAIN_PHASE_CAP`], and at least one, which is the
+    /// un-staggered behaviour.
     fn grain_phases(grain: usize, frames: usize) -> u64 {
-        ((grain / frames.max(1)) as u64).clamp(1, CHANNELS as u64)
+        ((grain / frames.max(1)) as u64).clamp(1, GRAIN_PHASE_CAP)
     }
 
     /// **Decide what span each lane renders this chunk.**
@@ -15948,8 +16115,15 @@ impl Renderer {
         grain: usize,
         free: &LaneSet,
     ) {
-        // The default every lane keeps: this chunk, as it always was.
-        for l in self.spine.lanes.iter_mut().flatten() {
+        // The default every lane keeps: this chunk, as it always was. A
+        // resting lane keeps the span it rested with, which nothing reads
+        // until it wakes, and it wakes before this runs (`fill_active`).
+        let resting = &self.spine.ext.resting;
+        for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+            let Some(l) = l.as_deref_mut() else { continue };
+            if resting.contains(ch) {
+                continue;
+            }
             let b = l.body_mut();
             b.at = at;
             b.len = frames;
@@ -15987,8 +16161,8 @@ impl Renderer {
             );
             (b > a && at < b).then_some(b)
         };
-        for walk_at in 0..self.spine.ext.order.len() {
-            let ch = self.spine.ext.order[walk_at] as usize;
+        for walk_at in 0..self.walk_len() {
+            let ch = self.walk_lane(walk_at);
             // Out of its slot while its span is decided, as in the decide
             // walk: `grain_ok` and `clip_pedal` are the renderer's to ask.
             let Some(mut boxed) = self.spine.lanes.get_mut(ch).and_then(Option::take) else {
@@ -16127,9 +16301,21 @@ impl Renderer {
     ///
     /// The edges are clip-relative and sorted, so this is a binary search
     /// per clip and it only runs for a lane that is about to be grained.
-    fn next_pedal_edge(clips: &[PlacedMidi], gens: &[u32], gen: u32, ch: usize, from: u64) -> Option<u64> {
+    ///
+    /// Only this lane's run of the schedule (`first`), as
+    /// `clip_pedal_level` reads it: the soonest edge is a `min`, so the
+    /// clips' order moves nothing, and `None` reads the whole list.
+    fn next_pedal_edge(
+        clips: &[PlacedMidi],
+        gens: &[u32],
+        first: Option<&[u32]>,
+        gen: u32,
+        ch: usize,
+        from: u64,
+    ) -> Option<u64> {
         let mut soonest: Option<u64> = None;
-        for (i, mc) in clips.iter().enumerate() {
+        for i in lane_range(first, ch, clips.len()) {
+            let mc = &clips[i];
             if mc.strip != ch || !Schedule::<PlacedMidi>::plays(gens, i, gen) {
                 continue;
             }
@@ -16180,7 +16366,14 @@ impl Renderer {
         len: usize,
         need: usize,
     ) -> usize {
-        let Some(edge) = Self::next_pedal_edge(&self.midi_clips, &self.midi_gens, gen, ch, from) else {
+        let Some(edge) = Self::next_pedal_edge(
+            &self.midi_clips,
+            &self.midi_gens,
+            self.spine.ext.midi_first.table(),
+            gen,
+            ch,
+            from,
+        ) else {
             return len;
         };
         // **The first block boundary strictly PAST the edge**, which is
@@ -16399,6 +16592,180 @@ impl Renderer {
         }
     }
 
+    /// **How many lanes this chunk's walks visit**, and the `i`th of them:
+    /// the active list when it was filled, else the whole `order`.
+    #[inline]
+    fn walk_len(&self) -> usize {
+        let ext = &self.spine.ext;
+        if ext.active_ok { ext.active.len() } else { ext.order.len() }
+    }
+
+    #[inline]
+    fn walk_lane(&self, i: usize) -> usize {
+        let ext = &self.spine.ext;
+        (if ext.active_ok { ext.active[i] } else { ext.order[i] }) as usize
+    }
+
+    /// **The fader target a lane's decide visit slews toward**, the one
+    /// spelling the visit and the resting check share: its level where it
+    /// is heard, silence where it is not.
+    #[inline]
+    fn rest_target_of(&self, ch: usize) -> f32 {
+        if self.spine.ext.heard.get(ch).copied().unwrap_or(false) {
+            self.lane_gain(ch)
+        } else {
+            0.0
+        }
+    }
+
+    /// **Whether anything stands between lane `ch` and resting this chunk**,
+    /// asked of the desk tables and never of the lane's box: the one list
+    /// the decide visit checks before a lane rests (`may_rest` there) and
+    /// [`Self::still_resting`] checks every chunk after.
+    ///
+    /// Two kinds of term. What would make the decide visit do something: a
+    /// clip under the playhead, a route landing on it, a knob or a curve for
+    /// its plugins, an arm, a kind a visit treats apart (a bus, a folder, a
+    /// drum, keys or DX7 lane, a frozen one), the room claiming its rack or
+    /// its board, an audition held on it. And what would change the span
+    /// the grain clock gives it, which is what its quiet frames count by
+    /// (`rest_inc`): every pin of [`pinned_lanes`], so a resting lane is
+    /// always a lane the clock would have served whole grains.
+    fn rest_blocked(&self, ch: usize) -> bool {
+        let ext = &self.spine.ext;
+        let d = &ext.desk;
+        ext.clip_under.contains(ch)
+            || ext.receives.contains(ch)
+            || ext.param_lanes.contains(ch)
+            || ext.curve_lanes.contains(ch)
+            || ext.buses.contains(ch)
+            || ext.room_rack.contains(ch)
+            || ext.board_live.contains(ch)
+            || ext.leased.contains(ch)
+            || ext.folder_is.get(ch).copied().unwrap_or(true)
+            || ext.punch_now.get(ch).copied().unwrap_or(0) != u64::MAX
+            || d.armed.contains(ch)
+            || d.midi_on.contains(ch)
+            || d.drums.contains(ch)
+            || d.builtins.contains(ch)
+            || d.keys.contains(ch)
+            || d.frozen.contains(ch)
+            || self.rest_tap == Some(ch)
+            || (self.keys_live
+                && [lane_seat(ch, CHAIN_OWN), lane_seat(ch, CHAIN_EXTRA)].iter().any(|seat| {
+                    (0..INSERTS).any(|b| {
+                        self.shared
+                            .seat_cell(SeatKind::Key, seat * INSERTS + b)
+                            .is_some_and(|c| unpack_key(c.load(Ordering::Relaxed)).is_some())
+                    })
+                }))
+            || self.shared.lanes.get(ch).audition.load(Ordering::Relaxed) != u32::MAX
+    }
+
+    /// **Whether a resting lane may go on resting this chunk**: nothing in
+    /// [`Self::rest_blocked`] has arrived for it, and its fader's target is
+    /// the one its slew settled at (a fader, mute, solo or polarity moved
+    /// wakes it). A few bit tests, one or two atomics and the target, and
+    /// its box is not touched.
+    fn still_resting(&self, ch: usize) -> bool {
+        !self.rest_blocked(ch)
+            && self
+                .spine
+                .ext
+                .rest_target
+                .get(ch)
+                .is_some_and(|t| *t == self.rest_target_of(ch).to_bits())
+    }
+
+    /// **The lanes this chunk walks** (design W7-scale-and-budgets: idle
+    /// lanes skip decide and fold in O(1), through a dense active list).
+    ///
+    /// A lane rests when its last decide visit found nothing to render,
+    /// nothing to fold and nothing owed: no note held or parked, no clip of
+    /// any kind ahead of it that a grain could serve, its fader settled
+    /// (`slew` moved nothing). While it rests the grain clock, the pedal
+    /// walk, the decide walk and the fold pass it by, which is exactly what
+    /// each of them would have done with it: the decide visit would have
+    /// taken its idle exit and slewed a settled fader by nothing, and the
+    /// fold would have found no grain. What the visits would still have
+    /// counted, the park rule's quiet frames, is paid when it wakes
+    /// (`LaneBody::rest_from`).
+    ///
+    /// It wakes, and is visited, the chunk anything it reads changes: per
+    /// lane in [`Self::still_resting`], and for every resting lane at once
+    /// on a locate or a stop, a start, an op, a plugin, a sample or an
+    /// instrument arriving, a clip list or a MIDI schedule swapped, or a
+    /// change of loop, grain, slew rate, stems, varispeed or probe. A desk
+    /// rendered with resting off (`Engine::set_active_list`) is the same
+    /// bits; `a_resting_lane_renders_what_the_full_walk_rendered` holds it.
+    ///
+    /// The list keeps `order`'s rank order, so the decide walk's visit order
+    /// and the fold's sum order are the full walk's with the resting lanes
+    /// taken out.
+    fn fill_active(&mut self, at: u64, frames: usize, rolling: bool, flush: bool) {
+        let grain = resolve_grain(self.shared.grain.load(Ordering::Relaxed), frames);
+        let (loop_a, loop_b) = (
+            self.shared.loop_a.load(Ordering::Relaxed),
+            self.shared.loop_b.load(Ordering::Relaxed),
+        );
+        // **What this chunk's visit would have added to a resting lane's
+        // quiet frames**: its span, which for an unpinned lane with nothing
+        // in its ring is the chunk, or the grain `plan_grains` widens it to
+        // from the playhead (its catch-up arm, from `at`, cut at the loop's
+        // end) while grains are being served.
+        let grained = grain > frames && rolling && !self.stems_live && self.varispeed_ratio().is_none();
+        self.rest_inc = if grained {
+            let loop_end = (loop_b > loop_a && at < loop_b).then_some(loop_b);
+            Self::clip_grain(at, Self::to_grid(at, grain.max(frames)), loop_end).max(frames) as u64
+        } else {
+            frames as u64
+        };
+        self.rest_tap = unpack_tap(self.shared.insert_tap_route.load(Ordering::Relaxed))
+            .and_then(|(seat, _)| lane_of_seat(seat));
+        let seen = RestSeen {
+            rolling,
+            loop_a,
+            loop_b,
+            coeff: self.gain_coeff.to_bits(),
+            grain,
+            stems: self.stems_live,
+            varispeed: self.varispeed_ratio().is_some(),
+            probe: self.probe,
+            keys: self.keys_live,
+        };
+        if !self.rest_on || self.rest_wake || flush || seen != self.rest_seen {
+            self.spine.ext.resting.clear();
+        }
+        self.rest_wake = false;
+        self.rest_seen = seen;
+        let mut active = std::mem::take(&mut self.spine.ext.active);
+        active.clear();
+        let mut ok = active.capacity() >= self.spine.ext.order.len();
+        if !ok {
+            self.spine.ext.resting.clear();
+        }
+        let any = !self.spine.ext.resting.is_empty();
+        for i in 0..self.spine.ext.order.len() {
+            let ch = self.spine.ext.order[i] as usize;
+            if any && self.spine.ext.resting.contains(ch) {
+                if self.still_resting(ch) {
+                    continue;
+                }
+                self.spine.ext.resting.remove(ch);
+            }
+            if active.len() < active.capacity() {
+                active.push(ch as u32);
+            } else {
+                ok = false;
+            }
+        }
+        self.spine.ext.active = active;
+        self.spine.ext.active_ok = ok;
+        if !ok {
+            self.spine.ext.resting.clear();
+        }
+    }
+
     fn mix_channels(
         &mut self,
         frames: usize,
@@ -16439,6 +16806,7 @@ impl Renderer {
             let Ok((lane, next)) = self.dx7_incoming.pop() else {
                 break;
             };
+            self.rest_wake = true;
             // **Into the lane's own box**, or straight back for a slot that
             // holds no lane: never dropped here.
             match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
@@ -16462,6 +16830,7 @@ impl Renderer {
             let Ok((lane, next)) = self.keys_incoming.pop() else {
                 break;
             };
+            self.rest_wake = true;
             match self.spine.lanes.get_mut(lane).and_then(Option::as_deref_mut) {
                 Some(l) => {
                     let old = std::mem::replace(&mut l.body_mut().keys, next);
@@ -16512,6 +16881,9 @@ impl Renderer {
                 };
                 let _ = self.midi_retiring.push(old);
                 lane_bounds(&self.midi_clips, &mut self.spine.ext.midi_first);
+                // Which lanes hold a MIDI clip is a term of every resting
+                // lane's idleness (`lane_has_clips`).
+                self.rest_wake = true;
                 // A new schedule owes nothing: what stands behind the
                 // playhead now is skipped by where the search starts, not by
                 // a cursor anybody has to remember to rewind.
@@ -16527,6 +16899,22 @@ impl Renderer {
                 l.body_mut().park_from = u64::MAX;
             }
         }
+        // **Which lanes the walks below visit**: every lane of the order but
+        // those resting, decided before the grain clock because the clock is
+        // the first walk that passes a resting lane by. See `fill_active`.
+        self.fill_active(at, frames, rolling, flush);
+        // The earliest frame any later chunk can ask a lane's grain ring
+        // for without a locate (which clears every ring): the playhead, or
+        // the loop's head once a loop can bring it back there. A ring holding
+        // nothing at or past it can never be read again, which is one of the
+        // terms of a lane's rest.
+        let rest_floor = {
+            let (a, b) = (
+                self.shared.loop_a.load(Ordering::Relaxed),
+                self.shared.loop_b.load(Ordering::Relaxed),
+            );
+            if b > a { at.min(a) } else { at }
+        };
         // **Every lane holding a drumpad**, not the first. A drum instrument
         // loads a full instance per channel, so each of those lanes turns its
         // own clip notes into strikes on its OWN kit — which is what makes a
@@ -16572,8 +16960,8 @@ impl Renderer {
                     self.keys_live,
                     &mut self.spine.ext.pinned,
                 );
-                for walk_at in 0..self.spine.ext.order.len() {
-                    let ch = self.spine.ext.order[walk_at] as usize;
+                for walk_at in 0..self.walk_len() {
+                    let ch = self.walk_lane(walk_at);
                     // **So does a plugin curve**: it was read for this chunk
                     // alone. See `curve_lanes`.
                     //
@@ -16615,8 +17003,8 @@ impl Renderer {
         // pedal is not a piano**: the DX7 can live without CC 64 and merely
         // sound less expressive; a modelled piano loses its sympathetic wash
         // and half of what makes a jazz voicing hang together.
-        for walk_at in 0..self.spine.ext.order.len() {
-            let ch = self.spine.ext.order[walk_at] as usize;
+        for walk_at in 0..self.walk_len() {
+            let ch = self.walk_lane(walk_at);
             // **This lane's span, not the chunk's.** A grained lane's
             // instrument is being fed for the grain it is about to render,
             // which may be up to a grain ahead of the playhead. See
@@ -16649,7 +17037,14 @@ impl Renderer {
             // Asked once per lane per block and used by all three consumers
             // below — the modelled keyboard, the DX7, and the rack.
             let clip_pedal = if rolling {
-                Self::clip_pedal_level(&self.midi_clips, &self.midi_gens, lane_gen, ch, at)
+                Self::clip_pedal_level(
+                    &self.midi_clips,
+                    &self.midi_gens,
+                    self.spine.ext.midi_first.table(),
+                    lane_gen,
+                    ch,
+                    at,
+                )
             } else {
                 [0; 3]
             };
@@ -16731,7 +17126,14 @@ impl Renderer {
         // read the live list and the clips while filling it.
         // Nothing renders until the deciding walk says so, and nothing
         // folds until a render says so.
-        for l in self.spine.lanes.iter_mut().flatten() {
+        // A resting lane's two are false already: it rested on a visit that
+        // wanted nothing and rendered nothing.
+        let resting = &self.spine.ext.resting;
+        for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+            let Some(l) = l.as_deref_mut() else { continue };
+            if resting.contains(ch) {
+                continue;
+            }
             let b = l.body_mut();
             b.wants = false;
             b.folds = false;
@@ -16750,8 +17152,8 @@ impl Renderer {
         self.spine.ext.probe_walk_pins.clear();
         self.spine.ext.probe_clip_pins.clear();
         self.spine.ext.probe_inst_pins.clear();
-        for walk_at in 0..self.spine.ext.order.len() {
-            let ch = self.spine.ext.order[walk_at] as usize;
+        for walk_at in 0..self.walk_len() {
+            let ch = self.walk_lane(walk_at);
             // **The lane comes OUT of its slot for its decision and goes
             // back after it.** A pointer move each way, no allocation: it
             // is what lets this walk hold the lane and call the renderer's
@@ -16762,6 +17164,15 @@ impl Renderer {
             let lane_gen = boxed.gen;
             'decide: {
                 let lane = boxed.body_mut();
+                // **A lane back from resting is owed the quiet frames the
+                // visits it missed would have counted** (`fill_active`), and
+                // paid before anything below can read them: each of those
+                // visits would have taken the same idle exit and added its
+                // chunk, and saturating adds of the sum are the adds.
+                if lane.rest_from != u64::MAX {
+                    lane.quiet = lane.quiet.saturating_add(self.rest_clock.saturating_sub(lane.rest_from));
+                    lane.rest_from = u64::MAX;
+                }
                 // **A BUS has no source of its own** (design 9): no clips, no
                 // input, no notes. Its racks run once, in the route phase,
                 // over what is routed and sent to it, and its fader is
@@ -17038,12 +17449,13 @@ impl Renderer {
                         lane.told &= !(1u128 << pitch);
                     }
                 } else {
+                    // This lane's run of the schedule and no more, as the
+                    // rolling walk above reads it: a stopped desk of a
+                    // thousand tracks asked every lane about every clip.
                     let gens = &self.midi_gens;
-                    lane_has_clips = self
-                        .midi_clips
-                        .iter()
-                        .enumerate()
-                        .any(|(i, m)| m.strip == ch && Schedule::<PlacedMidi>::plays(gens, i, lane_gen));
+                    let clips = &self.midi_clips;
+                    lane_has_clips = lane_range(self.spine.ext.midi_first.table(), ch, clips.len())
+                        .any(|i| clips[i].strip == ch && Schedule::<PlacedMidi>::plays(gens, i, lane_gen));
                 }
 
                 // ── the AUDITION, reconciled ────────────────────────────────
@@ -17155,9 +17567,7 @@ impl Renderer {
                     } else {
                         0.0
                     };
-                    for _ in 0..frames {
-                        lane.channel_gain += (target - lane.channel_gain) * coeff;
-                    }
+                    slew(&mut lane.channel_gain, target, coeff, frames);
                     break 'decide;
                 }
 
@@ -17351,13 +17761,39 @@ impl Renderer {
                     // without exception, so advancing it here too would smooth
                     // it twice as fast and land the fader early.
                     if !is_folder {
-                        let target = if self.spine.ext.heard.get(ch).copied().unwrap_or(false) {
-                            self.lane_gain(ch)
-                        } else {
-                            0.0
-                        };
-                        for _ in 0..frames {
-                            lane.channel_gain += (target - lane.channel_gain) * coeff;
+                        let target = self.rest_target_of(ch);
+                        let settled = !slew(&mut lane.channel_gain, target, coeff, frames);
+                        // **And whether it may rest** (`fill_active`): the
+                        // visit did nothing a later one would not do again,
+                        // identically, while nothing it reads changes. Its
+                        // fader is settled; no reason to be live counts it
+                        // (so the skipped visits would each have added their
+                        // chunk to its quiet frames); no note is held, owed
+                        // or auditioned, no pedal stands, no MIDI clip is on
+                        // it and nothing in its grain ring can be read again;
+                        // and it is none of the kinds a visit treats apart.
+                        let may_rest = self.rest_on
+                            && settled
+                            && !live_now
+                            && !(holds_voice && sounding)
+                            && !armed
+                            && !lane_has_clips
+                            && !auditioning
+                            && !lane.loud
+                            && lane.told == 0
+                            && lane.park_from == u64::MAX
+                            && lane.audition_on.is_none()
+                            && lane.pedal_sent == [0; 3]
+                            && lane.grain.dead_before(rest_floor)
+                            && ch < self.spine.ext.rest_target.len()
+                            // The span this visit counted is the one the
+                            // clock counts for the visits it will skip.
+                            && frames as u64 == self.rest_inc
+                            && !self.rest_blocked(ch);
+                        if may_rest {
+                            self.spine.ext.resting.insert(ch);
+                            self.spine.ext.rest_target[ch] = target.to_bits();
+                            lane.rest_from = self.rest_clock.saturating_add(self.rest_inc);
                         }
                     }
                     break 'decide;
@@ -17469,7 +17905,11 @@ impl Renderer {
         // spine's capacity, so filling it allocates nothing.
         let mut wanted = std::mem::take(&mut self.spine.ext.wanted);
         wanted.clear();
+        let resting = &self.spine.ext.resting;
         for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+            if resting.contains(ch) {
+                continue;
+            }
             if l.as_deref_mut().is_some_and(|l| l.body_mut().wants) && wanted.len() < wanted.capacity() {
                 wanted.push(ch as u32);
             }
@@ -17664,8 +18104,13 @@ impl Renderer {
             // **Close the slot each lane's render opened.** Done here, after
             // the fork has joined, because `keep` finishes the ring's key and
             // the render only ever held the slot's rows. A lane the walk
-            // skipped never opened one.
-            for l in self.spine.lanes.iter_mut().flatten() {
+            // skipped never opened one, and a resting lane wants nothing.
+            let resting = &self.spine.ext.resting;
+            for (ch, l) in self.spine.lanes.iter_mut().enumerate() {
+                let Some(l) = l.as_deref_mut() else { continue };
+                if resting.contains(ch) {
+                    continue;
+                }
                 let b = l.body_mut();
                 if b.wants {
                     b.grain.keep(b.len, b.folds, b.prep.is_folder, b.prep.armed);
@@ -17704,8 +18149,8 @@ impl Renderer {
         // Ascending reproduces the single walk this pass used to be, exactly,
         // which is what lets the render above become several walks without
         // the sum moving.
-        for walk_at in 0..self.spine.ext.order.len() {
-            let ch = self.spine.ext.order[walk_at] as usize;
+        for walk_at in 0..self.walk_len() {
+            let ch = self.walk_lane(walk_at);
             // Out of its slot for the fold and back after, as in the decide
             // walk: the fold asks the renderer's own methods about the lane
             // it holds.
@@ -17877,7 +18322,9 @@ impl Renderer {
         self.lane_notes = lane_notes;
         self.lane_controls = lane_controls;
         self.spine.ext.folders = parents;
-
+        // What every resting lane's visit would have counted this chunk; a
+        // lane that wakes is paid the difference (`LaneBody::rest_from`).
+        self.rest_clock = self.rest_clock.saturating_add(self.rest_inc);
     }
 
     /// **Every folder's bus, deepest first: rack, fader, and onward.**
@@ -19373,11 +19820,7 @@ impl Renderer {
             }
             let target = send_gate_target(heard, &desk.phase, slot);
             b.pre_gate_from = b.pre_gate;
-            let mut g = b.pre_gate;
-            for _ in 0..frames {
-                g += (target - g) * coeff;
-            }
-            b.pre_gate = g;
+            slew(&mut b.pre_gate, target, coeff, frames);
         }
     }
 
@@ -22018,11 +22461,74 @@ impl Engine {
     /// through the same pool, on the same gate, as the lane render. On by
     /// default. The sums are added in one serial order either way, so this
     /// changes no bit, and the tests that hold that are why it is a switch.
+    /// **Let idle lanes rest, or walk every lane every chunk** (design
+    /// W7-scale-and-budgets: the active list). On by default. Resting changes
+    /// no bit, and the tests that hold that are why it is a switch; the
+    /// bench uses it to price what resting saves.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the active list's off switch, for the bit-exactness tests and a bench"))]
+    pub fn set_active_list(&mut self, on: bool) {
+        if let Some(r) = self.offline.as_mut() {
+            r.rest_on = on;
+        }
+    }
+
+    /// How many lanes are resting after the last chunk: what lets a test say
+    /// the resting walk it compared really rested.
+    #[cfg(test)]
+    pub(crate) fn resting_lanes(&self) -> usize {
+        self.offline.as_ref().map_or(0, |r| r.spine.ext.resting.iter().count())
+    }
+
+    /// A lane's fader as its slew left it, as bits, and whether it rests.
+    #[cfg(test)]
+    pub(crate) fn lane_fader(&self, slot: usize) -> Option<(u32, bool)> {
+        let r = self.offline.as_ref()?;
+        let b = r.spine.lanes.get(slot)?.as_deref()?.peek();
+        Some((b.channel_gain.to_bits(), r.spine.ext.resting.contains(slot)))
+    }
+
+    /// Whether the last chunk's decide walk visited a lane: it is awake, or
+    /// it went to rest in that very chunk (its mark is the clock the chunk
+    /// left). A lane still resting from an earlier chunk was passed by.
+    #[cfg(test)]
+    pub(crate) fn lane_visited(&self, slot: usize) -> Option<bool> {
+        let r = self.offline.as_ref()?;
+        let b = r.spine.lanes.get(slot)?.as_deref()?.peek();
+        Some(!r.spine.ext.resting.contains(slot) || b.rest_from == r.rest_clock)
+    }
+
+    /// A lane's park counter, paid up: what a resting lane is owed is added
+    /// when it wakes, so two engines that agree on every lane's counter after
+    /// a chunk that woke them all agree on what every later park decides.
+    #[cfg(test)]
+    pub(crate) fn lane_quiet(&self, slot: usize) -> Option<u64> {
+        let r = self.offline.as_ref()?;
+        let b = r.spine.lanes.get(slot)?.as_deref()?.peek();
+        Some(if b.rest_from == u64::MAX {
+            b.quiet
+        } else {
+            b.quiet.saturating_add(r.rest_clock.saturating_sub(b.rest_from))
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code, reason = "the level fork's off switch, for the bit-exactness tests and a bench"))]
     pub fn set_level_fork(&mut self, on: bool) {
         if let Some(r) = self.offline.as_mut() {
             r.level_fork = on;
         }
+    }
+
+    /// **An export pool of `peers` plain threads**, whatever this machine's
+    /// core count says (`LanePool::new` still clamps it to its cap): the
+    /// bench's door to the width question, one desk at several widths.
+    #[cfg(test)]
+    pub(crate) fn set_offline_fanout_width(&mut self, peers: usize) {
+        let Some(r) = self.offline.as_mut() else {
+            return;
+        };
+        r.fanout = (peers > 0).then(|| LanePool::new(peers, None, None));
+        r.hands = Hands::new(r.fanout.as_ref().map_or(1, LanePool::hands));
+        r.fanout_any = peers > 0;
     }
 
     pub fn set_offline_fanout(&mut self, on: bool) {
@@ -22517,6 +23023,12 @@ impl Engine {
             level_fork: true,
             #[cfg(test)]
             level_forks: 0,
+            rest_on: true,
+            rest_clock: 0,
+            rest_wake: true,
+            rest_seen: RestSeen::default(),
+            rest_inc: 0,
+            rest_tap: None,
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
@@ -29354,6 +29866,12 @@ mod tests {
             level_fork: true,
             #[cfg(test)]
             level_forks: 0,
+            rest_on: true,
+            rest_clock: 0,
+            rest_wake: true,
+            rest_seen: RestSeen::default(),
+            rest_inc: 0,
+            rest_tap: None,
             transfer_ready: false,
             drums_send: std::array::from_fn(|_| vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]),
             drums_sends: false,
@@ -29643,6 +30161,56 @@ mod tests {
 
         // A lane with no counter answers rather than panicking.
         assert!(!park_lane(None, false, false, false, frames, rate));
+    }
+
+    /// **A settled fader's one step is the walk it skips, bit for bit**
+    /// (`slew`): from every start, toward every target, at every rate and
+    /// length a callback can bring, what `slew` leaves is what 128 steps of
+    /// the plain walk leave, including the starts that sit one or two units
+    /// in the last place off their target, where a tolerance would stop and
+    /// the walk would not. And it says whether it moved.
+    #[test]
+    fn a_settled_slew_is_the_walk_it_skips() {
+        let walk = |mut g: f32, t: f32, c: f32, n: usize| {
+            for _ in 0..n {
+                g += (t - g) * c;
+            }
+            g
+        };
+        let mut x: u32 = 0x2545_f491;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut settled = 0usize;
+        for _ in 0..20_000 {
+            let t = [0.0f32, 1.0, 0.5, -1.0, 8.0, f32::from_bits(next() >> 2) % 4.0][next() as usize % 6];
+            // Starts at the target, a few ulps off it either way, near it,
+            // and anywhere.
+            let ulps = (next() % 7) as i32 - 3;
+            let g0 = match next() % 4 {
+                0 => t,
+                1 => f32::from_bits(t.to_bits().wrapping_add_signed(ulps)),
+                2 => t + (next() % 1000) as f32 * 1.0e-7,
+                _ => (next() % 2000) as f32 / 500.0 - 2.0,
+            };
+            if !g0.is_finite() {
+                continue;
+            }
+            let c = [1.0e-4f32, 1.0e-3, 0.0021, 0.01][next() as usize % 4];
+            let n = [1usize, 16, 128, 512][next() as usize % 4];
+            let mut g = g0;
+            let moved = slew(&mut g, t, c, n);
+            let want = walk(g0, t, c, n);
+            assert_eq!(g.to_bits(), want.to_bits(), "from {g0} toward {t} at {c}, {n} frames: slew left {g}, the walk {want}");
+            assert_eq!(moved, (g0 + (t - g0) * c).to_bits() != g0.to_bits(), "from {g0} toward {t}: slew misreported moving");
+            if !moved {
+                settled += 1;
+            }
+        }
+        assert!(settled > 1_000, "only {settled} settled starts, so the early way out was hardly asked");
     }
 
     /// A knob turned in a plugin's own window reaches the audio thread — and
@@ -30999,7 +31567,7 @@ mod tests {
                 ClipPedal { at: 30_000, cc: 66, value: 100 },
             ]),
         }];
-        let at = |f: u64| Renderer::clip_pedal_level(&clips, &[], 0, 2, f);
+        let at = |f: u64| Renderer::clip_pedal_level(&clips, &[], None, 0, 2, f);
         // Before the clip: up. Nothing outside a clip holds a pedal.
         assert_eq!(at(0), [0, 0, 0]);
         assert_eq!(at(999), [0, 0, 0]);
@@ -31016,7 +31584,7 @@ mod tests {
         // no special case for any of the three.
         assert_eq!(at(1_000 + 48_000), [0, 0, 0]);
         // Another lane's clip is not this lane's pedal.
-        assert_eq!(Renderer::clip_pedal_level(&clips, &[], 0, 3, 1_000), [0, 0, 0]);
+        assert_eq!(Renderer::clip_pedal_level(&clips, &[], None, 0, 3, 1_000), [0, 0, 0]);
     }
 
     /// **An untouched trim is a null through the real rack** — planar hand-in,
