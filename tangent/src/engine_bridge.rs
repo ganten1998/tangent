@@ -3184,7 +3184,11 @@ mod tests {
 
     use tangent_record::audio::{ChannelPick, Picks};
 
-    fn row(id: u32, spec: Option<ChannelPick>, armed: bool) -> InputRow {
+    /// An audio track's row as the pick table reads it. Not `row`: the
+    /// desk tests above name a fixture desk's track by that word
+    /// (W5-identity-maps), and two helpers of one name in this module
+    /// stopped the wave's merged test target compiling.
+    fn input_row(id: u32, spec: Option<ChannelPick>, armed: bool) -> InputRow {
         InputRow { id: TrackId(id), audio: true, spec, armed }
     }
 
@@ -3211,10 +3215,10 @@ mod tests {
         let s = stream(8);
         // A, B, an audio track naming nothing, D.
         let mut rows = vec![
-            row(10, Some(Mono(0)), true),
-            row(11, Some(Stereo(2, 3)), false),
-            row(12, None, false),
-            row(13, Some(Mono(4)), false),
+            input_row(10, Some(Mono(0)), true),
+            input_row(11, Some(Stereo(2, 3)), false),
+            input_row(12, None, false),
+            input_row(13, Some(Mono(4)), false),
         ];
         t.bind(&rows, &s);
         assert!(t.explicit());
@@ -3227,7 +3231,7 @@ mod tests {
         assert_eq!(picks_of(&t, &[10, 11, 12, 13]), vec![Some(0), Some(1), None, Some(2)], "a reorder moved a pick");
         assert_eq!(t.stream_picks(), listed, "a reorder would reopen the stream");
         // A track inserted above everything, naming an input: the next pick.
-        rows.insert(0, row(14, Some(Mono(7)), false));
+        rows.insert(0, input_row(14, Some(Mono(7)), false));
         t.bind(&rows, &s);
         assert_eq!(picks_of(&t, &[10, 11, 13, 14]), vec![Some(0), Some(1), Some(2), Some(3)]);
         // B removed: its pick is free, and a hole reads nothing.
@@ -3236,7 +3240,7 @@ mod tests {
         assert_eq!(picks_of(&t, &[10, 13, 14]), vec![Some(0), Some(2), Some(3)], "a removal moved a pick");
         assert_eq!((t.picks()[1].track, t.picks()[1].width), (None, 0), "a freed pick still reads");
         // A new binding takes the lowest pick free, which is B's.
-        rows.push(row(15, Some(Mono(5)), false));
+        rows.push(input_row(15, Some(Mono(5)), false));
         t.bind(&rows, &s);
         assert_eq!(picks_of(&t, &[10, 13, 14, 15]), vec![Some(0), Some(2), Some(3), Some(1)]);
         // Each reads its own columns.
@@ -3259,18 +3263,18 @@ mod tests {
         use ChannelPick::Mono;
         let mut t = PickTable::default();
         let s = stream(4);
-        let mut rows = vec![row(1, Some(Mono(2)), true), row(2, Some(Mono(3)), false)];
+        let mut rows = vec![input_row(1, Some(Mono(2)), true), input_row(2, Some(Mono(3)), false)];
         t.bind(&rows, &s);
         let held = t.pick_of(TrackId(1)).expect("a pick");
         t.hold(&[held]);
         rows.remove(0);
-        rows.push(row(3, Some(Mono(1)), false));
+        rows.push(input_row(3, Some(Mono(1)), false));
         t.bind(&rows, &s);
         let e = t.picks()[held.0 as usize];
         assert_eq!((e.track, e.from, e.width, e.cols), (None, Some(Mono(2)), 1, [2, 2]), "the held pick lost its input");
         assert_ne!(t.pick_of(TrackId(3)), Some(held), "a held pick was given to another track");
         t.release(&[held]);
-        rows.push(row(4, Some(Mono(0)), false));
+        rows.push(input_row(4, Some(Mono(0)), false));
         t.bind(&rows, &s);
         assert_eq!(t.pick_of(TrackId(4)), Some(held), "a released pick is not free again");
     }
@@ -3288,7 +3292,7 @@ mod tests {
         use ChannelPick::Mono;
         let mut t = PickTable::default();
         let whole = stream(4);
-        let mut rows = vec![row(1, None, true), row(2, None, false)];
+        let mut rows = vec![input_row(1, None, true), input_row(2, None, false)];
         t.bind(&rows, &whole);
         assert!(!t.explicit());
         let held = t.pick_of(TrackId(1)).expect("a pick");
@@ -3339,7 +3343,7 @@ mod tests {
     fn a_held_pick_keeps_its_input_when_the_desk_stops_naming_inputs() {
         use ChannelPick::Mono;
         let mut t = PickTable::default();
-        let mut rows = vec![row(1, None, false), row(2, Some(Mono(2)), true), row(3, None, false)];
+        let mut rows = vec![input_row(1, None, false), input_row(2, Some(Mono(2)), true), input_row(3, None, false)];
         let named = InputStream { device_channels: Some(4), picks: Picks::from_slice(&[Mono(2)]) };
         t.bind(&rows, &named);
         let held = t.pick_of(TrackId(2)).expect("a pick");
@@ -3378,12 +3382,12 @@ mod tests {
         use ChannelPick::Mono;
         let mut t = PickTable::default();
         let first = InputStream { device_channels: Some(8), picks: Picks::from_slice(&[Mono(4), Mono(5)]) };
-        let mut rows = vec![row(1, None, true), row(2, None, false)];
+        let mut rows = vec![input_row(1, None, true), input_row(2, None, false)];
         t.bind(&rows, &first);
         assert_eq!(picks_of(&t, &[1, 2]), vec![Some(0), Some(1)]);
         let held = PickId(0);
         t.hold(&[held]);
-        rows.insert(0, row(9, None, false));
+        rows.insert(0, input_row(9, None, false));
         let moved = InputStream { device_channels: Some(8), picks: Picks::from_slice(&[Mono(6), Mono(7)]) };
         for s in [&first, &moved] {
             t.bind(&rows, s);
