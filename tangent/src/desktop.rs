@@ -37392,10 +37392,21 @@ mod arr_identity {
 
     /// A desk with nothing on it but these rows: `(row, input spec,
     /// armed)`, every one an AUDIO track.
+    ///
+    /// **No plugin on any bay, said in the file's own words**: the fresh
+    /// install's drumpad and DX7 are cleared through the format-2 `desk`
+    /// object (design Appendix D), which every settings shape reads and
+    /// writes, and not through the field that holds them. That field is
+    /// `strip_inserts` here and `plugins` (a map by `SeatBay`) once
+    /// W5-identity-maps lands beside this lane, and a helper that named
+    /// either one stopped compiling at the merge.
     fn desk(rows: &[(usize, &str, bool)]) -> Settings {
-        let mut s = Settings::default();
+        let mut file: serde_json::Value =
+            serde_json::from_str(&Settings::default().to_json()).expect("the shipped settings are JSON");
+        file["desk"]["plugins"] = serde_json::json!({});
+        let mut s = Settings::from_json(&file.to_string());
+        assert!(s.desk_model().model.plugins.is_empty(), "the shipped plugins are still on the desk");
         s.channel_kinds.iter_mut().for_each(|k| *k = 0);
-        s.strip_inserts.iter_mut().for_each(String::clear);
         s.strip_muted = 0;
         s.strip_soloed = 0;
         s.strip_phase = 0;
