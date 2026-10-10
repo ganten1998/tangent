@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::tests::project_scratch;
 use super::*;
 use crate::automation::{AutoMode, AutoParam, Point, Shape};
 use crate::desk_id::{Node, TrackId};
@@ -691,7 +692,7 @@ fn a_hidden_row_with_residue_on_it_is_never_reused() {
 /// hidden row left, a row of its own at the end.
 #[test]
 fn a_file_dropped_below_the_last_lane_is_a_new_track_with_a_new_id() {
-    let root = super::tests::project_scratch("w6-drop-below");
+    let root = project_scratch("w6-drop-below");
     let wav = root.join("take.wav");
     std::fs::write(&wav, b"RIFF").expect("a file to drop");
     let (_ctx, mut app) = app_on(
@@ -889,7 +890,7 @@ fn strips_and_lanes_are_sized_by_the_count_asked_for_not_by_the_desk() {
 /// the desk before the gesture, and one redo the desk after it.
 #[test]
 fn a_midi_item_drawn_or_dropped_on_an_empty_lane_is_one_moment() {
-    let root = super::tests::project_scratch("w6-midi-moment");
+    let root = project_scratch("w6-midi-moment");
     let mid = root.join("c.mid");
     let track: &[u8] = &[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0, 0x00, 0xFF, 0x2F, 0x00];
     let mut smf = Vec::new();
