@@ -521,6 +521,35 @@ fn no_surface_says_a_key_is_only_a_thank_you() {
     assert!(hits.is_empty(), "stale supporter copy:\n  {}", hits.join("\n  "));
 }
 
+/// **No string any other crate ships has an em dash** either: the desktop
+/// host's notices ("Nothing is armed...", the export's and the IR
+/// capture's lines), the engine's and the host's errors that reach a
+/// toast, and the plugin's. Only the dash rule: these crates are not where
+/// a key is described, and their literals name device widths ("a
+/// 2-channel input") that the width rule would read as the desk.
+/// `tangent-ui` and the fulfilment email are read whole by the scan above.
+#[test]
+fn no_shipped_string_in_any_crate_has_an_em_dash() {
+    let root = root();
+    let mut hits = Vec::new();
+    let mut read = 0;
+    for dir in ["tangent/src", "tangent-host/src", "tangent-record/src", "tangent-core/src", "plugin/src"] {
+        let files = crate::ban_scan::rust_files(&root.join(dir));
+        let tests = crate::ban_scan::test_only_files(&files);
+        for file in files.iter().filter(|f| !tests.contains(*f)) {
+            read += 1;
+            let src = std::fs::read_to_string(file).expect("a source file");
+            for lit in literals(&src).into_iter().filter(|l| l.contains(EM_DASH)) {
+                let rel = file.strip_prefix(&root).unwrap_or(file).display().to_string();
+                hits.push(format!("{rel}: {lit:?}"));
+            }
+        }
+    }
+    // Not a vacuous pass: the five trees were found and read.
+    assert!(read > 90, "the scan read only {read} files");
+    assert!(hits.is_empty(), "a shipped string has an em dash:\n  {}", hits.join("\n  "));
+}
+
 /// **Every refused phrase is refused when planted**, on the surface kind it
 /// would come back on: a prose page and a shipped string literal. The scan
 /// above passing proves nothing unless this does too.

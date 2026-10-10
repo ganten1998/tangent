@@ -23767,7 +23767,7 @@ impl Engine {
             drop(state_handle);
             drop(refused);
             return Err(format!(
-                "the audio engine did not take {} — the seat's hand-off ring \
+                "the audio engine did not take {}: the seat's hand-off ring \
                  is full, which means the callback has stalled",
                 display_name
             ));

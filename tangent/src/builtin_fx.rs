@@ -1494,7 +1494,7 @@ impl BuiltinUnit {
                     .map(|(_, v)| v.as_str())?;
                 match crate::wavread::read(std::path::Path::new(path)) {
                     Ok(wav) => u.load_ir(&wav),
-                    Err(e) => Some(format!("its impulse response did not load — {e}")),
+                    Err(e) => Some(format!("its impulse response did not load: {e}")),
                 }
             }
             _ => None,
@@ -2402,7 +2402,7 @@ impl IrUnit {
         if wav.rate != engine {
             return Some(format!(
                 "its impulse response was captured at {} Hz and this session runs at \
-                 {engine} Hz — loaded as-is, so it plays shifted",
+                 {engine} Hz; loaded as-is, so it plays shifted",
                 wav.rate
             ));
         }

@@ -30,15 +30,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   doing: on, missing, stopped or failed.
 
 - **Buses and returns, as many as a session needs, on every tier.** New Bus
-  and New Return, on a track's right-click menu, add a row at the end of
-  the desk that is not a track: it takes no clips and no input, hears no
+  and New Return, on a track's right-click, add a row at the end of the
+  desk that is not a track: it takes no clips and no input, hears no
   MIDI, and never counts toward the free desk's tracks. A bus has a fader,
   pan, mute, solo, six bays, automation, a colour and a name; it runs its
   plugins once over whatever arrives, and it can be routed on or be a
   sidechain source. Any track sends to any number of buses and returns
-  (Send to a Bus or Return, or Send to a New Return, in the same menu),
-  each send at its own level and after the fader unless you flip it to
-  before, and a post-fader send is offered for automation by its bus's
+  from its Routing window (Send to a Bus or Return, or Send to a New
+  Return), each send at its own level and after the fader unless you flip
+  it to before, and a post-fader send is offered for automation by its bus's
   name. Soloing a track keeps the returns it feeds audible, and a soloed
   bus hears what feeds it.
 
