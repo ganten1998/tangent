@@ -626,19 +626,24 @@ pub struct TangentApp {
     /// that reopened with four rows unfolded because of what somebody did
     /// last Tuesday would be the same species of surprise as a window that
     /// remembers a tiling manager's geometry.
-    /// **Which automation lanes are showing**, as `(lane, parameter)`.
+    /// **Which automation lanes are showing**, as `(owner, parameter)`.
     ///
     /// A set of PAIRS rather than a set of lanes with one chosen parameter
     /// each, which is what it was: mixing a track means watching its volume
     /// and its send at once, and a row that could only show one of them made
     /// that a thing you toggled between rather than saw.
-    arr_auto_open: HashSet<(usize, crate::automation::AutoParam)>,
+    ///
+    /// **Keyed by whose row it is, never by where** (see [`AutoRow`]): a
+    /// reorder moves rows and a row stays open on its track, because
+    /// nothing about the track changed. Every automation field below keys
+    /// the same way, and none of them is carried by any structural edit.
+    arr_auto_open: HashSet<AutoRow>,
     /// Which automation lanes are armed to WRITE. Session state, like
     /// `arr_auto_open`: arming is a thing you do for the next take, not a
     /// property of the song.
-    arr_auto_armed: HashSet<(usize, crate::automation::AutoParam)>,
+    arr_auto_armed: HashSet<AutoRow>,
     /// Which are bypassed — kept, drawn, editable, and not applied.
-    arr_auto_bypassed: HashSet<(usize, crate::automation::AutoParam)>,
+    arr_auto_bypassed: HashSet<AutoRow>,
     /// Per strip, what each of its three bays offers an automation lane.
     /// Pushed by the host — see [`Self::set_fx_params`].
     fx_params: HashMap<usize, [crate::ports::FxParams; recorder::INSERTS]>,
@@ -668,20 +673,20 @@ pub struct TangentApp {
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: HashMap<(usize, usize), f32>,
-    /// The node being pressed or carried, drawn a size larger: `(lane, slot,
-    /// index)`. ONE row's - by lane and index alone, the same index lit on
-    /// every open row of the lane - and let go with the gesture (the
+    /// The node being pressed or carried, drawn a size larger: `(owner,
+    /// slot, index)`. ONE row's - by owner and index alone, the same index
+    /// lit on every open row of the lane - and let go with the gesture (the
     /// release, or the quiet frame that stands in for an unseen one).
-    arr_auto_hot: Option<(usize, usize, usize)>,
-    /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
+    arr_auto_hot: Option<(crate::desk_id::Node, usize, usize)>,
+    /// **The automation row the keyboard is aimed at**, `(owner, slot)`.
     ///
     /// A row can be closed by its × or by Delete, and Delete needs to know
     /// WHICH — so pressing a row's name chooses it, exactly as pressing a
     /// clip chooses that. Cleared whenever a clip or a track is chosen
     /// instead, because two things claiming the Delete key is a Delete key
     /// nobody can predict.
-    arr_auto_sel: Option<(usize, usize)>,
-    /// **Selected automation NODES**, as `(lane, slot, index)`.
+    arr_auto_sel: Option<(crate::desk_id::Node, usize)>,
+    /// **Selected automation NODES**, as `(owner, slot, index)`.
     ///
     /// Distinct from `arr_auto_sel`, which chooses a whole ROW: one of them
     /// answers Delete by closing the lane and the other by removing points,
@@ -696,21 +701,25 @@ pub struct TangentApp {
     /// that reorders a curve therefore has to REMAP or clear this: a drag
     /// and a paste re-find the nodes they moved, and undo, delete and every
     /// other press let the selection go.
-    arr_auto_nodes: Vec<(usize, usize, usize)>,
+    arr_auto_nodes: Vec<(crate::desk_id::Node, usize, usize)>,
     /// Copied nodes, with their times measured from the EARLIEST of them.
     ///
     /// Relative because a paste lands at the playhead: absolute times would
     /// put them back exactly where they were copied from, which is the one
     /// place a paste is never wanted.
     auto_clipboard: Vec<crate::automation::Point>,
-    /// **The row each copied node came from**, `(lane, param)`, parallel to
+    /// **The row each copied node came from**, `(owner, param)`, parallel to
     /// `auto_clipboard`. Nodes chosen on several rows are pasted back row
     /// for row (see `arr_paste_auto_nodes`); merged into one shape, a pan
     /// position used to land on a volume row as a fader level.
-    auto_clipboard_rows: Vec<(usize, crate::automation::AutoParam)>,
-    /// **The row the copied nodes came from**, as `(lane, param)`: where a
+    ///
+    /// Let go when the session changes (`reset_automation_session`), unlike
+    /// the nodes themselves: a track's id means something only in its own
+    /// document, so the next document's row with the same id is a stranger.
+    auto_clipboard_rows: Vec<AutoRow>,
+    /// **The row the copied nodes came from**, as `(owner, param)`: where a
     /// paste lands when nothing on the timeline names a row.
-    auto_clipboard_from: Option<(usize, crate::automation::AutoParam)>,
+    auto_clipboard_from: Option<AutoRow>,
     /// **The automation row the hand last pressed** — a node, the row's
     /// empty room, or its name.
     ///
@@ -718,7 +727,7 @@ pub struct TangentApp {
     /// playhead to a paste point IS a press on the row, and a press on empty
     /// room lets the nodes go, so a paste used to find no row at all and fall
     /// through to the CLIPS: copy, click where it should go, paste, nothing.
-    arr_auto_focus: Option<(usize, crate::automation::AutoParam)>,
+    arr_auto_focus: Option<AutoRow>,
     /// **A node drag's anchor** — see `AutoDragFrom`. Taken on the drag's
     /// first frame and dropped at the release.
     arr_auto_drag_from: Option<AutoDragFrom>,
@@ -741,17 +750,17 @@ pub struct TangentApp {
     /// as it was at the press is the fix, and it is the same reason
     /// `MeDrag::Move` snapshots its selection.
     arr_tempo_drag_from: Option<crate::tempo::TempoMap>,
-    /// Each lane's automation mode. Absent is [`crate::automation::AutoMode`]'s
-    /// default, Read. Session-only — see the type, where the reason is a
-    /// safety one.
-    arr_auto_modes: HashMap<usize, crate::automation::AutoMode>,
-    /// Lanes a Latch has armed. Cleared when the transport stops, which is
-    /// what makes Latch different from Write.
-    arr_auto_latched: HashSet<usize>,
-    /// The last point WRITTEN per `(lane, param)`, so a move at sixty frames
-    /// a second does not lay down sixty points a second. See
+    /// Each lane's automation mode, by its owner. Absent is
+    /// [`crate::automation::AutoMode`]'s default, Read. Session-only — see
+    /// the type, where the reason is a safety one.
+    arr_auto_modes: HashMap<crate::desk_id::Node, crate::automation::AutoMode>,
+    /// Lanes a Latch has armed, by their owners. Cleared when the transport
+    /// stops, which is what makes Latch different from Write.
+    arr_auto_latched: HashSet<crate::desk_id::Node>,
+    /// The last point WRITTEN per `(owner, param)`, so a move at sixty
+    /// frames a second does not lay down sixty points a second. See
     /// `arr_write_automation`.
-    arr_auto_last: HashMap<(usize, crate::automation::AutoParam), (f64, f64)>,
+    arr_auto_last: HashMap<AutoRow, (f64, f64)>,
     /// Whether the transport was rolling last frame, so the app can notice
     /// it STOP. The host writes the recorder's state straight into the app,
     /// so there is no call to hang this on — the edge is looked for instead.
@@ -1073,17 +1082,26 @@ pub struct TangentApp {
     /// Where its strip drag left it. `None` centres it.
     drumpad_pos: Option<Pos2>,
     /// The kit document: paths and knobs, saved beside the arrangement.
-    /// **One kit per channel.** A drum instrument loads a full instance per
-    /// channel, so the kits are per lane and the panel edits ONE of them —
+    /// **One kit per track.** A drum instrument loads a full instance per
+    /// channel, so the kits are per track and the panel edits ONE of them —
     /// see `drumpad_lane` and the `drumpad()` pair, which are the only way
-    /// this is reached. A `Vec` indexed by channel; lanes with no drumpad
-    /// hold the empty kit and cost nothing.
-    drumpad_kits: Vec<crate::drumpad::DrumpadDoc>,
-    /// Which lane's kit the drumpad window is showing and editing.
+    /// this is reached.
+    ///
+    /// **Keyed by the TRACK** (design 4), not indexed by lane as it was: a
+    /// reorder used to have to permute this `Vec` in step with every other
+    /// lane table, and a kit left behind was a drum track playing the kit
+    /// of whatever row it landed on. A track with no entry has the empty
+    /// kit and costs nothing.
+    drumpad_kits: crate::drumpad::TrackKits,
+    /// Which track's kit the drumpad window is showing and editing, or
+    /// `None` before it was ever pointed at one (row 0's, as it always
+    /// was; see `drumpad_row`).
     ///
     /// Not a second copy of anything: the kits live in `drumpad_kits` and
-    /// this only says which one has the panel's attention.
-    drumpad_lane: usize,
+    /// this only says which one has the panel's attention. By identity, so
+    /// the panel stays on its track through a reorder, an insert above it
+    /// and their undo, and an aim at a removed track comes back with it.
+    drumpad_lane: Option<crate::desk_id::TrackId>,
     /// The pad the inspector describes.
     drumpad_sel: usize,
     /// The pad the mouse is holding down — the release owes a `PadHit off`.
@@ -1116,10 +1134,12 @@ pub struct TangentApp {
     /// **The bay an effect was copied FROM**, in seat space, waiting for a
     /// PASTE FX. See `copy_fx`.
     fx_clipboard: Option<(usize, usize)>,
-    /// A paste asked the host to copy plugin state from one strip to
-    /// another: `(from lane, to lane, from track, to track)`. Taken once,
-    /// like `clips_dirty`, by whichever form the host asks for.
-    insert_state_copy: Option<(usize, usize, crate::desk_id::TrackId, crate::desk_id::TrackId)>,
+    /// A paste asked the host to copy plugin state from one track to
+    /// another: `(from track, to track)`. Taken once, like `clips_dirty`, by
+    /// whichever form the host asks for; the lane form finds each track's
+    /// row when it is taken, so a reorder between the paste and the take
+    /// cannot send the host to another track's states.
+    insert_state_copy: Option<(crate::desk_id::TrackId, crate::desk_id::TrackId)>,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -1450,19 +1470,24 @@ pub struct TangentApp {
     /// track asks this one. Kept as its own field rather than derived so the
     /// dozens of places that already read it did not all have to learn about
     /// multiple selection to go on working.
-    selected_channel: Option<usize>,
+    ///
+    /// **The selection names TRACKS, not rows** (design 4): a reorder, an
+    /// insert above and their undo leave it on the tracks it chose with
+    /// nothing carrying it. `selected_row` and `selected_rows` turn it into
+    /// the rows the views and the gestures work in.
+    selected_channel: Option<crate::desk_id::TrackId>,
     /// Every selected track, in the order they were added.
     ///
     /// Shift extends from [`Self::sel_anchor`]; Cmd on macOS and Ctrl
     /// elsewhere adds and removes one at a time. Empty means nothing is
     /// selected, and it always agrees with `selected_channel`: the last entry
     /// here IS that channel.
-    selected_tracks: Vec<usize>,
+    selected_tracks: Vec<crate::desk_id::TrackId>,
     /// Where a Shift range is measured from: the last track chosen WITHOUT
     /// Shift. Held separately from the primary because shift-clicking around
     /// must keep measuring from the same fixed end, which is what makes a
     /// range feel like a range rather than a chain.
-    sel_anchor: Option<usize>,
+    sel_anchor: Option<crate::desk_id::TrackId>,
     /// An LCD Start/End/Length cell being ridden: row, part, and the y the
     /// current step was measured from.
     lcd_drag: Option<(u8, u8, f32)>,
@@ -2530,9 +2555,10 @@ struct Moment {
     /// whenever the desk did not move, which on a run of clip edits is
     /// always: a hundred moments then hold ONE desk.
     desk: std::sync::Arc<crate::arrangement::DeskSnap>,
-    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_all`.
-    /// A hundred moments of the full 128-pad form would be megabytes. What
-    /// an undo restores the kits FROM; the comparison is the words.
+    /// Every non-empty kit, compactly and by its TRACK — see
+    /// `DrumpadDoc::compact_tracks`. A hundred moments of the full 128-pad
+    /// form would be megabytes. What an undo restores the kits FROM; the
+    /// comparison is the words.
     kits: String,
     /// The exact form: every word `undo_mark`'s walk mixes, over the
     /// document, this desk and the kits. Equal words, equal text.
@@ -2572,20 +2598,32 @@ impl Moment {
     }
 }
 
+/// **An automation row, by whose it is**: the owner (a track by its
+/// identity, or the master) and the parameter.
+///
+/// What every session field that names an automation row keys by. A lane
+/// number is where a track sits, and it changes under every reorder and
+/// insert; the owner is the track, which does not. The lanes the views and
+/// the curves speak are turned into owners at the edge
+/// (`TangentApp::auto_owner`) and back (`TangentApp::auto_lane_of`).
+type AutoRow = (crate::desk_id::Node, crate::automation::AutoParam);
+
 /// **Automation rows closed with their curves**, by the set each stood in -
-/// see `Moment::rows_closed`.
+/// see `Moment::rows_closed`. By owner, like the sets themselves, so an undo
+/// reopens a row on its own track wherever the rows have moved since.
 #[derive(Clone, Debug, Default)]
 struct ClosedRows {
-    open: Vec<(usize, crate::automation::AutoParam)>,
-    armed: Vec<(usize, crate::automation::AutoParam)>,
-    bypassed: Vec<(usize, crate::automation::AutoParam)>,
+    open: Vec<AutoRow>,
+    armed: Vec<AutoRow>,
+    bypassed: Vec<AutoRow>,
     /// **What the gesture takes, whatever stood open at the time**: every
-    /// row on these lanes (a track's removal), and these rows (a plugin's
-    /// replace, the curves that went). A redo shuts every row they name, so
-    /// a row opened after the undo, on a curve the undo brought back, goes
-    /// with its curve again, as it would have gone at the gesture.
-    lanes: Vec<usize>,
-    curves: Vec<(usize, crate::automation::AutoParam)>,
+    /// row these owners have (a track's removal), and these rows (a
+    /// plugin's replace, the curves that went). A redo shuts every row they
+    /// name, so a row opened after the undo, on a curve the undo brought
+    /// back, goes with its curve again, as it would have gone at the
+    /// gesture.
+    owners: Vec<crate::desk_id::Node>,
+    curves: Vec<AutoRow>,
 }
 
 impl ClosedRows {
@@ -2593,13 +2631,13 @@ impl ClosedRows {
         self.open.is_empty()
             && self.armed.is_empty()
             && self.bypassed.is_empty()
-            && self.lanes.is_empty()
+            && self.owners.is_empty()
             && self.curves.is_empty()
     }
 
     /// Whether `row` is one the gesture takes away.
-    fn takes(&self, row: &(usize, crate::automation::AutoParam)) -> bool {
-        self.lanes.contains(&row.0) || self.curves.contains(row)
+    fn takes(&self, row: &AutoRow) -> bool {
+        self.owners.contains(&row.0) || self.curves.contains(row)
     }
 }
 
@@ -2660,13 +2698,13 @@ impl SavedPoint {
 /// Everything a track is, held by value. See [`TangentApp::copy_track`].
 #[derive(Clone)]
 struct TrackCopy {
-    /// Which lane it came from — the host needs it to find the plugin state
-    /// files, which are keyed by strip and bay.
-    from: usize,
     /// **Which track it came from**, which no reorder renumbers: what the
-    /// host finds the plugin states by once they are named by identity
-    /// (`take_insert_state_copy_ids`). `from` is remapped by hand across a
-    /// lane move; this needs nothing.
+    /// host finds the plugin states by (`take_insert_state_copy_ids`, and
+    /// the lane form, which asks where this track stands when the note is
+    /// taken). It used to be the LANE it came from, remapped by hand across
+    /// one road's lane move (Paste Track Below) and by no other, so a copy
+    /// taken before a drag reorder sent the host to the states of whatever
+    /// track had moved into that row.
     from_id: crate::desk_id::TrackId,
     kind: Option<recorder::ChannelKind>,
     name: String,
@@ -3321,13 +3359,21 @@ fn media_doc(doc: &std::path::Path, source: Option<&std::path::Path>) -> std::pa
 /// file elsewhere and is not ours to duplicate; a file already in `dst` is
 /// that folder's own and is never overwritten.
 fn copy_kit_samples(
-    kits: &[crate::drumpad::DrumpadDoc],
+    kits: &crate::drumpad::TrackKits,
     src: &std::path::Path,
     dst: &std::path::Path,
 ) {
-    for slot in kits.iter().flat_map(|k| k.pads.iter()) {
+    for slot in kits.values().flat_map(|k| k.pads.iter()) {
         copy_named_file(&slot.path, src, dst);
     }
+}
+
+/// **The empty kit, to lend.** A track with no entry in `drumpad_kits` has
+/// this kit, and a reader that hands out a `&DrumpadDoc` lends this one
+/// rather than inserting an entry to borrow from.
+fn empty_kit() -> &'static crate::drumpad::DrumpadDoc {
+    static EMPTY: std::sync::OnceLock<crate::drumpad::DrumpadDoc> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(crate::drumpad::DrumpadDoc::default)
 }
 
 /// **The files the DOCUMENT stands on**, by the kit samples' rules: every
@@ -4370,10 +4416,8 @@ impl TangentApp {
             drumpad_open: false,
             drumpad_rect: None,
             drumpad_pos: None,
-            drumpad_kits: (0..recorder::CHANNELS)
-                .map(|_| crate::drumpad::DrumpadDoc::default())
-                .collect(),
-            drumpad_lane: 0,
+            drumpad_kits: crate::drumpad::TrackKits::new(),
+            drumpad_lane: None,
             drumpad_sel: 36,
             drumpad_down: None,
             drumpad_grab: None,
@@ -5368,9 +5412,8 @@ impl TangentApp {
     /// folder.
     fn reorder_group(&self, from: usize) -> Vec<usize> {
         let mut group: Vec<usize> = self
-            .selected_tracks
-            .iter()
-            .copied()
+            .selected_rows()
+            .into_iter()
             .filter(|n| *n < recorder::CHANNELS)
             .collect();
         group.sort_unstable();
@@ -6123,17 +6166,13 @@ impl TangentApp {
     /// Empty unless `n` is itself in a selection of more than one, which is
     /// what keeps every ordinary single-track gesture on exactly one track.
     fn selection_partners(&self, n: usize) -> Vec<usize> {
-        let out: Vec<usize> =
-            if self.selected_tracks.len() < 2 || !self.selected_tracks.contains(&n) {
-                Vec::new()
-            } else {
-                self.selected_tracks
-                    .iter()
-                    .copied()
-                    .filter(|x| *x != n && *x < recorder::CHANNELS)
-                    .collect()
-            };
-        out
+        let rows = self.selected_rows();
+        if rows.len() < 2 || !rows.contains(&n) {
+            return Vec::new();
+        }
+        rows.into_iter()
+            .filter(|x| *x != n && *x < recorder::CHANNELS)
+            .collect()
     }
 
     /// `n`, plus everybody selected with it — the set an operation aimed at
@@ -6822,6 +6861,11 @@ impl TangentApp {
     fn remove_channel_inner(&mut self, n: usize) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
+        // **The track going**, by its identity, before the row is minted a
+        // new one: everything below that names the removed TRACK (its rows,
+        // its aims, its kit) is found by this, wherever the row stands.
+        let gone = self.track_id_at(n);
+        let gone_node = crate::desk_id::Node::Track(gone);
         // **A folder takes its membership with it.**
         //
         // Membership is positional — "the nearest folder above me" — so
@@ -6869,8 +6913,10 @@ impl TangentApp {
         // **The emptied row is not the removed track any more**, so it
         // stops wearing its id: whatever still names that id (a selection,
         // a host's note) is inert from here, and the undo that brings the
-        // track back brings the id back with it.
-        self.mint_row_id(n);
+        // track back brings the id back with it. Nothing follows the row to
+        // its new id, which is the whole difference from a mint that makes a
+        // track (`mint_emptied_row_id`).
+        self.mint_emptied_row_id(n);
         use crate::recorder::Strip;
         let d = Settings::default();
         let at = Strip::Channel(n).index();
@@ -6936,19 +6982,23 @@ impl TangentApp {
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
             self.arr_save_edits();
         }
-        self.close_auto_rows(&[n], &[]);
-        self.arr_auto_nodes.retain(|(l, _, _)| *l != n);
-        let gone = |aim: Option<(usize, crate::automation::AutoParam)>| aim.filter(|(l, _)| *l != n);
-        self.arr_auto_focus = gone(self.arr_auto_focus);
-        self.auto_clipboard_from = gone(self.auto_clipboard_from);
-        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| *l != n);
-        self.arr_auto_hot = self.arr_auto_hot.filter(|(l, _, _)| *l != n);
+        // Its rows close INTO the moment, by the track they are, so the undo
+        // that brings the track back reopens them on it wherever it lands.
+        self.close_auto_rows(&[gone_node], &[]);
+        self.arr_auto_nodes.retain(|(o, _, _)| *o != gone_node);
+        let aim = |a: Option<AutoRow>| a.filter(|(o, _)| *o != gone_node);
+        self.arr_auto_focus = aim(self.arr_auto_focus);
+        self.auto_clipboard_from = aim(self.auto_clipboard_from);
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| *o != gone_node);
+        self.arr_auto_hot = self.arr_auto_hot.filter(|(o, _, _)| *o != gone_node);
         // And its drum KIT: a drum track made here later played the old
-        // one's samples at the old one's settings.
-        if self.drumpad_kits.get(n).is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default()) {
-            if let Some(k) = self.drumpad_kits.get_mut(n) {
-                *k = crate::drumpad::DrumpadDoc::default();
-            }
+        // one's samples at the old one's settings. It leaves the map with
+        // its track; the moment before this one keeps it for the undo.
+        if self
+            .drumpad_kits
+            .remove(&gone)
+            .is_some_and(|k| k != crate::drumpad::DrumpadDoc::default())
+        {
             self.drumpad_dirty = true;
             self.drumpad_edited();
         }
@@ -6985,6 +7035,8 @@ impl TangentApp {
         self.settings
             .insert_bypass
             .drop_seat(recorder::folder_extra_seat(at));
+        // The row is another row now: the aims that named it let go.
+        self.on_desk_shape_change();
         self.save_settings();
         // No commit here, for the reason `paste_track_inner` states: the
         // hold in `remove_channel` is what ends the gesture.
@@ -7707,8 +7759,8 @@ impl TangentApp {
             any_solo: desk.any_solo(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
-            selected: self.selected_channel,
-            selected_tracks: &self.selected_tracks,
+            selected: self.selected_row(),
+            selected_tracks: self.selected_rows(),
             fx_menu: self.mixer_fx_menu,
             // Whether the open menu's bay can take a key, asked once here
             // so the hit test and the painter agree by construction.
@@ -9853,6 +9905,7 @@ impl TangentApp {
         self.desk_index_dirty();
         self.load_drumpad_doc();
         self.reset_automation_session();
+        self.forget_document_tracks();
         // **Seed the undo baseline HERE too.** Every road into a document
         // ends at `undo_reset` — open, save-as, fresh — and this one forgot,
         // which left `history` empty until the FIRST edit committed its own
@@ -11157,6 +11210,11 @@ impl TangentApp {
                 let _ = self.settings.routes.drop_into(ch);
             }
         }
+        // **The route labels follow the table this put down.** They are
+        // the table drawn as words, and an open, an undo or a redo that
+        // replaced the routes left the strips naming the last session's (or
+        // the last moment's) sources until a route was next edited by hand.
+        self.refresh_route_labels();
         self.desk_reload = true;
     }
 
@@ -11780,7 +11838,7 @@ impl TangentApp {
     /// **Cmd/Ctrl+Shift+F on the selected track.** Frozen thaws, live freezes,
     /// and a lane with nothing to render says so rather than doing nothing.
     fn freeze_selected(&mut self) {
-        let Some(lane) = self.selected_channel.filter(|n| *n < recorder::CHANNELS) else {
+        let Some(lane) = self.selected_row().filter(|n| *n < recorder::CHANNELS) else {
             self.notify(crate::notify::Kind::Info, "Select a track to freeze it.");
             return;
         };
@@ -12276,32 +12334,27 @@ impl TangentApp {
             }
         }
 
-        // ── session state that names a lane ──────────────────────────────
-        self.selected_channel = self.selected_channel.map(|n| {
-            if n < CHANNELS { inv[n] } else { n }
-        });
-        // The whole selection follows the same map, or a reorder would leave
-        // the rim behind on whichever tracks happened to take those rows.
-        for n in &mut self.selected_tracks {
-            if *n < CHANNELS {
-                *n = inv[*n];
-            }
-        }
-        self.sel_anchor = self.sel_anchor.map(|n| {
-            if n < CHANNELS { inv[n] } else { n }
-        });
-        self.input_menu = None;
-        self.mixer_naming = None;
-        self.mixer_typing = None;
-        self.mixer_fx_menu = None;
-        self.mixer_grab = None;
-        self.arr_drag = None;
-        self.arr_pending = None;
+        // ── session state ────────────────────────────────────────────────
+        //
+        // **What names a TRACK is keyed by its identity, so nothing here
+        // carries it**: the selection, the drum panel and its kit, every
+        // automation row's open, armed and bypassed state, its mode, latch
+        // and last written point, the paste's aims and the copied track all
+        // stayed on their tracks because their tracks did not change. This
+        // block used to remap each of them by hand, and each one added
+        // without its remap (the kits, the curves' rows, the T switches)
+        // was a moved track wearing another track's state until somebody
+        // noticed. What names a ROW for one gesture lets go instead, at the
+        // end, once the route table it relabels has moved too - see
+        // `on_desk_shape_change`, which also puts the pedal window down.
+        //
+        // Two SEAT aims ride the move until W5 keys them by bay identity: a
+        // pick under way and the face it opens on load. A pedal seat
+        // follows its channel, like its plugins do.
         if let Some((strip, _)) = self.open_insert_on_load.as_mut() {
             if *strip < CHANNELS {
                 *strip = inv[*strip];
             } else if let Some((ch, p)) = recorder::amp_pedal_of(*strip) {
-                // A pedal seat follows its channel, like its plugins did.
                 *strip = recorder::amp_pedal_seat(inv[ch], p);
             }
         }
@@ -12312,70 +12365,15 @@ impl TangentApp {
                 *strip = recorder::amp_pedal_seat(inv[ch], p);
             }
         }
-        // **And the OPEN pedal window goes DOWN**, rather than being carried.
-        //
-        // Remapping its seat is the move that looks right and is worse than
-        // doing nothing. The window it is standing on is an open
-        // `Dialog::InsertFace`, and this function does not remap THAT — the
-        // face goes on naming desk row 0's bay 0 whoever is in row 0 now,
-        // which is a pre-existing rough edge and not this lane's to smooth.
-        // Move only the pedal and the two windows stop describing the same
-        // strip: the amp shows whatever landed in that row while the pedal
-        // above it shows the board of the track that left, with no way for
-        // anybody looking at them to tell. Leaving both stale keeps them in
-        // agreement but leaves `picker_insert` — which IS remapped, three
-        // lines up — aimed at a seat the stack no longer claims, so a pick
-        // made across a reorder would land its face in the desk's slot and
-        // put the amp away.
-        //
-        // Closing it is the one answer with no disagreement in it. A reorder
-        // moves the ground under both windows; the second one is the one
-        // that can be put down cheaply, and a window that vanishes when you
-        // drag a track is a thing a person can see and understand.
-        self.pedal_stack = None;
-
-        // ── everything else keyed by CHANNEL ─────────────────────────────
-        //
-        // These three arrived with the drum lanes and the automation rows,
-        // and none of them was here: a reorder moved the tracks and left
-        // them behind, so a track that moved played ANOTHER lane's kit and
-        // answered another lane's curves. Folder drags reorder constantly,
-        // which is why it showed up there first — the owner: "if a track
-        // becomes a child, then are removed from the folder, 1/2 n=2 of them
-        // have audio permanently degrade drastically. Add it back? Totally
-        // fine again as long as it's in the folder once more." Moving it
-        // twice can land the kit back under its track, which is exactly what
-        // "fine again" was.
-        //
-        // **The KITS.** A drum instrument loads a full instance per channel
-        // and its samples live in a per-channel document; leaving them
-        // behind is a drum track playing whatever the seat it landed on
-        // happened to hold.
-        {
-            let mut kits: Vec<crate::drumpad::DrumpadDoc> =
-                Vec::with_capacity(self.drumpad_kits.len());
-            for n in 0..CHANNELS {
-                kits.push(
-                    self.drumpad_kits
-                        .get(order[n])
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-            for (n, k) in kits.into_iter().enumerate() {
-                if let Some(slot) = self.drumpad_kits.get_mut(n) {
-                    *slot = k;
-                }
-            }
-            self.drumpad_lane = inv
-                .get(self.drumpad_lane)
-                .copied()
-                .unwrap_or(self.drumpad_lane);
-            self.drumpad_dirty = true;
-        }
-        // **The CURVES.** They are keyed by lane, so without this a track's
-        // volume automation stays on the seat and starts driving whichever
-        // track moved into it.
+        // **The kits stay with their tracks and the host hears of it.** A
+        // drum lane's kit is keyed by its track, so it moved with the row by
+        // not moving at all; what the engine holds is per LANE, and every
+        // moved drum lane's samples have to be pushed again.
+        self.drumpad_dirty = true;
+        // **The CURVES.** They are document state keyed by lane (until W6
+        // gives them an `AutoLane`), so without this a track's volume
+        // automation stays on the seat and starts driving whichever track
+        // moved into it.
         {
             let moved: Vec<crate::automation::Curve> = self
                 .arrangement
@@ -12395,14 +12393,11 @@ impl TangentApp {
             self.arrangement.automation =
                 crate::automation::Automation::from_curves(moved);
         }
-        // **And which rows are OPEN, armed or bypassed, and the paste's
-        // aims**, for the same reason: they are `(lane, param)` and the lane
-        // just changed. One function, because an undo or redo across this
-        // reorder has to carry them too - see `carry_automation_rows`.
-        self.carry_automation_rows(&inv);
-        // The node selection names rows that have just moved. Cleared rather
-        // than remapped: it is a hand's selection, and a reorder is the hand
-        // doing something else.
+        // The chosen nodes and the chosen row let go. Not because they would
+        // land on another track - they name their owner - but because they
+        // are a hand's choice, and a reorder is the hand doing something
+        // else; a Delete pressed next should not take nodes off a track the
+        // eye has just watched move.
         self.arr_auto_nodes.clear();
         self.arr_auto_sel = None;
 
@@ -12433,6 +12428,8 @@ impl TangentApp {
         self.settings
             .insert_bypass
             .remap_seats(&recorder::seat_order(order));
+        // The desk has its new shape: the aims that named rows let go.
+        self.on_desk_shape_change();
 
         // **And the moment this gesture leaves keeps the order**, so undo
         // can hand the host the way back - see `Moment::perm`. Composed, for
@@ -12446,57 +12443,18 @@ impl TangentApp {
         self.arr_save_edits();
     }
 
-    /// **The automation rows the session holds, carried to the lanes they
-    /// now name.** Which rows are open, armed or bypassed, and the paste's
-    /// two aims, are `(lane, param)` pairs kept beside the document rather
-    /// than in it, so nothing else moves them; so are each lane's mode,
-    /// latch and last written point. A reorder calls this, and so
-    /// does an undo or redo that crosses one: the words put each curve back
-    /// on its old lane, and a bypass left where the reorder had taken it
-    /// let that curve play and silenced whichever curve took its row.
-    ///
-    /// **The paste's aims are rows too**, and a paste with nothing chosen
-    /// lands on one: carried with the lane they name, or it would replace a
-    /// span on whatever track moved into that row. `inv[old] = new`; a lane
-    /// past the channels holds still.
-    fn carry_automation_rows(&mut self, inv: &[usize]) {
-        use crate::automation::AutoParam;
-        use crate::recorder::CHANNELS;
-        let to = |l: usize| match inv.get(l) {
-            Some(&n) if l < CHANNELS && n < CHANNELS => n,
-            _ => l,
-        };
-        let remap = |set: &HashSet<(usize, AutoParam)>| {
-            set.iter().map(|&(l, p)| (to(l), p)).collect::<HashSet<_>>()
-        };
-        self.arr_auto_open = remap(&self.arr_auto_open);
-        self.arr_auto_armed = remap(&self.arr_auto_armed);
-        self.arr_auto_bypassed = remap(&self.arr_auto_bypassed);
-        self.arr_auto_focus = self.arr_auto_focus.map(|(l, p)| (to(l), p));
-        self.auto_clipboard_from = self.auto_clipboard_from.map(|(l, p)| (to(l), p));
-        self.arr_auto_modes = self.arr_auto_modes.iter().map(|(&l, &m)| (to(l), m)).collect();
-        self.arr_auto_latched = self.arr_auto_latched.iter().map(|&l| to(l)).collect();
-        self.arr_auto_last = self
-            .arr_auto_last
-            .iter()
-            .map(|(&(l, p), &v)| ((to(l), p), v))
-            .collect();
-    }
-
-    /// **Close the automation rows on `lanes` and the rows `curves` name,
-    /// open, armed and bypassed, and keep them for the moment this gesture
-    /// leaves**, so the undo that brings their curves back opens them again
-    /// (`Moment::rows_closed`). For a track's removal (its lane) and a
-    /// plugin's replace (the curves that went), which take the curves those
-    /// rows draw. The lanes and curves are kept too, for the redo to shut
-    /// whatever of them stands open by then.
-    fn close_auto_rows(&mut self, lanes: &[usize], curves: &[(usize, crate::automation::AutoParam)]) {
+    /// **Close the automation rows these owners have and the rows `curves`
+    /// name, open, armed and bypassed, and keep them for the moment this
+    /// gesture leaves**, so the undo that brings their curves back opens
+    /// them again (`Moment::rows_closed`). For a track's removal (its
+    /// owner) and a plugin's replace (the curves that went), which take the
+    /// curves those rows draw. The owners and curves are kept too, for the
+    /// redo to shut whatever of them stands open by then.
+    fn close_auto_rows(&mut self, owners: &[crate::desk_id::Node], curves: &[AutoRow]) {
         let kept = &mut self.rows_closed_since_moment;
-        kept.lanes.extend_from_slice(lanes);
+        kept.owners.extend_from_slice(owners);
         kept.curves.extend_from_slice(curves);
-        let named = |row: &(usize, crate::automation::AutoParam)| {
-            lanes.contains(&row.0) || curves.contains(row)
-        };
+        let named = |row: &AutoRow| owners.contains(&row.0) || curves.contains(row);
         kept.open.extend(self.arr_auto_open.iter().filter(|r| named(r)));
         kept.armed.extend(self.arr_auto_armed.iter().filter(|r| named(r)));
         kept.bypassed.extend(self.arr_auto_bypassed.iter().filter(|r| named(r)));
@@ -12512,7 +12470,7 @@ impl TangentApp {
         self.arr_auto_open.extend(rows.open.iter().copied());
         self.arr_auto_armed.extend(rows.armed.iter().copied());
         self.arr_auto_bypassed.extend(rows.bypassed.iter().copied());
-        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !rows.open.iter().any(|r| r.0 == *l));
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| !rows.open.iter().any(|r| r.0 == *o));
     }
 
     /// The rows a moment's gesture takes, shut again with the aims that name
@@ -12522,7 +12480,7 @@ impl TangentApp {
     /// otherwise stand open (and armed) under the emptied slot. Answers what
     /// it shut, which the moment keeps for the next undo to open.
     fn shut_auto_rows(&mut self, rows: &ClosedRows) -> ClosedRows {
-        let named = |row: &(usize, crate::automation::AutoParam)| {
+        let named = |row: &AutoRow| {
             rows.takes(row)
                 || rows.open.contains(row)
                 || rows.armed.contains(row)
@@ -12532,7 +12490,7 @@ impl TangentApp {
             open: self.arr_auto_open.iter().copied().filter(|r| named(r)).collect(),
             armed: self.arr_auto_armed.iter().copied().filter(|r| named(r)).collect(),
             bypassed: self.arr_auto_bypassed.iter().copied().filter(|r| named(r)).collect(),
-            lanes: rows.lanes.clone(),
+            owners: rows.owners.clone(),
             curves: rows.curves.clone(),
         };
         self.arr_auto_open.retain(|r| !named(r));
@@ -12540,7 +12498,7 @@ impl TangentApp {
         self.arr_auto_bypassed.retain(|r| !named(r));
         self.arr_auto_focus = self.arr_auto_focus.filter(|r| !named(r));
         self.auto_clipboard_from = self.auto_clipboard_from.filter(|r| !named(r));
-        self.arr_auto_sel = self.arr_auto_sel.filter(|(l, _)| !shut.open.iter().any(|r| r.0 == *l));
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| !shut.open.iter().any(|r| r.0 == *o));
         shut
     }
 
@@ -12633,17 +12591,9 @@ impl TangentApp {
         let mut order: Vec<usize> = (0..CHANNELS).filter(|c| *c != free).collect();
         let at = n + 1;
         order.insert(at, free);
-        // **The clipboard names a LANE, and the lanes are about to move.** A
-        // track copy carries the index it came from so the host can find that
-        // track's plugin-state files on disk; paste-below shifts the source
-        // down a row whenever it sat under the click, and a stale index would
-        // send the host to somebody else's sidecars. Remapped BEFORE the
-        // reorder, while `order` is still the description of the move.
-        if let Some(c) = self.track_clipboard.as_mut() {
-            if let Some(moved) = order.iter().position(|old| *old == c.from) {
-                c.from = moved;
-            }
-        }
+        // The clipboard names its source TRACK (`TrackCopy::from_id`), so the
+        // rows moving under it need nothing: the host is sent to that
+        // track's states wherever the move leaves it.
         self.reorder_channels(&order);
         // **Folder membership is the one thing the permutation cannot get
         // right**, because the lane that was spent came from outside every
@@ -12679,8 +12629,7 @@ impl TangentApp {
             return false;
         };
         let _ = self.add_bare_track(at);
-        self.selected_channel = Some(at);
-        self.selected_tracks = vec![at];
+        self.select_alone(at);
         self.save_settings();
         self.commit_undo_moment();
         true
@@ -12785,7 +12734,6 @@ impl TangentApp {
         self.auto_clipboard_rows.clear();
         self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
-            from: n,
             from_id: self.track_id_at(n),
             kind: self.channel_kind(n),
             name: self
@@ -13022,9 +12970,7 @@ impl TangentApp {
         // makes the engine treat a lane as drums; the KIT is what it plays.
         // Copy one without the other and the new lane strikes silently.
         if let Some(kit) = copy.kit.clone() {
-            if let Some(slot) = self.drumpad_kits.get_mut(into) {
-                *slot = kit;
-            }
+            self.drumpad_kits.insert(self.track_id_at(into), kit);
             // The samples have to be decoded for the new lane and the kit
             // pushed to the audio thread, which is what this asks for.
             self.drumpad_dirty = true;
@@ -13033,9 +12979,8 @@ impl TangentApp {
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
         // defaults, which is a different instrument wearing the same name.
-        self.insert_state_copy = Some((copy.from, into, copy.from_id, self.track_id_at(into)));
-        self.selected_channel = Some(into);
-        self.selected_tracks = vec![into];
+        self.insert_state_copy = Some((copy.from_id, self.track_id_at(into)));
+        self.select_alone(into);
         self.save_settings();
         // No commit here: the hold in `paste_track` is what ends this
         // gesture, and a commit inside a hold is a no-op anyway. The
@@ -13044,8 +12989,16 @@ impl TangentApp {
 
     /// The (from, to) strips whose insert state the host should copy, taken
     /// once. See `paste_track`.
+    ///
+    /// **The rows the two TRACKS stand on now**, asked as the note is taken,
+    /// so a reorder between the copy and the paste (or the paste and the
+    /// take) cannot hand the host another track's files. A copy whose
+    /// source track has been removed since has no row to name, and this
+    /// form answers nothing for it; the id form still names the track,
+    /// whose states the host keeps by identity.
     pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
-        self.insert_state_copy.take().map(|(from, to, _, _)| (from, to))
+        let (from, to) = self.insert_state_copy.take()?;
+        Some((self.row_of(from)?, self.row_of(to)?))
     }
 
     /// **The same note, by identity**: the (from, to) TRACKS, taken once.
@@ -13055,7 +13008,7 @@ impl TangentApp {
     pub fn take_insert_state_copy_ids(
         &mut self,
     ) -> Option<(crate::desk_id::TrackId, crate::desk_id::TrackId)> {
-        self.insert_state_copy.take().map(|(_, _, from, to)| (from, to))
+        self.insert_state_copy.take()
     }
 
     /// **Every row's id, in lane order**: the desk's rows by identity, for
@@ -13082,21 +13035,185 @@ impl TangentApp {
     }
 
     /// **Row `n` becomes a new track, so it gets a new id** (design 3): add,
-    /// paste, a folder's header, a kind given to an empty row, and a row a
-    /// removal emptied. Fresh means never held by any row of this desk, so
-    /// whatever session state still names the old id is inert, and an undo
-    /// that brings the old row back brings its old id with it.
+    /// paste, a folder's header, a kind or an input given to an empty row,
+    /// a clip landing on one. Fresh means never held by any row of this
+    /// desk.
+    ///
+    /// **What stood on the row stays on the row.** An empty row is not
+    /// always a bare one: it can be selected (an empty slot is a paste
+    /// target and wears the rim), the drum panel can be pointed at it, and
+    /// a desk can carry a kit on a row with no kind. All of that is keyed
+    /// by the row's id, and a new id would orphan it - the kit worst of
+    /// all, silently - where the row's position-keyed fields (its name, its
+    /// bays) simply stay. So everything keyed by the old id follows the row
+    /// to the new one (`retarget_row`).
     fn mint_row_id(&mut self, n: usize) {
-        let Some(slot) = self.settings.track_ids.get_mut(n) else {
-            return;
-        };
+        let was = self.track_id_at(n);
+        if let Some(now) = self.mint_bare(n) {
+            self.retarget_row(was, now);
+        }
+    }
+
+    /// **The row a removal empties gets a new id, and nothing follows it**:
+    /// the removed track keeps its own, so whatever still names it - its
+    /// automation rows, the drum panel, a host's note - is inert from here,
+    /// and the undo that brings the track back brings its id back with it.
+    fn mint_emptied_row_id(&mut self, n: usize) {
+        let _ = self.mint_bare(n);
+    }
+
+    /// A new id on row `n`, minted from the counter: the id, or `None` for
+    /// no such row or a counter past a `u32`.
+    fn mint_bare(&mut self, n: usize) -> Option<crate::desk_id::TrackId> {
+        let slot = self.settings.track_ids.get_mut(n)?;
         let Ok(id) = u32::try_from(self.settings.next_track_id) else {
             // Four billion tracks minted in one session: keep the id the row
             // has rather than wrap onto one in use.
-            return;
+            return None;
         };
         *slot = crate::desk_id::TrackId(id);
         self.settings.next_track_id += 1;
+        Some(*slot)
+    }
+
+    /// **Everything the session keys by track `from`, keyed by `to`
+    /// instead**: the row `from` named has a new id and is the same row.
+    /// `mint_row_id`'s other half, and its only caller - a removal mints
+    /// without it, on purpose. An id substitution, not a positional remap:
+    /// no other track's state is touched, and nothing moves between rows.
+    fn retarget_row(&mut self, from: crate::desk_id::TrackId, to: crate::desk_id::TrackId) {
+        use crate::desk_id::Node;
+        if from == to {
+            return;
+        }
+        if let Some(kit) = self.drumpad_kits.remove(&from) {
+            self.drumpad_kits.insert(to, kit);
+        }
+        let track = |t: crate::desk_id::TrackId| if t == from { to } else { t };
+        self.drumpad_lane = self.drumpad_lane.map(track);
+        self.selected_channel = self.selected_channel.map(track);
+        self.sel_anchor = self.sel_anchor.map(track);
+        for t in &mut self.selected_tracks {
+            *t = track(*t);
+        }
+        let node = |n: Node| if n == Node::Track(from) { Node::Track(to) } else { n };
+        let rows = |set: &mut HashSet<AutoRow>| {
+            *set = set.drain().map(|(o, p)| (node(o), p)).collect();
+        };
+        rows(&mut self.arr_auto_open);
+        rows(&mut self.arr_auto_armed);
+        rows(&mut self.arr_auto_bypassed);
+        self.arr_auto_focus = self.arr_auto_focus.map(|(o, p)| (node(o), p));
+        self.auto_clipboard_from = self.auto_clipboard_from.map(|(o, p)| (node(o), p));
+        for (o, _) in &mut self.auto_clipboard_rows {
+            *o = node(*o);
+        }
+        self.arr_auto_modes = self.arr_auto_modes.drain().map(|(o, m)| (node(o), m)).collect();
+        self.arr_auto_latched = self.arr_auto_latched.drain().map(node).collect();
+        self.arr_auto_last = self.arr_auto_last.drain().map(|((o, p), v)| ((node(o), p), v)).collect();
+        self.arr_auto_sel = self.arr_auto_sel.map(|(o, s)| (node(o), s));
+        self.arr_auto_hot = self.arr_auto_hot.map(|(o, s, i)| (node(o), s, i));
+        for (o, _, _) in &mut self.arr_auto_nodes {
+            *o = node(*o);
+        }
+    }
+
+    /// **Whose automation lane `lane` is**: the track on that row, by its
+    /// identity, or the master on the master's lane. `None` past both. The
+    /// one door from a lane - what the views, the hits and the curves speak
+    /// - to the key every automation session field is held by.
+    fn auto_owner(&self, lane: usize) -> Option<crate::desk_id::Node> {
+        if lane == master_lane() {
+            return Some(crate::desk_id::Node::Master);
+        }
+        self.settings.track_ids.get(lane).copied().map(crate::desk_id::Node::Track)
+    }
+
+    /// **The lane an automation row's owner stands on now**: the master's
+    /// own, or its track's row. `None` for a track this desk does not hold
+    /// (removed: its rows are inert until an undo brings it back).
+    fn auto_lane_of(&self, owner: crate::desk_id::Node) -> Option<usize> {
+        match owner {
+            crate::desk_id::Node::Master => Some(master_lane()),
+            crate::desk_id::Node::Track(id) => self.row_of(id),
+            _ => None,
+        }
+    }
+
+    /// `(lane, param)` as the row it is, by owner.
+    fn auto_row(&self, lane: usize, param: crate::automation::AutoParam) -> Option<AutoRow> {
+        self.auto_owner(lane).map(|o| (o, param))
+    }
+
+    /// An owner-keyed row back to `(lane, param)`, while its owner stands
+    /// on a lane.
+    fn auto_row_lane(&self, row: AutoRow) -> Option<(usize, crate::automation::AutoParam)> {
+        self.auto_lane_of(row.0).map(|l| (l, row.1))
+    }
+
+    /// **The rows the selected tracks stand on**, in selection order: what
+    /// the views draw the rim from and every gesture on the selection acts
+    /// on. A selected track this desk no longer holds is skipped.
+    fn selected_rows(&self) -> Vec<usize> {
+        self.selected_tracks.iter().filter_map(|t| self.row_of(*t)).collect()
+    }
+
+    /// The PRIMARY's row - see `selected_channel` - while its track stands
+    /// on one.
+    fn selected_row(&self) -> Option<usize> {
+        self.selected_channel.and_then(|t| self.row_of(t))
+    }
+
+    /// **Row `n`'s track, and nothing else, is selected**: the primary and
+    /// the whole selection. The anchor is left where it was, as every road
+    /// that lands a new track on the selection always has.
+    fn select_alone(&mut self, n: usize) {
+        let id = self.track_id_at(n);
+        self.selected_channel = Some(id);
+        self.selected_tracks = vec![id];
+    }
+
+    /// **The track the selection's PRIMARY is**, by identity: the id form of
+    /// `selected_channel()` (C11), for a host that names tracks.
+    pub fn selected_track(&self) -> Option<crate::desk_id::TrackId> {
+        self.selected_channel
+    }
+
+    /// **The desk changed shape: the transient aims let go** (design 4).
+    ///
+    /// Every structural edit calls this - the reorder every move, insert
+    /// below, grouping and folder drag goes through, a track's removal, and
+    /// an undo or redo that moved rows. What it clears is what names a ROW
+    /// for the length of one gesture or one open menu: the input menu, a
+    /// strip being named or typed into, the insert menu, a fader or strip
+    /// in a hand, the timeline's drag and its anchors, a drawn item and a
+    /// file drop in flight, a pedal window. Each was a lane the moment
+    /// before, so each would act on whatever track the edit moved into it;
+    /// a menu that closes and a drag that stops are what a hand sees when
+    /// the ground moves under it. The meters' held picture is a row's too,
+    /// so it starts again from the next push, and the route labels are
+    /// rebuilt from the table the edit rewrote.
+    ///
+    /// Everything that names a TRACK is keyed by its identity instead and
+    /// is untouched here: no structural edit carries it, because none has
+    /// to (`session_lane_fields`, the classification scan, holds both
+    /// lists).
+    fn on_desk_shape_change(&mut self) {
+        self.input_menu = None;
+        self.mixer_naming = None;
+        self.mixer_typing = None;
+        self.mixer_fx_menu = None;
+        self.mixer_grab = None;
+        self.mixer_reorder = None;
+        self.arr_drag = None;
+        self.arr_auto_drag_from = None;
+        self.arr_pending = None;
+        self.arr_drop = None;
+        self.arr_move_orig.clear();
+        self.arr_stretch_orig.clear();
+        self.pedal_stack = None;
+        self.meter_hold = [[0.0; 2]; recorder::STRIPS];
+        self.refresh_route_labels();
     }
 
     /// **Which legacy shape the open document's `state/` folder is in**,
@@ -13316,7 +13433,7 @@ impl TangentApp {
         // and ignoring it made the keybind land somewhere off-screen. A
         // used selection falls through to the first free slot AFTER it,
         // then anywhere.
-        if let Some(sel) = self.selected_channel {
+        if let Some(sel) = self.selected_row() {
             if sel < self.desk_extent() && !self.channel_used(sel) {
                 let _ = self.add_bare_track(sel);
                 return;
@@ -13730,14 +13847,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // memory: reopened, it came up with every pad empty. A folder made
         // real by a take or an import never wrote the sidecar.
         if !dir.join(crate::drumpad::FILE_NAME).exists()
-            && self.drumpad_kits.iter().any(|k| !k.is_empty())
+            && self.drumpad_kits.values().any(|k| !k.is_empty())
         {
-            crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane,
-                &self.project_doc,
-            );
+            self.save_kits_beside(&self.project_doc);
         }
     }
 
@@ -13784,12 +13896,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// The live kit sidecar into `dir`, whatever is in it.
     pub fn write_kit_into(&self, dir: &std::path::Path) {
-        crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane,
-            &crate::arrangement::doc_in(dir),
-        );
+        self.save_kits_beside(&crate::arrangement::doc_in(dir));
     }
 
     /// **The session now IS the template it just wrote**, so there is
@@ -13955,6 +14062,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // loads the template's kit once it has repointed.
         self.load_drumpad_doc();
         self.reset_automation_session();
+        self.forget_document_tracks();
         self.reconcile_auto_bases();
         // **One settings write per open, here, after everything an open
         // touches has landed** — the path, the desk, whatever the reconcile
@@ -14071,12 +14179,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Which rows are open, armed and bypassed, the lanes' modes and
     /// latches, the chosen nodes and row, and the aims a paste falls back
-    /// to are session state keyed by `(lane, param)`, and a lane in the next
-    /// document is somebody else's track. A row armed in the last project
-    /// wrote an invisible curve into this one the first time a fader moved
-    /// during playback, and a bypass silenced this one's curve. Every road
-    /// that replaces the document calls this. The copied nodes themselves
-    /// stay: a copy made in one project pastes into another.
+    /// to are session state keyed by `(owner, param)`, and an owner is a
+    /// track's id, which means something only in its own document: the next
+    /// document's `t3` is somebody else's track. A row armed in the last
+    /// project wrote an invisible curve into this one the first time a
+    /// fader moved during playback, and a bypass silenced this one's curve.
+    /// Every road that replaces the document calls this. The copied nodes
+    /// themselves stay - a copy made in one project pastes into another -
+    /// but not the rows they came from, which are the last document's ids:
+    /// a paste lands them on the row it aims at, as one shape.
     fn reset_automation_session(&mut self) {
         self.arr_auto_open.clear();
         self.arr_auto_armed.clear();
@@ -14090,6 +14201,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_auto_focus = None;
         self.arr_auto_drag_from = None;
         self.auto_clipboard_from = None;
+        self.auto_clipboard_rows.clear();
+    }
+
+    /// **The selection lets go of the last document's tracks.** It names
+    /// tracks by id, and an id means something only in the document that
+    /// minted it: kept across an open, `t40` would select whatever track
+    /// the next document gave that id, or nothing at all. The design's rule
+    /// for every entry keyed by a track: inert while its track is gone,
+    /// purged when the session changes.
+    fn forget_document_tracks(&mut self) {
+        self.selected_channel = None;
+        self.selected_tracks.clear();
+        self.sel_anchor = None;
     }
 
     /// **On open, a lone base node and its control are made to agree.**
@@ -14283,10 +14407,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.named = true;
         self.save_project_doc();
         self.save_settings();
-        crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane, &doc);
+        self.save_kits_beside(&doc);
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
@@ -14351,12 +14472,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.save_settings();
         // The kit's sidecar is part of the project and copies with it — its
         // samples already came along inside `media/`.
-        crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane,
-            &doc,
-        );
+        self.save_kits_beside(&doc);
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
@@ -15239,10 +15355,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and the menu read the same way down.
     fn arr_auto_rows(&self, lane: usize) -> Vec<crate::automation::AutoParam> {
         use crate::automation::AutoParam;
+        let Some(owner) = self.auto_owner(lane) else {
+            return Vec::new();
+        };
         let mut out: Vec<AutoParam> = self
             .arr_auto_open
             .iter()
-            .filter(|(l, _)| *l == lane)
+            .filter(|(o, _)| *o == owner)
             .map(|(_, p)| *p)
             .collect();
         let rank = |p: &AutoParam| match p {
@@ -15272,8 +15391,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         lane: usize,
         param: crate::automation::AutoParam,
     ) {
-        if !self.arr_auto_open.remove(&(lane, param)) {
-            self.arr_auto_open.insert((lane, param));
+        let Some(row) = self.auto_row(lane, param) else {
+            return;
+        };
+        if !self.arr_auto_open.remove(&row) {
+            self.arr_auto_open.insert(row);
             self.arr_seed_first_node(lane, param);
         }
         self.arr_auto_hot = None;
@@ -15597,7 +15719,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Aim the keyboard at one automation row. See `arr_auto_sel`.
     fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
-        self.arr_auto_sel = Some((lane, slot));
+        self.arr_auto_sel = self.auto_owner(lane).map(|o| (o, slot));
         // One subject at a time: a Delete that might mean a clip OR a curve
         // is a Delete nobody presses twice.
         self.arr_selected = None;
@@ -15626,7 +15748,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// used to clear the others, and a box or a paste beside a chosen clip
     /// on a frozen track had Delete refuse the nodes for the clip's sake.
     fn arr_choose_auto_nodes(&mut self, nodes: Vec<(usize, usize, usize)>) {
-        self.arr_auto_nodes = nodes;
+        self.arr_auto_nodes = self.auto_nodes_owned(nodes);
         self.arr_auto_sel = None;
         self.arr_selected = None;
         self.arr_multi.clear();
@@ -15637,15 +15759,42 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_auto_sel = None;
         self.arr_selected = None;
         self.arr_multi.clear();
+        let Some(owner) = self.auto_owner(lane) else {
+            return;
+        };
         if let Some(at) = self
             .arr_auto_nodes
             .iter()
-            .position(|n| *n == (lane, slot, index))
+            .position(|n| *n == (owner, slot, index))
         {
             self.arr_auto_nodes.remove(at);
         } else {
-            self.arr_auto_nodes.push((lane, slot, index));
+            self.arr_auto_nodes.push((owner, slot, index));
         }
+    }
+
+    /// **Nodes the views name by lane, held by owner**: `(lane, slot,
+    /// index)` as the hits and the curves give them, keyed the way
+    /// `arr_auto_nodes` keeps them. A lane with no owner names no node.
+    fn auto_nodes_owned(
+        &self,
+        nodes: Vec<(usize, usize, usize)>,
+    ) -> Vec<(crate::desk_id::Node, usize, usize)> {
+        nodes
+            .into_iter()
+            .filter_map(|(lane, slot, index)| Some((self.auto_owner(lane)?, slot, index)))
+            .collect()
+    }
+
+    /// Whether the node `(lane, slot, index)` is one of the chosen.
+    fn auto_node_chosen(&self, lane: usize, slot: usize, index: usize) -> bool {
+        self.auto_owner(lane)
+            .is_some_and(|o| self.arr_auto_nodes.contains(&(o, slot, index)))
+    }
+
+    /// The node under the hand is `(lane, slot, index)` - see `arr_auto_hot`.
+    fn set_auto_hot(&mut self, lane: usize, slot: usize, index: usize) {
+        self.arr_auto_hot = self.auto_owner(lane).map(|o| (o, slot, index));
     }
 
     /// The selected nodes as `(lane, param, index)`, resolved NOW, each
@@ -15659,8 +15808,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut out: Vec<(usize, crate::automation::AutoParam, usize)> = self
             .arr_auto_nodes
             .iter()
-            .filter_map(|(lane, slot, index)| {
-                self.arr_auto_param_at(*lane, *slot).map(|p| (*lane, p, *index))
+            .filter_map(|(owner, slot, index)| {
+                let lane = self.auto_lane_of(*owner)?;
+                self.arr_auto_param_at(lane, *slot).map(|p| (lane, p, *index))
             })
             .collect();
         out.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then(b.2.cmp(&a.2)));
@@ -15752,16 +15902,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut picks = self.arr_auto_node_picks();
         picks.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         // Each node with the row it came from - see `auto_clipboard_rows`.
-        let mut pts: Vec<((usize, crate::automation::AutoParam), crate::automation::Point)> =
-            Vec::new();
+        let mut pts: Vec<(AutoRow, crate::automation::Point)> = Vec::new();
         for (lane, param, index) in &picks {
+            let Some(row) = self.auto_row(*lane, *param) else {
+                continue;
+            };
             if let Some(p) = self
                 .arrangement
                 .automation
                 .get(*lane, *param)
                 .and_then(|c| c.points().get(*index))
             {
-                pts.push(((*lane, *param), *p));
+                pts.push((row, *p));
             }
         }
         if pts.is_empty() {
@@ -15772,7 +15924,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for (_, p) in &mut pts {
             p.at_s -= first;
         }
-        self.auto_clipboard_from = picks.first().map(|(l, p, _)| (*l, *p));
+        self.auto_clipboard_from = picks.first().and_then(|(l, p, _)| self.auto_row(*l, *p));
         // **The stamp is what makes Cmd+V arrive at all** — see the field.
         // Clips and notes stamped it and nodes did not, so with no text on
         // the system clipboard the paste chord was swallowed whole.
@@ -15815,7 +15967,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return false;
         }
         self.arr_end_node_drag();
-        let mut shares: Vec<((usize, AutoParam), Vec<Point>)> = Vec::new();
+        let mut shares: Vec<(AutoRow, Vec<Point>)> = Vec::new();
         if self.auto_clipboard_rows.len() == self.auto_clipboard.len() {
             for (row, p) in self.auto_clipboard_rows.iter().zip(&self.auto_clipboard) {
                 match shares.iter_mut().find(|(r, _)| r == row) {
@@ -15824,17 +15976,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
         }
+        // Rows by their owners, landed on the lanes those owners stand on
+        // NOW: a share copied off a track that has moved since goes to the
+        // track, not to the row it left.
         let targets: Vec<((usize, AutoParam), Vec<Point>)> = if shares.len() > 1 {
-            shares.into_iter().filter(|((l, p), _)| self.arr_auto_is_open(*l, *p)).collect()
+            shares
+                .into_iter()
+                .filter_map(|(row, shape)| Some((self.auto_row_lane(row)?, shape)))
+                .filter(|((l, p), _)| self.arr_auto_is_open(*l, *p))
+                .collect()
         } else {
-            let chosen = self
-                .arr_auto_nodes
-                .first()
-                .and_then(|(l, s, _)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p)));
-            let aimed = self
-                .arr_auto_sel
-                .and_then(|(l, s)| self.arr_auto_param_at(l, s).map(|p| (l, p)));
-            let Some(row) = [chosen, aimed, self.arr_auto_focus, self.auto_clipboard_from]
+            let chosen = self.arr_auto_nodes.first().and_then(|(o, s, _)| {
+                let l = self.auto_lane_of(*o)?;
+                self.arr_auto_param_at(l, *s).map(|p| (l, p))
+            });
+            let aimed = self.arr_auto_sel.and_then(|(o, s)| {
+                let l = self.auto_lane_of(o)?;
+                self.arr_auto_param_at(l, s).map(|p| (l, p))
+            });
+            let focus = self.arr_auto_focus.and_then(|r| self.auto_row_lane(r));
+            let from = self.auto_clipboard_from.and_then(|r| self.auto_row_lane(r));
+            let Some(row) = [chosen, aimed, focus, from]
                 .into_iter()
                 .flatten()
                 .find(|(l, p)| self.arr_auto_is_open(*l, *p))
@@ -15942,8 +16104,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// what is on screen, and a lane that deleted its automation because
     /// somebody tidied the view would be unforgivable.
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
-        if let Some(param) = self.arr_auto_param_at(lane, slot) {
-            self.arr_auto_open.remove(&(lane, param));
+        if let Some(row) = self
+            .arr_auto_param_at(lane, slot)
+            .and_then(|param| self.auto_row(lane, param))
+        {
+            self.arr_auto_open.remove(&row);
             // Slots renumber — see `arr_toggle_automation_param`.
             self.arr_auto_nodes.clear();
             self.arr_auto_sel = None;
@@ -15952,9 +16117,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Arm this lane to WRITE while the transport rolls.
     fn arr_toggle_auto_arm(&mut self, lane: usize, slot: usize) {
-        if let Some(param) = self.arr_auto_param_at(lane, slot) {
-            if !self.arr_auto_armed.remove(&(lane, param)) {
-                self.arr_auto_armed.insert((lane, param));
+        if let Some(row) = self
+            .arr_auto_param_at(lane, slot)
+            .and_then(|param| self.auto_row(lane, param))
+        {
+            if !self.arr_auto_armed.remove(&row) {
+                self.arr_auto_armed.insert(row);
             }
         }
     }
@@ -15966,9 +16134,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it out and putting it back — and which is unanswerable if the only way
     /// to take it out is to lose it.
     fn arr_toggle_auto_bypass(&mut self, lane: usize, slot: usize) {
-        if let Some(param) = self.arr_auto_param_at(lane, slot) {
-            if !self.arr_auto_bypassed.remove(&(lane, param)) {
-                self.arr_auto_bypassed.insert((lane, param));
+        if let Some(row) = self
+            .arr_auto_param_at(lane, slot)
+            .and_then(|param| self.auto_row(lane, param))
+        {
+            if !self.arr_auto_bypassed.remove(&row) {
+                self.arr_auto_bypassed.insert(row);
             }
         }
     }
@@ -16137,7 +16308,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Whether a lane is showing a row for this parameter.
     fn arr_auto_is_open(&self, lane: usize, param: crate::automation::AutoParam) -> bool {
-        self.arr_auto_open.contains(&(lane, param))
+        self.auto_row(lane, param).is_some_and(|row| self.arr_auto_open.contains(&row))
     }
 
     /// Put a point on a lane's curve, answering where it landed.
@@ -16707,7 +16878,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut moving: Vec<(usize, crate::automation::AutoParam, usize)> = self
             .arr_auto_nodes
             .iter()
-            .filter_map(|(l, s, i)| self.arr_auto_param_at(*l, *s).map(|p| (*l, p, *i)))
+            .filter_map(|(o, s, i)| {
+                let l = self.auto_lane_of(*o)?;
+                self.arr_auto_param_at(l, *s).map(|p| (l, p, *i))
+            })
             .collect();
         if !moving.contains(&(lane, param, index)) {
             moving.push((lane, param, index));
@@ -16862,8 +17036,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
         }
-        self.arr_auto_nodes = chosen;
-        self.arr_auto_hot = lead_now.map(|(slot, i)| (lane, slot, i));
+        self.arr_auto_nodes = self.auto_nodes_owned(chosen);
+        self.arr_auto_hot = lead_now
+            .and_then(|(slot, i)| Some((self.auto_owner(lane)?, slot, i)));
         if let Some(anchor) = self.arr_auto_drag_from.as_mut() {
             anchor.produced = produced;
             if let Some((_, i)) = lead_now {
@@ -16989,7 +17164,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// A lane's automation mode.
     pub fn arr_auto_mode(&self, lane: usize) -> crate::automation::AutoMode {
-        self.arr_auto_modes.get(&lane).copied().unwrap_or_default()
+        self.auto_owner(lane)
+            .and_then(|o| self.arr_auto_modes.get(&o).copied())
+            .unwrap_or_default()
     }
 
     /// Step a lane to the next mode.
@@ -17015,11 +17192,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let now = self.arr_auto_mode(lane);
         let i = AutoMode::ALL.iter().position(|m| *m == now).unwrap_or(0);
         let next = AutoMode::ALL[(i + 1) % AutoMode::ALL.len()];
-        self.arr_auto_modes.insert(lane, next);
+        let Some(owner) = self.auto_owner(lane) else {
+            return;
+        };
+        self.arr_auto_modes.insert(owner, next);
         // Leaving a writing mode disarms whatever it armed, or a lane could
         // sit latched in a mode that has no latch.
-        self.arr_auto_latched.remove(&lane);
-        self.arr_auto_last.retain(|(l, _), _| *l != lane);
+        self.arr_auto_latched.remove(&owner);
+        self.arr_auto_last.retain(|(o, _), _| *o != owner);
     }
 
     /// The transport stopped: every latch lets go.
@@ -17035,8 +17215,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Whether a lane is writing right now, which is also whether its curve
     /// should stop driving the control.
     fn arr_auto_writing(&self, lane: usize, touching: bool) -> bool {
-        self.arr_auto_mode(lane)
-            .writes(touching, self.arr_auto_latched.contains(&lane))
+        let latched = self.auto_owner(lane).is_some_and(|o| self.arr_auto_latched.contains(&o));
+        self.arr_auto_mode(lane).writes(touching, latched)
     }
 
     /// A control was MOVED while the transport rolled: write it down.
@@ -17059,8 +17239,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if lane >= recorder::CHANNELS {
             return;
         }
+        let Some(key) = self.auto_row(lane, param) else {
+            return;
+        };
         let at_s = self.recorder.position_s.max(0.0);
-        let key = (lane, param);
         // How far apart two written points have to be. A twentieth of a
         // second is finer than any fader move anybody makes and coarse
         // enough that a pass leaves a curve somebody can pick up and edit.
@@ -17094,7 +17276,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_auto_last.insert(key, (at_s, value));
         // A Latch arms the moment it first writes, so the hand can come off.
         if self.arr_auto_mode(lane) == crate::automation::AutoMode::Latch {
-            self.arr_auto_latched.insert(lane);
+            self.arr_auto_latched.insert(key.0);
         }
         self.clips_dirty = true;
         self.desk_index_dirty();
@@ -17284,8 +17466,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             mark(k.strip);
             mark(k.from);
         }
-        for (r, kit) in self.drumpad_kits.iter().enumerate() {
-            if !kit.is_empty() {
+        // A kit is its track's, so it marks the row its track stands on.
+        for (r, id) in self.settings.track_ids.iter().enumerate() {
+            if self.drumpad_kits.get(id).is_some_and(|k| !k.is_empty()) {
                 mark(r);
             }
         }
@@ -17534,7 +17717,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         Moment {
             arr: std::sync::Arc::new(self.arrangement.clone_without_desk()),
             desk,
-            kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
+            kits: crate::drumpad::DrumpadDoc::compact_tracks(&self.drumpad_kits),
             words: std::sync::Arc::new(words),
             mark,
             // Attached where a moment is KEPT - see `undo_commit_moment`.
@@ -17557,7 +17740,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut f = crate::arrangement::Fingerprint::new();
         self.arrangement
             .hash_into_ref(Some(Self::desk_view(&self.settings)), &mut f);
-        crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
+        crate::drumpad::DrumpadDoc::hash_tracks_into(&self.drumpad_kits, &mut f);
         f.finish()
     }
 
@@ -17575,7 +17758,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let hint = self.history.get(self.hist_at).map_or(0, |m| m.words.len());
         let mut f = crate::arrangement::Fingerprint::recording(hint);
         self.arrangement.hash_into_ref(Some(desk), &mut f);
-        crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
+        crate::drumpad::DrumpadDoc::hash_tracks_into(&self.drumpad_kits, &mut f);
         f.finish_recorded()
     }
 
@@ -17845,39 +18028,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.send_desk_perm(&order);
         }
         // And the automation rows the session keeps beside the words, which
-        // the words cannot put back, one crossed moment at a time: a
-        // reorder's carry (see `carry_automation_rows`), and the rows its
-        // gesture closed with their curves, open again going back, and every
-        // row it takes shut again going forward (see `Moment::rows_closed`).
+        // the words cannot put back, one crossed moment at a time: the rows
+        // its gesture closed with their curves, open again going back, and
+        // every row it takes shut again going forward (see
+        // `Moment::rows_closed`). A reorder's moment needs nothing here any
+        // more: every row is keyed by its owner, and the undo puts each
+        // owner's track back where it was with nothing to carry.
         let crossed: Vec<usize> = if at < from {
             (at + 1..=from).rev().collect()
         } else {
             (from + 1..=at).collect()
         };
         for k in crossed {
-            let Some(m) = self.history.get(k) else {
+            let Some(rows) = self.history.get(k).and_then(|m| m.rows_closed.clone()) else {
                 continue;
             };
-            let (perm, rows) = (m.perm.clone(), m.rows_closed.clone());
             if at < from {
-                if let Some(rows) = rows {
-                    self.reopen_auto_rows(&rows);
-                }
-                if let Some(order) = perm {
-                    self.carry_automation_rows(&order);
-                }
+                self.reopen_auto_rows(&rows);
             } else {
-                if let Some(order) = perm {
-                    self.carry_automation_rows(&invert_order(&order));
-                }
-                if let Some(rows) = rows {
-                    // What this redo shut is what the next undo opens: the
-                    // rows as they stood before it, one opened since the
-                    // last undo included.
-                    let shut = self.shut_auto_rows(&rows);
-                    if let Some(m) = self.history.get_mut(k) {
-                        m.rows_closed = Some(std::sync::Arc::new(shut));
-                    }
+                // What this redo shut is what the next undo opens: the
+                // rows as they stood before it, one opened since the
+                // last undo included.
+                let shut = self.shut_auto_rows(&rows);
+                if let Some(m) = self.history.get_mut(k) {
+                    m.rows_closed = Some(std::sync::Arc::new(shut));
                 }
             }
         }
@@ -17885,17 +18059,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.outgoing_discarded = false;
         // **The kits first**, so the reload below this frame sees them: the
         // document's save and the clips-dirty flag both fire in this same
-        // call, and a kit restored after them would wait a frame.
-        let kits = crate::drumpad::DrumpadDoc::from_compact_all(
-            &moment.kits,
-            recorder::CHANNELS,
-        );
-        if kits != self.drumpad_kits {
+        // call, and a kit restored after them would wait a frame. By track,
+        // as the moment kept them: each lands on its own track, which the
+        // desk below puts back on its own row.
+        let kits = crate::drumpad::DrumpadDoc::from_compact_tracks(&moment.kits);
+        let kits_moved = !crate::drumpad::DrumpadDoc::same_tracks(&kits, &self.drumpad_kits);
+        if kits_moved {
             self.drumpad_kits = kits;
             self.drumpad_dirty = true;
+        }
+        // The rows as they stand before the moment lands: an undo or redo
+        // that moved them, minted them or put them back changed the desk's
+        // shape, and the aims that named rows let go (see below).
+        let rows_before = self.settings.track_ids.clone();
+        // The struct, not a re-parse: what comes back is bit for bit what
+        // was committed, never the reader's sanitised opinion of it — see
+        // `Moment`. The document carries the moment's desk afterwards, as
+        // the parsed one used to, for the two roads that read it.
+        self.apply_desk_snapshot(&moment.desk);
+        if kits_moved {
             // A plain write: this IS the undo, so it must not commit a moment
             // of its own — that would push the state we just travelled
-            // to onto the top of the stack and make redo unreachable.
+            // to onto the top of the stack and make redo unreachable. After
+            // the desk, whose rows the sidecar is written by: each kit goes
+            // under the row its track stands on in THIS moment.
             //
             // **And only into a folder that is already real.** An undo is not
             // a thing worth keeping: undoing a track move on a fresh scratch
@@ -17907,11 +18094,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.drumpad_save();
             }
         }
-        // The struct, not a re-parse: what comes back is bit for bit what
-        // was committed, never the reader's sanitised opinion of it — see
-        // `Moment`. The document carries the moment's desk afterwards, as
-        // the parsed one used to, for the two roads that read it.
-        self.apply_desk_snapshot(&moment.desk);
+        if self.settings.track_ids != rows_before {
+            self.on_desk_shape_change();
+        }
         // **An AUTO width and lane count come back too.** The apply skips a
         // zero for the open and the template adopt, and an undo through the
         // same skip left a dragged width or a wheeled count standing: the
@@ -18546,7 +18731,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// "all of this".
     fn quantize_fallback_lanes(&self) -> Vec<usize> {
         let mut lanes: Vec<usize> = Vec::new();
-        for &n in &self.selected_tracks {
+        for n in self.selected_rows() {
             if self.is_folder(n) {
                 lanes.extend(self.folder_children(n));
             } else {
@@ -18584,7 +18769,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.midi_edit.is_some() || self.clip_selection_is_on_a_picked_track() {
             return;
         }
-        if self.selected_tracks.is_empty() {
+        if self.selected_rows().is_empty() {
             return;
         }
         let lanes = self.quantize_fallback_lanes();
@@ -19936,7 +20121,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // empty one are the two states, and only one of them has a clip to
         // copy.
         if self.arr_multi.is_empty() && self.arr_selected.is_none() {
-            if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+            if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
                 self.copy_track(n);
             }
             return;
@@ -19989,7 +20174,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // aiming at a live one falls through to the clips below rather than
         // destroying it.
         if self.track_on_clipboard() {
-            if let Some(n) = self.selected_channel.filter(|n| !self.channel_used(*n)) {
+            if let Some(n) = self.selected_row().filter(|n| !self.channel_used(*n)) {
                 self.paste_track(n);
                 return;
             }
@@ -19999,7 +20184,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let at = self.arr_snap_t(self.recorder.position_s.max(0.0));
         let pasted = self.clip_clipboard.clone();
-        let lane_d = match self.selected_channel {
+        let lane_d = match self.selected_row() {
             Some(target) => {
                 let base = pasted
                     .iter()
@@ -20071,8 +20256,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arr_delete_auto_nodes();
             return;
         }
-        if let Some((lane, slot)) = self.arr_auto_sel.take() {
-            self.arr_close_auto_row(lane, slot);
+        if let Some((owner, slot)) = self.arr_auto_sel.take() {
+            if let Some(lane) = self.auto_lane_of(owner) {
+                self.arr_close_auto_row(lane, slot);
+            }
             return;
         }
         // **A frozen lane's clips stay** - they are what the frozen file was
@@ -22412,7 +22599,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The host reads this to decide which MIDI lane hears the keyboard when
     /// no lane is armed.
     pub fn selected_channel(&self) -> Option<usize> {
-        self.selected_channel
+        self.selected_row()
     }
 
     /// **The lane the MIDI editor is open on**, or `None` when it is closed.
@@ -22834,22 +23021,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .is_some_and(|p| p == dialogs::DRUMPAD_PATH)
                 })
             });
-        let (kits, saved_lane) = match doc {
-            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside_ids(
+        let (kits, saved_track) = match doc {
+            Some(doc) => crate::drumpad::DrumpadDoc::load_track_kits(
                 doc,
                 &self.settings.track_ids,
                 legacy_lane,
             ),
-            None => (
-                (0..recorder::CHANNELS)
-                    .map(|_| crate::drumpad::DrumpadDoc::default())
-                    .collect(),
-                None,
-            ),
+            None => (crate::drumpad::TrackKits::new(), None),
         };
         self.drumpad_kits = kits;
-        // **The lane that was in front of you when it was saved**, and only
-        // then the first that has a kit.
+        // **The track that was in front of you when it was saved**, and only
+        // then the first, down the desk, that has a kit.
         //
         // The fallback alone was the bug. A session with kits on lanes 0, 3
         // and 5, left showing 3, reopened on 0 — different samples on every
@@ -22857,22 +23039,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // from the kit having been destroyed. The file had recorded the right
         // answer on every save since lanes existed; nothing read it.
         //
-        // Still checked, not trusted: a lane whose kit has since been emptied
-        // would open on blank pads and be the same complaint again.
-        self.drumpad_lane = saved_lane
-            .filter(|ch| {
-                self.drumpad_kits
-                    .get(*ch)
-                    .is_some_and(|k| !k.is_empty())
-            })
+        // Still checked, not trusted: a track whose kit has since been
+        // emptied would open on blank pads and be the same complaint again.
+        // Neither found, the panel names no track and stands on row 0.
+        let has_kit = |kits: &crate::drumpad::TrackKits, id: &crate::desk_id::TrackId| {
+            kits.get(id).is_some_and(|k| !k.is_empty())
+        };
+        self.drumpad_lane = saved_track
+            .filter(|id| has_kit(&self.drumpad_kits, id))
             .or_else(|| {
-                (0..recorder::CHANNELS).find(|ch| {
-                    self.drumpad_kits
-                        .get(*ch)
-                        .is_some_and(|k| !k.is_empty())
-                })
-            })
-            .unwrap_or(0);
+                self.settings
+                    .track_ids
+                    .iter()
+                    .copied()
+                    .find(|id| has_kit(&self.drumpad_kits, id))
+            });
         self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
         // C2, and the page that shows it — see `drumpad_focus`. Not key 0:
         // no page even shows key 0, the pages anchor at 4.
@@ -22907,12 +23088,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
-        crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane,
-            &doc,
-        );
+        self.save_kits_beside(&doc);
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -22947,12 +23123,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
-        crate::drumpad::DrumpadDoc::save_all_beside_ids(
-            &self.drumpad_kits,
-            &self.settings.track_ids,
-            self.drumpad_lane,
-            &doc,
-        );
+        self.save_kits_beside(&doc);
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -23053,13 +23224,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The kit saves itself, so the kit is a REAL thing: the folder
             // is born here if it never was.
             self.materialize_project_dir();
-            crate::drumpad::DrumpadDoc::save_all_beside_ids(
+            self.save_kits_beside(&doc);
+        }
+    }
+
+    /// **The kit sidecar beside `doc`**: every track's kit off the map, by
+    /// the rows they stand on now, the panel's row as the file's primary.
+    /// The one writer every road that saves a kit goes through.
+    fn save_kits_beside(&self, doc: &std::path::Path) {
+        crate::drumpad::DrumpadDoc::save_track_kits(
             &self.drumpad_kits,
             &self.settings.track_ids,
-            self.drumpad_lane,
-            &doc,
+            self.drumpad_row(),
+            doc,
         );
-        }
     }
 
     /// One knob's current value, in its own units.
@@ -23728,25 +23906,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         std::mem::take(&mut self.drumpad_dirty)
     }
 
-    /// Every pad's file, resolved against the open project. `None` for an
-    /// empty pad.
     /// **The kit the panel is editing.** Every reader goes through here, so
-    /// there is one place that decides which lane that is.
+    /// there is one place that decides which track that is.
     fn drumpad(&self) -> &crate::drumpad::DrumpadDoc {
-        self.drumpad_kits
-            .get(self.drumpad_lane)
-            .unwrap_or(&self.drumpad_kits[0])
+        self.drumpad_kits.get(&self.drumpad_track()).unwrap_or_else(|| empty_kit())
     }
 
     fn drumpad_mut(&mut self) -> &mut crate::drumpad::DrumpadDoc {
         // A kit on a lane is a fact the desk index reads (residue).
         self.desk_index_dirty();
-        let lane = self.drumpad_lane.min(self.drumpad_kits.len().saturating_sub(1));
-        &mut self.drumpad_kits[lane]
+        let id = self.drumpad_track();
+        self.drumpad_kits.entry(id).or_default()
     }
 
-    /// **Which lane's kit the drumpad window shows.** Set when the window is
-    /// opened from a lane, and clamped to a channel that exists.
+    /// **The row whose kit the panel shows**: its track's row, or row 0 when
+    /// the panel names no track this desk holds - nothing chosen yet, or a
+    /// track removed since, whose aim comes back with its undo. Row 0 is
+    /// where the panel stood before it was ever pointed anywhere, and where
+    /// an aim past the kits always fell back to.
+    fn drumpad_row(&self) -> usize {
+        self.drumpad_lane.and_then(|id| self.row_of(id)).unwrap_or(0)
+    }
+
+    /// **The track whose kit the panel shows and edits** (`drumpad_row`'s),
+    /// by identity: the id form of `drumpad_lane()` (C11).
+    pub fn drumpad_track(&self) -> crate::desk_id::TrackId {
+        self.track_id_at(self.drumpad_row())
+    }
+
     /// **What the OS keeps of the display's height**, 0.5..=1.0, told by the
     /// host once at startup.
     ///
@@ -23761,20 +23948,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **Point the drum panel at row `lane`'s track.** Set when the window is
+    /// opened from a lane; a lane past the desk is ignored. It names the
+    /// TRACK, so the panel stays with it through every edit that moves it.
     pub fn set_drumpad_lane(&mut self, lane: usize) {
-        if lane < self.drumpad_kits.len() {
-            self.drumpad_lane = lane;
+        if let Some(id) = self.settings.track_ids.get(lane).copied() {
+            self.drumpad_lane = Some(id);
         }
     }
 
+    /// The row whose kit the drumpad window shows, for the host that speaks
+    /// lanes. See `drumpad_row`.
     pub fn drumpad_lane(&self) -> usize {
-        self.drumpad_lane
+        self.drumpad_row()
     }
 
     /// Every lane's kit, for the host's push. Empty kits included, because
-    /// a lane that LOST its drumpad has to be told so.
+    /// a lane that LOST its drumpad has to be told so. `None` only past the
+    /// desk.
     pub fn drumpad_kit_of(&self, lane: usize) -> Option<&crate::drumpad::DrumpadDoc> {
-        self.drumpad_kits.get(lane)
+        let id = self.settings.track_ids.get(lane)?;
+        Some(self.drumpad_kit_of_track(*id))
+    }
+
+    /// **A track's kit, by identity** (C11's id form): the empty kit for a
+    /// track that has none.
+    pub fn drumpad_kit_of_track(&self, id: crate::desk_id::TrackId) -> &crate::drumpad::DrumpadDoc {
+        self.drumpad_kits.get(&id).unwrap_or_else(|| empty_kit())
     }
 
     /// **One LANE's sample paths**, for the host to decode into its kit.
@@ -23783,9 +23983,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self,
         lane: usize,
     ) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
-        let Some(kit) = self.drumpad_kits.get(lane) else {
-            return std::array::from_fn(|_| None);
-        };
+        match self.settings.track_ids.get(lane) {
+            Some(id) => self.drumpad_paths_of_track(*id),
+            None => std::array::from_fn(|_| None),
+        }
+    }
+
+    /// **One TRACK's sample paths**, the id form of `drumpad_paths_of`.
+    pub fn drumpad_paths_of_track(
+        &self,
+        id: crate::desk_id::TrackId,
+    ) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
+        let kit = self.drumpad_kit_of_track(id);
         std::array::from_fn(|i| {
             let slot = &kit.pads[i];
             if slot.path.is_empty() {
@@ -23798,11 +24007,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// One lane's knobs, for the engine's push.
     pub fn drum_kit_params_of(&self, lane: usize) -> recorder::DrumKitParams {
-        self.drumpad_kits
-            .get(lane)
+        self.drumpad_kit_of(lane)
             .map_or_else(recorder::DrumKitParams::default, crate::drumpad::DrumpadDoc::params)
     }
 
+    /// One track's knobs, the id form of `drum_kit_params_of`.
+    pub fn drum_kit_params_of_track(&self, id: crate::desk_id::TrackId) -> recorder::DrumKitParams {
+        self.drumpad_kit_of_track(id).params()
+    }
+
+    /// Every pad's file in the panel's kit, resolved against the open
+    /// project. `None` for an empty pad.
     pub fn drumpad_paths(&self) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
         // `kit_doc`, like its per-lane twin: a scratch that has not been
         // written yet still reads its samples out of the template.
@@ -26098,23 +26313,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The PRIMARY is the last one, which is the contract
         // `selected_channel` documents: the last entry here IS that channel.
-        self.selected_channel = lanes.last().copied();
-        self.selected_tracks = lanes;
+        // By the tracks the clips' rows hold.
+        let tracks: Vec<crate::desk_id::TrackId> = lanes.iter().map(|l| self.track_id_at(*l)).collect();
+        self.selected_channel = tracks.last().copied();
+        self.selected_tracks = tracks;
     }
 
     fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
         self.arr_auto_sel = None;
+        let id = self.track_id_at(n);
         if mods.shift {
             // **From the ANCHOR, not from the primary.** Shift-clicking around
             // has to keep measuring from the same fixed end, or the range
-            // walks with each click and stops being a range.
-            let from = self.sel_anchor.unwrap_or(n);
+            // walks with each click and stops being a range. The anchor is a
+            // track, so the range is measured from where it stands NOW: a
+            // reorder since the anchor was set moves the end with its track.
+            let anchor = self.sel_anchor.filter(|a| self.row_of(*a).is_some()).unwrap_or(id);
+            let from = self.row_of(anchor).unwrap_or(n);
             let (lo, hi) = if from <= n { (from, n) } else { (n, from) };
-            self.selected_tracks = (lo..=hi).collect();
-            self.sel_anchor = Some(from);
-            self.selected_channel = Some(n);
+            self.selected_tracks = (lo..=hi).map(|r| self.track_id_at(r)).collect();
+            self.sel_anchor = Some(anchor);
+            self.selected_channel = Some(id);
         } else if mods.command {
-            match self.selected_tracks.iter().position(|x| *x == n) {
+            match self.selected_tracks.iter().position(|x| *x == id) {
                 Some(at) => {
                     self.selected_tracks.remove(at);
                     // Taking the primary out promotes whatever is left, and
@@ -26124,15 +26345,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.selected_channel = self.selected_tracks.last().copied();
                 }
                 None => {
-                    self.selected_tracks.push(n);
-                    self.selected_channel = Some(n);
+                    self.selected_tracks.push(id);
+                    self.selected_channel = Some(id);
                 }
             }
-            self.sel_anchor = Some(n);
+            self.sel_anchor = Some(id);
         } else {
-            self.selected_tracks = vec![n];
-            self.sel_anchor = Some(n);
-            self.selected_channel = Some(n);
+            self.selected_tracks = vec![id];
+            self.sel_anchor = Some(id);
+            self.selected_channel = Some(id);
         }
     }
 
@@ -26145,10 +26366,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// mean the user has moved on, so that collapses to the one track, which
     /// is what every desk does.
     fn touch_track(&mut self, n: usize) {
-        self.selected_channel = Some(n);
-        if !self.selected_tracks.contains(&n) {
-            self.selected_tracks = vec![n];
-            self.sel_anchor = Some(n);
+        let id = self.track_id_at(n);
+        self.selected_channel = Some(id);
+        if !self.selected_tracks.contains(&id) {
+            self.selected_tracks = vec![id];
+            self.sel_anchor = Some(id);
         }
     }
 
@@ -27044,7 +27266,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 {
                     let n = n.auto_lane();
                     if let Some(param) = self.arr_auto_param_at(n, row) {
-                        self.arr_auto_focus = Some((n, param));
+                        self.arr_auto_focus = self.auto_row(n, param);
                     }
                 }
                 // A new press is a new gesture: whatever anchor the last
@@ -27108,7 +27330,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // the timeline has learned this.
                         if ctx.input(|k| k.modifiers.shift) {
                             self.arr_toggle_auto_node(n, row, i);
-                        } else if !self.arr_auto_nodes.contains(&(n, row, i)) {
+                        } else if !self.auto_node_chosen(n, row, i) {
                             // Pressing a node that is NOT in the selection
                             // replaces it. Pressing one that IS leaves the
                             // set alone, so a drag can move several at once
@@ -27116,12 +27338,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // them to one.
                             self.arr_select_auto_node(n, row, i);
                         }
-                        self.arr_auto_hot = Some((n, row, i));
+                        self.set_auto_hot(n, row, i);
                         // **A shift-press that took the node OUT is only
                         // that**: it starts no drag. The drag's first frame
                         // runs on the press itself, carries the node under
                         // the hand, and would choose it straight back.
-                        if !self.arr_auto_nodes.contains(&(n, row, i)) {
+                        if !self.auto_node_chosen(n, row, i) {
                             return;
                         }
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
@@ -27265,7 +27487,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // The new node comes CHOSEN, so the Delete or the
                             // copy that follows acts on what was just made.
                             self.arr_choose_auto_nodes(vec![(n, row, i)]);
-                            self.arr_auto_hot = Some((n, row, i));
+                            self.set_auto_hot(n, row, i);
                             self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                             self.arr_auto_drag_from = self.arr_auto_anchor(n, param, i).map(|mut a| {
                                 a.grab = Some((t, v));
@@ -28427,7 +28649,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.arr_delete_held = true;
             } else if self.arr_selected.is_none() && self.arr_multi.is_empty() {
                 if let Some(n) = self
-                    .selected_channel
+                    .selected_row()
                     .filter(|n| fresh && !self.arr_delete_held && self.channel_used(*n))
                 {
                     self.remove_selected_channels(n);
@@ -28478,7 +28700,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     && !i.modifiers.shift
                     && i.key_pressed(egui::Key::A)
             }) {
-                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
                     self.arr_open_automation_menu(n);
                 }
             }
@@ -28636,7 +28858,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let lane = l
                 .lane_rows
                 .find_row(|r| r.is_positive() && r.contains(p))
-                .unwrap_or_else(|| me.selected_channel.unwrap_or(0));
+                .unwrap_or_else(|| me.selected_row().unwrap_or(0));
             (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
         };
         self.arr_drop_hover = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -28695,7 +28917,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .filter(|p| rect.contains(*p))
                         .map(|p| landing_now(self, p))
                 })
-                .unwrap_or_else(|| (self.selected_channel.unwrap_or(0), 0.0));
+                .unwrap_or_else(|| (self.selected_row().unwrap_or(0), 0.0));
             self.arr_drop = None;
             // **The lane under the pointer is now the SELECTED one.** The
             // owner asked for the track being dropped onto to select, and it
@@ -28813,6 +29035,59 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **One lane's open automation rows, as the arrangement draws them** -
+    /// a track's lane or the master's, built the one way, so the master's
+    /// rows are a track's rows in every respect but their subject.
+    ///
+    /// The row state is asked of its OWNER (`auto_owner`): which rows are
+    /// open, armed, bypassed, chosen and hot belong to the track, not to
+    /// the row it happens to be drawn on this frame.
+    fn auto_views(&self, lane: usize) -> Vec<crate::arrangement_panel::AutoView<'_>> {
+        let owner = self.auto_owner(lane);
+        self.arr_auto_rows(lane)
+            .into_iter()
+            .enumerate()
+            .map(|(slot, param)| {
+                let row = owner.map(|o| (o, param));
+                let here = |o: &crate::desk_id::Node, s: usize| Some(*o) == owner && s == slot;
+                crate::arrangement_panel::AutoView {
+                    param,
+                    label: self.auto_param_label(lane, param),
+                    selected: self.arr_auto_sel.is_some_and(|(o, s)| here(&o, s)),
+                    // **The dial reads the lane's BASE LEVEL** — its first
+                    // node — and only falls back to where the control is
+                    // standing when the lane has no node at all. A dial
+                    // showing the live control while the curve drove
+                    // something else was a dial that disagreed with its own
+                    // lane.
+                    resting: self.auto_base(lane, param),
+                    armed: row.is_some_and(|r| self.arr_auto_armed.contains(&r)),
+                    bypassed: row.is_some_and(|r| self.arr_auto_bypassed.contains(&r)),
+                    points: self
+                        .arrangement
+                        .automation
+                        .get(lane, param)
+                        .map_or(&[][..], crate::automation::Curve::points),
+                    hot: self
+                        .arr_auto_hot
+                        .filter(|(o, s, _)| here(o, *s))
+                        .map(|(_, _, i)| i),
+                    chosen: self
+                        .arr_auto_nodes
+                        .iter()
+                        .filter(|(o, s, _)| here(o, *s))
+                        .map(|(_, _, i)| *i)
+                        .collect(),
+                    // The DRAG, not the hover — see `AutoView::moving`.
+                    moving: match self.arr_drag {
+                        Some(ArrDrag::AutoPoint(l, s, i)) if l == lane && s == slot => Some(i),
+                        _ => None,
+                    },
+                }
+            })
+            .collect()
+    }
+
     fn arrange_view<'a>(
         &'a self,
         clips: &'a [crate::arrangement_panel::ClipView<'a>],
@@ -28893,98 +29168,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // lane's are — same `AutoView`, same resolution of label,
             // resting value, arm and bypass — so the row that appears under
             // the master is a track's row in every respect but its subject.
-            master_automation: self
-                .arr_auto_rows(master_lane())
-                .into_iter()
-                .enumerate()
-                .map(|(slot, param)| crate::arrangement_panel::AutoView {
-                    param,
-                    label: self.auto_param_label(master_lane(), param),
-                    selected: self.arr_auto_sel
-                        == Some((master_lane(), slot)),
-                    resting: self.auto_base(master_lane(), param),
-                    armed: self
-                        .arr_auto_armed
-                        .contains(&(master_lane(), param)),
-                    bypassed: self
-                        .arr_auto_bypassed
-                        .contains(&(master_lane(), param)),
-                    points: self
-                        .arrangement
-                        .automation
-                        .get(master_lane(), param)
-                        .map_or(&[][..], crate::automation::Curve::points),
-                    hot: self
-                        .arr_auto_hot
-                        .filter(|(l, s, _)| {
-                            *l == master_lane() && *s == slot
-                        })
-                        .map(|(_, _, i)| i),
-                    chosen: self
-                        .arr_auto_nodes
-                        .iter()
-                        .filter(|(l, s, _)| {
-                            *l == master_lane() && *s == slot
-                        })
-                        .map(|(_, _, i)| *i)
-                        .collect(),
-                    moving: match self.arr_drag {
-                        Some(ArrDrag::AutoPoint(l, s, i))
-                            if l == master_lane() && s == slot =>
-                        {
-                            Some(i)
-                        }
-                        _ => None,
-                    },
-                })
-                .collect(),
+            master_automation: self.auto_views(master_lane()),
             lanes: crate::arrangement_panel::Lanes::new(window.iter().map(|row| {
                 let n = *row as usize;
                 let kind = self.channel_kind(n);
                 (n, crate::arrangement_panel::LaneView {
-                    automation: self
-                        .arr_auto_rows(n)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(slot, param)| crate::arrangement_panel::AutoView {
-                            param,
-                            label: self.auto_param_label(n, param),
-                            selected: self.arr_auto_sel == Some((n, slot)),
-                            // **The dial reads the lane's BASE LEVEL** —
-                            // its first node — and only falls back to where
-                            // the control is standing when the lane has no
-                            // node at all. A dial showing the live control
-                            // while the curve drove something else was a
-                            // dial that disagreed with its own lane.
-                            resting: self.auto_base(n, param),
-                            armed: self.arr_auto_armed.contains(&(n, param)),
-                            bypassed: self.arr_auto_bypassed.contains(&(n, param)),
-                            points: self
-                                .arrangement
-                                .automation
-                                .get(n, param)
-                                .map_or(&[][..], crate::automation::Curve::points),
-                            hot: self
-                                .arr_auto_hot
-                                .filter(|(l, s, _)| *l == n && *s == slot)
-                                .map(|(_, _, i)| i),
-                            chosen: self
-                                .arr_auto_nodes
-                                .iter()
-                                .filter(|(l, s, _)| *l == n && *s == slot)
-                                .map(|(_, _, i)| *i)
-                                .collect(),
-                            // The DRAG, not the hover — see `AutoView::moving`.
-                            moving: match self.arr_drag {
-                                Some(ArrDrag::AutoPoint(l, s, i))
-                                    if l == n && s == slot =>
-                                {
-                                    Some(i)
-                                }
-                                _ => None,
-                            },
-                        })
-                        .collect(),
+                    automation: self.auto_views(n),
                     route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
@@ -29050,8 +29239,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             clips,
             header_w: self.arr_header_w_pt(),
             time_sel: self.time_sel,
-            selected_channel: self.selected_channel,
-            selected_tracks: &self.selected_tracks,
+            selected_channel: self.selected_row(),
+            selected_tracks: self.selected_rows(),
             // A track's name being typed, by its row: the click and the
             // master have no header to type into here.
             naming: self
@@ -29180,7 +29369,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .to_owned();
             return;
         }
-        let lane = self.drumpad_lane;
+        let lane = self.drumpad_row();
         let suggested = {
             let at = recorder::Strip::Channel(lane).index();
             let name = self
@@ -29998,7 +30187,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         param: crate::automation::AutoParam,
         v: f64,
     ) {
-        if !self.recorder.playing || !self.arr_auto_armed.contains(&(lane, param)) {
+        let armed = self.auto_row(lane, param).is_some_and(|row| self.arr_auto_armed.contains(&row));
+        if !self.recorder.playing || !armed {
             return;
         }
         // NOT snapped: a written point records when the hand actually moved.
@@ -31324,9 +31514,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.desk_index_dirty();
         use crate::recorder::CHANNELS;
         let mut sel: Vec<usize> = self
-            .selected_tracks
-            .iter()
-            .copied()
+            .selected_rows()
+            .into_iter()
             .filter(|n| *n < CHANNELS && self.channel_used(*n))
             .collect();
         sel.sort_unstable();
@@ -31338,7 +31527,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the whole door now, both ways: on a selected FOLDER it releases
         // the children and the row goes back to being a track.
         if sel.len() < 2 {
-            if let Some(f) = self.selected_channel.filter(|n| self.is_folder(*n)) {
+            if let Some(f) = self.selected_row().filter(|n| self.is_folder(*n)) {
                 // Not under an export, which writes this folder's bus - see
                 // `folders_held`.
                 if self.folders_held() {
@@ -31351,7 +31540,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // ── an empty slot becomes an empty folder ────────────────────────
         if sel.len() < 2 {
             let Some(n) = self
-                .selected_channel
+                .selected_row()
                 .filter(|n| *n < CHANNELS && !self.channel_used(*n))
             else {
                 return false;
@@ -31375,8 +31564,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // is a flag on a slot nothing draws.
             self.settings.tracks_added |= 1 << n;
             self.set_in_folder(n, self.folder_of(n).is_some());
-            self.selected_channel = Some(n);
-            self.selected_tracks = vec![n];
+            self.select_alone(n);
             self.save_settings();
             self.arr_save_edits();
             return true;
@@ -31463,8 +31651,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
         }
-        self.selected_channel = Some(at);
-        self.selected_tracks = vec![at];
+        self.select_alone(at);
         self.save_settings();
         self.arr_save_edits();
         self.commit_undo_moment();
@@ -32091,16 +32278,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let ids = template_row_ids(&doc);
             crate::drumpad::DrumpadDoc::load_all_beside_ids(&doc, &ids, None)
         } else {
-            (
-                (0..recorder::CHANNELS)
-                    .map(|_| crate::drumpad::DrumpadDoc::default())
-                    .collect(),
-                None,
-            )
+            (Vec::new(), None)
         };
-        self.drumpad_kits = kits;
-        if let Some(lane) = lane {
-            self.drumpad_lane = lane;
+        // Lane r's kit onto the track on THIS desk's row r, by its id.
+        self.drumpad_kits = crate::drumpad::DrumpadDoc::keyed(&self.settings.track_ids, kits);
+        if let Some(id) = lane.and_then(|l| self.settings.track_ids.get(l).copied()) {
+            self.drumpad_lane = Some(id);
         }
         // The pads changed under whatever is playing them, and the sidecar
         // has to follow — the same flag `apply_kit_preset` raises.
@@ -34200,7 +34383,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let mut out = crate::automation::Automation::default();
         for c in self.arrangement.automation.curves() {
-            if !self.arr_auto_bypassed.contains(&(c.lane, c.param)) && !waiting(c) {
+            let bypassed = self
+                .auto_row(c.lane, c.param)
+                .is_some_and(|row| self.arr_auto_bypassed.contains(&row));
+            if !bypassed && !waiting(c) {
                 out.set(c.clone());
             }
         }
@@ -34636,7 +34822,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
         self.arrangement.automation = Automation::from_curves(curves);
         if !gone.is_empty() {
-            let named = |row: &(usize, AutoParam)| gone.contains(row);
+            // The rows those curves drew, by their owners.
+            let gone: Vec<AutoRow> =
+                gone.into_iter().filter_map(|(lane, param)| self.auto_row(lane, param)).collect();
+            let named = |row: &AutoRow| gone.contains(row);
             self.close_auto_rows(&[], &gone);
             self.arr_auto_focus = self.arr_auto_focus.filter(|row| !named(row));
             self.auto_clipboard_from = self.auto_clipboard_from.filter(|row| !named(row));
@@ -34710,14 +34899,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.arrangement.automation = Automation::from_curves(all);
             self.arr_save_edits();
         }
-        let carry = |rows: &HashSet<(usize, AutoParam)>| -> HashSet<(usize, AutoParam)> {
-            rows.iter().filter_map(|&(lane, param)| across(lane, param)).collect()
+        // The rows go across with their curves: a BAY move, which keeps a
+        // row on its owner and moves it between that owner's bays (or onto
+        // the other bay's owner). Through the lanes the bays are addressed
+        // by, and back to owners; a row whose owner stands on no lane
+        // (a removed track's, inert) stays exactly as it was.
+        let row_across = |app: &Self, row: AutoRow| -> Option<AutoRow> {
+            match app.auto_row_lane(row) {
+                Some((lane, param)) => across(lane, param).and_then(|(l, p)| app.auto_row(l, p)),
+                None => Some(row),
+            }
         };
-        self.arr_auto_open = carry(&self.arr_auto_open);
-        self.arr_auto_armed = carry(&self.arr_auto_armed);
-        self.arr_auto_bypassed = carry(&self.arr_auto_bypassed);
-        self.arr_auto_focus = self.arr_auto_focus.and_then(|(l, p)| across(l, p));
-        self.auto_clipboard_from = self.auto_clipboard_from.and_then(|(l, p)| across(l, p));
+        let carry = |app: &Self, rows: &HashSet<AutoRow>| -> HashSet<AutoRow> {
+            rows.iter().filter_map(|&row| row_across(app, row)).collect()
+        };
+        self.arr_auto_open = carry(self, &self.arr_auto_open);
+        self.arr_auto_armed = carry(self, &self.arr_auto_armed);
+        self.arr_auto_bypassed = carry(self, &self.arr_auto_bypassed);
+        self.arr_auto_focus = self.arr_auto_focus.and_then(|row| row_across(self, row));
+        self.auto_clipboard_from = self.auto_clipboard_from.and_then(|row| row_across(self, row));
         // The rows renumbered: the choices that name slots go.
         self.arr_end_node_drag();
         self.arr_auto_nodes.clear();
@@ -35927,7 +36127,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // whatever lane was last shown would mean the key and the
                     // bay disagreed about which kit you were looking at.
                     let want = self
-                        .selected_channel
+                        .selected_row()
                         .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         .or_else(|| {
                             (0..recorder::CHANNELS)
@@ -36010,7 +36210,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // wants a file on it has selected nothing and means lane zero.
             MenuAction::InsertMedia => {
                 let lane = self
-                    .selected_channel
+                    .selected_row()
                     .unwrap_or_else(|| {
                         (0..recorder::CHANNELS)
                             .find(|n| self.channel_used(*n))
@@ -41981,12 +42181,12 @@ impl TangentApp {
                     )
                 });
                 if copy_ev {
-                    if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                    if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
                         self.copy_track(n);
                     }
                 }
                 if paste_ev {
-                    if let Some(n) = self.selected_channel {
+                    if let Some(n) = self.selected_row() {
                         // **Through the one decision**, so the chord and the
                         // menu row land the copy in the same place: an empty
                         // slot receives it, a live track keeps its life and
@@ -41998,7 +42198,7 @@ impl TangentApp {
                     }
                 }
                 if cut_ev {
-                    if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                    if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
                         self.copy_track(n);
                         self.remove_selected_channels(n);
                     }
@@ -42013,7 +42213,7 @@ impl TangentApp {
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
                 })
             {
-                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
                     self.remove_selected_channels(n);
                 }
             }
@@ -43400,6 +43600,54 @@ impl TangentApp {
 /// free, and nothing is left behind by the thousands of apps the suite
 /// builds; a cheater's and a supporter's are created, because their standing
 /// is a file in it.
+/// **Tests speak rows; the session speaks tracks.** The doors a test takes
+/// from a row number to the identity the session keys by (W4-lane-refs),
+/// each read at the moment of the call, as a click on that row would make
+/// it. A test that sets state through these and then moves the rows is
+/// asking exactly the question the session answers: does it stay with the
+/// track?
+#[cfg(test)]
+impl TangentApp {
+    /// The PRIMARY on row `row`'s track (or nothing).
+    fn set_primary_row(&mut self, row: Option<usize>) {
+        self.selected_channel = row.map(|r| self.track_id_at(r));
+    }
+
+    /// The selection, these rows' tracks in this order.
+    fn set_selected_rows(&mut self, rows: &[usize]) {
+        self.selected_tracks = rows.iter().map(|r| self.track_id_at(*r)).collect();
+    }
+
+    /// Whose automation lane `lane` is.
+    fn owner_at(&self, lane: usize) -> crate::desk_id::Node {
+        self.auto_owner(lane).unwrap_or_else(|| panic!("lane {lane} has no owner"))
+    }
+
+    /// The row `(lane, param)`, by its owner.
+    fn auto_row_at(&self, lane: usize, param: crate::automation::AutoParam) -> AutoRow {
+        (self.owner_at(lane), param)
+    }
+
+    /// The chosen nodes as `(lane, slot, index)`, where their owners stand now.
+    fn auto_nodes_at(&self) -> Vec<(usize, usize, usize)> {
+        self.arr_auto_nodes
+            .iter()
+            .filter_map(|(o, s, i)| Some((self.auto_lane_of(*o)?, *s, *i)))
+            .collect()
+    }
+
+    /// Row `lane`'s track's kit (the empty one when it has none).
+    fn kit_at(&self, lane: usize) -> &crate::drumpad::DrumpadDoc {
+        self.drumpad_kit_of(lane).unwrap_or_else(|| panic!("no row {lane}"))
+    }
+
+    /// Row `lane`'s track's kit, to change.
+    fn kit_at_mut(&mut self, lane: usize) -> &mut crate::drumpad::DrumpadDoc {
+        let id = self.settings.track_ids[lane];
+        self.drumpad_kits.entry(id).or_default()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tiers {
     use tangent_core::license::LicenseStore;
@@ -43635,7 +43883,7 @@ mod paywall_tests {
                 go: |app, _| {
                     app.copy_track(1);
                     let v = vacant(app);
-                    app.selected_channel = Some(v);
+                    app.set_primary_row(Some(v));
                     app.arr_paste();
                     None
                 },
@@ -43648,7 +43896,7 @@ mod paywall_tests {
                     app.track_clipboard = None;
                     app.clip_clipboard = vec![clip_at("media/x.wav", 0, 0.0)];
                     let v = vacant(app);
-                    app.selected_channel = Some(v);
+                    app.set_primary_row(Some(v));
                     app.arr_paste();
                     None
                 },
@@ -43698,8 +43946,8 @@ mod paywall_tests {
                 on_full: false,
                 go: |app, _| {
                     let v = vacant(app);
-                    app.selected_channel = Some(v);
-                    app.selected_tracks = vec![v];
+                    app.set_primary_row(Some(v));
+                    app.set_selected_rows(&[v]);
                     let _ = app.make_folder();
                     None
                 },
@@ -43709,8 +43957,8 @@ mod paywall_tests {
                 makes: 1,
                 on_full: true,
                 go: |app, _| {
-                    app.selected_channel = Some(0);
-                    app.selected_tracks = vec![0, 1];
+                    app.set_primary_row(Some(0));
+                    app.set_selected_rows(&[0, 1]);
                     let _ = app.make_folder();
                     None
                 },
@@ -46047,8 +46295,8 @@ mod tests {
         for n in [1usize, 2] {
             app.add_bare_track(n);
         }
-        app.selected_tracks = vec![1, 2];
-        app.selected_channel = Some(1);
+        app.set_selected_rows(&[1, 2]);
+        app.set_primary_row(Some(1));
         app.arr_save_edits();
         app.commit_view_change();
 
@@ -46060,7 +46308,7 @@ mod tests {
             "grouping left {} moments",
             app.hist_at - before
         );
-        let folder = app.selected_channel.expect("the folder is selected");
+        let folder = app.selected_row().expect("the folder is selected");
         assert!(app.is_folder(folder), "the folder was not made");
 
         // ONE step back un-groups AND puts the rows where they were.
@@ -50036,7 +50284,7 @@ mod tests {
         assert!(app.channel_used(3), "the new row is not a track");
         assert_eq!(app.channel_kind(3), None, "a fresh track has no input yet");
         assert_eq!(name_of(&app, 4), "UNDER", "the row below was overwritten");
-        assert_eq!(app.selected_channel, Some(3), "the new track is not selected");
+        assert_eq!(app.selected_row(), Some(3), "the new track is not selected");
 
         // ── and a folder keeps its children ──────────────────────────
         //
@@ -50137,8 +50385,8 @@ mod tests {
             assert_eq!(lanes(&app), before, "Insert Track Below moved the lanes under {held}");
             assert!(!app.paste_track_below(2), "Paste Track Below opened a lane under {held}");
             assert_eq!(lanes(&app), before, "Paste Track Below moved the lanes under {held}");
-            app.selected_tracks = vec![2, 3];
-            app.selected_channel = Some(2);
+            app.set_selected_rows(&[2, 3]);
+            app.set_primary_row(Some(2));
             assert!(!app.make_folder(), "Cmd/Ctrl+F grouped tracks under {held}");
             assert_eq!(lanes(&app), before, "Cmd/Ctrl+F moved the lanes under {held}");
             app.eject_from_folder(9);
@@ -50185,8 +50433,8 @@ mod tests {
             app.messages.clear();
             let held = format!("export={exporting} record={arr}");
             if exporting {
-                app.selected_tracks = vec![10];
-                app.selected_channel = Some(10);
+                app.set_selected_rows(&[10]);
+                app.set_primary_row(Some(10));
                 assert!(!app.make_folder(), "Cmd/Ctrl+F says it made a folder under {held}");
                 assert_eq!(
                     app.folder_parents(),
@@ -50194,8 +50442,8 @@ mod tests {
                     "Cmd/Ctrl+F on an empty row made a folder under {held}, moving the rows below it onto its bus"
                 );
             }
-            app.selected_tracks = vec![8];
-            app.selected_channel = Some(8);
+            app.set_selected_rows(&[8]);
+            app.set_primary_row(Some(8));
             let dissolved = app.make_folder();
             if exporting {
                 assert!(!dissolved, "Cmd/Ctrl+F says it dissolved a folder under {held}");
@@ -50270,8 +50518,8 @@ mod tests {
         // Each road, aimed at its own track; a key is let go again, so the
         // next press is a fresh one.
         let remove_by = |road: &str, ctx: &egui::Context, app: &mut TangentApp, lane: usize| {
-            app.selected_channel = Some(lane);
-            app.selected_tracks = vec![lane];
+            app.set_primary_row(Some(lane));
+            app.set_selected_rows(&[lane]);
             app.arrangement_open = road == "Delete on the arrangement";
             app.mixer_open = road.ends_with("mixer") || road == "the mixer's cut";
             match road {
@@ -50340,8 +50588,8 @@ mod tests {
         app.settings.channel_gains[1] = 0.33;
 
         // A track selected, no clips: the chord takes the track.
-        app.selected_channel = Some(1);
-        app.selected_tracks = vec![1];
+        app.set_primary_row(Some(1));
+        app.set_selected_rows(&[1]);
         app.arr_copy();
         assert!(app.track_on_clipboard(), "the chord did not copy the track");
 
@@ -50352,8 +50600,8 @@ mod tests {
         assert!((app.settings.channel_gains[1] - before).abs() < 1e-9);
 
         // Aimed at an EMPTY slot, the track lands.
-        app.selected_channel = Some(6);
-        app.selected_tracks = vec![6];
+        app.set_primary_row(Some(6));
+        app.set_selected_rows(&[6]);
         assert!(!app.channel_used(6));
         app.arr_paste();
         assert!(app.channel_used(6), "the chord did not paste the track");
@@ -50529,44 +50777,44 @@ mod tests {
 
         // Plain: this one alone.
         app.select_track(3, Modifiers::NONE);
-        assert_eq!(app.selected_tracks, vec![3]);
-        assert_eq!(app.selected_channel, Some(3));
+        assert_eq!(app.selected_rows(), vec![3]);
+        assert_eq!(app.selected_row(), Some(3));
 
         // Shift: everything between, and the clicked end is the primary.
         app.select_track(6, shift);
-        assert_eq!(app.selected_tracks, vec![3, 4, 5, 6]);
-        assert_eq!(app.selected_channel, Some(6));
+        assert_eq!(app.selected_rows(), vec![3, 4, 5, 6]);
+        assert_eq!(app.selected_row(), Some(6));
 
         // **Still measured from 3.** A second shift-click re-cuts the range
         // from the anchor rather than extending from 6.
         app.select_track(5, shift);
-        assert_eq!(app.selected_tracks, vec![3, 4, 5]);
+        assert_eq!(app.selected_rows(), vec![3, 4, 5]);
 
         // And backwards over the anchor.
         app.select_track(1, shift);
-        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
-        assert_eq!(app.selected_channel, Some(1), "the clicked end is primary");
+        assert_eq!(app.selected_rows(), vec![1, 2, 3]);
+        assert_eq!(app.selected_row(), Some(1), "the clicked end is primary");
 
         // Cmd adds one without disturbing the rest.
         app.select_track(9, cmd);
-        assert_eq!(app.selected_tracks, vec![1, 2, 3, 9]);
-        assert_eq!(app.selected_channel, Some(9));
+        assert_eq!(app.selected_rows(), vec![1, 2, 3, 9]);
+        assert_eq!(app.selected_row(), Some(9));
 
         // Cmd again on the same track takes it back out.
         app.select_track(9, cmd);
-        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
-        assert_eq!(app.selected_channel, Some(3), "the primary was promoted");
+        assert_eq!(app.selected_rows(), vec![1, 2, 3]);
+        assert_eq!(app.selected_row(), Some(3), "the primary was promoted");
 
         // Down to nothing, which is a state that has to be reachable.
         for n in [1, 2, 3] {
             app.select_track(n, cmd);
         }
         assert!(app.selected_tracks.is_empty());
-        assert_eq!(app.selected_channel, None);
+        assert_eq!(app.selected_row(), None);
 
         // A plain press starts over.
         app.select_track(7, Modifiers::NONE);
-        assert_eq!(app.selected_tracks, vec![7]);
+        assert_eq!(app.selected_rows(), vec![7]);
     }
 
     /// **Reaching for one track's control does not throw the selection away.**
@@ -50581,19 +50829,19 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.select_track(2, Modifiers::NONE);
         app.select_track(5, Modifiers::SHIFT);
-        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+        assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
 
         app.touch_track(4);
         assert_eq!(
-            app.selected_tracks,
+            app.selected_rows(),
             vec![2, 3, 4, 5],
             "a fader inside the selection cleared it"
         );
-        assert_eq!(app.selected_channel, Some(4), "it is still the primary");
+        assert_eq!(app.selected_row(), Some(4), "it is still the primary");
 
         app.touch_track(11);
         assert_eq!(
-            app.selected_tracks,
+            app.selected_rows(),
             vec![11],
             "a control outside the selection did not take over"
         );
@@ -50663,7 +50911,7 @@ mod tests {
         }
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
-        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+        assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
 
         // ── a SWITCH takes them all ──────────────────────────────────────
         app.apply_mixer_hit(M::Mute(Column::Track(3)), 0.0);
@@ -50730,7 +50978,7 @@ mod tests {
         }
         app.select_track(1, egui::Modifiers::NONE);
         app.select_track(3, egui::Modifiers::SHIFT);
-        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
+        assert_eq!(app.selected_rows(), vec![1, 2, 3]);
 
         app.move_selection(1, 6);
         let at = |n: usize| ((app.settings.channel_gains[n] - 0.1) * 10.0).round() as usize;
@@ -50755,7 +51003,7 @@ mod tests {
         );
         // And the selection followed the tracks it names, to where they now
         // are — the head's own drop row and the two behind it.
-        assert_eq!(app.selected_tracks, vec![6, 7, 8]);
+        assert_eq!(app.selected_rows(), vec![6, 7, 8]);
     }
 
     /// **Painting the pedal lane is a BOUNDED edit**: what stood after the
@@ -51048,7 +51296,7 @@ mod tests {
         let (_c1, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
-        assert_eq!(app.selected_tracks, picked.to_vec());
+        assert_eq!(app.selected_rows(), picked.to_vec());
         for n in picked {
             assert!(!app.to_theory(n), "track {n} started switched on");
         }
@@ -52914,10 +53162,10 @@ mod tests {
         app.freeze_toggle(0);
         assert!(app.take_project_request().is_none(), "an unsaved project asked for a render");
         let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
-        app.selected_channel = Some(3);
+        app.set_primary_row(Some(3));
         app.freeze_selected();
         assert!(app.take_project_request().is_none(), "an empty lane asked for a render");
-        app.selected_channel = Some(0);
+        app.set_primary_row(Some(0));
         app.freeze_selected();
         assert!(
             matches!(app.take_project_request(), Some(crate::ports::ProjectRequest::Freeze(0))),
@@ -52938,7 +53186,7 @@ mod tests {
         let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
         app.note_frozen(0, "media/frozen-01.wav".to_owned(), 3.0);
         assert!(app.lane_frozen(0).is_some(), "fixture: the lane is not frozen");
-        app.selected_channel = Some(0);
+        app.set_primary_row(Some(0));
         for (label, state) in [
             ("a realtime export", recorder::RecordState::Rolling),
             ("an export filing itself", recorder::RecordState::Idle),
@@ -54569,11 +54817,11 @@ mod tests {
         app.open_project(&doc);
 
         assert_eq!(
-            app.drumpad_kits[3].pads[36].path, "media/kick.wav",
+            app.kit_at(3).pads[36].path, "media/kick.wav",
             "the drum lane opened with empty pads — the kit went elsewhere"
         );
         assert!(
-            app.drumpad_kits[0].is_empty(),
+            app.kit_at(0).is_empty(),
             "the kit landed on the piano lane as well"
         );
         assert_eq!(
@@ -55156,7 +55404,7 @@ mod tests {
 
         let lanes: Vec<usize> = app.arrangement.clips.iter().map(|c| c.lane).collect();
         assert_eq!(lanes, vec![3], "the drop did not land on the lane under it");
-        assert_eq!(app.selected_channel, Some(3), "the dropped-on lane did not select");
+        assert_eq!(app.selected_row(), Some(3), "the dropped-on lane did not select");
     }
 
     /// **A track carries its whole identity to a new row** — kind, input,
@@ -55468,7 +55716,7 @@ mod tests {
         assert_eq!(app.arr_multi, vec![pasted.id], "the fresh set is not selected");
         // **The SELECTED track takes the next paste** — nobody wants every
         // copy stuck on the lane it came from.
-        app.selected_channel = Some(6);
+        app.set_primary_row(Some(6));
         app.arr_paste();
         assert_eq!(
             app.arrangement().clips.last().unwrap().lane,
@@ -55518,7 +55766,7 @@ mod tests {
         // their spread instead of piling on the bottom.
         let edge = app.desk_extent() - 1;
         app.recorder.position_s = 40.0;
-        app.selected_channel = Some(edge);
+        app.set_primary_row(Some(edge));
         app.arr_paste();
         let mut lanes: Vec<usize> = app
             .arrangement()
@@ -57367,7 +57615,7 @@ mod tests {
         app.arrangement_open = true;
         app.set_channel_input_spec(2, "midi:all");
         assert!(app.channel_used(2), "the fixture channel is not used");
-        app.selected_channel = Some(2);
+        app.set_primary_row(Some(2));
         // A lane rename is open — the same state the header's name field sets.
         app.mixer_naming = Some((recorder::Column::Track(2), "DR".to_owned()));
         assert!(app.text_entry_active(), "a rename must count as text entry");
@@ -58334,7 +58582,7 @@ mod tests {
 
         let armed = |mode: AutoMode, rolling: bool| {
             let (_ctx, mut app) = headless(Caps::DESKTOP);
-            app.arr_auto_modes.insert(0, mode);
+            app.arr_auto_modes.insert(app.owner_at(0), mode);
             app.recorder.playing = rolling;
             app.recorder.position_s = 4.0;
             app.apply_mixer_hit(M::Fader(Column::Track(0)), 0.6);
@@ -58362,7 +58610,7 @@ mod tests {
     fn a_latch_outlives_the_hand_and_not_the_transport() {
         use crate::automation::AutoMode;
         let (ctx, mut app) = headless(Caps::DESKTOP);
-        app.arr_auto_modes.insert(0, AutoMode::Latch);
+        app.arr_auto_modes.insert(app.owner_at(0), AutoMode::Latch);
         app.recorder.playing = true;
         app.recorder.position_s = 1.0;
 
@@ -58379,7 +58627,7 @@ mod tests {
         assert!(!app.arr_auto_writing(0, false), "the latch survived the stop");
 
         // A Touch, by contrast, lets go the moment the hand does.
-        app.arr_auto_modes.insert(1, AutoMode::Touch);
+        app.arr_auto_modes.insert(app.owner_at(1), AutoMode::Touch);
         app.recorder.playing = true;
         app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column::Track(1)), 0.6);
         assert!(!app.arr_auto_writing(1, false), "a Touch latched");
@@ -58396,7 +58644,7 @@ mod tests {
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        app.arr_auto_modes.insert(0, AutoMode::Write);
+        app.arr_auto_modes.insert(app.owner_at(0), AutoMode::Write);
         app.recorder.playing = true;
 
         // Sixty frames a second for ten seconds, the fader creeping.
@@ -58431,7 +58679,7 @@ mod tests {
         // seconds of holding a fader still is one value, however long you
         // hold it.
         let (_ctx, mut still) = headless(Caps::DESKTOP);
-        still.arr_auto_modes.insert(0, AutoMode::Write);
+        still.arr_auto_modes.insert(still.owner_at(0), AutoMode::Write);
         still.recorder.playing = true;
         for i in 0..600 {
             still.recorder.position_s = f64::from(i) / 10.0;
@@ -58459,13 +58707,13 @@ mod tests {
         assert_eq!(app.auto_suspend_mask(), 0, "a fresh song suspends something");
 
         // Off keeps the curve and stops obeying it.
-        app.arr_auto_modes.insert(2, AutoMode::Off);
+        app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Off);
         assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Off is not suspended");
         // Read obeys it.
-        app.arr_auto_modes.insert(2, AutoMode::Read);
+        app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Read);
         assert_eq!(app.auto_suspend_mask() & (1 << 2), 0, "Read is suspended");
         // A writing mode suspends, so the curve does not fight the hand.
-        app.arr_auto_modes.insert(2, AutoMode::Write);
+        app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Write);
         assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Write is not suspended");
         // ...and nothing else is caught up in it.
         assert_eq!(app.auto_suspend_mask() & !(1 << 2), 0, "a neighbour was suspended");
@@ -58612,7 +58860,7 @@ mod tests {
 
         // Armed but NOT rolling: setting a level before you start.
         app.recorder.playing = false;
-        app.arr_auto_armed.insert((0, AutoParam::Gain));
+        app.arr_auto_armed.insert(app.auto_row_at(0, AutoParam::Gain));
         app.auto_set_control(0, AutoParam::Gain, 0.5);
         assert_eq!(points(&app), 0, "an armed lane wrote while stopped");
 
@@ -59771,24 +60019,24 @@ mod tests {
         // One clip: its track, and it becomes the primary.
         app.arr_selected = Some(1);
         app.arr_sync_tracks_to_clips();
-        assert_eq!(app.selected_tracks, vec![2]);
-        assert_eq!(app.selected_channel, Some(2));
+        assert_eq!(app.selected_rows(), vec![2]);
+        assert_eq!(app.selected_row(), Some(2));
 
         // Several across two tracks: both, in the order named, deduplicated —
         // two clips on track 5 select it once.
         app.arr_selected = Some(1);
         app.arr_multi = vec![2, 3];
         app.arr_sync_tracks_to_clips();
-        assert_eq!(app.selected_tracks, vec![2, 5], "tracks: {:?}", app.selected_tracks);
-        assert_eq!(app.selected_channel, Some(5), "the primary is not the last named");
+        assert_eq!(app.selected_rows(), vec![2, 5], "tracks: {:?}", app.selected_rows());
+        assert_eq!(app.selected_row(), Some(5), "the primary is not the last named");
 
         // Choosing tracks by their headers is a different gesture and is left
         // alone while the clip selection stands still.
-        app.selected_tracks = vec![7];
-        app.selected_channel = Some(7);
+        app.set_selected_rows(&[7]);
+        app.set_primary_row(Some(7));
         app.arr_sync_tracks_to_clips();
         assert_eq!(
-            app.selected_tracks,
+            app.selected_rows(),
             vec![7],
             "an unchanged clip selection overwrote a track selection"
         );
@@ -59814,7 +60062,7 @@ mod tests {
         assert_eq!(app.engine_automation().curves().len(), 2, "both should play");
 
         // Bypass the first. The document keeps it; the engine does not get it.
-        app.arr_auto_bypassed.insert((0, AutoParam::Gain));
+        app.arr_auto_bypassed.insert(app.auto_row_at(0, AutoParam::Gain));
         let engine = app.engine_automation();
         assert_eq!(engine.curves().len(), 1, "the bypassed curve still reached the engine");
         assert!(
@@ -59832,7 +60080,7 @@ mod tests {
         );
 
         // And it comes back, unchanged.
-        app.arr_auto_bypassed.remove(&(0, AutoParam::Gain));
+        app.arr_auto_bypassed.remove(&app.auto_row_at(0, AutoParam::Gain));
         assert_eq!(
             app.engine_automation().value_at(0, AutoParam::Gain, 4.0),
             Some(0.8),
@@ -62855,7 +63103,7 @@ mod tests {
                 |ctx| app.frame(ctx),
             );
             assert_eq!(
-                app.selected_channel,
+                app.selected_row(),
                 Some(3),
                 "{what} (hit {hit:?}) did not select the empty slot"
             );
@@ -63114,8 +63362,8 @@ mod tests {
         assert_eq!(app.folder_children(4), vec![5, 6]);
 
         // The LAST child: out where it stands.
-        app.selected_tracks = vec![6];
-        app.selected_channel = Some(6);
+        app.set_selected_rows(&[6]);
+        app.set_primary_row(Some(6));
         app.eject_from_folder(6);
         assert!(!app.in_folder(6), "the tail child is still inside");
         assert_eq!(app.folder_children(4), vec![5], "the run did not end early");
@@ -63127,8 +63375,8 @@ mod tests {
         app.snap_into_folder(6, 4);
         assert_eq!(app.folder_children(4), vec![5, 6]);
         app.settings.strip_names[5] = "EJECTME".to_owned();
-        app.selected_tracks = vec![5];
-        app.selected_channel = Some(5);
+        app.set_selected_rows(&[5]);
+        app.set_primary_row(Some(5));
         app.eject_from_folder(5);
         assert_eq!(
             app.settings.strip_names.get(6).map(String::as_str),
@@ -63299,8 +63547,8 @@ mod tests {
         }
         // And the selecting arm really selects an empty slot.
         app.select_track(3, egui::Modifiers::NONE);
-        assert_eq!(app.selected_channel, Some(3), "the empty slot did not select");
-        assert_eq!(app.selected_tracks, vec![3]);
+        assert_eq!(app.selected_row(), Some(3), "the empty slot did not select");
+        assert_eq!(app.selected_rows(), vec![3]);
     }
 
     /// The number is twelve points wide on a header full of controls; the
@@ -64571,7 +64819,7 @@ mod tests {
         app.settings.keytoggle_enabled = false;
         app.settings.arr_snap = true;
         app.arrangement_open = true;
-        app.arr_auto_open.insert((0, AutoParam::Gain));
+        app.arr_auto_open.insert(app.auto_row_at(0, AutoParam::Gain));
         let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
         app.arrangement.automation.set(Curve::sanitised(
             0,
@@ -64672,7 +64920,7 @@ mod tests {
     #[test]
     fn delete_takes_the_chosen_nodes_and_never_the_track() {
         let (ctx, mut app) = auto_bench("autodelete");
-        app.selected_channel = Some(0);
+        app.set_primary_row(Some(0));
         let used = app.channel_used(0);
         // Choose two by the hand: a click, then a shift-click.
         let (a, b) = (auto_at(&app, 2.0, 0.8), auto_at(&app, 4.0, 0.2));
@@ -64684,7 +64932,7 @@ mod tests {
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (6.0, 0.6)], "Delete took the wrong nodes");
         assert_eq!(app.channel_used(0), used, "Delete went to the TRACK");
         // **The base stays** even when it is chosen with the rest.
-        app.arr_auto_nodes = vec![(0, 0, 0), (0, 0, 1)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 0), (0, 0, 1)]);
         key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5)], "the base node was deleted");
     }
@@ -64698,7 +64946,7 @@ mod tests {
     #[test]
     fn a_held_delete_after_nodes_leaves_the_track() {
         let (ctx, mut app) = auto_bench("autodelheld");
-        app.selected_channel = Some(0);
+        app.set_primary_row(Some(0));
         assert!(app.channel_used(0));
         let a = auto_at(&app, 2.0, 0.8);
         press(&ctx, &mut app, a);
@@ -64737,10 +64985,10 @@ mod tests {
         let (_ctx, mut app) = auto_bench("autosession");
         let root = project_scratch("autosessionnew");
         app.set_project_dir(root.join("Projects"));
-        app.arr_auto_armed.insert((0, AutoParam::Gain));
-        app.arr_auto_bypassed.insert((0, AutoParam::Gain));
-        app.arr_auto_nodes = vec![(0, 0, 1)];
-        assert!(app.arr_auto_open.contains(&(0, AutoParam::Gain)), "fixture: the row is not open");
+        app.arr_auto_armed.insert(app.auto_row_at(0, AutoParam::Gain));
+        app.arr_auto_bypassed.insert(app.auto_row_at(0, AutoParam::Gain));
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
+        assert!(app.arr_auto_open.contains(&app.auto_row_at(0, AutoParam::Gain)), "fixture: the row is not open");
         app.new_project();
         assert!(app.arr_auto_armed.is_empty(), "a row armed in the last project writes into this one");
         assert!(app.arr_auto_bypassed.is_empty(), "a bypass from the last project silences this one's curve");
@@ -64804,7 +65052,7 @@ mod tests {
         press(&ctx, &mut app, a);
         release(&ctx, &mut app, a);
         let _ = run_frame(&ctx, &mut app);
-        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 1)], "the click did not choose the node");
+        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 1)], "the click did not choose the node");
         assert_eq!(auto_nodes(&app), before, "a click moved the node");
         assert_eq!(app.history.len(), moments, "a click left an undo step");
     }
@@ -64818,7 +65066,7 @@ mod tests {
         use crate::automation::{AutoParam, Curve, Point, Shape};
         let (ctx, mut app) = auto_bench("autohot");
         let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
-        app.arr_auto_open.insert((0, AutoParam::Pan));
+        app.arr_auto_open.insert(app.auto_row_at(0, AutoParam::Pan));
         app.arrangement.automation.set(Curve::sanitised(
             0,
             AutoParam::Pan,
@@ -64864,7 +65112,7 @@ mod tests {
         let from = auto_at(&app, 1.0, 0.95);
         let via = [auto_at(&app, 3.0, 0.5), auto_at(&app, 5.0, 0.05)];
         drag_through(&ctx, &mut app, from, &via);
-        let mut got = app.arr_auto_nodes.clone();
+        let mut got = app.auto_nodes_at();
         got.sort();
         assert_eq!(got, vec![(0, 0, 1), (0, 0, 2)], "the box chose the wrong nodes");
         assert!(
@@ -64930,11 +65178,11 @@ mod tests {
         let from = auto_at(&app, 3.5, 0.95);
         let rect = app.arrangement_rect.expect("drawn");
         drag_through(&ctx, &mut app, from, &[Pos2::new(rect.left() + 10.0, from.y + 60.0)]);
-        assert!(!app.arr_auto_nodes.contains(&(0, 0, 1)), "the 2 s node, left of the window, was chosen");
+        assert!(!app.auto_node_chosen(0, 0, 1), "the 2 s node, left of the window, was chosen");
         // The window's own nodes are still the box's to choose.
         let to = auto_at(&app, 5.0, 0.05);
         drag_through(&ctx, &mut app, from, &[to]);
-        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 2)], "the box lost the 4 s node it covers");
+        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 2)], "the box lost the 4 s node it covers");
     }
 
     /// **Copy, click where it should go, paste**: it lands on that row, at
@@ -64989,7 +65237,7 @@ mod tests {
     fn copying_clips_after_nodes_leaves_the_paste_to_the_clips() {
         use crate::arrangement::{ArrClip, ClipKind};
         let (_ctx, mut app) = auto_bench("autoclipslast");
-        app.arr_auto_nodes = vec![(0, 0, 1)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
         assert!(app.arr_copy_auto_nodes());
         let id = app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
@@ -65020,7 +65268,7 @@ mod tests {
         app.arr_copy();
         assert!(app.auto_clipboard.is_empty(), "copying a clip kept the old nodes on the clipboard");
         // The row the hand last pressed is still there to aim at.
-        app.arr_auto_focus = Some((0, crate::automation::AutoParam::Gain));
+        app.arr_auto_focus = Some(app.auto_row_at(0, crate::automation::AutoParam::Gain));
         let (before, clips) = (auto_nodes(&app), app.arrangement.clips.len());
         app.recorder.position_s = 8.0;
         app.arr_paste();
@@ -65068,7 +65316,7 @@ mod tests {
         release(&ctx, &mut app, a);
         click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
         click_with(&ctx, &mut app, a, egui::Modifiers::SHIFT);
-        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 2)], "shift did not take the node back out");
+        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 2)], "shift did not take the node back out");
         key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (2.0, 0.8), (6.0, 0.6)], "Delete took the un-chosen node");
     }
@@ -65082,7 +65330,7 @@ mod tests {
         let (_ctx, mut app) = auto_bench("autoclipmenu");
         let id = app.arrangement.add_clip(bench_item(1, 1.0));
         let clips = app.arrangement.clips.len();
-        app.arr_auto_nodes = vec![(0, 0, 1)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
         app.arr_clip_menu_subject(id);
         app.arr_delete_selected();
         assert_eq!(auto_nodes(&app).len(), 4, "the menu's Delete took a node");
@@ -65113,7 +65361,7 @@ mod tests {
         drag_through(&ctx, &mut app, from, &via);
         assert_eq!(app.arr_auto_nodes.len(), 2, "fixture: the box chose {:?}", app.arr_auto_nodes);
         assert!(app.arr_selected.is_none(), "the box left the clip chosen beside its nodes");
-        app.arr_auto_sel = Some((0, 0));
+        app.arr_auto_sel = Some((app.owner_at(0), 0));
         drag_through(&ctx, &mut app, from, &via);
         assert!(app.arr_auto_sel.is_none(), "the box left the row chosen beside its nodes");
         // A node added with Shift, the same two ways.
@@ -65121,13 +65369,13 @@ mod tests {
         click_with(&ctx, &mut app, room, egui::Modifiers::SHIFT);
         assert_eq!(app.arr_auto_nodes.len(), 1, "fixture: the shift-click chose {:?}", app.arr_auto_nodes);
         assert!(app.arr_multi.is_empty(), "the added node left the clips chosen beside it");
-        app.arr_auto_sel = Some((0, 0));
+        app.arr_auto_sel = Some((app.owner_at(0), 0));
         click_with(&ctx, &mut app, more_room, egui::Modifiers::SHIFT);
         assert!(app.arr_auto_sel.is_none(), "the added node left the row chosen beside it");
         // A paste, over both at once: no frame runs in between.
         assert!(app.arr_copy_auto_nodes());
         app.arr_selected = Some(id);
-        app.arr_auto_sel = Some((0, 0));
+        app.arr_auto_sel = Some((app.owner_at(0), 0));
         app.recorder.position_s = 9.0;
         assert!(app.arr_paste_auto_nodes());
         assert_eq!(app.arr_auto_nodes.len(), 1, "fixture: the paste chose {:?}", app.arr_auto_nodes);
@@ -65171,14 +65419,14 @@ mod tests {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = auto_bench("autogroupedge");
         // The 2, 4 and 6 s nodes chosen; the one at 6 s carried to 1 s.
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2), (0, 0, 3)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2), (0, 0, 3)]);
         app.arr_drag_auto_point(0, AutoParam::Gain, 3, 1.0, 0.6);
         // The group stops when its first node reaches the start — where it
         // meets the base, and carries its value in (no step at zero).
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.8), (2.0, 0.2), (4.0, 0.6)], "the group lost its shape");
         // And in value: pulled down past the floor, the pair keeps its gap.
         let (_ctx, mut app) = auto_bench("autogroupfloor");
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
         app.arr_drag_auto_point(0, AutoParam::Gain, 1, 2.0, 0.0);
         let got = auto_nodes(&app);
         assert!((got[1].1 - 0.6).abs() < 1e-9 && got[2].1.abs() < 1e-9, "values merged at the floor: {got:?}");
@@ -65245,10 +65493,10 @@ mod tests {
     fn opening_a_row_lets_the_node_choice_go() {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = auto_bench("autorowsel");
-        app.arr_auto_nodes = vec![(0, 0, 1)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
         app.arr_toggle_automation_param(0, AutoParam::Pan);
         assert!(app.arr_auto_nodes.is_empty(), "the choice outlived the renumbering");
-        app.arr_auto_sel = Some((0, 1));
+        app.arr_auto_sel = Some((app.owner_at(0), 1));
         app.arr_close_auto_row(0, 1);
         assert!(app.arr_auto_sel.is_none(), "the row choice outlived the renumbering");
     }
@@ -65363,11 +65611,11 @@ mod tests {
     #[test]
     fn a_paste_replaces_what_its_span_covers() {
         let (_ctx, mut app) = auto_bench("autospan");
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)]; // 2 s and 4 s: a 2 s span
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]); // 2 s and 4 s: a 2 s span
         assert!(app.arr_copy_auto_nodes());
         app.recorder.position_s = 3.0;
         app.arr_auto_nodes.clear();
-        app.arr_auto_focus = Some((0, crate::automation::AutoParam::Gain));
+        app.arr_auto_focus = Some(app.auto_row_at(0, crate::automation::AutoParam::Gain));
         assert!(app.arr_paste_auto_nodes());
         // 3..5 s is the pasted span: the old 4 s node inside it is gone.
         let got = auto_nodes(&app);
@@ -65382,10 +65630,10 @@ mod tests {
     fn nodes_copied_from_two_rows_are_not_merged_onto_one() {
         use crate::automation::{AutoParam, Curve, Point, Shape};
         let (_ctx, mut app) = auto_bench("autotworows");
-        app.arr_auto_open.insert((0, AutoParam::Pan));
+        app.arr_auto_open.insert(app.auto_row_at(0, AutoParam::Pan));
         let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
         app.arrangement.automation.set(Curve::sanitised(0, AutoParam::Pan, vec![pt(0.0, 0.5), pt(3.0, 0.1)]));
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 1, 1)]; // volume 2 s (0.8), pan 3 s (0.1)
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 1, 1)]); // volume 2 s (0.8), pan 3 s (0.1)
         let _ = app.arr_copy_auto_nodes();
         app.arr_auto_nodes.clear();
         app.recorder.position_s = 10.0;
@@ -65414,10 +65662,10 @@ mod tests {
     fn a_shape_pasted_onto_a_mute_row_holds() {
         use crate::automation::{AutoParam, Shape};
         let (_ctx, mut app) = auto_bench("autopastemute");
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
         assert!(app.arr_copy_auto_nodes());
         app.arr_toggle_automation_param(0, AutoParam::Mute);
-        app.arr_auto_focus = Some((0, AutoParam::Mute));
+        app.arr_auto_focus = Some(app.auto_row_at(0, AutoParam::Mute));
         app.recorder.position_s = 8.0;
         assert!(app.arr_paste_auto_nodes());
         let mute = app.arrangement.automation.get(0, AutoParam::Mute).expect("nothing landed on the mute row");
@@ -65431,7 +65679,7 @@ mod tests {
     #[test]
     fn cmd_a_opens_the_selected_tracks_automation_lanes() {
         let (ctx, mut app) = auto_bench("autocmda");
-        app.selected_channel = Some(0);
+        app.set_primary_row(Some(0));
         key_with(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
         assert!(
             matches!(app.dialog, Some(Dialog::Automation { .. })),
@@ -65447,7 +65695,7 @@ mod tests {
     fn cmd_a_on_an_empty_slot_opens_nothing() {
         let (ctx, mut app) = auto_bench("autocmdaempty");
         let empty = (0..recorder::CHANNELS).find(|n| !app.channel_used(*n)).expect("an empty slot");
-        app.selected_channel = Some(empty);
+        app.set_primary_row(Some(empty));
         key_with(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
         assert!(
             !matches!(app.dialog, Some(Dialog::Automation { .. })),
@@ -73493,21 +73741,21 @@ mod tests {").expect("the tests module")];
         );
 
         // (1) A kit somebody loaded is REPLACED, not kept.
-        app.drumpad_kits[0].pads[0].path = "media/Somebody Elses Snare.wav".to_owned();
+        app.kit_at_mut(0).pads[0].path = "media/Somebody Elses Snare.wav".to_owned();
         app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
         app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
         assert_eq!(
-            app.drumpad_kits[0].pads[0].path, "media/Kick.wav",
+            app.kit_at(0).pads[0].path, "media/Kick.wav",
             "the reset kept the kit that was loaded - it is not a reset"
         );
 
         // (2) And pads somebody EMPTIED are filled back in, which is the
         // other direction the owner saw fail.
-        app.drumpad_kits[0].pads[0].path = String::new();
+        app.kit_at_mut(0).pads[0].path = String::new();
         app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
         app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
         assert_eq!(
-            app.drumpad_kits[0].pads[0].path, "media/Kick.wav",
+            app.kit_at(0).pads[0].path, "media/Kick.wav",
             "emptied pads stayed empty through a reset"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -74578,7 +74826,7 @@ mod velocity_selection_tests {
         let (_c, mut app) = headless(Caps::DESKTOP);
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
-        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+        assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
 
         app.apply_dialog_action(DialogAction::TrackColor(3, 9));
         for n in [2, 3, 4, 5] {
@@ -74697,7 +74945,7 @@ mod folder_tests {
 
         // **Choosing.** One replaces, shift adds, shift again removes.
         app.arr_select_auto_node(0, 0, 1);
-        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 1)]);
+        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 1)]);
         app.arr_toggle_auto_node(0, 0, 2);
         assert_eq!(app.arr_auto_nodes.len(), 2);
         app.arr_toggle_auto_node(0, 0, 2);
@@ -74735,7 +74983,7 @@ mod folder_tests {
         // first: removing one renumbers the rest, so a loop going upwards
         // takes the wrong points from the second one on, and a TIME cannot
         // tell a step's two halves apart.
-        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
         app.arr_delete_auto_nodes();
         assert_eq!(count(&app), 4, "delete took the wrong number of nodes");
         assert!(app.arr_auto_nodes.is_empty(), "the selection outlived the nodes");
@@ -75566,7 +75814,7 @@ mod folder_tests {
         let mut app = app();
         app.undo_reset();
 
-        app.drumpad_kits[0].pads[36] = crate::drumpad::PadSlot {
+        app.kit_at_mut(0).pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
             name: "Kick".to_owned(),
             ..Default::default()
@@ -75574,28 +75822,28 @@ mod folder_tests {
         app.drumpad_edited();
 
         // A second edit, so there is a middle to come back to.
-        app.drumpad_kits[0].pads[40] = crate::drumpad::PadSlot {
+        app.kit_at_mut(0).pads[40] = crate::drumpad::PadSlot {
             path: "media/snare.wav".to_owned(),
             ..Default::default()
         };
         app.drumpad_edited();
-        assert_eq!(app.drumpad_kits[0].pads[40].path, "media/snare.wav");
+        assert_eq!(app.kit_at(0).pads[40].path, "media/snare.wav");
 
         app.undo();
         assert_eq!(
-            app.drumpad_kits[0].pads[40].path, "",
+            app.kit_at(0).pads[40].path, "",
             "undo did not take the snare back off the pad"
         );
         assert_eq!(
-            app.drumpad_kits[0].pads[36].path, "media/kick.wav",
+            app.kit_at(0).pads[36].path, "media/kick.wav",
             "undo went back too far"
         );
         // The name and knobs ride with it, not just the path.
-        assert_eq!(app.drumpad_kits[0].pads[36].name, "Kick");
+        assert_eq!(app.kit_at(0).pads[36].name, "Kick");
 
         app.redo();
         assert_eq!(
-            app.drumpad_kits[0].pads[40].path, "media/snare.wav",
+            app.kit_at(0).pads[40].path, "media/snare.wav",
             "redo did not put the snare back"
         );
 
@@ -75603,7 +75851,7 @@ mod folder_tests {
         app.undo();
         app.undo();
         assert!(
-            app.drumpad_kits[0].is_empty(),
+            app.kit_at(0).is_empty(),
             "undoing every edit left pads behind"
         );
     }
@@ -75673,11 +75921,11 @@ mod folder_tests {
             0,
             Some(dialogs::DRUMPAD_PATH),
         );
-        app.drumpad_kits[0].pads[36] = crate::drumpad::PadSlot {
+        app.kit_at_mut(0).pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
             ..Default::default()
         };
-        assert!(!app.drumpad_kits[0].is_empty(), "the fixture kit is empty");
+        assert!(!app.kit_at(0).is_empty(), "the fixture kit is empty");
 
         app.copy_track(0);
         app.paste_track(3);
@@ -75691,7 +75939,7 @@ mod folder_tests {
         );
         // And the kit came with it, which is the part that did not.
         assert_eq!(
-            app.drumpad_kits[3].pads[36].path, "media/kick.wav",
+            app.kit_at(3).pads[36].path, "media/kick.wav",
             "the pasted drum lane has no sample on the pad it was copied from"
         );
         assert!(
@@ -75700,14 +75948,14 @@ mod folder_tests {
         );
 
         // A track with no pads must not carry an empty kit over something.
-        app.drumpad_kits[5].pads[40] = crate::drumpad::PadSlot {
+        app.kit_at_mut(5).pads[40] = crate::drumpad::PadSlot {
             path: "media/snare.wav".to_owned(),
             ..Default::default()
         };
         app.copy_track(1);
         app.paste_track(5);
         assert_eq!(
-            app.drumpad_kits[5].pads[40].path, "media/snare.wav",
+            app.kit_at(5).pads[40].path, "media/snare.wav",
             "pasting a non-drum track wiped a kit that was already there"
         );
     }
@@ -75806,7 +76054,7 @@ mod folder_tests {
             a.add_bare_track(n);
         }
         // Channel 3 is the one with a kit and a curve on it.
-        a.drumpad_kits[3].pads[36] = crate::drumpad::PadSlot {
+        a.kit_at_mut(3).pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
             ..Default::default()
         };
@@ -75826,11 +76074,11 @@ mod folder_tests {
 
         // The kit went with it, and did not stay behind.
         assert_eq!(
-            a.drumpad_kits[1].pads[36].path, "media/kick.wav",
+            a.kit_at(1).pads[36].path, "media/kick.wav",
             "the kit did not follow its track"
         );
         assert!(
-            a.drumpad_kits[3].pads[36].path.is_empty(),
+            a.kit_at(3).pads[36].path.is_empty(),
             "the kit was left behind as well as moved"
         );
         // So did the curve — with its points, not just its existence.
@@ -75865,7 +76113,7 @@ mod folder_tests {
             a.add_bare_track(n);
         }
         a.arr_toggle_automation_param(3, AutoParam::Gain);
-        a.arr_auto_bypassed.insert((3, AutoParam::Gain));
+        a.arr_auto_bypassed.insert(a.auto_row_at(3, AutoParam::Gain));
         // Move 3 up to 1: order[new] = old.
         let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
         order.remove(3);
@@ -75910,8 +76158,8 @@ mod folder_tests {
         for n in [1usize, 2, 3] {
             a.add_bare_track(n);
         }
-        a.arr_auto_modes.insert(3, AutoMode::Latch);
-        a.arr_auto_latched.insert(3);
+        a.arr_auto_modes.insert(a.owner_at(3), AutoMode::Latch);
+        a.arr_auto_latched.insert(a.owner_at(3));
         // Move 3 up to 1: order[new] = old.
         let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
         order.remove(3);
@@ -75920,12 +76168,12 @@ mod folder_tests {
         assert_eq!(a.arr_auto_mode(1), AutoMode::Latch, "the mode stayed on the row the track left");
         assert_eq!(a.arr_auto_mode(3), AutoMode::Read, "the track that took row 3 took its Latch");
         assert!(
-            a.arr_auto_latched.contains(&1) && !a.arr_auto_latched.contains(&3),
+            a.arr_auto_latched.contains(&a.owner_at(1)) && !a.arr_auto_latched.contains(&a.owner_at(3)),
             "the latch stayed on the row the track left"
         );
         a.undo();
         assert_eq!(a.arr_auto_mode(3), AutoMode::Latch, "the undo left the mode on the row it had moved to");
-        assert!(a.arr_auto_latched.contains(&3), "the undo left the latch on the row it had moved to");
+        assert!(a.arr_auto_latched.contains(&a.owner_at(3)), "the undo left the latch on the row it had moved to");
     }
 
     /// **A removed track takes its automation with it.** The curves are
@@ -75943,11 +76191,11 @@ mod folder_tests {
             .automation
             .entry(3, AutoParam::Mute)
             .put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
-        a.arr_auto_armed.insert((3, AutoParam::Mute));
+        a.arr_auto_armed.insert(a.auto_row_at(3, AutoParam::Mute));
         a.remove_channel(3);
         assert!(a.arrangement.automation.get(3, AutoParam::Mute).is_none(), "the curve stayed on the slot");
-        assert!(!a.arr_auto_open.contains(&(3, AutoParam::Mute)), "the row stayed open under an empty slot");
-        assert!(!a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the arm stayed for the next track");
+        assert!(!a.arr_auto_open.contains(&a.auto_row_at(3, AutoParam::Mute)), "the row stayed open under an empty slot");
+        assert!(!a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Mute)), "the arm stayed for the next track");
         a.add_bare_track(3);
         assert_eq!(
             a.engine_automation().value_at(3, AutoParam::Mute, 5.0),
@@ -76008,8 +76256,8 @@ mod folder_tests {
                 Point { at_s: 4.0, value: 0.9, shape: Shape::Linear },
             ],
         ));
-        a.arr_auto_open.insert((3, freq));
-        a.arr_auto_bypassed.insert((3, freq));
+        a.arr_auto_open.insert(a.auto_row_at(3, freq));
+        a.arr_auto_bypassed.insert(a.auto_row_at(3, freq));
         a.arr_save_edits();
         a.set_insert(3, 0, Some("@tangent-comp"));
         assert!(
@@ -76017,7 +76265,7 @@ mod folder_tests {
             "the EQ's frequency curve now rides the compressor's attack"
         );
         assert!(!a.arr_auto_is_open(3, freq), "the EQ's row stayed open over the compressor's knob");
-        assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the EQ's bypass stayed for the compressor's knob");
+        assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, freq)), "the EQ's bypass stayed for the compressor's knob");
         a.undo();
         assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
         assert!(a.arrangement.automation.get(3, freq).is_some(), "the undo put the EQ back without its curve");
@@ -76042,8 +76290,8 @@ mod folder_tests {
             a.arr_toggle_automation_param(3, p);
             a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
         }
-        a.arr_auto_armed.insert((3, AutoParam::Mute));
-        a.arr_auto_bypassed.insert((3, AutoParam::Gain));
+        a.arr_auto_armed.insert(a.auto_row_at(3, AutoParam::Mute));
+        a.arr_auto_bypassed.insert(a.auto_row_at(3, AutoParam::Gain));
         a.arr_save_edits();
         a.remove_channel(3);
         assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "fixture: the removal left its row open");
@@ -76052,15 +76300,15 @@ mod folder_tests {
         for p in [AutoParam::Mute, AutoParam::Gain] {
             assert!(a.arr_auto_is_open(3, p), "the undo brought {p:?}'s curve back with its row shut");
         }
-        assert!(a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the undo left the row disarmed");
+        assert!(a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Mute)), "the undo left the row disarmed");
         assert!(
             a.engine_automation().get(3, AutoParam::Gain).is_none(),
             "the undo brought a bypassed curve back playing"
         );
         a.redo();
         assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "the redo left a row open under the empty slot");
-        assert!(!a.arr_auto_armed.contains(&(3, AutoParam::Mute)), "the redo left the arm for the next track");
-        assert!(!a.arr_auto_bypassed.contains(&(3, AutoParam::Gain)), "the redo left the bypass behind");
+        assert!(!a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Mute)), "the redo left the arm for the next track");
+        assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, AutoParam::Gain)), "the redo left the bypass behind");
 
         // A plugin's REPLACE.
         let mut a = app();
@@ -76072,8 +76320,8 @@ mod folder_tests {
             freq,
             vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
         ));
-        a.arr_auto_open.insert((3, freq));
-        a.arr_auto_bypassed.insert((3, freq));
+        a.arr_auto_open.insert(a.auto_row_at(3, freq));
+        a.arr_auto_bypassed.insert(a.auto_row_at(3, freq));
         a.arr_save_edits();
         a.set_insert(3, 0, Some("@tangent-comp"));
         assert!(!a.arr_auto_is_open(3, freq), "fixture: the replace left the EQ's row open");
@@ -76083,7 +76331,7 @@ mod folder_tests {
         assert!(a.engine_automation().get(3, freq).is_none(), "the undo brought the EQ's bypassed curve back playing");
         a.redo();
         assert!(!a.arr_auto_is_open(3, freq), "the redo left the EQ's row open over the compressor's knob");
-        assert!(!a.arr_auto_bypassed.contains(&(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
+        assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
     }
 
     /// **A redo closes every row its gesture takes away, a row opened after
@@ -76115,7 +76363,7 @@ mod folder_tests {
         // Opened after the undo, on the curve it brought back, and armed:
         // session state, so the redo is still there to take.
         a.arr_toggle_automation_param(3, AutoParam::Gain);
-        a.arr_auto_armed.insert((3, AutoParam::Gain));
+        a.arr_auto_armed.insert(a.auto_row_at(3, AutoParam::Gain));
         a.redo();
         assert!(
             a.arrangement.automation.get(3, AutoParam::Gain).is_none(),
@@ -76126,14 +76374,14 @@ mod folder_tests {
             "the redo left a row opened after the undo standing under the empty slot"
         );
         assert!(
-            !a.arr_auto_armed.contains(&(3, AutoParam::Gain)),
+            !a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Gain)),
             "the redo left that row's arm for the next track made there"
         );
         a.undo();
         for p in [AutoParam::Mute, AutoParam::Gain] {
             assert!(a.arr_auto_is_open(3, p), "the undo after the redo brought {p:?}'s row back shut");
         }
-        assert!(a.arr_auto_armed.contains(&(3, AutoParam::Gain)), "the undo after the redo dropped the arm");
+        assert!(a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Gain)), "the undo after the redo dropped the arm");
 
         // A plugin's REPLACE, with the EQ's frequency row open and a second
         // curve of its under a shut row.
@@ -76149,7 +76397,7 @@ mod folder_tests {
                 vec![Point { at_s: 0.0, value: 0.2, shape: Shape::Linear }],
             ));
         }
-        a.arr_auto_open.insert((3, freq));
+        a.arr_auto_open.insert(a.auto_row_at(3, freq));
         a.arr_save_edits();
         a.set_insert(3, 0, Some("@tangent-comp"));
         a.undo();
@@ -76246,7 +76494,7 @@ mod folder_tests {
                 at(bay, id),
                 vec![Point { at_s: 0.0, value: v, shape: Shape::Linear }],
             ));
-            a.arr_auto_open.insert((3, at(bay, id)));
+            a.arr_auto_open.insert(a.auto_row_at(3, at(bay, id)));
         }
         a.arr_save_edits();
         let before = a.hist_at;
@@ -76275,14 +76523,14 @@ mod folder_tests {
         a.settings.channel_pans[3] = -1.0;
         a.settings.strip_phase |= 1 << 3;
         a.settings.channel_icons[3] = 5;
-        a.drumpad_kits[3].pads[36].path = "media/kick.wav".to_owned();
+        a.kit_at_mut(3).pads[36].path = "media/kick.wav".to_owned();
         a.remove_channel(3);
         a.add_bare_track(3);
         let d = Settings::default();
         assert_eq!(a.settings.channel_pans[3], d.channel_pans[3], "the new track inherited the old one's pan");
         assert_eq!(a.settings.strip_phase & (1 << 3), 0, "the new track inherited the old one's polarity");
         assert_eq!(a.settings.channel_icons[3], d.channel_icons[3], "the new track inherited the old one's icon");
-        assert!(a.drumpad_kits[3].is_empty(), "the new track inherited the old one's drum kit");
+        assert!(a.kit_at(3).is_empty(), "the new track inherited the old one's drum kit");
     }
 
     /// **A reorder carries both ends of a sidechain key edge; a delete takes
@@ -77670,7 +77918,7 @@ mod folder_tests {
         app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
         let scratch = projects.join("Untitled");
         app.adopt_template(&template, &scratch);
-        assert!(app.drumpad_kits.iter().any(|k| !k.is_empty()), "the template's kit did not load");
+        assert!(app.drumpad_kits.values().any(|k| !k.is_empty()), "the template's kit did not load");
         let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
         order.swap(0, 1);
         app.reorder_channels(&order);
@@ -78009,8 +78257,8 @@ mod folder_tests {
 
         // ── an empty slot ────────────────────────────────────────────────
         let mut a = app();
-        a.selected_channel = Some(6);
-        a.selected_tracks = vec![6];
+        a.set_primary_row(Some(6));
+        a.set_selected_rows(&[6]);
         assert!(!a.channel_used(6), "the fixture's slot 6 is not free");
         assert!(a.make_folder(), "an empty slot refused to become a folder");
         assert!(a.settings.strip_is_folder[6], "slot 6 is not a folder");
@@ -78021,13 +78269,13 @@ mod folder_tests {
         for n in [2usize, 3, 4] {
             a.add_bare_track(n);
         }
-        a.selected_tracks = vec![2, 4];
-        a.selected_channel = Some(2);
+        a.set_selected_rows(&[2, 4]);
+        a.set_primary_row(Some(2));
         assert!(a.make_folder(), "a selection refused to be grouped");
 
         // The folder sits where the topmost track was, and the run it took
         // in has moved down by one to sit under it.
-        let folder = a.selected_channel.expect("the folder is not selected");
+        let folder = a.selected_row().expect("the folder is not selected");
         assert!(a.settings.strip_is_folder[folder], "no folder was made");
         assert_eq!(folder, 2, "the folder did not land above the run");
         for ch in folder + 1..=folder + 3 {
@@ -78059,8 +78307,8 @@ mod folder_tests {
         for n in 0..CHANNELS {
             full.add_bare_track(n);
         }
-        full.selected_tracks = vec![1, 2];
-        full.selected_channel = Some(1);
+        full.set_selected_rows(&[1, 2]);
+        full.set_primary_row(Some(1));
         assert!(
             !full.make_folder(),
             "a full desk pretended to make a folder with no row to put it on"
@@ -78096,8 +78344,8 @@ mod folder_tests {
         for n in (0..CHANNELS).filter(|n| *n != 5) {
             holed.add_bare_track(n);
         }
-        holed.selected_tracks = vec![4, 6];
-        holed.selected_channel = Some(4);
+        holed.set_selected_rows(&[4, 6]);
+        holed.set_primary_row(Some(4));
         assert!(!holed.make_folder(), "a folder was made with no row outside its run");
         let said = holed.said().notes();
         assert_eq!(said.len(), 1, "the refusal did not speak once");
@@ -78637,7 +78885,7 @@ mod folder_tests {
             ((a.settings.channel_gains[n] - 0.05) * 20.0).round() as usize
         };
 
-        a.selected_tracks = vec![4];
+        a.set_selected_rows(&[4]);
         a.move_selection(4, 7);
 
         assert_eq!(
@@ -78751,7 +78999,7 @@ mod folder_tests {
         assert_eq!(a.drag_block(5), vec![5]);
 
         // Drag the folder down past the plain tracks.
-        a.selected_tracks = vec![1];
+        a.set_selected_rows(&[1]);
         a.move_selection(1, 4);
 
         // The three moved together and kept their order. Read across EIGHT
@@ -79162,7 +79410,7 @@ mod folder_tests {
             ],
             ..Default::default()
         });
-        a.drumpad_kits[0].pads[0].path = "media/kick.wav".into();
+        a.kit_at_mut(0).pads[0].path = "media/kick.wav".into();
         a.undo_reset();
         a
     }
@@ -79301,13 +79549,13 @@ mod folder_tests {
                 a.settings.strip_folder_shut.push(true);
             })),
             ("a pad's knob", Box::new(|a: &mut TangentApp| {
-                a.drumpad_kits[0].pads[0].params.gain = 0.5;
+                a.kit_at_mut(0).pads[0].params.gain = 0.5;
             })),
             ("a pad cleared", Box::new(|a: &mut TangentApp| {
-                a.drumpad_kits[0].pads[0].path = String::new();
+                a.kit_at_mut(0).pads[0].path = String::new();
             })),
             ("a kit loaded onto another lane", Box::new(|a: &mut TangentApp| {
-                a.drumpad_kits[2].pads[5].path = "media/hat.wav".into();
+                a.kit_at_mut(2).pads[5].path = "media/hat.wav".into();
             })),
             ("a tempo map drawn", Box::new(|a: &mut TangentApp| {
                 a.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
@@ -80387,7 +80635,7 @@ mod dirty_cost_probe {
     fn the_old_moment(app: &TangentApp) -> (String, String) {
         (
             app.arrangement.to_json_with_desk(Some(&app.desk_snapshot())),
-            crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
+            crate::drumpad::DrumpadDoc::compact_tracks(&app.drumpad_kits),
         )
     }
 
@@ -81852,7 +82100,9 @@ mod sampler_road_tests {
 impl TangentApp {
     #[doc(hidden)]
     pub fn set_arr_auto_mode_for_test(&mut self, lane: usize, mode: crate::automation::AutoMode) {
-        self.arr_auto_modes.insert(lane, mode);
+        if let Some(owner) = self.auto_owner(lane) {
+            self.arr_auto_modes.insert(owner, mode);
+        }
     }
 }
 
@@ -82106,7 +82356,7 @@ mod views_windowed_tests {
         a.set_channel_kind(10, None);
         assert!(a.settings.routes.add(Route::new(12, Target::Hardware { first: 0, stereo: true })));
         a.settings.insert_keys.set(13, 0, Some(14));
-        a.drumpad_kits[15].pads[36].path = "media/kick.wav".to_owned();
+        a.kit_at_mut(15).pads[36].path = "media/kick.wav".to_owned();
         a.note_frozen(16, "media/frozen-17-1.wav".into(), 2.0);
         a.arrangement.automation.set(crate::automation::Curve::sanitised(
             17,
@@ -82293,14 +82543,14 @@ mod views_windowed_tests {
             crate::mixer_panel::Layout::new(rect, &v).bar
         };
         assert!(bar.track.is_positive(), "a 32-track desk at 8 drew no bar");
-        let selected = a.selected_tracks.clone();
+        let selected = a.selected_rows();
         let p = bar.thumb.center();
         frame(&ctx, &mut a, vec![egui::Event::PointerMoved(p), button(p, true)]);
         let far = Pos2::new(rect.right() + 40.0, p.y);
         frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far)]);
         frame(&ctx, &mut a, vec![egui::Event::PointerMoved(far), button(far, false)]);
         assert!((a.mixer_scroll_px - bar.max_px).abs() < 0.5, "the desk stopped at {}", a.mixer_scroll_px);
-        assert_eq!(a.selected_tracks, selected, "the bar's press selected a track");
+        assert_eq!(a.selected_rows(), selected, "the bar's press selected a track");
         assert!(a.mixer_grab.is_none() && a.mixer_reorder.is_none(), "the bar's press armed a strip");
 
         a.mixer_open = false;
@@ -82379,10 +82629,10 @@ mod persist_tests {
         assert_eq!(app.take_insert_state_copy(), None, "taking one form took the note");
 
         let tracks = ids(&app);
-        app.selected_tracks = vec![5, 7];
-        app.selected_channel = Some(5);
+        app.set_selected_rows(&[5, 7]);
+        app.set_primary_row(Some(5));
         assert!(app.make_folder());
-        let header = app.selected_channel.expect("the folder is selected");
+        let header = app.selected_row().expect("the folder is selected");
         let after = ids(&app);
         assert!(!tracks.contains(&after[header]), "the folder's header row kept a stranger's id");
         for id in [added, pasted, source] {
@@ -82506,25 +82756,25 @@ mod persist_tests {
             let doc = app.project_doc().expect("a project").to_path_buf();
             let mut b = crate::drumpad::DrumpadDoc::default();
             b.pads[36].path = "media/b-kick.wav".into();
-            app.drumpad_kits[4] = b;
+            *app.kit_at_mut(4) = b;
             app.drumpad_edited();
             assert!(app.add_bare_track(4));
             app.save_project_doc();
-            let a_kit = app.drumpad_kits[0].clone();
+            let a_kit = app.kit_at(0).clone();
             let (id0, id4) = (ids(&app)[0], ids(&app)[4]);
 
             app.move_channel(4, 0);
             assert_eq!(ids(&app)[0], id4);
-            app.drumpad_kits[0].pads[40].path = "media/b-snare.wav".into();
+            app.kit_at_mut(0).pads[40].path = "media/b-snare.wav".into();
             app.drumpad_edited();
 
             let (_ctx2, mut back) = headless(Caps::DESKTOP);
             back.open_project(&doc);
             let lane_of = |id| back.row_of(id).expect("the track is on the desk");
-            let b_back = &back.drumpad_kits[lane_of(id4)];
+            let b_back = back.kit_at(lane_of(id4));
             assert_eq!(b_back.pads[36].path, "media/b-kick.wav", "track 4's kit left its track");
             assert_eq!(b_back.pads[40].path, "media/b-snare.wav", "the unsaved pad edit was lost");
-            assert_eq!(back.drumpad_kits[lane_of(id0)], a_kit, "track 0's kit left its track");
+            assert_eq!(*back.kit_at(lane_of(id0)), a_kit, "track 0's kit left its track");
             let _ = std::fs::remove_dir_all(&root);
         });
     }
@@ -82696,8 +82946,8 @@ mod persist_tests {
             let (_ctx, mut author) = headless(Caps::DESKTOP);
             assert!(author.add_bare_track(5));
             let lane = author.track_ids().iter().position(|id| id.0 >= 32).expect("a minted row");
-            author.drumpad_kits[lane].pads[36].path = "media/added.wav".into();
-            author.drumpad_lane = lane;
+            author.kit_at_mut(lane).pads[36].path = "media/added.wav".into();
+            author.set_drumpad_lane(lane);
             author.write_template_into(&template).expect("template");
             let side = std::fs::read_to_string(template.join(crate::drumpad::FILE_NAME)).expect("kit");
             let minted = author.track_ids()[lane].to_string();
@@ -82706,8 +82956,8 @@ mod persist_tests {
             let (_ctx2, mut app) = headless(Caps::DESKTOP);
             app.settings.project_dir = Some(root.join("Projects").to_string_lossy().into_owned());
             app.reset_kits_to_default();
-            assert_eq!(app.drumpad_kits[lane].pads[36].path, "media/added.wav", "the kit came back empty");
-            assert_eq!(app.drumpad_lane, lane, "the panel's lane was lost");
+            assert_eq!(app.kit_at(lane).pads[36].path, "media/added.wav", "the kit came back empty");
+            assert_eq!(app.drumpad_lane(), lane, "the panel's lane was lost");
             let _ = std::fs::remove_dir_all(&root);
         });
     }

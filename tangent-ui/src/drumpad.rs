@@ -67,6 +67,11 @@ const TRACK_KITS: &str = "track_kits";
 /// identity.
 const PRIMARY_TRACK: &str = "primary_track";
 
+/// **Every track's kit, by the track** (design 4: "Kits become
+/// `BTreeMap<TrackId, DrumpadDoc>`"): what the app holds in memory. A track
+/// with no entry has the empty kit.
+pub type TrackKits = std::collections::BTreeMap<crate::desk_id::TrackId, DrumpadDoc>;
+
 /// One pad's slot in the document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PadSlot {
@@ -312,6 +317,47 @@ impl DrumpadDoc {
         ids.into_iter().zip(kits).filter(|(_, k)| !k.is_empty()).collect()
     }
 
+    /// **Every kit the desk's rows hold, keyed by TRACK**: the form the app
+    /// keeps in memory (W4-lane-refs), read through
+    /// [`Self::load_all_beside_ids`] against the rows `ids`, with the
+    /// panel's track when the file named one this desk holds.
+    ///
+    /// Keyed by identity so that nothing ever has to carry a kit: a reorder
+    /// moves rows, and a kit stays on its track because nothing about the
+    /// track changed. The lane-indexed `Vec` this replaces had to be
+    /// permuted by every structural edit, and the edit that forgot was a
+    /// drum track playing the kit of whatever row it landed on.
+    pub fn load_track_kits(
+        doc: &std::path::Path,
+        ids: &[crate::desk_id::TrackId],
+        legacy_lane: Option<usize>,
+    ) -> (TrackKits, Option<crate::desk_id::TrackId>) {
+        let (kits, primary) = Self::load_all_beside_ids(doc, ids, legacy_lane);
+        (Self::keyed(ids, kits), primary.and_then(|lane| ids.get(lane).copied()))
+    }
+
+    /// **Lane-ordered kits into the map**: `kits[lane]` is the kit of the
+    /// track `ids[lane]`. A kit equal to the empty one is left out, the
+    /// map's one rule, so "no kit" has a single spelling (no entry) and two
+    /// maps holding the same kits are the same map.
+    pub fn keyed(ids: &[crate::desk_id::TrackId], kits: Vec<Self>) -> TrackKits {
+        let empty = Self::default();
+        ids.iter().copied().zip(kits).filter(|(_, k)| *k != empty).collect()
+    }
+
+    /// **Do two maps hold the same kits?** An entry that IS the empty kit
+    /// and no entry at all mean the same thing - a track whose panel was
+    /// opened and left as it was holds one - so they compare equal here
+    /// where `==` on the maps would call them different.
+    pub fn same_tracks(a: &TrackKits, b: &TrackKits) -> bool {
+        let empty = Self::default();
+        a.keys().chain(b.keys()).all(|id| match (a.get(id), b.get(id)) {
+            (Some(x), Some(y)) => x == y,
+            (Some(one), None) | (None, Some(one)) => *one == empty,
+            (None, None) => true,
+        })
+    }
+
     /// **Every lane's kit into the one sidecar**, its lanes read as ids by
     /// the identity rule. The host's road until it holds the desk's ids;
     /// the app writes through [`Self::save_all_beside_ids`].
@@ -344,8 +390,51 @@ impl DrumpadDoc {
         doc: &std::path::Path,
         format: crate::desk_format::Format,
     ) {
+        let by_lane: Vec<&Self> = kits.iter().collect();
+        Self::write_lanes(&by_lane, ids, primary, doc, format);
+    }
+
+    /// **The kits the app holds BY TRACK, into the one sidecar**: the file
+    /// [`Self::save_all_beside_ids`] writes for these rows, each row's kit
+    /// read off the map by the row's id. `primary` is the panel's LANE. A
+    /// kit whose track is on no row is not written, the writer's rule: the
+    /// desk says which tracks exist, and a map can outlive a row only until
+    /// an undo brings it back, which brings its kit back with it.
+    pub fn save_track_kits(
+        kits: &TrackKits,
+        ids: &[crate::desk_id::TrackId],
+        primary: usize,
+        doc: &std::path::Path,
+    ) {
+        Self::save_track_kits_as(kits, ids, primary, doc, crate::desk_format::Format::current());
+    }
+
+    /// [`Self::save_track_kits`] in `format`: the rows in lane order, a row
+    /// with no entry carrying the empty kit, which neither writer writes.
+    pub(crate) fn save_track_kits_as(
+        kits: &TrackKits,
+        ids: &[crate::desk_id::TrackId],
+        primary: usize,
+        doc: &std::path::Path,
+        format: crate::desk_format::Format,
+    ) {
+        let empty = Self::default();
+        let by_lane: Vec<&Self> = ids.iter().map(|id| kits.get(id).unwrap_or(&empty)).collect();
+        Self::write_lanes(&by_lane, ids, primary, doc, format);
+    }
+
+    /// The one writer under both forms: `kits[lane]` is the kit of the
+    /// track `ids[lane]`, borrowed, so a map's kits are written without a
+    /// clone each.
+    fn write_lanes(
+        kits: &[&Self],
+        ids: &[crate::desk_id::TrackId],
+        primary: usize,
+        doc: &std::path::Path,
+        format: crate::desk_format::Format,
+    ) {
         if format == crate::desk_format::Format::Legacy {
-            Self::save_all_beside_legacy(kits, primary, doc);
+            Self::write_legacy(kits, primary, doc);
             return;
         }
         let mut track_kits = Map::new();
@@ -366,16 +455,23 @@ impl DrumpadDoc {
         crate::settings::write_atomic(&path, text.as_bytes());
     }
 
+    /// The legacy writer over owned kits, for the tests that pin its bytes.
+    #[cfg(test)]
+    fn save_all_beside_legacy(kits: &[Self], primary: usize, doc: &std::path::Path) {
+        let by_lane: Vec<&Self> = kits.iter().collect();
+        Self::write_legacy(&by_lane, primary, doc);
+    }
+
     /// Today's bytes: the primary kit at the top level for a pre-lanes
     /// build, `lane_kits` by lane, `primary_lane`.
-    fn save_all_beside_legacy(kits: &[Self], primary: usize, doc: &std::path::Path) {
+    fn write_legacy(kits: &[&Self], primary: usize, doc: &std::path::Path) {
         // The kit's map straight into the root. This used to pretty-print
         // each kit to text and parse it back into a `Value` — 128 pads
         // through the printer and the parser per kit per save — to arrive
         // at the map `to_value` builds in the first place. Byte-identical
         // output: `the_sidecar_is_written_as_it_always_was` builds the file
         // the old way and compares.
-        let mut root = kits.get(primary).map(Self::to_value).unwrap_or_default();
+        let mut root = kits.get(primary).map(|k| k.to_value()).unwrap_or_default();
         root.insert("primary_lane".into(), Value::from(primary as u64));
         let mut lane_kits = Map::new();
         for (lane, kit) in kits.iter().enumerate() {
@@ -834,35 +930,60 @@ impl DrumpadDoc {
     pub fn compact_all(kits: &[Self]) -> String {
         let mut root = Map::new();
         for (lane, kit) in kits.iter().enumerate() {
-            if kit.is_empty() && (kit.master - 1.0).abs() < f32::EPSILON {
-                continue;
+            if let Some(k) = kit.compact_one() {
+                root.insert(lane.to_string(), k);
             }
-            let mut k = Map::new();
-            k.insert("master".into(), Value::from(f64::from(kit.master)));
-            let mut pads = Map::new();
-            for (key, pad) in kit.pads.iter().enumerate() {
-                if pad.path.is_empty() {
-                    continue;
-                }
-                let mut m = pad.extra.clone();
-                m.insert("path".into(), Value::from(pad.path.clone()));
-                m.insert("name".into(), Value::from(pad.name.clone()));
-                m.insert("gain".into(), Value::from(f64::from(pad.params.gain)));
-                m.insert("pan".into(), Value::from(f64::from(pad.params.pan)));
-                m.insert("tune".into(), Value::from(f64::from(pad.params.tune)));
-                m.insert("choke".into(), Value::from(u64::from(pad.params.choke)));
-                m.insert("obey".into(), Value::from(pad.params.obey));
-                m.insert(
-                    "trim_start".into(),
-                    Value::from(f64::from(pad.params.trim_start)),
-                );
-                m.insert("trim_end".into(), Value::from(f64::from(pad.params.trim_end)));
-                pads.insert(key.to_string(), Value::Object(m));
-            }
-            k.insert("pads".into(), Value::Object(pads));
-            root.insert(lane.to_string(), Value::Object(k));
         }
         serde_json::to_string(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// **Every TRACK's kit, compactly**: [`Self::compact_all`]'s form keyed
+    /// by the track (`"t<id>"`, the desk grammar) rather than by the lane, in
+    /// id order. What the undo timeline keeps now that the app holds its
+    /// kits by identity: a moment's kits and its desk's ids are restored
+    /// together, so each kit lands on its own track whatever rows moved
+    /// between the moment and the undo. The lane form stays for the tests
+    /// that pin it and for anybody holding kits by lane.
+    pub fn compact_tracks(kits: &TrackKits) -> String {
+        let mut root = Map::new();
+        for (id, kit) in kits {
+            if let Some(k) = kit.compact_one() {
+                root.insert(id.to_string(), k);
+            }
+        }
+        serde_json::to_string(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// One kit's compact object, or `None` for a kit the compaction leaves
+    /// out: no pad holding anything and the fader at unity.
+    fn compact_one(&self) -> Option<Value> {
+        if self.is_empty() && (self.master - 1.0).abs() < f32::EPSILON {
+            return None;
+        }
+        let mut k = Map::new();
+        k.insert("master".into(), Value::from(f64::from(self.master)));
+        let mut pads = Map::new();
+        for (key, pad) in self.pads.iter().enumerate() {
+            if pad.path.is_empty() {
+                continue;
+            }
+            let mut m = pad.extra.clone();
+            m.insert("path".into(), Value::from(pad.path.clone()));
+            m.insert("name".into(), Value::from(pad.name.clone()));
+            m.insert("gain".into(), Value::from(f64::from(pad.params.gain)));
+            m.insert("pan".into(), Value::from(f64::from(pad.params.pan)));
+            m.insert("tune".into(), Value::from(f64::from(pad.params.tune)));
+            m.insert("choke".into(), Value::from(u64::from(pad.params.choke)));
+            m.insert("obey".into(), Value::from(pad.params.obey));
+            m.insert(
+                "trim_start".into(),
+                Value::from(f64::from(pad.params.trim_start)),
+            );
+            m.insert("trim_end".into(), Value::from(f64::from(pad.params.trim_end)));
+            pads.insert(key.to_string(), Value::Object(m));
+        }
+        k.insert("pads".into(), Value::Object(pads));
+        Some(Value::Object(k))
     }
 
     /// **The kits into a [`Fingerprint`]**, walking beside `compact_all`.
@@ -878,33 +999,49 @@ impl DrumpadDoc {
     /// number. Two numbers is two things to keep in step.
     pub fn hash_all_into(kits: &[Self], f: &mut Fingerprint) {
         for (lane, kit) in kits.iter().enumerate() {
-            if kit.is_empty() && (kit.master - 1.0).abs() < f32::EPSILON {
+            kit.hash_one_into(lane, f);
+        }
+    }
+
+    /// **The TRACKS' kits into a [`Fingerprint`]**, walking beside
+    /// [`Self::compact_tracks`] exactly as [`Self::hash_all_into`] walks
+    /// beside the lane form: id order, the id framing each kit where the
+    /// lane did.
+    pub fn hash_tracks_into(kits: &TrackKits, f: &mut Fingerprint) {
+        for (id, kit) in kits {
+            kit.hash_one_into(id.0 as usize, f);
+        }
+    }
+
+    /// One kit's run, framed by `key` (its lane, or its track's id), or
+    /// nothing for a kit the compaction leaves out.
+    fn hash_one_into(&self, key: usize, f: &mut Fingerprint) {
+        if self.is_empty() && (self.master - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        // The kit's own number and its pad COUNT frame the run, so "lane 0
+        // holding two pads" cannot read as two lanes holding one.
+        f.len(key);
+        f.f64(f64::from(self.master));
+        f.len(self.pads.iter().filter(|p| !p.path.is_empty()).count());
+        for (pad_key, pad) in self.pads.iter().enumerate() {
+            if pad.path.is_empty() {
                 continue;
             }
-            // The lane's own number and its pad COUNT frame the run, so
-            // "lane 0 holding two pads" cannot read as two lanes holding one.
-            f.len(lane);
-            f.f64(f64::from(kit.master));
-            f.len(kit.pads.iter().filter(|p| !p.path.is_empty()).count());
-            for (key, pad) in kit.pads.iter().enumerate() {
-                if pad.path.is_empty() {
-                    continue;
-                }
-                f.len(key);
-                // The strangers FIRST, because that is the order the
-                // compaction builds the object in — `preserve_order` makes
-                // that order part of the text.
-                f.map(&pad.extra);
-                f.str(&pad.path);
-                f.str(&pad.name);
-                f.f64(f64::from(pad.params.gain));
-                f.f64(f64::from(pad.params.pan));
-                f.f64(f64::from(pad.params.tune));
-                f.u64(u64::from(pad.params.choke));
-                f.bool(pad.params.obey);
-                f.f64(f64::from(pad.params.trim_start));
-                f.f64(f64::from(pad.params.trim_end));
-            }
+            f.len(pad_key);
+            // The strangers FIRST, because that is the order the
+            // compaction builds the object in — `preserve_order` makes
+            // that order part of the text.
+            f.map(&pad.extra);
+            f.str(&pad.path);
+            f.str(&pad.name);
+            f.f64(f64::from(pad.params.gain));
+            f.f64(f64::from(pad.params.pan));
+            f.f64(f64::from(pad.params.tune));
+            f.u64(u64::from(pad.params.choke));
+            f.bool(pad.params.obey);
+            f.f64(f64::from(pad.params.trim_start));
+            f.f64(f64::from(pad.params.trim_end));
         }
     }
 
@@ -920,54 +1057,75 @@ impl DrumpadDoc {
                 continue;
             }
             let Some(k) = v.as_object() else { continue };
-            if let Some(m) = k.get("master").and_then(Value::as_f64) {
-                out[lane].master = m as f32;
-            }
-            let Some(Value::Object(pads)) = k.get("pads") else { continue };
-            for (pk, pv) in pads {
-                let Ok(idx) = pk.parse::<usize>() else { continue };
-                if idx >= DRUM_PADS {
-                    continue;
-                }
-                let Some(o) = pv.as_object() else { continue };
-                let num = |n: &str, d: f32| {
-                    o.get(n).and_then(Value::as_f64).map_or(d, |x| x as f32)
-                };
-                let mut params = DrumPadParams {
-                    gain: num("gain", 1.0),
-                    pan: num("pan", 0.0),
-                    tune: num("tune", 0.0),
-                    trim_start: num("trim_start", 0.0),
-                    trim_end: num("trim_end", 1.0),
-                    ..DrumPadParams::default()
-                };
-                if let Some(c) = o.get("choke").and_then(Value::as_u64) {
-                    params.choke = c as u8;
-                }
-                if let Some(b) = o.get("obey").and_then(Value::as_bool) {
-                    params.obey = b;
-                }
-                let mut extra = o.clone();
-                for k in PAD_KEYS {
-                    extra.shift_remove(k);
-                }
-                out[lane].pads[idx] = PadSlot {
-                    path: o
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    name: o
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    params,
-                    extra,
-                };
-            }
+            out[lane].fill_compact(k);
         }
         out
+    }
+
+    /// **[`Self::compact_tracks`]' inverse**: the map back, a key that is not
+    /// a canonical track id (`t3`, never `t03` or `3`) skipped. Unreadable
+    /// text is no kits at all, never a panic.
+    pub fn from_compact_tracks(text: &str) -> TrackKits {
+        let mut out = TrackKits::new();
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(text) else {
+            return out;
+        };
+        for (key, v) in &root {
+            let Ok(id) = key.parse::<crate::desk_id::TrackId>() else { continue };
+            let Some(k) = v.as_object() else { continue };
+            out.entry(id).or_default().fill_compact(k);
+        }
+        out
+    }
+
+    /// One compact kit object into this (default) kit.
+    fn fill_compact(&mut self, k: &Map<String, Value>) {
+        if let Some(m) = k.get("master").and_then(Value::as_f64) {
+            self.master = m as f32;
+        }
+        let Some(Value::Object(pads)) = k.get("pads") else { return };
+        for (pk, pv) in pads {
+            let Ok(idx) = pk.parse::<usize>() else { continue };
+            if idx >= DRUM_PADS {
+                continue;
+            }
+            let Some(o) = pv.as_object() else { continue };
+            let num = |n: &str, d: f32| {
+                o.get(n).and_then(Value::as_f64).map_or(d, |x| x as f32)
+            };
+            let mut params = DrumPadParams {
+                gain: num("gain", 1.0),
+                pan: num("pan", 0.0),
+                tune: num("tune", 0.0),
+                trim_start: num("trim_start", 0.0),
+                trim_end: num("trim_end", 1.0),
+                ..DrumPadParams::default()
+            };
+            if let Some(c) = o.get("choke").and_then(Value::as_u64) {
+                params.choke = c as u8;
+            }
+            if let Some(b) = o.get("obey").and_then(Value::as_bool) {
+                params.obey = b;
+            }
+            let mut extra = o.clone();
+            for k in PAD_KEYS {
+                extra.shift_remove(k);
+            }
+            self.pads[idx] = PadSlot {
+                path: o
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: o
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                params,
+                extra,
+            };
+        }
     }
 }
 
