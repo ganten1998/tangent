@@ -20686,9 +20686,13 @@ fn unpack_tap(w: u64) -> Option<(usize, usize)> {
     Some(((w & 0xffff_ffff) as usize, ((w >> 32) & 0xff) as usize))
 }
 
-/// The seat field of [`pack_aim`]: 23 bits, past every seat the spine can
-/// have (`seat_space(MAX_ROWS)` is under 600,000). A seat that does not fit
-/// is stored as all ones, which no rack answers to.
+/// The seat field of [`pack_aim`]: 23 bits, past every lane seat the spine
+/// can have (`seat_space(MAX_ROWS)` is under 600,000) and every sparse pad
+/// seat of a lane below slot 60,927 (`pad_seat`: 128 a lane past
+/// `PAD_SEAT_BASE`, W7-slot-gaps). A seat that does not fit is stored as all
+/// ones, which no rack answers to: the tap cannot be aimed at a pad of a
+/// lane that far out, and draws nothing there. The other three fields fill
+/// the word, so widening this one is a new word, not a wider field.
 const AIM_SEAT: u64 = (1 << 23) - 1;
 
 /// **The host's aim, with the generation it was made for**: seat (23 bits),
