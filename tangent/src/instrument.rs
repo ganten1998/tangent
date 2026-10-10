@@ -409,9 +409,11 @@ const PAD_CHANNEL: u8 = 9;
 /// zero while its replacement starts clean. ~5 ms at 48 kHz.
 const PAD_STEAL_FRAMES: f32 = 256.0;
 
-/// Pad strikes carried into one chunk. Sixteen pads struck twice inside one
-/// 512-frame block is flams on every pad at once; more than this is a MIDI
-/// file being dumped, and the surplus lands at the top of the next chunk.
+/// Pad strikes ONE KIT carries into one chunk (`PadBank::hits`). Sixteen pads
+/// struck twice inside one 512-frame block is flams on every pad at once;
+/// more than this is a MIDI file being dumped, and the surplus lands at the
+/// top of the next chunk. Per kit, so fifty drum lanes striking together
+/// each strike.
 const MAX_PAD_HITS_PER_BLOCK: usize = 32;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -6812,6 +6814,16 @@ pub struct PadBank {
     gain: f32,
     pdc: DelayLine,
     dry_pdc: DelayLine,
+    /// **This kit's strikes this chunk**, live and clip both, in the order
+    /// they were collected, and its note-offs for the pads that obey them.
+    /// The kit's own, bought with the bank (design 7.1: a lane holds what
+    /// its own hand touches): they were one list for the whole desk, of
+    /// [`MAX_PAD_HITS_PER_BLOCK`], so fifty drum lanes striking together lost
+    /// every strike past the thirty-second, and those kits were silent in
+    /// the file. A kit still holds thirty-two a chunk, which is every pad
+    /// of a kit struck twice.
+    hits: Vec<PadHit>,
+    offs: Vec<PadHit>,
 }
 
 impl PadBank {
@@ -6821,6 +6833,8 @@ impl PadBank {
             gain: 1.0,
             pdc: DelayLine::new(),
             dry_pdc: DelayLine::new(),
+            hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
+            offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
         }
     }
 
@@ -6830,6 +6844,17 @@ impl PadBank {
             v.silence();
         }
     }
+}
+
+/// **The pad bank of the lane at `slot`**: `None` for a slot with no lane,
+/// or a lane that is not a drum lane.
+fn kit_bank(lanes: &mut [Option<Box<Lane>>], slot: usize) -> Option<&mut PadBank> {
+    lanes.get_mut(slot)?.as_deref_mut()?.body_mut().pads.as_deref_mut()
+}
+
+/// [`kit_bank`], read.
+fn kit_bank_ref(lanes: &[Option<Box<Lane>>], slot: usize) -> Option<&PadBank> {
+    lanes.get(slot)?.as_deref()?.peek().pads.as_deref()
 }
 
 /// Whether lane `ch` holds a kit with anything loaded: what decides if
@@ -9686,10 +9711,6 @@ struct Renderer {
     preview_retiring: Producer<Option<Arc<tangent_record::decode::Clip>>>,
     preview: Option<Arc<tangent_record::decode::Clip>>,
     preview_pos: usize,
-    /// This chunk's strikes, filled by `collect_notes` beside the note list.
-    pad_hits: Vec<PadHit>,
-    /// Note-OFFS for pads that obey them, same frame offsets.
-    pad_offs: Vec<PadHit>,
     dx7_incoming: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     dx7_retiring: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     keys_incoming: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
@@ -10702,8 +10723,14 @@ impl Renderer {
         self.note_lanes.clear();
         self.controls.clear();
         self.control_lanes.clear();
-        self.pad_hits.clear();
-        self.pad_offs.clear();
+        // Every kit's strikes are this chunk's from here: each kit keeps its
+        // own (`PadBank::hits`).
+        for lane in self.spine.lanes.iter_mut().flatten() {
+            if let Some(bank) = lane.body_mut().pads.as_deref_mut() {
+                bank.hits.clear();
+                bank.offs.clear();
+            }
+        }
         // **The desk's routing table, read ONCE per block.**
         //
         // Two loads per channel however many messages arrive, and the
@@ -10814,9 +10841,6 @@ impl Renderer {
                         // through a release while another's chokes on it.
                         for &lane in &self.spine.ext.drum_live {
                             let lane = lane as usize;
-                            if self.pad_offs.len() >= self.pad_offs.capacity() {
-                                break;
-                            }
                             // The same routing rule the notes answer to: a
                             // drum track that named its own pad controller
                             // must not be struck by somebody else's.
@@ -10829,18 +10853,31 @@ impl Renderer {
                             {
                                 continue;
                             }
-                            self.pad_offs.push(PadHit {
-                                offset,
-                                pad,
-                                velocity: 0.0,
-                                lane,
-                            });
+                            // Into the kit's OWN releases, which hold their
+                            // own count: a full one costs this kit its
+                            // release and no other kit theirs.
+                            let Some(bank) = kit_bank(&mut self.spine.lanes, lane) else {
+                                continue;
+                            };
+                            if bank.offs.len() < bank.offs.capacity() {
+                                bank.offs.push(PadHit {
+                                    offset,
+                                    pad,
+                                    velocity: 0.0,
+                                    lane,
+                                });
+                            }
                         }
                     }
                 } else if event.status & 0xF0 == 0x90 && velocity != 0 {
-                    if self.pad_hits.len() == self.pad_hits.capacity() {
-                        // Full. Hold it for the next chunk, exactly as the
-                        // note list does two branches down.
+                    // **A kit that is full holds the strike for the next
+                    // chunk**, exactly as the note list does two branches
+                    // down: all of it, for every kit, so no kit plays a
+                    // strike another kit was made to wait for.
+                    let full = self.spine.ext.drum_live.iter().any(|&lane| {
+                        kit_bank_ref(&self.spine.lanes, lane as usize).is_some_and(|b| b.hits.len() >= b.hits.capacity())
+                    });
+                    if full {
                         self.pending = Some(event);
                         break;
                     }
@@ -10852,18 +10889,17 @@ impl Renderer {
                         // else on this desk.
                         for &lane in &self.spine.ext.drum_live {
                             let lane = lane as usize;
-                            if self.pad_hits.len() >= self.pad_hits.capacity() {
-                                break;
-                            }
                             if !self.spine.ext.midi_routes.get(lane).is_some_and(|r| reach.reaches(*r)) {
                                 continue;
                             }
-                            self.pad_hits.push(PadHit {
-                                offset,
-                                pad,
-                                velocity: f32::from(velocity) / 127.0,
-                                lane,
-                            });
+                            if let Some(bank) = kit_bank(&mut self.spine.lanes, lane) {
+                                bank.hits.push(PadHit {
+                                    offset,
+                                    pad,
+                                    velocity: f32::from(velocity) / 127.0,
+                                    lane,
+                                });
+                            }
                         }
                     }
                 }
@@ -14365,15 +14401,13 @@ impl Renderer {
         // an empty map at block rate. `swap_plugins` sets it, because a
         // rack's contents change nowhere else.
         let any_rack = seat_rack(&self.racks, &self.spine.lanes, Strip::Drums.index()).is_some_and(|r| !r.is_empty()) || self.pad_racks_live;
-        if self.pad_hits.is_empty()
-            && self.pad_offs.is_empty()
-            && !self
-                .spine
-                .lanes
-                .iter()
-                .flatten()
-                .filter_map(|l| l.peek().pads.as_deref())
-                .any(|bank| bank.voices.iter().any(PadVoice::active))
+        if !self
+            .spine
+            .lanes
+            .iter()
+            .flatten()
+            .filter_map(|l| l.peek().pads.as_deref())
+            .any(|bank| !bank.hits.is_empty() || !bank.offs.is_empty() || bank.voices.iter().any(PadVoice::active))
             && !any_rack
         {
             // **The kit's fader advances even while the kit is silent.**
@@ -14581,9 +14615,11 @@ impl Renderer {
             // release sharing a frame with the next strike must fade the
             // voice that ENDED, never the one just born. The hits ran
             // first once, and every legato note on an obeying pad choked.
-            for h in &self.pad_offs {
-                // This lane's releases only: another kit's note-off has
-                // nothing to say about this kit's voice for the same pad.
+            // This kit's own releases (`PadBank::offs`): another kit's
+            // note-off has nothing to say about this kit's voice for the
+            // same pad. By index, beside the voices they release.
+            for i in 0..bank.offs.len() {
+                let h = bank.offs[i];
                 if h.offset != f as i32 || h.lane != lane_ix {
                     continue;
                 }
@@ -14594,7 +14630,8 @@ impl Renderer {
             // The strikes that land on this frame: whoever shares the choke
             // group fades, the struck pad starts clean. The group is read at
             // the strike, so moving a knob never cuts a voice already gone.
-            for h in &self.pad_hits {
+            for i in 0..bank.hits.len() {
+                let h = bank.hits[i];
                 if h.offset != f as i32 || h.lane != lane_ix {
                     continue;
                 }
@@ -16254,26 +16291,28 @@ impl Renderer {
                         if key < PAD_BASE || pad >= PADS {
                             continue;
                         }
+                        // THIS lane's kit — the clip is on it — and its own
+                        // strikes, which no other drum lane's fill.
+                        let Some(bank) = lane.pads.as_deref_mut() else {
+                            break;
+                        };
                         if !n.on {
                             // Pads are one-shots — unless this one OBEYS
                             // note-offs, where the release fades the voice.
-                            if obey[pad >> 6] & (1u64 << (pad & 63)) != 0
-                                && self.pad_offs.len() < self.pad_offs.capacity()
-                            {
-                                self.pad_offs.push(PadHit {
+                            if obey[pad >> 6] & (1u64 << (pad & 63)) != 0 && bank.offs.len() < bank.offs.capacity() {
+                                bank.offs.push(PadHit {
                                     offset: n.offset,
                                     pad,
                                     velocity: 0.0,
-                                    // THIS lane's kit — the clip is on it.
                                     lane: ch,
                                 });
                             }
                             continue;
                         }
-                        if self.pad_hits.len() == self.pad_hits.capacity() {
+                        if bank.hits.len() == bank.hits.capacity() {
                             break;
                         }
-                        self.pad_hits.push(PadHit {
+                        bank.hits.push(PadHit {
                             offset: n.offset,
                             pad,
                             velocity: n.velocity,
@@ -19667,8 +19706,6 @@ impl Engine {
             preview_retiring,
             preview: None,
             preview_pos: 0,
-            pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
-            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             dx7_incoming,
             dx7_retiring,
             keys_incoming,
@@ -26468,8 +26505,6 @@ mod tests {
             preview_retiring: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).0,
             preview: None,
             preview_pos: 0,
-            pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
-            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -40802,5 +40837,315 @@ mod memory_inputs {
         assert_eq!(took.len(), want.len(), "the take is not as long as the input");
         assert!(took == want, "the take is not input 40, sample for sample");
         assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+    }
+
+    /// Bytes of a four-second stereo ring at `RATE`: what one capture ring
+    /// held, and what one lane's column of the stem ring held.
+    const RING: usize = 4 * RATE as usize * 2 * 4;
+
+    /// **Idle stem and capture memory stays flat as lanes are added**, and
+    /// is measured, not estimated (W5, done when; design 7.12).
+    ///
+    /// The rings an engine holds are read off their own capacities: none on
+    /// a fresh engine, none after two hundred and fifty-six lanes more, and
+    /// once armed, one pick's ring and a two-slot tap cost the same on the
+    /// wide desk as on the narrow one. Counted beside that: what building
+    /// the lanes asks the allocator for, per lane, is far under the four
+    /// seconds of stereo each lane's stem column used to cost in a ring
+    /// held from the first block, and what building an engine asks for is
+    /// under the thirty-two capture rings and the thirty-two-lane stem ring
+    /// it used to hold before anything was armed.
+    #[test]
+    fn idle_stem_and_capture_memory_stays_flat_as_lanes_are_added() {
+        let (_, built) = crate::rt_alloc::count_bytes(|| Engine::offline(RATE, Timebase::new()).expect("an engine"));
+        assert!(built < 64 * RING, "an engine asked for {built} bytes, a ring per input and a lane's worth of stems");
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an engine");
+        assert_eq!((e.capture_ring_bytes(), e.stem_ring_bytes()), (0, 0), "an idle engine holds a ring");
+        const MORE: usize = 256;
+        let fresh: Vec<(Slot, LaneSpec)> = (CHANNELS..CHANNELS + MORE).map(|s| (Slot(s as u32), audio())).collect();
+        let (_, bytes) = crate::rt_alloc::count_bytes(|| e.install_lanes(fresh).expect("the lanes install"));
+        e.settle_offline();
+        assert!(bytes / MORE < RING / 2, "a lane asked for {} bytes, a stem ring's column of them", bytes / MORE);
+        assert_eq!((e.capture_ring_bytes(), e.stem_ring_bytes()), (0, 0), "idle memory moved with the lanes");
+        let wide = CHANNELS + MORE - 1;
+        e.sync_capture_rings(&[PickId(wide as u32)]).expect("a ring");
+        e.arm_stems(&[Slot(3), Slot(wide as u32)]);
+        let mut narrow = Engine::offline(RATE, Timebase::new()).expect("an engine");
+        narrow.sync_capture_rings(&[PickId(3)]).expect("a ring");
+        narrow.arm_stems(&[Slot(3), Slot(4)]);
+        assert_eq!(
+            (e.capture_ring_bytes(), e.stem_ring_bytes()),
+            (narrow.capture_ring_bytes(), narrow.stem_ring_bytes()),
+            "armed memory is not the armed things' alone"
+        );
+        assert_eq!(e.capture_ring_bytes(), capture_ring_frames(RATE) * TAP_CHANNELS * 4);
+        assert_eq!(e.stem_ring_bytes(), 2 * capture_ring_frames(RATE) * TAP_CHANNELS * 4);
+    }
+
+    /// **A capture ring is never smaller than the graph's quantum** (W5,
+    /// done when; the capture-ring law): at every rate the engine opens,
+    /// the ring holds at least two of the largest callback the engine runs
+    /// and two of every smaller quantum, so one callback can never push more
+    /// than the ring can hold before the host drains it. And the ring an
+    /// armed pick is given is that size.
+    #[test]
+    fn a_capture_ring_is_never_smaller_than_the_graph_quantum() {
+        for rate in [8_000u32, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000, 768_000] {
+            let frames = capture_ring_frames(rate);
+            let mut quantum = 32usize;
+            while quantum <= MAX_CALLBACK_FRAMES {
+                assert!(frames >= 2 * quantum, "at {rate} Hz a ring of {frames} frames is under two quanta of {quantum}");
+                quantum *= 2;
+            }
+            assert!(frames >= 4 * rate as usize, "at {rate} Hz the ring is under four seconds");
+        }
+        let mut e = Engine::offline(8_000, Timebase::new()).expect("an engine");
+        e.sync_capture_rings(&[PickId(0)]).expect("a ring");
+        assert!(e.capture_ring_bytes() >= 2 * MAX_CALLBACK_FRAMES * TAP_CHANNELS * 4, "the ring built is not the law's");
+    }
+
+    /// A noise clip on `slot`, for its lane's generation.
+    fn clip_on(e: &Engine, slot: usize, seed: u32) -> SlotPlaced {
+        let clip = crate::render_golden::noise(0.5, seed);
+        let len = clip.frames() as u64;
+        SlotPlaced {
+            slot: Slot(slot as u32),
+            gen: e.lane_gen(Slot(slot as u32)).expect("a lane"),
+            placed: Placed { clip, strip: 0, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 },
+        }
+    }
+
+    /// Every stem the tap gives over `blocks` blocks, rolling from zero.
+    fn stems_of(e: &mut Engine, blocks: usize) -> Vec<f32> {
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let mut stems = Vec::new();
+        for _ in 0..blocks {
+            e.render_offline(&mut out);
+            e.drain_stems(&mut stems);
+        }
+        stems
+    }
+
+    /// One slot's stereo stem out of a drained tap.
+    fn stem(e: &Engine, stems: &[f32], slot: usize) -> Vec<f32> {
+        let wide = e.stem_frame_width();
+        let col = e.stem_column(Slot(slot as u32)).expect("the tap carries the slot");
+        (0..stems.len() / wide).flat_map(|f| [stems[f * wide + col * 2], stems[f * wide + col * 2 + 1]]).collect()
+    }
+
+    /// **The stem tap carries the slots it was armed for, and nothing
+    /// else, in the order it was armed** (design 7.12: the stem ring is
+    /// built at arm time for the armed slots). Armed for three of two
+    /// hundred lanes, out of slot order, a frame is six floats, and each
+    /// slot's pair is bit for bit the column the whole-desk tap gives it.
+    #[test]
+    fn the_stem_tap_carries_only_the_slots_it_was_armed_for() {
+        const LANES: usize = 200;
+        let picked = [199usize, 3, 150];
+        let render = |armed: Option<&[usize]>| {
+            let mut e = engine_with(LANES, audio(), LaneFlags::MIDI_OFF);
+            let clips = picked.iter().zip([0x11u32, 0x22, 0x33]).map(|(s, seed)| clip_on(&e, *s, seed)).collect();
+            e.set_clips_slotted(clips);
+            match armed {
+                Some(slots) => e.arm_stems(&slots.iter().map(|s| Slot(*s as u32)).collect::<Vec<_>>()),
+                None => e.set_stems(true),
+            }
+            let stems = stems_of(&mut e, 6);
+            (e, stems)
+        };
+        let (whole, all) = render(None);
+        let (only, few) = render(Some(&picked));
+        assert_eq!(only.stem_frame_width(), picked.len() * 2, "a frame is not the armed slots' alone");
+        assert_eq!(only.stem_ring_bytes() * whole.stem_frame_width(), whole.stem_ring_bytes() * picked.len() * 2);
+        for slot in picked {
+            let mine = stem(&only, &few, slot);
+            assert!(mine.iter().any(|v| *v != 0.0), "slot {slot}'s stem is silent");
+            assert!(mine == stem(&whole, &all, slot), "slot {slot}'s stem is not the whole desk tap's column");
+        }
+    }
+
+    /// **A hundred and twenty stems are written under names that sort in
+    /// desk order** (W5, done when: "a 120-stem export writes 3-digit names
+    /// that sort"). A hundred and twenty lanes, each with a clip, the tap
+    /// armed for every one through the export's own door, each stem written
+    /// by the WAV writer under `stem_file_name`, and the folder listed:
+    /// sorted by name it is the desk's order. At two digits the hundredth
+    /// sorted between the tenth and the eleventh.
+    #[test]
+    fn a_hundred_and_twenty_stems_are_written_under_names_that_sort() {
+        const LANES: usize = 120;
+        let mut e = engine_with(LANES, audio(), LaneFlags::MIDI_OFF);
+        let clips = (0..LANES).map(|s| clip_on(&e, s, 0x100 + s as u32)).collect();
+        e.set_clips_slotted(clips);
+        let slots: Vec<Slot> = (0..LANES as u32).map(Slot).collect();
+        crate::desktop::arm_stem_tap(&e, true, &slots, false);
+        let stems = stems_of(&mut e, 3);
+        let dir = std::env::temp_dir().join(format!("tangent-w5-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the stems folder");
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: RATE,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::from_unix(0, 0), spec);
+        let mut written = Vec::new();
+        for row in 0..LANES {
+            let name = crate::desktop::stem_file_name(row, " Lane ");
+            let mut w = tangent_record::wav::WavWriter::create(&dir.join(&name), spec, &bext).expect("a stem");
+            let own = stem(&e, &stems, row);
+            assert!(own.iter().any(|v| *v != 0.0), "row {row}'s stem is silent");
+            w.write_interleaved(&own).expect("written");
+            w.finish().expect("closed");
+            written.push(name);
+        }
+        let mut listed: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the folder")
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().into_owned())
+            .collect();
+        listed.sort();
+        assert_eq!(listed, written, "the stems do not sort in desk order");
+        assert_eq!((listed[0].as_str(), listed[99].as_str()), ("001-Lane.wav", "100-Lane.wav"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kit whose pad 0 is a held DC level of `v`, a second long.
+    fn kit_of(v: f32) -> PadKit {
+        let mut kit = PadKit::default();
+        kit.pads[0] = Some(Arc::new(tangent_record::decode::Clip {
+            samples: vec![v; RATE as usize * 2],
+            rate: RATE,
+            source: PathBuf::new(),
+        }));
+        kit
+    }
+
+    /// **Every drum lane's kit reaches an offline engine, at fifty drum
+    /// lanes** (W5, done when: "the third-kit-exported-silent test runs at
+    /// 50 drum lanes"; `every_drum_lanes_kit_reaches_an_offline_engine` is
+    /// its thirty-two-lane original, kept). An export furnishes every lane's
+    /// kit in one pass before a block plays, and a ring of two kits once
+    /// dropped the third onward, silently, in the file. Through the slot
+    /// API, as the bridge furnishes it: fifty drum lanes, each its own kit
+    /// by `Attach`, each struck by a clip on its own lane, and each lane's
+    /// own stem carries its own kit's level and nobody else's.
+    #[test]
+    fn every_drum_lanes_kit_reaches_an_offline_engine_at_fifty_lanes() {
+        const LANES: usize = 50;
+        let drum = LaneSpec { kind: LaneKind::Midi, drum: true };
+        let mut e = engine_with(LANES, drum, LaneFlags::DRUM);
+        let level = |s: usize| (s + 1) as f32 / 128.0;
+        for s in 0..LANES {
+            let slot = Slot(s as u32);
+            let gen = e.lane_gen(slot).expect("a lane");
+            e.attach(slot, gen, LanePart::Kit(Box::new(kit_of(level(s))))).expect("the kit goes");
+            e.settle_offline();
+        }
+        let strikes = (0..LANES)
+            .map(|s| SlotPlacedMidi {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane"),
+                placed: PlacedMidi {
+                    strip: s,
+                    start: 0,
+                    len: u64::from(RATE),
+                    notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+                    pedal: Arc::new(Vec::new()),
+                },
+            })
+            .collect();
+        e.set_midi_slotted(strikes);
+        let slots: Vec<Slot> = (0..LANES as u32).map(Slot).collect();
+        e.arm_stems(&slots);
+        let stems = stems_of(&mut e, 4);
+        assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0, "a kit was refused");
+        let peak = |s: usize| stem(&e, &stems, s).iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let first = peak(0);
+        assert!(first > 0.0, "the first drum lane is silent");
+        for s in 1..LANES {
+            let ratio = peak(s) / first;
+            assert!(
+                (ratio - (s + 1) as f32).abs() < 1e-3 * (s + 1) as f32,
+                "drum lane {s} of {LANES} peaked at {} against the first's {first}: its kit never arrived, or another's did",
+                peak(s)
+            );
+        }
+    }
+
+    /// **A monitor layout and the capture rings swap with nothing allocated
+    /// on the callback, at every width** (W5, done when: "`rt_alloc` covers
+    /// MonitorPlan and capture-ring swaps"), 33, 65, 200 and 1000 lanes: a
+    /// layout of a pick per lane arriving, rings for picks across several
+    /// flag words arriving (the pick table growing past its first slots
+    /// through a Grow), the tee writing, the layout reordered under the
+    /// take, and the rings going home. The farthest pick's take is the
+    /// input it reads.
+    #[test]
+    fn layouts_and_capture_rings_swap_without_allocating_at_every_width() {
+        const DEV: usize = 8;
+        for lanes in [33usize, 65, 200, 1000] {
+            let mut e = engine_with(lanes, audio(), LaneFlags::ARMED | LaneFlags::MIDI_OFF);
+            let far = lanes - 1;
+            // Picks across the flag words where the desk has them: the first,
+            // either side of the first word's edge, and the farthest.
+            let armed = |i: usize| [0, 63, 64, far].contains(&i) && i < lanes;
+            let mut rows: Vec<InputRow> = (0..lanes)
+                .map(|i| InputRow {
+                    id: TrackId(i as u32),
+                    audio: true,
+                    spec: Some(ChannelPick::Mono((i % DEV) as u16)),
+                    armed: armed(i),
+                })
+                .collect();
+            let stream = InputStream { device_channels: Some(DEV), picks: Picks::EVERYTHING };
+            let mut table = PickTable::default();
+            table.bind(&rows, &stream);
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..4 {
+                e.render_offline(&mut out);
+            }
+            let (mut tx, rx) = RingBuffer::<f32>::new(DEV * BLOCK * 8);
+            let feed = |tx: &mut Producer<f32>| {
+                let block = device_block(DEV, BLOCK);
+                let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+            };
+            e.set_monitor(Some((rx, DEV as u16, vec![DEV as u8].into_boxed_slice(), BLOCK as u32, Picks::EVERYTHING)));
+            feed(&mut tx);
+            assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: a ring arriving allocated");
+            e.set_monitor_inputs(&table.monitor(lane_of(&e)), &Picks::EVERYTHING);
+            feed(&mut tx);
+            assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: a layout of {lanes} picks arriving allocated");
+            let picks = table.armed(&rows);
+            assert_eq!(picks.len(), (0..lanes).filter(|i| armed(*i)).count(), "{lanes}: an armed pick has no ring");
+            e.sync_capture_rings(&picks).expect("the armed picks' rings");
+            e.set_capturing(&picks);
+            feed(&mut tx);
+            assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: the rings arriving under their flags allocated");
+            let mut took = Vec::new();
+            let far_pick = table.pick_of(TrackId(far as u32)).expect("the far track's pick");
+            for b in 0..4 {
+                if b == 2 {
+                    rows.reverse();
+                    table.bind(&rows, &stream);
+                    e.set_monitor_inputs(&table.monitor(lane_of(&e)), &Picks::EVERYTHING);
+                }
+                feed(&mut tx);
+                assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: block {b} of the take allocated");
+                e.drain_capture(far_pick, &mut took);
+            }
+            assert_eq!(table.pick_of(TrackId(far as u32)), Some(far_pick), "a reorder moved the far pick");
+            assert!(!took.is_empty() && took.iter().all(|v| *v == level(far % DEV)), "{lanes}: the far pick's take is not its input");
+            e.set_capturing(&[]);
+            e.sync_capture_rings(&[]).expect("the rings go home");
+            assert_eq!(counted(&mut e, &mut out), 0, "{lanes}: the rings going home allocated");
+            e.retire_tick();
+            e.sync_capture_rings(&[]).expect("home");
+            assert_eq!(e.capture_ring_bytes(), 0, "{lanes}: a ring stayed");
+            assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0, "{lanes}: an op was refused");
+            assert_eq!(e.capture_dropped(), 0);
+        }
     }
 }
