@@ -22442,30 +22442,6 @@ impl Engine {
         max.saturating_sub(r.spine.ext.folder_lat.get(lane).copied().unwrap_or(0))
     }
 
-    /// **Spread this offline engine's lanes over the other cores.**
-    ///
-    /// `Engine::offline` builds no pool, and the reason written here used
-    /// to be that "an export has no deadline and wants every core for the
-    /// render it is already running flat out". **It was not running flat
-    /// out.** Measured on 96 hosted reverbs at the exporter's own 512-frame
-    /// blocks: 13.11 s of wall for twelve seconds of audio against 13.32 s
-    /// of CPU, which is 1.0 cores. With this on, the same render is 3.79 s
-    /// on 17.96 s of CPU - 3.5x, for threads the app already knows how to
-    /// start.
-    ///
-    /// **No real-time plan**, deliberately: see [`LanePool::new`]. A bounce
-    /// must not outrank the user interface or a device that is still open,
-    /// and it has no deadline it could miss anyway.
-    ///
-    /// The fold sums lanes in ascending order whether or not the render was
-    /// forked, so the audio is bit-identical either way -
-    /// `the_fork_renders_what_the_single_walk_rendered` holds exactly that,
-    /// and `an_exported_file_is_the_same_whether_or_not_it_forked` holds it
-    /// for a whole file.
-    /// **Let a post-fork level fork, or not** (design 7.8): its live nodes
-    /// through the same pool, on the same gate, as the lane render. On by
-    /// default. The sums are added in one serial order either way, so this
-    /// changes no bit, and the tests that hold that are why it is a switch.
     /// **Let idle lanes rest, or walk every lane every chunk** (design
     /// W7-scale-and-budgets: the active list). On by default. Resting changes
     /// no bit, and the tests that hold that are why it is a switch; the
@@ -22516,6 +22492,10 @@ impl Engine {
         })
     }
 
+    /// **Let a post-fork level fork, or not** (design 7.8): its live nodes
+    /// through the same pool, on the same gate, as the lane render. On by
+    /// default. The sums are added in one serial order either way, so this
+    /// changes no bit, and the tests that hold that are why it is a switch.
     #[cfg_attr(not(test), allow(dead_code, reason = "the level fork's off switch, for the bit-exactness tests and a bench"))]
     pub fn set_level_fork(&mut self, on: bool) {
         if let Some(r) = self.offline.as_mut() {
@@ -22536,6 +22516,26 @@ impl Engine {
         r.fanout_any = peers > 0;
     }
 
+    /// **Spread this offline engine's lanes over the other cores.**
+    ///
+    /// `Engine::offline` builds no pool, and the reason written here used
+    /// to be that "an export has no deadline and wants every core for the
+    /// render it is already running flat out". **It was not running flat
+    /// out.** Measured on 96 hosted reverbs at the exporter's own 512-frame
+    /// blocks: 13.11 s of wall for twelve seconds of audio against 13.32 s
+    /// of CPU, which is 1.0 cores. With this on, the same render is 3.79 s
+    /// on 17.96 s of CPU - 3.5x, for threads the app already knows how to
+    /// start.
+    ///
+    /// **No real-time plan**, deliberately: see [`LanePool::new`]. A bounce
+    /// must not outrank the user interface or a device that is still open,
+    /// and it has no deadline it could miss anyway.
+    ///
+    /// The fold sums lanes in ascending order whether or not the render was
+    /// forked, so the audio is bit-identical either way -
+    /// `the_fork_renders_what_the_single_walk_rendered` holds exactly that,
+    /// and `an_exported_file_is_the_same_whether_or_not_it_forked` holds it
+    /// for a whole file.
     pub fn set_offline_fanout(&mut self, on: bool) {
         let Some(r) = self.offline.as_mut() else {
             return;
