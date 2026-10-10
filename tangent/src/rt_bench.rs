@@ -3533,3 +3533,129 @@ fn rt_bench() {
     println!("\ndeadline at 128 frames / 48 kHz: {DEADLINE_US:.1} us per block");
     println!("(64 frames = {:.1} us, 256 frames = {:.1} us)", DEADLINE_US / 2.0, DEADLINE_US * 2.0);
 }
+
+/// **A desk built through the slot API, as the bridge builds one**: `lanes`
+/// lanes (the legacy thirty-two and as many installed past them), nothing
+/// armed and nothing listening, a noise clip on each of `clipped`, and the
+/// plan `shape` makes of them, rolling. The shim words cannot say a bus or a
+/// send, so the post-fork rungs are built here.
+fn slot_desk(lanes: usize, clipped: &[usize], shape: impl FnOnce(&mut crate::desk_plan::PlanInputs)) -> Engine {
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::instrument::{LaneKind, LaneSpec, SlotPlaced};
+    let mut e = Engine::offline_sized(RATE, Timebase::new(), lanes.max(32)).expect("an offline engine needs no device");
+    e.set_armed(0);
+    e.set_midi_off(u64::MAX);
+    e.set_desk(&quiet_desk());
+    let fresh: Vec<(Slot, LaneSpec)> =
+        (32..lanes).map(|s| (Slot(s as u32), LaneSpec { kind: LaneKind::Audio, drum: false })).collect();
+    if !fresh.is_empty() {
+        e.install_lanes(fresh).expect("the lanes install");
+    }
+    e.settle_offline();
+    let mut inputs = PlanInputs {
+        lanes: (0..lanes)
+            .map(|s| InLane {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                flags: LaneFlags::MIDI_OFF,
+                parent: None,
+                punch: None,
+                midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                pick: None,
+            })
+            .collect(),
+        ..PlanInputs::default()
+    };
+    shape(&mut inputs);
+    e.publish_plan(&inputs).expect("the plan goes");
+    let clip = noise(12.0);
+    let len = clip.frames() as u64;
+    e.set_clips_slotted(
+        clipped
+            .iter()
+            .map(|&s| SlotPlaced {
+                slot: Slot(s as u32),
+                gen: e.lane_gen(Slot(s as u32)).expect("a lane"),
+                placed: Placed { clip: Arc::clone(&clip), strip: 0, start: 0, offset: 0, len, fade_in: 0, fade_out: 0, gain: 0.5 },
+            })
+            .collect(),
+    );
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    grain_from_env(&e);
+    e
+}
+
+/// `unit` into bay `bay` of lane `slot`'s rack `rack`.
+fn seat_at(e: &mut Engine, slot: usize, rack: u16, bay: usize, unit: &str) {
+    use crate::instrument::{RackAddr, RackOwner};
+    let addr = RackAddr { owner: RackOwner::Lane(crate::desk_plan::Slot(slot as u32)), rack };
+    e.load_insert_at(addr, bay, Some(Path::new(unit)), None)
+        .unwrap_or_else(|err| panic!("{unit} did not load into lane {slot}: {err}"))
+        .unwrap_or_else(|| panic!("{unit} loaded but the bay reports no tenant"));
+}
+
+/// **The post-fork rungs** (design 11.8, measured and never asserted in
+/// time): fifty returns, each a bus with a plate fed by its own track's
+/// send, and twenty-five folders side by side, each holding two tracks with
+/// [EQ, comp, plate] in its bays; each with the lanes forked and the levels
+/// walked, then forked. W7-scale-and-budgets reads these against the
+/// deadline; the rows are here so the desks the level fork is for have a
+/// bench to be read on.
+///
+/// ```text
+/// cargo test --release -p tangent --bin tangent -- bus_and_folder_rungs --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a bench: run it deliberately with --ignored --nocapture"]
+fn bus_and_folder_rungs() {
+    use crate::desk_plan::{InSend, LaneFlags, SendFrom, SendTo, Slot};
+    println!(
+        "\nTangent post-fork rungs: {BLOCK} frames at {RATE} Hz, deadline {DEADLINE_US:.0} us\n"
+    );
+    let returns = |level_fork: bool| {
+        let tracks: Vec<usize> = (0..50).collect();
+        let mut e = slot_desk(100, &tracks, |p| {
+            for b in 50..100 {
+                p.lanes[b].flags = LaneFlags::BUS | LaneFlags::MIDI_OFF;
+            }
+            p.sends = (0..50)
+                .map(|k| InSend { from: SendFrom::Lane(Slot(k)), to: SendTo::Lane(Slot(50 + k)), level: 0.5, pre: false })
+                .collect();
+        });
+        for b in 50..100 {
+            seat_at(&mut e, b, 0, 0, PLATE_PATH);
+        }
+        e.set_offline_fanout(true);
+        e.set_level_fork(level_fork);
+        e
+    };
+    let folders = |level_fork: bool| {
+        let tracks: Vec<usize> = (0..75).collect();
+        let mut e = slot_desk(75, &tracks, |p| {
+            for f in 0..25u32 {
+                let at = (f * 3) as usize;
+                p.lanes[at + 1].parent = Some(Slot(f * 3));
+                p.lanes[at + 2].parent = Some(Slot(f * 3));
+            }
+        });
+        for f in 0..25 {
+            for (bay, unit) in [EQ_PATH, COMP_PATH, PLATE_PATH].into_iter().enumerate() {
+                seat_at(&mut e, f * 3, 0, bay, unit);
+            }
+        }
+        e.set_offline_fanout(true);
+        e.set_level_fork(level_fork);
+        e
+    };
+    for (name, build) in [
+        ("50 returns x plate", &returns as &dyn Fn(bool) -> Engine),
+        ("25 folders x [EQ, comp, plate]", &folders as &dyn Fn(bool) -> Engine),
+    ] {
+        for level_fork in [false, true] {
+            let mut e = build(level_fork);
+            let label = format!("{name}, levels {}", if level_fork { "forked" } else { "walked" });
+            measure(&label, &mut e, WARMUP, BLOCK);
+        }
+    }
+}
