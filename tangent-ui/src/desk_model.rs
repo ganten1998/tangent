@@ -194,6 +194,31 @@ pub fn take_send(sends: &mut Vec<Send>, to: Node, pre: bool) -> bool {
     before != sends.len()
 }
 
+/// **The desk's buses and returns, by identity**: every row whose kind is a
+/// bus. What [`bus_sends`] judges a send against, gathered once for a walk
+/// over many strips.
+pub fn buses_of(rows: &[TrackRow]) -> BTreeSet<TrackId> {
+    rows.iter().filter(|r| r.kind == Some(RowKind::Bus)).map(|r| r.id).collect()
+}
+
+/// **A strip's sends to buses**, in the order they were made: each of
+/// `sends` aimed at a track in `buses` ([`buses_of`]).
+///
+/// **The one rule for what a send to a bus is** (design 9: only a bus row
+/// takes a send), and both sides of the seam read it: the app offers, draws
+/// and counts a strip's sends by it (`TangentApp::strip_bus_sends`), and the
+/// bridge plays them by it (`Bridge::read_sends`). The app used to count any
+/// send aimed at a track while the bridge played only those whose track was
+/// a bus, so a send aimed at a track that is no bus was drawn on its strip,
+/// listed in the routing window, offered a curve and counted towards the
+/// +N chip, and heard nowhere. Such a send is legal in a format-2 file (the
+/// reader keeps whatever row a send names, and the row may be made a bus
+/// again), so it stays in the file; by this rule it is neither shown nor
+/// played. The effects return's entry, the knob, is no send to a bus.
+pub fn bus_sends<'a>(sends: &'a [Send], buses: &'a BTreeSet<TrackId>) -> impl Iterator<Item = &'a Send> + 'a {
+    sends.iter().filter(move |x| x.to.track().is_some_and(|t| buses.contains(&t)))
+}
+
 /// The DX7's cartridge and patch on one row. `cart` is a path, empty for
 /// the bank that ships: `strip_dx7_cartridge`'s own convention.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

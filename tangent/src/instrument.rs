@@ -9022,19 +9022,29 @@ impl CurveOwners<'_> {
 }
 
 /// **One send's level, as a curve** (design 9: send automation works per
-/// return). A send of the plan's is named by its two ends, as the plan names
-/// it, and its curve's points are read as that send's level, 0..1, whatever
-/// the curve's own `lane` and `param` say. `gen` is the source lane's
-/// generation, checked at use (design 7.5): a curve drawn for a lane that has
-/// gone plays on nobody. The drum bus and the click have none and ignore it.
-/// **`AutoParam::Send` stays the Fx send**: it rides the lane's own curves
-/// and drives the strip's Return 0 entries (or its knob, with none), and
-/// wins over a curve here naming one of those entries, as it would over the
-/// knob; `AutoParam::SendTo` is what W7 maps onto these.
+/// return). A send of the plan's is named by its two ends and its side of
+/// the fader, as the plan names it, and its curve's points are read as that
+/// send's level, 0..1, whatever the curve's own `lane` and `param` say. `gen`
+/// is the source lane's generation, checked at use (design 7.5): a curve
+/// drawn for a lane that has gone plays on nobody. The drum bus and the
+/// click have none and ignore it. **`AutoParam::Send` stays the Fx send**:
+/// it rides the lane's own curves and drives the strip's Return 0 entries
+/// (or its knob, with none), and wins over a curve here naming one of those
+/// entries, as it would over the knob; `AutoParam::SendTo` is what the
+/// bridge maps onto these (`Bridge::send_curves`).
+///
+/// **`pre` is part of the name.** A strip can send to one bus from both
+/// sides of its fader (a file can say so; no gesture makes one), and those
+/// are two sends with one pair of ends. The app's curve belongs to ONE of
+/// them, the post-fader send (`AutoParam::SendTo`: a pre-fader send is a cue
+/// feed and has no curve), so a curve named by its ends alone rode its twin
+/// too and took the cue mix down with the send it was drawn on.
 #[derive(Clone, Debug)]
 pub struct SendCurve {
     pub from: crate::desk_plan::SendFrom,
     pub to: crate::desk_plan::SendTo,
+    /// Which side of the fader the send this curve drives is on.
+    pub pre: bool,
     pub gen: u32,
     pub curve: tangent_ui::automation::Curve,
 }
@@ -19374,8 +19384,10 @@ impl Renderer {
     /// **Each send's curve, onto the send it names in the plan playing**
     /// (`SendTable::auto`), at this chunk's position: a send with no curve
     /// reads its gains cell, as a knob nobody automated reads its own. Found
-    /// by the send's two ends, so whichever plan plays, the curve finds its
-    /// send; a curve for a lane of another generation is skipped.
+    /// by the send's two ends and its side of the fader, so whichever plan
+    /// plays, the curve finds its send and never that send's twin on the
+    /// fader's other side ([`SendCurve::pre`]); a curve for a lane of another
+    /// generation is skipped.
     fn resolve_send_curves(&mut self, at: u64) {
         if !self.send_curves_retiring.is_full() {
             if let Ok(next) = self.send_curves_incoming.pop() {
@@ -19399,11 +19411,15 @@ impl Renderer {
             }
             let Some(v) = c.curve.value_at(secs) else { continue };
             let ends = crate::desk_plan::send_key(c.from, c.to);
-            let (by_ends, auto) = (&self.plan.sends.by_ends, &mut self.plan.sends.auto);
+            let (by_ends, sends, auto) = (&self.plan.sends.by_ends, &self.plan.sends.sends, &mut self.plan.sends.auto);
             let first = by_ends.partition_point(|&(f, t, _)| (f, t) < ends);
             for &(f, t, i) in &by_ends[first..] {
                 if (f, t) != ends {
                     break;
+                }
+                // Its own side of the fader only: the twin is another send.
+                if sends.get(i as usize).is_none_or(|s| s.pre != c.pre) {
+                    continue;
                 }
                 if let Some(cell) = auto.get_mut(i as usize) {
                     *cell = Some(v as f32);
@@ -23741,9 +23757,11 @@ impl Engine {
         self.shared.drum_strips.store(mask, Ordering::Relaxed);
     }
 
-    /// What the aligners are currently aiming at, in frames.
+    /// What the aligners are currently aiming at, in frames: read by the
+    /// width suite (`slot_gaps`) too, which holds what a bus that looks
+    /// ahead does to the desk's alignment through the bridge.
     #[cfg(test)]
-    fn published_max_latency_for_test(&self) -> u32 {
+    pub(crate) fn published_max_latency_for_test(&self) -> u32 {
         self.shared.max_latency.load(Ordering::Relaxed)
     }
 
@@ -42311,6 +42329,7 @@ mod slot_engine {
                     e.set_send_curves(vec![SendCurve {
                         from: SendFrom::Lane(Slot(0)),
                         to: SendTo::Lane(Slot(40)),
+                        pre: false,
                         gen,
                         curve: ramp(),
                     }])
@@ -42332,6 +42351,45 @@ mod slot_engine {
             assert!((end_c - end_p).abs() < 1e-3 * end_p.max(1e-9) + 1e-7, "the curved send did not end at full: {end_c} against {end_p}");
             let (stale, _) = render(Some(1));
             assert_eq!(bits(&stale), bits(&no_curve_40), "a curve for another generation played");
+        }
+
+        /// **A send's curve drives its own side of the fader and never its
+        /// twin** (W7-join: `SendCurve::pre`). Lane 0 sends to bus 40 from
+        /// both sides of its fader, a pre-fader cue at a half and a
+        /// post-fader send at full, and a curve holds one of them at nothing.
+        /// The bus then hears exactly the other alone, bit for bit: the plan
+        /// with the curved send's own level at nothing. Named by its two ends
+        /// only, the curve took both sends down and the bus fell silent.
+        #[test]
+        fn a_send_curve_drives_its_own_side_of_the_fader_and_never_its_twin() {
+            use tangent_ui::automation::{AutoParam, Curve, Point, Shape};
+            let render = |levels: (f32, f32), curve_pre: Option<bool>| -> Vec<u32> {
+                let mut e = wide(42);
+                let mut inputs = bus_plan(&e, 42, &[40]);
+                inputs.sends = vec![send(0, 40, levels.0, true), send(0, 40, levels.1, false)];
+                e.publish_plan(&inputs).expect("the plan goes");
+                if let Some(pre) = curve_pre {
+                    let gen = e.lane_gen(Slot(0)).expect("a lane");
+                    let nothing = |at_s| Point { at_s, value: 0.0, shape: Shape::Hold };
+                    e.set_send_curves(vec![SendCurve {
+                        from: SendFrom::Lane(Slot(0)),
+                        to: SendTo::Lane(Slot(40)),
+                        pre,
+                        gen,
+                        curve: Curve::sanitised(0, AutoParam::Send, vec![nothing(0.0), nothing(30.0)]),
+                    }])
+                    .expect("the curves go");
+                }
+                e.set_clips_slotted(vec![clip_at(&e, 0, 0x7a7a)]);
+                let (_, stems) = roll(&mut e, 10);
+                bits(&column(&stems, e.stem_frame_width() / 2, 40))
+            };
+            let post_curved = render((0.5, 1.0), Some(false));
+            assert!(post_curved.iter().any(|v| f32::from_bits(*v) != 0.0), "the post-fader send's curve silenced the cue beside it");
+            assert_eq!(post_curved, render((0.5, 0.0), None), "the post-fader send's curve is not the post-fader send at nothing");
+            let pre_curved = render((0.5, 1.0), Some(true));
+            assert_eq!(pre_curved, render((0.0, 1.0), None), "the pre-fader send's curve is not the pre-fader send at nothing");
+            assert_ne!(pre_curved, post_curved, "fixture: the two sides sound alike");
         }
 
         /// One impulse at frame `at`, then silence, both sides.
