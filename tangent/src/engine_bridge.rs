@@ -42,7 +42,7 @@ use tangent_ui::desk_legacy::{
 use tangent_ui::recorder::{ChannelKind, Desk, MidiRoute};
 use tangent_ui::routing::Target;
 
-use crate::desk_plan::{InKey, InLane, InRoute, LaneFlags, PlanInputs, RouteEnd, Slot, SpecialFlags};
+use crate::desk_plan::{InKey, InLane, InRoute, LaneFlags, PickId, PlanInputs, RouteEnd, Slot, SpecialFlags};
 use crate::desktop::{
     arm_stem_tap, effect_params_from, export_clip_placement, furnish_mirror_bay, is_instrument_sentinel,
     keys_patch_of, leaf_of, mirror_sampler_samples,
@@ -349,9 +349,19 @@ pub fn full_build_with(
     // The chips' answer, through the one place either road turns a spec
     // into the engine's two atomics. See `arm_stem_tap`. A freeze taps
     // its lane wet; the probe taps nothing.
+    // **Armed for the lanes the pass writes and no others** (design 7.12:
+    // the stem ring is built at arm time, for the armed slots): each stem
+    // row's lane, or the frozen track's.
     match &build {
-        BuildFor::Export(spec) => arm_stem_tap(&e, spec.stems, spec.stems_dry),
-        BuildFor::Freeze(_) => arm_stem_tap(&e, true, false),
+        BuildFor::Export(spec) => {
+            let slots: Vec<Slot> =
+                stem_files(app).iter().filter_map(|(row, _)| bridge.lane(*row)).map(|l| l.slot).collect();
+            arm_stem_tap(&e, spec.stems, &slots, spec.stems_dry);
+        }
+        BuildFor::Freeze(_) => {
+            let slots: Vec<Slot> = freeze.and_then(|row| bridge.lane(row)).map(|l| l.slot).into_iter().collect();
+            arm_stem_tap(&e, true, &slots, false);
+        }
         BuildFor::Probe => {}
     }
     // Everything sent lands before the first block: an offline engine has
@@ -364,8 +374,8 @@ pub fn full_build_with(
 /// only the rows with something to SAY - clips, or an instrument in a bay
 /// (the DX7, the drumpad, an SD3 following the transport). A kind with
 /// neither is an armed input that renders silence offline, and a folder of
-/// silent WAVs reads as a bug. `NN-<track name>.wav`, the name made safe for
-/// a file system. The caller binds each row to its lane through the bridge
+/// silent WAVs reads as a bug. `NNN-<track name>.wav` (`stem_file_name`),
+/// the name made safe for a file system. The caller binds each row to its lane through the bridge
 /// at the press (design 7.13: stems bind `(slot, gen)` at the press).
 pub fn stem_files(app: &TangentApp) -> Vec<(usize, String)> {
     let clips = &app.arrangement().clips;
@@ -379,7 +389,7 @@ pub fn stem_files(app: &TangentApp) -> Vec<(usize, String)> {
                 .chars()
                 .map(|c| if std::path::is_separator(c) { '-' } else { c })
                 .collect();
-            (row, format!("{:02}-{}.wav", row + 1, name.trim()))
+            (row, crate::desktop::stem_file_name(row, &name))
         })
         .collect()
 }
@@ -637,6 +647,10 @@ pub struct Bridge {
     /// built ONCE a frame.
     desk: Desk,
     stats: BridgeStats,
+    /// **Which input each audio track takes, by identity**: see
+    /// [`PickTable`] and [`Self::sync_inputs`]. Kept across a new engine,
+    /// because a pick is the track's and not the engine's.
+    picks: PickTable,
     /// A test's ask to run an offline engine's removals through the live
     /// two-phase road (RETIRING, then home), which an offline engine skips.
     #[cfg(test)]
@@ -1302,6 +1316,319 @@ fn structure(inputs: &PlanInputs) -> PlanInputs {
     s
 }
 
+// ── the inputs: which device input each audio track takes ─────────────────
+//
+// W5-engine-memory-inputs (design 7.12, 7.13 and A5). The app names a
+// track's input by the track ("3", "1+2"); the stream takes them as a list
+// of picks; the engine's monitor and its capture tee know a pick by its
+// place in that list. This is the one place the three meet.
+
+/// **The input stream as the host has it open this frame**: how wide the
+/// device is (`None`: no device), and the picks it was opened with, as
+/// asked. The device fits them (`Picks::fitted`), and so does
+/// [`PickTable::bind`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputStream {
+    pub device_channels: Option<usize>,
+    pub picks: tangent_record::audio::Picks,
+}
+
+/// **One row of the desk as the pick table reads it**, in row order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputRow {
+    pub id: TrackId,
+    /// An AUDIO track: the only kind with an input.
+    pub audio: bool,
+    /// The input it names, when it names one (`TangentApp::parse_input_spec`).
+    pub spec: Option<tangent_record::audio::ChannelPick>,
+    /// R lit: its pick is owed a capture ring (design 7.12).
+    pub armed: bool,
+}
+
+/// **The desk's rows, for [`PickTable::bind`]**: each row's track, whether
+/// it is an audio track, the input it names and its arm.
+pub fn input_rows(app: &TangentApp) -> Vec<InputRow> {
+    app.track_ids()
+        .iter()
+        .enumerate()
+        .map(|(row, id)| InputRow {
+            id: *id,
+            audio: app.channel_kind(row) == Some(ChannelKind::Audio),
+            spec: TangentApp::parse_input_spec(app.channel_input_spec(row)).map(|(a, b)| match b {
+                Some(b) => tangent_record::audio::ChannelPick::Stereo(a, b),
+                None => tangent_record::audio::ChannelPick::Mono(a),
+            }),
+            armed: row_armed(app, row),
+        })
+        .collect()
+}
+
+/// **One pick of this frame**, by its place: the track it feeds (if any),
+/// the input it reads, and that input's columns on the open device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PickEntry {
+    pub pick: PickId,
+    pub track: Option<TrackId>,
+    /// The device input it reads. `None` with a width is the whole device
+    /// taken as one input (a stream that never named an input); `None`
+    /// without one reads nothing.
+    pub from: Option<tangent_record::audio::ChannelPick>,
+    /// Device columns read: 1, 2, the device's width for the whole device,
+    /// or 0 for nothing (no device, or an input the device does not have).
+    pub width: u8,
+    /// The device columns of its left and right (a mono input's twice).
+    pub cols: [u16; 2],
+}
+
+/// **Which input each audio track takes, by identity** (contract C9's
+/// `PickTable`; design 7.13 and A5).
+///
+/// **Explicit**, once any audio track names its own input: each track that
+/// names one holds a `PickId` from the moment it first does, the lowest one
+/// free, and keeps it for as long as it names one. So a reorder, an insert
+/// above, a removal elsewhere or a second track bound moves no pick: the
+/// capture ring a record is writing is never another track's, and the stream
+/// is never reopened for a change of shape (its picks are listed by `PickId`,
+/// which a reorder does not change). A track that names none takes nothing.
+///
+/// **Ordinal**, for a desk that never named an input: the k-th audio row
+/// takes pick k of the stream as it was opened (the band's input and the
+/// ones beside it), exactly as it always has.
+///
+/// **Held**: a pick a running record took at its press keeps the input it
+/// was reading and is given to no other track until the record lets it go,
+/// whatever happens to its track meanwhile (design A5: the record is bound by
+/// identity).
+#[derive(Clone, Debug, Default)]
+pub struct PickTable {
+    /// Explicit mode: every track that names an input, and its pick.
+    named: BTreeMap<TrackId, PickId>,
+    /// The picks a record holds, with the input each was reading.
+    held: BTreeMap<PickId, Option<tangent_record::audio::ChannelPick>>,
+    /// This frame's answer, by PickId: `picks[p].pick == PickId(p)`.
+    picks: Vec<PickEntry>,
+    explicit: bool,
+}
+
+impl PickTable {
+    /// **This frame's picks**, from the rows in row order and the stream as
+    /// it is open. Allocates per call (a frame's worth, on the host).
+    pub fn bind(&mut self, rows: &[InputRow], stream: &InputStream) {
+        use tangent_record::audio::ChannelPick;
+        self.explicit = rows.iter().any(|r| r.audio && r.spec.is_some());
+        let dev = stream.device_channels.unwrap_or(0);
+        let mut entries: Vec<(Option<TrackId>, Option<ChannelPick>, bool)> = Vec::new();
+        if self.explicit {
+            let wanted: BTreeMap<TrackId, ChannelPick> =
+                rows.iter().filter(|r| r.audio).filter_map(|r| Some((r.id, r.spec?))).collect();
+            // A track that stopped naming an input lets its pick go, unless a
+            // record holds it.
+            self.named.retain(|id, _| wanted.contains_key(id));
+            let mut used: BTreeSet<u32> = self.named.values().map(|p| p.0).collect();
+            used.extend(self.held.keys().map(|p| p.0));
+            // In row order, so a desk bound for the first time numbers its
+            // picks the way it reads (and the way the stream used to list them).
+            for r in rows.iter().filter(|r| r.audio && r.spec.is_some()) {
+                if self.named.contains_key(&r.id) {
+                    continue;
+                }
+                let Some(free) = (0..u32::MAX).find(|p| !used.contains(p)) else { break };
+                if free as usize >= tangent_ui::desk_id::MAX_ROWS {
+                    break;
+                }
+                used.insert(free);
+                self.named.insert(r.id, PickId(free));
+            }
+            let n = used.iter().next_back().map_or(0, |p| *p as usize + 1);
+            entries.resize(n, (None, None, false));
+            for (id, pick) in &self.named {
+                entries[pick.0 as usize] = (Some(*id), wanted.get(id).copied(), false);
+            }
+            // A held pick reads what it read when the record began, and feeds
+            // its track only while the track still names it.
+            for (pick, from) in &self.held {
+                let at = pick.0 as usize;
+                if let Some(e) = entries.get_mut(at) {
+                    let track = e.0.filter(|id| self.named.get(id) == Some(pick));
+                    *e = (track, *from, false);
+                }
+            }
+        } else {
+            // Ordinal: nothing named, nothing kept by name.
+            self.named.clear();
+            let honoured = stream.picks.clone().fitted(dev.max(1));
+            let audio: Vec<TrackId> = rows.iter().filter(|r| r.audio).map(|r| r.id).collect();
+            let stream_n = if honoured.is_empty() { usize::from(dev > 0) } else { honoured.len() };
+            let n = audio.len().max(stream_n);
+            for p in 0..n {
+                let whole = honoured.is_empty() && p == 0 && dev > 0;
+                entries.push((audio.get(p).copied(), honoured.get(p), whole));
+            }
+        }
+        self.picks = entries
+            .into_iter()
+            .enumerate()
+            .map(|(p, (track, from, whole))| {
+                let (width, cols) = pick_columns(from, whole, dev);
+                PickEntry { pick: PickId(p as u32), track, from, width, cols }
+            })
+            .collect();
+    }
+
+    /// **A record takes these picks**: each keeps the input it reads now, and
+    /// none is given to another track, until [`Self::release`].
+    pub fn hold(&mut self, picks: &[PickId]) {
+        for p in picks {
+            let from = self.picks.get(p.0 as usize).and_then(|e| e.from);
+            self.held.insert(*p, from);
+        }
+    }
+
+    /// The record is over: its picks are the desk's again.
+    pub fn release(&mut self, picks: &[PickId]) {
+        for p in picks {
+            self.held.remove(p);
+        }
+    }
+
+    /// **A track's pick**, as of the last [`Self::bind`].
+    pub fn pick_of(&self, id: TrackId) -> Option<PickId> {
+        self.picks.iter().find(|e| e.track == Some(id)).map(|e| e.pick)
+    }
+
+    /// Every pick of the last [`Self::bind`], by PickId.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the pick table's tests"))]
+    pub fn picks(&self) -> &[PickEntry] {
+        &self.picks
+    }
+
+    /// Whether the desk names its inputs (explicit), or takes them by order.
+    #[cfg_attr(not(test), allow(dead_code, reason = "asked by the pick table's tests"))]
+    pub fn explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// **The monitor's layout of these picks**: every pick by PickId, on the
+    /// lane its track has (`lane_of`), with its width and device columns.
+    /// A pick whose track has no lane, or that feeds no track, is bound to
+    /// no lane and still drains.
+    pub fn monitor(&self, lane_of: impl Fn(TrackId) -> Option<LaneAt>) -> Vec<crate::lane_bank::MonitorPick> {
+        use crate::lane_bank::MonitorPick;
+        self.picks
+            .iter()
+            .map(|p| {
+                let (slot, gen) =
+                    p.track.and_then(&lane_of).map_or((Slot(0), MonitorPick::NO_LANE), |l| (l.slot, l.gen));
+                MonitorPick { pick: p.pick, slot, gen, width: p.width, cols: p.cols }
+            })
+            .collect()
+    }
+
+    /// **The picks owed a capture ring**: each armed audio row's pick that
+    /// reads something (design 7.12: capture rings are per ARMED pick). A
+    /// pick that reads nothing has nothing to capture and is owed none.
+    pub fn armed(&self, rows: &[InputRow]) -> Vec<PickId> {
+        rows.iter()
+            .filter(|r| r.audio && r.armed)
+            .filter_map(|r| self.pick_of(r.id))
+            .filter(|p| self.picks.get(p.0 as usize).is_some_and(|e| e.width > 0))
+            .collect()
+    }
+
+    /// **The inputs the stream opens with**, for an explicit desk: every
+    /// named pick's input, in PickId order, so a change of shape never
+    /// changes the list (and so never reopens the stream). Empty for an
+    /// ordinal desk, whose stream is the band's own choice.
+    pub fn stream_picks(&self) -> Vec<tangent_record::audio::ChannelPick> {
+        if !self.explicit {
+            return Vec::new();
+        }
+        self.picks.iter().filter(|e| e.track.is_some()).filter_map(|e| e.from).collect()
+    }
+}
+
+/// **A pick's width and device columns on a `dev`-wide device**: its own
+/// input's channels if the device has them, the first pair of the whole
+/// device for a whole-device pick, nothing otherwise.
+fn pick_columns(from: Option<tangent_record::audio::ChannelPick>, whole: bool, dev: usize) -> (u8, [u16; 2]) {
+    use tangent_record::audio::ChannelPick;
+    let col = |c: u16| if usize::from(c) < dev { Some(c) } else { None };
+    match from {
+        Some(ChannelPick::Mono(a)) => match col(a) {
+            Some(a) => (1, [a, a]),
+            None => (0, [0, 0]),
+        },
+        Some(ChannelPick::Stereo(a, b)) => match (col(a), col(b)) {
+            (Some(a), Some(b)) => (2, [a, b]),
+            _ => (0, [0, 0]),
+        },
+        None if whole && dev > 0 => {
+            let right = u16::try_from(1.min(dev - 1)).unwrap_or(0);
+            (u8::try_from(dev).unwrap_or(u8::MAX), [0, right])
+        }
+        None => (0, [0, 0]),
+    }
+}
+
+impl Bridge {
+    /// **Every audio track's input, once a frame** (C9's `sync_inputs`):
+    /// the pick table bound against this frame's rows and the stream, the
+    /// monitor told every pick by `PickId` with its lane (slot and
+    /// generation) and its device columns, and a capture ring held for every
+    /// armed pick and for no other (design 7.12). Answers the inputs the
+    /// stream should open with (see [`PickTable::stream_picks`]), for the
+    /// host to hand the device selection.
+    pub fn sync_inputs(
+        &mut self,
+        app: &TangentApp,
+        e: &mut Engine,
+        stream: &InputStream,
+    ) -> Vec<tangent_record::audio::ChannelPick> {
+        self.sync_input_rows(&input_rows(app), e, stream)
+    }
+
+    /// [`Self::sync_inputs`] over rows already read: the one road, which the
+    /// app's rows take every frame and a test can drive with rows of its own
+    /// (an arm the app has no keyboard road to, or more rows than a desk of
+    /// today holds).
+    pub fn sync_input_rows(
+        &mut self,
+        rows: &[InputRow],
+        e: &mut Engine,
+        stream: &InputStream,
+    ) -> Vec<tangent_record::audio::ChannelPick> {
+        self.picks.bind(rows, stream);
+        let monitor = self.picks.monitor(|id| self.lane_of(id));
+        let dev = stream.device_channels.unwrap_or(0).max(1);
+        e.set_monitor_inputs(&monitor, &stream.picks.clone().fitted(dev));
+        // Busy waits a frame: the ring is asked for again next frame.
+        let _ = e.sync_capture_rings(&self.picks.armed(rows));
+        self.picks.stream_picks()
+    }
+
+    /// **A track's pick**, as of the last [`Self::sync_inputs`].
+    pub fn pick_of(&self, id: TrackId) -> Option<PickId> {
+        self.picks.pick_of(id)
+    }
+
+    /// The pick table, as of the last [`Self::sync_inputs`].
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the input tests"))]
+    pub fn pick_table(&self) -> &PickTable {
+        &self.picks
+    }
+
+    /// **A record holds these picks** for as long as it runs: see
+    /// [`PickTable::hold`].
+    pub fn hold_picks(&mut self, picks: &[PickId]) {
+        self.picks.hold(picks);
+    }
+
+    /// The record is over. See [`PickTable::release`].
+    pub fn release_picks(&mut self, picks: &[PickId]) {
+        self.picks.release(picks);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,9 +2287,11 @@ mod tests {
                     }
                     continue;
                 }
+                // The lane's own column of a tap armed for the written lanes.
+                let col = e.stem_column(Slot(*lane as u32)).expect("the tap was armed for every written lane");
                 for f in 0..frames {
-                    let l = scratch[f * wide + *lane * 2];
-                    let r = scratch[f * wide + *lane * 2 + 1];
+                    let l = scratch[f * wide + col * 2];
+                    let r = scratch[f * wide + col * 2 + 1];
                     if spec.mono {
                         fold.push((l + r) * 0.5);
                     } else {
@@ -2788,5 +3117,268 @@ mod tests {
         let silent: Vec<&String> = files.iter().filter(|(_, _, loud)| !loud).map(|(n, ..)| n).collect();
         assert!(silent.is_empty(), "these lanes were not heard: {silent:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the inputs: the pick table (W5-engine-memory-inputs) ────────────────
+
+    use tangent_record::audio::{ChannelPick, Picks};
+
+    fn row(id: u32, spec: Option<ChannelPick>, armed: bool) -> InputRow {
+        InputRow { id: TrackId(id), audio: true, spec, armed }
+    }
+
+    fn stream(dev: usize) -> InputStream {
+        InputStream { device_channels: Some(dev), picks: Picks::EVERYTHING }
+    }
+
+    /// Each track's pick, by track.
+    fn picks_of(t: &PickTable, ids: &[u32]) -> Vec<Option<u32>> {
+        ids.iter().map(|id| t.pick_of(TrackId(*id)).map(|p| p.0)).collect()
+    }
+
+    /// **A named input's pick is its track's, through every change of
+    /// shape** (design A5: "an explicit binding gets the lowest free PickId
+    /// and keeps it"). The picks are numbered along the rows once, when the
+    /// desk is first bound, and never again: a permutation, a track inserted
+    /// above, a removal and a new binding each move no pick that stands, a
+    /// new binding takes the lowest one free, and the stream's list of
+    /// inputs, being by pick, does not change under a reorder.
+    #[test]
+    fn a_named_inputs_pick_is_its_tracks_through_every_change_of_shape() {
+        use ChannelPick::{Mono, Stereo};
+        let mut t = PickTable::default();
+        let s = stream(8);
+        // A, B, an audio track naming nothing, D.
+        let mut rows = vec![
+            row(10, Some(Mono(0)), true),
+            row(11, Some(Stereo(2, 3)), false),
+            row(12, None, false),
+            row(13, Some(Mono(4)), false),
+        ];
+        t.bind(&rows, &s);
+        assert!(t.explicit());
+        assert_eq!(picks_of(&t, &[10, 11, 12, 13]), vec![Some(0), Some(1), None, Some(2)]);
+        let listed = t.stream_picks();
+        assert_eq!(listed, vec![Mono(0), Stereo(2, 3), Mono(4)], "the stream's inputs, by pick");
+        // Reversed: nothing moves, not even the stream's list.
+        rows.reverse();
+        t.bind(&rows, &s);
+        assert_eq!(picks_of(&t, &[10, 11, 12, 13]), vec![Some(0), Some(1), None, Some(2)], "a reorder moved a pick");
+        assert_eq!(t.stream_picks(), listed, "a reorder would reopen the stream");
+        // A track inserted above everything, naming an input: the next pick.
+        rows.insert(0, row(14, Some(Mono(7)), false));
+        t.bind(&rows, &s);
+        assert_eq!(picks_of(&t, &[10, 11, 13, 14]), vec![Some(0), Some(1), Some(2), Some(3)]);
+        // B removed: its pick is free, and a hole reads nothing.
+        rows.retain(|r| r.id != TrackId(11));
+        t.bind(&rows, &s);
+        assert_eq!(picks_of(&t, &[10, 13, 14]), vec![Some(0), Some(2), Some(3)], "a removal moved a pick");
+        assert_eq!((t.picks()[1].track, t.picks()[1].width), (None, 0), "a freed pick still reads");
+        // A new binding takes the lowest pick free, which is B's.
+        rows.push(row(15, Some(Mono(5)), false));
+        t.bind(&rows, &s);
+        assert_eq!(picks_of(&t, &[10, 13, 14, 15]), vec![Some(0), Some(2), Some(3), Some(1)]);
+        // Each reads its own columns.
+        let cols = |id: u32| t.picks()[t.pick_of(TrackId(id)).expect("a pick").0 as usize].cols;
+        assert_eq!((cols(10), cols(13), cols(14), cols(15)), ([0, 0], [4, 4], [7, 7], [5, 5]));
+        // An input the device does not have reads nothing, and keeps its pick.
+        rows[0].spec = Some(Mono(9));
+        t.bind(&rows, &s);
+        let p = t.pick_of(TrackId(14)).expect("still bound");
+        assert_eq!((p.0, t.picks()[p.0 as usize].width), (3, 0));
+    }
+
+    /// **A pick a record holds keeps the input it was reading, and goes to
+    /// no other track, until the record lets it go** (design A5: the record
+    /// is bound by identity). Its track removed mid-take, the pick still
+    /// reads its column (the tee keeps writing the take) and feeds no lane;
+    /// a new binding takes another pick. Released, it is free again.
+    #[test]
+    fn a_held_pick_keeps_its_input_and_goes_to_no_other_track() {
+        use ChannelPick::Mono;
+        let mut t = PickTable::default();
+        let s = stream(4);
+        let mut rows = vec![row(1, Some(Mono(2)), true), row(2, Some(Mono(3)), false)];
+        t.bind(&rows, &s);
+        let held = t.pick_of(TrackId(1)).expect("a pick");
+        t.hold(&[held]);
+        rows.remove(0);
+        rows.push(row(3, Some(Mono(1)), false));
+        t.bind(&rows, &s);
+        let e = t.picks()[held.0 as usize];
+        assert_eq!((e.track, e.from, e.width, e.cols), (None, Some(Mono(2)), 1, [2, 2]), "the held pick lost its input");
+        assert_ne!(t.pick_of(TrackId(3)), Some(held), "a held pick was given to another track");
+        t.release(&[held]);
+        rows.push(row(4, Some(Mono(0)), false));
+        t.bind(&rows, &s);
+        assert_eq!(t.pick_of(TrackId(4)), Some(held), "a released pick is not free again");
+    }
+
+    /// **Today's assignment, transcribed** (`push_monitor_settings` at the
+    /// base of this wave): the k-th eligible audio row takes pick k, where
+    /// eligible is every audio row on a desk that names no input, and only
+    /// the rows that name one on a desk where any does; pick k reads the
+    /// stream's k-th honoured pick (or the whole device for a stream of
+    /// none), by the running offset the renderer walked. Answers each
+    /// pick's row, width and two device columns.
+    fn todays_assignment(rows: &[InputRow], s: &InputStream) -> Vec<(usize, u8, [u16; 2])> {
+        let any_explicit = rows.iter().any(|r| r.audio && r.spec.is_some());
+        let dev = s.device_channels.unwrap_or(0);
+        let chosen: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.audio && (!any_explicit || r.spec.is_some()))
+            .map(|(i, _)| i)
+            .take(32)
+            .collect();
+        let stream_picks = if any_explicit {
+            Picks::from_slice(&chosen.iter().filter_map(|i| rows[*i].spec).collect::<Vec<_>>())
+        } else {
+            s.picks.clone()
+        };
+        let honoured = stream_picks.fitted(dev.max(1));
+        let widths = honoured.widths(dev);
+        let mut offset = 0usize;
+        let ch_in = dev.max(1);
+        chosen
+            .iter()
+            .enumerate()
+            .map(|(k, row)| {
+                let w = widths.get(k).copied().map_or(0, usize::from);
+                let width = if dev == 0 { 0 } else { w.min(ch_in.saturating_sub(offset)) };
+                let at = offset;
+                offset += width;
+                let col = |c: usize| honoured.source(at + c, ch_in).unwrap_or(at + c).min(ch_in - 1) as u16;
+                let cols = if width == 0 { [0, 0] } else { [col(0), col(1.min(width - 1))] };
+                (*row, width as u8, cols)
+            })
+            .collect()
+    }
+
+    /// **With no explicit binding anywhere, every fixture keeps today's
+    /// input assignment** (W5, done when), and a desk that names its inputs,
+    /// bound for the first time, numbers them as today did too. Over every
+    /// settings era and DAW blob in the corpus and a few desks of its own
+    /// (the shipped one, thirty-two audio tracks naming nothing, a desk
+    /// mixing named inputs with NO INPUT rows), against streams of no
+    /// device, a stereo box opened whole, and an eight-input box opened on
+    /// two of its inputs: each pick's track, width and device columns are
+    /// what the walk this replaces gave them.
+    #[test]
+    fn every_fixture_keeps_todays_input_assignment() {
+        use ChannelPick::{Mono, Stereo};
+        let mut desks: Vec<(String, Settings)> = Vec::new();
+        let eras = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/eras");
+        let mut names: Vec<PathBuf> = std::fs::read_dir(&eras)
+            .expect("the era corpus")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                (n.starts_with("settings-") || n.starts_with("daw-")) && n.ends_with(".json")
+            })
+            .collect();
+        names.sort();
+        assert!(names.len() >= 10, "the era corpus shrank to {}", names.len());
+        for path in names {
+            let text = std::fs::read_to_string(&path).expect("a fixture");
+            desks.push((path.display().to_string(), Settings::from_json(&text)));
+        }
+        desks.push(("shipped".to_owned(), Settings::default()));
+        let mut every = blank();
+        kind(&mut every, &(0..CHANNELS).collect::<Vec<_>>(), ChannelKind::Audio);
+        desks.push(("32 audio".to_owned(), every));
+        let mut mixed = blank();
+        kind(&mut mixed, &[0, 2, 3, 5, 9], ChannelKind::Audio);
+        while mixed.channel_inputs.len() < CHANNELS {
+            mixed.channel_inputs.push(String::new());
+        }
+        mixed.channel_inputs[2] = "3".to_owned();
+        mixed.channel_inputs[5] = "0+1".to_owned();
+        mixed.channel_inputs[9] = "7".to_owned();
+        desks.push(("mixed".to_owned(), mixed));
+        let streams = [
+            InputStream { device_channels: None, picks: Picks::EVERYTHING },
+            InputStream { device_channels: Some(2), picks: Picks::EVERYTHING },
+            InputStream { device_channels: Some(8), picks: Picks::from_slice(&[Mono(2), Stereo(4, 5)]) },
+        ];
+        let mut ordinal_desks = 0;
+        for (name, settings) in desks {
+            let app = app_with(settings);
+            let rows = input_rows(&app);
+            if !rows.iter().any(|r| r.audio && r.spec.is_some()) {
+                ordinal_desks += 1;
+            }
+            for s in &streams {
+                let mut t = PickTable::default();
+                t.bind(&rows, s);
+                let today = todays_assignment(&rows, s);
+                // **Where today misread, the columns are not pinned to it.**
+                // A named input the device does not have was dropped from
+                // the stream's list, and every binding after it read the
+                // NEXT one's columns: a track hearing another track's
+                // microphone. Each pick reads its own input now, or nothing.
+                let dev = s.device_channels.unwrap_or(0);
+                let all_fit = rows.iter().filter_map(|r| r.spec).all(|p| p.fits(dev.max(1)));
+                let explicit = rows.iter().any(|r| r.audio && r.spec.is_some());
+                for (k, (r, width, cols)) in today.iter().enumerate() {
+                    let e = t.picks().get(k).unwrap_or_else(|| panic!("{name} on {s:?}: pick {k} is gone"));
+                    assert_eq!(e.track, Some(rows[*r].id), "{name} on {s:?}: pick {k} feeds another track");
+                    if !explicit || all_fit {
+                        assert_eq!((e.width, e.cols), (*width, *cols), "{name} on {s:?}: pick {k} reads other columns");
+                    } else {
+                        let own = rows[*r].spec.expect("a named input");
+                        let want = if dev > 0 && own.fits(dev) { own.channels() as u8 } else { 0 };
+                        assert_eq!(e.width, want, "{name} on {s:?}: pick {k} does not read its own input");
+                    }
+                }
+            }
+        }
+        assert!(ordinal_desks >= 8, "only {ordinal_desks} desks took their inputs by order");
+    }
+
+    /// **The bridge binds every pick to its track's lane and holds a capture
+    /// ring for each armed pick and no other** (design 7.12): rings come
+    /// with the arm and go with it, and a desk with nothing armed holds
+    /// none.
+    #[test]
+    fn the_bridge_rings_the_armed_picks_and_no_others() {
+        let mut s = blank();
+        kind(&mut s, &[1, 2, 3], ChannelKind::Audio);
+        while s.channel_inputs.len() < CHANNELS {
+            s.channel_inputs.push(String::new());
+        }
+        s.channel_inputs[1] = "0".to_owned();
+        s.channel_inputs[2] = "1".to_owned();
+        s.channel_inputs[3] = "1".to_owned();
+        s.channel_armed = Some(1 << 1 | 1 << 3);
+        let app = app_with(s);
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&app, &mut e);
+        let st = stream(2);
+        assert_eq!(e.capture_ring_bytes(), 0, "an engine holds a ring before anything was asked");
+        p.sync_inputs(&app, &mut e, &st);
+        let one = {
+            let mut probe = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+            probe.sync_capture_rings(&[PickId(0)]).expect("a ring");
+            probe.capture_ring_bytes()
+        };
+        assert_eq!(e.capture_ring_bytes(), 2 * one, "not a ring per armed pick");
+        let ids = app.track_ids();
+        let (a, b, c) = (ids[1], ids[2], ids[3]);
+        assert_eq!((p.pick_of(a), p.pick_of(b), p.pick_of(c)), (Some(PickId(0)), Some(PickId(1)), Some(PickId(2))));
+        assert!(p.pick_table().explicit());
+        // Two tracks on one input are two picks of it.
+        assert_eq!(p.pick_table().picks()[1].cols, p.pick_table().picks()[2].cols);
+        // Disarmed, the rings go home: a frame for the callback to send them,
+        // and the next sync drops them.
+        let mut rows = input_rows(&app);
+        rows.iter_mut().for_each(|r| r.armed = false);
+        p.sync_input_rows(&rows, &mut e, &st);
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        p.sync_input_rows(&rows, &mut e, &st);
+        assert_eq!(e.capture_ring_bytes(), 0, "a disarmed pick kept its ring");
     }
 }

@@ -779,13 +779,7 @@ struct Audio {
     /// panel means when it says how wide the input is.
     dev_channels: usize,
     /// The live tap, until the engine takes it. See `Session::take_monitor`.
-    monitor: Option<(
-        rtrb::Consumer<f32>,
-        u16,
-        [u8; crate::instrument::INPUTS],
-        u32,
-        audio::Picks,
-    )>,
+    monitor: Option<crate::instrument::MonitorTap>,
 }
 
 impl Audio {
@@ -836,9 +830,11 @@ impl Audio {
         // an interface narrower than it was drops a pick, and a layout taken
         // from what was asked for would then point every strip at the wrong
         // column of the block.
-        let sink_widths = sink.widths::<{ crate::instrument::INPUTS }>();
+        // One width per pick the stream honours, however many that is: the
+        // monitor's layout is as long as the desk binds (`audio::Picks`).
+        let sink_widths = sink.widths().into_boxed_slice();
         let dev_channels = sink.device_channels();
-        let monitor_picks = sink.picks();
+        let monitor_picks = sink.picks().clone();
         // **The device's own block, for the monitor's backlog ceiling.**
         // `Default` means cpal did not say, so this takes the largest buffer
         // the app offers rather than guessing small — a ceiling that is too
@@ -1402,7 +1398,7 @@ impl Session {
         let Some(a) = self.audio.as_ref() else {
             return false;
         };
-        if a.cmds.send(Cmd::Picks(picks)).is_err() {
+        if a.cmds.send(Cmd::Picks(picks.clone())).is_err() {
             return false;
         }
         self.picks = picks;
@@ -1419,25 +1415,18 @@ impl Session {
     ///
     /// The monitor takes them from `take_monitor` below instead, which hands
     /// the ring and its layout over together so the two cannot disagree.
-    /// This is the accessor for anyone who wants the standing answer.
+    /// This is the accessor for anyone who wants the standing answer: the
+    /// picks as ASKED, which the device then fits (`Picks::fitted`).
     #[allow(dead_code)]
-    pub fn picks(&self) -> audio::Picks {
-        self.picks
+    pub fn picks(&self) -> &audio::Picks {
+        &self.picks
     }
 
     /// Hand the live-monitor tap to whoever will play it, once.
     ///
     /// Taken rather than borrowed: the ring's read end belongs to exactly one
     /// consumer, and that is the engine's render thread.
-    pub fn take_monitor(
-        &mut self,
-    ) -> Option<(
-        rtrb::Consumer<f32>,
-        u16,
-        [u8; crate::instrument::INPUTS],
-        u32,
-        audio::Picks,
-    )> {
+    pub fn take_monitor(&mut self) -> Option<crate::instrument::MonitorTap> {
         self.audio.as_mut().and_then(|a| a.monitor.take())
     }
 
@@ -1619,7 +1608,7 @@ impl Session {
         let mut fallback_note = None;
         let opened = Audio::open(
             selection,
-            picks,
+            picks.clone(),
             self.timebase,
             self.tap_tx.clone(),
             buffer_frames,
@@ -1632,7 +1621,7 @@ impl Session {
             }
             Audio::open(
                 &InputSelection::Default,
-                picks,
+                picks.clone(),
                 self.timebase,
                 self.tap_tx.clone(),
                 buffer_frames,

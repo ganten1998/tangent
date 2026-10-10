@@ -723,12 +723,6 @@ pub enum Strip {
 /// same thirty-two.
 pub const CHANNELS: usize = LEGACY_LANES;
 
-/// How many inputs of one interface the engine keeps picks for: the
-/// capture's own number (`tangent_record::audio::MAX_PICKS`), which is where
-/// the channels are actually kept. A desk with more strips than the capture
-/// has picks would draw channels nothing can ever fill.
-pub const INPUTS: usize = tangent_record::audio::MAX_PICKS;
-
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;
 
@@ -2475,11 +2469,6 @@ struct Shared {
     /// an EP track in one session, or eight of either, is the ordinary thing
     /// to want and what the old single instance could never do.
     keys_strips: AtomicU32,
-    /// Which general channel each capture PICK feeds: desk indices, -1 for an
-    /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
-    /// the order, the callback only reads it, which is the same trust split
-    /// every other mask here follows.
-    pick_strip: [AtomicI64; INPUTS],
     metro_gain: AtomicU32,
     /// The backing track's level, linear.
     track_gain: AtomicU32,
@@ -2671,20 +2660,21 @@ struct Shared {
     /// a fresh engine behaves as every engine did until the host's first
     /// push says otherwise.
     armed: AtomicU32,
-    /// Which input picks tee into the arrangement's capture rings — a bit
-    /// per INPUT (not per channel). Zero is off. The host sets it when
-    /// arrangement record starts and clears it on stop.
-    arr_capture: AtomicU32,
+    /// **Which picks tee into the arrangement's capture rings**: a bit per
+    /// PICK (not per channel), by `PickId`. The host sets them when an
+    /// arrangement record starts and clears them when it stops; the callback
+    /// reads them once per callback into `Spine::capturing`, before any op
+    /// is applied, so the door that refuses to replace a capturing pick's
+    /// ring and the tee that writes into it agree within a callback.
+    ///
+    /// **As many bits as a desk can have rows** ([`CAPTURE_WORDS`]): eight
+    /// kilobytes, so no pick a desk can bind is ever turned away for its
+    /// number. It was a `u32`, which is thirty-two picks and a record that
+    /// silently captured nothing on the thirty-third.
+    arr_capture: Box<[AtomicU64]>,
     /// Frames the capture tee had to drop because a ring was full — the host
     /// stalled for seconds. Climbing means a take with a hole in it.
     cap_dropped: AtomicU64,
-    /// The per-lane STEM tap is running — set by the host for an export
-    /// pass, cleared when it ends.
-    stems_on: AtomicBool,
-    /// **Floats per frame of the stem tap**, written by the callback when
-    /// the tap is armed: two per slot of the desk as it stood then. See
-    /// `Engine::stem_frame_width`.
-    stem_width: AtomicUsize,
     /// The DRUM BUS fader and pan — the pads sum through this strip.
     drums_gain: AtomicU32,
     drums_pan: AtomicU32,
@@ -3057,8 +3047,8 @@ struct Shared {
     ir_peak_r: AtomicU32,
     /// **APPENDED — the stem tap is running DRY.**
     ///
-    /// A mode on `stems_on`, not a second tap switch: with `stems_on` off
-    /// this says nothing and costs a bool load. On, it decides WHICH of the
+    /// A mode on the armed stem tap, not a second tap switch: with no tap
+    /// armed this says nothing and costs a bool load. On, it decides WHICH of the
     /// two per-lane buffers the ring is fed from — the wet one every other
     /// customer already reads, or the dry one written beside it.
     ///
@@ -3510,7 +3500,6 @@ impl Shared {
             drum_strips: AtomicU32::new(0),
             builtin_strips: AtomicU32::new(0),
             keys_strips: AtomicU32::new(0),
-            pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
             // Both effects OFF by default. A first launch has to sound like the
             // instrument and not like a room, and `Effects::process` skips its
@@ -3542,10 +3531,8 @@ impl Shared {
             out_ring_asked: AtomicU32::new(0),
             midi_off: AtomicU64::new(0),
             armed: AtomicU32::new(u32::MAX),
-            arr_capture: AtomicU32::new(0),
+            arr_capture: (0..CAPTURE_WORDS).map(|_| AtomicU64::new(0)).collect(),
             cap_dropped: AtomicU64::new(0),
-            stems_on: AtomicBool::new(false),
-            stem_width: AtomicUsize::new(CHANNELS * 2),
             drums_gain: AtomicU32::new(1.0f32.to_bits()),
             drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
@@ -6132,6 +6119,23 @@ impl DeskLanes {
 }
 
 
+/// **`set` becomes exactly the picks `words` names**, as far as the set
+/// reaches: a clear, one load per word the set covers, and one insert per
+/// set bit, with no allocation. `Acquire`, against the host's `Release`: a
+/// flag seen here brings every op the host pushed before setting it, so a
+/// pick's ring sent ahead of its record is on the spine before its first
+/// tee.
+fn load_flags(set: &mut LaneSet, words: &[AtomicU64]) {
+    set.clear();
+    for (w, cell) in words.iter().take(set.capacity() / 64).enumerate() {
+        let mut rest = cell.load(Ordering::Acquire);
+        while rest != 0 {
+            set.insert(w * 64 + rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
+    }
+}
+
 /// **`set` becomes exactly the lanes `word` names**, lowest first, with no
 /// allocation: a clear and one insert per set bit.
 fn load_word(set: &mut LaneSet, word: u64) {
@@ -6872,6 +6876,38 @@ type Op = crate::lane_bank::EngineOp<Lane, LanePart, Wide>;
 /// ring is `EngineBusy::Busy`, never a dropped op.
 const OP_RING: usize = 64;
 
+/// **Words of capture flags**: a bit for every pick a desk could bind, which
+/// is at most one per row (`desk_id::MAX_ROWS`, the hostile-file bound and
+/// not a tier). See `Shared::arr_capture`.
+const CAPTURE_WORDS: usize = tangent_ui::desk_id::MAX_ROWS.div_ceil(64);
+
+/// **How many picks a fresh spine has capture slots for.** A slot is an
+/// empty `Option` until a pick is armed (`Engine::sync_capture_rings`), so
+/// this costs a few hundred bytes; a pick past it grows the table through a
+/// Grow, built on the host like every other.
+const FIRST_PICKS: usize = 64;
+
+/// **How many frames a pick's capture ring holds**: four seconds, and never
+/// fewer than two of the largest callback the engine runs.
+///
+/// The host drains every UI frame, so four seconds is a stall of seconds
+/// before a sample is lost, and a full ring drops and says so
+/// (`cap_dropped`). The floor is the capture-ring law: a ring smaller than
+/// the graph's quantum keeps `ring/quantum` of the audio with every counter
+/// clean, because one callback can push more than the ring holds before the
+/// host has a chance to drain it (three takes lost 22 to 53 percent that
+/// way). At the lowest rate the engine opens, four seconds is far past any
+/// quantum; the floor is what keeps that true if either number moves.
+const fn capture_ring_frames(rate: u32) -> usize {
+    let four_s = rate as usize * 4;
+    let floor = MAX_CALLBACK_FRAMES * 2;
+    if four_s > floor {
+        four_s
+    } else {
+        floor
+    }
+}
+
 /// **What a lane is, as the host asks for it** (contract C8). The kind is
 /// the host's record; the engine builds the same lane for every kind and the
 /// plan's flags say how it plays.
@@ -7577,7 +7613,7 @@ impl crate::lane_bank::SpineExt for Wide {
 fn spine_from_bank(bank: Vec<Rack>, gen: u32) -> (Vec<Option<Rack>>, Spine<Lane, Wide>) {
     use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
     let mut bank: Vec<Option<Rack>> = bank.into_iter().map(Some).collect();
-    let mut spine = Spine::with_ext(CHANNELS, INPUTS, Wide::new(CHANNELS));
+    let mut spine = Spine::with_ext(CHANNELS, FIRST_PICKS, Wide::new(CHANNELS));
     for ch in 0..CHANNELS {
         let mut take = |seat: usize| bank.get_mut(seat).and_then(Option::take);
         let (Some(own), Some(extra)) = (take(ch), take(folder_extra_seat(ch))) else {
@@ -9953,32 +9989,40 @@ struct Renderer {
     monitor: Option<Consumer<f32>>,
     /// How many channels that ring carries per frame.
     monitor_channels: usize,
-    /// Slewed, so switching monitoring on is a fade rather than a bang.
-    monitor_gain: [f32; INPUTS],
-    /// **Whether the ROOM may hear each input**, slewed like `monitor_gain`
-    /// and multiplied into the room's share of it. One per input because it
-    /// follows that input's strip: a muted strip, or every other one while
-    /// something is soloed, is withheld from the speakers while the take
-    /// still gets it. See the arm rule in `mix_monitor`.
-    room_audible: [f32; INPUTS],
-    /// Channels per input strip, in stream order. Zero for one not open.
-    monitor_widths: [usize; INPUTS],
-    /// **Which DEVICE column each strip's channels live in.** The capture
-    /// rings carry whole device frames now, so the picks that used to decide
-    /// the ring's shape decide the READING of it instead — and a stereo pick
-    /// need not be two adjacent inputs, so this cannot be an offset.
-    monitor_picks: tangent_record::audio::Picks,
+    /// **Every pick of the live input, by its stable `PickId`**: the lane it
+    /// plays onto (slot and generation, checked at use), how wide it is and
+    /// which DEVICE columns it reads. The capture rings carry whole device
+    /// frames, so a pick's columns are its own, worked out on the host, and
+    /// a stereo pick need not be two adjacent inputs. As many as the stream
+    /// has: they arrive with the layout (`lane_bank::MonitorPlan`), never
+    /// from a fixed table.
+    monitor_picks: Box<[crate::lane_bank::MonitorPick]>,
+    /// The picks the stream itself honours, in its own order: what the IR
+    /// wizard turns a device input into a ring column through.
+    monitor_columns: tangent_record::audio::Picks,
+    /// **Each pick's `[gain, room]`**, slewed. The gain is so switching
+    /// monitoring on is a fade rather than a bang; the room is **whether the
+    /// ROOM may hear the pick**, multiplied into the room's share of it,
+    /// because it follows that pick's strip: a muted strip, or every other
+    /// one while something is soloed, is withheld from the speakers while
+    /// the take still gets it. See the arm rule in `mix_monitor`. One per
+    /// pick, carried by `PickId` across a layout change (a pick that keeps
+    /// its place keeps its fade) and arriving zeroed with a new device.
+    monitor_fades: Box<[[f32; 2]]>,
     /// The INPUT device's own block, in frames. What the monitor ring is
     /// allowed to hold before the surplus is stale rather than in flight.
     monitor_block: usize,
     monitor_scratch: Vec<f32>,
-    /// The STEM tap: every lane's post-fader stereo, interleaved
-    /// `stem_cols` wide, while `stems_on`. The export's second ear.
-    stem_tx: Producer<f32>,
-    /// **How many floats a stem frame is**: the desk buffers' stride at the
-    /// moment the tap was armed, held for the whole export (see the latch
-    /// beside `stems_live`) and published as `Shared::stem_width`.
-    stem_cols: usize,
+    /// **The STEM tap, while one is armed**: the post-fader stereo of the
+    /// slots it names, interleaved in that order, a frame at a time. The
+    /// export's second ear. Built on the host when an export arms it, for
+    /// exactly the slots it wants, and swapped in whole (`stems_incoming`).
+    stem: Option<StemTap>,
+    /// The stem tap's two rings, in the click's exact shape: a tap arrives
+    /// whole (or `None`, which disarms) and the one it replaces goes home to
+    /// be dropped there.
+    stems_incoming: Consumer<Option<StemTap>>,
+    stems_retiring: Producer<Option<StemTap>>,
     /// **The scope's tap: the SPEAKERS' mix, before the click joins it.**
     /// "Everything the app is doing, minus the metronome" exists as a
     /// buffer at exactly one point in the block — this is it. A full ring
@@ -10057,7 +10101,7 @@ struct Renderer {
     pad_out: Vec<f32>,
     /// The io pair a pad's rack processes in place.
     pad_io: Vec<Vec<f32>>,
-    /// `stems_on`, read once a block so the three mixers agree.
+    /// A stem tap is armed, read once a block so the three mixers agree.
     stems_live: bool,
     /// **The one stems-fill answer for this chunk**, computed once at the top
     /// of `render_program` and read by every gate that used to spell out
@@ -10468,12 +10512,25 @@ impl Renderer {
         self.spine.capacity() * 2
     }
 
+    /// **A stem tap arriving, or a disarm**: swapped in whole, the one it
+    /// replaces sent home to be dropped there. No room home, no swap: the
+    /// tap that is armed keeps playing, the clips' own protocol.
+    fn take_stem_tap(&mut self) {
+        while self.stems_retiring.slots() > 0 {
+            let Ok(next) = self.stems_incoming.pop() else {
+                break;
+            };
+            let old = std::mem::replace(&mut self.stem, next);
+            let _ = self.stems_retiring.push(old);
+        }
+    }
+
     /// Apply every queued op, counting what was refused. See `apply_ops`.
     fn apply_queued_ops(&mut self) {
         // **Which picks are capturing, as the op door sees it**: a `Capture`
         // for one of them is refused and goes home (design 7.4), so a take
         // never loses its ring mid-record.
-        load_word(&mut self.spine.capturing, u64::from(self.shared.arr_capture.load(Ordering::Relaxed)));
+        load_flags(&mut self.spine.capturing, &self.shared.arr_capture);
         let report = crate::lane_bank::apply_ops(
             &mut self.spine,
             &mut self.plan,
@@ -10983,6 +11040,7 @@ impl Renderer {
         // a frame is rendered, so no chunk ever sees half of a change. Moves
         // pointers and nothing else.
         self.apply_queued_ops();
+        self.take_stem_tap();
         // **The desk buffers' stride, read AFTER the ops.** A Grow that lands
         // in this callback changes it, and every lane, the fold and the
         // stems write at `self.stride()`; a copy taken before the apply made
@@ -11340,19 +11398,12 @@ impl Renderer {
                 }
             }
             self.aim_insert_tap();
-            let stems_were = self.stems_live;
-            self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
-            // **The stem stream's width is bound when the tap is armed**
-            // (design 7.13: stems bind at the press), not read per chunk: a
-            // Grow mid-export widens the desk buffers, and a stream whose
-            // frames changed width under a host slicing at the old one is
-            // every stem after that point wrong. A lane added during the
-            // export has no stem; the ones that did keep their columns.
-            // Published for the host's de-interleave (`stem_frame_width`).
-            if self.stems_live && !stems_were {
-                self.stem_cols = self.stride();
-                self.shared.stem_width.store(self.stem_cols, Ordering::Relaxed);
-            }
+            // **The stem stream's columns are bound when the tap is armed**
+            // (design 7.13: stems bind at the press): the tap carries the
+            // slots it was built for, so a Grow mid-export widens the desk
+            // buffers and moves no column, and a lane added during the
+            // export has no stem.
+            self.stems_live = self.stem.is_some();
             // **Dry only counts while stems are being taken.** The four
             // other customers of the per-lane buffer are the mix's own, and
             // none of them may see the dry copy — so the flag is latched
@@ -11469,7 +11520,7 @@ impl Renderer {
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
             //
-            self.mix_monitor(n, at, rolling, muted, soloed);
+            self.mix_monitor(n, at, rolling);
             self.mix_preview(n);
             // The drumpad, upstream of the bus return, the room split and
             // the master — so the pads are limited, mastered, heard and
@@ -11494,38 +11545,33 @@ impl Renderer {
                 let coeff = self.gain_coeff;
                 self.fold_folders(n, coeff, pdc_max);
             }
-            if self.stems_live {
-                // **Whole frames of the BOUND width, never a part of one.**
-                // The room was rounded to `CHANNELS * 2` floats while a frame
-                // is `stride` wide, so past thirty-two lanes a nearly full
-                // ring took a frame and a half and every frame after it was
-                // shifted. A frame is `stem_cols` floats out of each
-                // `stride`-wide row of the desk buffer: the same slice, whole,
-                // while the desk has not grown since the press.
-                let stride = self.stride();
-                let cols = self.stem_cols.min(stride).max(1);
-                let frames_room = self.stem_tx.slots() / cols;
-                let take = n.min(frames_room);
-                // **One ring, two buffers, and the mode picks.** The
-                // host drains the same tap either way, so nothing
-                // downstream of here — the writers, the de-interleave,
-                // the mono fold, the WAV — has to learn that dry stems
-                // exist. Only the fill point moved.
+            if let Some(tap) = self.stem.as_mut() {
+                // **Whole frames of the tap's own slots, never a part of
+                // one.** A frame is two floats for each slot the tap was
+                // armed for, gathered out of the desk buffer's `stride`-wide
+                // row into the tap's frame scratch and pushed whole, so a
+                // nearly full ring takes whole frames or none and no frame
+                // after it is shifted.
+                //
+                // **One ring, two buffers, and the mode picks.** The host
+                // drains the same tap either way, so nothing downstream of
+                // here — the writers, the de-interleave, the mono fold, the
+                // WAV — has to learn that dry stems exist. Only the fill
+                // point moved.
+                let cols = tap.row.len().max(1);
+                let take = n.min(tap.tx.slots() / cols);
                 let from = if self.stems_dry {
                     &self.spine.desk.dry_scratch
                 } else {
                     &self.spine.desk.stem_scratch
                 };
-                if cols == stride {
-                    if let Some(rows) = from.get(..take * stride) {
-                        let _ = self.stem_tx.push_entire_slice(rows);
+                for f in 0..take {
+                    for (i, slot) in tap.slots.iter().enumerate() {
+                        let at = f * stride + *slot as usize * 2;
+                        tap.row[i * 2] = from.get(at).copied().unwrap_or(0.0);
+                        tap.row[i * 2 + 1] = from.get(at + 1).copied().unwrap_or(0.0);
                     }
-                } else {
-                    for f in 0..take {
-                        if let Some(row) = from.get(f * stride..f * stride + cols) {
-                            let _ = self.stem_tx.push_entire_slice(row);
-                        }
-                    }
+                    let _ = tap.tx.push_entire_slice(&tap.row);
                 }
             }
             // ── the click, and what it sends ───────────────────────────
@@ -12606,7 +12652,7 @@ impl Renderer {
     /// the time this runs, so deriving a position here would give the room
     /// the next block of the take against the current block of the live
     /// input, a whole buffer of lead on the one path a player is listening to.
-    fn mix_monitor(&mut self, frames: usize, at: u64, rolling: bool, muted: u64, soloed: u64) {
+    fn mix_monitor(&mut self, frames: usize, at: u64, rolling: bool) {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
         self.room_live = false;
@@ -12641,31 +12687,46 @@ impl Renderer {
         // so the ring being let go of waits in the plan and leaves with it on
         // the next Monitor op: nothing is freed on this thread. It was
         // assigned in place, which dropped the old `Consumer` here.
+        //
+        // **The tables are SWAPPED too, never copied or built here**: the
+        // picks, the stream's own columns and the fades are as long as the
+        // stream has picks, which no fixed table here could hold, so the host
+        // builds them with the plan and the ones they replace leave in it.
         if let Some(plan) = self.spine.monitor.as_deref_mut().filter(|p| p.fresh) {
             plan.fresh = false;
-            let widths: [usize; INPUTS] =
-                std::array::from_fn(|i| plan.widths.get(i).copied().map_or(0, usize::from));
             if plan.layout_only {
                 if self.monitor.is_some() {
-                    self.monitor_widths = widths;
-                    self.monitor_picks = plan.columns;
+                    // **A pick that keeps its place keeps its fade.** Copied
+                    // into the plan's own table by PickId before the swap:
+                    // a layout change is not a new device, and a bound
+                    // input that jumped back to silence would be a dropout
+                    // in the room for every pick a gesture did not touch.
+                    let keep = plan.fades.len().min(self.monitor_fades.len());
+                    plan.fades[..keep].copy_from_slice(&self.monitor_fades[..keep]);
+                    std::mem::swap(&mut self.monitor_picks, &mut plan.picks);
+                    std::mem::swap(&mut self.monitor_columns, &mut plan.columns);
+                    std::mem::swap(&mut self.monitor_fades, &mut plan.fades);
                 }
             } else {
                 std::mem::swap(&mut self.monitor, &mut plan.ring);
+                // The ring's own scratch, sized for its device, when it
+                // brought one (see `MonitorPlan::scratch`).
+                if !plan.scratch.is_empty() {
+                    std::mem::swap(&mut self.monitor_scratch, &mut plan.scratch);
+                }
                 if self.monitor.is_some() {
                     self.monitor_channels = usize::from(plan.channels).max(1);
-                    self.monitor_widths = widths;
-                    self.monitor_picks = plan.columns;
                     self.monitor_block = plan.block.max(1) as usize;
                 } else {
                     self.monitor_channels = 0;
-                    self.monitor_widths = [0; INPUTS];
-                    self.monitor_picks = tangent_record::audio::Picks::EVERYTHING;
                     self.monitor_block = 0;
                 }
                 // A new device fades in from silence rather than arriving at
-                // whatever the last one was playing at.
-                self.monitor_gain = [0.0; INPUTS];
+                // whatever the last one was playing at: the plan's fades are
+                // the host's, every gain at zero.
+                std::mem::swap(&mut self.monitor_picks, &mut plan.picks);
+                std::mem::swap(&mut self.monitor_columns, &mut plan.columns);
+                std::mem::swap(&mut self.monitor_fades, &mut plan.fades);
             }
         }
         // Read before the ring is borrowed: `varispeed_ratio` takes `&self`
@@ -12792,8 +12853,8 @@ impl Renderer {
         if let Some(job) = self.ir.as_mut() {
             if !job.cols_ready {
                 job.cols = (
-                    ir_ring_col(&self.monitor_picks, job.in_pair.0, ch_in),
-                    ir_ring_col(&self.monitor_picks, job.in_pair.1, ch_in),
+                    ir_ring_col(&self.monitor_columns, job.in_pair.0, ch_in),
+                    ir_ring_col(&self.monitor_columns, job.in_pair.1, ch_in),
                 );
                 job.cols_ready = true;
             }
@@ -12968,39 +13029,39 @@ impl Renderer {
         // A rig with nothing armed still pays nothing: no input heard, no
         // split, one master chain, exactly as before.
         let mut live_in_room = false;
-        // **Every input of the interface, at its own offset in the block.**
-        // `Picks` laid them end to end when the stream was opened — a mono
-        // input then a stereo pair is one channel then two — and this is the
-        // other end of that: which columns of the interleaved frame belong to
-        // which strip.
-        let mut offset = 0usize;
-        let capturing = self.shared.arr_capture.load(Ordering::Relaxed);
+        // **Every pick of the interface, each reading its own columns.**
+        // `Picks` laid them end to end when the stream was opened - a mono
+        // input then a stereo pair is one channel then two - and the ring
+        // carries whole DEVICE frames, so each pick's columns are a fact
+        // about the pick, worked out on the host (`MonitorPick::cols`). They
+        // used to be found here by walking every pick before this one, per
+        // sample, and by a running offset that read NOTHING for a pick past
+        // the device's width: the ninth binding on an eight-input box, a
+        // real desk now that the picks are as many as the bound tracks.
         // What the routes make of a routed strip, walked once a chunk and
         // only if one is open - see `route_transfer`.
         let mut transfer: Option<[[f32; 2]; CHANNELS]> = None;
-        for input in 0..INPUTS {
-            let width = self.monitor_widths[input].min(ch_in.saturating_sub(offset));
+        for input in 0..self.monitor_picks.len().min(self.monitor_fades.len()) {
+            let pick = self.monitor_picks[input];
+            let width = usize::from(pick.width);
             if width == 0 {
                 continue;
             }
-            let at_ch = offset;
-            offset += width;
-            // **The device column this strip's k-th channel lives in.** The
-            // ring is device-wide, so a strip's columns are wherever its pick
-            // put them — not `at_ch + k`, which was the old ring's own
-            // packing. `EVERYTHING` has no picks and maps straight through,
-            // which is exactly right for "the whole device in its own order".
-            let dev_col = |k: usize| {
-                self.monitor_picks
-                    .source(at_ch + k, ch_in)
-                    .unwrap_or(at_ch + k)
-                    .min(ch_in.saturating_sub(1))
-            };
+            // **The device column this strip's k-th channel lives in**, its
+            // left for a mono pick's both sides, clamped to the ring as it
+            // was in the walk this replaces.
+            let cols = pick.cols.map(|c| usize::from(c).min(ch_in.saturating_sub(1)));
+            let dev_col = |k: usize| cols[k.min(1)];
             // ── the arrangement's tee: RAW frames, folded to stereo exactly
             // as the monitor folds (a mono input to both sides) — pre-fader,
             // pre-rack, pre-arm. The take is the signal at the jack, not the
             // room's opinion of it. ──
-            if u64::from(capturing) & word_bit(input) != 0 {
+            //
+            // **By PickId, before the binding is asked**: a record holds its
+            // pick's ring whether or not the pick still feeds a lane this
+            // block, so a take is never at the mercy of a layout change
+            // (design A5).
+            if self.spine.capturing.contains(input) {
                 // **The pick's ring on the spine** (design 7.4, `Capture`):
                 // the host swaps it by `Engine::set_capture_ring`, which the
                 // callback refuses while this pick's capture runs.
@@ -13019,18 +13080,17 @@ impl Renderer {
                     }
                 }
             }
-            // **Which CHANNEL this pick feeds**, mapped by the host: the k-th
-            // AUDIO channel takes pick k. An unbound pick still drains — the
-            // ring has to keep moving — but is nobody's audio.
-            let bound = self.shared.pick_strip[input].load(Ordering::Relaxed);
-            let Some(strip) = usize::try_from(bound)
-                .ok()
-                .filter(|b| *b < CHANNELS)
-                .map(Strip::Channel)
-            else {
-                self.monitor_gain[input] = 0.0;
+            // **Which LANE this pick feeds**, by slot and the generation it
+            // was bound for, checked at use (design 7.5): a lane that has
+            // gone, or a slot now holding another lane, is nobody's. An
+            // unbound pick still drains - the ring has to keep moving - but
+            // is nobody's audio.
+            let slot = pick.slot.0 as usize;
+            if pick.gen == crate::lane_bank::MonitorPick::NO_LANE || !self.lane_is(slot, pick.gen) {
+                self.monitor_fades[input][0] = 0.0;
                 continue;
-            };
+            }
+            let strip = Strip::Channel(slot);
             // **Arm is the record switch, and it beats the mute in the
             // TAKE.** An armed strip's input goes into the take whatever the
             // mute does: the arrangement already records it raw whatever the
@@ -13044,7 +13104,12 @@ impl Renderer {
             // must keep moving) and reaches nothing once its gain has faded:
             // a project must open without headphones.
             let live = self.spine.ext.desk.armed.contains(strip.index());
-            let audible = strip_is_heard(strip, muted, soloed);
+            // **Heard, as every walk asks it**: the chunk's own answer by
+            // slot (`fill_heard`), which is `strip_is_heard` over the desk's
+            // words for a legacy lane and the plan's for any lane at all. The
+            // words have no bit past the sixty-fourth, where a pick bound to
+            // a lane would have aliased onto a lane it never fed.
+            let audible = self.spine.ext.heard_flat.get(slot).copied().unwrap_or(false);
             let heard = live && audible;
             live_in_room |= heard;
             let target = if live {
@@ -13067,12 +13132,12 @@ impl Renderer {
                 0.0
             };
             let audible_to = if audible { 1.0 } else { 0.0 };
-            if self.monitor_gain[input] <= 1.0e-6 {
+            if self.monitor_fades[input][0] <= 1.0e-6 {
                 // Nothing of this input is sounding yet, so the room's answer
                 // is taken outright rather than slewed from the last one: a
                 // strip that is muted when its input opens never reaches the
                 // speakers for even the length of a fade.
-                self.room_audible[input] = audible_to;
+                self.monitor_fades[input][1] = audible_to;
             }
             // Silent and already faded out: the drain above was the whole job
             // for this one. The others still get their turn.
@@ -13080,17 +13145,18 @@ impl Renderer {
             // meter reads the input the take is getting — see `meter_source`.
             // A strip that is neither armed nor still fading has nothing to
             // meter and nothing to mix.
-            if !live && self.monitor_gain[input] <= 1.0e-6 {
-                self.monitor_gain[input] = 0.0;
+            if !live && self.monitor_fades[input][0] <= 1.0e-6 {
+                self.monitor_fades[input][0] = 0.0;
                 continue;
             }
             // **The live monitor, which is the path automation would most
             // easily have been left out of** — it is not the arrangement, so
             // a version that automated clips would look right and do nothing
             // to somebody's own playing coming through the desk.
-            // The pick is bound to a channel below `CHANNELS` (the filter
-            // above), so the strip IS the lane; no clamp stands between them.
-            let lane = strip.index();
+            // The pick is bound to a lane by slot and generation (checked
+            // above), so the strip IS the lane, at any slot; no clamp stands
+            // between them.
+            let lane = slot;
             // **A live input on a FOLDER goes into the bus raw**, like every
             // other source standing on one: the folder's fader, rack, pan,
             // send and meter are the fold's to apply, once, over the whole
@@ -13179,7 +13245,7 @@ impl Renderer {
                 );
             }
             for i in 0..n {
-                self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
+                self.monitor_fades[input][0] += (target - self.monitor_fades[input][0]) * self.gain_coeff;
                 for c in 0..TAP_CHANNELS {
                     let col = dev_col(c.min(width - 1));
                     let clip = if merge_clip {
@@ -13193,7 +13259,7 @@ impl Renderer {
                     };
                     let jack = self.monitor_scratch[i * ch_in + col] + clip;
                     raw_peak[c.min(1)] = raw_peak[c.min(1)].max(jack.abs());
-                    let src = jack * self.monitor_gain[input];
+                    let src = jack * self.monitor_fades[input][0];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
                     }
@@ -13264,10 +13330,13 @@ impl Renderer {
                 // knob turned in it would have moved on screen and changed
                 // nothing. Taken before the rack is borrowed mutably — two fields,
                 // so the borrows are disjoint only if each is one expression.
+                // By the lane's own seat, which for a lane past slot 31 is in
+                // the range past the frozen map (`lane_seat`), not its index.
+                let own_seat = lane_seat(slot, CHAIN_OWN);
                 let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
                     std::array::from_fn(|b| {
                         self.spine.ext.auto_params
-                            .get((strip.index()) * INSERTS + b)
+                            .get(own_seat * INSERTS + b)
                             .map_or(&[][..], Vec::as_slice)
                     });
                 if !is_folder {
@@ -13324,7 +13393,7 @@ impl Renderer {
                     // for exactly that word within sight of every `run_rack` —
                     // and the paragraph above pushed the guard out of sight.
                     if takes_rack {
-                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, strip.index()) {
+                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, own_seat) {
                             run_rack(
                             rack,
                             &mut self.fx_in,
@@ -13335,7 +13404,7 @@ impl Renderer {
                             &seat_params,
                             &self.shared,
                             &self.spine.ext.desk.frozen,
-                            strip.index(),
+                            own_seat,
                             self.sampler_samples
                                 .get(strip.index())
                                 .and_then(Option::as_ref),
@@ -13353,7 +13422,7 @@ impl Renderer {
                         // Not a key pass either, for the same reason. Still
                         // inside the `!is_folder` arm; `run_extra_rack` holds
                         // the guard as well, so neither can drift.
-                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, tangent_ui::recorder::folder_extra_seat(strip.index())) {
+                        if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, lane_seat(slot, CHAIN_EXTRA)) {
                             run_extra_rack(
                                 rack,
                                 is_folder,
@@ -13362,7 +13431,7 @@ impl Renderer {
                                 &mut self.fx_out,
                                 &self.shared,
                                 &self.spine.ext.desk.frozen,
-                                tangent_ui::recorder::folder_extra_seat(strip.index()),
+                                lane_seat(slot, CHAIN_EXTRA),
                                 n,
                                 notes,
                                 controls,
@@ -13379,7 +13448,7 @@ impl Renderer {
                 }
             }
             let mut room = room_from;
-            let mut room_in = self.room_audible[input];
+            let mut room_in = self.monitor_fades[input][1];
             // **A LIVE INPUT is on the lane too, and it routes with it.**
             // The routed-away gate was put on the clip, pad and instrument
             // folds and missed this one, so a channel with an input open went
@@ -13485,7 +13554,7 @@ impl Renderer {
                 }
             }
             room_to = room;
-            self.room_audible[input] = room_in;
+            self.monitor_fades[input][1] = room_in;
             let peak = meter_source(live, peak, raw_peak);
             // A folder's meter is the GROUP's, and the fold reports it.
             if !is_folder {
@@ -18204,6 +18273,8 @@ pub struct Engine {
     plan_shadows: Vec<DeskPlan>,
     /// A monitor plan the op ring had no room for, sent by `retire_tick`.
     monitor_pending: RefCell<Option<Box<crate::lane_bank::MonitorPlan>>>,
+    /// What the monitor was last told, whole. See [`MonitorShadow`].
+    monitor_shadow: RefCell<MonitorShadow>,
     /// The clip's two rings, in the plugin handoff's exact shape and for its
     /// exact reason: the audio thread must never free a hundred megabytes of
     /// samples, so the displaced clip comes BACK here and is dropped by the
@@ -18252,8 +18323,23 @@ pub struct Engine {
     inst_rate: f32,
     preview_to_audio: Producer<Option<Arc<tangent_record::decode::Clip>>>,
     preview_from_audio: Consumer<Option<Arc<tangent_record::decode::Clip>>>,
-    cap_rx: Vec<Consumer<f32>>,
-    stem_rx: Consumer<f32>,
+    /// **Each pick's capture ring, as the host knows it**, by `PickId`: built
+    /// when the pick's track is armed and sent on the op ring, taken home
+    /// when it is not (design 7.12: capture rings are per ARMED pick, not
+    /// one per input the engine might ever see). The read end lives here
+    /// for as long as the ring might be written.
+    captures: std::collections::BTreeMap<u32, HostCapture>,
+    /// The spine's capture slots once every op sent has landed.
+    pick_capacity: usize,
+    /// The picks whose capture flag the host has set (`Shared::arr_capture`).
+    capturing: RefCell<std::collections::BTreeSet<u32>>,
+    /// The stem tap's rings to the callback (see `Renderer::stem`), and the
+    /// read end and slots of the one last armed. The read end outlives a
+    /// disarm, so the pass that disarmed it can still drain what is in it.
+    stems_to_audio: RefCell<Producer<Option<StemTap>>>,
+    stems_from_audio: RefCell<Consumer<Option<StemTap>>>,
+    stem_rx: RefCell<Option<Consumer<f32>>>,
+    stem_slots: RefCell<Vec<Slot>>,
     scope_rx: Consumer<f32>,
     /// The INSERT tap ring's read end; the write end lives in `Shared` —
     /// see [`InsertTapLane`]. Drained by the host only while a face has the
@@ -18297,6 +18383,126 @@ fn new_rack() -> (Rack, [Handoff; INSERTS]) {
         retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
     };
     (rack, std::array::from_fn(|_| ends.next().expect("one per insert")))
+}
+
+/// **An armed stem tap, built whole on the host**: the ring's write end,
+/// the slots whose stems it carries (in the order their columns are
+/// interleaved), and one frame of them, assembled in place before it is
+/// pushed whole. Sized for exactly the slots an export asked for (design
+/// 7.12: the stem ring is built at arm time for the armed slots); it was a
+/// ring of four seconds of every lane, held by every engine from its first
+/// block.
+struct StemTap {
+    tx: Producer<f32>,
+    slots: Box<[u32]>,
+    row: Box<[f32]>,
+}
+
+impl StemTap {
+    fn new(tx: Producer<f32>, slots: &[Slot]) -> Self {
+        Self {
+            tx,
+            slots: slots.iter().map(|s| s.0).collect(),
+            row: vec![0.0; slots.len() * TAP_CHANNELS].into_boxed_slice(),
+        }
+    }
+}
+
+/// **The live input's ring, as the capture opened it**: the ring, the
+/// device's width, how many columns each of the stream's picks reads (one
+/// entry per pick, or one as wide as the device for the whole device), the
+/// device's block, and the picks the stream honours. What
+/// `record::Session::take_monitor` hands over and [`Engine::set_monitor`]
+/// takes.
+pub type MonitorTap = (Consumer<f32>, u16, Box<[u8]>, u32, tangent_record::audio::Picks);
+
+/// **A pick's capture ring, as the host knows it**: the read end (the host's
+/// own rings; `None` for one a caller of `set_capture_ring` keeps), and
+/// whether the ring has been sent home. A ring on its way home keeps its
+/// read end until it is home: the callback refuses to take a capturing
+/// pick's ring, and a take still draining it must find it.
+#[derive(Debug)]
+struct HostCapture {
+    rx: Option<Consumer<f32>>,
+    leaving: bool,
+}
+
+/// **Frames of the live input a renderer can read in one chunk**, per
+/// device channel: room for the largest chunk at the slowest varispeed with
+/// the device's block in flight beside it, as the scratch has always been
+/// (`widest * 4096`).
+const MONITOR_SCRATCH_FRAMES: usize = 4096;
+
+/// **What the host last told the monitor**, so that every road that changes
+/// one part of it (a new ring, the stream's own picks, the desk's bindings)
+/// can send all of it: a monitor plan is whole (design 7.4: the ring and its
+/// layout arrive together), and a road that sent only its own part would
+/// clear the others.
+#[derive(Debug, Default)]
+struct MonitorShadow {
+    /// The device ring's width and block, as last sent with a ring.
+    channels: u16,
+    block: u32,
+    /// Each pick's width and device columns, by PickId.
+    layout: Vec<(u8, [u16; 2])>,
+    /// Each pick's lane, by PickId: `None` binds it to no lane.
+    binds: Vec<Option<(Slot, u32)>>,
+    /// The stream's own picks (the IR wizard's lookup).
+    columns: tangent_record::audio::Picks,
+}
+
+impl MonitorShadow {
+    /// The plan this shadow describes, every fade at rest, no ring.
+    fn plan(&self, layout_only: bool) -> crate::lane_bank::MonitorPlan {
+        use crate::lane_bank::MonitorPick;
+        let picks = self
+            .layout
+            .iter()
+            .enumerate()
+            .map(|(p, &(width, cols))| {
+                let (slot, gen) = self
+                    .binds
+                    .get(p)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((Slot(0), MonitorPick::NO_LANE));
+                MonitorPick { pick: PickId(p as u32), slot, gen, width, cols }
+            })
+            .collect();
+        crate::lane_bank::MonitorPlan {
+            channels: self.channels,
+            block: self.block,
+            layout_only,
+            fresh: true,
+            ..crate::lane_bank::MonitorPlan::with_picks(picks, self.columns.clone())
+        }
+    }
+}
+
+/// **A stream's own layout, pick by pick**: one entry per width, in stream
+/// order, each reading the columns `Picks` laid end to end at its offset -
+/// the running offset the renderer used to walk once per sample, worked out
+/// here once. A pick that would start past the ring's width reads nothing,
+/// as it never could through this road. For a desk whose bindings name
+/// their own inputs the bridge gives each pick its own columns instead
+/// (`Engine::set_monitor_inputs`).
+fn stream_layout(widths: &[u8], columns: &tangent_record::audio::Picks, channels: u16) -> Vec<(u8, [u16; 2])> {
+    let ch_in = usize::from(channels).max(1);
+    let mut offset = 0usize;
+    widths
+        .iter()
+        .map(|w| {
+            let width = usize::from(*w).min(ch_in.saturating_sub(offset));
+            let at = offset;
+            offset += width;
+            let col = |k: usize| {
+                let c = columns.source(at + k, ch_in).unwrap_or(at + k).min(ch_in - 1);
+                u16::try_from(c).unwrap_or(u16::MAX)
+            };
+            let cols = if width == 0 { [0, 0] } else { [col(0), col(1.min(width - 1))] };
+            (u8::try_from(width).unwrap_or(u8::MAX), cols)
+        })
+        .collect()
 }
 
 /// **The slot API** (contract C8): lanes by identity, beside today's
@@ -18448,7 +18654,7 @@ impl Engine {
         while cap < need {
             cap = cap.saturating_mul(2);
         }
-        (cap, Box::new(Spine::with_ext(cap, INPUTS, Wide::new(cap))))
+        (cap, Box::new(Spine::with_ext(cap, self.pick_capacity, Wide::new(cap))))
     }
 
     /// **Install lanes at these slots**, one batch, one op (design 7.4).
@@ -18774,6 +18980,25 @@ impl Engine {
                 EngineOp::Plan(plan) => {
                     self.plan_shadows.retain(|p| p.gen != plan.gen);
                 }
+                // **A capture op home.** With no ring it is a take-away the
+                // callback refused, because the pick was capturing: the
+                // ring is still on the spine, and the next sync asks again
+                // once the record has ended. With a ring it is the one a
+                // take-away or a replacement displaced, dropped here; a
+                // pick whose ring was on its way home has none now.
+                EngineOp::Capture { pick, ring } => match ring {
+                    None => {
+                        if let Some(c) = self.captures.get_mut(&pick.0) {
+                            c.leaving = false;
+                        }
+                    }
+                    Some(old) => {
+                        if self.captures.get(&pick.0).is_some_and(|c| c.leaving) {
+                            self.captures.remove(&pick.0);
+                        }
+                        drop(old);
+                    }
+                },
                 other => drop(other),
             }
         }
@@ -18787,8 +19012,10 @@ impl Engine {
     pub fn settle_offline(&mut self) {
         if let Some(r) = self.offline.as_mut() {
             r.apply_queued_ops();
+            r.take_stem_tap();
         }
         self.drain_retired_ops();
+        while self.stems_from_audio.borrow_mut().pop().is_ok() {}
     }
 
     /// **An offline engine with room for `lanes` slots from the start**:
@@ -19319,19 +19546,15 @@ impl Engine {
             RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2);
         let (preview_retiring, preview_from_audio) =
             RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2);
-        // The capture rings: four seconds each, stereo. The host drains every
-        // UI frame and would have to stall for seconds to lose a sample; a
-        // full ring drops and says so in `cap_dropped`.
-        let mut cap_tx = Vec::with_capacity(INPUTS);
-        let mut cap_rx = Vec::with_capacity(INPUTS);
-        for _ in 0..INPUTS {
-            let (tx, rx) = RingBuffer::<f32>::new(rate as usize * 2 * 4);
-            cap_tx.push(tx);
-            cap_rx.push(rx);
-        }
-        // The stem tap: four seconds of every lane in stereo. Idle it costs
-        // a ring nobody fills.
-        let (stem_tx, stem_rx) = RingBuffer::<f32>::new(rate as usize * CHANNELS * 2 * 4);
+        // **No capture ring and no stem ring, until something is armed**
+        // (design 7.12, memory sized by use). There were thirty-two capture
+        // rings of four seconds each, one per input the engine might ever
+        // see, and a stem ring of four seconds of every lane: about a
+        // hundred megabytes on every engine, recording or not. A pick's ring
+        // is built when its track is armed (`sync_capture_rings`) and the
+        // stem ring when an export arms its stems (`arm_stems`).
+        let (stems_to_audio, stems_incoming) = RingBuffer::<Option<StemTap>>::new(2);
+        let (stems_retiring, stems_from_audio) = RingBuffer::<Option<StemTap>>::new(2);
         // The scope's third of a second of stereo.
         let (scope_tx, scope_rx) = RingBuffer::<f32>::new(1 << 15);
         // The INSERT tap: the scope's own third of a second, which is >= 2x
@@ -19380,14 +19603,11 @@ impl Engine {
         // **A legacy desk: row r at slot r, every lane installed now.** The
         // bank is built seat by seat to pair with the host's rings above;
         // the lanes take their nine racks out of it here.
-        let (racks, mut spine) = spine_from_bank(racks, LEGACY_GEN);
-        // The arrangement's capture tee, one ring per input pick: raw frames
-        // go in while `arr_capture` has the pick's bit, and the host drains
-        // them into the project's WAV files. On the spine from the start, so
-        // a `Capture` op swaps one where it already stands.
-        for (cell, tx) in spine.captures.iter_mut().zip(cap_tx) {
-            *cell = Some(tx);
-        }
+        // The arrangement's capture tee writes into a ring per ARMED pick,
+        // which arrives on the op ring when its track is armed
+        // (`Engine::sync_capture_rings`): the spine starts with the slots
+        // and no rings.
+        let (racks, spine) = spine_from_bank(racks, LEGACY_GEN);
         let hands = Hands::new(pool.as_ref().map_or(1, LanePool::hands));
         let (ops_tx, ops_rx) = RingBuffer::<Op>::new(OP_RING);
         let (retire_tx, retire_rx) = RingBuffer::<Op>::new(OP_RING);
@@ -19493,13 +19713,14 @@ impl Engine {
             gain_coeff: gain_coefficient(f64::from(rate)),
             monitor: None,
             monitor_channels: 0,
-            monitor_gain: [0.0; INPUTS],
-            room_audible: [1.0; INPUTS],
-            monitor_widths: [0; INPUTS],
-            monitor_picks: tangent_record::audio::Picks::EVERYTHING,
+            monitor_picks: Box::new([]),
+            monitor_columns: tangent_record::audio::Picks::EVERYTHING,
+            monitor_fades: Box::new([]),
             monitor_block: 0,
-            monitor_scratch: vec![0.0; widest * 4096],
-            stem_tx,
+            monitor_scratch: vec![0.0; widest * MONITOR_SCRATCH_FRAMES],
+            stem: None,
+            stems_incoming,
+            stems_retiring,
             has_folders: false,
             scope_tx,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -19527,7 +19748,6 @@ impl Engine {
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
-            stem_cols: CHANNELS * 2,
             stems_wanted: false,
             keys_live: false,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -19598,6 +19818,7 @@ impl Engine {
             slot_capacity: CHANNELS,
             plan_shadows: Vec::new(),
             monitor_pending: RefCell::new(None),
+            monitor_shadow: RefCell::new(MonitorShadow::default()),
             maps_to_audio,
             maps_from_audio,
             auto_to_audio,
@@ -19623,8 +19844,13 @@ impl Engine {
             inst_rate: rate as f32,
             preview_to_audio,
             preview_from_audio,
-            cap_rx,
-            stem_rx,
+            captures: std::collections::BTreeMap::new(),
+            pick_capacity: FIRST_PICKS,
+            capturing: RefCell::new(std::collections::BTreeSet::new()),
+            stems_to_audio: RefCell::new(stems_to_audio),
+            stems_from_audio: RefCell::new(stems_from_audio),
+            stem_rx: RefCell::new(None),
+            stem_slots: RefCell::new(Vec::new()),
             scope_rx,
             insert_tap_rx,
             reastream_rx: Some(reastream_rx),
@@ -20798,9 +21024,29 @@ impl Engine {
         }
     }
 
-    pub fn set_pick_strips(&self, strips: [Option<usize>; INPUTS]) {
-        for (cell, strip) in self.shared.pick_strip.iter().zip(strips) {
-            cell.store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+    /// **Which lane each pick feeds, by the pick's place**: today's road,
+    /// kept for its tests, onto the monitor's bindings (`MonitorPick`). Each
+    /// strip is a slot of the legacy desk, bound at the generation its lane
+    /// has now; the bridge binds by identity instead (`set_monitor_inputs`).
+    /// A plan goes only when a binding moved.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the legacy pick road: the bridge binds picks by identity"))]
+    pub fn set_pick_strips(&self, strips: &[Option<usize>]) {
+        let binds: Vec<Option<(Slot, u32)>> = strips
+            .iter()
+            .map(|s| {
+                let slot = Slot(u32::try_from((*s)?).ok()?);
+                Some((slot, self.lane_gen(slot)?))
+            })
+            .collect();
+        let changed = {
+            let mut sh = self.monitor_shadow.borrow_mut();
+            let changed = sh.binds != binds;
+            sh.binds = binds;
+            changed
+        };
+        if changed {
+            let plan = self.monitor_shadow.borrow().plan(true);
+            self.send_monitor(plan);
         }
     }
 
@@ -22045,18 +22291,162 @@ impl Engine {
 
     /// Which input picks tee into the capture rings — a bit per input, zero
     /// off. Flipped on when arrangement record starts, off when it stops.
+    ///
+    /// Today's road, a bit per pick below thirty-two, kept for its tests
+    /// onto [`Engine::set_capturing`], which has no such ceiling.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the legacy capture mask: a record names its picks"))]
     pub fn set_arr_capture(&self, mask: u32) {
-        self.shared.arr_capture.store(mask, Ordering::Relaxed);
+        let picks: Vec<PickId> = (0..32u32).filter(|p| mask & (1 << p) != 0).map(PickId).collect();
+        self.set_capturing(&picks);
     }
 
-    /// Drain one input's captured frames (interleaved stereo) into `out`.
-    pub fn drain_capture(&mut self, input: usize, out: &mut Vec<f32>) {
-        let Some(rx) = self.cap_rx.get_mut(input) else {
+    /// **Exactly these picks tee into their capture rings**, every other
+    /// pick stops. Set when an arrangement record starts, emptied when it
+    /// stops. `Release`: a flag the callback sees brings every op the host
+    /// pushed before it, the pick's own ring among them (`load_flags`), so a
+    /// ring sent ahead of its record is on the spine for the record's first
+    /// block. A pick past every bit a desk could need is no pick.
+    pub fn set_capturing(&self, picks: &[PickId]) {
+        let want: std::collections::BTreeSet<u32> =
+            picks.iter().map(|p| p.0).filter(|p| (*p as usize) < CAPTURE_WORDS * 64).collect();
+        let mut on = self.capturing.borrow_mut();
+        let bit = |p: u32| (p as usize / 64, 1u64 << (p % 64));
+        for &p in on.difference(&want) {
+            let (w, b) = bit(p);
+            self.shared.arr_capture[w].fetch_and(!b, Ordering::Release);
+        }
+        for &p in want.difference(&on) {
+            let (w, b) = bit(p);
+            self.shared.arr_capture[w].fetch_or(b, Ordering::Release);
+        }
+        *on = want;
+    }
+
+    /// Whether `pick`'s capture flag is set.
+    #[cfg_attr(not(test), allow(dead_code, reason = "asked by the record-under-shape-changes tests"))]
+    pub fn is_capturing(&self, pick: PickId) -> bool {
+        self.capturing.borrow().contains(&pick.0)
+    }
+
+    /// Drain one pick's captured frames (interleaved stereo) into `out`.
+    /// Nothing for a pick with no ring.
+    pub fn drain_capture(&mut self, pick: PickId, out: &mut Vec<f32>) {
+        let Some(rx) = self.captures.get_mut(&pick.0).and_then(|c| c.rx.as_mut()) else {
             return;
         };
         while let Ok(v) = rx.pop() {
             out.push(v);
         }
+    }
+
+    /// **Frames the capture tee had to drop** because a pick's ring was full:
+    /// the host stalled for seconds. Climbing means a take with a hole in it.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the capture tests; the counter has no reader on screen yet"))]
+    pub fn capture_dropped(&self) -> u64 {
+        self.shared.cap_dropped.load(Ordering::Relaxed)
+    }
+
+    /// **A capture ring for every pick named, and none for any other**
+    /// (design 7.12: capture rings are per ARMED pick). Called every frame
+    /// with the picks of the armed audio tracks: a pick that has no ring
+    /// gets a fresh one, built here and sent on the op ring, and a pick no
+    /// longer named sends its ring home, unless its capture is running, in
+    /// which case it waits for the record to end (design 7.4: a pick's ring
+    /// is never replaced, or taken, while its capture flag is set). An
+    /// engine nothing is armed on holds no capture ring at all.
+    pub fn sync_capture_rings(&mut self, armed: &[PickId]) -> Result<(), EngineBusy> {
+        self.drain_retired_ops();
+        let want: std::collections::BTreeSet<u32> = armed.iter().map(|p| p.0).collect();
+        let home: Vec<u32> = self
+            .captures
+            .iter()
+            .filter(|(p, c)| !want.contains(p) && !c.leaving)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in home {
+            if self.capturing.borrow().contains(&p) {
+                continue;
+            }
+            let op = crate::lane_bank::EngineOp::Capture { pick: PickId(p), ring: None };
+            if self.ops_tx.borrow_mut().push(op).is_err() {
+                return Err(EngineBusy::Busy);
+            }
+            if let Some(c) = self.captures.get_mut(&p) {
+                c.leaving = true;
+            }
+        }
+        for p in want {
+            if !self.captures.contains_key(&p) {
+                self.install_capture(PickId(p))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **A ring for `pick` now, if it has none**: what
+    /// [`Engine::sync_capture_rings`] would send it next frame, for a track
+    /// armed in the very frame its record starts. Leaves every other pick's
+    /// ring as it is.
+    pub fn arm_capture(&mut self, pick: PickId) -> Result<(), EngineBusy> {
+        self.drain_retired_ops();
+        if self.captures.contains_key(&pick.0) {
+            return Ok(());
+        }
+        self.install_capture(pick)
+    }
+
+    /// **A fresh ring for `pick`, sent on the op ring**: four seconds of
+    /// stereo, and never less than the capture-ring law asks
+    /// ([`capture_ring_frames`]). The slot it lands in is empty (the host
+    /// sends a ring only where it holds none), which the callback takes even
+    /// while the pick captures: nothing is replaced.
+    fn install_capture(&mut self, pick: PickId) -> Result<(), EngineBusy> {
+        let at = pick.0 as usize;
+        if at >= CAPTURE_WORDS * 64 {
+            return Err(EngineBusy::TooMany);
+        }
+        self.ensure_picks(at + 1)?;
+        if self.ops_tx.borrow().slots() < 1 {
+            return Err(EngineBusy::Busy);
+        }
+        let (tx, rx) = RingBuffer::<f32>::new(capture_ring_frames(self.output.sample_rate) * TAP_CHANNELS);
+        let op = crate::lane_bank::EngineOp::Capture { pick, ring: Some(tx) };
+        if self.ops_tx.borrow_mut().push(op).is_err() {
+            return Err(EngineBusy::Busy);
+        }
+        self.captures.insert(pick.0, HostCapture { rx: Some(rx), leaving: false });
+        Ok(())
+    }
+
+    /// **Room on the spine for `need` picks**: a Grow whose shell has the
+    /// lanes it has now and twice the capture slots, built here, when the
+    /// table is short. Rare: the table starts at [`FIRST_PICKS`] and doubles.
+    fn ensure_picks(&mut self, need: usize) -> Result<(), EngineBusy> {
+        if need <= self.pick_capacity {
+            return Ok(());
+        }
+        let mut cap = self.pick_capacity.max(1);
+        while cap < need {
+            cap = cap.saturating_mul(2);
+        }
+        if self.ops_tx.borrow().slots() < 2 {
+            return Err(EngineBusy::Busy);
+        }
+        let shell = Box::new(Spine::with_ext(self.slot_capacity, cap, Wide::new(self.slot_capacity)));
+        if self.ops_tx.borrow_mut().push(crate::lane_bank::EngineOp::Grow(shell)).is_err() {
+            return Err(EngineBusy::Busy);
+        }
+        self.pick_capacity = cap;
+        Ok(())
+    }
+
+    /// **How many bytes of capture ring the engine holds**, the ones on
+    /// their way in or out included: a ring per armed pick and none for
+    /// anything else, so it does not move as lanes are added (design 7.12).
+    #[cfg_attr(not(test), allow(dead_code, reason = "the memory measurement's own reading"))]
+    pub fn capture_ring_bytes(&self) -> usize {
+        let one = capture_ring_frames(self.output.sample_rate) * TAP_CHANNELS * size_of::<f32>();
+        self.captures.values().filter(|c| c.rx.is_some()).count() * one
     }
 
     /// One channel's pan, -1..1, centre unity. Pushed each frame with the
@@ -22080,8 +22470,70 @@ impl Engine {
     }
 
     /// The stem tap's switch: on for an export pass, off after.
+    ///
+    /// **On is every slot the spine has**, in slot order: today's tap, whose
+    /// frame was the whole desk buffer, kept for the roads and the goldens
+    /// that read a column by its slot. An export that knows its stems arms
+    /// only those ([`Engine::arm_stems`]). Off disarms; what the ring still
+    /// holds stays drainable until the next arm.
     pub fn set_stems(&self, on: bool) {
-        self.shared.stems_on.store(on, Ordering::Relaxed);
+        if on {
+            let every: Vec<Slot> = (0..self.slot_capacity as u32).map(Slot).collect();
+            self.arm_stems(&every);
+        } else {
+            self.send_stem_tap(None);
+        }
+    }
+
+    /// **Arm the stem tap for exactly these slots** (design 7.12: the stem
+    /// ring is built at arm time, for the armed slots). A frame of
+    /// [`Engine::drain_stems`] is then two floats per slot, in this order:
+    /// [`Engine::stem_column`] says where a slot's pair is. The ring holds
+    /// four seconds of them, built here; there is none until a pass asks.
+    pub fn arm_stems(&self, slots: &[Slot]) {
+        let floats = capture_ring_frames(self.output.sample_rate) * TAP_CHANNELS * slots.len().max(1);
+        let (tx, rx) = RingBuffer::<f32>::new(floats);
+        *self.stem_rx.borrow_mut() = Some(rx);
+        *self.stem_slots.borrow_mut() = slots.to_vec();
+        self.send_stem_tap(Some(StemTap::new(tx, slots)));
+    }
+
+    /// The tap onto its ring, the one it displaced dropped HERE first. A
+    /// ring with no room (a stalled callback) waits a millisecond at a time
+    /// for the callback to take one, the kit's own bargain.
+    fn send_stem_tap(&self, tap: Option<StemTap>) {
+        while self.stems_from_audio.borrow_mut().pop().is_ok() {}
+        let mut tap = Some(tap);
+        let deadline = retire_deadline(self.offline.is_some());
+        loop {
+            match self.stems_to_audio.borrow_mut().push(tap.take().flatten()) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(back)) => tap = Some(back),
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            while self.stems_from_audio.borrow_mut().pop().is_ok() {}
+        }
+    }
+
+    /// **Where a slot's stem is** in a frame of [`Engine::drain_stems`]:
+    /// its pair starts at twice this. `None` for a slot the tap was not
+    /// armed for.
+    pub fn stem_column(&self, slot: Slot) -> Option<usize> {
+        self.stem_slots.borrow().iter().position(|s| *s == slot)
+    }
+
+    /// **How many bytes of stem ring the engine holds**: none until a pass
+    /// arms the tap, and then four seconds of the slots it armed, never of
+    /// the whole desk (design 7.12).
+    #[cfg_attr(not(test), allow(dead_code, reason = "the memory measurement's own reading"))]
+    pub fn stem_ring_bytes(&self) -> usize {
+        self.stem_rx
+            .borrow()
+            .as_ref()
+            .map_or(0, |rx| rx.buffer().capacity() * size_of::<f32>())
     }
 
     /// **Take the stems DRY: every strip's own inserts out of the tap.**
@@ -22099,21 +22551,26 @@ impl Engine {
     }
 
     /// Drain the stem tap into `out`: interleaved stereo, one column pair
-    /// per SLOT, [`Engine::stem_frame_width`] floats per frame. That width is
-    /// bound when the tap is armed and held for the whole export, so a desk
-    /// that grows mid-export never changes it; on a desk of thirty-two lanes
-    /// it is `CHANNELS * 2`, as it always was.
+    /// per armed SLOT ([`Engine::stem_column`]), [`Engine::stem_frame_width`]
+    /// floats per frame. Bound when the tap is armed and held for the whole
+    /// export, so a desk that grows mid-export never changes it.
     pub fn drain_stems(&mut self, out: &mut Vec<f32>) {
-        while let Ok(v) = self.stem_rx.pop() {
-            out.push(v);
+        let mut rx = self.stem_rx.borrow_mut();
+        let Some(rx) = rx.as_mut() else {
+            return;
+        };
+        if let Ok(chunk) = rx.read_chunk(rx.slots()) {
+            let (a, b) = chunk.as_slices();
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            chunk.commit_all();
         }
     }
 
     /// **How many floats one frame of [`Engine::drain_stems`] is**: two per
-    /// slot of the desk as it stood when the stem tap was last armed. Read it
-    /// after arming and a block, as the export does before it slices.
+    /// slot the tap was last armed for, known the moment it is armed.
     pub fn stem_frame_width(&self) -> usize {
-        self.shared.stem_width.load(Ordering::Relaxed)
+        self.stem_slots.borrow().len() * TAP_CHANNELS
     }
 
     /// Everything the scope tap delivered since the last frame —
@@ -22422,14 +22879,45 @@ impl Engine {
     /// inputs does not change what is IN it — only which columns each strip
     /// reads. Nothing has to be flushed and nothing can be misread: every
     /// frame in the ring means the same thing before and after.
-    pub fn set_monitor_layout(&self, widths: [u8; INPUTS], picks: tangent_record::audio::Picks) {
-        self.send_monitor(crate::lane_bank::MonitorPlan {
-            widths: widths.to_vec().into_boxed_slice(),
-            columns: picks,
-            layout_only: true,
-            fresh: true,
-            ..crate::lane_bank::MonitorPlan::default()
-        });
+    #[cfg_attr(not(test), allow(dead_code, reason = "the stream's own layout reaches the monitor through the bridge"))]
+    pub fn set_monitor_layout(&self, widths: &[u8], picks: tangent_record::audio::Picks) {
+        let plan = {
+            let mut sh = self.monitor_shadow.borrow_mut();
+            sh.layout = stream_layout(widths, &picks, sh.channels);
+            sh.columns = picks;
+            sh.plan(true)
+        };
+        self.send_monitor(plan);
+    }
+
+    /// **The live input's whole layout, from the bridge**: every pick of the
+    /// stream by `PickId`, each with its lane (slot and generation) and its
+    /// device columns, and the stream's own picks (design 7.5: "MonitorPlan
+    /// pick bindings `(PickId -> slot, gen, width)`"). Compared with what the
+    /// monitor was last told and sent only when it differs, so the bridge
+    /// may hand it over every frame. Answers whether a plan went.
+    pub fn set_monitor_inputs(
+        &self,
+        picks: &[crate::lane_bank::MonitorPick],
+        columns: &tangent_record::audio::Picks,
+    ) -> bool {
+        let layout: Vec<(u8, [u16; 2])> = picks.iter().map(|p| (p.width, p.cols)).collect();
+        let binds: Vec<Option<(Slot, u32)>> = picks
+            .iter()
+            .map(|p| (p.gen != crate::lane_bank::MonitorPick::NO_LANE).then_some((p.slot, p.gen)))
+            .collect();
+        let plan = {
+            let mut sh = self.monitor_shadow.borrow_mut();
+            if sh.layout == layout && sh.binds == binds && sh.columns == *columns {
+                return false;
+            }
+            sh.layout = layout;
+            sh.binds = binds;
+            sh.columns = columns.clone();
+            sh.plan(true)
+        };
+        self.send_monitor(plan);
+        true
     }
 
     /// **A monitor plan onto the op ring**, or parked here until there is
@@ -22474,56 +22962,78 @@ impl Engine {
 
     /// **A pick's capture ring, swapped on the op ring** (contract C8,
     /// design 7.4 `Capture`). `None` takes the pick's ring away. The ring
-    /// being replaced comes home and is dropped here.
+    /// being replaced comes home and is dropped here. The caller keeps the
+    /// read end; the host's own road is [`Engine::sync_capture_rings`].
     ///
-    /// `Busy` while the pick is capturing (`set_arr_capture` has its bit): a
-    /// take's ring is never replaced under it, and the callback would refuse
-    /// the op anyway. `TooMany` for a pick past the engine's picks.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the monitor plan and capture rings are W5-engine-memory-inputs'"))]
+    /// `Busy` while the pick is capturing and holds a ring: a take's ring is
+    /// never replaced or taken under it, and the callback would refuse the
+    /// op anyway. `TooMany` for a pick past every bit a desk could need. A
+    /// pick past the spine's table grows it first.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the host's capture rings travel by `sync_capture_rings`"))]
     pub fn set_capture_ring(&mut self, pick: PickId, ring: Option<Producer<f32>>) -> Result<(), EngineBusy> {
         self.drain_retired_ops();
         let at = pick.0 as usize;
-        if at >= INPUTS {
+        if at >= CAPTURE_WORDS * 64 {
             return Err(EngineBusy::TooMany);
         }
-        if u64::from(self.shared.arr_capture.load(Ordering::Relaxed)) & word_bit(at) != 0 {
+        if self.capturing.borrow().contains(&pick.0) && self.captures.contains_key(&pick.0) {
             return Err(EngineBusy::Busy);
         }
+        self.ensure_picks(at + 1)?;
         if self.ops_tx.borrow().slots() < 1 {
             return Err(EngineBusy::Busy);
         }
+        let taking = ring.is_none();
         let op = crate::lane_bank::EngineOp::Capture { pick, ring };
-        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)
+        self.ops_tx.borrow_mut().push(op).map_err(|_| EngineBusy::Busy)?;
+        // **The host's record**: a ring whose read end the caller holds, or
+        // one on its way home.
+        if taking {
+            if let Some(c) = self.captures.get_mut(&pick.0) {
+                c.leaving = true;
+            }
+        } else {
+            self.captures.insert(pick.0, HostCapture { rx: None, leaving: false });
+        }
+        Ok(())
     }
 
     /// Hand the renderer the live input's ring. `None` takes it away.
-    pub fn set_monitor(
-        &mut self,
-        tap: Option<(
-            Consumer<f32>,
-            u16,
-            [u8; INPUTS],
-            u32,
-            tangent_record::audio::Picks,
-        )>,
-    ) {
+    ///
+    /// The ring arrives with the stream's own layout (its widths and
+    /// honoured picks, read off the sink that opened it) and with the
+    /// bindings the monitor already had, by PickId: a device reopened under
+    /// a desk keeps every input on its lane. The bridge's layout, if it
+    /// differs, follows on the next frame (`set_monitor_inputs`).
+    pub fn set_monitor(&mut self, tap: Option<MonitorTap>) {
         // The plans the callback sent home, the old rings in them, dropped
         // here first.
         self.drain_retired_ops();
-        let plan = match tap {
-            Some((ring, channels, widths, block, picks)) => crate::lane_bank::MonitorPlan {
-                ring: Some(ring),
-                channels,
-                block,
-                widths: widths.to_vec().into_boxed_slice(),
-                columns: picks,
-                fresh: true,
-                ..crate::lane_bank::MonitorPlan::default()
-            },
-            None => crate::lane_bank::MonitorPlan {
-                fresh: true,
-                ..crate::lane_bank::MonitorPlan::default()
-            },
+        let plan = {
+            let mut sh = self.monitor_shadow.borrow_mut();
+            match tap {
+                Some((ring, channels, widths, block, picks)) => {
+                    sh.channels = channels;
+                    sh.block = block;
+                    sh.layout = stream_layout(&widths, &picks, channels);
+                    sh.columns = picks;
+                    crate::lane_bank::MonitorPlan {
+                        ring: Some(ring),
+                        channels,
+                        block,
+                        scratch: vec![0.0; MONITOR_SCRATCH_FRAMES * usize::from(channels).max(TAP_CHANNELS)],
+                        ..sh.plan(false)
+                    }
+                }
+                None => {
+                    sh.channels = 0;
+                    sh.block = 0;
+                    crate::lane_bank::MonitorPlan {
+                        fresh: true,
+                        ..crate::lane_bank::MonitorPlan::default()
+                    }
+                }
+            }
         };
         self.send_monitor(plan);
     }
@@ -25782,7 +26292,8 @@ mod tests {
         pub(super) fn for_tests(capacity: usize, shared: Arc<Shared>, tap: Producer<f32>, dev_ch: usize) -> Renderer {
             let mut r = legacy_test_renderer(Arc::clone(&shared), tap, dev_ch);
             if capacity > r.spine.capacity() {
-                let mut shell: Spine<Lane, Wide> = Spine::with_ext(capacity, INPUTS, Wide::new(capacity));
+                let mut shell: Spine<Lane, Wide> =
+                    Spine::with_ext(capacity, r.spine.captures.len(), Wide::new(capacity));
                 for i in 0..r.spine.lanes.len() {
                     shell.lanes[i] = r.spine.lanes[i].take();
                     shell.gens[i] = r.spine.gens[i];
@@ -25855,13 +26366,14 @@ mod tests {
         Renderer {
             monitor: None,
             monitor_channels: 0,
-            monitor_gain: [0.0; INPUTS],
-            room_audible: [1.0; INPUTS],
-            monitor_widths: [0; INPUTS],
-            monitor_picks: tangent_record::audio::Picks::EVERYTHING,
+            monitor_picks: Box::new([]),
+            monitor_columns: tangent_record::audio::Picks::EVERYTHING,
+            monitor_fades: Box::new([]),
             monitor_block: 0,
             monitor_scratch: Vec::new(),
-            stem_tx: RingBuffer::<f32>::new(1 << 16).0,
+            stem: None,
+            stems_incoming: RingBuffer::<Option<StemTap>>::new(2).1,
+            stems_retiring: RingBuffer::<Option<StemTap>>::new(2).0,
             has_folders: false,
             scope_tx: RingBuffer::<f32>::new(1 << 15).0,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -25889,7 +26401,6 @@ mod tests {
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
-            stem_cols: CHANNELS * 2,
             stems_wanted: false,
             keys_live: false,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -26329,16 +26840,39 @@ mod tests {
     }
 
 
-    /// **An `INPUTS`-wide array from the entries that matter.** The fixtures
-    /// used to write `[a, b, c, d]` literals, which pinned them to a cap of
-    /// four — see `tangent_record::audio::MAX_PICKS`, now one per channel.
-    /// The interesting slots are the leading ones in every one of them.
-    fn inputs_array<T: Copy + Default, const N: usize>(head: [T; N]) -> [T; INPUTS] {
-        let mut out = [T::default(); INPUTS];
-        for (slot, v) in out.iter_mut().zip(head) {
-            *slot = v;
-        }
-        out
+    /// **A test renderer's monitor layout: these widths, in the stream's own
+    /// order**, each pick reading the columns a stream that never named an
+    /// input lays end to end (`Picks::EVERYTHING`), none bound to a lane yet,
+    /// every fade at rest. The tables a monitor plan brings, set straight onto
+    /// the renderer; `r.monitor_channels` first, as the plan's ring would.
+    fn test_widths(r: &mut Renderer, widths: &[u8]) {
+        use crate::lane_bank::MonitorPick;
+        let layout = stream_layout(
+            widths,
+            &tangent_record::audio::Picks::EVERYTHING,
+            u16::try_from(r.monitor_channels).unwrap_or(u16::MAX),
+        );
+        r.monitor_picks = layout
+            .iter()
+            .enumerate()
+            .map(|(p, &(width, cols))| MonitorPick {
+                pick: PickId(p as u32),
+                slot: Slot(0),
+                gen: MonitorPick::NO_LANE,
+                width,
+                cols,
+            })
+            .collect();
+        r.monitor_fades = vec![[0.0, 1.0]; widths.len()].into_boxed_slice();
+    }
+
+    /// **Pick `pick` plays onto lane `lane`**, at the generation the lane
+    /// holds: what the host's `pick_strip` store said before the binding
+    /// moved into the plan.
+    fn test_bind(r: &mut Renderer, pick: usize, lane: usize) {
+        let gen = r.spine.lanes.get(lane).and_then(Option::as_deref).map_or(LEGACY_GEN, |l| l.gen);
+        r.monitor_picks[pick].slot = Slot(lane as u32);
+        r.monitor_picks[pick].gen = gen;
     }
 
     fn queue(tx: &mut Producer<MidiEvent>, stamp: Nanos, bytes: [u8; 3]) {
@@ -28386,7 +28920,7 @@ mod tests {
         // An AUDIO lane: no live MIDI, and armed to the room.
         e.set_midi_off(1 << CH);
         e.set_armed(1 << CH);
-        e.set_pick_strips(inputs_array([Some(CH)]));
+        e.set_pick_strips(&[Some(CH)]);
         e.set_monitor_on(true);
         e.set_rolling(false);
         let mut out = vec![0.0f32; FRAMES * 2];
@@ -28402,7 +28936,7 @@ mod tests {
         e.set_monitor(Some((
             ring,
             1,
-            inputs_array([1]),
+            vec![1].into_boxed_slice(),
             FRAMES as u32,
             tangent_record::audio::Picks::EVERYTHING,
         )));
@@ -28598,7 +29132,7 @@ mod tests {
         e.set_master_gain(1.0);
         e.set_midi_off(1 << CH);
         e.set_armed(1 << CH);
-        e.set_pick_strips(inputs_array([Some(CH)]));
+        e.set_pick_strips(&[Some(CH)]);
         e.set_monitor_on(false);
         e.set_rolling(false);
         let mut out = vec![0.0f32; FRAMES * 2];
@@ -28610,7 +29144,7 @@ mod tests {
         e.set_monitor(Some((
             ring,
             1,
-            inputs_array([1]),
+            vec![1].into_boxed_slice(),
             FRAMES as u32,
             tangent_record::audio::Picks::EVERYTHING,
         )));
@@ -30106,13 +30640,13 @@ mod tests {
             // **Armed with an input open** — the state a lane is left in the
             // moment a record finishes, and the whole point of the fixture.
             e.set_armed(1 << CH);
-            e.set_pick_strips(inputs_array([None, None, None, Some(CH)]));
+            e.set_pick_strips(&[None, None, None, Some(CH)]);
             e.set_monitor_on(monitoring);
             let (mut jack, ring) = RingBuffer::<f32>::new(1 << 15);
             e.set_monitor(Some((
                 ring,
                 1,
-                inputs_array([0, 0, 0, 1]),
+                vec![0, 0, 0, 1].into_boxed_slice(),
                 FRAMES as u32,
                 tangent_record::audio::Picks::EVERYTHING,
             )));
@@ -32197,10 +32731,10 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_block = BLOCK;
             r.monitor_scratch = vec![0.0; 8192];
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
             r.lane_body_mut(1).channel_gain = 1.0;
@@ -32288,10 +32822,10 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_block = BLOCK;
             r.monitor_scratch = vec![0.0; 8192];
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
             r.lane_body_mut(1).channel_gain = 1.0;
@@ -32361,12 +32895,12 @@ mod tests {
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
-        r.monitor_widths = inputs_array([1]);
+        test_widths(&mut r, &[1]);
         r.monitor_scratch = vec![0.0; 8192];
         // A live input on channel 1, armed and heard, routed whole to
         // channel 2 through an empty rack. The transport is parked and there
         // is no clip anywhere.
-        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        test_bind(&mut r, 0, 1);
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.armed.store(1 << 1, Ordering::Relaxed);
         shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -35020,15 +35554,19 @@ mod tests {
 
     /// **The engine's own numbers are the capture's and the frozen map's.**
     ///
-    /// `tangent-record` declares `MAX_PICKS` because that is where the
-    /// channels are actually kept, and the engine's picks ARE that number now,
-    /// not a copy of the UI's: a desk with more strips than the capture has
-    /// picks would draw channels nothing can ever fill. The engine's strip
-    /// space is the frozen V32 map's (design Appendix A), whatever the UI's
-    /// live desk grows to.
+    /// The capture keeps a pick for every track that binds one, with no
+    /// number of its own (`tangent_record::audio::Picks`; its `MAX_PICKS` is
+    /// gone), so the engine's capture flags cover a pick for every row a
+    /// desk can have: a desk with more strips than the capture had picks drew
+    /// channels nothing could ever fill. The engine's strip space is the
+    /// frozen V32 map's (design Appendix A), whatever the UI's live desk
+    /// grows to.
     #[test]
     fn the_desk_has_as_many_inputs_as_the_capture_can_keep() {
-        assert_eq!(INPUTS, tangent_record::audio::MAX_PICKS);
+        assert!(
+            CAPTURE_WORDS * 64 >= tangent_ui::desk_id::MAX_ROWS,
+            "a pick a desk can bind has no capture flag"
+        );
         assert_eq!(STRIPS, tangent_ui::desk_legacy::V32_STRIPS, "the strip space left the frozen map");
         assert_eq!(MASTER_SEAT, tangent_ui::desk_lift::V32_MASTER, "the master's seat left the frozen map");
         assert_eq!(
@@ -35073,12 +35611,12 @@ mod tests {
         }
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
-        r.monitor_widths = inputs_array([1]);
+        test_widths(&mut r, &[1]);
         r.monitor_block = BLOCK;
         r.monitor_scratch = vec![0.0; 8192];
         // Pick 0 feeds channel 1 — an AUDIO channel by assignment, exactly
         // what the host pushes for the first audio-kind channel.
-        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        test_bind(&mut r, 0, 1);
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         r.lane_body_mut(1).channel_gain = 1.0;
@@ -35141,7 +35679,7 @@ mod tests {
         }
         r.monitor = Some(in_rx);
         r.monitor_channels = 3;
-        r.monitor_widths = inputs_array([1, 2]);
+        test_widths(&mut r, &[1, 2]);
         r.monitor_block = 512;
         // NOT a multiple of three, exactly as `widest * 4096` is not a
         // multiple of eighteen.
@@ -35181,16 +35719,16 @@ mod tests {
             }
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
             // At the fader's destination rather than on its way there: the
             // slews are per sample and this test is about routing. The pick
             // feeds channel 1, an AUDIO channel by assignment.
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
             r.lane_body_mut(1).channel_gain = 1.0;
-            r.monitor_gain[0] = 1.0;
+            r.monitor_fades[0][0] = 1.0;
             shared.monitor_on.store(monitored, Ordering::Relaxed);
             r.room_gain = if monitored { 1.0 } else { 0.0 };
 
@@ -35260,9 +35798,9 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
             // `Shared::new` arms EVERYTHING until the desk pushes a mask.
@@ -35336,12 +35874,12 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
             // Lane 1 is the child, lane 2 its folder — pushed the way the desk
             // pushes it, so the renderer's own tree walk builds the folder.
             shared.lanes.get(1).folder_of.store(2, Ordering::Relaxed);
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
             shared.lanes.get(2).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -35432,9 +35970,9 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
-            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            test_bind(&mut r, 0, 1);
             shared.midi_off.store(1 << 1 | 1 << 9, Ordering::Relaxed);
             shared.armed.store(1 << 1, Ordering::Relaxed);
             shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -35512,7 +36050,7 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
             let child = tree[0].0;
             for &(lane, parent) in tree {
@@ -35524,7 +36062,7 @@ mod tests {
                     r.lane_body_mut(p).channel_gain = 1.0;
                 }
             }
-            shared.pick_strip[0].store(child as i64, Ordering::Relaxed);
+            test_bind(&mut r, 0, child);
             shared.midi_off.store(1 << child, Ordering::Relaxed);
             shared.armed.store(1 << child, Ordering::Relaxed);
             shared.send_cell(strip_of_index(sender)).expect("a strip").store(folder_send.to_bits(), Ordering::Relaxed);
@@ -35612,12 +36150,12 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = inputs_array([1]);
+            test_widths(&mut r, &[1]);
             r.monitor_scratch = vec![0.0; 8192];
             // Lane 1 in lane 2 is what makes lane 2 a folder, and the input
             // is bound to the folder's OWN strip.
             shared.lanes.get(1).folder_of.store(2, Ordering::Relaxed);
-            shared.pick_strip[0].store(2, Ordering::Relaxed);
+            test_bind(&mut r, 0, 2);
             shared.midi_off.store(1 << 2, Ordering::Relaxed);
             shared.armed.store(1 << 2, Ordering::Relaxed);
             shared.lanes.get(2).gain.store(0.5f32.to_bits(), Ordering::Relaxed);
@@ -35724,9 +36262,9 @@ mod tests {
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
-        r.monitor_widths = inputs_array([1]);
+        test_widths(&mut r, &[1]);
         r.monitor_scratch = vec![0.0; 8192];
-        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        test_bind(&mut r, 0, 1);
         shared.midi_off.store(1 << 1, Ordering::Relaxed);
         shared.lanes.get(1).gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         shared.armed.store(1 << 1, Ordering::Relaxed);
@@ -37438,21 +37976,21 @@ mod slot_engine {
             assert_eq!(c, 0, "an Attach allocated at {lanes}");
             let (_, ring) = RingBuffer::<f32>::new(4096);
             let picks = tangent_record::audio::Picks::EVERYTHING;
-            e.set_monitor(Some((ring, 2, [2; INPUTS], 512, picks)));
+            e.set_monitor(Some((ring, 2, vec![2; 32].into_boxed_slice(), 512, picks.clone())));
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "a monitor ring arriving allocated at {lanes}");
-            e.set_monitor_layout([1; INPUTS], picks);
+            e.set_monitor_layout(&[1; 32], picks.clone());
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "a monitor layout allocated at {lanes}");
             let (_, ring) = RingBuffer::<f32>::new(4096);
-            e.set_monitor(Some((ring, 2, [2; INPUTS], 512, picks)));
+            e.set_monitor(Some((ring, 2, vec![2; 32].into_boxed_slice(), 512, picks.clone())));
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "a monitor ring displacing one allocated at {lanes}");
             // A ring and its layout landing in ONE apply: the layout joins
             // the untaken ring's plan.
             let (_, ring) = RingBuffer::<f32>::new(4096);
-            e.set_monitor(Some((ring, 2, [2; INPUTS], 512, picks)));
-            e.set_monitor_layout([1; INPUTS], picks);
+            e.set_monitor(Some((ring, 2, vec![2; 32].into_boxed_slice(), 512, picks.clone())));
+            e.set_monitor_layout(&[1; 32], picks.clone());
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "a monitor ring and its layout in one block allocated at {lanes}");
             let (cap, _) = RingBuffer::<f32>::new(64);
@@ -37792,26 +38330,26 @@ mod slot_engine {
         warm(&mut e);
         let (_tx, ring) = RingBuffer::<f32>::new(4096);
         let picks = tangent_record::audio::Picks::EVERYTHING;
-        e.set_monitor(Some((ring, 2, [2; INPUTS], 512, picks)));
-        let mut widths = [0u8; INPUTS];
-        widths[0] = 1;
-        e.set_monitor_layout(widths, picks);
+        e.set_monitor(Some((ring, 2, vec![2].into_boxed_slice(), 512, picks.clone())));
+        e.set_monitor_layout(&[1], picks.clone());
         assert_eq!(counted_block(&mut e), 0, "the pair allocated on the callback");
         let r = e.offline.as_ref().expect("a renderer");
         assert!(r.monitor.is_some(), "the new device's ring went home unused");
         assert_eq!(r.monitor_channels, 2);
-        assert_eq!(r.monitor_widths[0], 1, "the layout pushed after the ring was lost");
+        assert_eq!(r.monitor_picks[0].width, 1, "the layout pushed after the ring was lost");
         // And through the slot API's own door, a layout alone.
+        use crate::lane_bank::MonitorPick;
         let plan = crate::lane_bank::MonitorPlan {
-            widths: vec![2; INPUTS].into_boxed_slice(),
-            columns: picks,
             layout_only: true,
-            ..crate::lane_bank::MonitorPlan::default()
+            ..crate::lane_bank::MonitorPlan::with_picks(
+                vec![MonitorPick { pick: PickId(0), slot: Slot(0), gen: MonitorPick::NO_LANE, width: 2, cols: [0, 1] }],
+                picks,
+            )
         };
         e.set_monitor_plan(plan).expect("never refused");
         assert_eq!(counted_block(&mut e), 0);
         let r = e.offline.as_ref().expect("a renderer");
-        assert!(r.monitor.is_some() && r.monitor_widths[0] == 2);
+        assert!(r.monitor.is_some() && r.monitor_picks[0].width == 2);
     }
 
     /// **A Grow while a route plays moves no bit** (design 7.3): the stride
@@ -37940,12 +38478,12 @@ mod slot_engine {
         let mut r = Renderer::for_tests(64, Arc::clone(&shared), tap, 2);
         assert_eq!(r.spine.capacity(), 64);
         let (tx, rx) = RingBuffer::<f32>::new(1000);
-        r.stem_tx = tx;
-        shared.stems_on.store(true, Ordering::Relaxed);
+        let every: Vec<Slot> = (0..64).map(Slot).collect();
+        r.stem = Some(StemTap::new(tx, &every));
         let mut out = vec![0.0f32; BLOCK * 2];
         r.render(&mut out, 0, 0);
-        let width = shared.stem_width.load(Ordering::Relaxed);
-        assert_eq!(width, 128, "the bound width is not the desk's");
+        let width = r.stem.as_ref().map_or(0, |t| t.row.len());
+        assert_eq!(width, 128, "the bound width is not the armed slots'");
         assert_eq!(rx.slots(), 1000 / 128 * 128, "{} floats is not whole {width}-float frames", rx.slots());
     }
 
@@ -38173,7 +38711,12 @@ mod slot_engine {
             assert!(ring.push(0.25).is_ok());
         }
         assert_eq!(rx.pop().ok(), Some(0.25), "the tee writes into some other ring");
-        assert_eq!(e.set_capture_ring(PickId(INPUTS as u32), None), Err(EngineBusy::TooMany));
+        // A pick past the table grows it; only a pick past every row a desk
+        // could have is no pick.
+        assert_eq!(
+            e.set_capture_ring(PickId(tangent_ui::desk_id::MAX_ROWS as u32), None),
+            Err(EngineBusy::TooMany)
+        );
         e.set_arr_capture(1 << 1);
         let (busy, _) = RingBuffer::<f32>::new(64);
         assert_eq!(e.set_capture_ring(PickId(1), Some(busy)), Err(EngineBusy::Busy));
@@ -38197,9 +38740,7 @@ mod slot_engine {
     fn the_capture_tee_writes_the_picks_ring_and_a_swapped_one() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("an offline engine");
         let (mut tx, rx) = RingBuffer::<f32>::new(48_000 * 2);
-        let mut widths = [0u8; INPUTS];
-        widths[0] = 2;
-        e.set_monitor(Some((rx, 2, widths, 1024, tangent_record::audio::Picks::EVERYTHING)));
+        e.set_monitor(Some((rx, 2, vec![2].into_boxed_slice(), 1024, tangent_record::audio::Picks::EVERYTHING)));
         let mut out = vec![0.0f32; BLOCK * 2];
         e.render_offline(&mut out);
         let feed = |tx: &mut Producer<f32>| {
@@ -38207,11 +38748,16 @@ mod slot_engine {
                 let _ = tx.push(if i % 2 == 0 { 0.25 } else { -0.25 });
             }
         };
+        // **No ring until the pick is armed** (design 7.12): an engine holds
+        // none of its own, and the armed pick's arrives on the op ring.
+        assert_eq!(e.capture_ring_bytes(), 0, "an engine with nothing armed holds a capture ring");
+        e.sync_capture_rings(&[PickId(0)]).expect("a ring for the armed pick");
+        assert!(e.capture_ring_bytes() > 0);
         e.set_arr_capture(1);
         feed(&mut tx);
         e.render_offline(&mut out);
         let mut got = Vec::new();
-        e.drain_capture(0, &mut got);
+        e.drain_capture(PickId(0), &mut got);
         assert!(got.contains(&0.25), "the tee wrote nothing into the pick's ring");
         e.set_arr_capture(0);
         let (swapped, mut taken) = RingBuffer::<f32>::new(1 << 16);
@@ -38222,7 +38768,7 @@ mod slot_engine {
         e.render_offline(&mut out);
         assert_eq!(taken.pop().ok(), Some(0.25), "the swapped-in ring took nothing");
         let mut old = Vec::new();
-        e.drain_capture(0, &mut old);
+        e.drain_capture(PickId(0), &mut old);
         assert!(old.is_empty(), "the replaced ring still took the take");
     }
 
@@ -38259,12 +38805,10 @@ mod ir_road {
     fn ir_loop_rig() -> (Engine, Producer<f32>) {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
         let (tx, rx) = RingBuffer::<f32>::new(48_000 * 2);
-        let mut widths = [0u8; INPUTS];
-        widths[0] = 2;
         e.set_monitor(Some((
             rx,
             2,
-            widths,
+            vec![2].into_boxed_slice(),
             1024,
             tangent_record::audio::Picks::EVERYTHING,
         )));
@@ -40023,4 +40567,240 @@ fn plan_words(plan: &DeskPlan) -> Vec<(&'static str, serde_json::Value)> {
         ("insert_key_n", serde_json::json!(keys.len())),
         ("insert_key", serde_json::json!(keys)),
     ]
+}
+
+// ── inputs and memory, sized by use (W5-engine-memory-inputs) ───────────────
+#[cfg(test)]
+mod memory_inputs {
+    //! **Every audio track can bind, arm, meter and record any device input,
+    //! and what an engine holds is what it is using** (design 7.12, 7.13 and
+    //! W5-engine-memory-inputs). The picks are as many as the bound tracks,
+    //! each reading its own device columns and bound to its lane by slot
+    //! and generation; a capture ring exists for an armed pick and nothing
+    //! else; the stem ring exists for the slots an export armed.
+    use super::*;
+    use crate::desk_plan::{InLane, LaneFlags, PlanInputs, Slot};
+    use crate::engine_bridge::{InputRow, InputStream, LaneAt, PickTable};
+    use tangent_record::audio::{ChannelPick, Picks};
+    use tangent_ui::desk_id::TrackId;
+
+    const RATE: u32 = 48_000;
+    const BLOCK: usize = 512;
+
+    fn audio() -> LaneSpec {
+        LaneSpec { kind: LaneKind::Audio, drum: false }
+    }
+
+    /// The plan naming every lane below `lanes`, each with `flags`.
+    fn every_lane(e: &Engine, lanes: usize, flags: LaneFlags) -> PlanInputs {
+        PlanInputs {
+            lanes: (0..lanes)
+                .map(|s| InLane {
+                    slot: Slot(s as u32),
+                    gen: e.lane_gen(Slot(s as u32)).expect("a lane at every slot"),
+                    flags,
+                    parent: None,
+                    punch: None,
+                    midi: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                    pick: None,
+                })
+                .collect(),
+            ..PlanInputs::default()
+        }
+    }
+
+    /// An offline engine with a lane in every slot below `lanes` (the
+    /// legacy thirty-two, then `spec` past them) and a plan naming them all
+    /// with `flags`, landed.
+    fn engine_with(lanes: usize, spec: LaneSpec, flags: LaneFlags) -> Engine {
+        let mut e = Engine::offline_sized(RATE, Timebase::new(), lanes.max(CHANNELS)).expect("an offline engine");
+        let fresh: Vec<(Slot, LaneSpec)> = (CHANNELS..lanes).map(|s| (Slot(s as u32), spec)).collect();
+        if !fresh.is_empty() {
+            e.install_lanes(fresh).expect("the lanes install");
+        }
+        e.settle_offline();
+        e.publish_plan(&every_lane(&e, lanes, flags)).expect("the plan goes");
+        e.settle_offline();
+        e
+    }
+
+    /// Track `i` on slot `i`, at the generation its lane holds.
+    fn lane_of(e: &Engine) -> impl Fn(TrackId) -> Option<LaneAt> + '_ {
+        |id| {
+            let slot = Slot(id.0);
+            e.lane_gen(slot).map(|gen| LaneAt { slot, gen })
+        }
+    }
+
+    /// Device column `c`'s own level: a number no other column carries.
+    fn level(c: usize) -> f32 {
+        (c + 1) as f32 / 256.0
+    }
+
+    /// One block of a `dev`-channel device whose column `c` holds `level(c)`.
+    fn device_block(dev: usize, frames: usize) -> Vec<f32> {
+        (0..frames).flat_map(|_| (0..dev).map(level)).collect()
+    }
+
+    /// A lane's meter, both sides, read and cleared.
+    fn meter(e: &Engine, slot: usize) -> [f32; 2] {
+        let cells = e.lane_shared(Slot(slot as u32)).expect("the lane's numbers");
+        std::array::from_fn(|c| f32::from_bits(cells.peak[c].swap(0, Ordering::Relaxed)))
+    }
+
+    /// **Two hundred tracks bind inputs, on an eight-input and on a
+    /// sixty-four-input interface, and every one hears its own** (W5, done
+    /// when: "200 tracks bind inputs on fake 8-input and 64-input devices").
+    ///
+    /// The cap this replaces was thirty-two picks, so the thirty-third track
+    /// bound could be armed and metered and never received a sample. Here
+    /// every track names an input (a mono one, or every fifth a pair), most
+    /// of them shared with another track because two hundred is far more
+    /// than either box has; each track is armed, so its meter reads its
+    /// input at the jack (`meter_source`), and each device column carries a
+    /// level no other carries, so a track reading a neighbour's column reads
+    /// a wrong number rather than a plausible one.
+    #[test]
+    fn two_hundred_tracks_hear_their_own_inputs_on_eight_and_sixty_four_inputs() {
+        const TRACKS: usize = 200;
+        for dev in [8usize, 64] {
+            let mut e = engine_with(TRACKS, audio(), LaneFlags::ARMED | LaneFlags::MIDI_OFF);
+            let spec = |i: usize| {
+                if i % 5 == 4 {
+                    ChannelPick::Stereo((i % dev) as u16, ((i + 1) % dev) as u16)
+                } else {
+                    ChannelPick::Mono((i % dev) as u16)
+                }
+            };
+            let rows: Vec<InputRow> = (0..TRACKS)
+                .map(|i| InputRow { id: TrackId(i as u32), audio: true, spec: Some(spec(i)), armed: true })
+                .collect();
+            let stream = InputStream { device_channels: Some(dev), picks: Picks::EVERYTHING };
+            let mut table = PickTable::default();
+            table.bind(&rows, &stream);
+            assert_eq!(table.picks().len(), TRACKS, "on {dev} inputs: a pick per bound track, nothing cut");
+            let monitor = table.monitor(lane_of(&e));
+            assert!(monitor.iter().all(|m| m.gen != crate::lane_bank::MonitorPick::NO_LANE), "a track bound to no lane");
+            let (mut tx, rx) = RingBuffer::<f32>::new(dev * BLOCK * 8);
+            e.set_monitor(Some((rx, dev as u16, vec![dev as u8].into_boxed_slice(), BLOCK as u32, Picks::EVERYTHING)));
+            assert!(e.set_monitor_inputs(&monitor, &Picks::EVERYTHING), "the layout was not sent");
+            let mut out = vec![0.0f32; BLOCK * 2];
+            for _ in 0..4 {
+                let _ = tx.write_chunk_uninit(dev * BLOCK).map(|c| c.fill_from_iter(device_block(dev, BLOCK)));
+                e.render_offline(&mut out);
+            }
+            for i in 0..TRACKS {
+                let (l, r) = match spec(i) {
+                    ChannelPick::Mono(a) => (a, a),
+                    ChannelPick::Stereo(a, b) => (a, b),
+                };
+                assert_eq!(
+                    meter(&e, i),
+                    [level(usize::from(l)), level(usize::from(r))],
+                    "on {dev} inputs, track {i} (pick {:?}) does not hear its own input",
+                    table.pick_of(TrackId(i as u32))
+                );
+            }
+            assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// One device block of `dev` columns whose column `col` carries the
+    /// ramp `from..from + frames` (scaled to stay a float that round-trips
+    /// exactly) and every other column a level of its own.
+    fn ramp_block(dev: usize, col: usize, from: usize, frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|f| (0..dev).map(move |c| if c == col { ((from + f) % 65_536) as f32 / 65_536.0 } else { level(c) }))
+            .collect()
+    }
+
+    /// The renderer's own callback, one block, with its allocations counted
+    /// on this thread (the hands' figure is name-keyed and a neighbour's
+    /// pool shares the names; `rt_alloc`'s own baseline holds the same).
+    fn counted(e: &mut Engine, out: &mut [f32]) -> usize {
+        let r = e.offline.as_mut().expect("a renderer");
+        let ((), c) = crate::rt_alloc::count_allocs(|| r.render(out, 0, 0));
+        e.drain_retired_ops();
+        c.here
+    }
+
+    /// **Arming input 40 of a sixty-four-input interface records it, bit for
+    /// bit, and the callback that captures it allocates nothing** (W5, done
+    /// when: "arming input 40 of a 64-input device records an arrangement
+    /// take"; "the capture callback allocates nothing"; "`rt_alloc` covers
+    /// MonitorPlan and capture-ring swaps").
+    ///
+    /// Input 40 is column 39, past every number the old caps drew: the
+    /// thirty-two picks and the thirty-two capture flags. Its column carries
+    /// a ramp no other column carries, so a take that reads a neighbour, or
+    /// that a stale-drop has holes in, is a wrong sequence and not a quiet
+    /// one. The renderer's scratch arrives with the ring, sized for its
+    /// sixty-four columns: sized by the output's two it held a quarter of
+    /// each chunk and the take came back a quarter long.
+    ///
+    /// Every block is counted: the ring and the layout arriving, the
+    /// capture ring arriving for the armed pick (its flag already set: it
+    /// lands in an empty slot), the tee writing, and a layout change while
+    /// it writes.
+    #[test]
+    fn input_forty_of_sixty_four_is_captured_bit_for_bit_and_nothing_allocates() {
+        const DEV: usize = 64;
+        const COL: usize = 39;
+        const TRACK: usize = 5;
+        let mut e = engine_with(CHANNELS, audio(), LaneFlags::MIDI_OFF);
+        let mut flags = every_lane(&e, CHANNELS, LaneFlags::MIDI_OFF);
+        flags.lanes[TRACK].flags = LaneFlags::ARMED | LaneFlags::MIDI_OFF;
+        e.publish_plan(&flags).expect("the plan goes");
+        let rows: Vec<InputRow> = (0..CHANNELS)
+            .map(|i| InputRow {
+                id: TrackId(i as u32),
+                audio: i == TRACK,
+                spec: (i == TRACK).then_some(ChannelPick::Mono(COL as u16)),
+                armed: i == TRACK,
+            })
+            .collect();
+        let stream = InputStream { device_channels: Some(DEV), picks: Picks::EVERYTHING };
+        let mut table = PickTable::default();
+        table.bind(&rows, &stream);
+        let pick = table.pick_of(TrackId(TRACK as u32)).expect("the armed track has a pick");
+        // A renderer's first blocks are its own business (the slot engine's
+        // tests warm the same way); what is counted is what arrives after.
+        let mut out = vec![0.0f32; BLOCK * 2];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        assert_eq!(counted(&mut e, &mut out), 0, "a steady block allocated");
+        let (mut tx, rx) = RingBuffer::<f32>::new(DEV * BLOCK * 8);
+        e.set_monitor(Some((rx, DEV as u16, vec![DEV as u8].into_boxed_slice(), BLOCK as u32, Picks::EVERYTHING)));
+        e.set_monitor_inputs(&table.monitor(lane_of(&e)), &Picks::EVERYTHING);
+        assert_eq!(counted(&mut e, &mut out), 0, "a sixty-four-column ring and its layout arriving allocated");
+        // The record presses: the pick's ring and its flag in one frame.
+        assert_eq!(e.capture_ring_bytes(), 0, "a ring before anything was armed");
+        e.sync_capture_rings(&table.armed(&rows)).expect("the armed pick's ring");
+        e.set_capturing(&[pick]);
+        let mut want = Vec::new();
+        let mut took = Vec::new();
+        let mut fed = 0usize;
+        for b in 0..24 {
+            let block = ramp_block(DEV, COL, fed, BLOCK);
+            for f in 0..BLOCK {
+                want.extend([block[f * DEV + COL]; 2]);
+            }
+            let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+            fed += BLOCK;
+            if b == 12 {
+                // A layout change under the take: the monitor's own plan
+                // swapped while the pick captures. Its ring stays.
+                e.set_monitor_inputs(&table.monitor(|_| None), &Picks::EVERYTHING);
+            }
+            assert_eq!(counted(&mut e, &mut out), 0, "block {b} of the take allocated on the callback");
+            e.drain_capture(pick, &mut took);
+        }
+        e.set_capturing(&[]);
+        e.drain_capture(pick, &mut took);
+        assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        assert_eq!(took.len(), want.len(), "the take is not as long as the input");
+        assert!(took == want, "the take is not input 40, sample for sample");
+        assert_eq!(e.shared.op_refused.load(Ordering::Relaxed), 0);
+    }
 }

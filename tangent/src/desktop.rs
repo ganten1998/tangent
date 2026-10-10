@@ -341,20 +341,17 @@ struct Recorder {
     /// ENGINE, and the two are opened by different edges — so it is held here
     /// rather than dropped when the second one is not there yet. See
     /// `push_monitor_settings`, which is where it gets handed over.
-    pending_monitor: Option<(
-        rtrb::Consumer<f32>,
-        u16,
-        [u8; crate::instrument::INPUTS],
-        u32,
-        tangent_record::audio::Picks,
-    )>,
+    pending_monitor: Option<crate::instrument::MonitorTap>,
     /// What each input strip is called, as the picker names it. Empty for one
     /// nobody has filled.
     ///
     /// Kept here rather than read back out of the app, because the host is
     /// what knows: which inputs are open is a fact about the device and the
     /// selection, and `tangent-ui` can reach neither.
-    input_names: [String; crate::instrument::INPUTS],
+    ///
+    /// One per input strip the app draws (`RecorderState::inputs`), however
+    /// many that is: sized to it the frame it is filled.
+    input_names: Vec<String>,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
     /// A copy, and a deliberate one: the preview uploads its own texture and
@@ -945,14 +942,34 @@ struct ArrRec {
     /// for the reason the arm mask is: what a take records must not change
     /// under it because somebody opened the MIDI Inputs dialog mid-take.
     midi: Vec<ArrRecLane>,
-    /// Armed AUDIO lanes at the press: (input pick, lane, frames so far).
-    audio: Vec<(usize, usize, Vec<f32>)>,
+    /// Armed AUDIO tracks at the press, each bound by identity (design A5).
+    audio: Vec<ArrRecAudio>,
+}
+
+/// **One armed AUDIO track's take, bound at the press by identity**: the
+/// track, the lane it had (`(slot, gen)`), the pick whose ring it drains and
+/// the frames so far (design 7.13: "It binds `(TrackId, slot, gen, PickId)`
+/// at the press and resolves rows at the finish").
+///
+/// It was `(input pick, lane, frames)`, a pick counted along the rows and a
+/// row number, both positions: a row inserted above while it rolled moved
+/// the pick onto another track's microphone and the take onto another row.
+/// The pick is the bridge's now, held for the record, and the row is asked
+/// of the track when the record finishes.
+#[cfg(feature = "recorder")]
+struct ArrRecAudio {
+    id: tangent_ui::desk_id::TrackId,
+    #[allow(dead_code, reason = "the binding the design names; the take lands by the track")]
+    lane: Option<crate::engine_bridge::LaneAt>,
+    pick: crate::desk_plan::PickId,
+    frames: Vec<f32>,
 }
 
 /// One armed MIDI lane's take, and the rule that says which messages are its.
 #[cfg(feature = "recorder")]
 struct ArrRecLane {
-    lane: usize,
+    /// The track it records, whose row is asked at the finish.
+    id: tangent_ui::desk_id::TrackId,
     /// The lane's routing rule at the press. See `ArrRec::midi`.
     route: tangent_ui::recorder::MidiRoute,
     /// Finished notes, clip-relative seconds.
@@ -969,8 +986,111 @@ struct ArrRecLane {
     open: std::collections::HashMap<u8, (f64, u8)>,
 }
 
+/// **The takes a press binds**: the armed MIDI tracks (each with the row its
+/// routing is read from at the press), the armed AUDIO tracks with their
+/// picks, and whether an armed audio track had no input to record.
+#[cfg(feature = "recorder")]
+struct PressTakes {
+    midi: Vec<(tangent_ui::desk_id::TrackId, usize)>,
+    audio: Vec<ArrRecAudio>,
+    armed_unbound: bool,
+}
+
 #[cfg(feature = "recorder")]
 impl ArrRec {
+    /// **The armed tracks, split by what they record**: a MIDI track takes
+    /// the note stream, an AUDIO track its input's pick. **The pick is the
+    /// bridge's** (`Bridge::sync_inputs`), the one the monitor plays and the
+    /// capture ring is held for: a walk of its own here once disagreed with
+    /// the monitor's on a desk mixing bound and NO INPUT lanes, and the red
+    /// button teed a ring nobody opened or drained another channel's
+    /// microphone onto the wrong lane.
+    ///
+    /// **Bound by identity** (design A5, 7.13): each take keeps its track,
+    /// the lane it had and its pick, so a row inserted above, a row removed
+    /// elsewhere or a second track armed moves no input and no take. The
+    /// rows are asked of the tracks when the record finishes.
+    fn press_takes(app: &TangentApp, bridge: &crate::engine_bridge::Bridge) -> PressTakes {
+        let armed = |row: usize| crate::engine_bridge::row_armed(app, row);
+        let mut out = PressTakes { midi: Vec::new(), audio: Vec::new(), armed_unbound: false };
+        for (row, id) in app.track_ids().iter().enumerate() {
+            match app.channel_kind(row) {
+                Some(tangent_ui::recorder::ChannelKind::Midi) => {
+                    if armed(row) {
+                        out.midi.push((*id, row));
+                    }
+                }
+                // A CLIP lane — used, no live source — arms in the UI like
+                // any other; its R lit and the record ignoring it was the
+                // owner's "non functional". It takes the note stream.
+                None if armed(row) => {
+                    out.midi.push((*id, row));
+                }
+                Some(tangent_ui::recorder::ChannelKind::Audio) if armed(row) => match bridge.pick_of(*id) {
+                    Some(pick) => out.audio.push(ArrRecAudio {
+                        id: *id,
+                        lane: bridge.lane_of(*id),
+                        pick,
+                        frames: Vec::new(),
+                    }),
+                    // NO INPUT on an explicit desk: R is lit but there is no
+                    // input behind it, and a press that does nothing
+                    // silently is a broken button.
+                    None => out.armed_unbound = true,
+                },
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// **The tee opened for these takes: each pick held, its ring there,
+    /// then its flag**, in that order. Held: no change of shape gives the
+    /// pick to another track while it records. The ring: the bridge keeps
+    /// one for every armed pick, and a track armed this very frame gets its
+    /// own now; it lands in an empty slot, which the callback takes even
+    /// under a flag set in the same pass. Whatever a previous take's tail
+    /// left in it is thrown away. The flag last, released after the ring
+    /// was sent (`Engine::set_capturing`).
+    fn open_tee(
+        audio: &[ArrRecAudio],
+        bridge: &mut crate::engine_bridge::Bridge,
+        e: Option<&mut crate::instrument::Engine>,
+    ) {
+        let picks: Vec<crate::desk_plan::PickId> = audio.iter().map(|a| a.pick).collect();
+        bridge.hold_picks(&picks);
+        if let Some(e) = e {
+            let mut stale = Vec::new();
+            for p in &picks {
+                let _ = e.arm_capture(*p);
+                e.drain_capture(*p, &mut stale);
+                stale.clear();
+            }
+            e.set_capturing(&picks);
+        }
+    }
+
+    /// What each take's ring holds, into the take.
+    fn drain_tee(&mut self, e: &mut crate::instrument::Engine) {
+        for a in &mut self.audio {
+            e.drain_capture(a.pick, &mut a.frames);
+        }
+    }
+
+    /// **The tee closed**: every flag down, what was in flight drained, and
+    /// the picks the desk's again (a track that named one may give it to
+    /// another now that nothing records through it). The block the device is
+    /// filling right now is not here yet and is let go: a tail a buffer
+    /// short, not a file that arrives late.
+    fn close_tee(&mut self, bridge: &mut crate::engine_bridge::Bridge, e: Option<&mut crate::instrument::Engine>) {
+        if let Some(e) = e {
+            e.set_capturing(&[]);
+            self.drain_tee(e);
+        }
+        let picks: Vec<crate::desk_plan::PickId> = self.audio.iter().map(|a| a.pick).collect();
+        bridge.release_picks(&picks);
+    }
+
     /// Which of the three `pedal_at` slots a controller number owns.
     const fn pedal_slot(cc: u8) -> Option<usize> {
         match cc {
@@ -5691,7 +5811,8 @@ impl DesktopApp {
             || self.frozen.inputs.0 != open_inputs
             || self.frozen.inputs.1 != alias
         {
-            for i in 0..state.inputs.len().min(self.recorder.input_names.len()) {
+            self.recorder.input_names.resize(state.inputs.len(), String::new());
+            for i in 0..state.inputs.len() {
                 let (device, channel, stereo) = open_inputs
                     .get(i)
                     .cloned()
@@ -5902,9 +6023,7 @@ impl DesktopApp {
         // seconds of room in the engine, emptied sixty times a second.
         if let Some(rec) = self.recorder.arr_rec.as_mut() {
             if let Some(e) = self.recorder.engine.as_mut() {
-                for (input, _lane, buf) in &mut rec.audio {
-                    e.drain_capture(*input, buf);
-                }
+                rec.drain_tee(e);
             }
         }
         // The red button's state, where the band can draw it — and the
@@ -5937,13 +6056,15 @@ impl DesktopApp {
                     });
                 }
             }
+            // Each take on its track's row as it stands this frame.
+            let app = &self.app;
             tangent_ui::recorder::ArrRecView {
                 start_s: rec.start_s,
                 lanes: rec
                     .midi
                     .iter()
-                    .map(|l| (l.lane, true))
-                    .chain(rec.audio.iter().map(|(_, l, _)| (*l, false)))
+                    .filter_map(|l| app.row_of(l.id).map(|r| (r, true)))
+                    .chain(rec.audio.iter().filter_map(|a| app.row_of(a.id).map(|r| (r, false))))
                     .collect(),
                 notes,
             }
@@ -9971,66 +10092,7 @@ impl DesktopApp {
             self.app.notify(Kind::Error, "No project is open.");
             return;
         }
-        // The armed lanes, split by what they record: a MIDI lane takes the
-        // note stream, an AUDIO lane its input pick. **The pick walk is
-        // `push_monitor_settings`' walk, exactly.** The moment any channel
-        // names its input, picks belong to the BOUND channels only — an
-        // unbound audio channel monitors nothing and consumes no pick. This
-        // walk used to stay ordinal, counting every audio channel bound or
-        // not, so on a desk mixing bound and NO INPUT lanes (a state the
-        // settings migration deliberately preserves) the red button asked
-        // the engine to tee a ring it never opened — the take came back
-        // empty and the performance was silently gone — or drained another
-        // channel's microphone onto the wrong lane.
-        let armed = |row: usize| crate::engine_bridge::row_armed(&self.app, row);
-        let rows = self.app.track_ids().len();
-        let mut midi_lanes = Vec::new();
-        let mut audio = Vec::new();
-        // The capture's picks to tee, one bit a PICK: the capture's own
-        // fixed table (`instrument::INPUTS`), never a lane.
-        let mut mask = 0u32;
-        let mut pick = 0usize;
-        // An armed audio lane the walk had to pass over: R is lit but there
-        // is no input behind it, and a press that does nothing silently is a
-        // broken button.
-        let mut armed_unbound = false;
-        let any_explicit = (0..rows).any(|ch| {
-            self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
-                && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
-        });
-        for ch in 0..rows {
-            match self.app.channel_kind(ch) {
-                Some(tangent_ui::recorder::ChannelKind::Midi) => {
-                    if armed(ch) {
-                        midi_lanes.push(ch);
-                    }
-                }
-                // A CLIP lane — used, no live source — arms in the UI like
-                // any other; its R lit and the record ignoring it was the
-                // owner's "non functional". It takes the note stream.
-                None if armed(ch) => {
-                    midi_lanes.push(ch);
-                }
-                Some(tangent_ui::recorder::ChannelKind::Audio) => {
-                    if any_explicit
-                        && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_none()
-                    {
-                        // NO INPUT on an explicit desk: the engine opened no
-                        // ring for this lane, so there is nothing to tee.
-                        if armed(ch) {
-                            armed_unbound = true;
-                        }
-                    } else if pick < crate::instrument::INPUTS {
-                        if armed(ch) {
-                            mask |= 1 << pick;
-                            audio.push((pick, ch, Vec::new()));
-                        }
-                        pick += 1;
-                    }
-                }
-                None => {}
-            }
-        }
+        let PressTakes { midi: midi_lanes, audio, armed_unbound } = ArrRec::press_takes(&self.app, &self.bridge);
         if midi_lanes.is_empty() && audio.is_empty() {
             self.app.notify(
                 Kind::Error,
@@ -10046,7 +10108,7 @@ impl DesktopApp {
         let rate = f64::from(e.output().sample_rate).max(1.0);
         let start_s = self.recorder.transport.position_s(Some(e), rate);
         let start_ns = e.timebase().now();
-        e.set_arr_capture(mask);
+        ArrRec::open_tee(&audio, &mut self.bridge, self.recorder.engine.as_mut());
         if !self.recorder.transport.playing() {
             self.recorder.transport.toggle_play();
         }
@@ -10075,12 +10137,12 @@ impl DesktopApp {
             start_ns,
             midi: midi_lanes
                 .into_iter()
-                .map(|lane| ArrRecLane {
+                .map(|(id, row)| ArrRecLane {
                     route: routes
-                        .get(lane)
+                        .get(row)
                         .copied()
                         .unwrap_or(tangent_ui::recorder::MidiRoute::EVERYTHING),
-                    lane,
+                    id,
                     notes: Vec::new(),
                     pedal: pedal.clone(),
                     pedal_at,
@@ -10099,18 +10161,12 @@ impl DesktopApp {
         let Some(mut rec) = self.recorder.arr_rec.take() else {
             return;
         };
-        let rate = if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_arr_capture(0);
-            // What was in flight when the tee closed. The block the device
-            // is filling right now is not here yet and is let go: a tail a
-            // buffer short, not a file that arrives late.
-            for (input, _lane, buf) in &mut rec.audio {
-                e.drain_capture(*input, buf);
-            }
-            f64::from(e.output().sample_rate).max(1.0)
-        } else {
-            48_000.0
-        };
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000.0, |e| f64::from(e.output().sample_rate).max(1.0));
+        rec.close_tee(&mut self.bridge, self.recorder.engine.as_mut());
         let end_s = self
             .recorder
             .transport
@@ -10136,8 +10192,18 @@ impl DesktopApp {
         // and simply lands nothing.
         if len_s >= 0.05 {
             for l in &rec.midi {
+                // **On its track's row as it stands now** (design 7.13: the
+                // record resolves rows at the finish). A track removed while
+                // it recorded has no row to land on, and that is said.
+                let Some(lane) = self.app.row_of(l.id) else {
+                    self.app.notify(
+                        Kind::Error,
+                        "A track was removed while it recorded; its notes had nowhere to land.",
+                    );
+                    continue;
+                };
                 out.push(tangent_ui::arrangement::RecordedClip {
-                    lane: l.lane,
+                    lane,
                     start_s: rec.start_s,
                     len_s,
                     path: None,
@@ -10167,11 +10233,18 @@ impl DesktopApp {
             // and left every pad reading a sample that was never copied. And
             // only when there is audio to keep: a MIDI-only take lives in the
             // document, and made an empty Untitled folder for nothing.
-            if rec.audio.iter().any(|(_, _, f)| f.len() as f64 / 2.0 / rate >= 0.05) {
+            if rec.audio.iter().any(|a| a.frames.len() as f64 / 2.0 / rate >= 0.05) {
                 self.app.materialize_project_dir();
                 let _ = std::fs::create_dir_all(&media);
             }
-            for (_input, lane, frames) in &rec.audio {
+            for a in &rec.audio {
+                let frames = &a.frames;
+                // **The track's row now, asked of the track** (design 7.13):
+                // rows inserted above it while it rolled moved it, and the
+                // take follows. `None` for a track removed meanwhile, whose
+                // file is still written and kept, and named.
+                let row = self.app.row_of(a.id);
+                let label = row.map_or_else(|| format!("track {}", a.id.0), |r| format!("channel {}", r + 1));
                 let seconds = frames.len() as f64 / 2.0 / rate;
                 if seconds < 0.05 {
                     // **A dead input is said out loud, never shrugged at.**
@@ -10189,10 +10262,9 @@ impl DesktopApp {
                             // the line break is a real one now: a lost `\`
                             // had left thirty spaces in the message.
                             format!(
-                                "channel {}: the input delivered no audio for a {:.1}s take - \
+                                "{label}: the input delivered no audio for a {:.1}s take - \
                                  nothing was kept and the old clips stand. To see why, open \
                                  the recorder band's cog, then AUDIO SETUP.",
-                                lane + 1,
                                 len_s
                             ),
                         );
@@ -10200,8 +10272,9 @@ impl DesktopApp {
                     continue;
                 }
                 let mut n = 1usize;
+                let stem = row.map_or_else(|| format!("t{}", a.id.0), |r| (r + 1).to_string());
                 let name = loop {
-                    let cand = format!("rec-{}-{n}.wav", lane + 1);
+                    let cand = format!("rec-{stem}-{n}.wav");
                     if !media.join(&cand).exists() {
                         break cand;
                     }
@@ -10219,16 +10292,22 @@ impl DesktopApp {
                         w.write_interleaved(frames)?;
                         w.finish()
                     });
-                match write {
-                    Ok(()) => out.push(tangent_ui::arrangement::RecordedClip {
-                        lane: *lane,
+                match (write, row) {
+                    (Ok(()), Some(lane)) => out.push(tangent_ui::arrangement::RecordedClip {
+                        lane,
                         start_s: rec.start_s,
                         len_s: seconds,
                         path: Some(format!("media/{name}")),
                         notes: Vec::new(),
                         pedal: Vec::new(),
                     }),
-                    Err(e) => {
+                    (Ok(()), None) => {
+                        self.app.notify(
+                            Kind::Error,
+                            format!("A track was removed while it recorded; its take is kept as media/{name}."),
+                        );
+                    }
+                    (Err(e), _) => {
                         self.app
                             .notify(Kind::Error, format!("could not write {name}: {e}"));
                     }
@@ -10494,7 +10573,7 @@ impl DesktopApp {
                         .chars()
                         .map(|c| if std::path::is_separator(c) { '-' } else { c })
                         .collect();
-                    let path = stage.join(format!("{:02}-{}.wav", row + 1, name.trim()));
+                    let path = stage.join(stem_file_name(row, &name));
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
@@ -10504,8 +10583,13 @@ impl DesktopApp {
                 stem_dir = Some(dir);
                 // The same door the offline twin arms its tap through, so the
                 // two passes cannot disagree about what a mode means. See
-                // `arm_stem_tap`.
-                arm_stem_tap(e, true, stems_dry);
+                // `arm_stem_tap`. **For the lanes this pass writes**, and no
+                // others: the ring is built now, for them (design 7.12).
+                let slots: Vec<crate::desk_plan::Slot> = stem_writers
+                    .iter()
+                    .map(|w| crate::desk_plan::Slot(w.lane as u32))
+                    .collect();
+                arm_stem_tap(e, true, &slots, stems_dry);
             }
         }
         // **The delivery is the pass's own**, made with it past the last
@@ -10549,10 +10633,14 @@ impl DesktopApp {
         }
         let mut lane_buf = Vec::with_capacity(frames * 2);
         for s in &mut b.stem_writers {
+            // The lane's own column of the tap, armed for these writers.
+            let Some(col) = e.stem_column(crate::desk_plan::Slot(s.lane as u32)) else {
+                continue;
+            };
             lane_buf.clear();
             for f in 0..frames {
-                lane_buf.push(b.stem_scratch[f * wide + s.lane * 2]);
-                lane_buf.push(b.stem_scratch[f * wide + s.lane * 2 + 1]);
+                lane_buf.push(b.stem_scratch[f * wide + col * 2]);
+                lane_buf.push(b.stem_scratch[f * wide + col * 2 + 1]);
             }
             s.loud |= any_sound(&lane_buf);
             let _ = s.writer.write_interleaved(&lane_buf);
@@ -11128,10 +11216,15 @@ impl DesktopApp {
                 b.e.drain_stems(&mut b.stem_scratch);
                 let frames = b.stem_scratch.len() / wide;
                 for s in &mut b.stems {
+                    // The lane's own column of the tap, which was armed for
+                    // the stems this pass writes and no others.
+                    let Some(col) = b.e.stem_column(crate::desk_plan::Slot(s.lane as u32)) else {
+                        continue;
+                    };
                     fold.clear();
                     for f in 0..frames {
-                        let l = b.stem_scratch[f * wide + s.lane * 2];
-                        let r = b.stem_scratch[f * wide + s.lane * 2 + 1];
+                        let l = b.stem_scratch[f * wide + col * 2];
+                        let r = b.stem_scratch[f * wide + col * 2 + 1];
                         if b.spec.mono {
                             fold.push((l + r) * 0.5);
                         } else {
@@ -15561,7 +15654,8 @@ impl DesktopApp {
         let desk = match self.recorder.engine.as_mut() {
             Some(e) => {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
-                self.bridge.punch_at(live_punches(self.recorder.arr_rec.as_ref(), rate));
+                let app = &self.app;
+                self.bridge.punch_at(live_punches(self.recorder.arr_rec.as_ref(), rate, |id| app.row_of(id)));
                 // **A lane whose track has gone is written down first**: every
                 // bay its plugins sit in, to the live shelf under the track's
                 // own bays, while the plugins are alive, and forgotten by the
@@ -15696,51 +15790,26 @@ impl DesktopApp {
         // desk, so the desk's own fader is the whole of it, and the second
         // copy would have been the fader applied to everything in the file
         // rather than to the microphone.
-        // Which capture pick feeds which LANE: the audio rows in order, each
-        // at its track's lane. Which MIDI lanes hear the keyboard is decided
-        // WHOLE by `recorder::live_midi_off`, in the bridge's plan: three
-        // rules that read each other, one of which silences all the rest,
-        // not a decision to make a bit at a time in the middle of the input
-        // picks.
-        let mut picks: [Option<usize>; crate::instrument::INPUTS] = [None; crate::instrument::INPUTS];
-        let mut next_pick = 0usize;
-        // **The desk's EXPLICIT input bindings, when any channel has one.**
-        // The strip's own menu names inputs now; the moment one channel
-        // does, the whole desk routes explicitly — bound channels take
-        // their named input, unbound audio channels take NOTHING. With no
-        // bindings anywhere the old ordinal walk stands, so nothing anyone
-        // set up before the menu existed changes under them.
-        let rows = self.app.track_ids().len();
-        let any_explicit = (0..rows).any(|ch| {
-            self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
-                && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
-        });
-        let mut explicit: Vec<tangent_record::audio::ChannelPick> = Vec::new();
-        for ch in 0..rows {
-            if self.app.channel_kind(ch) != Some(tangent_ui::recorder::ChannelKind::Audio) {
-                continue;
-            }
-            // A row whose track has no lane yet is fed nothing this frame;
-            // the pick it would take waits with it.
-            let lane = self.bridge.lane(ch).map(|l| l.slot.0 as usize);
-            if any_explicit {
-                if let Some((a, b)) = TangentApp::parse_input_spec(self.app.channel_input_spec(ch)) {
-                    if next_pick < picks.len() {
-                        picks[next_pick] = lane;
-                        explicit.push(match b {
-                            Some(b) => tangent_record::audio::ChannelPick::Stereo(a, b),
-                            None => tangent_record::audio::ChannelPick::Mono(a),
-                        });
-                        next_pick += 1;
-                    }
-                }
-            } else if next_pick < picks.len() {
-                picks[next_pick] = lane;
-                next_pick += 1;
-            }
-        }
+        // **Which input each audio track takes, through the one seam**
+        // (`Bridge::sync_inputs`, design 8): the pick table by identity, so a
+        // track keeps its pick through every change of shape; the monitor
+        // told every pick with its lane and its device columns; and a capture
+        // ring held for every armed pick and for no other. Which MIDI lanes
+        // hear the keyboard is decided WHOLE by `recorder::live_midi_off`, in
+        // the bridge's plan: three rules that read each other, one of which
+        // silences all the rest, not a decision to make a bit at a time in
+        // the middle of the input picks.
+        //
+        // The device is handed the inputs the stream opens with, by PickId,
+        // so a reorder changes nothing it is told and never reopens it; an
+        // ordinal desk (no input named anywhere) hands it none and the band's
+        // own choice stands.
+        let stream = crate::engine_bridge::InputStream {
+            device_channels: self.recorder.session.device_channels(),
+            picks: self.recorder.session.picks().clone(),
+        };
+        let explicit = self.bridge.sync_inputs(&self.app, e, &stream);
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
-        e.set_pick_strips(picks);
         // Never read from a settings file — see `TangentApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -16054,16 +16123,8 @@ impl DesktopApp {
                 if self.recorder.session.set_picks(choice.channels) {
                     // The monitor keeps its ring — the frames in it mean the
                     // same thing before and after — and is told which columns
-                    // each strip owns now.
-                    if let Some(e) = self.recorder.engine.as_ref() {
-                        let dev = self.recorder.session.device_channels().unwrap_or(2);
-                        e.set_monitor_layout(
-                            choice
-                                .channels
-                                .widths::<{ crate::instrument::INPUTS }>(dev),
-                            choice.channels,
-                        );
-                    }
+                    // each pick reads by the bridge, on the next frame, from
+                    // the picks the session now holds (`Bridge::sync_inputs`).
                     let opened = crate::devices::selection(&self.recorder.audio).wanted;
                     crate::devices::settle(
                         &self.recorder.audio,
@@ -17560,13 +17621,24 @@ pub(crate) fn mirror_sampler_samples(
 /// captures, MIDI and audio alike, and nowhere when nothing records. Handed
 /// to the bridge every frame (`Bridge::punch_at`), which puts each on its
 /// track's lane in the plan, so the carve stops sounding the moment the take
-/// ends and is real.
+/// ends and is real. **Each take's row is its track's this frame**
+/// (`row_of`), so a row inserted above a recording track carries its punch
+/// with it.
 #[cfg(feature = "recorder")]
-fn live_punches(rec: Option<&ArrRec>, rate: f64) -> Vec<Option<u64>> {
+fn live_punches(
+    rec: Option<&ArrRec>,
+    rate: f64,
+    row_of: impl Fn(tangent_ui::desk_id::TrackId) -> Option<usize>,
+) -> Vec<Option<u64>> {
     let mut punches = Vec::new();
     if let Some(rec) = rec {
         let at = frames_at(rate, rec.start_s);
-        let rows = rec.midi.iter().map(|l| l.lane).chain(rec.audio.iter().map(|(_, l, _)| *l));
+        let rows = rec
+            .midi
+            .iter()
+            .map(|l| l.id)
+            .chain(rec.audio.iter().map(|a| a.id))
+            .filter_map(&row_of);
         for row in rows {
             if punches.len() <= row {
                 punches.resize(row + 1, None);
@@ -17575,6 +17647,16 @@ fn live_punches(rec: Option<&ArrRec>, rate: f64) -> Vec<Option<u64>> {
         }
     }
     punches
+}
+
+/// **A stem's file name**: the row's number, three digits, then the track's
+/// name, `001-Vocal.wav`. Three digits so a folder of them sorts in desk
+/// order however a file browser sorts: at two, the hundredth stem was
+/// `100-...` and sorted between `10-...` and `11-...`. A desk past 999
+/// rows still writes every stem; past there the numbers widen and the
+/// folder sorts by name. Both export roads name their stems through here.
+pub(crate) fn stem_file_name(row: usize, name: &str) -> String {
+    format!("{:03}-{}.wav", row + 1, name.trim())
 }
 
 /// **Arm a pass's stem tap from the two bools the Export dialog filled in.**
@@ -17597,9 +17679,19 @@ fn live_punches(rec: Option<&ArrRec>, rate: f64) -> Vec<Option<u64>> {
 /// a third time on its own side, once a block, because five writers of the dry
 /// buffer have to agree and one place to agree in is cheaper than five — see
 /// `Shared::stems_dry`.
+///
+/// **`slots` are the lanes the pass writes a stem for, and the tap is armed
+/// for them alone** (design 7.12: the stem ring is built at arm time for the
+/// armed slots). It used to tap every lane of the desk into a ring every
+/// engine held from its first block, four seconds of the whole desk. Each
+/// writer finds its lane's pair by `Engine::stem_column`.
 #[cfg(feature = "recorder")]
-pub(crate) fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
-    e.set_stems(stems);
+pub(crate) fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, slots: &[crate::desk_plan::Slot], dry: bool) {
+    if stems && !slots.is_empty() {
+        e.arm_stems(slots);
+    } else {
+        e.set_stems(false);
+    }
     e.set_stems_dry(stems && dry);
 }
 
@@ -19809,7 +19901,7 @@ impl DesktopApp {
             Recorder {
                 transport: crate::transport::Transport::new(),
                 pending_monitor: None,
-                input_names: std::array::from_fn(|_| String::new()),
+                input_names: Vec::new(),
                 arr_rec: None,
             pedal_live: [0; 3],
                 bounce: None,
@@ -23448,7 +23540,7 @@ mod tests {
         let start = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         assert!(
             start.contains("let stage = open_stems_stage(&dir);")
-                && start.contains("let path = stage.join(format!(")
+                && start.contains("let path = stage.join(stem_file_name(")
                 && start.contains("stem_dir = Some(dir);"),
             "the realtime pass writes its stems straight into the export's folder again"
         );
@@ -30630,9 +30722,9 @@ mod tests {
         );
         // An arrangement take makes a scratch real through the one door that
         // brings its kit across, and only when it has audio to keep.
-        let take = between("// The WAVs, one per armed input, into the project's own media/.", "for (_input, lane, frames) in &rec.audio");
+        let take = between("// The WAVs, one per armed input, into the project's own media/.", "for a in &rec.audio");
         assert!(
-            take.contains("if rec.audio.iter().any(|(_, _, f)| f.len() as f64 / 2.0 / rate >= 0.05) {\n                self.app.materialize_project_dir();"),
+            take.contains("if rec.audio.iter().any(|a| a.frames.len() as f64 / 2.0 / rate >= 0.05) {\n                self.app.materialize_project_dir();"),
             "an arrangement take makes its folder behind `materialize_project_dir`'s back"
         );
         // A freeze and an export make a scratch real through the same door,
@@ -36615,9 +36707,10 @@ mod sidecar_walk_probe {
             e.render_offline(&mut out);
             e.drain_stems(&mut drained);
         }
-        let wide = e.stem_frame_width();
+        let wide = e.stem_frame_width().max(2);
+        let col = e.stem_column(crate::desk_plan::Slot(EXPORT_SEAT as u32)).expect("the tap was armed for the lane");
         (0..drained.len() / wide)
-            .map(|f| drained[f * wide + EXPORT_SEAT * 2].abs())
+            .map(|f| drained[f * wide + col * 2].abs())
             .fold(0.0f32, f32::max)
     }
 
@@ -36645,7 +36738,7 @@ mod sidecar_walk_probe {
             tangent_ui::dialogs::set_export_stem_mode(&mut spec, chip);
             assert!(spec.stems, "the fixture never armed the tap at all");
             let mut e = engine_with_comp(Some(&deep_comp_state()));
-            arm_stem_tap(&e, spec.stems, spec.stems_dry);
+            arm_stem_tap(&e, spec.stems, &[crate::desk_plan::Slot(EXPORT_SEAT as u32)], spec.stems_dry);
             stem_peak(&mut e)
         };
         let chips = tangent_ui::dialogs::EXPORT_STEM_CHIPS;
@@ -36717,7 +36810,7 @@ mod sidecar_walk_probe {
         )
         .expect("the mirror seats the comp");
         warm(&mut from_desk);
-        arm_stem_tap(&from_desk, true, false);
+        arm_stem_tap(&from_desk, true, &[crate::desk_plan::Slot(EXPORT_SEAT as u32)], false);
         let squeezed = stem_peak(&mut from_desk);
 
         // The same call with no desk to ask, which is the road the export took
@@ -36736,7 +36829,7 @@ mod sidecar_walk_probe {
         )
         .expect("the mirror seats the comp");
         warm(&mut from_shelf);
-        arm_stem_tap(&from_shelf, true, false);
+        arm_stem_tap(&from_shelf, true, &[crate::desk_plan::Slot(EXPORT_SEAT as u32)], false);
         let untouched = stem_peak(&mut from_shelf);
 
         // SAFETY: still under `SIDECAR_ENV`.
@@ -37044,7 +37137,7 @@ mod arr_pedal {
             start_s: 0.0,
             start_ns: 0,
             midi: vec![ArrRecLane {
-                lane: 0,
+                id: tangent_ui::desk_id::TrackId(0),
                 route: tangent_ui::recorder::MidiRoute::EVERYTHING,
                 notes: Vec::new(),
                 pedal,
@@ -37158,7 +37251,7 @@ mod arr_pedal {
             start_ns: 0,
             midi: vec![
                 ArrRecLane {
-                    lane: 1,
+                    id: tangent_ui::desk_id::TrackId(1),
                     route: MidiRoute {
                         src: 1 << 0,
                         chan: 1 << 2,
@@ -37169,7 +37262,7 @@ mod arr_pedal {
                     open: std::collections::HashMap::new(),
                 },
                 ArrRecLane {
-                    lane: 4,
+                    id: tangent_ui::desk_id::TrackId(4),
                     route: MidiRoute {
                         src: 1 << 1,
                         chan: u32::MAX,
@@ -37222,7 +37315,7 @@ mod arr_pedal {
             start_s: 0.0,
             start_ns: 0,
             midi: vec![ArrRecLane {
-                lane: 0,
+                id: tangent_ui::desk_id::TrackId(0),
                 route: narrow,
                 notes: Vec::new(),
                 pedal: Vec::new(),
@@ -37270,5 +37363,226 @@ mod arr_pedal {
         assert!((only(&r).pedal[0].at_s - 0.0).abs() < 1e-9);
         assert_eq!(only(&r).pedal[0].value, 127, "the take opened with the pedal up");
         assert_eq!(only(&r).pedal[1].value, 0);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The arrangement record, bound by identity (W5-engine-memory-inputs)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "recorder"))]
+mod arr_identity {
+    //! **A take is bound at the press to its track, its lane and its pick,
+    //! and lands on its track wherever its row is at the finish** (design
+    //! 7.13 and A5). Driven through the same `ArrRec` steps the red button
+    //! takes (`press_takes`, `open_tee`, `drain_tee`, `close_tee`), over a
+    //! real app, the bridge and an offline engine whose monitor ring is a
+    //! fake interface: `DesktopApp` itself cannot be built in a test.
+    use super::*;
+    use crate::desk_plan::PickId;
+    use crate::engine_bridge::{input_rows, Bridge, InputStream};
+    use crate::instrument::Engine;
+    use tangent_record::audio::Picks;
+    use tangent_ui::desk_id::TrackId;
+    use tangent_ui::host::Caps;
+    use tangent_ui::recorder::ChannelKind;
+    use tangent_ui::settings::Settings;
+
+    const RATE: u32 = 48_000;
+    const BLOCK: usize = 512;
+
+    /// A desk with nothing on it but these rows: `(row, input spec,
+    /// armed)`, every one an AUDIO track.
+    fn desk(rows: &[(usize, &str, bool)]) -> Settings {
+        let mut s = Settings::default();
+        s.channel_kinds.iter_mut().for_each(|k| *k = 0);
+        s.strip_inserts.iter_mut().for_each(String::clear);
+        s.strip_muted = 0;
+        s.strip_soloed = 0;
+        s.strip_phase = 0;
+        let mut armed = 0u32;
+        while s.channel_inputs.len() < s.channel_kinds.len() {
+            s.channel_inputs.push(String::new());
+        }
+        for &(row, spec, arm) in rows {
+            s.channel_kinds[row] = ChannelKind::as_u8(Some(ChannelKind::Audio));
+            s.channel_inputs[row] = spec.to_owned();
+            if arm {
+                armed |= 1 << row;
+            }
+        }
+        s.channel_armed = Some(armed);
+        s
+    }
+
+    fn app_of(settings: Settings) -> TangentApp {
+        let ctx = egui::Context::default();
+        TangentApp::with_license(&ctx, settings, Caps::PLUGIN, crate::composite::tiers::free("w5-rec"))
+    }
+
+    /// One frame of the app, which keeps its undo line from the desk it drew.
+    fn frame(app: &mut TangentApp) {
+        let ctx = egui::Context::default();
+        app.install_fonts(&ctx);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1300.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// Device column `c`'s own level, for every column but the ramp's.
+    fn level(c: usize) -> f32 {
+        (c + 1) as f32 / 256.0
+    }
+
+    /// A `dev`-column block: column `col` carries a ramp from `from`, every
+    /// other column a level of its own.
+    fn ramp_block(dev: usize, col: usize, from: usize, frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|f| (0..dev).map(move |c| if c == col { ((from + f) % 65_536) as f32 / 65_536.0 } else { level(c) }))
+            .collect()
+    }
+
+    /// The take's own row, asked of its track as the finish asks it.
+    fn landed(app: &TangentApp, rec: &ArrRec) -> Option<usize> {
+        rec.audio.first().and_then(|a| app.row_of(a.id))
+    }
+
+    /// The rig: an app, its bridge and an offline engine wearing a
+    /// `dev`-input interface's monitor ring, synced once.
+    fn rig(settings: Settings, dev: usize) -> (TangentApp, Bridge, Engine, rtrb::Producer<f32>, InputStream) {
+        let app = app_of(settings);
+        let mut e = Engine::offline(RATE, tangent_record::audio::Timebase::new()).expect("an offline engine");
+        let mut bridge = Bridge::new();
+        let (tx, rx) = rtrb::RingBuffer::<f32>::new(dev * BLOCK * 8);
+        e.set_monitor(Some((rx, dev as u16, vec![dev as u8].into_boxed_slice(), BLOCK as u32, Picks::EVERYTHING)));
+        let stream = InputStream { device_channels: Some(dev), picks: Picks::EVERYTHING };
+        bridge.sync(&app, &mut e);
+        bridge.sync_inputs(&app, &mut e, &stream);
+        let mut out = vec![0.0f32; BLOCK * 2];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        (app, bridge, e, tx, stream)
+    }
+
+    /// **Arming input 40 of a sixty-four-input interface records a take,
+    /// sample for sample, on its track** (W5, done when). The track names
+    /// input 40 (`"39"`, zero-based), is armed, and the press binds it: its
+    /// pick is the bridge's, its ring arrives for the armed pick, and the
+    /// take is column 39 folded to both sides, with nothing dropped.
+    #[test]
+    fn arming_input_forty_of_sixty_four_records_a_take_on_its_track() {
+        const DEV: usize = 64;
+        const COL: usize = 39;
+        let (app, mut bridge, mut e, mut tx, _) = rig(desk(&[(3, "39", true)]), DEV);
+        let takes = ArrRec::press_takes(&app, &bridge);
+        assert!(!takes.armed_unbound);
+        assert_eq!(takes.audio.len(), 1, "the armed audio track has no take");
+        assert_eq!(takes.audio[0].id, app.track_ids()[3]);
+        ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut want = Vec::new();
+        let mut out = vec![0.0f32; BLOCK * 2];
+        for b in 0..16 {
+            let block = ramp_block(DEV, COL, b * BLOCK, BLOCK);
+            for f in 0..BLOCK {
+                want.extend([block[f * DEV + COL]; 2]);
+            }
+            let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+            e.render_offline(&mut out);
+            rec.drain_tee(&mut e);
+        }
+        rec.close_tee(&mut bridge, Some(&mut e));
+        assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        assert!(rec.audio[0].frames == want, "the take is not input 40, sample for sample");
+        assert_eq!(landed(&app, &rec), Some(3), "the take does not land on its track");
+    }
+
+    /// **A record captures through a permuted, grown and shrunk desk, and
+    /// lands on its own track** (W5, done when: "while an arrangement record
+    /// captures, the bridge applies a permuted, grown and shrunk desk (rows
+    /// inserted above, a row removed elsewhere, a second track armed). The
+    /// WAV equals the reference input bit for bit, `cap_dropped` stays 0,
+    /// and the take lands on its own track. A pick's ring is never replaced
+    /// while its capture flag is set.")
+    ///
+    /// The desk names its inputs, so every pick is held by its track: A on
+    /// input 1, B on input 2, C on input 3, A armed. While A records, a track
+    /// is inserted above it, A is dragged down the desk, C is removed and B
+    /// is armed (which sends B a ring of its own while A's pick captures).
+    /// With the picks counted along the rows, as they were, the insert above
+    /// gave A's pick to another track and the removal gave the next one
+    /// A's: the take filled with another input, or with nothing.
+    #[test]
+    fn a_record_rides_out_a_reshaped_desk_and_lands_on_its_track() {
+        const DEV: usize = 4;
+        let (mut app, mut bridge, mut e, mut tx, stream) =
+            rig(desk(&[(1, "0", true), (2, "1", false), (3, "2", false)]), DEV);
+        let (a, b, c) = (app.track_ids()[1], app.track_ids()[2], app.track_ids()[3]);
+        let takes = ArrRec::press_takes(&app, &bridge);
+        assert_eq!(takes.audio.len(), 1);
+        let pick: PickId = takes.audio[0].pick;
+        ArrRec::open_tee(&takes.audio, &mut bridge, Some(&mut e));
+        let one_ring = e.capture_ring_bytes();
+        assert!(one_ring > 0, "A's ring is not there at the press");
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: takes.audio };
+        let mut want = Vec::new();
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let mut b_armed = false;
+        for blk in 0..24 {
+            match blk {
+                4 => {
+                    frame(&mut app);
+                    assert!(app.insert_track_below(0), "the insert above was refused");
+                    assert_eq!(app.row_of(a), Some(2), "the insert did not land above A");
+                }
+                8 => {
+                    let from = app.row_of(a).expect("A is on the desk");
+                    app.move_channel(from, from + 3);
+                    assert_ne!(app.row_of(a), Some(from), "the drag did not move A");
+                }
+                12 => {
+                    frame(&mut app);
+                    let row = app.row_of(c).expect("C is on the desk");
+                    app.apply_dialog_action(tangent_ui::dialogs::DialogAction::TrackRemove(row));
+                    assert_eq!(app.row_of(c), None, "C was not removed");
+                }
+                16 => b_armed = true,
+                _ => {}
+            }
+            // The frame's own syncs, as `push_monitor_settings` makes them:
+            // the shape, then every input (B armed by its row, which the app
+            // has no keyboard road to).
+            bridge.sync(&app, &mut e);
+            let mut rows = input_rows(&app);
+            if b_armed {
+                if let Some(r) = rows.iter_mut().find(|r| r.id == b) {
+                    r.armed = true;
+                }
+            }
+            bridge.sync_input_rows(&rows, &mut e, &stream);
+            assert_eq!(bridge.pick_of(a), Some(pick), "block {blk}: A's pick moved");
+            assert!(e.is_capturing(pick), "block {blk}: A's capture stopped");
+            let block = ramp_block(DEV, 0, blk * BLOCK, BLOCK);
+            for f in 0..BLOCK {
+                want.extend([block[f * DEV]; 2]);
+            }
+            let _ = tx.write_chunk_uninit(block.len()).map(|c| c.fill_from_iter(block));
+            e.render_offline(&mut out);
+            rec.drain_tee(&mut e);
+        }
+        assert_eq!(e.capture_ring_bytes(), 2 * one_ring, "B's ring did not arrive beside A's");
+        rec.close_tee(&mut bridge, Some(&mut e));
+        assert_eq!(e.capture_dropped(), 0, "the tee dropped frames");
+        assert_eq!(rec.audio[0].frames.len(), want.len(), "the take is not as long as the input");
+        assert!(rec.audio[0].frames == want, "the take is not A's input, sample for sample");
+        let row = landed(&app, &rec).expect("A has a row");
+        assert_eq!(app.track_ids()[row], a, "the take would land on another track");
+        assert_eq!(app.channel_input_spec(row), "0", "the row the take lands on is not A's");
+        assert!(bridge.pick_of(b).is_some_and(|p| p != pick), "B shares A's pick");
     }
 }
