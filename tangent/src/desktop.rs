@@ -1461,9 +1461,11 @@ pub struct DesktopApp {
     /// structural word each frame. See `engine_bridge::Bridge`.
     #[cfg(feature = "recorder")]
     bridge: crate::engine_bridge::Bridge,
-    /// The drumpad knobs each lane was last given, on the same bargain.
+    /// The drumpad knobs each lane was last given, on the same bargain, by
+    /// SLOT, any slot: it was a row per legacy lane, so a kit past slot 31
+    /// was told its knobs again every frame for want of a record.
     #[cfg(feature = "recorder")]
-    pushed_pads: [Option<tangent_ui::recorder::DrumKitParams>; crate::instrument::LEGACY_LANES],
+    pushed_pads: std::collections::BTreeMap<usize, tangent_ui::recorder::DrumKitParams>,
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -1613,8 +1615,13 @@ pub struct DesktopApp {
     /// unchanged lanes because one bay loaded would spend a frame doing
     /// nothing. Cleared wherever `sampler_cache` is, because a file decoded
     /// at the old device's rate is not the file this lane is playing.
+    ///
+    /// **By SLOT, any slot** (W7-slot-gaps): it was a row per legacy lane,
+    /// so a lane past slot 31 had no record, was never handed its file and
+    /// played its sampler silent. A slot with no entry has been handed
+    /// nothing; `Some(None)` is a lane told it has no file.
     #[cfg(feature = "recorder")]
-    sampler_have: Vec<Option<(std::path::PathBuf, u8)>>,
+    sampler_have: std::collections::BTreeMap<usize, Option<(std::path::PathBuf, u8)>>,
     /// The decode workers `run_warm` feeds and drains. See [`DecodePool`].
     #[cfg(feature = "recorder")]
     pool: DecodePool,
@@ -12012,7 +12019,7 @@ impl DesktopApp {
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
                 self.sampler_cache.clear();
-                self.sampler_have = vec![None; crate::instrument::LEGACY_LANES];
+                self.sampler_have.clear();
                 // Whatever the crew is still decoding belongs to the old
                 // project; so does whatever is queued for it.
                 self.pool.invalidate();
@@ -13591,8 +13598,12 @@ impl DesktopApp {
         doc: Option<&std::path::Path>,
     ) -> Vec<(usize, Option<std::path::PathBuf>, u8)> {
         let mut out = Vec::new();
-        for lane in 0..crate::instrument::LEGACY_LANES {
-            let slot = crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX));
+        // **Every lane the engine holds, at any slot** (W7-slot-gaps). It
+        // walked the legacy thirty-two, so a sampler on a lane past them was
+        // never read here: live it was never handed its file, and an
+        // export's mirror (`mirror_sampler_samples`) rendered it silent.
+        for slot in e.lane_slots() {
+            let lane = slot.0 as usize;
             for bay in 0..tangent_ui::desk_id::BAYS {
                 let Some((rack, b)) =
                     crate::engine_bridge::lane_bay(slot, tangent_ui::desk_id::Rack::Chain(0), bay as u8)
@@ -13659,20 +13670,22 @@ impl DesktopApp {
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        // What every lane SHOULD be holding, indexed by lane. A lane with no
-        // sampler bay at all wants nothing, which is how a bay that was
-        // removed gets its samples freed.
-        let mut wanted: Vec<Option<(std::path::PathBuf, u8)>> =
-            vec![None; crate::instrument::LEGACY_LANES];
+        // What every lane SHOULD be holding, by SLOT, at any slot the engine
+        // holds a lane (W7-slot-gaps: it was the legacy thirty-two). A slot
+        // the host handed a file to whose lane names none any more wants
+        // nothing, which is how a bay that was removed gets its samples
+        // freed; so does a lane with no sampler bay at all.
+        let mut wanted: std::collections::BTreeMap<usize, Option<(std::path::PathBuf, u8)>> =
+            self.sampler_have.keys().map(|lane| (*lane, None)).collect();
         for (lane, path, root) in self.sampler_bays() {
-            if let (Some(slot), Some(path)) = (wanted.get_mut(lane), path) {
-                *slot = Some((path, root));
-            }
+            wanted.insert(lane, path.map(|p| (p, root)));
         }
         let mut delivered_all = true;
-        for (lane, want) in wanted.iter().enumerate() {
+        for (&lane, want) in &wanted {
             let want = want.clone();
-            if self.sampler_have.get(lane) == Some(&want) {
+            // A slot never handed anything already holds nothing.
+            let have = self.sampler_have.get(&lane).cloned().flatten();
+            if have == want {
                 continue;
             }
             // Decoded here or taken from the cache, exactly as a pad is —
@@ -13725,9 +13738,7 @@ impl DesktopApp {
                 .as_mut()
                 .is_some_and(|e| e.set_sampler_sample(crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX)), sample));
             if landed {
-                if let Some(slot) = self.sampler_have.get_mut(lane) {
-                    *slot = sent;
-                }
+                self.sampler_have.insert(lane, sent);
                 // **What the face draws, told by the road that actually
                 // delivered it.** Reported inside the landed arm so the panel
                 // can never show a waveform for a sample the audio thread
@@ -13757,7 +13768,7 @@ impl DesktopApp {
         // across EVERY lane — the kit's rule, and for its reason: sweeping
         // per lane would evict the sample a second lane is still playing.
         let live: Vec<std::path::PathBuf> = wanted
-            .iter()
+            .values()
             .filter_map(|w| w.as_ref().map(|(p, _)| p.clone()))
             .collect();
         self.sampler_cache
@@ -15685,7 +15696,7 @@ impl DesktopApp {
                 // was decoded at a rate this device may not run, and a lane
                 // holding one would play it at the wrong speed.
                 self.sampler_cache.clear();
-                self.sampler_have = vec![None; crate::instrument::LEGACY_LANES];
+                self.sampler_have.clear();
                 self.sampler_owed = true;
                 // Both of those are answered a file a frame from here on, and
                 // between a device settling and the user touching something
@@ -15806,12 +15817,10 @@ impl DesktopApp {
             self.pushed_auto = None;
             for slot in &synced.moved {
                 let at = slot.0 as usize;
-                if let Some(have) = self.sampler_have.get_mut(at) {
-                    *have = Some((std::path::PathBuf::from(RELOAD), 0));
-                }
-                if let Some(pushed) = self.pushed_pads.get_mut(at) {
-                    *pushed = None;
-                }
+                // Any slot: a lane past the thirty-second is owed its
+                // sampler's file like any other (W7-slot-gaps).
+                self.sampler_have.insert(at, Some((std::path::PathBuf::from(RELOAD), 0)));
+                self.pushed_pads.remove(&at);
             }
             self.sampler_owed = true;
         }
@@ -15890,7 +15899,7 @@ impl DesktopApp {
         // A fresh engine forgets the pads with everything else: the bridge
         // says when it adopted one.
         if synced.primed {
-            self.pushed_pads = [None; crate::instrument::LEGACY_LANES];
+            self.pushed_pads.clear();
         }
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
@@ -15905,11 +15914,9 @@ impl DesktopApp {
         for (row, lane) in self.bridge.lanes_holding(&self.app, tangent_ui::dialogs::DRUMPAD_PATH) {
             let params = self.app.drum_kit_params_of(row);
             let at = lane.slot.0 as usize;
-            if self.pushed_pads.get(at).copied().flatten() != Some(params) {
+            if self.pushed_pads.get(&at) != Some(&params) {
                 e.set_pad_params(lane.slot, &params);
-                if let Some(slot) = self.pushed_pads.get_mut(at) {
-                    *slot = Some(params);
-                }
+                self.pushed_pads.insert(at, params);
             }
         }
         // **The microphone fader, and it goes to ONE place now.** It used to
@@ -20228,7 +20235,7 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             bridge: crate::engine_bridge::Bridge::new(),
             #[cfg(feature = "recorder")]
-            pushed_pads: [None; crate::instrument::LEGACY_LANES],
+            pushed_pads: std::collections::BTreeMap::new(),
             pace_frames: 0,
             pace_dt: Vec::new(),
             pace_causes: std::collections::BTreeMap::new(),
@@ -20319,7 +20326,7 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             sampler_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
-            sampler_have: vec![None; crate::instrument::LEGACY_LANES],
+            sampler_have: std::collections::BTreeMap::new(),
             #[cfg(feature = "recorder")]
             pool: DecodePool::new(),
             #[cfg(feature = "recorder")]
@@ -26113,7 +26120,7 @@ mod tests {
             "the sampler reload no longer sweeps its cache"
         );
         assert!(
-            reload.contains("if self.sampler_have.get(lane) == Some(&want)"),
+            reload.contains("if have == want {"),
             "the reload lost its only-what-changed test, so every bay landing \
              hands the audio thread thirty-two files it already has"
         );

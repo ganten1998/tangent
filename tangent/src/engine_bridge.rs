@@ -3520,17 +3520,18 @@ mod tests {
     /// the engine keeps of a bay's tenant live in that rack's one record. A
     /// lane at slot 40, past the frozen seat map's thirty-two rows: its
     /// chain, its extra rack and a pedal each seat a comp by identity, each
-    /// answers what it holds and the state it plays, and a lane's pad rack
-    /// past the map's pads is named but not made yet, so it holds nothing.
-    /// When the lane goes home, its racks' records go with it.
+    /// answers what it holds and the state it plays, and so does a pad's
+    /// rack past the map's pads, made by the load (W7-slot-gaps: it was
+    /// named and never made, so a kit there played its pads dry). When the
+    /// lane goes home, its racks' records go with it, the pad's included.
     #[test]
     fn a_plugin_is_reached_through_its_racks_host_record_at_any_slot() {
         let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
         let slot = Slot(40);
-        e.install_lanes(vec![(slot, LaneSpec { kind: LaneKind::Audio, drum: false })]).expect("a lane at 40");
+        e.install_lanes(vec![(slot, LaneSpec { kind: LaneKind::Audio, drum: true })]).expect("a lane at 40");
         e.settle_offline();
         let dial = dialled(COMP_PATH, &[(0, 0.2), (1, 0.9)]);
-        let racks = [Rack::Chain(0), Rack::Chain(1), Rack::Pedal(3)];
+        let racks = [Rack::Chain(0), Rack::Chain(1), Rack::Pedal(3), Rack::Pad(5)];
         for rack in racks {
             let (addr, bay) = lane_bay(slot, rack, 2).expect("a rack of the lane");
             assert_eq!(addr.lane(), Some(slot), "{rack:?}: the rack is not the lane's");
@@ -3545,12 +3546,6 @@ mod tests {
             );
             assert_eq!(e.save_insert_state_at(addr, bay), Some(dial.clone()), "{rack:?}: the bay lost its dial");
         }
-        let (pad, bay) = lane_bay(slot, Rack::Pad(5), 0).expect("a pad rack is a rack of the lane");
-        assert_eq!(
-            e.load_insert_at(pad, bay, Some(Path::new(COMP_PATH)), None).expect("no error"),
-            None,
-            "a pad rack past the map's pads seated a plugin"
-        );
         e.remove_lanes(&[slot]).expect("the lane goes home");
         let mut out = vec![0.0f32; 256 * 2];
         e.render_offline(&mut out);
