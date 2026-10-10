@@ -1626,6 +1626,21 @@ Two checkpoints, each green:
 - **`rt_alloc`:** covers MonitorPlan and capture-ring swaps.
 - **Quantum:** capture rings are never smaller than the graph quantum (test).
 
+### W5-save-gaps
+
+**Added 2026-10-09 by the owner** ("yes fix those in wave 5"). Four save-road defects found by W4; three of them are on main today. Each fix gets a test that fails with the fix removed.
+
+**Goal.** What a save writes is what the session shows, and no kill or Don't Save loses a kit or a plugin state.
+
+1. **Save As and add_bare_track write a stale desk.** `save_project_as` writes `self.arrangement` without refreshing its desk from the live session, and `add_bare_track` does not refresh it either (W4-lane-refs proved it with a probe: add a track, Save As, reopen the copy, the row is missing; the copy's kit sidecar is written from the live rows, so its two files disagree). Fix: every save road refreshes the document's desk from the session at the moment it writes, through one function, and a scan or a road-list test proves no save road writes without it. Test: add a track (bare, MIDI, audio, folder), Save As, reopen the copy, every row and its kit are there; the same for Save and Save a Copy if it exists.
+2. **Removing a drum track deletes its kit on disk at once.** The sidecar is rewritten without the kit immediately, so Don't Save after a removal reopens the project with the kit gone. Fix: a removal changes only the session; the sidecar is written with the document on the next save (W4-lane-refs already writes the sidecar with the document). Undo of the removal before a save brings the kit back from memory. Test: remove a drum track, Don't Save, reopen: kit present; remove, Save, reopen: kit gone; remove, undo, Save: kit present.
+3. **drumpad.json backup.** W4-integrate (97c08bf) keeps a legacy kit sidecar once beside it before the first format-2 write. Verify it covers every road that first writes format 2 (Save, Save As into an existing folder, template seeding, the launch reclaim), and that restoring `<doc>.pre-v8` plus the kept sidecar into a release build opens with its kits. Extend if any road is missed.
+4. **A kill mid-save on the in-place roads.** W4-integrate (2e87564) journals the two roads that move a session to a NEW folder (states owed before the document lands, paid at the next launch). Still open: `switch_project`, New, and `on_exit` when they write a never-written scratch's document for the first time, where the mirror lands after the document. Fix: the same owe-then-write journal on those roads (or mirror first, document last, if that is simpler and provably equivalent). Also: an owed mirror whose destination volume is unmounted at the next launch must stay owed (not be dropped) until it can be paid or the user discards the project. Tests: kill injected between every write on each road; the next launch pays what is owed; nothing is silently dropped.
+
+**Files.** tangent-ui/src/app.rs (save roads, remove_track, add_bare_track), tangent-ui/src/drumpad.rs, tangent/src/desktop.rs (switch_project, New, on_exit, the owed-mirror journal from 2e87564), tangent/src/shelf.rs (journal only). Coordinate: W5-identity-maps owns most of app.rs; keep hunks local to the save and remove roads.
+
+**Done when.** The four tests above pass, each fails with its fix reverted, and the full gate is green.
+
 ### W6-rows-unlimited
 
 **Goal.** The desk becomes the list of rows that exist:
