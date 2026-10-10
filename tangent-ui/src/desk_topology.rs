@@ -49,6 +49,13 @@ impl Topology {
     /// the caller, or by [`Self::of_desk`] and [`Self::of_model`]).
     pub fn new(rows: &[TrackRow], specials: &Specials, routes: impl IntoIterator<Item = (Node, Node)>) -> Self {
         let mut t = Topology::default();
+        // **A send is an edge only where it sounds** (`desk_model::bus_sends`,
+        // the one rule the app and the bridge read): a send aimed at a track
+        // that is no bus stays in the file but carries nothing, so it closes
+        // no loop. A send to a node that is no track (the effects return)
+        // is an edge as it always was.
+        let buses = crate::desk_model::buses_of(rows);
+        let sounds = |s: &crate::desk_model::Send| s.to.track().is_none_or(|id| buses.contains(&id));
         // A folder's run, by the walk every reader of the flags uses: a
         // member belongs to the nearest folder above it with only members
         // between, and a member flag with anything else between is stale
@@ -68,12 +75,12 @@ impl Topology {
             } else {
                 None
             };
-            for s in &r.sends {
+            for s in r.sends.iter().filter(|s| sounds(s)) {
                 t.edge(me, s.to);
             }
         }
         for (node, sp) in specials.iter() {
-            for s in &sp.sends {
+            for s in sp.sends.iter().filter(|s| sounds(s)) {
                 t.edge(node, s.to);
             }
         }
@@ -355,4 +362,31 @@ mod tests {
         assert!(!topo.would_cycle(t(150), t(0)));
         assert!(topo.would_cycle(t(150), t(25)));
     }
+
+    /// **A send aimed at a track that is no bus closes no loop** (W7-join's
+    /// review): it is kept in the file, but nothing plays it
+    /// (`desk_model::bus_sends`), so the picker must not grey a target for
+    /// a loop through it. Made a bus, the same row's send is an edge again.
+    #[test]
+    fn a_send_to_a_track_that_is_no_bus_is_no_edge_until_the_track_is_a_bus() {
+        // Track 1 sends to track 2, an audio row: the send is kept, plays
+        // nowhere, and so a route from 2 back to 1 closes no loop.
+        let mut rows = vec![row(1), row(2)];
+        rows[0].sends.push(send(t(2)));
+        let topo = Topology::of_desk(&rows, &Specials::default(), &routed(&[]));
+        assert!(!topo.reaches(t(1), t(2)), "a send that sounds nowhere is an edge");
+        assert!(!topo.would_cycle(t(2), t(1)), "a dead send greyed a route back");
+        let topo = Topology::of_desk(&rows, &Specials::default(), &routed(&[(t(2), t(1))]));
+        assert!(!topo.in_loop(t(2), t(1)), "a dead send marked a route as feedback");
+        // Made a bus, the same send is an edge, and the route back loops.
+        rows[1] = bus(2);
+        let topo = Topology::of_desk(&rows, &Specials::default(), &routed(&[(t(2), t(1))]));
+        assert!(topo.in_loop(t(2), t(1)), "a send to a bus is an edge");
+        // The specials' sends read the same rule.
+        let mut specials = Specials::default();
+        specials.drums.sends.push(send(t(7)));
+        let topo = Topology::of_desk(&[row(7)], &specials, &routed(&[]));
+        assert!(!topo.reaches(Node::Drums, t(7)), "a special's dead send is an edge");
+    }
+
 }
