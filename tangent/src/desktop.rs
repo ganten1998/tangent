@@ -28,6 +28,8 @@ use std::sync::{mpsc, Arc};
 // unused-import warning there.
 #[cfg(feature = "recorder")]
 use std::sync::Mutex;
+#[cfg(feature = "recorder")]
+use crate::shelf::{incoming_state, shelve_displaced, DisplacedShelf};
 
 /// A real MIDI input, opened with `midir`.
 ///
@@ -269,29 +271,21 @@ struct Recorder {
     /// `reconcile_device_send`. Holds a `!Send` cpal stream, which is why it
     /// lives here on the UI thread beside the engine's own.
     device_send: Option<tangent_record::devsend::DeviceSend>,
-    /// What is loaded in each insert slot, flat like `Settings::strip_inserts`.
+    /// What is loaded in each insert bay, by the ENGINE's address for it
+    /// (its lane's slot, the rack, the bay): see [`InsertLedger`].
     /// Remembered whether or not the load worked, so a plugin that refuses is
     /// asked once — `load_insert` blocks for seconds on a sampler, and a
     /// plugin that refuses must not be retried sixty times a second.
-    /// What each BAY has loaded, flat: `seat * INSERTS + bay`.
     ///
-    /// **`INSERT_SPACE`, which is EVERY seat — not the strips plus the first
-    /// pad block.** All five places that size this said
+    /// **Every bay the desk can hold, not the strips plus the first pad
+    /// block.** All five places that sized the flat table this replaced said
     /// `(STRIPS + 1 + DRUM_PADS) * INSERTS`, which comes to 444 — and
     /// `MASTER_EXTRA_SEAT` IS seat 148, whose bays are 444, 445 and 446. So
     /// the reconcile walked `0..444`, never reached them, and a plugin in the
     /// master's SECOND rack was never handed to the engine: silent in
-    /// playback, and present in the export, because the settings and the
-    /// exporter both size themselves from the right constant.
-    ///
-    /// That divergence is the worst possible symptom. It reads as a broken
-    /// exporter, or a broken plugin, and never as a short array.
-    ///
-    /// `open_insert_picker` carries the same story one layer up: the same
-    /// seat was unreachable there and was fixed only there, which is how this
-    /// survived. Deriving the length from the constant the rest of the app
-    /// already uses is what stops there being a third time.
-    inserts_loaded: Vec<Option<String>>,
+    /// playback, and present in the export. Keyed by what is there, the
+    /// ledger has no length to get wrong.
+    inserts_loaded: InsertLedger,
     /// The drumpad kit could not be handed to the audio thread last frame
     /// (stalled callback, absent engine) — try again this one.
     pads_retry: bool,
@@ -600,10 +594,17 @@ struct OfflineBounce {
     freeze: Option<FreezeJob>,
 }
 
-/// **A freeze in flight on the offline mirror.** One lane's stem, written
+/// **A freeze in flight on the offline mirror.** One track's stem, written
 /// under the project's `media/`, handed to the app through `note_frozen`
 /// when the render is done.
+///
+/// **Bound to the TRACK, not its row** (design 7.13: "`FreezeJob` holds the
+/// TrackId and lands through `row_of`"): the stem is read from the mirror
+/// lane the track was given, and the file lands on whatever row the track
+/// stands on when the render finishes.
 struct FreezeJob {
+    id: tangent_ui::desk_id::TrackId,
+    /// The track's lane in the MIRROR engine: the stem column to read.
     lane: usize,
     /// Relative to the document, the way the app stores a clip's path.
     rel_path: String,
@@ -625,6 +626,9 @@ struct FreezeJob {
 /// when the render finishes rather than shipped. See [`any_sound`].
 #[cfg(feature = "recorder")]
 struct StemWriter {
+    /// The LANE whose column of the stem tap this file is cut from: the
+    /// row's track's lane, bound at the press (design 7.13: "stems bind
+    /// `(slot, gen)` at the press").
     lane: usize,
     path: std::path::PathBuf,
     writer: tangent_record::wav::WavWriter,
@@ -1164,7 +1168,7 @@ pub struct DesktopApp {
     /// on — a frame is long enough for the desk to change its mind about a
     /// bay.
     #[cfg(feature = "recorder")]
-    insert_announced: Option<usize>,
+    insert_announced: Option<crate::engine_bridge::EngineBay>,
     /// How many bays the reconcile found outstanding THIS frame, with the
     /// engine exclusion applied. `inserts_pending` reads it back for the
     /// splash rather than walking the seat space a second time; see there.
@@ -1263,7 +1267,7 @@ pub struct DesktopApp {
     /// a backstop; a row that stopped being a comp reads zero, so a stale
     /// index costs nothing worse than one idle swap.
     #[cfg(feature = "recorder")]
-    comp_rows: Vec<usize>,
+    comp_rows: Vec<crate::engine_bridge::EngineBay>,
     #[cfg(feature = "recorder")]
     comp_rows_stale: bool,
     #[cfg(feature = "recorder")]
@@ -1334,7 +1338,7 @@ pub struct DesktopApp {
     bridge: crate::engine_bridge::Bridge,
     /// The drumpad knobs each lane was last given, on the same bargain.
     #[cfg(feature = "recorder")]
-    pushed_pads: [Option<tangent_ui::recorder::DrumKitParams>; tangent_ui::recorder::CHANNELS],
+    pushed_pads: [Option<tangent_ui::recorder::DrumKitParams>; crate::instrument::LEGACY_LANES],
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -1499,11 +1503,12 @@ pub struct DesktopApp {
     scope_buf: Vec<f32>,
     /// The INSERT tap drain's reusable buffer, and where the tap is aimed —
     /// `None` while no plugin face has it armed, which is also the gate on
-    /// draining it at all. Kept in ENGINE terms (seat, bay), translated once
-    /// where the request lands, so an engine rebuilt mid-session could be
-    /// re-armed from here without re-asking the UI.
+    /// draining it at all. Kept in ENGINE terms (the rack by identity, and
+    /// the bay), translated once where the request lands, so an engine rebuilt
+    /// mid-session could be re-armed from here without re-asking the UI.
     tap_buf: Vec<f32>,
-    insert_tap_at: Option<(usize, usize)>,
+    #[cfg(feature = "recorder")]
+    insert_tap_at: Option<crate::engine_bridge::EngineBay>,
     /// The IR wizard's host-side road: what is armed, the reference pass on
     /// hold, the worker chewing a finished capture, and the processed IRs
     /// waiting for a Save. See the "IRs on disk" section.
@@ -2279,20 +2284,25 @@ fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathB
 ///
 /// The plugin's short name comes from the app's own bay text rather than from
 /// the module, so the menu says exactly what the bay chip says.
+///
+/// **Two names, one rack**: `strip` is where the app keeps it (by row) and
+/// `rack` what the engine calls it (the lane's own rack by its slot, through
+/// the bridge, and so through its `HostRack`). Only one of them is right for
+/// each side after a reorder.
 #[cfg(feature = "recorder")]
 fn push_fx_params(
     app: &mut TangentApp,
     engine: &crate::instrument::Engine,
-    strip: usize,
+    (strip, rack): (usize, crate::instrument::RackAddr),
     inserts: usize,
 ) {
-    let bays: [tangent_ui::ports::FxParams; tangent_ui::recorder::INSERTS] =
+    let bays: [tangent_ui::ports::FxParams; tangent_ui::desk_id::BAYS] =
         std::array::from_fn(|bay| {
             if bay >= inserts {
                 return tangent_ui::ports::FxParams::default();
             }
             let params: Vec<tangent_ui::ports::FxParam> = engine
-                .insert_parameters(strip, bay)
+                .insert_parameters_at(rack, bay)
                 .into_iter()
                 .map(|p| tangent_ui::ports::FxParam {
                     id: p.id,
@@ -2311,7 +2321,7 @@ fn push_fx_params(
                 // Read here, once, with the parameters it travels with:
                 // whether the tenant reports an aux input bus a key could
                 // feed. The UI gates the bay menu's "Sidechain" row on it.
-                has_sidechain: engine_insert_wants_key(engine, strip, bay),
+                has_sidechain: engine_insert_wants_key(engine, rack, bay),
             }
         });
     app.set_fx_params(strip, bays);
@@ -2320,8 +2330,8 @@ fn push_fx_params(
 /// Whether the bay's tenant can take a key — the engine's own answer, one
 /// thin seam kept so the UI lane and the engine lane could land apart.
 #[cfg(feature = "recorder")]
-fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay: usize) -> bool {
-    engine.insert_wants_key(seat, bay)
+fn engine_insert_wants_key(engine: &crate::instrument::Engine, rack: crate::instrument::RackAddr, bay: usize) -> bool {
+    engine.insert_wants_key_at(rack, bay)
 }
 
 /// **Read one seat's bays and hand the app every built-in face on it** —
@@ -2332,14 +2342,15 @@ fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay:
 /// All three bays every time rather than just the one that moved, because an
 /// unload must CLEAR its face (the empty `BuiltinFace` is the tombstone) and
 /// the caller only knows which flat index changed, not what it used to hold.
+/// The app's seat and the engine's rack, as [`push_fx_params`] takes them.
 #[cfg(feature = "recorder")]
 fn push_builtin_faces(
     app: &mut TangentApp,
     engine: &crate::instrument::Engine,
-    strip: usize,
+    (strip, rack): (usize, crate::instrument::RackAddr),
 ) {
-    for slot in 0..tangent_ui::recorder::INSERTS {
-        let face = match engine.builtin_insert(strip, slot) {
+    for slot in 0..tangent_ui::desk_id::BAYS {
+        let face = match engine.builtin_insert_at(rack, slot) {
             Some((spec, values)) => tangent_ui::ports::BuiltinFace {
                 strip,
                 slot,
@@ -2372,7 +2383,7 @@ fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
-                extra: engine.builtin_extra(strip, slot).to_vec(),
+                extra: engine.builtin_extra_at(rack, slot).to_vec(),
             },
             None => tangent_ui::ports::BuiltinFace {
                 strip,
@@ -2445,11 +2456,14 @@ fn live_face(
     use tangent_ui::automation::AutoParam;
     let mut values = saved.to_vec();
     let mut moved: Vec<u32> = Vec::new();
+    // The document's own lane for the master's curves, from the one home of
+    // that arithmetic.
+    let master = tangent_ui::arrangement_panel::LaneId::Master.auto_lane();
     for c in auto.curves() {
         let AutoParam::Plugin { bay: b, id } = c.param else {
             continue;
         };
-        if crate::instrument::param_slot(c.lane, usize::from(b)) != Some((seat, bay)) {
+        if crate::instrument::param_slot(c.lane, usize::from(b), master) != Some((seat, bay)) {
             continue;
         }
         let Some(k) = spec.params.iter().position(|p| p.id == id) else {
@@ -3833,7 +3847,7 @@ fn audio_clip_passes(
         }
         out.push(crate::instrument::Placed {
             clip: Arc::clone(decoded),
-            strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
+            strip: clip.lane,
             start: frames(clip.start_s + at),
             offset: frames(clip.offset_s),
             len: frames(this),
@@ -3982,7 +3996,7 @@ pub(crate) fn export_clip_placement(
             let notes = midi_clip_notes(clip, f64::from(rate));
             if !notes.is_empty() {
                 midi_placed.push(crate::instrument::PlacedMidi {
-                    strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
+                    strip: clip.lane,
                     start: frames(clip.start_s),
                     len: frames(clip.len_s),
                     notes: Arc::new(notes),
@@ -5285,15 +5299,17 @@ impl DesktopApp {
         // The drumpad's peaks, read-and-reset like the strips' — exactly
         // once a frame, and pushed before the state borrow below takes the
         // app for the rest of this function.
-        let mut pad_levels = [0.0f32; tangent_ui::recorder::DRUM_PADS];
+        let mut pad_levels = [0.0f32; tangent_ui::desk_id::PADS];
         if let Some(e) = self.recorder.engine.as_ref() {
             // **The pads light for the kit the window is SHOWING.** With a
             // full instance per channel there is a meter per lane, and the
             // window is looking at one of them — the first, until it learns
             // to choose.
-            let lane = (0..tangent_ui::recorder::CHANNELS)
-                .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-                .unwrap_or(0);
+            let lane = self
+                .bridge
+                .lanes_holding(&self.app, tangent_ui::dialogs::DRUMPAD_PATH)
+                .first()
+                .map_or(crate::desk_plan::Slot(0), |(_, at)| at.slot);
             let pads = e.pad_peaks(lane);
             pad_levels = pads;
             self.app.note_drumpad_peaks(pads);
@@ -5329,7 +5345,6 @@ impl DesktopApp {
         // changed (see the field), and the per-frame cost is one swap per
         // loaded compressor.
         if let Some(e) = self.recorder.engine.as_ref() {
-            let inserts = tangent_ui::recorder::INSERTS;
             let now = std::time::Instant::now();
             let backstop = self
                 .comp_rows_at
@@ -5340,17 +5355,21 @@ impl DesktopApp {
                     self.recorder
                         .inserts_loaded
                         .iter()
-                        .enumerate()
-                        .filter(|(_, l)| l.as_deref() == Some(crate::builtin_fx::COMP_PATH))
-                        .map(|(i, _)| i),
+                        .filter(|(_, l)| l.as_str() == crate::builtin_fx::COMP_PATH)
+                        .map(|(at, _)| *at),
                 );
                 self.comp_rows_stale = false;
                 self.comp_rows_epoch = self.engine_epoch;
                 self.comp_rows_at = Some(now);
             }
-            for &i in &self.comp_rows {
-                self.app
-                    .set_insert_gr(i / inserts, i % inserts, e.insert_gr_db(i / inserts, i % inserts));
+            // Read by the engine's address, drawn at the app's: the needle
+            // belongs to the track whose lane the comp is in, wherever its
+            // row has gone.
+            for &(rack, bay) in &self.comp_rows {
+                let db = e.insert_gr_db_at(rack, bay);
+                if let Some((strip, slot)) = self.bridge.app_seat(&self.app, (rack, bay)) {
+                    self.app.set_insert_gr(strip, slot, db);
+                }
             }
         }
         // A bay announced last frame is loaded THIS frame, after this runs:
@@ -5472,10 +5491,24 @@ impl DesktopApp {
             state.loudness.pair = e.loudness_stereo();
             // What the timeline is playing, lane by lane — the half the
             // theory view could never see. See `Engine::lane_sounding`.
-            state.lane_sounding = e.lane_sounding();
+            // **Read by slot, drawn by row**: each row shows its own track's
+            // lane wherever a reorder has put the two.
+            let sounding = e.lane_sounding();
             // The desk's own meters. Read-and-reset on the engine's side, so
             // this has to happen exactly once a frame and here is that once.
-            state.strip_peaks = e.strip_peaks();
+            let peaks = e.strip_peaks();
+            state.lane_sounding = std::array::from_fn(|row| {
+                self.bridge.lane(row).and_then(|l| sounding.get(l.slot.0 as usize).copied()).unwrap_or(0)
+            });
+            state.strip_peaks = std::array::from_fn(|strip| {
+                let from = match tangent_ui::desk_legacy::decode_v32_strip(strip) {
+                    Some(tangent_ui::desk_legacy::LegacyOwner::Row(row)) => {
+                        self.bridge.lane(usize::from(row)).map(|l| l.slot.0 as usize)
+                    }
+                    _ => Some(strip),
+                };
+                from.and_then(|i| peaks.get(i).copied()).unwrap_or([0.0; 2])
+            });
             // **And the VU falls back to it when nothing else is feeding.**
             // The band's meter shows what is being recorded: the input when
             // there is one, and otherwise the instrument. With no interface
@@ -5498,7 +5531,7 @@ impl DesktopApp {
             state.master = tangent_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
             state.loudness = tangent_ui::recorder::Loudness::default();
-            state.lane_sounding = [0; tangent_ui::recorder::CHANNELS];
+            state.lane_sounding.fill(0);
         }
         // **Levels with nothing plugged in, for looking at the desk.**
         //
@@ -5658,7 +5691,7 @@ impl DesktopApp {
             || self.frozen.inputs.0 != open_inputs
             || self.frozen.inputs.1 != alias
         {
-            for i in 0..tangent_ui::recorder::INPUTS {
+            for i in 0..state.inputs.len().min(self.recorder.input_names.len()) {
                 let (device, channel, stereo) = open_inputs
                     .get(i)
                     .cloned()
@@ -6168,108 +6201,37 @@ impl DesktopApp {
             e.set_master_mono(self.app.master_mono());
             e.set_master_mute(self.app.master_muted());
         }
-        // **A track reorder moves the plugin-state sidecars with it** —
-        // BEFORE the reconcile below, or the racks reload against the old
-        // rows' knobs. Live states written down first, so what moves is
-        // what was sounding.
+        // **A track reorder moves NOTHING in the engine or on the shelf**
+        // (design 7.13: "one Plan. No plugin moves, no renames, no round
+        // trips"). Every track's lane stays at its slot with its bays in it,
+        // the bridge has already published the new order as one plan, the
+        // reconcile below finds every bay where it was, and each plugin's
+        // state file is named by its bay's identity (`shelf`), so no file
+        // has a row in its name to follow. What still follows the ROWS is
+        // what the app keeps by position: the faces it draws by seat.
         //
         // **And so do its undo and its redo**, which hand over the inverse
-        // and the order again (`TangentApp::undo_apply`). A moment names
-        // each bay's bundle and nothing about the plugin in it, so an undo
-        // that sent nothing put every name back and the reconcile rebuilt
-        // each moved bay from a file written for another row: factory
-        // settings, or a neighbour's where both rows held the same plugin.
+        // and the order again (`TangentApp::undo_apply`).
         if let Some(order) = self.app.take_desk_state_perm() {
-            // The channel order lifted onto the whole seat space, so each
-            // folder-extra seat and each pedal seat follows its channel
-            // through every copy of the per-seat state - see
-            // `recorder::seat_order`.
-            let full = tangent_ui::recorder::seat_order(&order);
-            // **Only the seats this permutation touches.** See
-            // `save_plugin_states_as_loaded_for`. Read off the lifted order,
-            // so a channel's row, its folder-extra seat and its seven pedal
-            // seats are all here: the list this replaced was kept by hand,
-            // named the first two, and left the pedals' settings out of the
-            // save while `seat_order` moved their files.
-            let moved: Vec<bool> = full.iter().enumerate().map(|(new, old)| new != *old).collect();
-            // **Written down in the layout the files are still in.** The
-            // engine, `inserts_loaded` and the sidecars all describe the OLD
-            // rows until the moves below, so each seat's live state lands in
-            // its own file under its own tenant's name, and then the three
-            // move together. Saving after the carry wrote every carried
-            // state at its NEW seat, and the file move then carried it a
-            // second time: the shelf ended in the old layout, and the next
-            // rebuild of a moved bay - a redo, a buffer-size change - read
-            // another row's file.
-            self.save_plugin_states_as_loaded_for(Some(&moved));
-            // **Carry the plugins across instead of rebuilding them.**
-            //
-            // A track that moves takes its plugins with it, and the instance
-            // the new seat wants is the one the old seat has. Moving it is
-            // two ring pushes; rebuilding it is a bundle scan, an
-            // instantiation and a state restore, one bay per frame — which
-            // is the spinning wheel. Whatever could not be carried comes
-            // back here and is rebuilt the slow way.
-            let stranded: Vec<usize> = self
-                .recorder
-                .engine
-                .as_mut()
-                .map(|e| e.permute_channel_inserts(&order))
-                .unwrap_or_default();
-            // The host's own copy of what sits in each seat travels too, or
-            // the reconcile below compares the new seat against the old
-            // seat's plugin and reloads everything it just carried.
-            permute_loaded_rows(&mut self.recorder.inserts_loaded, &full);
-            permute_insert_states_in(
-                insert_state_path(0, 0)
-                    .parent()
-                    .map(std::path::Path::to_path_buf),
-                &full,
-            );
-            // **The LIVE shelf only, never the project's.** The project
-            // folder changes when somebody saves, and a Save mirrors the live
-            // shelf into it whole (`copy_states_to_project`). Permuting
-            // `<project>/state/` here was a write left from when every edit
-            // saved the document; since nothing saves itself it put a saved
-            // project's plugin states in the new layout under a document
-            // still in the old one, and "Don't Save" - or a crash - reopened
-            // the moved tracks with each other's settings, or at factory.
-            //
-            // And the displaced-state shelf, which is keyed by seat exactly
-            // like the files and has to stay beside them - see
-            // `permute_displaced`.
-            permute_displaced(&mut self.displaced_states, &full);
-
-            // **Only the rows that MOVED**, which is why this is not
-            // `force_insert_reload`.
-            //
-            // That marks every one of the ~450 bays on the desk — sixteen
-            // channels, the buses, the master and 128 drum pads — and the
-            // reconcile below reloads exactly one mismatched bay per frame.
-            // So a reorder tore down and re-instantiated every plugin in the
-            // session, one per frame, each one scanning a bundle and
-            // restoring its state: the owner's "when a reorder occurs of any
-            // kind -- massive delay". A row that did not move has the same
-            // plugin with the same state and nothing to do.
-            // **Only what could not be carried.** A seat whose plugin
-            // moved is already correct: same instance, same state, new
-            // index. Marking it would undo the whole point.
-            let bays = tangent_ui::recorder::INSERTS;
-            for seat in stranded {
-                for b in 0..bays {
-                    if let Some(slot) = self.recorder.inserts_loaded.get_mut(seat * bays + b) {
-                        *slot = Some("\u{1f}reload".to_owned());
-                    }
-                }
-            }
             // **The faces follow their seats.** The app's face mirror is
-            // keyed by seat, and a carried instance changed seat without a
-            // reload — nothing below will re-push it. Only the moved rows;
-            // an unmoved face is already right.
+            // keyed by the APP's seat, and a moved row's seats now name
+            // another track: each rack of the track standing there now is
+            // re-read from its own lane, its chains, its pedal board and its
+            // pads alike. Only the moved rows; an unmoved face is already
+            // right. `order[new] = old`.
             if let Some(e) = self.recorder.engine.as_ref() {
-                for (seat, m) in moved.iter().enumerate() {
-                    if *m {
-                        push_builtin_faces(&mut self.app, e, seat);
+                let ids = self.app.track_ids().to_vec();
+                for (row, old) in order.iter().enumerate() {
+                    let Some(&id) = ids.get(row).filter(|_| row != *old) else {
+                        continue;
+                    };
+                    for rack in crate::engine_bridge::track_racks() {
+                        let sb = tangent_ui::desk_id::SeatBay::new(tangent_ui::desk_id::Node::Track(id), rack, 0);
+                        if let (Some((seat, _)), Some((at, _))) =
+                            (crate::engine_bridge::app_seat_of(&ids, sb), self.bridge.engine_bay(sb))
+                        {
+                            push_builtin_faces(&mut self.app, e, (seat, at));
+                        }
                     }
                 }
             }
@@ -6277,44 +6239,47 @@ impl DesktopApp {
         // **A pasted track's plugin STATE — BEFORE the bay reconcile below.**
         //
         // The copy itself is the app's (kind, levels, bays, clips), but the
-        // state a plugin saved lives in a file keyed by (strip, bay) and
+        // state a plugin saved lives in a file keyed by its bay and
         // nothing in `tangent-ui` may reach a file.
         //
         // The ORDER is the whole of it. This sat a hundred lines further
         // down, after the reconcile that loads the bay — so the pasted
-        // instance was created, handed `saved_insert_state` for a file that
+        // instance was created, handed its saved state for a file that
         // did not exist yet, and came up at the plugin's DEFAULTS. And it
         // stayed there: the reconcile only fires when a bay's WANTED path
         // stops matching its loaded one, and a state file appearing later
         // changes neither. A pasted drum sampler with no kit takes MIDI,
         // lights its pads and makes no sound.
-        if let Some((from, to)) = self.app.take_insert_state_copy() {
-            let (from, to) = (
-                tangent_ui::recorder::Strip::Channel(from).index(),
-                tangent_ui::recorder::Strip::Channel(to).index(),
-            );
-            // **All SIX slots, through the seat map.** A track's 3..5 live
-            // in an appended rack seat, so a loop over `INSERTS` copied the
-            // states of half the rack and left the other half's plugins
-            // coming up at their defaults. `paste_track` writes all six.
-            let bays = tangent_ui::recorder::INSERTS;
-            for slot in 0..tangent_ui::recorder::bays_at(from) {
-                let (from_seat, from_bay) = tangent_ui::recorder::seat_bay(from, slot);
-                let (to_seat, to_bay) = tangent_ui::recorder::seat_bay(to, slot);
-                let src = insert_state_path(from_seat, from_bay);
-                let dst = insert_state_path(to_seat, to_bay);
+        //
+        // **By identity**: the copied track's bays to the pasted track's,
+        // whichever rows the two stand on now (`take_insert_state_copy_ids`).
+        if let Some((from, to)) = self.app.take_insert_state_copy_ids() {
+            use tangent_ui::desk_id::{slot_key, Node};
+            // **All SIX slots, through the display-slot resolver.** A
+            // track's 3..5 live in its second rack, so a loop over one rack
+            // copied the states of half of it and left the other half's
+            // plugins coming up at their defaults. `paste_track` writes all
+            // six.
+            for slot in 0..2 * tangent_ui::desk_id::BAYS {
+                let (Some(src), Some(dst)) = (slot_key(Node::Track(from), slot), slot_key(Node::Track(to), slot))
+                else {
+                    continue;
+                };
+                let held = crate::engine_bridge::app_seat_of(self.app.track_ids(), dst)
+                    .and_then(|(seat, bay)| self.app.insert(seat, bay).map(str::to_owned));
+                let at = self.bridge.engine_bay(dst);
                 // A bay the source never used leaves the destination's own
                 // file alone rather than deleting it: the paste has already
                 // cleared that bay through `set_insert`, and a stale file
                 // whose owner does not match is ignored by
-                // `saved_insert_state` anyway.
-                if src.exists() {
-                    let _ = std::fs::copy(&src, &dst);
+                // `shelf::saved_state` anyway.
+                if let Some((owner, state)) = crate::shelf::owner_and_state(&crate::shelf::state_path(src)) {
+                    crate::shelf::write_state(dst, &owner, &state);
                     // The pasted plugin's file is the newest word on it in
                     // this bay; an earlier tenant of the same bundle shelved
                     // here must not outrank it. See `incoming_state`.
-                    if let Some(b) = self.app.insert(to_seat, to_bay).map(str::to_owned) {
-                        self.displaced_states.remove(&(to_seat, to_bay, b));
+                    if let Some(b) = held.clone() {
+                        self.displaced_states.remove(&(dst, b));
                     }
                 }
                 // **And the bay is rebuilt even when its NAME did not
@@ -6325,19 +6290,19 @@ impl DesktopApp {
                 // goes on playing its own settings with the state just
                 // copied sitting unread beside it. The marker is
                 // `force_insert_reload`'s, for the same reason.
-                if self.app.insert(to_seat, to_bay).is_some() {
-                    if let Some(cell) =
-                        self.recorder.inserts_loaded.get_mut(to_seat * bays + to_bay)
-                    {
-                        *cell = Some("\u{1f}reload".to_owned());
-                    }
+                if let (Some(_), Some(at)) = (held, at) {
+                    self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
                 }
             }
         }
-        let inserts = tangent_ui::recorder::INSERTS;
-        let mismatched = |app: &TangentApp, loaded: &[Option<String>], i: usize| {
-            app.insert(i / inserts, i % inserts) != loaded[i].as_deref()
-        };
+        let inserts = tangent_ui::desk_id::BAYS;
+        // **What the desk wants in every bay, by the ENGINE's address**: the
+        // app's bays by identity (`engine_bridge::desk_bays`) at their
+        // tracks' lanes' racks, each reached through its `HostRack` (design
+        // 8, item 8). The ledger is kept by the same address, so a reorder
+        // changes neither side and the walk below finds nothing to do.
+        let wanted = self.bays_wanted();
+        let mismatched = |loaded: &InsertLedger, at: &crate::engine_bridge::EngineBay| wanted.get(at) != loaded.get(at);
         // **The bay this frame loads is the bay the LAST frame announced.**
         //
         // `busy.rs`'s law, which `announce`/`run_chore` keep for the blocking
@@ -6356,9 +6321,16 @@ impl DesktopApp {
         let due = self
             .insert_announced
             .take()
-            .filter(|&i| mismatched(&self.app, &self.recorder.inserts_loaded, i));
-        if let Some(i) = due {
-            let want = self.app.insert(i / inserts, i % inserts).map(str::to_owned);
+            .filter(|at| mismatched(&self.recorder.inserts_loaded, at));
+        if let Some(at) = due {
+            let (rack, bay) = at;
+            let want = wanted.get(&at).cloned();
+            // **Where the APP keeps this bay**, for what the app keeps by
+            // seat: its faces, its parameter lists, its open-on-load flags.
+            // And the bay's identity, which its state file and the displaced
+            // shelf are keyed by.
+            let app_at = self.bridge.app_seat(&self.app, at);
+            let sb = self.bridge.bay_at_engine(at);
             // **The outgoing tenant's settings, asked while it is still
             // alive.** `load_insert` below drops whatever this bay holds, and
             // nothing on that road asks it for its state, so a plugin pasted
@@ -6367,7 +6339,7 @@ impl DesktopApp {
             // found its sidecar: the last save, or nothing. This is the one
             // place every one of those roads passes before the instance is
             // gone. Shelved under the ENGINE's record of the tenant, which
-            // names what is really seated even when `inserts_loaded` holds a
+            // names what is really seated even when the ledger holds a
             // reload marker or a load that failed; never when the incoming
             // plugin is the same bundle, which reloads from the file written
             // for it; and not during a whole-desk rebuild, whose tenants
@@ -6375,22 +6347,21 @@ impl DesktopApp {
             if !self.racks_restoring {
                 if let Some(e) = self.recorder.engine.as_ref() {
                     let gone = e
-                        .insert(i / inserts, i % inserts)
+                        .insert_at(rack, bay)
                         .and_then(|l| l.bundle.to_str())
                         .filter(|g| want.as_deref() != Some(*g))
                         .map(str::to_owned);
-                    if let Some(gone) = gone {
-                        if let Some(blob) = e.save_insert_state(i / inserts, i % inserts) {
-                            shelve_displaced(
-                                &mut self.displaced_states,
-                                (i / inserts, i % inserts, gone),
-                                blob,
-                            );
+                    if let (Some(gone), Some(sb)) = (gone, sb) {
+                        if let Some(blob) = e.save_insert_state_at(rack, bay) {
+                            shelve_displaced(&mut self.displaced_states, (sb, gone), blob);
                         }
                     }
                 }
             }
-            self.recorder.inserts_loaded[i] = want.clone();
+            match want.clone() {
+                Some(w) => self.recorder.inserts_loaded.insert(at, w),
+                None => self.recorder.inserts_loaded.remove(&at),
+            };
             // **The default pedalboard is not seeded here.** The app seeds
             // it at the gesture that seats an amp (`TangentApp::set_insert`),
             // in that gesture's undo moment, and each pedal then loads
@@ -6408,11 +6379,10 @@ impl DesktopApp {
                 .as_deref()
                 .filter(|p| !is_instrument_sentinel(p))
                 .and_then(|p| {
-                    incoming_state(
-                        &self.displaced_states,
-                        &(i / inserts, i % inserts, p.to_owned()),
-                        || saved_insert_state(i / inserts, i % inserts, p),
-                    )
+                    let sb = sb?;
+                    incoming_state(&self.displaced_states, &(sb, p.to_owned()), || {
+                        crate::shelf::saved_state(sb, p)
+                    })
                 });
             if let Some(e) = self.recorder.engine.as_mut() {
                 // **A built-in INSTRUMENT is not a bundle.** Its sentinel
@@ -6420,8 +6390,8 @@ impl DesktopApp {
                 // it be picked, saved and named by the same code — but the
                 // ENGINE renders it in `mix_channels`, not in the rack, so
                 // the bay itself is handed nothing. See
-                // `sync_instrument_lanes`, driven by the masks the per-frame
-                // walk pushes. A built-in EFFECT sentinel passes through: the
+                // `sync_instruments`, driven by the lanes the bridge reads
+                // each frame. A built-in EFFECT sentinel passes through: the
                 // engine seats those in the rack. See `is_instrument_sentinel`.
                 let engine_want = want.as_deref().filter(|p| !is_instrument_sentinel(p));
                 let path = engine_want.map(std::path::Path::new);
@@ -6429,10 +6399,10 @@ impl DesktopApp {
                 // plugin.** The same bargain the instrument slots have had for
                 // a while and the racks never did: an effect whose settings
                 // died at every relaunch, silently, because nothing ever asked
-                // its instance for them. See `insert_state_path`.
+                // its instance for them. See `shelf`.
                 // Worked out above, where the shelf could still be read.
                 let state = bay_state;
-                match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
+                match e.load_insert_at(rack, bay, path, state.as_deref()) {
                     Ok(_) => {
                         self.recorder.engine_error = None;
                         // **A shelved state is spent once it is seated.** The
@@ -6440,9 +6410,8 @@ impl DesktopApp {
                         // it afresh; left standing it would outrank the file
                         // the next save writes for this very plugin. Kept on
                         // a failed load, which seated nothing.
-                        if let Some(p) = engine_want {
-                            self.displaced_states
-                                .remove(&(i / inserts, i % inserts, p.to_owned()));
+                        if let (Some(p), Some(sb)) = (engine_want, sb) {
+                            self.displaced_states.remove(&(sb, p.to_owned()));
                         }
                         // **What the bay now offers an automation lane**, read
                         // once, HERE.
@@ -6453,40 +6422,53 @@ impl DesktopApp {
                         // call per parameter per plugin per frame, on the
                         // main thread, for a list that changes when somebody
                         // loads a plugin.
-                        push_fx_params(&mut self.app, e, i / inserts, inserts);
-                        // And the built-in faces on the same seat, values
-                        // included — the face data has exactly the staleness
-                        // window the parameter list has, so it travels with
-                        // it.
-                        push_builtin_faces(&mut self.app, e, i / inserts);
+                        if let Some((strip, _)) = app_at {
+                            push_fx_params(&mut self.app, e, (strip, rack), inserts);
+                            // And the built-in faces on the same rack, values
+                            // included — the face data has exactly the
+                            // staleness window the parameter list has, so it
+                            // travels with it.
+                            push_builtin_faces(&mut self.app, e, (strip, rack));
+                        }
                         // **The window, the moment the load lands.** Only for
                         // the pick that just happened — the app's flag answers
                         // once and never for a launch restore — and only when
                         // something was actually loaded: an unload has no
                         // window to show.
                         if path.is_some()
-                            && self.app.take_open_insert_on_load(i / inserts, i % inserts)
+                            && app_at.is_some_and(|(s, b)| self.app.take_open_insert_on_load(s, b))
                         {
-                            if let Err(err) = e.open_insert_editor(i / inserts, i % inserts) {
+                            if let Err(err) = e.open_insert_editor_at(rack, bay) {
                                 self.recorder.engine_error =
                                     Some(format!("could not open the plugin's window: {err}"));
                             }
                         }
                     }
                     Err(err) => {
-                        // The auto-open belongs to a load that happened.
-                        let _ = self.app.take_open_insert_on_load(i / inserts, i % inserts);
-                        // A failed load leaves the bay empty, so the menu must
-                        // not go on offering the last plugin's parameters.
-                        push_fx_params(&mut self.app, e, i / inserts, inserts);
-                        // Nor its face: the tombstone push clears it.
-                        push_builtin_faces(&mut self.app, e, i / inserts);
+                        if let Some((strip, b)) = app_at {
+                            // The auto-open belongs to a load that happened.
+                            let _ = self.app.take_open_insert_on_load(strip, b);
+                            // A failed load leaves the bay empty, so the menu
+                            // must not go on offering the last plugin's
+                            // parameters.
+                            push_fx_params(&mut self.app, e, (strip, rack), inserts);
+                            // Nor its face: the tombstone push clears it.
+                            push_builtin_faces(&mut self.app, e, (strip, rack));
+                        }
                         let which = want
                             .as_deref()
                             .and_then(|p| p.rsplit(['/', '\\']).next())
                             .unwrap_or("that plugin");
-                        let channel = tangent_ui::recorder::Strip::all()
-                            .get(i / inserts)
+                        let channel = sb
+                            .and_then(|sb| match sb.seat.node {
+                                tangent_ui::desk_id::Node::Track(id) => {
+                                    self.app.row_of(id).map(tangent_ui::recorder::Strip::Channel)
+                                }
+                                tangent_ui::desk_id::Node::Drums => Some(tangent_ui::recorder::Strip::Drums),
+                                tangent_ui::desk_id::Node::Click => Some(tangent_ui::recorder::Strip::Click),
+                                tangent_ui::desk_id::Node::Fx => Some(tangent_ui::recorder::Strip::Fx),
+                                tangent_ui::desk_id::Node::Master => None,
+                            })
                             .map_or_else(|| "the master".to_owned(), |s| s.label());
                         self.recorder.engine_error =
                             Some(format!("{which} did not load on {channel}: {err}"));
@@ -6514,10 +6496,20 @@ impl DesktopApp {
 
         // One walk, two answers — the bay to announce and the size of the
         // wait. See `insert_walk`, which is where the reasoning lives. Taken
-        // AFTER the load above, so what it counts is what is left.
-        let (next, outstanding) = insert_walk(self.recorder.inserts_loaded.len(), |i| {
-            mismatched(&self.app, &self.recorder.inserts_loaded, i)
+        // AFTER the load above, so what it counts is what is left: over every
+        // bay the desk wants or the engine holds, which is the only place a
+        // difference can be.
+        let bays: Vec<crate::engine_bridge::EngineBay> = wanted
+            .keys()
+            .chain(self.recorder.inserts_loaded.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let (next, outstanding) = insert_walk(bays.len(), |k| {
+            mismatched(&self.recorder.inserts_loaded, &bays[k])
         });
+        let next = next.map(|k| bays[k]);
         // **Nothing can load without an engine**, so a desk waiting for a
         // device is not waiting for plugins — the same exclusion
         // `inserts_pending` makes for the splash, and for the same reason. A
@@ -6555,9 +6547,7 @@ impl DesktopApp {
         } else {
             self.insert_batch = self.insert_batch.saw(outstanding);
             let progress = self.insert_batch.progress();
-            let name = next
-                .and_then(|i| self.app.insert(i / inserts, i % inserts))
-                .map(leaf_of);
+            let name = next.and_then(|at| wanted.get(&at)).map(|p| leaf_of(p));
             if let Some(busy) = self.busy_chunk(Busied::Inserts, "Loading plugins") {
                 busy.detail = name;
                 busy.progress = Some(progress);
@@ -6699,7 +6689,10 @@ impl DesktopApp {
             // answers. Patch 0, because the strip's setting was reset to it.
             if let Some(v) = cart.voices.first().copied() {
                 if let Some(e) = self.recorder.engine.as_mut() {
-                    e.set_builtin_voice(strip, v);
+                    // The strip's track, at its lane.
+                    if let Some(l) = self.bridge.lane(strip) {
+                        e.set_builtin_voice(l.slot, v);
+                    }
                 }
             }
             self.cartridge = Some(cart);
@@ -7236,7 +7229,10 @@ impl DesktopApp {
                         // **Heard as it is turned.** An editor that only
                         // applied on OK makes every change a guess.
                         if let Some(e) = self.recorder.engine.as_mut() {
-                            e.set_builtin_voice(strip, v);
+                            // The strip's track, at its lane.
+                            if let Some(l) = self.bridge.lane(strip) {
+                                e.set_builtin_voice(l.slot, v);
+                            }
                         }
                         self.push_patch_edit(None);
                     }
@@ -7277,7 +7273,10 @@ impl DesktopApp {
                         self.cartridge_at(&path).voices.get(index).copied()
                     };
                     if let (Some(v), Some(e)) = (voice, self.recorder.engine.as_mut()) {
-                        e.set_builtin_voice(slot, v);
+                        // The strip's track, at its lane.
+                        if let Some(l) = self.bridge.lane(slot) {
+                            e.set_builtin_voice(l.slot, v);
+                        }
                     }
                 }
                 R::LoadStripCartridge { strip } => {
@@ -7332,7 +7331,10 @@ impl DesktopApp {
                         self.staging.get(index).copied(),
                         self.recorder.engine.as_mut(),
                     ) {
-                        e.set_builtin_voice(slot, v);
+                        // The strip's track, at its lane.
+                        if let Some(l) = self.bridge.lane(slot) {
+                            e.set_builtin_voice(l.slot, v);
+                        }
                     }
                 }
                 R::EditStaged { slot, index } => {
@@ -7400,7 +7402,10 @@ impl DesktopApp {
                             );
                             if let Some(v) = cart.voices.first().copied() {
                                 if let Some(e) = self.recorder.engine.as_mut() {
-                                    e.set_builtin_voice(strip, v);
+                                    // The strip's track, at its lane.
+                                    if let Some(l) = self.bridge.lane(strip) {
+                                        e.set_builtin_voice(l.slot, v);
+                                    }
                                 }
                             }
                             let n = self.staging.count();
@@ -7436,22 +7441,22 @@ impl DesktopApp {
                 // not: thirty-two note-ons in the recorded part, one per name
                 // somebody listened to, is a take somebody has to clean up.
                 R::AuditionStrip { strip, key } => {
-                    if let Some(e) = self.recorder.engine.as_ref() {
-                        e.set_audition(strip, key);
+                    // The strip's track, held at its lane.
+                    if let (Some(e), Some(l)) = (self.recorder.engine.as_ref(), self.bridge.lane(strip)) {
+                        e.set_audition(l.slot, key);
                     }
                 }
                 // An insert's own window. Same one-row-two-names bargain as an
                 // instrument's: press it again and the window that is up goes
                 // away.
                 R::OpenInsertEditor(strip, slot) => {
-                    let up = self
-                        .recorder
-                        .engine
-                        .as_ref()
-                        .is_some_and(|e| e.insert_editor_open(strip, slot));
-                    if up {
+                    // The app names the bay by its row; the window is the
+                    // plugin's in the track's lane.
+                    let at = self.engine_at(strip, slot);
+                    let up = at.zip(self.recorder.engine.as_ref()).is_some_and(|(at, e)| e.insert_editor_open_at(at.0, at.1));
+                    if let (true, Some(at)) = (up, at) {
                         if let Some(e) = self.recorder.engine.as_mut() {
-                            e.close_insert_editor(strip, slot);
+                            e.close_insert_editor_at(at.0, at.1);
                         }
                     } else if self.recorder.engine.is_some() {
                         // **Opening one is not free and never was.** An LV2
@@ -7477,8 +7482,9 @@ impl DesktopApp {
                 // moves nothing anywhere, which is the contract — the next
                 // face push snaps the optimistic mirror back.
                 R::SetInsertParam { strip, slot, id, value } => {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_insert_param(strip, slot, id, value);
+                    let at = self.engine_at(strip, slot);
+                    if let (Some(e), Some(at)) = (self.recorder.engine.as_mut(), at) {
+                        e.set_insert_param_at(at.0, at.1, id, value);
                         // **Push the face back, NOW.** The readings are
                         // host-printed strings and the EQ's curve is
                         // host-computed; a push that only happened at load
@@ -7486,44 +7492,45 @@ impl DesktopApp {
                         // let a stale frame yank a dragged slider backward.
                         // One strip, one frame behind the finger - the lag a
                         // reading can wear, where "never" could not.
-                        push_builtin_faces(&mut self.app, e, strip);
+                        push_builtin_faces(&mut self.app, e, (strip, at.0));
                     }
                 }
                 R::TypeInsertParam { strip, slot, id, text } => {
-                    if let Some(e) = self.recorder.engine.as_mut() {
+                    let at = self.engine_at(strip, slot);
+                    if let (Some(e), Some(at)) = (self.recorder.engine.as_mut(), at) {
                         // Read on the unit's own scale, by the same
                         // `describe` that prints the reading, so what the
                         // field shows after Enter is the number typed.
-                        let value = e.builtin_insert(strip, slot).and_then(|(spec, values)| {
+                        let value = e.builtin_insert_at(at.0, at.1).and_then(|(spec, values)| {
                             crate::builtin_fx::value_for_reading(spec.path, id, &text, values)
                         });
                         if let Some(value) = value {
-                            e.set_insert_param(strip, slot, id, value);
+                            e.set_insert_param_at(at.0, at.1, id, value);
                         }
                         // Pushed either way: a refused word leaves the
                         // reading as it was, and the face has to be told
                         // so rather than left showing the words.
-                        push_builtin_faces(&mut self.app, e, strip);
+                        push_builtin_faces(&mut self.app, e, (strip, at.0));
                     }
                 }
                 R::SetInsertTap { strip, slot, on } => {
-                    // The face speaks DESK terms; `seat_bay` is the one
-                    // translation into the rack's, exactly as its own note
+                    // The face speaks DESK terms; `desk_id::slot_key` is the
+                    // one translation into a bay, exactly as its own note
                     // demands — a call site that recomputes the master's
-                    // two-rack fold taps somebody else's plugin.
-                    let at = tangent_ui::recorder::seat_bay(strip, slot);
-                    self.insert_tap_at = on.then_some(at);
+                    // two-rack fold taps somebody else's plugin. And the
+                    // bay's seat is the track's LANE's, through the bridge,
+                    // so the tap stays on its plugin through a reorder.
+                    let sb = crate::engine_bridge::strip_slot(&self.app, strip, slot);
+                    self.insert_tap_at = sb.and_then(|sb| self.bridge.engine_bay(sb)).filter(|_| on);
                     if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_insert_tap(self.insert_tap_at);
+                        e.set_insert_tap_at(self.insert_tap_at.and_then(|at| e.tap_aim(at)));
                     }
                     // Arming is also "a face just opened here": its preset
                     // shelf rides along, so the panel's list is filled by
                     // the time the eye reaches it.
                     if on {
-                        if let Some(unit) = self
-                            .app
-                            .insert(strip, slot)
-                            .map(str::to_owned)
+                        if let Some(unit) =
+                            sb.and_then(|sb| crate::engine_bridge::bay_path(&self.app, sb)).map(str::to_owned)
                         {
                             self.push_preset_rows(&unit);
                         }
@@ -7680,17 +7687,18 @@ impl DesktopApp {
                             // `clear_insert_ir` for why the bay is cleared at
                             // all — the owner overruled the first answer.
                             if removed {
-                                let bays = tangent_ui::recorder::INSERTS;
-                                let seats = tangent_ui::recorder::TOTAL_SEATS;
+                                let bays = tangent_ui::desk_id::BAYS;
+                                let seats = tangent_ui::desk_legacy::V32_TOTAL_SEATS;
                                 let mut emptied = 0usize;
                                 for seat in 0..seats {
                                     for bay in 0..bays {
-                                        let here = self
-                                            .recorder
-                                            .engine
-                                            .as_ref()
-                                            .and_then(|e| {
-                                                e.builtin_extra(seat, bay)
+                                        // Asked of the bay's own lane: the
+                                        // app names it by row.
+                                        let at = self.engine_at(seat, bay);
+                                        let here = at
+                                            .zip(self.recorder.engine.as_ref())
+                                            .and_then(|(at, e)| {
+                                                e.builtin_extra_at(at.0, at.1)
                                                     .iter()
                                                     .find(|(k, _)| k == "ir_path")
                                                     .map(|(_, v)| v.clone())
@@ -7847,7 +7855,7 @@ impl DesktopApp {
     }
 
     /// Read a preset back and hand it to the app as plain data. The unit
-    /// check is the owner rule `write_insert_state` keeps for plugin state:
+    /// check is the owner rule `shelf::write_state` keeps for plugin state:
     /// a file that names a different unit moves nothing, out loud. A sampler
     /// preset's file rides along (`preset_sample`), for the app to copy into
     /// this project and bind after the knobs, and so does a convolver
@@ -7937,8 +7945,8 @@ impl DesktopApp {
     ///
     /// **It refuses a path that is not a file on the disk, and that refusal
     /// is load-bearing rather than tidy.** What this writes is PERSISTED:
-    /// `write_insert_state` is a `std::fs::write` of the bay's sidecar, and
-    /// the next project open hands whatever is in it to `wavread::read`. So
+    /// `write_bay_state` writes the bay's state file (`shelf::write_state`),
+    /// and the next project open hands whatever is in it to `wavread::read`. So
     /// a path that names nothing does not fail politely a frame later — it
     /// replaces a working bay's impulse with a string, on disk, silently,
     /// and the sound is gone the next time the project is opened.
@@ -7958,24 +7966,24 @@ impl DesktopApp {
         if !ir_bindable(path) {
             return false;
         }
+        let Some(at) = self.bridge.engine_seat(&self.app, strip, slot) else {
+            return false;
+        };
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(strip, slot) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::IR_PATH {
             return false;
         }
-        let mut extra = e.builtin_extra(strip, slot).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| k != "ir_path");
         extra.push(("ir_path".to_owned(), path.to_owned()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
-        write_insert_state(strip, slot, spec.path, &blob);
-        let bays = tangent_ui::recorder::INSERTS;
-        if let Some(cell) = self.recorder.inserts_loaded.get_mut(strip * bays + slot) {
-            *cell = Some("\u{1f}reload".to_owned());
-        }
+        self.write_bay_state(strip, slot, spec.path, &blob);
+        self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
         true
     }
 
@@ -8041,10 +8049,13 @@ impl DesktopApp {
     /// `take_sampler_load` queue — the road a face's chosen file travels.
     #[cfg(feature = "recorder")]
     fn bind_insert_sample(&mut self, lane: usize, slot: usize, path: &str, root_key: u8) -> bool {
+        let Some(at) = self.bridge.engine_seat(&self.app, lane, slot) else {
+            return false;
+        };
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(lane, slot) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::SAMPLER_PATH {
@@ -8059,18 +8070,18 @@ impl DesktopApp {
         } else {
             crate::instrument::SAMPLER_ROOT_KEY
         };
-        let mut extra = e.builtin_extra(lane, slot).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| !matches!(k.as_str(), "sample_path" | "sample_name" | "root_key"));
         extra.push(("sample_path".to_owned(), path.to_owned()));
         extra.push(("sample_name".to_owned(), name));
         extra.push(("root_key".to_owned(), root.to_string()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
-        write_insert_state(lane, slot, spec.path, &blob);
+        self.write_bay_state(lane, slot, spec.path, &blob);
         // **The engine's own record, now.** See this function's head: this
         // line is the difference between a bay that plays the file and one
         // that plays silence until something else wakes the window.
         if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_builtin_extra(lane, slot, extra);
+            e.set_builtin_extra_at(at.0, at.1, extra);
         }
         // And the debt that carries it: `run_warm` decodes the file and
         // `reload_sampler` hands it to the audio thread, both a frame from
@@ -8081,12 +8092,9 @@ impl DesktopApp {
         // the panel would go on printing the previous file's name until the
         // reload landed.
         if let Some(e) = self.recorder.engine.as_ref() {
-            push_builtin_faces(&mut self.app, e, lane);
+            push_builtin_faces(&mut self.app, e, (lane, at.0));
         }
-        let bays = tangent_ui::recorder::INSERTS;
-        if let Some(cell) = self.recorder.inserts_loaded.get_mut(lane * bays + slot) {
-            *cell = Some("\u{1f}reload".to_owned());
-        }
+        self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
         true
     }
 
@@ -8110,24 +8118,24 @@ impl DesktopApp {
     /// for beats a surprise you did not.
     #[cfg(feature = "recorder")]
     fn clear_insert_ir(&mut self, strip: usize, slot: usize) -> bool {
+        let Some(at) = self.bridge.engine_seat(&self.app, strip, slot) else {
+            return false;
+        };
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
-        let Some((spec, values)) = e.builtin_insert(strip, slot) else {
+        let Some((spec, values)) = e.builtin_insert_at(at.0, at.1) else {
             return false;
         };
         if spec.path != crate::builtin_fx::IR_PATH {
             return false;
         }
-        let mut extra = e.builtin_extra(strip, slot).to_vec();
+        let mut extra = e.builtin_extra_at(at.0, at.1).to_vec();
         extra.retain(|(k, _)| k != "ir_path");
         extra.push(("ir_path".to_owned(), String::new()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
-        write_insert_state(strip, slot, spec.path, &blob);
-        let bays = tangent_ui::recorder::INSERTS;
-        if let Some(cell) = self.recorder.inserts_loaded.get_mut(strip * bays + slot) {
-            *cell = Some("\u{1f}reload".to_owned());
-        }
+        self.write_bay_state(strip, slot, spec.path, &blob);
+        self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
         true
     }
 
@@ -9417,7 +9425,10 @@ impl DesktopApp {
                 self.app.set_cartridge(cartridge_info(&cart, "", false));
                 if let Some(v) = cart.voices.first().copied() {
                     if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_builtin_voice(strip, v);
+                        // The strip's track, at its lane.
+                        if let Some(l) = self.bridge.lane(strip) {
+                            e.set_builtin_voice(l.slot, v);
+                        }
                     }
                 }
                 self.cartridges.insert(path, cart.clone());
@@ -9971,30 +9982,33 @@ impl DesktopApp {
         // the engine to tee a ring it never opened — the take came back
         // empty and the performance was silently gone — or drained another
         // channel's microphone onto the wrong lane.
-        let armed = self.app.armed_mask();
+        let armed = |row: usize| crate::engine_bridge::row_armed(&self.app, row);
+        let rows = self.app.track_ids().len();
         let mut midi_lanes = Vec::new();
         let mut audio = Vec::new();
+        // The capture's picks to tee, one bit a PICK: the capture's own
+        // fixed table (`instrument::INPUTS`), never a lane.
         let mut mask = 0u32;
         let mut pick = 0usize;
         // An armed audio lane the walk had to pass over: R is lit but there
         // is no input behind it, and a press that does nothing silently is a
         // broken button.
         let mut armed_unbound = false;
-        let any_explicit = (0..tangent_ui::recorder::CHANNELS).any(|ch| {
+        let any_explicit = (0..rows).any(|ch| {
             self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
                 && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
         });
-        for ch in 0..tangent_ui::recorder::CHANNELS {
+        for ch in 0..rows {
             match self.app.channel_kind(ch) {
                 Some(tangent_ui::recorder::ChannelKind::Midi) => {
-                    if armed & (1 << ch) != 0 {
+                    if armed(ch) {
                         midi_lanes.push(ch);
                     }
                 }
                 // A CLIP lane — used, no live source — arms in the UI like
                 // any other; its R lit and the record ignoring it was the
                 // owner's "non functional". It takes the note stream.
-                None if armed & (1 << ch) != 0 => {
+                None if armed(ch) => {
                     midi_lanes.push(ch);
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
@@ -10003,11 +10017,11 @@ impl DesktopApp {
                     {
                         // NO INPUT on an explicit desk: the engine opened no
                         // ring for this lane, so there is nothing to tee.
-                        if armed & (1 << ch) != 0 {
+                        if armed(ch) {
                             armed_unbound = true;
                         }
-                    } else if pick < tangent_ui::recorder::INPUTS {
-                        if armed & (1 << ch) != 0 {
+                    } else if pick < crate::instrument::INPUTS {
+                        if armed(ch) {
                             mask |= 1 << pick;
                             audio.push((pick, ch, Vec::new()));
                         }
@@ -10444,7 +10458,8 @@ impl DesktopApp {
                     format: tangent_record::wav::SampleFormat::Float32,
                 };
                 let doc = self.app.arrangement().clone();
-                for lane in 0..tangent_ui::recorder::CHANNELS {
+                let rows = self.app.track_ids().len();
+                for row in 0..rows {
                     // Only lanes with something to say — see the offline
                     // twin below for the reasoning.
                     // **A stem is worth writing when something REACHES the
@@ -10461,20 +10476,25 @@ impl DesktopApp {
                     // one: it carries its children's audio and has no clips
                     // of its own, so counting only clips would drop exactly
                     // the buses somebody grouped in order to bounce them.
-                    let has_clips = doc.clips.iter().any(|c| c.lane == lane);
-                    let collects = self.app.is_folder(lane)
-                        && (0..tangent_ui::recorder::CHANNELS)
-                            .any(|c| self.app.folder_of(c) == Some(lane));
+                    let has_clips = doc.clips.iter().any(|c| c.lane == row);
+                    let collects = self.app.is_folder(row)
+                        && (0..rows).any(|c| self.app.folder_of(c) == Some(row));
                     if !has_clips && !collects {
                         continue;
                     }
+                    // **Bound to the row's lane at the press** (design 7.13:
+                    // stems bind `(slot, gen)` at the press): the tap's column
+                    // is the lane's, and the name is the row's as it reads now.
+                    let Some(lane) = self.bridge.lane(row).map(|l| l.slot.0 as usize) else {
+                        continue;
+                    };
                     let name: String = self
                         .app
-                        .channel_display_name(lane)
+                        .channel_display_name(row)
                         .chars()
                         .map(|c| if std::path::is_separator(c) { '-' } else { c })
                         .collect();
-                    let path = stage.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
+                    let path = stage.join(format!("{:02}-{}.wav", row + 1, name.trim()));
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
@@ -10520,7 +10540,9 @@ impl DesktopApp {
         };
         b.stem_scratch.clear();
         e.drain_stems(&mut b.stem_scratch);
-        let wide = tangent_ui::recorder::CHANNELS * 2;
+        // As wide as the engine's spine, bound when the tap was armed: see
+        // `Engine::stem_frame_width`.
+        let wide = e.stem_frame_width().max(2);
         let frames = b.stem_scratch.len() / wide;
         if frames == 0 {
             return;
@@ -10852,25 +10874,25 @@ impl DesktopApp {
         // handed in: the LIVE engine, whose racks are wearing the knobs as
         // dialled this second (`desk_insert_state`), and each DX7 lane's
         // voice out of the cartridge cache.
-        let build = match freeze {
-            // The identity rule until W3's `row_of`: row r is TrackId(r).
-            Some(lane) => crate::engine_bridge::BuildFor::Freeze(tangent_ui::desk_id::TrackId(
-                u32::try_from(lane).unwrap_or(u32::MAX),
-            )),
+        // **A freeze is of a TRACK** (design 7.13): the row asked about now,
+        // the track it holds for the rest of the render.
+        let frozen_id = freeze.and_then(|row| self.app.track_ids().get(row).copied());
+        let build = match frozen_id {
+            Some(id) => crate::engine_bridge::BuildFor::Freeze(id),
             None => crate::engine_bridge::BuildFor::Export(spec.clone()),
         };
-        let dx7: std::collections::BTreeMap<usize, crate::dx7::Voice> = (0..tangent_ui::recorder::CHANNELS)
+        let dx7: std::collections::BTreeMap<usize, crate::dx7::Voice> = (0..self.app.track_ids().len())
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|ch| (ch, self.voice_for_strip(ch)))
             .collect();
         let mut furnish = crate::engine_bridge::Furnish {
-            live: self.recorder.engine.as_ref(),
+            live: self.recorder.engine.as_ref().map(|e| (e, &self.bridge)),
             dx7,
             ..Default::default()
         };
-        let made = crate::engine_bridge::furnish_offline_with(
+        let made = crate::engine_bridge::full_build_with(
             &self.app,
             rate,
             tangent_record::audio::Timebase::new(),
@@ -10878,8 +10900,8 @@ impl DesktopApp {
             &mut furnish,
         );
         let crate::engine_bridge::Furnish { refused, unread, .. } = furnish;
-        let e = match made {
-            Ok(e) => e,
+        let crate::engine_bridge::Built { engine: e, bridge: mirror } = match made {
+            Ok(built) => built,
             Err(err) => {
                 self.app.notify(Kind::Error, format!("export: {err}"));
                 refuse!();
@@ -10947,11 +10969,15 @@ impl DesktopApp {
         };
         let mut stems = Vec::new();
         let mut freeze_job = None;
-        if let Some(lane) = freeze {
+        if let (Some(row), Some(id)) = (freeze, frozen_id) {
+            let Some(lane) = mirror.lane_of(id).map(|l| l.slot.0 as usize) else {
+                self.app.notify(Kind::Error, "freeze: the track has no lane to render");
+                return;
+            };
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let name = format!("frozen-{:02}-{stamp}.wav", lane + 1);
+            let name = format!("frozen-{:02}-{stamp}.wav", row + 1);
             let path = out_dir.join(&name);
             let _ = std::fs::remove_file(&path);
             match tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
@@ -10961,7 +10987,7 @@ impl DesktopApp {
                     return;
                 }
             }
-            freeze_job = Some(FreezeJob { lane, rel_path: format!("media/{name}"), skip: None });
+            freeze_job = Some(FreezeJob { id, lane, rel_path: format!("media/{name}"), skip: None });
         } else if spec.stems {
             let dir = stage.join(spec.stems_folder());
             if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -10970,7 +10996,10 @@ impl DesktopApp {
             }
             // **Only lanes with something to SAY get a stem** - see
             // `engine_bridge::stem_files`, which the export goldens name too.
-            for (lane, file) in crate::engine_bridge::stem_files(&self.app) {
+            for (row, file) in crate::engine_bridge::stem_files(&self.app) {
+                let Some(lane) = mirror.lane(row).map(|l| l.slot.0 as usize) else {
+                    continue;
+                };
                 let path = dir.join(file);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                     stems.push(StemWriter { lane, path, writer: w, loud: false });
@@ -11042,9 +11071,15 @@ impl DesktopApp {
                 }
             }
         }
+        // **Landed on the TRACK, wherever its row is now** (`row_of`). A
+        // track removed while it rendered has nowhere to land; its file stays
+        // in the project's media, named, and nothing is told a lie.
         if let Some(n) = frames {
             let len_s = n as f64 / f64::from(spec.rate.max(1));
-            self.app.note_frozen(job.lane, job.rel_path, len_s);
+            match self.app.row_of(job.id) {
+                Some(row) => self.app.note_frozen(row, job.rel_path, len_s),
+                None => self.app.notify(Kind::Error, "freeze: the track was removed while it rendered"),
+            }
         }
     }
 
@@ -11062,13 +11097,16 @@ impl DesktopApp {
             return;
         }
         let budget = std::time::Instant::now();
-        let wide = tangent_ui::recorder::CHANNELS * 2;
         let mut fold = Vec::new();
         while b.done < b.until {
             let n = 1024usize.min((b.until - b.done) as usize);
             let out = &mut b.block[..n * 2];
             out.fill(0.0);
             b.e.render_offline(out);
+            // The stem tap's frame, as wide as the mirror's spine (two floats
+            // a slot) and not the desk, bound when the tap was armed and read
+            // once a block has published it: `Engine::stem_frame_width`.
+            let wide = b.e.stem_frame_width().max(2);
             if let Some(job) = b.freeze.as_mut() {
                 if job.skip.is_none() {
                     job.skip = Some(u64::from(b.e.offline_stem_lead(job.lane)));
@@ -11380,7 +11418,7 @@ impl DesktopApp {
     /// Whether anything on the desk will have to be ASKED for its state when
     /// the session is written down. See `save_plugin_states`.
     fn has_plugin_state(&self) -> bool {
-        self.recorder.inserts_loaded.iter().any(Option::is_some)
+        !self.recorder.inserts_loaded.is_empty()
     }
 
     /// Run whatever project action the app asked for. The host runs these
@@ -11534,7 +11572,7 @@ impl DesktopApp {
                     &self.app,
                     src.as_deref().filter(|_| was_real),
                     &stage,
-                    &global_state_dir(),
+                    &crate::shelf::global_dir(),
                 );
                 let dst = shelf.join(&name);
                 // **And it says so, either way.** This row replaces a whole
@@ -11829,7 +11867,7 @@ impl DesktopApp {
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
                 self.sampler_cache.clear();
-                self.sampler_have = vec![None; tangent_ui::recorder::CHANNELS];
+                self.sampler_have = vec![None; crate::instrument::LEGACY_LANES];
                 // Whatever the crew is still decoding belongs to the old
                 // project; so does whatever is queued for it.
                 self.pool.invalidate();
@@ -11851,31 +11889,52 @@ impl DesktopApp {
         Some(self.app.project_doc()?.parent()?.join("state"))
     }
 
-    /// Copy the live plugin-state sidecars INTO the project, so the folder
-    /// carries its instruments' knobs as well as their names.
+    /// Copy the live plugin states INTO the project, so the folder carries
+    /// its instruments' knobs as well as their names.
     ///
     /// A full mirror and not "copy what is occupied": the project's shelf has
-    /// to LOSE the sidecar of a seat whose plugin was removed since the last
+    /// to LOSE the state of a bay whose plugin was removed since the last
     /// save, or opening that project again hands the file to whatever sits
-    /// there next. [`mirror_sidecars`] is where the whole of that reasoning
-    /// lives, in both directions.
+    /// there next. [`crate::shelf::mirror_shelf`] is where the whole of that
+    /// reasoning lives, in both directions. Every file it writes is named by
+    /// identity; a legacy sidecar the folder still holds is never touched.
     ///
-    /// EVERY seat, too - the master's second rack and the folder-extra seats
-    /// were both invisible to the old STRIPS+1+DRUM_PADS bound, so a project
-    /// carried neither. See the seat-space doc in recorder.rs.
-    fn copy_states_to_project(&self) {
+    /// **And once the mirror has made the folder whole, the document's
+    /// `legacy_states` marker goes** (design 6.6): checked against the
+    /// document ON DISK, every plugin it names that keeps a state must have
+    /// its pstate file in `state/`, and only then is that one key patched out
+    /// of the file and forgotten in memory. A road that wrote the document
+    /// and not the shelf leaves the marker standing, and the legacy names it
+    /// points at stay readable until a mirror like this one replaces them.
+    fn copy_states_to_project(&mut self) {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
         // An UNMATERIALISED scratch has no folder and must not grow one
         // for a state shelf alone - "no untitled folders PERIOD". The
-        // states still live in the global sidecars; a session worth
-        // keeping materialises through a real writer first.
+        // states still live on the global shelf; a session worth keeping
+        // materialises through a real writer first.
         if !dir.parent().is_some_and(std::path::Path::is_dir) {
             return;
         }
         let _ = std::fs::create_dir_all(&dir);
-        mirror_sidecars(&global_state_dir(), &dir);
+        crate::shelf::mirror_shelf(&crate::shelf::global_dir(), &crate::shelf::ShelfNames::Pstate, &dir);
+        self.clear_legacy_marker();
+    }
+
+    /// **The open document's marker, cleared if its folder is whole**: see
+    /// `copy_states_to_project`. Reads the document on disk, not the
+    /// session: the marker is a fact about the file and the folder beside it.
+    fn clear_legacy_marker(&mut self) {
+        let Some(doc) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let Some(plugins) = crate::shelf::doc_plugins(&doc) else {
+            return;
+        };
+        if self.app.doc_legacy_states().is_some() && crate::shelf::clear_legacy_marker(&doc, &plugins) {
+            self.app.forget_legacy_states();
+        }
     }
 
     /// **"Don't Save" clears the scratch it discarded.** A kit edit saves
@@ -11930,6 +11989,38 @@ impl DesktopApp {
         self.copy_states_to_project();
     }
 
+    /// **The two roads that move a session into a NEW home, made safe to
+    /// kill before their mirror** (design 6.6: "None of them can leave a
+    /// plugin at defaults"): Save As and the first save.
+    ///
+    /// The app writes the document into the panel's folder, which holds no
+    /// `state/` of its own (a copy brings the document and `media/`; a home
+    /// born at the chosen place brings nothing), and the mirror that gives it
+    /// one runs here after the document has landed. A kill between the two
+    /// left a project whose every plugin opened at its defaults, and the
+    /// knobs were nowhere a relaunch could reach: the launch stands on the
+    /// template and mirrors ITS shelf onto the live one before anybody can
+    /// open anything. So, before the save runs:
+    ///
+    /// - the live knobs go onto the live shelf FIRST, rather than after the
+    ///   document as they did: asking every plugin for its state is the step
+    ///   a crashing plugin takes the process down in, and before the
+    ///   document it costs the save nothing;
+    /// - the mirror owed to the home the app will choose
+    ///   (`TangentApp::save_choice_dir`) is written down beside the live
+    ///   shelf, and the launch that finds it standing pays it before the
+    ///   template replaces that shelf (`shelf::pay_owed_mirror`).
+    ///
+    /// The road takes the record away once it has mirrored
+    /// (`shelf::mirror_paid`).
+    #[cfg(feature = "recorder")]
+    fn owe_states_to_new_home(&mut self, purpose: tangent_ui::ports::SavePurpose, path: &std::path::Path) {
+        self.save_plugin_states();
+        if let Some(home) = self.app.save_choice_dir(purpose, path) {
+            crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home);
+        }
+    }
+
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
     /// project has no state for loses its global sidecar too — the last
     /// session's reverb tail must not leak into this one's fresh plugin.
@@ -11954,9 +12045,20 @@ impl DesktopApp {
     /// and making the scratch real, Save As Template and Duplicate of one
     /// need it to bring it across with the template's other media. Every
     /// adoption of a template comes through here.
+    ///
+    /// **Read by the names the session's document says its folder is in**
+    /// (design 6.6): pstate only for a document born format 2 or already
+    /// mirrored, and pstate-then-legacy, through the era's provenance, while
+    /// it carries the `legacy_states` marker. So an old project's knobs land
+    /// on their own bays (its buses, master and pads included, which the
+    /// positional copy once seated at defaults), and a stray legacy file in
+    /// a format-2 folder is never read. The folder itself is only read.
     fn copy_states_from_shelf(&mut self, dir: &std::path::Path) {
-        mirror_sidecars(dir, &global_state_dir());
-        self.app.set_sampler_media(sampler_media_on_shelf(dir));
+        let global = crate::shelf::global_dir();
+        crate::shelf::mirror_shelf(dir, &crate::shelf::ShelfNames::for_marker(self.app.doc_legacy_states()), &global);
+        // The samplers, read off the live shelf the mirror just made the
+        // folder's copy of, whatever names the folder holds them under.
+        self.app.set_sampler_media(sampler_media_on_shelf(&global));
     }
 
     /// **Clear the Untitled litter.** Every folder directly under the
@@ -12018,13 +12120,92 @@ impl DesktopApp {
         // bays the engine has nothing in, never over one still playing its
         // old instance (see `chain_bay_pending`).
         self.racks_restoring = true;
-        let bays = tangent_ui::recorder::INSERTS;
-        for i in 0..self.recorder.inserts_loaded.len() {
-            let wanted = self.app.insert(i / bays, i % bays).is_some();
-            let held = self.recorder.inserts_loaded[i].is_some();
-            if bay_needs_reload(wanted, held) {
-                self.recorder.inserts_loaded[i] = Some("\u{1f}reload".to_owned());
+        let wanted = self.bays_wanted();
+        let bays: std::collections::BTreeSet<crate::engine_bridge::EngineBay> =
+            wanted.keys().chain(self.recorder.inserts_loaded.keys()).copied().collect();
+        for at in bays {
+            if bay_needs_reload(wanted.contains_key(&at), self.recorder.inserts_loaded.contains_key(&at)) {
+                self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
             }
+        }
+    }
+
+    /// **What the desk wants in every bay, at the engine's address for it**:
+    /// the app's bays by identity (`engine_bridge::desk_bays`), each at its
+    /// track's lane. A bay whose track has no lane yet (one waiting for a
+    /// slot) is not wanted anywhere until it has one.
+    #[cfg(feature = "recorder")]
+    fn bays_wanted(&self) -> InsertLedger {
+        crate::engine_bridge::desk_bays(&self.app)
+            .into_iter()
+            .filter_map(|(sb, path)| Some((self.bridge.engine_bay(sb)?, path)))
+            .collect()
+    }
+
+    /// **A lane leaving the engine, written down and forgotten** (design
+    /// 7.13): every bay the track's plugins sit in has its live state written
+    /// to the live shelf under the bay's identity (`pstate-t<id>-...`) while
+    /// the plugin is still alive, and the ledger forgets the bay, so the
+    /// reconcile neither unloads it one bay a frame nor reads it as loaded
+    /// when a new track takes the slot. The plugins go home with the lane,
+    /// and an undo that brings the track back after the lane is home seats
+    /// each bay from its file. The bridge calls this through `sync_with` when
+    /// a track's lane starts to leave.
+    ///
+    /// **Answers what it forgot**, and the bridge keeps that on the leaving
+    /// lane: a track that comes back BEFORE its lane was sent home takes the
+    /// same lane back with every plugin still seated in it (design 7.13:
+    /// "nothing was sent home, so nothing reloads"), and its entries go back
+    /// into the ledger (`Synced::reclaimed`). Forgotten for good, the
+    /// reconcile found every bay of the reclaimed lane wanted and not loaded
+    /// and reloaded each live plugin in place from its file, and a bay whose
+    /// state could not be asked for here came back at its defaults.
+    ///
+    /// `shelf` is the live shelf's folder (`shelf::global_dir`), named by
+    /// the caller so the write can be driven onto a scratch one.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn forget_lane(
+        ledger: &mut InsertLedger,
+        shelf: &std::path::Path,
+        e: &crate::instrument::Engine,
+        id: tangent_ui::desk_id::TrackId,
+        lane: crate::engine_bridge::LaneAt,
+    ) -> crate::engine_bridge::Forgotten {
+        let mine: crate::engine_bridge::Forgotten = ledger
+            .iter()
+            .filter(|(at, _)| at.0.lane() == Some(lane.slot))
+            .map(|(at, b)| (*at, b.clone()))
+            .collect();
+        for (at, bundle) in &mine {
+            ledger.remove(at);
+            if bundle.starts_with('\u{1f}') || is_instrument_sentinel(bundle) {
+                continue;
+            }
+            let ours = e.insert_at(at.0, at.1).is_some_and(|l| l.bundle == std::path::Path::new(bundle));
+            // The bay's identity: the leaving TRACK's, at the rack and bay
+            // the engine names.
+            let sb = at.0.desk_rack().and_then(|rack| {
+                let sb = tangent_ui::desk_id::SeatBay::new(
+                    tangent_ui::desk_id::Node::Track(id),
+                    rack,
+                    u8::try_from(at.1).ok()?,
+                );
+                sb.is_valid().then_some(sb)
+            });
+            if let (true, Some(state), Some(sb)) = (ours, e.save_insert_state_at(at.0, at.1), sb) {
+                crate::shelf::write_state_in(shelf, sb, bundle, &state);
+            }
+        }
+        mine
+    }
+
+    /// **What `forget_lane` let go of, taken back** for every lane the bridge
+    /// handed back to its track this frame (`Synced::reclaimed`). An entry
+    /// the ledger already holds again is newer and stays.
+    #[cfg(feature = "recorder")]
+    pub(crate) fn reclaim_lanes(ledger: &mut InsertLedger, synced: &crate::engine_bridge::Synced) {
+        for (at, bundle) in synced.reclaimed.iter().flatten() {
+            ledger.entry(*at).or_insert_with(|| bundle.clone());
         }
     }
 
@@ -12479,8 +12660,10 @@ impl DesktopApp {
         if self.pads_owed {
             // Every drum LANE, because each carries its own kit — the same
             // walk `reload_pads` makes, and for the same reason.
-            let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
-                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            let lanes: Vec<usize> = (0..self.app.track_ids().len())
+                .filter(|row| {
+                    crate::engine_bridge::row_instrument(&self.app, *row) == Some(tangent_ui::dialogs::DRUMPAD_PATH)
+                })
                 .collect();
             for lane in lanes {
                 for path in self.app.drumpad_paths_of(lane).into_iter().flatten() {
@@ -12597,7 +12780,7 @@ impl DesktopApp {
                 // its file plays instead, placed below the loop.
                 if !notes.is_empty() && self.app.lane_frozen(clip.lane).is_none() {
                     midi_placed.push(crate::instrument::PlacedMidi {
-                        strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
+                        strip: clip.lane,
                         start: frames(clip.start_s),
                         len: frames(clip.len_s),
                         notes: Arc::new(notes),
@@ -12895,8 +13078,10 @@ impl DesktopApp {
             // of them, and the spawn-for-ever loop would be back with one
             // extra step in it. Collected first because the closure below
             // borrows the app while `retain` borrows the set.
-            let live_pads: Vec<std::path::PathBuf> = (0..tangent_ui::recorder::CHANNELS)
-                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            let live_pads: Vec<std::path::PathBuf> = (0..self.app.track_ids().len())
+                .filter(|row| {
+                    crate::engine_bridge::row_instrument(&self.app, *row) == Some(tangent_ui::dialogs::DRUMPAD_PATH)
+                })
                 .flat_map(|lane| self.app.drumpad_paths_of(lane))
                 .flatten()
                 .collect();
@@ -12923,9 +13108,14 @@ impl DesktopApp {
             // in memory.
             self.stretch_cache.retain(|key, _| live_stretches.contains(key));
         }
+        // **Each clip on its track's lane**, stamped `(slot, gen)` by the
+        // bridge (design 7.5): a clip for a lane that has gone plays on
+        // nobody, and a lane that arrives later is owed this list again
+        // (`Synced::moved`).
+        let (placed, midi_placed) = (self.bridge.slot_clips(placed), self.bridge.slot_midi(midi_placed));
         if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_clips(placed);
-            e.set_midi_clips(midi_placed);
+            e.set_clips_slotted(placed);
+            e.set_midi_slotted(midi_placed);
         }
         let mut info = info.unwrap_or_default();
         info.seconds = span;
@@ -13057,14 +13247,13 @@ impl DesktopApp {
         // instance per channel, so this decodes once per lane — the cache
         // below means two lanes naming the same file decode it once and
         // share the `Arc`.
-        let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
-            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-            .collect();
+        // Each by its row (whose kit it is) and its lane (where it plays).
+        let lanes = self.bridge.lanes_holding(&self.app, tangent_ui::dialogs::DRUMPAD_PATH);
         // The window's own lane is the one whose load STATUS the pads show.
         let shown = self.app.drumpad_lane();
         let mut delivered_all = !lanes.is_empty();
-        for lane in lanes.iter().copied() {
-        let paths = self.app.drumpad_paths_of(lane);
+        for (row, at) in lanes.iter().copied() {
+        let paths = self.app.drumpad_paths_of(row);
         let mut kit = crate::instrument::PadKit::default();
         let mut status: [tangent_ui::ports::PadStatus; crate::instrument::PADS] =
             std::array::from_fn(|_| tangent_ui::ports::PadStatus::default());
@@ -13099,15 +13288,20 @@ impl DesktopApp {
         // kit silently while the ghosts drew anyway, and the Windows
         // tester's pads struck the DX7. Undelivered = try again next frame,
         // until the audio thread really has it.
+        //
+        // **Attached to its lane** (design 7.13: "Attach(Kit). Nothing
+        // reloads"), behind the lane's Install on the op ring, and checked
+        // against the lane's generation where it lands: a kit for a lane
+        // that has gone goes straight home.
         let landed = self
             .recorder
             .engine
             .as_mut()
-            .is_some_and(|e| e.set_pad_kit(lane, kit));
+            .is_some_and(|e| e.attach(at.slot, at.gen, crate::instrument::LanePart::Kit(Box::new(kit))).is_ok());
         delivered_all &= landed;
         // The status belongs to the kit the WINDOW is showing: it is what
         // draws those pads' names, waveforms and missing-file marks.
-        if landed && lane == shown {
+        if landed && row == shown {
             self.app.set_drumpad_status(status);
         }
         }
@@ -13116,7 +13310,7 @@ impl DesktopApp {
         // first one's samples.
         let live: Vec<std::path::PathBuf> = lanes
             .iter()
-            .flat_map(|l| self.app.drumpad_paths_of(*l))
+            .flat_map(|(row, _)| self.app.drumpad_paths_of(*row))
             .flatten()
             .collect();
         self.pad_cache.retain(|path, _| live.iter().any(|p| p == path));
@@ -13168,17 +13362,22 @@ impl DesktopApp {
         e: &crate::instrument::Engine,
         doc: Option<&std::path::Path>,
     ) -> Vec<(usize, Option<std::path::PathBuf>, u8)> {
-        let bays = tangent_ui::recorder::INSERTS;
         let mut out = Vec::new();
-        for lane in 0..tangent_ui::recorder::CHANNELS {
-            for bay in 0..bays {
-                let Some((spec, _)) = e.builtin_insert(lane, bay) else {
+        for lane in 0..crate::instrument::LEGACY_LANES {
+            let slot = crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX));
+            for bay in 0..tangent_ui::desk_id::BAYS {
+                let Some((rack, b)) =
+                    crate::engine_bridge::lane_bay(slot, tangent_ui::desk_id::Rack::Chain(0), bay as u8)
+                else {
+                    continue;
+                };
+                let Some((spec, _)) = e.builtin_insert_at(rack, b) else {
                     continue;
                 };
                 if spec.path != crate::builtin_fx::SAMPLER_PATH {
                     continue;
                 }
-                let extra = e.builtin_extra(lane, bay);
+                let extra = e.builtin_extra_at(rack, b);
                 let read = |key: &str| {
                     extra
                         .iter()
@@ -13236,15 +13435,15 @@ impl DesktopApp {
         // sampler bay at all wants nothing, which is how a bay that was
         // removed gets its samples freed.
         let mut wanted: Vec<Option<(std::path::PathBuf, u8)>> =
-            vec![None; tangent_ui::recorder::CHANNELS];
+            vec![None; crate::instrument::LEGACY_LANES];
         for (lane, path, root) in self.sampler_bays() {
             if let (Some(slot), Some(path)) = (wanted.get_mut(lane), path) {
                 *slot = Some((path, root));
             }
         }
         let mut delivered_all = true;
-        for lane in 0..tangent_ui::recorder::CHANNELS {
-            let want = wanted[lane].clone();
+        for (lane, want) in wanted.iter().enumerate() {
+            let want = want.clone();
             if self.sampler_have.get(lane) == Some(&want) {
                 continue;
             }
@@ -13296,7 +13495,7 @@ impl DesktopApp {
                 .recorder
                 .engine
                 .as_mut()
-                .is_some_and(|e| e.set_sampler_sample(lane, sample));
+                .is_some_and(|e| e.set_sampler_sample(crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX)), sample));
             if landed {
                 if let Some(slot) = self.sampler_have.get_mut(lane) {
                     *slot = sent;
@@ -13304,16 +13503,19 @@ impl DesktopApp {
                 // **What the face draws, told by the road that actually
                 // delivered it.** Reported inside the landed arm so the panel
                 // can never show a waveform for a sample the audio thread
-                // refused — the drumpad's own lesson, one file up.
-                self.app.set_sampler_info(
-                    lane,
-                    tangent_ui::ports::SamplerInfo {
-                        name,
-                        seconds,
-                        peaks,
-                        missing,
-                    },
-                );
+                // refused — the drumpad's own lesson, one file up. The engine
+                // speaks of a lane by its slot; the face is the row's.
+                if let Some(row) = self.bridge.row_of_slot(crate::desk_plan::Slot(lane as u32)) {
+                    self.app.set_sampler_info(
+                        row,
+                        tangent_ui::ports::SamplerInfo {
+                            name,
+                            seconds,
+                            peaks,
+                            missing,
+                        },
+                    );
+                }
             } else {
                 // **The face only draws once the file actually LANDED.** A
                 // full ring under a stalled callback — or no engine at all —
@@ -13867,9 +14069,8 @@ impl DesktopApp {
             format: tangent_record::wav::SampleFormat::Float32,
         };
         let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
-        let lane_ch = lane.min(tangent_ui::recorder::CHANNELS - 1);
         let written = tangent_record::wav::WavWriter::create(&file, spec, &bext).and_then(|mut w| {
-            render_placed_span(&placed, lane_ch, from, to, |block| w.write_interleaved(block))?;
+            render_placed_span(&placed, lane, from, to, |block| w.write_interleaved(block))?;
             w.finish()
         });
         if let Err(e) = written {
@@ -13902,6 +14103,42 @@ impl DesktopApp {
                 format!("Glued {count} clips into {name}")
             },
         );
+    }
+
+    /// **The engine's name for the app's `(seat, bay)`**, through the bridge:
+    /// the app keeps its bays by row, the engine its racks by identity (a
+    /// lane's by its slot), each reached through its `HostRack`.
+    #[cfg(feature = "recorder")]
+    fn engine_at(&self, seat: usize, bay: usize) -> Option<crate::engine_bridge::EngineBay> {
+        self.bridge.engine_seat(&self.app, seat, bay)
+    }
+
+    /// **What the plugin in the app's bay is PLAYING**, asked of its lane.
+    #[cfg(feature = "recorder")]
+    fn live_state(&self, seat: usize, bay: usize) -> Option<Vec<u8>> {
+        let at = self.engine_at(seat, bay)?;
+        self.recorder.engine.as_ref()?.save_insert_state_at(at.0, at.1)
+    }
+
+    /// **Write a bay's state to the live shelf, the bay named by the app's
+    /// `(seat, bay)`**: under its identity's pstate name (`shelf`), so the
+    /// file is its track's wherever the row goes. A seat no track holds
+    /// writes nothing.
+    #[cfg(feature = "recorder")]
+    fn write_bay_state(&self, seat: usize, bay: usize, bundle: &str, state: &[u8]) {
+        if let Some(sb) = crate::engine_bridge::seat_bay_at(self.app.track_ids(), seat, bay) {
+            crate::shelf::write_state(sb, bundle, state);
+        }
+    }
+
+    /// **A file just written is `bundle`'s newest word in the app's bay**, so
+    /// whatever the displaced shelf kept of it there must not outrank it.
+    /// See `incoming_state`.
+    #[cfg(feature = "recorder")]
+    fn forget_displaced(&mut self, seat: usize, bay: usize, bundle: &str) {
+        if let Some(sb) = crate::engine_bridge::seat_bay_at(self.app.track_ids(), seat, bay) {
+            self.displaced_states.remove(&(sb, bundle.to_owned()));
+        }
     }
 
     /// Copy one bay's effect to another channel's next free bay, with the
@@ -13951,9 +14188,21 @@ impl DesktopApp {
             // (the drop landed on a column or a header row, not on a bay),
             // which is what `seat_bay` wants.
             None => {
-                let slots = tangent_ui::recorder::bays_at(to_strip);
-                let free = (0..slots)
-                    .map(|slot| tangent_ui::recorder::seat_bay(to_strip, slot))
+                // The slots the strip SHOWS (`recorder::bays_on`, by what the
+                // strip is), each through the display-slot resolver to its
+                // bay and back to the seat the app keeps it at.
+                let node = crate::engine_bridge::strip_node(&self.app, to_strip);
+                let shows = tangent_ui::recorder::bays_on(match node {
+                    Some(tangent_ui::desk_id::Node::Track(_)) => Some(tangent_ui::recorder::Strip::Channel(0)),
+                    Some(tangent_ui::desk_id::Node::Drums) => Some(tangent_ui::recorder::Strip::Drums),
+                    Some(tangent_ui::desk_id::Node::Click) => Some(tangent_ui::recorder::Strip::Click),
+                    Some(tangent_ui::desk_id::Node::Fx) => Some(tangent_ui::recorder::Strip::Fx),
+                    _ => None,
+                });
+                let ids = self.app.track_ids().to_vec();
+                let free = (0..shows)
+                    .filter_map(|slot| crate::engine_bridge::strip_slot(&self.app, to_strip, slot))
+                    .filter_map(|sb| crate::engine_bridge::app_seat_of(&ids, sb))
                     .find(|(seat, bay)| self.app.insert(*seat, *bay).is_none());
                 match free {
                     Some((seat, bay)) => {
@@ -13978,18 +14227,12 @@ impl DesktopApp {
         // The state it is playing at, not the one on disk: a plugin somebody
         // has been turning knobs on has not written a sidecar since it
         // loaded.
-        if let Some(state) = self
-            .recorder
-            .engine
-            .as_ref()
-            .and_then(|e| e.save_insert_state(from_strip, from_bay))
-        {
-            write_insert_state(to_strip, to_bay, &bundle, &state);
+        if let Some(state) = self.live_state(from_strip, from_bay) {
+            self.write_bay_state(to_strip, to_bay, &bundle, &state);
             // **The file just written is this bundle's newest word here**,
             // so whatever the shelf kept of an earlier one in this bay must
             // not outrank it. See `incoming_state`.
-            self.displaced_states
-                .remove(&(to_strip, to_bay, bundle.clone()));
+            self.forget_displaced(to_strip, to_bay, &bundle);
         }
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
@@ -14006,14 +14249,13 @@ impl DesktopApp {
     /// re-pointed by the app in the same call.
     #[cfg(feature = "recorder")]
     fn follow_insert_window(&mut self, from: (usize, usize), to: (usize, usize)) {
-        let was_up = self
-            .recorder
-            .engine
-            .as_ref()
-            .is_some_and(|e| e.insert_editor_open(from.0, from.1));
-        if was_up {
+        let at = self.engine_at(from.0, from.1);
+        let was_up = at.is_some_and(|at| {
+            self.recorder.engine.as_ref().is_some_and(|e| e.insert_editor_open_at(at.0, at.1))
+        });
+        if let (true, Some(at)) = (was_up, at) {
             if let Some(e) = self.recorder.engine.as_mut() {
-                e.close_insert_editor(from.0, from.1);
+                e.close_insert_editor_at(at.0, at.1);
             }
             self.app.open_insert_when_loaded(to.0, to.1);
         }
@@ -14050,16 +14292,10 @@ impl DesktopApp {
         }
         // Its live state, written under the bay that is going to read it —
         // `copy_insert`'s ordering rule, for its reason.
-        if let Some(state) = self
-            .recorder
-            .engine
-            .as_ref()
-            .and_then(|e| e.save_insert_state(from_strip, from_bay))
-        {
-            write_insert_state(to_strip, to_bay, &bundle, &state);
+        if let Some(state) = self.live_state(from_strip, from_bay) {
+            self.write_bay_state(to_strip, to_bay, &bundle, &state);
             // Newer than anything shelved for it here - see `copy_insert`.
-            self.displaced_states
-                .remove(&(to_strip, to_bay, bundle.clone()));
+            self.forget_displaced(to_strip, to_bay, &bundle);
         }
         // **ONE moment for the drag**, through the app's trade. `set_insert`
         // commits its own, so filling the destination and clearing the
@@ -14109,20 +14345,13 @@ impl DesktopApp {
         // nothing here has to save it first: the reconcile asks the plugin
         // it tears down for the settings it is PLAYING, which is newer than
         // that file, and shelves them. See `displaced_states`.
-        if let Some(state) = self
-            .recorder
-            .engine
-            .as_ref()
-            .and_then(|e| e.save_insert_state(from_strip, from_bay))
-        {
-            write_insert_state(to_strip, to_bay, &bundle, &state);
+        if let Some(state) = self.live_state(from_strip, from_bay) {
+            self.write_bay_state(to_strip, to_bay, &bundle, &state);
             // Newer than anything shelved for it here - see `copy_insert`.
-            self.displaced_states
-                .remove(&(to_strip, to_bay, bundle.clone()));
+            self.forget_displaced(to_strip, to_bay, &bundle);
         }
-        let bays = tangent_ui::recorder::INSERTS;
-        if let Some(cell) = self.recorder.inserts_loaded.get_mut(to_strip * bays + to_bay) {
-            *cell = Some("\u{1f}reload".to_owned());
+        if let Some(at) = self.engine_at(to_strip, to_bay) {
+            self.recorder.inserts_loaded.insert(at, RELOAD.to_owned());
         }
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
         self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
@@ -14145,7 +14374,7 @@ impl DesktopApp {
     /// already come up without.
     ///
     /// Each state is written under the bundle that is going to READ it —
-    /// `saved_insert_state` refuses a sidecar whose owner does not match, so
+    /// `shelf::saved_state` refuses a state file whose owner does not match, so
     /// a state left tagged with the old occupant's name is a plugin coming up
     /// at its defaults with the file it wanted sitting right there.
     #[cfg(feature = "recorder")]
@@ -14165,13 +14394,7 @@ impl DesktopApp {
         // somebody has been turning knobs on has not written a sidecar since
         // it loaded. Both are read before either is written, or the second
         // read finds the first write.
-        let (a_state, b_state) = match self.recorder.engine.as_ref() {
-            Some(e) => (
-                e.save_insert_state(a_strip, a_bay),
-                e.save_insert_state(b_strip, b_bay),
-            ),
-            None => (None, None),
-        };
+        let (a_state, b_state) = (self.live_state(a_strip, a_bay), self.live_state(b_strip, b_bay));
         // **Both files are about to be cross-tagged**, which buries each
         // bay's own copy - and undoing the swap asks for both. The
         // reconcile shelves what each plugin is PLAYING as it tears the two
@@ -14179,25 +14402,20 @@ impl DesktopApp {
         // shelf is that the two files written here are the newest word on
         // each incoming plugin, so nothing shelved earlier outranks them.
         if let Some(state) = a_state {
-            write_insert_state(b_strip, b_bay, &a, &state);
-            self.displaced_states.remove(&(b_strip, b_bay, a.clone()));
+            self.write_bay_state(b_strip, b_bay, &a, &state);
+            self.forget_displaced(b_strip, b_bay, &a);
         }
         if let Some(state) = b_state {
-            write_insert_state(a_strip, a_bay, &b, &state);
-            self.displaced_states.remove(&(a_strip, a_bay, b.clone()));
+            self.write_bay_state(a_strip, a_bay, &b, &state);
+            self.forget_displaced(a_strip, a_bay, &b);
         }
         // Which side had its window up, read BEFORE the bays are re-pointed
         // and the reconcile tears both instances down.
-        let (a_up, b_up) = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or((false, false), |e| {
-                (
-                    e.insert_editor_open(a_strip, a_bay),
-                    e.insert_editor_open(b_strip, b_bay),
-                )
-            });
+        let up = |at: Option<crate::engine_bridge::EngineBay>| {
+            at.zip(self.recorder.engine.as_ref())
+                .is_some_and(|(at, e)| e.insert_editor_open_at(at.0, at.1))
+        };
+        let (a_up, b_up) = (up(self.engine_at(a_strip, a_bay)), up(self.engine_at(b_strip, b_bay)));
         // One moment, for the reason `move_insert` states: the halfway
         // state of a TRADE is worse still - `b` in both bays and `a` gone
         // from the project entirely. Each unit's automation trades with it
@@ -14221,81 +14439,61 @@ impl DesktopApp {
     /// somebody chose a preset, and it is also the moment they are most likely
     /// to then force-quit or unplug something.
     fn save_plugin_states(&mut self) {
-        // EVERY seat. The old STRIPS+1+DRUM_PADS bound predates the
-        // master's second rack and the folder-extra seats, so a plugin
-        // dialed in on any of those never got a sidecar and came back at
-        // its defaults - while the project-copy loops below had already
-        // been taught the full space and were copying stale files.
-        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
-            for bay in 0..tangent_ui::recorder::INSERTS {
-                let Some(bundle) = self.app.insert(strip, bay).map(str::to_owned) else {
+        // EVERY bay the desk seats. The old STRIPS+1+DRUM_PADS bound predates
+        // the master's second rack and the folder-extra seats, so a plugin
+        // dialed in on any of those never got a sidecar and came back at its
+        // defaults. Asked of each bay's own lane through the bridge, and
+        // filed where the app keeps the bay.
+        for seat in 0..tangent_ui::desk_legacy::V32_TOTAL_SEATS {
+            for bay in 0..tangent_ui::desk_id::BAYS {
+                let Some(bundle) = self.app.insert(seat, bay).map(str::to_owned) else {
                     continue;
                 };
-                if let Some(state) = self
-                    .recorder
-                    .engine
-                    .as_ref()
-                    .and_then(|e| e.save_insert_state(strip, bay))
-                {
-                    write_insert_state(strip, bay, &bundle, &state);
+                if let Some(state) = self.live_state(seat, bay) {
+                    self.write_bay_state(seat, bay, &bundle, &state);
                 }
             }
         }
     }
 
     /// As [`Self::save_plugin_states`], but each sidecar's OWNER is what is
-    /// really LOADED in the engine's slot — `inserts_loaded`'s truth — not
-    /// what the settings say should be there. The reorder path needs this:
-    /// the settings are already the NEW layout when it saves, and a state
-    /// tagged with the new occupant's name is a state its own plugin
-    /// rejects after the files move.
-    /// Every loaded plugin's state to disk, keyed by where it is LOADED.
-    ///
-    /// `only` narrows it to a set of strips. A reorder needs the states of
-    /// the rows it is about to move and no others — asking a sampler for its
-    /// state is not free, and there are four hundred and fifty seats on this
-    /// desk. Before this took an argument, making a folder saved the whole
-    /// session's plugins to ask about a handful of rows.
-    fn save_plugin_states_as_loaded_for(&mut self, only: Option<&[bool]>) {
-        let bays = tangent_ui::recorder::INSERTS;
-        for i in 0..self.recorder.inserts_loaded.len() {
-            if let Some(want) = only {
-                if !want.get(i / bays).copied().unwrap_or(false) {
-                    continue;
-                }
-            }
-            let Some(bundle) = self
-                .recorder
-                .inserts_loaded
-                .get(i)
-                .and_then(|b| b.clone())
-                // The reload marker and the instrument sentinels have no
-                // state to ask for; a built-in EFFECT bay answers from its
-                // ledger like any LV2 bay and must not be skipped here, or
-                // its knobs die at relaunch — the exact disease the sidecars
-                // cure.
-                .filter(|b| !b.starts_with('\u{1f}') && !is_instrument_sentinel(b))
-            else {
+    /// really LOADED in the engine's bay — the ledger's truth — not what the
+    /// settings say should be there: a bay the reconcile has not reached yet
+    /// still holds its outgoing tenant, and a state tagged with the incoming
+    /// one's name is a state its own plugin rejects. What an engine teardown
+    /// writes down.
+    fn save_plugin_states_as_loaded(&mut self) {
+        let loaded: Vec<(crate::engine_bridge::EngineBay, String)> = self
+            .recorder
+            .inserts_loaded
+            .iter()
+            .map(|(at, b)| (*at, b.clone()))
+            .collect();
+        for (at, bundle) in loaded {
+            // The reload marker and the instrument sentinels have no state to
+            // ask for; a built-in EFFECT bay answers from its ledger like any
+            // LV2 bay and must not be skipped here, or its knobs die at
+            // relaunch — the exact disease the sidecars cure.
+            if bundle.starts_with('\u{1f}') || is_instrument_sentinel(&bundle) {
                 continue;
-            };
-            let (strip, bay) = (i / bays, i % bays);
+            }
             // **And only where the ENGINE agrees about the tenant.** A load
-            // that failed writes the wanted name into `inserts_loaded` and
-            // leaves the outgoing plugin seated, so asking that seat for its
-            // state and filing it under the ledger's name hands one plugin's
-            // blob to another the next time the bay loads - the check
+            // that failed writes the wanted name into the ledger and leaves
+            // the outgoing plugin seated, so asking that seat for its state
+            // and filing it under the ledger's name hands one plugin's blob
+            // to another the next time the bay loads - the check
             // `desk_insert_state` makes, for the reason it gives.
-            if let Some(state) = self
+            let state = self
                 .recorder
                 .engine
                 .as_ref()
                 .filter(|e| {
-                    e.insert(strip, bay)
+                    e.insert_at(at.0, at.1)
                         .is_some_and(|l| l.bundle == std::path::Path::new(&bundle))
                 })
-                .and_then(|e| e.save_insert_state(strip, bay))
-            {
-                write_insert_state(strip, bay, &bundle, &state);
+                .and_then(|e| e.save_insert_state_at(at.0, at.1));
+            if let (Some(state), Some(sb)) = (state, self.bridge.bay_at_engine(at)) {
+                crate::shelf::write_state(sb, &bundle, &state);
             }
         }
     }
@@ -14317,14 +14515,14 @@ impl DesktopApp {
     ///
     /// Written by what is LOADED, not by what the desk asks for: a bay the
     /// reconcile has not reached yet still holds its outgoing tenant. The
-    /// ledger is wiped here too, because "`inserts_loaded` is all `None`
-    /// whenever the engine goes" is what `force_insert_reload` and the
-    /// reconcile both rely on. And the counts it was clicking go with it -
+    /// ledger is wiped here too, because "`inserts_loaded` is empty whenever
+    /// the engine goes" is what `force_insert_reload` and the reconcile both
+    /// rely on. And the counts it was clicking go with it -
     /// see `forget_counts`.
     fn retire_engine(&mut self) {
-        self.save_plugin_states_as_loaded_for(None);
+        self.save_plugin_states_as_loaded();
         self.recorder.engine = None;
-        self.recorder.inserts_loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        self.recorder.inserts_loaded = InsertLedger::new();
         self.forget_counts();
     }
 
@@ -15126,8 +15324,7 @@ impl DesktopApp {
                 // A fresh engine has nothing loaded, whatever was loaded in
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
-                self.recorder.inserts_loaded =
-                    vec![None; tangent_ui::recorder::INSERT_SPACE];
+                self.recorder.inserts_loaded = InsertLedger::new();
                 // Every rack on the desk is empty and being rebuilt: the room
                 // may hold an armed input until its chain is back.
                 self.racks_restoring = true;
@@ -15271,7 +15468,7 @@ impl DesktopApp {
                 // was decoded at a rate this device may not run, and a lane
                 // holding one would play it at the wrong speed.
                 self.sampler_cache.clear();
-                self.sampler_have = vec![None; tangent_ui::recorder::CHANNELS];
+                self.sampler_have = vec![None; crate::instrument::LEGACY_LANES];
                 self.sampler_owed = true;
                 // Both of those are answered a file a frame from here on, and
                 // between a device settling and the user touching something
@@ -15353,23 +15550,56 @@ impl DesktopApp {
         // machine with no monitor (or one another app holds) would have kept
         // counting and writing 4/4 while the band showed 6/8.
         self.recorder.session.set_meter(self.app.time_signature());
-        // **The desk's structure, through the one seam** - see
-        // `engine_bridge::Bridge::sync`: the tables on change, the arm,
-        // live-MIDI, punch, instrument, drum, folder, polarity and suspend
-        // words every frame. First, so the desk it builds is THE desk of
-        // this frame: built ONCE, the take facts below read its masks and
-        // the bridge compared it. With no engine there is nothing to push
-        // and the app builds it for the facts alone.
-        let mut primed = false;
+        // **The desk, through the one seam** - see `engine_bridge::Bridge`:
+        // every track's lane by identity, the shape as one plan when it
+        // moved, and every fader, pan, send and keyboard knob by slot. First,
+        // so the desk it builds is THE desk of this frame: built ONCE, the
+        // take facts below read its masks and the bridge compared it. With no
+        // engine there is nothing to push and the app builds it for the
+        // facts alone.
+        let mut synced = crate::engine_bridge::Synced::default();
         let desk = match self.recorder.engine.as_mut() {
             Some(e) => {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
                 self.bridge.punch_at(live_punches(self.recorder.arr_rec.as_ref(), rate));
-                primed = self.bridge.sync(&self.app, e).primed;
+                // **A lane whose track has gone is written down first**: every
+                // bay its plugins sit in, to the live shelf under the track's
+                // own bays, while the plugins are alive, and forgotten by the
+                // ledger, so the reconcile neither unloads it bay by bay nor
+                // reads a new track's slot as loaded. See `forget_lane`.
+                let ledger = &mut self.recorder.inserts_loaded;
+                let shelf = crate::shelf::global_dir();
+                synced = self.bridge.sync_with(&self.app, e, &mut |e, id, lane| {
+                    Self::forget_lane(ledger, &shelf, e, id, lane)
+                });
+                // **A lane taken back before it left keeps its plugins**, so
+                // the ledger takes back what it forgot of them: the reconcile
+                // then finds every bay as it was and reloads nothing.
+                Self::reclaim_lanes(&mut self.recorder.inserts_loaded, &synced);
                 self.bridge.desk()
             }
             None => self.app.desk(),
         };
+        // **A lane that came or went is owed everything sent by `(slot,
+        // gen)`**: the clips, the MIDI, the curves and the kits are pushed
+        // again, so a new lane hears its own and nothing waits on a lane that
+        // has left, and whatever the host keeps per slot outside the lane
+        // (a sampler's file, the kit's knobs) is forgotten for those slots.
+        if !synced.moved.is_empty() {
+            self.clips_owed = true;
+            self.pads_owed = true;
+            self.pushed_auto = None;
+            for slot in &synced.moved {
+                let at = slot.0 as usize;
+                if let Some(have) = self.sampler_have.get_mut(at) {
+                    *have = Some((std::path::PathBuf::from(RELOAD), 0));
+                }
+                if let Some(pushed) = self.pushed_pads.get_mut(at) {
+                    *pushed = None;
+                }
+            }
+            self.sampler_owed = true;
+        }
         // The placement facts, fresh each frame so `begin` latches this
         // frame's truth: the playhead (where the take will start on the
         // timeline), the head the count-in will leave in the file, and the
@@ -15394,17 +15624,12 @@ impl DesktopApp {
                     tangent_ui::recorder::RecordState::CountIn { .. }
                 ),
             );
-            let mask = |bits: &[bool]| {
-                bits.iter()
-                    .enumerate()
-                    .fold(0u32, |m, (i, b)| if *b && i < 32 { m | 1 << i } else { m })
-            };
             self.recorder.session.set_take_facts(
                 timeline_start,
                 rolling,
                 head,
-                mask(&desk.muted),
-                mask(&desk.soloed),
+                crate::record::manifest_mask(&desk.muted),
+                crate::record::manifest_mask(&desk.soloed),
             );
         }
         // **Whether an armed input is still waiting on a bay it is heard
@@ -15420,16 +15645,30 @@ impl DesktopApp {
         // guitar through a bay that has not loaded yet is the DI, and it is
         // the loudest thing in the room.
         let racks_ready = !self.armed_racks_pending();
-        let Some(e) = self.recorder.engine.as_ref() else {
+        // **The DX7 voices, for every DX7 lane the bridge just shipped an
+        // instance to**: a voice is the strip's OWN cartridge's patch, which
+        // the cartridge cache answers (a map lookup, not a file read), and a
+        // keyboard lane needs no follow-up, its patch and knobs being
+        // per-lane atomics the bridge stores. Before the engine is borrowed:
+        // the cache is this app's.
+        let voices: Vec<(crate::desk_plan::Slot, crate::dx7::Voice)> = synced
+            .made_dx7
+            .iter()
+            .map(|(row, slot)| (*slot, self.voice_for_strip(*row)))
+            .collect();
+        let Some(e) = self.recorder.engine.as_mut() else {
             return;
         };
+        for (slot, v) in voices {
+            e.set_builtin_voice(slot, v);
+        }
         let gains = self.app.gains();
         e.set_metronome_gain(gains.metronome);
         e.set_drums(self.app.drums_gain(), self.app.drums_pan());
         // A fresh engine forgets the pads with everything else: the bridge
-        // says when it primed one.
-        if primed {
-            self.pushed_pads = [None; tangent_ui::recorder::CHANNELS];
+        // says when it adopted one.
+        if synced.primed {
+            self.pushed_pads = [None; crate::instrument::LEGACY_LANES];
         }
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
@@ -15439,16 +15678,14 @@ impl DesktopApp {
         // The drumpad's knobs, on the same on-change bargain as the tables:
         // atomic stores of numbers that only move when a hand is on them,
         // compared here so a hand that is not on them costs a compare.
-        // **The knobs, to every lane holding a kit.** One document kit still,
-        // so they all get the same numbers; per-lane kits change what is sent
-        // and not this loop.
-        for lane in (0..tangent_ui::recorder::CHANNELS)
-            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-        {
-            let params = self.app.drum_kit_params_of(lane);
-            if self.pushed_pads.get(lane).copied().flatten() != Some(params) {
-                e.set_pad_params(lane, &params);
-                if let Some(slot) = self.pushed_pads.get_mut(lane) {
+        // **The knobs, to every lane holding a kit**, by its lane: each track
+        // its own kit's knobs, at the slot its lane holds.
+        for (row, lane) in self.bridge.lanes_holding(&self.app, tangent_ui::dialogs::DRUMPAD_PATH) {
+            let params = self.app.drum_kit_params_of(row);
+            let at = lane.slot.0 as usize;
+            if self.pushed_pads.get(at).copied().flatten() != Some(params) {
+                e.set_pad_params(lane.slot, &params);
+                if let Some(slot) = self.pushed_pads.get_mut(at) {
                     *slot = Some(params);
                 }
             }
@@ -15459,75 +15696,51 @@ impl DesktopApp {
         // desk, so the desk's own fader is the whole of it, and the second
         // copy would have been the fader applied to everything in the file
         // rather than to the microphone.
-        // The eight general channels: their faders, which capture pick feeds
-        // which of them, which one holds the built-in, and which are NOT fed
-        // MIDI — four views of one fact, the channel_kinds array, pushed
-        // together so the callback can never see them disagree for long.
-        let mut picks: [Option<usize>; tangent_ui::recorder::INPUTS] =
-            [None; tangent_ui::recorder::INPUTS];
+        // Which capture pick feeds which LANE: the audio rows in order, each
+        // at its track's lane. Which MIDI lanes hear the keyboard is decided
+        // WHOLE by `recorder::live_midi_off`, in the bridge's plan: three
+        // rules that read each other, one of which silences all the rest,
+        // not a decision to make a bit at a time in the middle of the input
+        // picks.
+        let mut picks: [Option<usize>; crate::instrument::INPUTS] = [None; crate::instrument::INPUTS];
         let mut next_pick = 0usize;
-        // The DX7's lanes and the modelled keyboard's, gathered in ONE walk
-        // - the bridge's, which pushed their strip masks - so the masks and
-        // the instances below cannot disagree about the desk.
-        let (builtin_mask, keys_mask) = crate::engine_bridge::live_instrument_lanes(&self.app);
         // **The desk's EXPLICIT input bindings, when any channel has one.**
         // The strip's own menu names inputs now; the moment one channel
         // does, the whole desk routes explicitly — bound channels take
         // their named input, unbound audio channels take NOTHING. With no
         // bindings anywhere the old ordinal walk stands, so nothing anyone
         // set up before the menu existed changes under them.
-        let any_explicit = (0..tangent_ui::recorder::CHANNELS).any(|ch| {
+        let rows = self.app.track_ids().len();
+        let any_explicit = (0..rows).any(|ch| {
             self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
                 && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
         });
         let mut explicit: Vec<tangent_record::audio::ChannelPick> = Vec::new();
-        for ch in 0..tangent_ui::recorder::CHANNELS {
-            e.set_channel_gain(ch, gains.channels[ch]);
-            e.set_channel_pan(ch, self.app.channel_pan(ch));
-            match self.app.channel_kind(ch) {
-                // Which MIDI lanes hear the keyboard is decided WHOLE by
-                // `recorder::live_midi_off`, in the bridge. Three rules that
-                // read each other, one of which silences all the rest — not
-                // a decision to make a bit at a time in the middle of the
-                // input picks.
-                Some(tangent_ui::recorder::ChannelKind::Midi) => {}
-                Some(tangent_ui::recorder::ChannelKind::Audio) => {
-                    if any_explicit {
-                        if let Some((a, b)) =
-                            TangentApp::parse_input_spec(self.app.channel_input_spec(ch))
-                        {
-                            if next_pick < picks.len() {
-                                picks[next_pick] = Some(ch);
-                                explicit.push(match b {
-                                    Some(b) => tangent_record::audio::ChannelPick::Stereo(a, b),
-                                    None => tangent_record::audio::ChannelPick::Mono(a),
-                                });
-                                next_pick += 1;
-                            }
-                        }
-                    } else if next_pick < picks.len() {
-                        picks[next_pick] = Some(ch);
+        for ch in 0..rows {
+            if self.app.channel_kind(ch) != Some(tangent_ui::recorder::ChannelKind::Audio) {
+                continue;
+            }
+            // A row whose track has no lane yet is fed nothing this frame;
+            // the pick it would take waits with it.
+            let lane = self.bridge.lane(ch).map(|l| l.slot.0 as usize);
+            if any_explicit {
+                if let Some((a, b)) = TangentApp::parse_input_spec(self.app.channel_input_spec(ch)) {
+                    if next_pick < picks.len() {
+                        picks[next_pick] = lane;
+                        explicit.push(match b {
+                            Some(b) => tangent_record::audio::ChannelPick::Stereo(a, b),
+                            None => tangent_record::audio::ChannelPick::Mono(a),
+                        });
                         next_pick += 1;
                     }
                 }
-                None => {}
+            } else if next_pick < picks.len() {
+                picks[next_pick] = lane;
+                next_pick += 1;
             }
         }
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
         e.set_pick_strips(picks);
-        // **Every keyboard lane's own state, every frame.** This used to be
-        // one guarded push because a patch change rebuilt the voice pool;
-        // that died when the pool learned to carry both mechanisms, so a
-        // patch is now a flag the engine compares per block, and three
-        // atomic stores per lane per frame is what every fader already
-        // costs. The change-detection state this retires is the point: a
-        // cached "what the engine holds" is one more thing to disagree.
-        for ch in 0..tangent_ui::recorder::CHANNELS {
-            if keys_mask & (1 << ch.min(31)) != 0 {
-                e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
-                e.set_keys_params(ch, &self.app.keys_params_of(ch));
-            }
-        }
         // Never read from a settings file — see `TangentApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -15589,26 +15802,6 @@ impl DesktopApp {
             // a beat of that signature carries.
             e.set_metronome_div(self.app.metronome_div());
         }
-        // **The instances themselves, last, with the `&mut` the walk above
-        // never needed.** Everything before this line is an atomic store;
-        // shipping and retiring whole synths is ring work, so it waits for
-        // the shared borrow to end. A DX7 lane born this frame is followed
-        // by its strip's own voice — the cartridge cache makes that a map
-        // lookup, not a file read — and a keyboard lane needs no follow-up,
-        // its patch and knobs being per-lane atomics pushed above.
-        let made_dx7 = self
-            .recorder
-            .engine
-            .as_mut()
-            .map_or(0, |e| e.sync_instrument_lanes(builtin_mask, keys_mask).0);
-        for ch in 0..tangent_ui::recorder::CHANNELS.min(32) {
-            if made_dx7 & (1 << ch) != 0 {
-                let v = self.voice_for_strip(ch);
-                if let Some(e) = self.recorder.engine.as_mut() {
-                    e.set_builtin_voice(ch, v);
-                }
-            }
-        }
     }
 
     /// Give the engine the tempo and meter maps, when they have changed.
@@ -15636,13 +15829,20 @@ impl DesktopApp {
 
     /// The automation curves, on the same change-detected bargain.
     #[cfg(feature = "recorder")]
+    ///
+    /// **By lane**: each row's curves move to its track's slot and play only
+    /// on that lane's generation (`Bridge::slot_automation`), so a reorder,
+    /// which the app answers by moving the curves with their rows, lands
+    /// every curve on its own track. `pushed_auto` keeps the app's own
+    /// picture, by row, which is what the open faces are drawn from.
     fn push_automation(&mut self) {
         let want = self.app.engine_automation();
         if self.pushed_auto.as_ref() == Some(&want) {
             return;
         }
+        let slotted = self.bridge.slot_automation(&want);
         if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_automation(want.clone());
+            e.set_automation_slotted(slotted);
             self.pushed_auto = Some(want);
         }
     }
@@ -15662,7 +15862,13 @@ impl DesktopApp {
             let rate = engine.output().sample_rate;
             let at = self.recorder.transport.position_s(Some(engine), f64::from(rate));
             for (seat, bay) in self.app.open_face_seats() {
-                let Some((spec, saved)) = engine.builtin_insert(seat, bay) else {
+                // The app opened the face at ITS seat; the unit is in the
+                // track's lane.
+                let Some((spec, saved)) = self
+                    .bridge
+                    .engine_seat(&self.app, seat, bay)
+                    .and_then(|(s, b)| engine.builtin_insert_at(s, b))
+                else {
                     continue;
                 };
                 if let Some(face) = live_face(spec, saved, auto, at, seat, bay, rate as f32) {
@@ -15697,11 +15903,11 @@ impl DesktopApp {
         // Every channel with something ON it, by name: a MIDI channel with an
         // instrument in bay 1, an AUDIO channel whose pick is open. An unused
         // channel is not a loss; a piano that is loaded and muted is.
-        for ch in 0..tangent_ui::recorder::CHANNELS {
+        for ch in 0..self.app.track_ids().len() {
             let strip = Strip::Channel(ch);
             let live = match self.app.channel_kind(ch) {
                 Some(tangent_ui::recorder::ChannelKind::Midi) => {
-                    self.app.insert(strip.index(), 0).is_some()
+                    crate::engine_bridge::row_instrument(&self.app, ch).is_some()
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => self
                     .app
@@ -15854,7 +16060,7 @@ impl DesktopApp {
                         e.set_monitor_layout(
                             choice
                                 .channels
-                                .widths::<{ tangent_ui::recorder::INPUTS }>(dev),
+                                .widths::<{ crate::instrument::INPUTS }>(dev),
                             choice.channels,
                         );
                     }
@@ -16354,6 +16560,15 @@ fn swap_in_template(stage: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// `state/` and saved mark are left alone: Save As Template used to save a
 /// real folder's session first and copy that, writing an experiment into
 /// the project and clearing its asterisk.
+///
+/// **The template is born whole and by identity** (design 6.6): the copy of
+/// a real folder skips its legacy sidecars (`state/insert-state-*`) and its
+/// documents' `.pre-v8` backups, `state/` is a full pstate mirror of the
+/// live shelf, and the template's document carries no `legacy_states`
+/// marker, because nothing legacy is left in it to fall back to. The
+/// folder's own document is not copied either: the session's is written in
+/// its place from memory, and a legacy one copied first would have that
+/// write keep it in the template as a `.pre-v8` of its own.
 #[cfg(feature = "recorder")]
 fn build_template(
     app: &TangentApp,
@@ -16362,281 +16577,55 @@ fn build_template(
     shelf: &std::path::Path,
 ) -> std::io::Result<()> {
     if let Some(src) = real {
-        copy_dir_all(src, stage)?;
+        copy_dir_skipping(src, stage, &|rel| {
+            let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let document = rel.parent().is_some_and(|p| p.as_os_str().is_empty())
+                && [tangent_ui::arrangement::DOC_NAME, tangent_ui::arrangement::DOC_NAME_LEGACY].contains(&name.as_str());
+            document
+                || (rel.starts_with("state") && name.starts_with("insert-state-"))
+                || name.ends_with(".pre-v8")
+        })?;
     }
     app.write_template_into(stage)?;
     let state = stage.join("state");
     let _ = std::fs::create_dir_all(&state);
-    mirror_sidecars(shelf, &state);
+    crate::shelf::mirror_shelf(shelf, &crate::shelf::ShelfNames::Pstate, &state);
+    crate::shelf::strip_legacy_marker(&tangent_ui::arrangement::doc_in(stage));
     Ok(())
 }
 
 /// Copy a directory tree, best effort — the project system's clone.
+#[cfg_attr(not(test), allow(dead_code, reason = "the template copy skips; the tests copy whole"))]
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
-    Ok(())
+    copy_dir_skipping(src, dst, &|_| false)
 }
 
-/// Rename the channel rows' `insert-state-<strip>-<bay>.bin` files in `dir`
-/// to follow a reorder: `order[new] = old`. Read whole, then write whole —
-/// a rename chain would eat itself on any rotation.
-/// Which insert slots a permutation actually disturbs.
-///
-/// `order[new] = old`, so a row with `order[n] == n` kept its plugin, its
-/// state and its bays and has nothing to reload. Its own function because
-/// the alternative — marking the whole desk — is what made a reorder take
-/// seconds, and a property that costs seconds when it is wrong deserves a
-/// test that does not need a window.
-/// **The bays a reorder really has to reload.**
-///
-/// A moved row is not enough. The forced reload exists because a plugin's
-/// STATE travels with its track — two channels holding the same plugin can
-/// swap, leaving the path identical at both seats and the settings wrong at
-/// both — so a bay whose path is unchanged still has to be re-instantiated.
-/// But a bay that is EMPTY on both sides of the move has no plugin and no
-/// state and nothing to do, and marking it makes the reconcile spend a frame
-/// finding that out.
-///
-/// That mattered because a folder is inserted ABOVE its children: making one
-/// shifts every row below it, so "the rows that moved" is very nearly the
-/// whole desk, and the desk is mostly empty. `loaded` is what each seat has
-/// in it now; a pair of `None`s is a pair of nothing.
-/// The host's per-seat record of what is loaded, permuted with the channels.
-///
-/// Flat `strip * INSERTS + bay`, and only the channel rows move: the buses,
-/// the master and the pads keep their seats.
-fn permute_loaded_rows(rows: &mut [Option<String>], order: &[usize]) {
-    let bays = tangent_ui::recorder::INSERTS;
-    let n = order.len();
-    let mut held: Vec<Option<String>> = Vec::with_capacity(n * bays);
-    for new in 0..n {
-        for b in 0..bays {
-            held.push(rows.get(order[new] * bays + b).and_then(Clone::clone));
-        }
-    }
-    for (i, v) in held.into_iter().enumerate() {
-        if let Some(slot) = rows.get_mut(i) {
-            *slot = v;
-        }
-    }
-}
-
-/// The bays a permutation MOVED something into or out of.
-///
-/// `reload_slots_for` wraps it for the caller that has no loaded table, and
-/// both are driven by the reconcile tests rather than by the app: the live
-/// path is `force_insert_reload`, which marks every bay that holds
-/// something. The reasoning both share — an empty bay on both sides of a
-/// move has nothing to do, and marking it costs the reconcile a frame to
-/// find that out — is what the tests hold.
-#[allow(dead_code)]
-fn reload_slots_for_loaded(order: &[usize], bays: usize, loaded: &[Option<String>]) -> Vec<usize> {
-    let mut out = Vec::new();
-    let held = |strip: usize, bay: usize| -> bool {
-        loaded
-            .get(strip * bays + bay)
-            .and_then(|b| b.as_deref())
-            .is_some_and(|b| !b.is_empty())
-    };
-    for (new, old) in order.iter().enumerate() {
-        if new == *old {
-            continue;
-        }
-        for b in 0..bays {
-            // Something was here, or something is coming here. Either way
-            // the seat changes; anything else is two empties trading places.
-            if held(new, b) || held(*old, b) {
-                out.push(new * bays + b);
+/// [`copy_dir_all`], leaving out every file `skip` names by its path
+/// relative to `src`.
+fn copy_dir_skipping(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip: &dyn Fn(&std::path::Path) -> bool,
+) -> std::io::Result<()> {
+    fn walk(
+        root: &std::path::Path,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        skip: &dyn Fn(&std::path::Path) -> bool,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let to = dst.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                walk(root, &entry.path(), &to, skip)?;
+            } else if !skip(entry.path().strip_prefix(root).unwrap_or(&entry.path())) {
+                std::fs::copy(entry.path(), &to)?;
             }
         }
+        Ok(())
     }
-    out
-}
-
-#[cfg(test)]
-fn reload_slots_for(order: &[usize], bays: usize) -> Vec<usize> {
-    let loaded: Vec<Option<String>> =
-        (0..order.len() * bays).map(|_| Some("x".to_owned())).collect();
-    reload_slots_for_loaded(order, bays, &loaded)
-}
-
-fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
-    let Some(dir) = dir else {
-        return;
-    };
-    let name = |strip: usize, bay: usize| dir.join(sidecar_name(strip, bay));
-    let bays = tangent_ui::recorder::INSERTS;
-    // **Only the rows that MOVED.** A row whose files are already where they
-    // belong is read and written back byte for byte otherwise, and a plugin
-    // state can be megabytes — a sampler's especially. Making a folder shifts
-    // most of the desk, so this ran over nearly every file in the session,
-    // twice (two directories), on every drag: the owner's "any and every
-    // operation regarding dragging children in and out produces spinning
-    // wheel for 2-5 seconds".
-    let mut held: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-    for new in 0..order.len() {
-        let old = order[new];
-        if old == new {
-            held.push(Vec::new());
-            continue;
-        }
-        let mut row = Vec::with_capacity(bays);
-        for b in 0..bays {
-            match std::fs::read(name(old, b)) {
-                Ok(bytes) => row.push(Some(bytes)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => row.push(None),
-                // A file that EXISTS but cannot be read (EIO, a dataless
-                // Dropbox placeholder): abort whole — a permutation that
-                // deletes what it could not carry is data loss.
-                Err(_) => return,
-            }
-        }
-        held.push(row);
-    }
-    for (new, row) in held.into_iter().enumerate() {
-        // An untouched row was never read; writing it back would be writing
-        // what is already there.
-        if row.is_empty() {
-            continue;
-        }
-        for (b, data) in row.into_iter().enumerate() {
-            match data {
-                Some(bytes) => {
-                    let _ = std::fs::write(name(new, b), bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(name(new, b));
-                }
-            }
-        }
-    }
-}
-
-/// Where one insert bay's plugin state lives: a sidecar beside the settings,
-/// keyed by CHANNEL AND BAY because that is what an insert is keyed by, and
-/// validated by bundle path on the way back, as the instrument slots' files
-/// were before the slots went - the wrong plugin's state is not a preset, it
-/// is arbitrary bytes to a `setState` that will believe them.
-#[cfg(feature = "recorder")]
-fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
-    global_state_dir().join(sidecar_name(strip, bay))
-}
-
-/// The LIVE sidecar shelf: the config folder beside `settings.json`, where a
-/// plugin's knobs sit while the app is running.
-fn global_state_dir() -> std::path::PathBuf {
-    Settings::path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default()
-}
-
-/// What a sidecar's name begins with. Spelled once and read back by
-/// [`sidecar_seat_bay`]: a writer and a reader that disagree about the
-/// spelling would mirror nothing at all and say nothing about it.
-const SIDECAR_PREFIX: &str = "insert-state-";
-
-/// What one seat's sidecar is called.
-fn sidecar_name(strip: usize, bay: usize) -> String {
-    format!("{SIDECAR_PREFIX}{strip}-{bay}.bin")
-}
-
-/// The `(seat, bay)` a filename names, or `None` for anything that is not one
-/// of ours — the settings file lives in the same folder.
-///
-/// Bounded by TODAY's seat space on purpose. The per-seat walk this replaced
-/// looped `0..TOTAL_SEATS` by `0..INSERTS`, so a file named for a seat only a
-/// bigger build ever had was neither copied nor deleted, and that is what
-/// makes a downgrade survivable: the space has grown four times and each
-/// shuffle renames into the numbers of its own era. The name must round-trip
-/// exactly, so nothing but a name this build would itself write is acted on.
-fn sidecar_seat_bay(name: &str) -> Option<(usize, usize)> {
-    let (seat, bay) = name.strip_prefix(SIDECAR_PREFIX)?.strip_suffix(".bin")?.split_once('-')?;
-    let (seat, bay) = (seat.parse().ok()?, bay.parse().ok()?);
-    (seat < tangent_ui::recorder::TOTAL_SEATS
-        && bay < tangent_ui::recorder::INSERTS
-        && sidecar_name(seat, bay) == name)
-        .then_some((seat, bay))
-}
-
-/// Which seats a shelf actually holds a sidecar for: ONE directory read.
-fn shelf_sidecars(dir: &std::path::Path) -> std::collections::BTreeSet<(usize, usize)> {
-    sidecar_fs_call();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return std::collections::BTreeSet::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name();
-            let seat = sidecar_seat_bay(name.to_str()?)?;
-            // `is_file` and not the dirent's own type, because the walk this
-            // replaced asked `Path::is_file` and that follows a symlink.
-            sidecar_fs_call();
-            dir.join(&name).is_file().then_some(seat)
-        })
-        .collect()
-}
-
-/// Counted so the shelf walk's cost is a NUMBER rather than a thing to reason
-/// about — `sidecar_walk_probe` prints it and
-/// `a_two_seat_project_does_not_walk_the_whole_seat_space` asserts on it.
-/// Empty outside tests.
-#[cfg(test)]
-static SIDECAR_FS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[inline]
-fn sidecar_fs_call() {
-    #[cfg(test)]
-    SIDECAR_FS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// **Mirror one shelf of insert-state sidecars onto another.** Every state
-/// `from` holds lands in `to`; every state `to` holds that `from` does not is
-/// REMOVED, because a stale sidecar is the last session's reverb tail arriving
-/// in this session's fresh plugin.
-///
-/// **Two directory reads, not `INSERT_SPACE` stats.** This asked the seat
-/// space — all 13,167 seat/bay pairs of it — whether each had a file, and
-/// then asked the filesystem to delete the four thousand-odd it did not, on
-/// both shelves, twice per project open: 52,668 filesystem calls to move the
-/// two files a session actually has. Measured at 35ms a mirror on a local
-/// disk in `what_the_shelf_walk_costs_at_project_open`, and a project folder
-/// is very often the one place a person keeps in Dropbox, where every one of
-/// those calls is a round trip through a file provider.
-///
-/// **Occupancy is the wrong key, and in BOTH directions.** `Drop for Engine`
-/// skips the empty seats because an empty seat has no instance to retire, and
-/// the temptation here is to copy that. It does not hold: the seat that
-/// matters most to a mirror is the one that has just BECOME empty, whose
-/// sidecar is still sitting in the destination and must be deleted — going
-/// out to a project (a plugin removed since the last save) exactly as much as
-/// coming back in (a project whose bay is empty must clear the live sidecar
-/// the last session left). What the walk is really asking is which sidecars
-/// EXIST, and the shelf itself answers that in one read.
-fn mirror_sidecars(from: &std::path::Path, to: &std::path::Path) {
-    // BOTH read before either is written, so the second read is of the shelf
-    // as it arrived rather than of the copies just made — the same answer
-    // either way, but only one of the two is obvious a year from now.
-    let (src, dst) = (shelf_sidecars(from), shelf_sidecars(to));
-    for &(seat, bay) in &src {
-        let name = sidecar_name(seat, bay);
-        sidecar_fs_call();
-        let _ = std::fs::copy(from.join(&name), to.join(&name));
-    }
-    for &(seat, bay) in dst.difference(&src) {
-        sidecar_fs_call();
-        let _ = std::fs::remove_file(to.join(sidecar_name(seat, bay)));
-    }
+    walk(src, src, dst, skip)
 }
 
 /// **The files a shelf's samplers name, as their bays store them**: the
@@ -16657,8 +16646,8 @@ fn sampler_media_on_shelf(dir: &std::path::Path) -> Vec<String> {
         return Vec::new();
     };
     let mut named = Vec::new();
-    for (seat, bay) in shelf_sidecars(dir) {
-        let path = dir.join(sidecar_name(seat, bay));
+    for sb in crate::shelf::shelf_states(dir) {
+        let path = dir.join(tangent_ui::desk_id::state_file_name(sb));
         // **The owner first, and the whole file only for a sampler's.**
         // Another plugin's state can run to megabytes (a noise print, a
         // library's patch), and every adoption of a template walks the shelf;
@@ -17151,6 +17140,22 @@ fn ir_bindable(path: &str) -> bool {
     !ir_is_sentinel(path) && std::path::Path::new(path).is_file()
 }
 
+/// **What the host has loaded into the engine, bay by bay**, keyed by the
+/// engine's own name for the bay (`EngineBay`: its rack by identity, a lane's
+/// by the lane's slot through the bridge, and the bay), reached through that
+/// rack's `HostRack`, never by the row it is drawn on. A track
+/// keeps its lane through any reorder, so the ledger keeps its entries and
+/// the reconcile finds nothing to reload (design 7.13: a reorder is one
+/// plan). A lane that leaves takes its entries with it (see
+/// `DesktopApp::forget_lane`), so a slot a new track takes starts empty.
+#[cfg(feature = "recorder")]
+pub(crate) type InsertLedger = std::collections::BTreeMap<crate::engine_bridge::EngineBay, String>;
+
+/// **The ledger's "rebuild this bay" mark.** Never equal to a path the desk
+/// can want or to an empty bay, so a marked bay is a mismatch until the
+/// reconcile has loaded it again. See `force_insert_reload`.
+const RELOAD: &str = "\u{1f}reload";
+
 /// **Is this string one of the app's ASKS rather than a path?**
 ///
 /// A leading unit separator is the shape of every sentinel this app writes —
@@ -17403,118 +17408,13 @@ fn encode_mp3(
     tangent_record::encode::encode_mp3_via_ffmpeg(interleaved, rate, mono, path)
 }
 
-#[cfg(feature = "recorder")]
-fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
-    let (owner, blob) = sidecar_owner_and_state(strip, bay)?;
-    (owner == bundle).then_some(blob)
-}
-
-/// **A bay's sidecar and WHOSE it is**, without asking whether it is the
-/// one wanted.
-///
-/// [`saved_insert_state`]'s inner half, split out so the owner a write left
-/// in the file can be read on its own: a paste, a swap, a copy or a move
-/// re-tags the file for its new tenant, and the old tenant's copy is gone -
-/// which is what `DesktopApp::displaced_states` is for.
-#[cfg(feature = "recorder")]
-fn sidecar_owner_and_state(strip: usize, bay: usize) -> Option<(String, Vec<u8>)> {
-    let raw = std::fs::read(insert_state_path(strip, bay)).ok()?;
-    let split = raw.iter().position(|b| *b == 0)?;
-    let owner = std::str::from_utf8(&raw[..split]).ok()?.to_owned();
-    Some((owner, raw[split + 1..].to_vec()))
-}
-
-/// **One plugin's settings on the displaced-state shelf**, and when they
-/// were put there. See `DesktopApp::displaced_states`.
-struct ShelvedState {
-    /// What the plugin's `save_insert_state` answered as it left the bay.
-    blob: Vec<u8>,
-    /// Later shelvings count higher; the lowest goes first when the shelf
-    /// is full.
-    stamp: u64,
-}
-
-/// The displaced-state shelf: `(seat, bay, bundle)` to what that plugin was
-/// playing when the reconcile took it out of that bay.
-type DisplacedShelf = std::collections::HashMap<(usize, usize, String), ShelvedState>;
-
-/// The most plugin states the shelf holds, and the most bytes of them.
-const SHELF_MAX_ENTRIES: usize = 256;
-const SHELF_MAX_BYTES: usize = 64 << 20;
-
-/// **Shelve one plugin's settings, and when the shelf is full drop the
-/// OLDEST, never all of it.**
-///
-/// Every unload shelves, so the shelf fills in ordinary work, and the answer
-/// to a full shelf used to be to clear it: thirty-two entries, and the
-/// thirty-third threw away exactly the settings the next Ctrl+Z was about to
-/// ask for. Undo walks back from the newest end, so the oldest entry is the
-/// one least likely to be asked for; the newest is kept whatever its size,
-/// because it is the one the very next undo wants. An empty blob restores
-/// nothing and is not kept.
-fn shelve_displaced(shelf: &mut DisplacedShelf, key: (usize, usize, String), blob: Vec<u8>) {
-    if blob.is_empty() {
-        return;
-    }
-    let stamp = shelf.values().map(|s| s.stamp + 1).max().unwrap_or(0);
-    shelf.insert(key, ShelvedState { blob, stamp });
-    loop {
-        let bytes: usize = shelf.values().map(|s| s.blob.len()).sum();
-        if shelf.len() <= 1 || (shelf.len() <= SHELF_MAX_ENTRIES && bytes <= SHELF_MAX_BYTES) {
-            break;
-        }
-        let Some(oldest) = shelf.iter().min_by_key(|(_, s)| s.stamp).map(|(k, _)| k.clone()) else {
-            break;
-        };
-        shelf.remove(&oldest);
-    }
-}
-
-/// **The settings a bay's incoming plugin is seated with**: what the shelf
-/// kept of that bundle at that seat FIRST, its sidecar when the shelf has
-/// nothing, and nothing when neither belongs to it.
-///
-/// The shelf outranks the file because it is newer by construction: an
-/// entry is what the plugin was playing when it left the bay, every road
-/// that writes the bay's sidecar for that bundle afterwards forgets the
-/// entry, and a reorder moves the shelf with its seats as it moves the
-/// files (`permute_displaced`). The file first would be the last SAVE: a
-/// unit dialled in since, deleted and brought back by Ctrl+Z, came back at
-/// the setting it had before the dial.
-fn incoming_state(
-    shelf: &DisplacedShelf,
-    key: &(usize, usize, String),
-    sidecar: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
-    shelf.get(key).map(|s| s.blob.clone()).or_else(sidecar)
-}
-
-/// **The shelf follows its seats through a reorder**, exactly as the
-/// sidecars do: `full[new] = old`, the order lifted onto the whole seat space
-/// (`recorder::seat_order`). Left behind, an entry would sit at a seat its
-/// row has moved away from and outrank the file of the same plugin carried
-/// in there.
-fn permute_displaced(shelf: &mut DisplacedShelf, full: &[usize]) {
-    let mut to: Vec<usize> = (0..full.len()).collect();
-    for (new, &old) in full.iter().enumerate() {
-        if let Some(slot) = to.get_mut(old) {
-            *slot = new;
-        }
-    }
-    let moved: Vec<_> = shelf
-        .drain()
-        .map(|((seat, bay, bundle), s)| ((to.get(seat).copied().unwrap_or(seat), bay, bundle), s))
-        .collect();
-    shelf.extend(moved);
-}
-
 /// **What a bay sounds like RIGHT NOW** — the desk that is playing first, its
 /// sidecar on disk only when the desk cannot answer.
 ///
 /// **This is what was behind the owner's "Export Processed stems exports
 /// unprocessed".** The full-speed export builds a second engine and furnishes
-/// it by hand, and it used to fill every rack from [`saved_insert_state`]
-/// alone. That file is not the desk: it is written when a project is SAVED,
+/// it by hand, and it used to fill every rack from the bay's state file
+/// (`shelf::saved_state`) alone. That file is not the desk: it is written when a project is SAVED,
 /// when a plugin's own OS window is closed, when a session is replaced, when a
 /// reorder moves its row, when the audio engine is torn down (`retire_engine`),
 /// and at quit — and nowhere else. No knob writes it. The suite's own units have no
@@ -17547,19 +17447,24 @@ fn permute_displaced(shelf: &mut DisplacedShelf, full: &[usize]) {
 /// come up at defaults with a state error, which is the very failure this
 /// exists to stop. Mismatched, the sidecar is the better answer, and it is
 /// also the only answer available when there is no live engine at all.
+///
+/// **Two addresses for one bay.** `live` names the live engine and the bay's
+/// seat IN IT (its track's lane there, through the live bridge), and `shelf`
+/// the bay whose state file is read when the live engine cannot answer: a
+/// mirror's lanes and the live engine's need not sit at the same slots once
+/// anything has moved, and the file is named by the bay's identity.
 #[cfg(feature = "recorder")]
 fn desk_insert_state(
-    live: Option<&crate::instrument::Engine>,
-    strip: usize,
-    bay: usize,
+    live: Option<(&crate::instrument::Engine, crate::engine_bridge::EngineBay)>,
+    shelf: Option<tangent_ui::desk_id::SeatBay>,
     bundle: &str,
 ) -> Option<Vec<u8>> {
-    live.filter(|e| {
-        e.insert(strip, bay)
+    live.filter(|(e, (rack, bay))| {
+        e.insert_at(*rack, *bay)
             .is_some_and(|l| l.bundle == std::path::Path::new(bundle))
     })
-    .and_then(|e| e.save_insert_state(strip, bay))
-    .or_else(|| saved_insert_state(strip, bay, bundle))
+    .and_then(|(e, (rack, bay))| e.save_insert_state_at(rack, bay))
+    .or_else(|| shelf.and_then(|sb| crate::shelf::saved_state(sb, bundle)))
 }
 
 /// **Seat one bay of a MIRROR engine from the desk it is mirroring.**
@@ -17571,22 +17476,20 @@ fn desk_insert_state(
 /// `an_export_mirror_takes_its_racks_from_the_desk_and_not_from_the_last_save`,
 /// which drives exactly this call with a comp dialled in on one engine and the
 /// same comp, still at the ratio it came up with, sitting on the shelf.
+///
+/// `at` is the bay's seat in the MIRROR; `live` and `shelf` are where its
+/// knobs are read from, as [`desk_insert_state`] takes them.
 #[cfg(feature = "recorder")]
 pub(crate) fn furnish_mirror_bay(
     mirror: &mut crate::instrument::Engine,
-    live: Option<&crate::instrument::Engine>,
-    strip: usize,
-    bay: usize,
+    live: Option<(&crate::instrument::Engine, crate::engine_bridge::EngineBay)>,
+    at: crate::engine_bridge::EngineBay,
+    shelf: Option<tangent_ui::desk_id::SeatBay>,
     bundle: &str,
 ) -> Result<(), String> {
-    let state = desk_insert_state(live, strip, bay, bundle);
+    let state = desk_insert_state(live, shelf, bundle);
     mirror
-        .load_insert(
-            strip,
-            bay,
-            Some(std::path::Path::new(bundle)),
-            state.as_deref(),
-        )
+        .load_insert_at(at.0, at.1, Some(std::path::Path::new(bundle)), state.as_deref())
         .map(|_| ())
 }
 
@@ -17641,7 +17544,7 @@ pub(crate) fn mirror_sampler_samples(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         mirror.set_sampler_sample(
-            lane,
+            crate::desk_plan::Slot(u32::try_from(lane).unwrap_or(u32::MAX)),
             Some(crate::instrument::SamplerSample {
                 clip: Arc::new(clip),
                 name,
@@ -17653,33 +17556,25 @@ pub(crate) fn mirror_sampler_samples(
 }
 
 /// **Where the arrangement record is replacing each lane's schedule**, in
-/// frames at `rate`: from the record start on every lane it captures, MIDI
-/// and audio alike, and nowhere when nothing records. Handed to the bridge
-/// every frame (`Bridge::punch_at`), so the carve stops sounding the moment
-/// the take ends and is real.
+/// frames at `rate`, by ROW: from the record start on every lane it
+/// captures, MIDI and audio alike, and nowhere when nothing records. Handed
+/// to the bridge every frame (`Bridge::punch_at`), which puts each on its
+/// track's lane in the plan, so the carve stops sounding the moment the take
+/// ends and is real.
 #[cfg(feature = "recorder")]
-fn live_punches(rec: Option<&ArrRec>, rate: f64) -> [Option<u64>; tangent_ui::recorder::CHANNELS] {
-    let mut punches = [None; tangent_ui::recorder::CHANNELS];
+fn live_punches(rec: Option<&ArrRec>, rate: f64) -> Vec<Option<u64>> {
+    let mut punches = Vec::new();
     if let Some(rec) = rec {
         let at = frames_at(rate, rec.start_s);
-        for l in &rec.midi {
-            if l.lane < punches.len() {
-                punches[l.lane] = Some(at);
+        let rows = rec.midi.iter().map(|l| l.lane).chain(rec.audio.iter().map(|(_, l, _)| *l));
+        for row in rows {
+            if punches.len() <= row {
+                punches.resize(row + 1, None);
             }
-        }
-        for (_, l, _) in &rec.audio {
-            if *l < punches.len() {
-                punches[*l] = Some(at);
-            }
+            punches[row] = Some(at);
         }
     }
     punches
-}
-
-/// The frozen lanes as the engine's mask - see `Shared::frozen`.
-#[cfg(feature = "recorder")]
-pub(crate) fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
-    frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
 }
 
 /// **Arm a pass's stem tap from the two bools the Export dialog filled in.**
@@ -17706,15 +17601,6 @@ pub(crate) fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -
 pub(crate) fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
     e.set_stems(stems);
     e.set_stems_dry(stems && dry);
-}
-
-#[cfg(feature = "recorder")]
-fn write_insert_state(strip: usize, bay: usize, bundle: &str, state: &[u8]) {
-    let mut out = Vec::with_capacity(bundle.len() + 1 + state.len());
-    out.extend_from_slice(bundle.as_bytes());
-    out.push(0);
-    out.extend_from_slice(state);
-    let _ = std::fs::write(insert_state_path(strip, bay), out);
 }
 
 /// `/Users/x/Movies/Tangent` reads as `~/Movies/Tangent`.
@@ -19825,6 +19711,12 @@ impl DesktopApp {
         } else {
             Caps::DESKTOP
         };
+        // **Which in-place renames the old builds would have run on the global
+        // shelf**, read off the settings this launch loaded before the app
+        // takes them: the conversion below copies through exactly that set
+        // when no durable marker names one.
+        #[cfg(feature = "recorder")]
+        let shuffles = settings.shelf_shuffles();
         let mut app = TangentApp::new(&cc.egui_ctx, settings, caps);
         // **How much of the screen this desktop actually leaves a window.**
         // Asked once, here, because it cannot be asked from `tangent-ui` at
@@ -19944,7 +19836,7 @@ impl DesktopApp {
                 device_send: None,
                 pads_retry: false,
                 sampler_retry: false,
-                inserts_loaded: vec![None; tangent_ui::recorder::INSERT_SPACE],
+                inserts_loaded: InsertLedger::new(),
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,
@@ -20031,7 +19923,7 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             bridge: crate::engine_bridge::Bridge::new(),
             #[cfg(feature = "recorder")]
-            pushed_pads: [None; tangent_ui::recorder::CHANNELS],
+            pushed_pads: [None; crate::instrument::LEGACY_LANES],
             pace_frames: 0,
             pace_dt: Vec::new(),
             pace_causes: std::collections::BTreeMap::new(),
@@ -20122,13 +20014,14 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             sampler_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
-            sampler_have: vec![None; tangent_ui::recorder::CHANNELS],
+            sampler_have: vec![None; crate::instrument::LEGACY_LANES],
             #[cfg(feature = "recorder")]
             pool: DecodePool::new(),
             #[cfg(feature = "recorder")]
             stretch_seen: std::collections::HashMap::new(),
             scope_buf: Vec::new(),
             tap_buf: Vec::new(),
+            #[cfg(feature = "recorder")]
             insert_tap_at: None,
             ir: IrRoad::default(),
         };
@@ -20153,162 +20046,59 @@ impl DesktopApp {
         // assembly are not something a quit gets to throw away.
         #[cfg(feature = "recorder")]
         me.restore_staged_bank();
-        #[cfg(feature = "recorder")]
-        me.open_project_at_launch();
-        // The one-launch sidecar shuffle, BEFORE any engine exists to load a
-        // bay: the settings just crossed the v13 desk change and the
-        // insert-state files are named by indices that moved.
-        // **All FOUR shuffles under one gate.** The attribute was on the
-        // first `if` alone, and an attribute on an `if` covers that `if` —
-        // so the three below it were compiled into a Minimal build that has
-        // none of the functions they call. The braces make the scope
-        // explicit rather than leaving it to the next reader to count.
+        // **The global shelf's one conversion, BEFORE any project opens**
+        // (design 6.6): every legacy sidecar copied to its bay's identity
+        // name through the composed map of the renames the old builds ran in
+        // place, from the durable pending marker or this launch's own set.
+        // Nothing is renamed or deleted, it runs once, and the project the
+        // launch stands on then reads its states by the same names. The
+        // one-launch in-place shuffles it replaces ran AFTER the open,
+        // behind flags that lived only in memory while the settings could
+        // already have been saved. The flags are still taken, so nothing
+        // else ever reads them as owed.
         #[cfg(feature = "recorder")]
         {
-            if me.app.take_desk_state_shift() {
-                shift_insert_states_for_v13();
+            let converted = crate::shelf::convert_global_shelf(shuffles);
+            if converted.ran {
+                log::info!(
+                    "plugin states: {} legacy file(s) copied to their identity names, {} already there",
+                    converted.copied,
+                    converted.kept
+                );
             }
-            if me.app.take_desk_state_shift_v14() {
-                shift_insert_states_for_v14();
+            // **A conversion that could not finish is owed, and so is its
+            // set.** It left the pending marker naming the set; the flags
+            // stay up as well, so that if the marker could not be written
+            // either, the first format-2 settings write (which writes one
+            // when none stands) names the load's set rather than the empty
+            // set a taken flag would leave it.
+            if converted.owed {
+                log::warn!(
+                    "plugin states: {} legacy file(s) could not be copied to their identity names; \
+                     the copy runs again at the next launch",
+                    converted.failed
+                );
+            } else {
+                let _ = (
+                    me.app.take_desk_state_shift(),
+                    me.app.take_desk_state_shift_v14(),
+                    me.app.take_pad_state_shift_v18(),
+                    me.app.take_desk_state_shift_v19(),
+                    me.app.take_desk_state_shift_v20(),
+                );
             }
-            if me.app.take_pad_state_shift_v18() {
-                shift_insert_states_for_v18();
-            }
-            if me.app.take_desk_state_shift_v19() {
-                shift_insert_states_for_v19();
-            }
-            if me.app.take_desk_state_shift_v20() {
-                shift_insert_states_for_v20();
+            // **A save that died between its document and its mirror is
+            // finished now**, while the live shelf still holds the knobs the
+            // dying session wrote there: the open below stands on the
+            // template and replaces that shelf with the template's. See
+            // `owe_states_to_new_home`.
+            if let Some(home) = crate::shelf::pay_owed_mirror(&crate::shelf::global_dir()) {
+                log::info!("plugin states: mirrored into {} for a save that did not finish", home.display());
             }
         }
+        #[cfg(feature = "recorder")]
+        me.open_project_at_launch();
         me
-    }
-}
-
-/// v12 → v13: the BACKING strip retired, and every insert-state sidecar named
-/// by a desk index above it moved down one — the click's 9 → 8, the bus's
-/// 10 → 9, the master's 11 → 10 — while the track's own are deleted. Numbers
-/// FROZEN as literals, the historical-migration rule: reading today's
-/// constants would re-break this the next time the desk changes shape.
-///
-/// Ascending on purpose: 8 is deleted before 9 moves into it, and each rename
-/// vacates the slot the next one wants. Failures are ignored — the sidecars
-/// carry an owner check on read, so a file that could not move is ignored,
-/// not misapplied; the cost is one plugin's saved knobs, once.
-#[cfg(feature = "recorder")]
-fn shift_insert_states_for_v13() {
-    for bay in 0..3 {
-        let _ = std::fs::remove_file(insert_state_path(8, bay));
-        for old in 9..=11 {
-            let from = insert_state_path(old, bay);
-            if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(old - 1, bay));
-            }
-        }
-    }
-}
-
-/// v17 -> v18: the pads grew to the whole keyboard; the old sixteen were
-/// keys 36..51, so their seats moved from 12..27 to 48..63. Highest first,
-/// same rule as every shuffle before it; numbers frozen as literals.
-#[cfg(feature = "recorder")]
-fn shift_insert_states_for_v18() {
-    for bay in 0..3 {
-        for pad in (0..16usize).rev() {
-            let from = insert_state_path(12 + pad, bay);
-            if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(12 + 36 + pad, bay));
-            }
-        }
-    }
-}
-
-/// 16 -> 32 channels: every seat at or above the old channel block —
-/// drums, click, fx, master, master-extra and all the pad blocks — steps
-/// up by exactly the growth. Uniform because the seat map appends its
-/// classes in order (channels, buses, pads), so one +grow over the old
-/// range is provably right for every old seat >= 16. Highest first, or
-/// the move eats itself. The old map's last seat was 2068 (frozen: the
-/// sixteen-channel era's own arithmetic).
-///
-/// **The growth is the literal 16**, the V32 shape the settings lift lands
-/// on (`desk_lift`), and never `CHANNELS - 16`: the desk's width is about to
-/// stop being a constant at all, and a rename that read it would move every
-/// sixteen-era sidecar somewhere the lifted desk never looks. The same
-/// shuffle is `ShelfShuffles::V20` in `desk_lift::legacy_shelf_seat`.
-#[cfg(feature = "recorder")]
-fn shift_insert_states_for_v20() {
-    let grow = 16;
-    for bay in 0..3 {
-        for old in (16..2069).rev() {
-            let from = insert_state_path(old, bay);
-            if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(old + grow, bay));
-            }
-        }
-    }
-}
-
-/// The v20 shuffle reads no live capacity constant: its body is the frozen
-/// sixteen-era arithmetic and nothing else.
-#[cfg(all(test, feature = "recorder"))]
-mod v20_shuffle_is_frozen {
-    #[test]
-    fn the_v20_shelf_shuffle_reads_no_live_constant() {
-        let src = include_str!("desktop.rs");
-        let at = src.find("fn shift_insert_states_for_v20()").expect("the shuffle");
-        let body = &src[at..at + src[at..].find("\n}\n").expect("its end")];
-        let code: String = body
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let idents: Vec<&str> = code
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|w| !w.is_empty())
-            .collect();
-        for banned in [
-            "CHANNELS", "STRIPS", "TOTAL_SEATS", "INSERT_SPACE", "INSERTS", "MASTER_LANE",
-            "MASTER_AUTO_LANE", "INPUTS", "recorder",
-        ] {
-            assert!(
-                !idents.contains(&banned),
-                "shift_insert_states_for_v20 reads the live `{banned}`; freeze it"
-            );
-        }
-        assert!(code.contains("let grow = 16;"), "the growth is not the frozen sixteen");
-    }
-}
-
-/// v18 -> v19: the channel count grew 8 -> 16, so every seat at or above the
-/// old channel block stepped up by 8 — the drum bus 8 -> 16, the click 9 ->
-/// 17, the fx return 10 -> 18, the master 11 -> 19, and the 128 pad seats
-/// 12.. -> 20... Highest first, or the move eats itself; numbers frozen as
-/// literals per the historical-migration rule. The upper bound covers the
-/// old master (11) and all 128 pads (12..139).
-#[cfg(feature = "recorder")]
-fn shift_insert_states_for_v19() {
-    for bay in 0..3 {
-        for old in (8..(12 + 128)).rev() {
-            let from = insert_state_path(old, bay);
-            if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(old + 8, bay));
-            }
-        }
-    }
-}
-
-/// v13 -> v14: the drum bus took seat 8, so the click's, the bus's and the
-/// master's sidecars walk UP one — highest first, or the move eats itself.
-#[cfg(feature = "recorder")]
-fn shift_insert_states_for_v14() {
-    for bay in 0..3 {
-        for old in (8..=10).rev() {
-            let from = insert_state_path(old, bay);
-            if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(old + 1, bay));
-            }
-        }
     }
 }
 
@@ -21571,37 +21361,42 @@ impl DesktopApp {
         if !self.racks_restoring || self.recorder.engine.is_none() {
             return false;
         }
-        let inserts = tangent_ui::recorder::INSERTS;
         let routes = self.app.routes();
         let desk = self.app.desk();
         let automation = self.app.automation();
         armed_rack_pending(
-            self.app.armed_mask(),
-            |ch| self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio),
-            &self.app.folder_parents(),
-            |ch| {
-                routes.from(ch).into_iter().fold(0u32, |m, (_, r)| match r.target {
-                    tangent_ui::routing::Target::Channel(n) if n < 32 => m | 1 << n,
-                    _ => m,
-                })
+            self.app.track_ids(),
+            |row| crate::engine_bridge::row_armed(&self.app, row),
+            |row| self.app.channel_kind(row) == Some(tangent_ui::recorder::ChannelKind::Audio),
+            |row| self.app.folder_of(row),
+            |row| {
+                routes
+                    .from(row)
+                    .into_iter()
+                    .filter_map(|(_, r)| match r.target {
+                        tangent_ui::routing::Target::Channel(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect()
             },
             // The send knob, or a curve on it, which can open a send the knob
             // leaves shut.
-            |ch| {
-                desk.send.get(ch).is_some_and(|s| *s > 0.0)
-                    || automation.get(ch, tangent_ui::automation::AutoParam::Send).is_some()
+            |row| {
+                desk.send.get(row).is_some_and(|s| *s > 0.0)
+                    || automation.get(row, tangent_ui::automation::AutoParam::Send).is_some()
             },
-            |seat, bay| {
-                self.recorder.inserts_loaded.get(seat * inserts + bay).is_some_and(|got| {
-                    chain_bay_pending(
-                        self.app.insert(seat, bay),
-                        got.as_deref(),
-                        self.recorder
-                            .engine
-                            .as_ref()
-                            .is_some_and(|e| e.insert(seat, bay).is_some()),
-                    )
-                })
+            // The app keeps the bay at the seat of the row its track stands
+            // on; the ledger and the engine know it by its lane, through the
+            // bridge. A bay with no lane yet is nothing the engine holds and
+            // nothing it has been told.
+            |sb| {
+                let at = self.bridge.engine_bay(sb);
+                chain_bay_pending(
+                    crate::engine_bridge::bay_path(&self.app, sb),
+                    at.and_then(|at| self.recorder.inserts_loaded.get(&at)).map(String::as_str),
+                    at.zip(self.recorder.engine.as_ref())
+                        .is_some_and(|(at, e)| e.insert_at(at.0, at.1).is_some()),
+                )
             },
         )
     }
@@ -22415,84 +22210,79 @@ fn chain_bay_pending(wanted: Option<&str>, ledger: Option<&str>, engine_holds: b
 /// behind [`DesktopApp::armed_racks_pending`], as a function of its inputs so
 /// that it can be driven by a test. `DesktopApp` cannot be built in one.
 ///
-/// `armed` is the arm mask and `is_input` says which channels take a live
-/// AUDIO input; only those can be heard dry. An input is heard through every
-/// seat its audio MEETS on the way out, and the walk names exactly those:
+/// `armed` says which rows are armed and `is_input` which take a live AUDIO
+/// input; only those can be heard dry. An input is heard through every bay
+/// its audio MEETS on the way out, and the walk names exactly those:
 ///
-/// - **every seat of its own channel and of each folder above it** (and the
+/// - **every rack of its own track and of each folder above it** (and the
 ///   one above that): the room runs the strip's racks and pedalboard over
 ///   the input, and a folder runs both racks and its board over the group's
 ///   sum. A denoiser on a microphone's folder is as much the microphone's as
 ///   one on its own strip, and the gate that looked only at the strip let
 ///   the room open onto a mic whose folder's denoiser had not loaded yet;
-/// - **only the first rack of a channel it is routed to**, from any of
-///   those and onward along the routes: the sends pass runs `racks[dest]`
-///   over the arrivals and nothing else of the destination, and runs after
-///   the folds, so a destination's second rack, pedals and folders never
-///   meet them;
+/// - **only the first rack of a track it is routed to**, from any of those
+///   and onward along the routes: the sends pass runs `racks[dest]` over the
+///   arrivals and nothing else of the destination, and runs after the
+///   folds, so a destination's second rack, pedals and folders never meet
+///   them;
 /// - **the effects bus's rack** when its own strip or a folder above it
 ///   sends there (`sends`): the room hears the send through it.
 ///
-/// `parents` is the engine's folder table (`folder_parents`, -1 for none);
-/// `routed_to` answers the channels one channel is routed to, as a mask.
-/// `mismatched` answers "is this seat's bay still waiting on what the desk
-/// asks for" - in the host, [`chain_bay_pending`]: a bay that has not arrived
-/// (the predicate `insert_walk` counts) and that the engine holds nothing in.
+/// `ids` are the desk's rows; `parent` answers the folder above a row;
+/// `routed_to` the rows a row is routed to. Rows and the bays they name are
+/// walked as sets and named by identity, so no desk width bounds the walk
+/// and no seat is worked out here. `mismatched` answers "is this bay still
+/// waiting on what the desk asks for" - in the host, [`chain_bay_pending`]: a
+/// bay that has not arrived (the predicate `insert_walk` counts) and that
+/// the engine holds nothing in.
 #[cfg(feature = "recorder")]
 fn armed_rack_pending(
-    armed: u32,
+    ids: &[tangent_ui::desk_id::TrackId],
+    armed: impl Fn(usize) -> bool,
     is_input: impl Fn(usize) -> bool,
-    parents: &[i32; tangent_ui::recorder::CHANNELS],
-    routed_to: impl Fn(usize) -> u32,
+    parent: impl Fn(usize) -> Option<usize>,
+    routed_to: impl Fn(usize) -> Vec<usize>,
     sends: impl Fn(usize) -> bool,
-    mismatched: impl Fn(usize, usize) -> bool,
+    mismatched: impl Fn(tangent_ui::desk_id::SeatBay) -> bool,
 ) -> bool {
-    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip, AMP_PEDALS, INSERTS};
-    // The input's own channels, as a mask: a worklist over 32 channels, each
-    // visited once, so a folder two inputs share costs nothing twice.
-    let mut own = 0u32;
-    let mut todo = (0..32usize)
-        .filter(|&ch| armed & 1 << ch != 0 && is_input(ch))
-        .fold(0u32, |m, ch| m | 1 << ch);
-    while todo != 0 {
-        let ch = todo.trailing_zeros() as usize;
-        todo &= todo - 1;
-        if own & 1 << ch != 0 {
+    use std::collections::BTreeSet;
+    use tangent_ui::desk_id::{Node, Rack, SeatBay, AMP_PEDALS, BAYS, STRIP_RACKS};
+    let rows = ids.len();
+    // The input's own tracks and every folder above them: a worklist, each
+    // row visited once, so a folder two inputs share costs nothing twice.
+    let mut own: BTreeSet<usize> = BTreeSet::new();
+    let mut todo: Vec<usize> = (0..rows).filter(|&r| armed(r) && is_input(r)).collect();
+    while let Some(r) = todo.pop() {
+        if !own.insert(r) {
             continue;
         }
-        own |= 1 << ch;
-        if let Some(p) = parents.get(ch).and_then(|p| usize::try_from(*p).ok()).filter(|p| *p < 32) {
-            todo |= 1 << p;
-        }
-        todo &= !own;
+        todo.extend(parent(r).filter(|p| *p < rows));
     }
-    // And the channels the routes carry it to, onward, but never up into a
+    // And the rows the routes carry it to, onward, but never up into a
     // destination's folders. A route loop is walked once and ends.
-    let mut routed = 0u32;
-    let mut todo = (0..32usize)
-        .filter(|ch| own & 1 << ch != 0)
-        .fold(0u32, |m, ch| m | routed_to(ch));
-    while todo != 0 {
-        let ch = todo.trailing_zeros() as usize;
-        todo &= todo - 1;
-        if routed & 1 << ch != 0 {
+    let mut routed: BTreeSet<usize> = BTreeSet::new();
+    let mut todo: Vec<usize> = own.iter().flat_map(|&r| routed_to(r)).collect();
+    while let Some(r) = todo.pop() {
+        if r >= rows || !routed.insert(r) {
             continue;
         }
-        routed |= 1 << ch;
-        todo |= routed_to(ch);
-        todo &= !routed;
+        todo.extend(routed_to(r));
     }
-    let via_bus = (0..32usize).any(|ch| own & 1 << ch != 0 && sends(ch));
-    (0..32usize)
-        .filter(|ch| own & 1 << ch != 0)
-        .flat_map(|ch| {
-            [ch, folder_extra_seat(ch)]
-                .into_iter()
-                .chain((0..AMP_PEDALS).map(move |pedal| amp_pedal_seat(ch, pedal)))
-        })
-        .chain((0..32usize).filter(|ch| routed & !own & 1 << ch != 0))
-        .chain(via_bus.then(|| Strip::Fx.index()))
-        .any(|seat| (0..INSERTS).any(|bay| mismatched(seat, bay)))
+    let via_bus = own.iter().any(|&r| sends(r));
+    let rack_bays = |node: Node, rack: Rack| (0..BAYS).map(move |b| SeatBay::new(node, rack, b as u8));
+    let whole = own.iter().filter_map(|&r| ids.get(r)).flat_map(|&id| {
+        let node = Node::Track(id);
+        (0..STRIP_RACKS)
+            .map(|c| Rack::Chain(c as u16))
+            .chain((0..AMP_PEDALS).map(|p| Rack::Pedal(p as u8)))
+            .flat_map(move |rack| rack_bays(node, rack))
+    });
+    let first = routed
+        .difference(&own)
+        .filter_map(|&r| ids.get(r))
+        .flat_map(|&id| rack_bays(Node::Track(id), Rack::Chain(0)));
+    let bus = via_bus.then(|| rack_bays(Node::Fx, Rack::Chain(0))).into_iter().flatten();
+    whole.chain(first).chain(bus).any(|sb| mismatched(sb))
 }
 
 /// One frame of the insert loader's walk: which bay to load next, and how
@@ -22623,8 +22413,11 @@ impl DesktopApp {
             Chore::OpenProject(path) => self.switch_project(&path),
             Chore::AudioPath => self.open_audio_path_now(ctx),
             Chore::InsertEditor(strip, slot) => {
-                if let Some(e) = self.recorder.engine.as_mut() {
-                    if let Err(err) = e.open_insert_editor(strip, slot) {
+                // Translated when it runs, not when it was asked: a frame
+                // went by, and the track's lane is what holds the plugin.
+                let at = self.engine_at(strip, slot);
+                if let (Some(e), Some(at)) = (self.recorder.engine.as_mut(), at) {
+                    if let Err(err) = e.open_insert_editor_at(at.0, at.1) {
                         self.recorder.engine_error =
                             Some(format!("could not open the effect's window: {err}"));
                     }
@@ -22635,8 +22428,12 @@ impl DesktopApp {
             Chore::FinishFreeze => self.finish_freeze(),
             Chore::RescanPlugins => self.rescan_plugins(),
             Chore::SaveCopy(path) => {
-                self.app
-                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectCopy, &path);
+                let purpose = tangent_ui::ports::SavePurpose::ProjectCopy;
+                // The knobs onto the live shelf, and the mirror owed to the
+                // copy's home written down, BEFORE its document lands there:
+                // see `owe_states_to_new_home`.
+                self.owe_states_to_new_home(purpose, &path);
+                self.app.finish_save_choice(purpose, &path);
                 // **And the plugins' knobs go with the copy.** The app copies
                 // the document and `media/`; the state shelf is the host's,
                 // and a copy without one opened with every plugin at its
@@ -22644,25 +22441,26 @@ impl DesktopApp {
                 // shelf, deliberately, so a missing shelf is a cleared desk.
                 // Shelved the way a Save shelves them, into the project that
                 // is now open, which is the copy.
-                self.save_plugin_states();
                 self.copy_states_to_project();
+                crate::shelf::mirror_paid(&crate::shelf::global_dir());
             }
             Chore::SaveFirst(path) => {
-                self.app
-                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectFirst, &path);
-                // The same three things a Save does, in the same order, now
-                // that the session has a folder to shelve into. `named` is
-                // the app's word that the move happened — a refused save
-                // (the template shelf) leaves it false and says nothing here,
-                // having said why already.
+                let purpose = tangent_ui::ports::SavePurpose::ProjectFirst;
+                self.owe_states_to_new_home(purpose, &path);
+                self.app.finish_save_choice(purpose, &path);
+                // The same three things a Save does, now that the session has
+                // a folder to shelve into (the knobs went onto the live shelf
+                // above). `named` is the app's word that the move happened —
+                // a refused save (the template shelf) leaves it false and
+                // says nothing here, having said why already.
                 if self.app.arrangement().named {
-                    self.save_plugin_states();
                     self.copy_states_to_project();
                     self.app.notify(
                         Kind::Success,
                         format!("Project saved - {}", self.app.project_name()),
                     );
                 }
+                crate::shelf::mirror_paid(&crate::shelf::global_dir());
             }
             // The pass's one receipt is the finish's own, stems and all.
             Chore::FinishBounce {
@@ -22999,7 +22797,7 @@ mod tests {
     /// eligibility probe reads, plus the racks and clips without which the
     /// lanes cost nothing and the nanosecond weighting would mean nothing.
     ///
-    /// **Through the export's own builder** (`engine_bridge::furnish_offline`,
+    /// **Through the export's own builder** (`engine_bridge::full_build`,
     /// `BuildFor::Probe`), with the one difference the probe exists for: it
     /// pushes the arm and MIDI state the session actually has, through the
     /// same `live_midi_off` rule the live walk uses, where an export pushes
@@ -23012,34 +22810,34 @@ mod tests {
         // **The project's own plugin state, and its bypass table.**
         //
         // Neither arrives with the document. `TangentApp::open_project` reads
-        // `project.tan`; the knobs live in `<project>/state/` as sidecars and
-        // the real app copies them onto the live shelf at open
+        // `project.tan`; the knobs live in `<project>/state/` (by identity,
+        // or by its era's legacy names while the document carries the
+        // marker) and the real app copies them onto the live shelf at open
         // (`copy_states_from_shelf`), which is a step of the DESKTOP wrapper
         // and not of the app this harness drives. Without it every bay here
         // ran at its shipped defaults — an EQ still flat, a compressor still
         // at 1 : 1 — which is exactly the "processed stem is the dry stem"
-        // fault `saved_insert_state` documents, and it made a click hunt over
+        // fault `desk_insert_state` documents, and it made a click hunt over
         // a real session a hunt over a session nobody has.
         //
         // The shelf is the one the caller redirected `IVORY_SETTINGS_PATH`
         // at, so this copies INTO scratch and never writes the project.
         if let Some(doc) = app.project_doc() {
             if let Some(dir) = doc.parent().map(|d| d.join("state")) {
-                mirror_sidecars(&dir, &global_state_dir());
+                let names = crate::shelf::ShelfNames::for_marker(app.doc_legacy_states());
+                crate::shelf::mirror_shelf(&dir, &names, &crate::shelf::global_dir());
             }
         }
-        // `5:1` for "take the compressor on track six out of circuit", so
-        // two renders of one session can be differenced to see what one
-        // plugin is doing.
-        let seat_bay_list = |key: &str| -> Vec<(usize, usize)> {
+        // `t5-c0-b1` for "take the compressor in track t5's second bay out
+        // of circuit", so two renders of one session can be differenced to
+        // see what one plugin is doing. **By identity** (design Appendix C),
+        // the grammar every sidecar and log speaks: a bay named by its seat
+        // number named another track's bay the moment anything moved.
+        let seat_bay_list = |key: &str| -> Vec<tangent_ui::desk_id::SeatBay> {
             std::env::var(key)
                 .unwrap_or_default()
                 .split(',')
-                .filter(|s| !s.is_empty())
-                .filter_map(|item| {
-                    let (s, b) = item.split_once(':')?;
-                    Some((s.trim().parse().ok()?, b.trim().parse().ok()?))
-                })
+                .filter_map(|item| item.trim().parse().ok())
                 .collect()
         };
         let probe = crate::engine_bridge::ProbeKnobs {
@@ -23076,7 +22874,7 @@ mod tests {
             fanout: std::env::var_os("TANGENT_PROBE_FANOUT").is_some(),
         };
         let mut furnish = crate::engine_bridge::Furnish { probe, ..Default::default() };
-        let e = crate::engine_bridge::furnish_offline_with(
+        let built = crate::engine_bridge::full_build_with(
             app,
             rate,
             tangent_record::audio::Timebase::new(),
@@ -23084,37 +22882,34 @@ mod tests {
             &mut furnish,
         )
         .ok()?;
-        // `TANGENT_READ=5:1` prints what that bay is set to, as the plugin
-        // itself spells each dial, plus whether its saved state survives a
-        // round trip through this host.
-        let inserts = tangent_ui::recorder::INSERTS;
-        for (seat, bay) in seat_bay_list("TANGENT_READ") {
-            let Some(path) = app.insert(seat, bay) else {
+        let (e, mirror) = (built.engine, built.bridge);
+        let desk = crate::engine_bridge::desk_bays(app);
+        // `TANGENT_READ=t5-c0-b1` prints what that bay is set to, as the
+        // plugin itself spells each dial, plus whether its saved state
+        // survives a round trip through this host.
+        for sb in seat_bay_list("TANGENT_READ") {
+            let (Some(path), Some((rack, bay))) = (desk.get(&sb), mirror.engine_bay(sb)) else {
                 continue;
             };
-            let saved = saved_insert_state(seat, bay, path).unwrap_or_default();
-            let again = e.save_insert_state(seat, bay).unwrap_or_default();
+            let saved = crate::shelf::saved_state(sb, path).unwrap_or_default();
+            let again = e.save_insert_state_at(rack, bay).unwrap_or_default();
             println!(
-                "  seat {seat} bay {bay} {path}\n    saved {} B, re-saved {} B, identical {}",
+                "  {sb} {path}\n    saved {} B, re-saved {} B, identical {}",
                 saved.len(),
                 again.len(),
                 saved == again,
             );
-            for (title, v, shown, units) in e.insert_readings(seat, bay) {
+            for (title, v, shown, units) in e.insert_readings_at(rack, bay) {
                 println!("      {title:<24} {v:.6}  {shown} {units}");
             }
         }
         if std::env::var_os("TANGENT_SEATS").is_some() {
-            for i in 0..(crate::instrument::RACK_SEATS * inserts) {
-                let (seat, bay) = (i / inserts, i % inserts);
-                let Some(path) = app.insert(seat, bay) else {
+            for (sb, path) in &desk {
+                let Some((rack, bay)) = mirror.engine_bay(*sb) else {
                     continue;
                 };
-                println!(
-                    "    seat {seat} bay {bay}: state {} B  bypassed {}  {path}",
-                    saved_insert_state(seat, bay, path).map_or(0, |v| v.len()),
-                    e.insert_bypassed(seat, bay),
-                );
+                let saved = crate::shelf::saved_state(*sb, path).map_or(0, |v| v.len());
+                println!("    {sb}: state {saved} B  bypassed {}  {path}", e.insert_bypassed_at(rack, bay));
             }
         }
         Some(e)
@@ -24018,7 +23813,7 @@ mod tests {
     ///
     /// A source scan, because what has to be checked is that nobody spells a
     /// band HERE rather than what any particular painter does with one; the
-    /// precedent is `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// precedent is `the_global_shelf_converts_once_before_the_launch_opens_a_project`
     /// below. `busy::COVER_ORDER` carries the argument and
     /// `shell::a_cover_is_painted_above_every_surface_this_app_can_open`
     /// checks the answer against the tier ladder.
@@ -24548,7 +24343,7 @@ mod tests {
     /// stayed there until something else replaced it — eight minutes and
     /// several takes, once. A source scan because `DesktopApp` cannot be
     /// built in a test (the precedent is
-    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// `the_global_shelf_converts_once_before_the_launch_opens_a_project`
     /// below); what it stops is somebody reintroducing the slot rather than
     /// adding a notification.
     /// **A file the decoder refuses must not be asked for again**, or the
@@ -25011,8 +24806,8 @@ mod tests {
     /// through `late_change`, and the road that changes nothing does not.**
     ///
     /// A source scan because `DesktopApp` cannot be built in a test (the
-    /// precedent is `every_one_launch_shuffle_is_reached_only_through_its_
-    /// own_taken_flag`), and every one of these is a road whose fault is
+    /// precedent is `the_global_shelf_converts_once_before_the_launch_opens_
+    /// a_project`), and every one of these is a road whose fault is
     /// invisible: the work happens, the state is right, and the window
     /// simply never paints it. What it pins is that each caller passes an
     /// ANSWER wherever it has one — only the two roads that cannot fail to
@@ -26084,7 +25879,7 @@ mod tests {
             source: file,
             root_key: crate::instrument::SAMPLER_ROOT_KEY,
         };
-        assert!(e.set_sampler_sample(LANE, Some(sample)), "the engine refused the sample");
+        assert!(e.set_sampler_sample(crate::desk_plan::Slot(LANE as u32), Some(sample)), "the engine refused the sample");
         e.set_channel_gain(LANE, 0.5);
         e.set_master_gain(1.0);
         e.set_midi_clips(vec![PlacedMidi {
@@ -26193,8 +25988,16 @@ mod tests {
         // An export's mirror, seated as `start_offline_render` seats it, reads
         // the same file and plays it.
         let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
-        furnish_mirror_bay(&mut mirror, Some(&desk), LANE, BAY, crate::builtin_fx::SAMPLER_PATH)
-            .expect("the mirror seats the sampler");
+        let at = crate::engine_bridge::lane_bay(crate::desk_plan::Slot(LANE as u32), tangent_ui::desk_id::Rack::Chain(0), BAY as u8)
+            .expect("the lane's first rack");
+        furnish_mirror_bay(
+            &mut mirror,
+            Some((&desk, at)),
+            at,
+            crate::engine_bridge::seat_bay_at(&tangent_ui::desk_legacy::identity_ids(32), LANE, BAY),
+            crate::builtin_fx::SAMPLER_PATH,
+        )
+        .expect("the mirror seats the sampler");
         mirror_sampler_samples(&mut mirror, RATE, Some(&doc));
         mirror.set_channel_gain(LANE, 0.5);
         mirror.set_master_gain(1.0);
@@ -26249,11 +26052,6 @@ mod tests {
     /// hand-over is a source scan, since a `DesktopApp` cannot be built.
     #[test]
     fn the_files_a_shelfs_samplers_name_are_read_off_the_shelf() {
-        // The walk counts its calls (`sidecar_fs_call`), and the probe that
-        // measures them must not count this test's.
-        let _lock = sidecar_walk_probe::SIDECAR_ENV
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let shelf = std::env::temp_dir().join(format!(
             "tangent-sampler-shelf-{}-{:?}",
             std::process::id(),
@@ -26261,18 +26059,16 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&shelf);
         std::fs::create_dir_all(&shelf).expect("a scratch shelf");
-        // A sidecar as `write_insert_state` writes one: the owner, a NUL, the
-        // unit's state text.
-        let write = |seat: usize, bay: usize, unit: &str, extra: &[(&str, &str)]| {
+        // A state file as `shelf::write_state` writes one: the owner, a NUL,
+        // the unit's state text, named by the bay of track `row`'s chain.
+        let write = |row: u32, bay: u8, unit: &str, extra: &[(&str, &str)]| {
+            use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
             let spec = crate::builtin_fx::spec_for(unit).expect("a built-in unit");
             let extra: Vec<(String, String)> =
                 extra.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
-            let mut blob = unit.as_bytes().to_vec();
-            blob.push(0);
-            blob.extend_from_slice(
-                crate::builtin_fx::state_text(spec, &spec.defaults(), &extra).as_bytes(),
-            );
-            std::fs::write(shelf.join(sidecar_name(seat, bay)), blob).expect("a sidecar");
+            let sb = SeatBay::new(Node::Track(TrackId(row)), Rack::Chain(0), bay);
+            let text = crate::builtin_fx::state_text(spec, &spec.defaults(), &extra);
+            assert!(crate::shelf::write_state_in(&shelf, sb, unit, text.as_bytes()), "a state file");
         };
         let sampler = crate::builtin_fx::SAMPLER_PATH;
         write(2, 0, sampler, &[("sample_path", "media/Pad.wav"), ("sample_name", "Pad.wav"), ("root_key", "60")]);
@@ -26294,9 +26090,14 @@ mod tests {
         let src = &whole[..whole.find("\nmod tests {").expect("this module")];
         let at = src.find("fn copy_states_from_shelf(").expect("copy_states_from_shelf");
         let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        // Read off the LIVE shelf the mirror has just made the folder's copy
+        // of: a marked folder's sampler may still wear its era's legacy name,
+        // which only the mirror (`ShelfNames::PstateThenLegacy`) reads.
+        let mirrored = body.find("crate::shelf::mirror_shelf(dir,");
+        let told = body.find("self.app.set_sampler_media(sampler_media_on_shelf(&global));");
         assert!(
-            body.contains("self.app.set_sampler_media(sampler_media_on_shelf(dir));"),
-            "adopting a shelf no longer tells the app what its samplers name"
+            mirrored.is_some_and(|m| told.is_some_and(|t| m < t)),
+            "adopting a shelf no longer tells the app what its samplers name, off the shelf it made"
         );
     }
 
@@ -26345,10 +26146,12 @@ mod tests {
         std::fs::create_dir_all(&shelf).expect("a shelf");
         let spec = crate::builtin_fx::spec_for(crate::builtin_fx::SAMPLER_PATH).expect("the sampler");
         let extra = vec![("sample_path".to_owned(), stored.to_string_lossy().into_owned())];
-        let mut blob = crate::builtin_fx::SAMPLER_PATH.as_bytes().to_vec();
-        blob.push(0);
-        blob.extend_from_slice(crate::builtin_fx::state_text(spec, &spec.defaults(), &extra).as_bytes());
-        std::fs::write(shelf.join(sidecar_name(0, 0)), blob).expect("the sampler's sidecar");
+        let text = crate::builtin_fx::state_text(spec, &spec.defaults(), &extra);
+        let sb = crate::engine_bridge::seat_bay_at(app.track_ids(), 0, 0).expect("strip 0's first bay");
+        assert!(
+            crate::shelf::write_state_in(&shelf, sb, crate::builtin_fx::SAMPLER_PATH, text.as_bytes()),
+            "the sampler's state file"
+        );
 
         // Save As Template, built as the Template arm builds it.
         let stage = root.join("Templates").join(".Rig.writing");
@@ -26426,7 +26229,7 @@ mod tests {
         assert!(live.set_builtin_extra(LANE, BAY, extra), "the engine refused the bind");
         let decoded = tangent_record::decode::decode(&file, RATE).expect("the sample decodes");
         assert!(live.set_sampler_sample(
-            LANE,
+            crate::desk_plan::Slot(LANE as u32),
             Some(SamplerSample {
                 clip: Arc::new(decoded),
                 name: "tone.wav".to_owned(),
@@ -26437,8 +26240,16 @@ mod tests {
 
         // The export's mirror, seated as `start_offline_render` seats it.
         let mut mirror = Engine::offline(RATE, Timebase::new()).expect("offline");
-        furnish_mirror_bay(&mut mirror, Some(&live), LANE, BAY, crate::builtin_fx::SAMPLER_PATH)
-            .expect("the mirror seats the sampler");
+        let at = crate::engine_bridge::lane_bay(crate::desk_plan::Slot(LANE as u32), tangent_ui::desk_id::Rack::Chain(0), BAY as u8)
+            .expect("the lane's first rack");
+        furnish_mirror_bay(
+            &mut mirror,
+            Some((&live, at)),
+            at,
+            crate::engine_bridge::seat_bay_at(&tangent_ui::desk_legacy::identity_ids(32), LANE, BAY),
+            crate::builtin_fx::SAMPLER_PATH,
+        )
+        .expect("the mirror seats the sampler");
         mirror_sampler_samples(&mut mirror, RATE, None);
 
         // One note on the lane in each, and listen.
@@ -26587,8 +26398,9 @@ mod tests {
         // lane's built-ins quiet as the desk does, and the desk spells the
         // frozen clip the same way. A source scan, because `DesktopApp`
         // cannot be built in a test; the export's furnishing is the
-        // bridge's (`furnish_offline_with`), which `start_offline_render`
-        // builds through.
+        // bridge's (`full_build_with`), which `start_offline_render`
+        // builds through, and a frozen lane's built-ins are stood down in
+        // the plan both engines are driven by.
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("\nmod tests {").expect("this module")];
         let body_of = |f: &str| {
@@ -26596,21 +26408,23 @@ mod tests {
             &src[at..at + src[at..].find("\n    fn ").expect("its end")]
         };
         assert!(
-            body_of("fn start_offline_render(").contains("crate::engine_bridge::furnish_offline_with("),
+            body_of("fn start_offline_render(").contains("crate::engine_bridge::full_build_with("),
             "the export no longer builds through the bridge's furnishing"
         );
         let bridge = include_str!("engine_bridge.rs");
         let bridge = &bridge[..bridge.find("#[cfg(test)]\nmod tests {").expect("the bridge's tests")];
-        let at = bridge.find("pub fn furnish_offline_with(").expect("furnish_offline_with");
+        let at = bridge.find("pub fn full_build_with(").expect("full_build_with");
         let render = &bridge[at..at + bridge[at..].find("\n}\n").expect("its end")];
         assert!(
             render.contains("export_clip_placement(app.arrangement(), app.frozen_lanes(), rate, |rel| {"),
             "the export does not place its clips through `export_clip_placement`, frozen lanes and all"
         );
-        for strips in ["e.set_builtin_strips(builtin_lanes", "e.set_keys_strips(keys_lanes"] {
-            let at = render.find(strips).unwrap_or_else(|| panic!("`{strips}` is gone"));
-            let line = &render[at..at + render[at..].find('\n').expect("its end")];
-            assert!(line.ends_with("& thawed);"), "a frozen lane's {strips} runs in the export: {line}");
+        let at = bridge.find("fn plan_inputs(").expect("plan_inputs");
+        let plan = &bridge[at..at + bridge[at..].find("\n    }\n").expect("its end")];
+        for strips in [".with(F::BUILTIN, ", ".with(F::KEYS, "] {
+            let at = plan.find(strips).unwrap_or_else(|| panic!("`{strips}` is gone"));
+            let line = &plan[at..at + plan[at..].find('\n').expect("its end")];
+            assert!(line.ends_with("&& !is_frozen)"), "a frozen lane's {strips} runs in the export: {line}");
         }
         assert!(
             body_of("fn reload_clips(").contains("let whole = frozen_lane_clip(&z);"),
@@ -26629,7 +26443,7 @@ mod tests {
         // freeze builds through (`start_offline_render`'s own scan says so).
         let bridge = include_str!("engine_bridge.rs");
         let bridge = &bridge[..bridge.find("#[cfg(test)]\nmod tests {").expect("the bridge's tests")];
-        let at = bridge.find("pub fn furnish_offline_with(").expect("furnish_offline_with");
+        let at = bridge.find("pub fn full_build_with(").expect("full_build_with");
         let start = &bridge[at..at + bridge[at..].find("\n}\n").expect("its end")];
         let seated = start.find("furnish_mirror_bay(&mut e,").expect("the rack seats");
         let handed = start
@@ -26657,7 +26471,7 @@ mod tests {
             .expect("sampler_bays is still called that");
         let walk = &walk[..walk.find("fn sampler_files").expect("sampler_files follows")];
         assert!(
-            walk.contains("e.builtin_extra(lane, bay)") && walk.contains("read(\"sample_path\")"),
+            walk.contains("e.builtin_extra_at(rack, b)") && walk.contains("read(\"sample_path\")"),
             "the walk no longer reads the file out of the bay's own state"
         );
         assert!(
@@ -27181,8 +26995,8 @@ mod tests {
             AutoParam::Plugin { bay: 0, id: 22 },
             vec![pt(0.0, 0.3)],
         ));
-        let master = tangent_ui::recorder::MASTER_SEAT;
-        let extra = tangent_ui::recorder::MASTER_EXTRA_SEAT;
+        let master = tangent_ui::desk_lift::V32_MASTER;
+        let extra = tangent_ui::desk_lift::V32_EXTRA_PADS - 1;
         assert!(live_face(spec, &saved, &m, 1.0, master, 0, 48_000.0).is_some());
         assert!(live_face(spec, &saved, &m, 1.0, extra, 0, 48_000.0).is_none());
     }
@@ -27325,7 +27139,7 @@ mod tests {
             "self.track_cache.get(&path)",
             "stretched_clip_audio(clip, decoded, &path, &mut renders)",
             "audio_clip_passes(clip, &audio, f64::from(rate), clip.gain as f32)",
-            "render_placed_span(&placed, lane_ch, from, to,",
+            "render_placed_span(&placed, lane, from, to,",
             "format: tangent_record::wav::SampleFormat::Float32",
         ] {
             assert!(body.contains(road), "the glue no longer goes through `{road}`");
@@ -27607,6 +27421,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A template is born of identity names alone** (design 6.6): its
+    /// copy of a real folder skips the legacy sidecars in `state/` and the
+    /// document's `.pre-v8` backup, its `state/` is a full mirror of the live
+    /// shelf by identity, and its document carries no `legacy_states` marker,
+    /// even when the session it is saved from was opened from a legacy
+    /// project whose marker still stands. The project itself keeps all of
+    /// it: a release build is handed it back whole.
+    #[test]
+    fn a_template_is_born_of_identity_names_alone() {
+        use tangent_ui::arrangement::{doc_in, Arrangement};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-tpl-identity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // A legacy project as a legacy build left it, with the backup a first
+        // format-2 save of it would keep beside it.
+        let song = root.join("Song");
+        std::fs::create_dir_all(song.join("state")).expect("state/");
+        std::fs::create_dir_all(song.join("media")).expect("media/");
+        let text = include_str!("../../tests/fixtures/eras/doc-v5-19.json");
+        let doc = doc_in(&song);
+        std::fs::write(&doc, text).expect("the legacy document");
+        std::fs::write(Arrangement::pre_v8_path(&doc), text).expect("its backup");
+        // And the kit sidecar's, which a first format-2 kit write keeps.
+        let kit_backup = format!("{}{}", tangent_ui::drumpad::FILE_NAME, tangent_ui::arrangement::PRE_V8_SUFFIX);
+        std::fs::write(song.join(&kit_backup), b"{\"lane_kits\": {}}").expect("the kit's backup");
+        let legacy = song.join("state").join("insert-state-0-0.bin");
+        std::fs::write(&legacy, b"/x/s0.vst3\0as the legacy build saved it").expect("a legacy sidecar");
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("desk"));
+        app.open_project(&doc);
+        assert!(app.doc_legacy_states().is_some(), "fixture: the legacy project carries no marker");
+        // The live shelf, by identity.
+        let shelf = root.join("shelf");
+        let sb = tangent_ui::desk_id::SeatBay::new(
+            tangent_ui::desk_id::Node::Track(tangent_ui::desk_id::TrackId(0)),
+            tangent_ui::desk_id::Rack::Chain(0),
+            0,
+        );
+        assert!(crate::shelf::write_state_in(&shelf, sb, "/x/s0.vst3", b"live"), "a live state");
+
+        let stage = root.join(".Rig.writing");
+        build_template(&app, Some(&song), &stage, &shelf).expect("the template");
+        let staged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(doc_in(&stage)).expect("the template's document"))
+                .expect("json");
+        let copied_legacy = stage.join("state").join("insert-state-0-0.bin").exists();
+        let copied_backup = Arrangement::pre_v8_path(&doc_in(&stage)).exists();
+        let copied_kit_backup = stage.join(&kit_backup).exists();
+        let mirrored = crate::shelf::read_state(&stage.join("state"), sb, "/x/s0.vst3");
+        let kept = (legacy.is_file(), Arrangement::pre_v8_path(&doc).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!copied_legacy, "the template copied the project's legacy sidecar");
+        assert!(!copied_backup, "the template copied the project's .pre-v8 backup");
+        assert!(!copied_kit_backup, "the template copied the kit sidecar's .pre-v8 backup");
+        assert_eq!(mirrored.as_deref(), Some(&b"live"[..]), "the template's state/ is not the live shelf");
+        assert!(tangent_ui::desk_format::is_format2(&staged["desk"]), "the template's desk is not format 2");
+        assert!(staged["desk"].get("legacy_states").is_none(), "the template carries the session's marker");
+        assert_eq!(kept, (true, true), "building the template touched the project");
+    }
+
+    /// **A legacy kit sidecar is kept once, beside it, before the first
+    /// format-2 write replaces it** (design 6.7, against 6.8's writer). The
+    /// format-2 `drumpad.json` holds `track_kits` and nothing a release build
+    /// reads (no top-level kit, no `lane_kits`, no `primary_lane`), so the
+    /// first kit write after the switch used to take every drum lane's kit
+    /// away from the project a restored `<doc>.pre-v8` hands back. A kit on
+    /// lane 2, as a release build wrote it: the first format-2 write keeps
+    /// `drumpad.json.pre-v8`, byte for byte, and that file restored opens
+    /// lane 2's kit and the panel's lane again; a second write leaves it as
+    /// it was; a folder whose sidecar is already format 2, or has none,
+    /// keeps nothing; and the sweeps take the backup for Tangent's own file.
+    #[test]
+    fn a_legacy_kit_sidecar_is_kept_once_before_the_first_format_2_write() {
+        use tangent_ui::arrangement::{doc_in, PRE_V8_SUFFIX};
+        use tangent_ui::drumpad::{DrumpadDoc, FILE_NAME};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-kit-pre-v8-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let song = root.join("Song");
+        std::fs::create_dir_all(&song).expect("the project");
+        let doc = doc_in(&song);
+        let sidecar = DrumpadDoc::sidecar(&doc);
+        let backup = song.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}"));
+        // The release build's file: the panel's kit at the top level, every
+        // lane's under `lane_kits`, and `primary_lane`.
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36].path = "media/kick.wav".to_owned();
+        kit.save_beside(&doc);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("the kit")).expect("json");
+        let top = legacy.clone();
+        legacy["primary_lane"] = 2.into();
+        legacy["lane_kits"] = serde_json::json!({ "2": top });
+        let legacy = serde_json::to_vec_pretty(&legacy).expect("json");
+        std::fs::write(&sidecar, &legacy).expect("the legacy sidecar");
+        let (kits, primary) = DrumpadDoc::load_all_beside(&doc, 32, None);
+        assert!(!kits[2].is_empty() && primary == Some(2), "fixture: no kit on lane 2");
+
+        // The first format-2 write: a kit edit, or a save.
+        let ids = tangent_ui::desk_legacy::identity_ids(32);
+        DrumpadDoc::save_all_beside_ids(&kits, &ids, 2, &doc);
+        let now: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar).expect("kit")).expect("json");
+        assert!(now.get("track_kits").is_some() && now.get("lane_kits").is_none(), "fixture: not a format-2 write");
+        assert_eq!(std::fs::read(&backup).ok(), Some(legacy.clone()), "the legacy sidecar was not kept byte for byte");
+        // The way back: the backup restored is the release build's kits.
+        let back = root.join("Restored");
+        std::fs::create_dir_all(&back).expect("a restore");
+        std::fs::write(back.join(FILE_NAME), std::fs::read(&backup).expect("backup")).expect("restored");
+        let (restored, panel) = DrumpadDoc::load_all_beside(&doc_in(&back), 32, None);
+        assert_eq!((restored[2] == kits[2], panel), (true, Some(2)), "the backup does not hand lane 2's kit back");
+
+        // Written once.
+        let mut edited = kits.clone();
+        edited[2].pads[38].path = "media/snare.wav".to_owned();
+        DrumpadDoc::save_all_beside_ids(&edited, &ids, 2, &doc);
+        assert_eq!(std::fs::read(&backup).ok(), Some(legacy), "a second format-2 write touched the backup");
+
+        // Nothing to keep: a sidecar already format 2, and none at all.
+        let fresh = root.join("Fresh");
+        std::fs::create_dir_all(&fresh).expect("fresh");
+        let fresh_doc = doc_in(&fresh);
+        DrumpadDoc::save_all_beside_ids(&kits, &ids, 2, &fresh_doc);
+        DrumpadDoc::save_all_beside_ids(&edited, &ids, 2, &fresh_doc);
+        assert!(!fresh.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}")).exists(), "a format-2 sidecar was kept as legacy");
+
+        // The sweeps: a scratch holding the backup is still only a scratch.
+        let untitled = root.join("Untitled 7");
+        std::fs::create_dir_all(&untitled).expect("a scratch");
+        for name in [tangent_ui::arrangement::DOC_NAME, FILE_NAME] {
+            std::fs::write(untitled.join(name), b"{}").expect("a file");
+        }
+        std::fs::write(untitled.join(format!("{FILE_NAME}{PRE_V8_SUFFIX}")), b"{}").expect("its backup");
+        let disposable = tangent_ui::app::holds_only_scratch(&untitled);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(disposable, "a scratch holding the kit's backup reads as somebody's work");
+    }
+
     /// **Save As Template writes the template, never the session.** From a
     /// saved project it saved the session first and copied the folder, so an
     /// experiment went into the project's document and `state/`, the title
@@ -27639,7 +27597,10 @@ mod tests {
         doc.save_to(&saved);
         std::fs::write(song.join("media/take.wav"), b"pcm").unwrap();
         std::fs::write(song.join("media/outtake.wav"), b"more pcm").unwrap();
-        let sidecar = sidecar_name(0, 0);
+        let sidecar = tangent_ui::desk_id::state_file_name(
+            crate::engine_bridge::seat_bay_at(&tangent_ui::desk_legacy::identity_ids(32), 0, 0)
+                .expect("strip 0's first bay"),
+        );
         std::fs::write(song.join("state").join(&sidecar), b"as saved").unwrap();
         std::fs::write(song.join("notes.txt"), b"mine").unwrap();
         let on_disk = std::fs::read(&saved).unwrap();
@@ -27687,6 +27648,32 @@ mod tests {
         }
     }
 
+    /// **The walk, asked the way these tests always asked it**: a mask of
+    /// armed rows, a table of parents, routes as masks and a question about
+    /// the APP's seat and bay, over the identity desk of thirty-two rows. The
+    /// walk itself takes rows and bays by identity (no desk width, no seat
+    /// arithmetic); this turns each bay it asks about back into the seat the
+    /// app keeps it at, so every assertion below says what it always said.
+    fn walk(
+        armed: u32,
+        is_input: impl Fn(usize) -> bool,
+        parents: &[i32],
+        routed: impl Fn(usize) -> u32,
+        sends: impl Fn(usize) -> bool,
+        seat_bay: impl Fn(usize, usize) -> bool,
+    ) -> bool {
+        let ids = tangent_ui::desk_legacy::identity_ids(tangent_ui::desk_legacy::V32_CHANNELS);
+        armed_rack_pending(
+            &ids,
+            |r| u32::try_from(r).ok().and_then(|r| 1u32.checked_shl(r)).is_some_and(|b| armed & b != 0),
+            is_input,
+            |r| parents.get(r).and_then(|p| usize::try_from(*p).ok()),
+            |r| (0..32usize).filter(|n| routed(r) & (1u32 << n) != 0).collect(),
+            sends,
+            |sb| crate::engine_bridge::app_seat_of(&ids, sb).is_some_and(|(seat, bay)| seat_bay(seat, bay)),
+        )
+    }
+
     /// **A rack that has not arrived yet holds the room shut**, and only for
     /// the inputs somebody is actually playing through.
     ///
@@ -27700,7 +27687,8 @@ mod tests {
     /// the input is not heard through.
     #[test]
     fn an_armed_input_waiting_on_its_chain_holds_the_room_shut() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, CHANNELS, INSERTS};
+        use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, INSERTS};
         let armed_on = |ch: usize| 1u32 << ch;
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
@@ -27709,23 +27697,23 @@ mod tests {
 
         // Nothing armed: the room is nobody's to hold.
         assert!(
-            !armed_rack_pending(0, audio, &flat, no_routes, no_sends, |_, _| true),
+            !walk(0, audio, &flat, no_routes, no_sends, |_, _| true),
             "a desk with nothing armed was reported as waiting"
         );
         // A bay on the armed strip itself.
         assert!(
-            armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, bay| seat == 3 && bay == 1),
+            walk(armed_on(3), audio, &flat, no_routes, no_sends, |seat, bay| seat == 3 && bay == 1),
             "the armed strip's own bay did not hold the room"
         );
         // Its FOLDER-EXTRA rack and its PEDALBOARD, which travel with the
         // track and are as much of the chain as the first rack.
         assert!(
-            armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == folder_extra_seat(3)),
+            walk(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == folder_extra_seat(3)),
             "the armed strip's second rack did not hold the room"
         );
         for pedal in 0..AMP_PEDALS {
             assert!(
-                armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
+                walk(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
                     seat == amp_pedal_seat(3, pedal)
                 }),
                 "pedal {pedal} of the armed strip's board did not hold the room"
@@ -27733,11 +27721,11 @@ mod tests {
         }
         // And the bay belongs to somebody else: the monitor stays open.
         assert!(
-            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == 4),
+            !walk(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| seat == 4),
             "another track's plugin dipped a live monitor"
         );
         assert!(
-            !armed_rack_pending(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
+            !walk(armed_on(3), audio, &flat, no_routes, no_sends, |seat, _| {
                 seat == folder_extra_seat(4)
             }),
             "another track's second rack dipped a live monitor"
@@ -27748,14 +27736,14 @@ mod tests {
         // is allowed to make.
         for ch in [0, 1, CHANNELS / 2, CHANNELS - 1] {
             assert!(
-                armed_rack_pending(armed_on(ch), audio, &flat, no_routes, no_sends, |seat, _| seat == ch),
+                walk(armed_on(ch), audio, &flat, no_routes, no_sends, |seat, _| seat == ch),
                 "channel {ch} could not hold the room"
             );
         }
         // And every bay of a seat is looked at, not just the first.
         for bay in 0..INSERTS {
             assert!(
-                armed_rack_pending(armed_on(2), audio, &flat, no_routes, no_sends, |seat, b| seat == 2 && b == bay),
+                walk(armed_on(2), audio, &flat, no_routes, no_sends, |seat, b| seat == 2 && b == bay),
                 "bay {bay} was never examined"
             );
         }
@@ -27769,7 +27757,8 @@ mod tests {
     /// that bay is the microphone's as much as any on its own strip.
     #[test]
     fn the_mics_wait_for_their_folders_denoiser_and_never_for_the_piano() {
-        use tangent_ui::recorder::{folder_extra_seat, CHANNELS};
+        use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
+        use tangent_ui::recorder::folder_extra_seat;
         let armed = 1u32 << 2 | 1 << 4 | 1 << 6;
         let audio = |ch: usize| matches!(ch, 0 | 4 | 6 | 7);
         let mut parents = [-1i32; CHANNELS];
@@ -27778,28 +27767,28 @@ mod tests {
         let no_routes = |_: usize| 0u32;
         let no_sends = |_: usize| false;
         assert!(
-            !armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 2 && bay == 0),
+            !walk(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 2 && bay == 0),
             "Kontakt on the armed piano held the microphones' room"
         );
         assert!(
-            armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 5 && bay == 0),
+            walk(armed, audio, &parents, no_routes, no_sends, |seat, bay| seat == 5 && bay == 0),
             "the mics' folder's denoiser was not waited for"
         );
         assert!(
-            armed_rack_pending(armed, audio, &parents, no_routes, no_sends, |seat, _| seat == folder_extra_seat(5)),
+            walk(armed, audio, &parents, no_routes, no_sends, |seat, _| seat == folder_extra_seat(5)),
             "the mics' folder's second rack was not waited for"
         );
         // An UNARMED mic's folder is not the armed one's: with only the DI
         // armed, the MICS folder's bays are nobody's to wait on.
         assert!(
-            !armed_rack_pending(1 << 4, audio, &parents, no_routes, no_sends, |seat, _| seat == 5),
+            !walk(1 << 4, audio, &parents, no_routes, no_sends, |seat, _| seat == 5),
             "an unarmed folder held the DI's room"
         );
         // Two folders deep: the grandparent is in the chain too.
         let mut nested = parents;
         nested[5] = 1;
         assert!(
-            armed_rack_pending(armed, audio, &nested, no_routes, no_sends, |seat, _| seat == 1),
+            walk(armed, audio, &nested, no_routes, no_sends, |seat, _| seat == 1),
             "the folder above the mics' folder was not waited for"
         );
         // A route: the mic moved to channel 9, whose bay is its chain now -
@@ -27810,11 +27799,11 @@ mod tests {
             _ => 0,
         };
         assert!(
-            armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 9),
+            walk(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 9),
             "the channel the mic is routed to was not waited for"
         );
         assert!(
-            !armed_rack_pending(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 10),
+            !walk(1 << 6, audio, &[-1; CHANNELS], routed, no_sends, |seat, _| seat == 10),
             "a bay off the mic's chain held its room"
         );
     }
@@ -27828,7 +27817,8 @@ mod tests {
     /// and its folders held the room over bays the input never reaches.
     #[test]
     fn an_armed_inputs_chain_is_the_racks_its_audio_meets() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip, CHANNELS};
+        use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip};
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
         let no_routes = |_: usize| 0u32;
@@ -27836,39 +27826,39 @@ mod tests {
         let fx = |seat: usize, _: usize| seat == Strip::Fx.index();
         // A send on the armed strip: the bus's rack is its chain.
         assert!(
-            armed_rack_pending(1 << 3, audio, &flat, no_routes, |ch| ch == 3, fx),
+            walk(1 << 3, audio, &flat, no_routes, |ch| ch == 3, fx),
             "the effects bus an armed input sends to was not waited for"
         );
         // No send anywhere on its way: the bus is somebody else's.
         assert!(
-            !armed_rack_pending(1 << 3, audio, &flat, no_routes, no_sends, fx),
+            !walk(1 << 3, audio, &flat, no_routes, no_sends, fx),
             "the effects bus held the room of an input that does not send to it"
         );
         assert!(
-            !armed_rack_pending(1 << 3, audio, &flat, no_routes, |ch| ch == 4, fx),
+            !walk(1 << 3, audio, &flat, no_routes, |ch| ch == 4, fx),
             "another track's send held this input's room"
         );
         // A folder above it that sends carries it there too.
         let mut parents = flat;
         parents[3] = 5;
         assert!(
-            armed_rack_pending(1 << 3, audio, &parents, no_routes, |ch| ch == 5, fx),
+            walk(1 << 3, audio, &parents, no_routes, |ch| ch == 5, fx),
             "the effects bus the input's folder sends to was not waited for"
         );
         // A route: the destination's FIRST rack, and nothing else of it.
         let to_nine = |ch: usize| if ch == 3 { 1u32 << 9 } else { 0 };
         assert!(
-            armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| seat == 9),
+            walk(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| seat == 9),
             "the channel the input is routed to was not waited for"
         );
         assert!(
-            !armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
+            !walk(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
                 seat == folder_extra_seat(9)
             }),
             "a route destination's second rack held the room; routed audio never meets it"
         );
         assert!(
-            !armed_rack_pending(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
+            !walk(1 << 3, audio, &flat, to_nine, no_sends, |seat, _| {
                 seat == amp_pedal_seat(9, 0)
             }),
             "a route destination's pedalboard held the room; routed audio never meets it"
@@ -27876,13 +27866,13 @@ mod tests {
         let mut nine_in_a_folder = flat;
         nine_in_a_folder[9] = 11;
         assert!(
-            !armed_rack_pending(1 << 3, audio, &nine_in_a_folder, to_nine, no_sends, |seat, _| seat == 11),
+            !walk(1 << 3, audio, &nine_in_a_folder, to_nine, no_sends, |seat, _| seat == 11),
             "a route destination's folder held the room; the folds have run before the sends pass"
         );
         // And a destination's own send does not carry routed arrivals: the
         // sends pass folds them into the mix and nowhere near the bus.
         assert!(
-            !armed_rack_pending(1 << 3, audio, &flat, to_nine, |ch| ch == 9, fx),
+            !walk(1 << 3, audio, &flat, to_nine, |ch| ch == 9, fx),
             "a route destination's send held the room"
         );
         // Onward along the routes, from the input and from its folders.
@@ -27892,12 +27882,12 @@ mod tests {
             _ => 0,
         };
         assert!(
-            armed_rack_pending(1 << 3, audio, &flat, onward, no_sends, |seat, _| seat == 10),
+            walk(1 << 3, audio, &flat, onward, no_sends, |seat, _| seat == 10),
             "the second hop of a route was not waited for"
         );
         let from_the_folder = |ch: usize| if ch == 5 { 1u32 << 12 } else { 0 };
         assert!(
-            armed_rack_pending(1 << 3, audio, &parents, from_the_folder, no_sends, |seat, _| seat == 12),
+            walk(1 << 3, audio, &parents, from_the_folder, no_sends, |seat, _| seat == 12),
             "the channel the input's folder is routed to was not waited for"
         );
     }
@@ -27928,7 +27918,7 @@ mod tests {
         );
         let born = body("fn start_engine(");
         let wipe = born
-            .find("self.recorder.inserts_loaded =\n                    vec![None; tangent_ui::recorder::INSERT_SPACE];")
+            .find("self.recorder.inserts_loaded = InsertLedger::new();")
             .expect("start_engine's ledger wipe");
         assert!(
             born[wipe..].contains("self.racks_restoring = true;"),
@@ -27979,7 +27969,7 @@ mod tests {
         let body = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
         assert!(
             body.contains("chain_bay_pending(")
-                && body.contains(".is_some_and(|e| e.insert(seat, bay).is_some())"),
+                && body.contains(".is_some_and(|(at, e)| e.insert_at(at.0, at.1).is_some())"),
             "the room's gate no longer asks the engine whether the bay holds anything"
         );
     }
@@ -27987,7 +27977,7 @@ mod tests {
     /// **And the room is actually wired to it.** `push_monitor_settings` is
     /// the one place `set_monitor_on` is pushed per frame; a source scan,
     /// because `DesktopApp` cannot be built in a test (see
-    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// `the_global_shelf_converts_once_before_the_launch_opens_a_project`
     /// for the precedent). What this stops is the gate being quietly dropped
     /// back to a bare `input_monitor()`. Production only: both lines are
     /// spelled in this test too, so a scan of the whole file found them here
@@ -28016,12 +28006,18 @@ mod tests {
     ///
     /// It was sized `(STRIPS + 1 + DRUM_PADS) * INSERTS` in FIVE places, which
     /// is 444 — one seat short of `MASTER_EXTRA_SEAT`, whose bays are 444–446.
-    /// The arithmetic is the whole bug, so the arithmetic is what this asserts.
+    /// The arithmetic is the whole bug, so the arithmetic is what this asserts,
+    /// of the seat space the engine's seats ARE: the frozen V32 map (design
+    /// Appendix A), which every lane's racks answer to and the host's ledger
+    /// is keyed by.
     #[test]
     fn the_insert_table_reaches_every_seat_including_the_masters_second_rack() {
-        use tangent_ui::recorder::{
-            DRUM_PADS, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
+        use tangent_ui::desk_id::{BAYS as INSERTS, PADS as DRUM_PADS};
+        use tangent_ui::desk_legacy::{
+            V32_INSERT_SPACE as INSERT_SPACE, V32_STRIPS as STRIPS, V32_TOTAL_SEATS as TOTAL_SEATS,
         };
+        const MASTER_SEAT: usize = tangent_ui::desk_lift::V32_MASTER;
+        const MASTER_EXTRA_SEAT: usize = tangent_ui::desk_lift::V32_EXTRA_PADS - 1;
         // The size that was wrong, named so the test says what it prevents.
         let short = (STRIPS + 1 + DRUM_PADS) * INSERTS;
         assert!(
@@ -28064,7 +28060,7 @@ mod tests {
     ///
     /// A source scan, because `DesktopApp` cannot be built in a test - the
     /// precedent is
-    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    /// `the_global_shelf_converts_once_before_the_launch_opens_a_project`.
     /// What it pins is that each named batch still reaches the door.
     #[test]
     fn every_host_side_edit_commits_its_own_undo_moment() {
@@ -28285,7 +28281,7 @@ mod tests {
     ///
     /// A source scan, because `DesktopApp` cannot be built in a test - the
     /// precedent is
-    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    /// `the_global_shelf_converts_once_before_the_launch_opens_a_project`.
     /// What it pins is the three facts a picker that does nothing would
     /// break: the choice is READ, it is WATCHED, and the fallback does not
     /// carry it to a backend that has never heard of it.
@@ -28451,59 +28447,43 @@ mod tests {
     /// and the lookup the reconcile makes is asked for both plugins.
     #[test]
     fn a_displaced_plugin_state_survives_the_write_that_buried_it() {
-        // `insert_state_path` is per-install, and `(CHANNELS + 3, 2)` is
-        // `MASTER_SEAT` bay 2 - the master's sixth slot on the live shelf -
-        // so this runs under `SIDECAR_ENV` with `IVORY_SETTINGS_PATH`
-        // pointed at a scratch folder, and puts the variable back after.
-        let _lock = sidecar_walk_probe::SIDECAR_ENV
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let shelf = std::env::temp_dir().join(format!(
+        // **A shelf of the test's own**, named outright: every state file is
+        // read and written through the shelf's directory-taking calls, so
+        // nothing here works out a path on the live shelf and nothing moves
+        // the settings path's variable (see the scan below).
+        let dir = std::env::temp_dir().join(format!(
             "tangent-displaced-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&shelf);
-        std::fs::create_dir_all(&shelf).expect("a scratch shelf");
-        let was = std::env::var_os("IVORY_SETTINGS_PATH");
-        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
-        let restore = || {
-            // SAFETY: still under `SIDECAR_ENV`.
-            unsafe {
-                match &was {
-                    Some(v) => std::env::set_var("IVORY_SETTINGS_PATH", v),
-                    None => std::env::remove_var("IVORY_SETTINGS_PATH"),
-                }
-            }
-            let _ = std::fs::remove_dir_all(&shelf);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch shelf");
+        // The master's sixth slot, by identity: the shelf and the state file
+        // are both keyed by the bay now.
+        let sb = crate::engine_bridge::seat_bay_at(&[], tangent_ui::desk_lift::V32_MASTER, 2)
+            .expect("the master's bay");
+        let write = |bundle: &str, state: &[u8]| {
+            assert!(crate::shelf::write_state_in(&dir, sb, bundle, state), "the state file did not land");
         };
-        let (strip, bay) = (tangent_ui::recorder::CHANNELS + 3, 2);
-        assert!(
-            insert_state_path(strip, bay).starts_with(&shelf),
-            "the sidecar is still on the live shelf"
-        );
+        let saved = |bundle: &str| crate::shelf::read_state(&dir, sb, bundle);
 
         // A plugin saved at one setting and dialled to another since.
-        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as saved");
-        let (owner, blob) = sidecar_owner_and_state(strip, bay).expect("a sidecar");
-        assert_eq!(owner, "/x/Amp.vst3", "the fixture did not write a sidecar");
+        write("/x/Amp.vst3", b"the amp as saved");
+        let (owner, blob) = crate::shelf::owner_and_state(&dir.join(tangent_ui::desk_id::state_file_name(sb)))
+            .expect("a state file");
+        assert_eq!(owner, "/x/Amp.vst3", "the fixture did not write a state file");
         assert_eq!(blob, b"the amp as saved");
         let mut shelf = DisplacedShelf::new();
-        let key = |b: &str| (strip, bay, b.to_owned());
+        let key = |b: &str| (sb, b.to_owned());
         // The paste: the reconcile shelves what the amp is PLAYING as it
         // tears it down, and the delay's state is written under the bay.
         shelve_displaced(&mut shelf, key("/x/Amp.vst3"), b"the amp as dialled".to_vec());
-        write_insert_state(strip, bay, "/x/Delay.vst3", b"the delay");
+        write("/x/Delay.vst3", b"the delay");
 
         // **The file no longer knows the amp**, which is the whole defect.
-        assert_eq!(
-            saved_insert_state(strip, bay, "/x/Amp.vst3"),
-            None,
-            "the paste did not actually bury the old tenant"
-        );
+        assert_eq!(saved("/x/Amp.vst3"), None, "the paste did not actually bury the old tenant");
         // This is exactly the lookup the reconcile makes.
-        let seat = |b: &str| incoming_state(&shelf, &key(b), || saved_insert_state(strip, bay, b));
+        let seat = |b: &str| incoming_state(&shelf, &key(b), || saved(b));
         assert_eq!(
             seat("/x/Amp.vst3").as_deref(),
             Some(&b"the amp as dialled"[..]),
@@ -28513,22 +28493,24 @@ mod tests {
         assert_eq!(seat("/x/Delay.vst3").as_deref(), Some(&b"the delay"[..]));
         // And a delete leaves the file standing - tagged with the amp, at its
         // last save - which must not outrank what the amp was playing.
-        write_insert_state(strip, bay, "/x/Amp.vst3", b"the amp as saved");
+        write("/x/Amp.vst3", b"the amp as saved");
         assert_eq!(
             seat("/x/Amp.vst3").as_deref(),
             Some(&b"the amp as dialled"[..]),
             "the last save outranked what the plugin was playing when it left"
         );
-        restore();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **The displaced-state test stays off the live shelf.** It read and
-    /// rewrote `insert-state-35-2.bin` - the master's sixth slot - beside
+    /// **The displaced-state test stays off the live shelf.** It once read
+    /// and rewrote `insert-state-35-2.bin` - the master's sixth slot - beside
     /// the owner's own settings, with no redirect and no lock against the
     /// tests that move `IVORY_SETTINGS_PATH`, and put the file back only at
-    /// the end: a failed assert left a foreign-tagged sidecar, and a live
-    /// save in between was overwritten. A source scan of that test, whose
-    /// redirect must stand before the first sidecar path is worked out.
+    /// the end: a failed assert left a foreign-tagged state file, and a live
+    /// save in between was overwritten. Since the shelf took directories
+    /// (`shelf::write_state_in`, `shelf::read_state`) it names a scratch
+    /// shelf outright, so the scan is that it never reaches for the live
+    /// shelf's own calls and never moves the variable at all.
     #[test]
     fn the_displaced_state_test_stays_off_the_live_shelf() {
         let whole = include_str!("desktop.rs");
@@ -28538,16 +28520,22 @@ mod tests {
         let body = &whole[at..at + whole[at..].find("\n    }\n").expect("its end")];
         // Whitespace out, so a line break inside a call cannot hide it.
         let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-        let lock = body.find("SIDECAR_ENV.lock()");
-        // To the scratch shelf - not the restore's own `set_var` at the end.
-        let redirect = body.find("std::env::set_var(\"IVORY_SETTINGS_PATH\",shelf");
-        let first = body.find("insert_state_path(").expect("the test reads a sidecar path");
-        assert!(
-            lock.is_some_and(|l| redirect.is_some_and(|r| l < r && r < first)),
-            "it reads and rewrites insert-state-35-2.bin - the master's sixth slot - \
-             on the live shelf beside the owner's settings.json, unlocked against \
-             the tests that move IVORY_SETTINGS_PATH"
-        );
+        assert!(body.contains("shelf::write_state_in(&dir"), "the test no longer writes to its own shelf");
+        for live in [
+            "shelf::write_state(",
+            "shelf::saved_state(",
+            "shelf::state_path(",
+            "global_dir(",
+            "IVORY_SETTINGS_PATH",
+            "set_var(",
+        ] {
+            let live: String = live.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !body.contains(&live),
+                "it reaches for `{live}`: the master's sixth slot on the live shelf, beside the \
+                 owner's settings.json, or a variable the rest of the suite reads"
+            );
+        }
     }
 
     /// **A full shelf drops its OLDEST entry, never all of them.**
@@ -28558,8 +28546,12 @@ mod tests {
     /// a re-shelved entry counts as new, and the newest is kept however big.
     #[test]
     fn a_full_shelf_drops_its_oldest_entry_and_keeps_the_rest() {
+        use crate::shelf::{SHELF_MAX_BYTES, SHELF_MAX_ENTRIES};
+        use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
         let mut shelf = DisplacedShelf::new();
-        let key = |n: usize| (n, 0, format!("/x/P{n}.vst3"));
+        let key = |n: usize| {
+            (SeatBay::new(Node::Track(TrackId(n as u32)), Rack::Chain(0), 0), format!("/x/P{n}.vst3"))
+        };
         for n in 0..SHELF_MAX_ENTRIES + 5 {
             shelve_displaced(&mut shelf, key(n), vec![1; 16]);
         }
@@ -28585,13 +28577,21 @@ mod tests {
         assert!(!shelf.contains_key(&key(10_001)), "an empty state was shelved");
     }
 
-    /// **A shelved state follows its seat through a reorder** - the channel
-    /// row, its folder-extra rack and its pedals - exactly as its sidecar
-    /// does, and a seat past the channels holds still.
+    /// **A shelved state is its BAY's, wherever its track's row goes** - the
+    /// channel row, its folder-extra rack and its pedals - and a special's
+    /// holds still. The shelf is keyed by identity (contract C10), so a
+    /// reorder moves nothing in it: the same bay, asked from the row its
+    /// track was dragged to, is the same key. It used to be keyed by seat and
+    /// moved with every reorder (`permute_displaced`, gone with the carry).
     #[test]
-    fn a_shelved_state_follows_its_seat_through_a_reorder() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, seat_order, CHANNELS};
-        let master = CHANNELS + 3;
+    fn a_shelved_state_is_its_bays_wherever_the_row_goes() {
+        use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat};
+        let master = tangent_ui::desk_lift::V32_MASTER;
+        let ids = tangent_ui::desk_legacy::identity_ids(CHANNELS);
+        let at = |ids: &[tangent_ui::desk_id::TrackId], seat: usize| {
+            crate::engine_bridge::seat_bay_at(ids, seat, 0).expect("a bay")
+        };
         let mut shelf = DisplacedShelf::new();
         for (seat, name) in [
             (2, "amp"),
@@ -28599,13 +28599,12 @@ mod tests {
             (amp_pedal_seat(2, 1), "pedal"),
             (master, "master"),
         ] {
-            shelve_displaced(&mut shelf, (seat, 0, name.to_owned()), name.as_bytes().to_vec());
+            shelve_displaced(&mut shelf, (at(&ids, seat), name.to_owned()), name.as_bytes().to_vec());
         }
         // Track 2 dragged to row 5: rows 3, 4 and 5 come up one.
-        let mut order: Vec<usize> = (0..CHANNELS).collect();
-        let moved = order.remove(2);
-        order.insert(5, moved);
-        permute_displaced(&mut shelf, &seat_order(&order));
+        let mut moved = ids.clone();
+        let t = moved.remove(2);
+        moved.insert(5, t);
         for (seat, name) in [
             (5, "amp"),
             (folder_extra_seat(5), "extra"),
@@ -28613,12 +28612,12 @@ mod tests {
             (master, "master"),
         ] {
             assert_eq!(
-                shelf.get(&(seat, 0, name.to_owned())).map(|s| s.blob.as_slice()),
+                shelf.get(&(at(&moved, seat), name.to_owned())).map(|s| s.blob.as_slice()),
                 Some(name.as_bytes()),
-                "the {name}'s shelved state did not follow its row to seat {seat}"
+                "the {name}'s shelved state is not found from the row its track moved to"
             );
         }
-        assert_eq!(shelf.len(), 4, "the move lost or doubled an entry");
+        assert_eq!(shelf.len(), 4, "the shelf lost or doubled an entry");
     }
 
     /// **The shelf stays newer than every sidecar it outranks.**
@@ -28629,8 +28628,10 @@ mod tests {
     /// reconcile shelves the outgoing tenant's LIVE state, never its file;
     /// every road that writes a bay's sidecar for the tenant it brings in -
     /// copy, move, paste, both bays of a swap, the Paste Track state copy -
-    /// forgets that tenant's entry there; and a reorder moves the shelf with
-    /// its seats. A source scan, because `DesktopApp` cannot be built in a
+    /// forgets that tenant's entry there; and the shelf is keyed by the bay's
+    /// identity, so a reorder cannot strand an entry (see
+    /// `a_shelved_state_is_its_bays_wherever_the_row_goes`). A source scan,
+    /// because `DesktopApp` cannot be built in a
     /// test; `a_displaced_plugin_state_survives_the_write_that_buried_it`
     /// drives the lookup itself.
     #[test]
@@ -28643,14 +28644,16 @@ mod tests {
             &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
         };
         // Nothing shelves a FILE: the reconcile shelves what is playing.
-        assert!(
-            !scan.contains("sidecar_owner_and_state(strip, bay) else"),
-            "a road shelves the stale file instead of the plugin's live settings"
-        );
+        for shelving in scan.match_indices("shelve_displaced(").map(|(at, _)| &scan[at..at + 400.min(scan.len() - at)]) {
+            assert!(
+                !shelving.contains("owner_and_state("),
+                "a road shelves the stale file instead of the plugin's live settings"
+            );
+        }
         let at = scan
             .find("// **The bay this frame loads is the bay the LAST frame announced.**")
             .expect("the reconcile");
-        let reconcile = &scan[at..at + scan[at..].find("e.load_insert(i / inserts").expect("its load")];
+        let reconcile = &scan[at..at + scan[at..].find("e.load_insert_at(rack, bay").expect("its load")];
         assert!(
             reconcile.contains("shelve_displaced(") && reconcile.contains("incoming_state("),
             "the reconcile no longer shelves the outgoing tenant, or no longer reads the shelf first"
@@ -28663,22 +28666,25 @@ mod tests {
             "fn swap_inserts(",
         ] {
             let b = body(road);
+            assert!(b.contains("self.write_bay_state("), "`{road}` no longer writes the bay's state");
             assert_eq!(
-                b.matches("write_insert_state(").count(),
-                b.matches("self.displaced_states").count(),
-                "`{road}` writes a sidecar and leaves an older shelved state outranking it"
+                b.matches("self.write_bay_state(").count(),
+                b.matches("self.forget_displaced(").count(),
+                "`{road}` writes a state file and leaves an older shelved state outranking it"
             );
         }
-        let copy = &scan[scan.find("let _ = std::fs::copy(&src, &dst);").expect("the Paste Track copy")..];
+        let copy = &scan[scan.find("crate::shelf::write_state(dst, &owner, &state);").expect("the Paste Track copy")..];
         let copy = &copy[..copy.find("// **And the bay is rebuilt even when").expect("the copy's end")];
         assert!(
             copy.contains("self.displaced_states.remove("),
             "the Paste Track state copy leaves an older shelved state outranking the pasted file"
         );
-        // And the shelf moves with its seats.
+        // And the shelf is keyed by the bay, never by a seat a reorder moves.
         assert!(
-            body("fn after_frame(&mut self").contains("permute_displaced(&mut self.displaced_states, &full);"),
-            "a reorder leaves the shelf at the seats its rows moved away from"
+            include_str!("shelf.rs").contains(
+                "pub(crate) type DisplacedShelf = std::collections::HashMap<(SeatBay, String), ShelvedState>;"
+            ),
+            "the shelf is keyed by something a reorder can move"
         );
     }
 
@@ -28723,9 +28729,9 @@ mod tests {
             .find("// **The bay this frame loads is the bay the LAST frame announced.**")
             .expect("the reconcile");
         let load = at + src[at..]
-            .find("e.load_insert(i / inserts, i % inserts, path, state.as_deref())")
+            .find("e.load_insert_at(rack, bay, path, state.as_deref())")
             .expect("the reconcile's load");
-        assert!(src[at..load].contains(".save_insert_state(i / inserts, i % inserts)"),
+        assert!(src[at..load].contains(".save_insert_state_at(rack, bay)"),
             "the reconcile replaces a bay's tenant without asking it for its settings: undoing a \
              paste, a swap or a delete brings the plugin back at its last SAVED settings, or factory");
     }
@@ -29464,7 +29470,7 @@ mod tests {
     /// a render every time somebody quantized a long take - the one thing
     /// the stretch road exists to avoid. A source scan, because
     /// `DesktopApp` cannot be built in a test; the precedent is
-    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`.
+    /// `the_global_shelf_converts_once_before_the_launch_opens_a_project`.
     ///
     /// The second half is the trap in doing it at all: while the warp is
     /// out, the clip's audio is still the UNWARPED file standing in for it,
@@ -29736,139 +29742,172 @@ mod tests {
         assert_eq!((many[2].fade_in, many[2].fade_out), (0, 9_600));
     }
 
-    /// **A reorder reloads the rows that moved and nothing else.**
-    ///
-    /// The whole desk used to be marked — sixteen channels, the buses, the
-    /// master and 128 drum pads, some 450 bays — and the reconcile loop
-    /// reloads exactly one mismatched bay per frame, each one instantiating
-    /// a plugin and restoring its state. Dragging one track past its
-    /// neighbour therefore tore down and rebuilt every plugin in the
-    /// session: the owner's "when a reorder occurs of any kind -- massive
-    /// delay".
+    /// **A reorder sends the engine nothing but the plan** (design 7.13: "one
+    /// Plan. No plugin moves, no renames, no round trips"). The arm used to
+    /// write the moved rows' live states down, carry their plugins across
+    /// the engine's seats (`permute_channel_inserts`, a ring round trip per
+    /// bay) and permute the ledger, then reload whatever the carry stranded;
+    /// with every track's lane where it was, none of that has anything to do.
+    /// A source scan of the arm, because `DesktopApp` cannot be built in a
+    /// test; `engine_bridge::a_reorder_is_one_plan_and_reloads_nothing`
+    /// drives the bridge and the engine through one.
     #[test]
-    fn a_reorder_only_reloads_the_rows_that_moved() {
-        let bays = 3;
-        // Track 0 dragged to position 2: rows 0, 1 and 2 move, the rest do
-        // not.
-        let mut order: Vec<usize> = (0..16).collect();
-        let ch = order.remove(0);
-        order.insert(2, ch);
-        let hit = reload_slots_for(&order, bays);
-        let rows: std::collections::BTreeSet<usize> =
-            hit.iter().map(|i| i / bays).collect();
-        assert_eq!(
-            rows,
-            [0usize, 1, 2].into_iter().collect(),
-            "a reorder of three rows touched {rows:?}"
-        );
-        assert_eq!(hit.len(), 3 * bays, "not every bay of a moved row moved");
-        // Nothing at all when nothing moved.
-        let still: Vec<usize> = (0..16).collect();
-        assert!(reload_slots_for(&still, bays).is_empty());
-        // And never past the rows the permutation names — the drum pads
-        // above the channels are not part of a channel reorder.
-        assert!(hit.iter().all(|i| i / bays < 16));
-    }
-
-    /// **A reorder writes the live states down in the layout the files are
-    /// in when it writes them.**
-    ///
-    /// The arm used to carry the plugins and permute `inserts_loaded` first,
-    /// then save - which wrote each carried state at its NEW seat - and then
-    /// moved the files a second time. The live shelf ended in the pre-move
-    /// layout, so the next rebuild of a moved bay (a redo, a buffer-size
-    /// change) seated it from another row's file. A source scan, because
-    /// `DesktopApp` cannot be built in a test.
-    #[test]
-    fn a_reorder_writes_the_live_states_in_the_layout_the_files_are_in() {
+    fn a_reorder_sends_the_engine_nothing_but_the_plan() {
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
         let at = src.find("if let Some(order) = self.app.take_desk_state_perm() {").expect("the reorder arm");
         let arm = &src[at..at + src[at..].find("// **A pasted track's plugin STATE").expect("the arm's end")];
-        let pos = |w: &str| arm.find(w).unwrap_or_else(|| panic!("the reorder arm lost `{w}`"));
-        let save = pos("self.save_plugin_states_as_loaded_for(");
-        let carry = pos("permute_channel_inserts(&order)");
-        let rows = pos("permute_loaded_rows(&mut self.recorder.inserts_loaded");
-        let files = pos("insert_state_path(0, 0)");
-        let old_then_move = save < carry && save < rows && save < files;
-        let move_then_new = save > carry && save > rows && save > files;
-        assert!(old_then_move || move_then_new,
-            "the live states are written after the carry and before the live shelf moves, so the \
-             shelf ends in the pre-move layout");
+        for gone in [
+            "engine.as_mut()",
+            "save_plugin_states",
+            "inserts_loaded",
+            "permute_channel_inserts",
+            "RELOAD",
+            "displaced_states",
+        ] {
+            assert!(!arm.contains(gone), "the reorder arm still reaches for `{gone}`");
+        }
     }
 
-    /// **A reorder's sidecars follow it there, and its undo's inverse brings
-    /// them back** - the channel row, its folder-extra rack and its pedals.
+    /// **A reorder moves no state file**, on the live shelf or anywhere.
     ///
-    /// Driven through the two free functions the reorder arm moves the
-    /// host's per-seat state with, over a scratch folder: the files written
-    /// in the OLD layout, the way the arm now writes them, then moved by the
-    /// lifted order. Insert Track is the case that matters, because it is a
-    /// CYCLE - three rows shift and the free lane comes up into the gap - so
-    /// moving the files twice, or by the order instead of its inverse on the
-    /// way back, lands every one of them on the wrong row. At every seat the
-    /// file's owner must agree with what `inserts_loaded` says is seated
-    /// there, or the next rebuild of that bay reads another plugin's state.
+    /// The arm used to walk the live shelf renaming every moved row's
+    /// sidecars (its channel row, its folder-extra rack and its pedals) by the
+    /// lifted order, and its undo walked them back by the inverse: a cycle
+    /// moved twice, or by the order instead of its inverse, landed every file
+    /// on the wrong row. Every state file is named by its TRACK now
+    /// (`pstate-t3-c1-b1.bin`), so there is nothing to move, and the arm must
+    /// not reach for the shelf or the disk at all. A source scan, because a
+    /// `DesktopApp` cannot be built; `engine_bridge`'s
+    /// `a_reorder_and_its_undo_keep_every_state_by_its_track` drives the
+    /// reorder and its undo through the app and the bridge and counts the
+    /// shelf's filesystem calls: none.
     #[test]
-    fn a_reorders_sidecars_follow_it_and_its_undo_brings_them_back() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, seat_order, CHANNELS};
-        let dir = std::env::temp_dir()
-            .join(format!("tangent-reorder-sidecars-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch folder");
-        let bays = tangent_ui::recorder::INSERTS;
-        let mut loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
-        // Rows 2, 3 and 4 hold A, B and C - each with a plugin in its
-        // folder-extra rack and on its third pedal - and row 5 is free.
-        let seats = |row: usize, name: &str| {
-            [
-                (row, 0, name.to_owned()),
-                (folder_extra_seat(row), 1, format!("{name}-extra")),
-                (amp_pedal_seat(row, 2), 0, format!("{name}-pedal")),
-            ]
-        };
-        for (row, name) in [(2, "A"), (3, "B"), (4, "C")] {
-            for (seat, bay, owner) in seats(row, name) {
-                let mut out = owner.as_bytes().to_vec();
-                out.push(0);
-                out.extend_from_slice(b"as dialled");
-                std::fs::write(dir.join(sidecar_name(seat, bay)), out).expect("a sidecar");
-                loaded[seat * bays + bay] = Some(owner);
-            }
+    fn a_reorder_moves_no_state_file() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("if let Some(order) = self.app.take_desk_state_perm() {").expect("the reorder arm");
+        let arm = &src[at..at + src[at..].find("// **A pasted track's plugin STATE").expect("the arm's end")];
+        for moves in ["crate::shelf::", "std::fs::", "permute_insert_states_in", "write_state", "saved_state"] {
+            assert!(!arm.contains(moves), "the reorder arm reaches for `{moves}`");
         }
-        let owner = |seat: usize, bay: usize| -> Option<String> {
-            let raw = std::fs::read(dir.join(sidecar_name(seat, bay))).ok()?;
-            let split = raw.iter().position(|b| *b == 0)?;
-            Some(String::from_utf8_lossy(&raw[..split]).into_owned())
-        };
-        let agree = |loaded: &[Option<String>], rows: &[(usize, &str)], when: &str| {
-            for &(row, name) in rows {
-                for (seat, bay, want) in seats(row, name) {
-                    assert_eq!(owner(seat, bay).as_deref(), Some(want.as_str()), "{when}: seat {seat} bay {bay}'s file");
-                    assert_eq!(loaded[seat * bays + bay].as_deref(), Some(want.as_str()), "{when}: seat {seat} bay {bay}'s ledger");
+        assert!(!src.contains("fn permute_insert_states_in"), "the row-by-row file shuffle is back");
+    }
+
+    /// **No file of the host reads the UI's desk-width constants**
+    /// (W4-integrate (C)): a row loop reads the desk's own rows
+    /// (`track_ids`), a per-lane table is sized by the engine's
+    /// `LEGACY_LANES`, picks by the capture's own count, pads by the identity
+    /// grammar's, and a fixture by the frozen V32 map's. Every `.rs` under
+    /// `tangent/src`, its tests included, code only (a comment may name what
+    /// it is about).
+    #[test]
+    fn the_host_reads_none_of_the_uis_desk_width_constants() {
+        const BANNED: [&str; 11] = [
+            "CHANNELS",
+            "STRIPS",
+            "TOTAL_SEATS",
+            "INSERT_SPACE",
+            "INPUTS",
+            "MASTER_SEAT",
+            "MASTER_EXTRA_SEAT",
+            "FOLDER_EXTRA_SEATS",
+            "AMP_PEDAL_SEATS",
+            "BUS_EXTRA_SEATS",
+            "DRUM_PADS",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the source tree").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
                 }
             }
-        };
-        // Insert Track under row 1: the free lane comes up to row 2 and the
-        // three rows under it shift down one - `open_lane_below`'s order.
-        let mut order: Vec<usize> = (0..CHANNELS).filter(|c| *c != 5).collect();
-        order.insert(2, 5);
-        let full = seat_order(&order);
-        permute_loaded_rows(&mut loaded, &full);
-        permute_insert_states_in(Some(dir.clone()), &full);
-        agree(&loaded, &[(3, "A"), (4, "B"), (5, "C")], "after the insert");
-        assert_eq!(owner(2, 0), None, "the opened row kept a sidecar");
-        // The undo: what `undo_apply` hands the host is the inverse.
-        let mut back = vec![0usize; CHANNELS];
-        for (new, &old) in order.iter().enumerate() {
-            back[old] = new;
         }
-        let full = seat_order(&back);
-        permute_loaded_rows(&mut loaded, &full);
-        permute_insert_states_in(Some(dir.clone()), &full);
-        agree(&loaded, &[(2, "A"), (3, "B"), (4, "C")], "after its undo");
-        assert_eq!(owner(5, 0), None, "the free lane kept a sidecar after the undo");
-        let _ = std::fs::remove_dir_all(&dir);
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 40, "the walk found {} files", files.len());
+        let mut found = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("a source file");
+            let code: String =
+                text.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+            // A path, `recorder::NAME`, however it is qualified in front.
+            for name in BANNED {
+                let needle = format!("recorder::{name}");
+                for (at, _) in code.match_indices(&needle) {
+                    let after = code[at + needle.len()..].chars().next();
+                    if !after.is_some_and(is_word) {
+                        found.push(format!("{}: {needle}", file.display()));
+                    }
+                }
+            }
+            // And a `use` list that brings one in bare.
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("use tangent_ui::recorder::{") {
+                let list = &rest[at..];
+                let list = &list[..list.find('}').unwrap_or(list.len())];
+                for item in list.split(|c: char| !is_word(c)) {
+                    if BANNED.contains(&item) {
+                        found.push(format!("{}: use .. {item}", file.display()));
+                    }
+                }
+                rest = &rest[at + 1..];
+            }
+        }
+        assert!(found.is_empty(), "the UI's desk width is read:\n{}", found.join("\n"));
+    }
+
+    /// **The host works out no seat and builds no lane mask** (W4-integrate
+    /// (C)): `desktop.rs` and `engine_bridge.rs` name every bay by its
+    /// identity and every lane by its track, through the bridge
+    /// (`engine_bay`, `app_seat_of`, `slot_key`, `row_armed`): no seat
+    /// function of the old fixed desk, no strip index turned into a seat, no
+    /// clamp onto the desk's edge, and no bit per lane in a word, which is
+    /// the arithmetic that stops at thirty-two. The production code of each,
+    /// code only; the app's own words are read through the bridge's one door
+    /// (`row_bit`), and a mask of capture PICKS (a fixed table) is not a lane
+    /// mask.
+    #[test]
+    fn the_host_works_out_no_seat_and_builds_no_lane_mask() {
+        let seat_arithmetic = [
+            "seat_order(",
+            "bays_at(",
+            "pad_rack_index",
+            "folder_extra_seat",
+            "amp_pedal_seat",
+            "bus_extra_seat",
+            "Strip::all()",
+            ".index()",
+            ".min(CHANNELS - 1)",
+            ".min(31)",
+            ".min(63)",
+        ];
+        let lane_masks = ["<< ch", "<< lane", "<< row", "<< slot", "fold(0u32", "fold(0u64", "1u32 <<", "1u64 <<"];
+        for (file, whole, extra) in [
+            ("desktop.rs", include_str!("desktop.rs"), &["armed_mask()"][..]),
+            ("engine_bridge.rs", include_str!("engine_bridge.rs"), &[][..]),
+        ] {
+            let src = &whole[..whole.find("\nmod tests {").unwrap_or(whole.len())];
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let seat_bay = code.match_indices("seat_bay(").any(|(at, _)| {
+                    !code[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                });
+                for needle in seat_arithmetic.iter().chain(lane_masks.iter()).chain(extra.iter()) {
+                    assert!(
+                        !code.contains(needle),
+                        "{file}:{}: `{needle}` - a seat worked out or a lane masked by hand: {}",
+                        n + 1,
+                        line.trim()
+                    );
+                }
+                assert!(!seat_bay, "{file}:{}: the old desk's `seat_bay`: {}", n + 1, line.trim());
+            }
+        }
     }
 
     /// **A reorder leaves the saved project's shelf alone** - the project
@@ -30515,7 +30554,8 @@ mod tests {
         assert!(shelved < built, "the template is built before the live knobs are on the shelf it mirrors");
         let helper = between("fn build_template(", "\n}\n");
         assert!(
-            helper.contains("app.write_template_into(stage)") && helper.contains("mirror_sidecars(shelf, &state)"),
+            helper.contains("app.write_template_into(stage)")
+                && helper.contains("crate::shelf::mirror_shelf(shelf, &crate::shelf::ShelfNames::Pstate, &state)"),
             "a template is no longer written from memory with its shelf"
         );
 
@@ -30708,7 +30748,7 @@ mod tests {
             }
             roads.push(road);
         }
-        for road in ["fn queue_warm", "fn land_decodes", "fn reload_clips", "pub fn furnish_offline_with"] {
+        for road in ["fn queue_warm", "fn land_decodes", "fn reload_clips", "pub fn full_build_with"] {
             assert!(
                 roads.iter().any(|r| r == road),
                 "`{road}` no longer resolves a clip's file, so this scan proves nothing about it"
@@ -31071,8 +31111,8 @@ mod tests {").expect("the tests module")];
     /// two an insertion that carried a doc and its gate off onto the newcomer,
     /// four recorder-only code added beside gated neighbours without the gate.
     /// The rest of the list is every other gate an insertion once carried off,
-    /// and the shuffles that call `insert_state_path`, which is gated now that
-    /// its own `#[cfg]` is back on it.
+    /// and the plugin-state shelf (`mod shelf;`) with the host's two doors
+    /// onto it, whose every caller is the recorder's.
     ///
     /// Every item is read before anything panics, so one run names each
     /// breakage.
@@ -31106,7 +31146,7 @@ mod tests {").expect("the tests module")];
             .find("fn the_minimal_builds_gates_sit_on_their_own_items")
             .expect("this test");
         let mut broken: Vec<String> = Vec::new();
-        for m in ["mod transient;", "mod warp;"] {
+        for m in ["mod transient;", "mod warp;", "mod shelf;"] {
             if !gated(main, m, usize::MAX) {
                 broken.push(format!("main.rs: `{m}` is compiled into Minimal"));
             }
@@ -31117,10 +31157,9 @@ mod tests {").expect("the tests module")];
             "fn warp_sig(",
             "fn arm_stem_tap(",
             "fn insert_walk(",
-            "fn insert_state_path(",
-            "fn shift_insert_states_for_v14(",
-            "fn shift_insert_states_for_v19(",
-            "fn shift_insert_states_for_v20(",
+            "fn write_bay_state(",
+            "fn forget_displaced(",
+            "fn desk_insert_state(",
             "const RATE_ASK_EVERY:",
             "attack_cache: std::collections::HashMap::new(),",
             "quantize_marked: None,",
@@ -31129,11 +31168,6 @@ mod tests {").expect("the tests module")];
             if !gated(desk, item, me) {
                 broken.push(format!("desktop.rs: `{item}` is compiled into Minimal"));
             }
-        }
-        if gated(desk, "fn saved_insert_state(", me) != gated(desk, "fn sidecar_owner_and_state(", me) {
-            broken.push(
-                "`saved_insert_state` calls `sidecar_owner_and_state`: gate both or neither".to_owned(),
-            );
         }
         let stretch_doc = "/// The stretch cache's key for a clip";
         let stem_doc = "/// **Arm a pass's stem tap";
@@ -31146,8 +31180,8 @@ mod tests {").expect("the tests module")];
         if !doc(desk, "fn arm_stem_tap(", me, stem_doc) {
             broken.push("arm_stem_tap lost its doc".to_owned());
         }
-        if doc(desk, "fn frozen_lane_mask(", me, stem_doc) {
-            broken.push("frozen_lane_mask wears arm_stem_tap's doc".to_owned());
+        if doc(desk, "fn live_punches(", me, stem_doc) {
+            broken.push("live_punches wears arm_stem_tap's doc".to_owned());
         }
         assert!(broken.is_empty(), "{} breakage(s): {}", broken.len(), broken.join("; "));
     }
@@ -31449,7 +31483,7 @@ mod tests {").expect("the tests module")];
         let after = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
         eprintln!("per-frame strings: before {before:.1} us, after {after:.1} us (sink {sink})");
         // The comp walk.
-        let mut ledger: Vec<Option<String>> = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        let mut ledger: Vec<Option<String>> = vec![None; tangent_ui::desk_legacy::V32_INSERT_SPACE];
         for i in [3usize, 7, 12, 40, 4149 * 3] {
             ledger[i] = Some(crate::builtin_fx::COMP_PATH.to_owned());
         }
@@ -31502,11 +31536,25 @@ mod tests {").expect("the tests module")];
             &src[at..end]
         };
         let body = body_of("fn push_monitor_settings(&mut self)");
-        let sync = body.find("self.bridge.sync(&self.app, e)").expect("the frame no longer syncs the bridge");
+        let sync = body.find("self.bridge.sync_with(&self.app, e,").expect("the frame no longer syncs the bridge");
         let took = body.find("self.bridge.desk()").expect("the frame builds its own desk beside the bridge's");
         assert!(sync < took, "the desk is taken from the bridge before it was built");
         assert_eq!(body.matches("self.app.desk()").count(), 1, "the desk is built more than once a frame");
-        assert!(body.contains("if primed {"), "a fresh engine no longer forgets the pads");
+        assert!(body.contains("if synced.primed {"), "a fresh engine no longer forgets the pads");
+        // **And a leaving lane is written down and forgotten** by the hook
+        // the sync calls while its plugins are alive, and what it forgot is
+        // taken back for a lane its track took back before it left.
+        assert!(
+            body.contains("Self::forget_lane(ledger, &shelf, e, id, lane)\n")
+                && body.contains("let shelf = crate::shelf::global_dir();"),
+            "a leaving lane's bays are not written down on the live shelf"
+        );
+        let reclaim = body.find("Self::reclaim_lanes(&mut self.recorder.inserts_loaded, &synced);");
+        assert!(
+            reclaim.is_some_and(|r| sync < r && r < took),
+            "a lane taken back before it left does not get its ledger entries back in the frame it is reclaimed"
+        );
+        assert!(body.contains("if !synced.moved.is_empty() {"), "a lane that came or went is not owed its lists again");
         let start = body_of("fn start_engine(&mut self");
         let bump = start
             .find("self.engine_epoch = self.engine_epoch.wrapping_add(1);")
@@ -31536,20 +31584,25 @@ mod tests {").expect("the tests module")];
             .find("if !self.recorder.session.is_recording() {")
             .expect("the meter's take gate");
         let gate_end = gate + body[gate..].find("\n        }\n").expect("the gate's end");
-        let push = body.find("self.bridge.sync(").expect("the bridge is not synced from the live push at all");
+        let push = body.find("self.bridge.sync_with(").expect("the bridge is not synced from the live push at all");
         assert!(
             !(gate..gate_end).contains(&push),
             "the bridge (and polarity with it) is pushed only while no take runs"
         );
+        // Polarity rides the plan, built from the app every frame the sync
+        // runs, with no take gate of its own anywhere on the road.
         let bridge = include_str!("engine_bridge.rs");
         let bridge = &bridge[..bridge.find("#[cfg(test)]\nmod tests {").expect("the bridge's tests")];
-        let at = bridge.find("pub fn sync(&mut self").expect("Bridge::sync");
-        let sync = &bridge[at..at + bridge[at..].find("\n    }\n").expect("its end")];
-        assert!(
-            sync.contains("e.set_strip_phase(app.strip_phase());"),
-            "polarity is not pushed to the live engine at all"
-        );
-        assert!(!sync.contains("is_recording"), "the sync holds something back under a take");
+        let body_of = |name: &str| {
+            let at = bridge.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            &bridge[at..at + bridge[at..].find("\n    }\n").expect("its end")]
+        };
+        let inputs = body_of("fn plan_inputs(");
+        assert!(inputs.contains("let phase = app.strip_phase();"), "polarity is not read for the plan at all");
+        assert!(inputs.contains(".with(F::PHASE, row_bit(phase, row))"), "a lane's polarity is not planned");
+        for road in ["fn sync_shape(", "fn plan_inputs(", "fn publish("] {
+            assert!(!body_of(road).contains("is_recording"), "`{road}` holds something back under a take");
+        }
     }
 
     /// **The frame log's percentiles**: empty is zero, `q = 1` is the max,
@@ -31673,13 +31726,18 @@ mod tests {").expect("the tests module")];
         assert!(reload.contains("self.app.frozen_lanes().to_vec()"), "the frozen file is no longer placed");
         // The render and the per-frame push are the bridge's now: the
         // furnishing every export, freeze and probe is built by, and the
-        // sync the live push hands its frame to.
+        // sync the live push hands its frame to. A freeze is of a TRACK, and
+        // its job carries the track it lands on.
         let render = body_of("fn start_offline_render(");
         assert!(
-            render.contains("Some(lane) => crate::engine_bridge::BuildFor::Freeze("),
+            render.contains("Some(id) => crate::engine_bridge::BuildFor::Freeze(id)"),
             "a freeze is not furnished as a freeze"
         );
-        assert!(render.contains("FreezeJob { lane, rel_path"), "the render lost its freeze job");
+        assert!(render.contains("FreezeJob { id, lane, rel_path"), "the render lost its freeze job");
+        assert!(
+            body_of("fn finish_freeze(&mut self").contains("match self.app.row_of(job.id)"),
+            "a freeze lands on a row rather than on its track"
+        );
         let tick = body_of("fn tick_offline_bounce(&mut self");
         assert!(tick.contains("offline_stem_lead(job.lane)"), "the tick no longer reads the lead");
         assert!(tick.contains("write_interleaved(&fold[drop * per..])"), "the lead is no longer cut");
@@ -31691,24 +31749,27 @@ mod tests {").expect("the tests module")];
             let end = bridge[at + 1..].find("\n}\n").map_or(bridge.len(), |n| at + 1 + n);
             &bridge[at..end]
         };
-        let furnish = bridge_fn("pub fn furnish_offline_with(");
+        // The freeze neutralises its lane: unity and centre for its own
+        // fader and pan, every mute and solo on the desk off, and its own
+        // fader rides left out of the curves.
+        let furnish = bridge_fn("pub fn full_build_with(");
+        assert!(furnish.contains("tangent_ui::automation::AutoParam::Mute"), "the render lost the lane's own rides");
+        let levels = bridge_fn("fn store_levels(");
+        assert!(levels.contains("if freeze == Some(row) {\n                (1.0, 0.0)"), "the frozen lane is not made pre-fader");
+        let inputs = bridge_fn("fn plan_inputs(");
         for needle in [
-            "e.set_channel_gain(lane, 1.0)",
-            "e.set_channel_pan(lane, 0.0)",
-            "desk.soloed.iter_mut()",
-            "tangent_ui::automation::AutoParam::Mute",
+            // Nothing may silence the lane being frozen.
+            "let soloed = |row: usize| {\n            freeze.is_none()",
+            "let muted = |row: usize| freeze.is_none()",
+            // The engine is told what is frozen, a frozen lane listens to
+            // nothing, and its built-ins stand down with its rack.
+            ".with(F::FROZEN, is_frozen)",
+            ".with(F::MIDI_OFF, row_bit(deaf, row) || is_frozen)",
+            "first == Some(tangent_ui::dialogs::BUILTIN_PATH) && !is_frozen",
+            "first == Some(tangent_ui::dialogs::KEYS_PATH) && !is_frozen",
         ] {
-            assert!(furnish.contains(needle), "the render lost `{needle}`");
+            assert!(inputs.contains(needle), "the plan lost `{needle}`");
         }
-        let routes = bridge_fn("fn publish_freeze_and_grain(");
-        assert!(routes.contains("e.set_frozen(frozen_lane_mask("), "the engine is not told what is frozen");
-        let push = bridge_fn("impl Bridge {");
-        assert!(push.contains("builtin_mask & thawed"), "a frozen built-in still renders");
-        assert!(push.contains("e.set_midi_off(live_midi_off(app, armed));"), "the live push no longer shuts lanes");
-        assert!(
-            bridge_fn("fn live_midi_off(").contains("u64::from(frozen_lane_mask("),
-            "a frozen lane still listens"
-        );
     }
 
     /// **A repeating clip's tail, as the blade now makes it, plays on from
@@ -31772,10 +31833,12 @@ mod tests {").expect("the tests module")];
         let at = src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state");
         let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
         let body = &src[at..end];
-        assert!(body.contains("for &i in &self.comp_rows {"), "the needle loop no longer walks the index");
+        assert!(body.contains("for &(rack, bay) in &self.comp_rows {"), "the needle loop no longer walks the index");
+        let walk = body.find("self.comp_rows.extend(").expect("the index's rebuild");
+        let rebuild = &body[body[..walk].rfind("if self.comp_rows_stale").expect("its gate")..walk];
         assert!(
-            !body.contains("for (i, loaded) in self.recorder.inserts_loaded.iter().enumerate()"),
-            "the per-frame walk over the whole ledger is back"
+            rebuild.contains("|| backstop"),
+            "the walk over the whole ledger is no longer gated: it runs every frame"
         );
         let stale = body.find("self.comp_rows_stale = true;").expect("nothing marks the index stale");
         let gate = &body[stale.saturating_sub(120)..stale];
@@ -31957,7 +32020,7 @@ mod tests {").expect("the tests module")];
     /// dies**, and this test exists because the first draft did the latter and
     /// nothing noticed.
     ///
-    /// `self.recorder.inserts_loaded = vec![None; INSERT_SPACE]` appears four
+    /// The ledger's wipe (`self.recorder.inserts_loaded = ...`) appears four
     /// times in this file. A patch anchored on that line landed the arming in
     /// `fill_recorder_state`'s FAULT branch, three lines after
     /// `self.recorder.engine = None` — so `opened_on` was unconditionally
@@ -32031,7 +32094,7 @@ mod tests {").expect("the tests module")];
         );
         let retire = body("fn retire_engine(&mut self)");
         let save = retire
-            .find("self.save_plugin_states_as_loaded_for(None);")
+            .find("self.save_plugin_states_as_loaded();")
             .expect("`retire_engine` no longer writes the plugins' settings down");
         let gone = retire
             .find("self.recorder.engine = None;")
@@ -34800,7 +34863,7 @@ mod tests {").expect("the tests module")];
     /// for a file that is not there" — and `bind_insert_ir` never looked at
     /// the file. So a right-click Delete deleted nothing and instead WROTE
     /// `"\u{1f}delete\u{1f}/…/Holmes Plate.wav"` into the bay's `ir_path`,
-    /// through `write_insert_state`, onto the disk: the bay that had been
+    /// through the bay's state file, onto the disk: the bay that had been
     /// playing an impulse came up empty the next time the project was opened,
     /// while the confirmation box said in so many words that the sound would
     /// not change.
@@ -35626,8 +35689,8 @@ mod tests {").expect("the tests module")];
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains("set_audition(strip, key)"),
-            "the audition no longer reaches the strip's own door"
+            code.contains("self.bridge.lane(strip)") && code.contains("set_audition(l.slot, key)"),
+            "the audition no longer reaches the strip's own door, at its track's lane"
         );
         for road in ["send_midi", "capture_app_midi", "note_event"] {
             assert!(
@@ -35756,15 +35819,17 @@ mod tests {").expect("the tests module")];
 #[cfg(all(test, feature = "recorder"))]
 mod sidecar_walk_probe {
     use super::*;
-    use tangent_ui::recorder::{INSERTS, INSERT_SPACE, TOTAL_SEATS};
+    use crate::shelf::{fs_calls as shelf_calls, mirror_shelf, ShelfNames};
+    use tangent_ui::desk_id::{state_file_name, Node, Rack, SeatBay, TrackId};
+    use tangent_ui::desk_legacy::{identity_ids, V32_INSERT_SPACE, V32_TOTAL_SEATS};
 
-    /// **`IVORY_SETTINGS_PATH` and `SIDECAR_FS_CALLS` are both process-global,
-    /// and tests are not.** Same reason and same shape as `SETTINGS_PATH_ENV`
-    /// in `settings.rs`: cargo runs these on parallel threads in ONE process,
-    /// so a count read here would otherwise include another test's walk, and a
-    /// settings path set here would be taken away under it. Shared with
-    /// `tests::a_displaced_plugin_state_survives_the_write_that_buried_it`,
-    /// which moves the settings path too.
+    /// **`IVORY_SETTINGS_PATH` is process-global, and tests are not.** Same
+    /// reason and same shape as `SETTINGS_PATH_ENV` in `settings.rs`: cargo
+    /// runs these on parallel threads in ONE process, so a settings path set
+    /// here would be taken away under another test. The one test below that
+    /// reads the LIVE shelf (the export mirror's) moves it under this lock.
+    /// The shelf's filesystem-call count needs none: it is kept per thread
+    /// (`shelf::fs_calls`), so a count read here is this test's alone.
     pub(super) static SIDECAR_ENV: Mutex<()> = Mutex::new(());
 
     /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
@@ -35785,47 +35850,48 @@ mod sidecar_walk_probe {
         dir
     }
 
-    /// A shelf with two seats occupied — one at the bottom of the seat space
-    /// and one at the very top, so a walk that merely stops early cannot pass
-    /// for a walk that never started.
-    fn two_seat_shelf(dir: &std::path::Path) -> [(usize, usize); 2] {
-        let seats = [(0usize, 0usize), (TOTAL_SEATS - 1, INSERTS - 1)];
-        for (seat, bay) in seats {
-            std::fs::write(dir.join(sidecar_name(seat, bay)), b"knobs").expect("seed");
+    /// A shelf with two bays' states in it — a track's first bay, and the
+    /// last pad bay of a track minted far past anything this desk holds — so
+    /// a read that merely stops early cannot pass for one that never walked.
+    fn two_seat_shelf(dir: &std::path::Path) -> [SeatBay; 2] {
+        let bays = [
+            SeatBay::new(Node::Track(TrackId(0)), Rack::Chain(0), 0),
+            SeatBay::new(Node::Track(TrackId(65_535)), Rack::Pad(127), 2),
+        ];
+        for sb in bays {
+            std::fs::write(dir.join(state_file_name(sb)), b"knobs").expect("seed");
         }
-        seats
+        bays
     }
 
     fn fs_calls<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let before = SIDECAR_FS_CALLS.load(Relaxed);
+        let before = shelf_calls();
         let out = f();
-        (out, SIDECAR_FS_CALLS.load(Relaxed) - before)
+        (out, shelf_calls() - before)
     }
 
     /// **A two-seat session must not pay for four thousand empty ones.**
     ///
     /// Opening a project mirrors the shelf twice — the outgoing session's
     /// states out to its folder, the incoming one's back in — and the per-seat
-    /// walk charged two filesystem calls for every one of `INSERT_SPACE`'s
-    /// seat/bay pairs whether or not anything had ever sat there. On a Dropbox
-    /// or network volume that is the difference between an open and a freeze,
-    /// which is why the bound is asserted rather than admired.
+    /// walk charged two filesystem calls for every one of the seat/bay pairs
+    /// whether or not anything had ever sat there. On a Dropbox or network
+    /// volume that is the difference between an open and a freeze, which is
+    /// why the bound is asserted rather than admired. A shelf named by
+    /// identity has no seat space to walk at all; the legacy names a marked
+    /// document's folder may still wear are one more directory read, not a
+    /// walk of its era's seats.
     #[test]
     fn a_two_seat_project_does_not_walk_the_whole_seat_space() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let from = scratch("bound-from");
         let to = scratch("bound-to");
-        let seats = two_seat_shelf(&from);
+        let bays = two_seat_shelf(&from);
 
-        let ((), calls) = fs_calls(|| mirror_sidecars(&from, &to));
+        let ((), calls) = fs_calls(|| mirror_shelf(&from, &ShelfNames::Pstate, &to));
 
         // The work itself still happened.
-        for (seat, bay) in seats {
-            assert!(
-                to.join(sidecar_name(seat, bay)).is_file(),
-                "seat {seat} bay {bay} did not arrive"
-            );
+        for sb in bays {
+            assert!(to.join(state_file_name(sb)).is_file(), "{sb} did not arrive");
         }
         // Generous on purpose: the point is the ORDER of magnitude, not a
         // number that has to be edited whenever a directory read grows an
@@ -35835,43 +35901,65 @@ mod sidecar_walk_probe {
             calls < 64,
             "a two-seat mirror made {calls} filesystem calls; the per-seat walk \
              made {} and that is the thing this stops",
-            INSERT_SPACE * 2
+            V32_INSERT_SPACE * 2
+        );
+        // A legacy folder of the widest era, read through its provenance.
+        let legacy = scratch("bound-legacy");
+        for name in ["insert-state-0-0.bin", "insert-state-4391-2.bin"] {
+            std::fs::write(legacy.join(name), b"\0knobs").expect("seed");
+        }
+        let names = ShelfNames::for_marker(Some(tangent_ui::desk_lift::DeskEra::V32));
+        let ((), calls) = fs_calls(|| mirror_shelf(&legacy, &names, &to));
+        assert!(calls < 64, "a two-file legacy folder cost {calls} filesystem calls");
+        assert!(to.join(state_file_name(bays[0])).is_file(), "the legacy file did not arrive at its bay");
+        for dir in [from, to, legacy] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **The correctness the shortcut must not buy its speed with.**
+    ///
+    /// A bay that HELD a plugin last save and is empty now still has a state
+    /// file sitting in the destination shelf, and it has to go: left there it
+    /// is handed to whatever lands in that bay next, which is the "last
+    /// session's reverb tail in this session's fresh plugin" the mirror exists
+    /// to prevent. "Skip the empty bays" is exactly the shortcut that would
+    /// break this, in BOTH directions — hence keying on what the two shelves
+    /// actually hold rather than on what the desk says is occupied.
+    #[test]
+    fn a_seat_that_became_empty_loses_its_sidecar() {
+        let from = scratch("stale-from");
+        let to = scratch("stale-to");
+        let [first, _] = two_seat_shelf(&from);
+        // The destination remembers a bay the source has since given up,
+        // and one it still holds with different bytes.
+        let gone = to.join(state_file_name(SeatBay::new(Node::Track(TrackId(7)), Rack::Chain(0), 1)));
+        std::fs::write(&gone, b"last week's reverb").expect("seed");
+        std::fs::write(to.join(state_file_name(first)), b"stale").expect("seed");
+
+        mirror_shelf(&from, &ShelfNames::Pstate, &to);
+
+        assert!(!gone.exists(), "a state file for a now-empty bay survived");
+        assert_eq!(
+            std::fs::read(to.join(state_file_name(first))).expect("read"),
+            b"knobs",
+            "an occupied bay's state file was not overwritten"
         );
         let _ = std::fs::remove_dir_all(&from);
         let _ = std::fs::remove_dir_all(&to);
     }
 
-    /// **The correctness the shortcut must not buy its speed with.**
-    ///
-    /// A seat that HELD a plugin last save and is empty now still has a
-    /// sidecar sitting in the destination shelf, and it has to go: left there
-    /// it is handed to whatever lands in that seat next, which is the "last
-    /// session's reverb tail in this session's fresh plugin" the mirror exists
-    /// to prevent. "Skip the empty seats" is exactly the shortcut that would
-    /// break this, in BOTH directions — hence keying on what the two shelves
-    /// actually hold rather than on what the desk says is occupied.
-    #[test]
-    fn a_seat_that_became_empty_loses_its_sidecar() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let from = scratch("stale-from");
-        let to = scratch("stale-to");
-        two_seat_shelf(&from);
-        // The destination remembers a seat the source has since given up,
-        // and one it still holds with different bytes.
-        let gone = to.join(sidecar_name(7, 1));
-        std::fs::write(&gone, b"last week's reverb").expect("seed");
-        std::fs::write(to.join(sidecar_name(0, 0)), b"stale").expect("seed");
-
-        mirror_sidecars(&from, &to);
-
-        assert!(!gone.exists(), "a sidecar for a now-empty seat survived");
+    /// Channel three's FOLDER-extra rack, first bay: seat 4136 of the frozen
+    /// V32 map, four thousand seats past the 108-bay head, which is where the
+    /// owner's Brusfri really sits.
+    fn brusfri_bay() -> SeatBay {
+        let sb = SeatBay::new(Node::Track(TrackId(3)), Rack::Chain(1), 0);
         assert_eq!(
-            std::fs::read(to.join(sidecar_name(0, 0))).expect("read"),
-            b"knobs",
-            "an occupied seat's sidecar was not overwritten"
+            crate::engine_bridge::seat_bay_at(&identity_ids(32), 4136, 0),
+            Some(sb),
+            "fixture: seat 4136 is not channel three's folder-extra rack"
         );
-        let _ = std::fs::remove_dir_all(&from);
-        let _ = std::fs::remove_dir_all(&to);
+        sb
     }
 
     /// **The loss the owner reported, at the seat he reported it from.**
@@ -35882,16 +35970,15 @@ mod sidecar_walk_probe {
     ///
     /// A launch with nothing to reopen adopts the default template and then
     /// mirrors the template's own `state/` onto the live shelf, and a shelf
-    /// that does not EXIST mirrors an empty one - which clears every sidecar
+    /// that does not EXIST mirrors an empty one - which clears every state
     /// the last session left. That is deliberate and it is what New depends
     /// on. It is also, for a template that NAMES a plugin and carries no
     /// state for it, a plugin handed its defaults at every single launch: a
     /// learned noise profile is not a default anybody can live with.
     ///
-    /// The seat is the one his Brusfri really sits in - channel three's
-    /// FOLDER-extra rack, seat 4136 of the sparse tail, four thousand seats
-    /// past the 108-bay head - because a shelf road that works only for the
-    /// head is a road that misses exactly this desk.
+    /// The bay is the one his Brusfri really sits in - channel three's
+    /// FOLDER-extra rack - because a shelf road that works only for the head
+    /// is a road that misses exactly this desk.
     #[test]
     fn a_template_with_no_state_shelf_hands_its_plugins_their_defaults() {
         let shelf = scratch("no-shelf-live");
@@ -35901,17 +35988,16 @@ mod sidecar_walk_probe {
         std::fs::create_dir_all(template.join("media")).expect("template media");
         std::fs::write(template.join(tangent_ui::arrangement::DOC_NAME), b"{}")
             .expect("template document");
-        let seat = tangent_ui::recorder::folder_extra_seat(3);
-        let learned = shelf.join(sidecar_name(seat, 0));
+        let sb = brusfri_bay();
+        let learned = shelf.join(state_file_name(sb));
         std::fs::write(&learned, b"the noise Brusfri learned").expect("seed");
 
-        mirror_sidecars(&template.join("state"), &shelf);
+        mirror_shelf(&template.join("state"), &ShelfNames::Pstate, &shelf);
 
         assert!(
             !learned.exists(),
-            "seat {seat}'s sidecar survived, so this is no longer the road \
-             that loses the noise profile and the fix above it is aimed at \
-             the wrong thing"
+            "{sb}'s state survived, so this is no longer the road that loses \
+             the noise profile and the fix above it is aimed at the wrong thing"
         );
         let _ = std::fs::remove_dir_all(&shelf);
         let _ = std::fs::remove_dir_all(&template);
@@ -35924,9 +36010,9 @@ mod sidecar_walk_probe {
     /// the live knobs into its `state/`). The learned profile arrives on the
     /// live shelf and the plugin comes back with it.
     ///
-    /// **The leak is still shut.** A seat the template does NOT name still
-    /// loses its sidecar, which is the whole reason the mirror clears: "the
-    /// last session's reverb tail must not leak into this one's fresh
+    /// **The leak is still shut.** A bay the template does NOT name still
+    /// loses its state file, which is the whole reason the mirror clears:
+    /// "the last session's reverb tail must not leak into this one's fresh
     /// plugin." Both halves are asserted here, because a fix that kept the
     /// profile by keeping everything would have traded one fault for the one
     /// the mirror was written to prevent.
@@ -35939,12 +36025,9 @@ mod sidecar_walk_probe {
         std::fs::write(session.join(tangent_ui::arrangement::DOC_NAME), b"{}")
             .expect("session document");
         std::fs::create_dir_all(session.join("state")).expect("session shelf");
-        let seat = tangent_ui::recorder::folder_extra_seat(3);
-        std::fs::write(
-            session.join("state").join(sidecar_name(seat, 0)),
-            b"the noise Brusfri learned",
-        )
-        .expect("seed");
+        let sb = brusfri_bay();
+        std::fs::write(session.join("state").join(state_file_name(sb)), b"the noise Brusfri learned")
+            .expect("seed");
 
         let template = scratch("shelf-template");
         let _ = std::fs::remove_dir_all(&template);
@@ -35952,21 +36035,20 @@ mod sidecar_walk_probe {
 
         // The live shelf as a launch finds it: last session's states.
         let shelf = scratch("shelf-live");
-        let stale = shelf.join(sidecar_name(0, 0));
+        let stale = shelf.join(state_file_name(SeatBay::new(Node::Track(TrackId(0)), Rack::Chain(0), 0)));
         std::fs::write(&stale, b"last session's reverb tail").expect("seed");
 
-        mirror_sidecars(&template.join("state"), &shelf);
+        mirror_shelf(&template.join("state"), &ShelfNames::Pstate, &shelf);
 
         assert_eq!(
-            std::fs::read(shelf.join(sidecar_name(seat, 0))).ok().as_deref(),
+            std::fs::read(shelf.join(state_file_name(sb))).ok().as_deref(),
             Some(&b"the noise Brusfri learned"[..]),
-            "the template carried a state for seat {seat} and the adopt did \
-             not put it on the live shelf, so the folder's Brusfri still \
-             comes up at its defaults"
+            "the template carried a state for {sb} and the adopt did not put it \
+             on the live shelf, so the folder's Brusfri still comes up at its defaults"
         );
         assert!(
             !stale.exists(),
-            "a seat the template does not name kept its sidecar - the last \
+            "a bay the template does not name kept its state - the last \
              session's reverb tail is leaking into this one's fresh plugin"
         );
         let _ = std::fs::remove_dir_all(&session);
@@ -35974,51 +36056,117 @@ mod sidecar_walk_probe {
         let _ = std::fs::remove_dir_all(&shelf);
     }
 
-    /// **A sidecar from outside today's seat space is left exactly alone.**
+    /// **A file that is not exactly a state of this build's is left exactly
+    /// alone.**
     ///
-    /// The per-seat walk was bounded by `TOTAL_SEATS`/`INSERTS`, so a file
-    /// named for a seat only a bigger build ever had was neither copied nor
-    /// deleted. That is what makes a downgrade survivable — the seat space has
-    /// grown four times and each shuffle renames into the numbers of its own
-    /// era — so the bound is behaviour, not an accident of the loop. The
-    /// settings file shares this folder, which is the other reason a shelf
-    /// read cannot simply take everything it finds.
+    /// The live shelf shares its folder with the settings file, and a
+    /// project's `state/` may still hold the legacy sidecars an older build
+    /// wrote (`insert-state-S-B.bin`): those are the way back to a release
+    /// build, and a new build never renames or deletes one (design 6.6). So
+    /// a mirror acts only on names `state_file_name` would write: a legacy
+    /// sidecar is neither copied by a shelf read by identity nor deleted from
+    /// the destination, a spelling of a bay that is not the canonical one
+    /// (`t03`, a fourth bay) is neither copied nor deleted, and the settings
+    /// file is not eaten.
     #[test]
     fn a_sidecar_from_another_era_is_neither_copied_nor_deleted() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let from = scratch("era-from");
         let to = scratch("era-to");
         two_seat_shelf(&from);
-        let far_out = sidecar_name(TOTAL_SEATS + 9, 0);
-        let too_many_bays = sidecar_name(0, INSERTS + 1);
-        std::fs::write(from.join(&far_out), b"tomorrow").expect("seed");
-        std::fs::write(to.join(&too_many_bays), b"yesterday").expect("seed");
+        let legacy_from = "insert-state-3-0.bin";
+        let legacy_to = "insert-state-7-1.bin";
+        let padded = "pstate-t03-c0-b0.bin";
+        let fourth_bay = "pstate-t0-c0-b3.bin";
+        std::fs::write(from.join(legacy_from), b"/x/A.vst3\0yesterday").expect("seed");
+        std::fs::write(from.join(padded), b"/x/A.vst3\0padded").expect("seed");
+        std::fs::write(to.join(legacy_to), b"/x/B.vst3\0the way back").expect("seed");
+        std::fs::write(to.join(fourth_bay), b"/x/B.vst3\0nobody's").expect("seed");
         std::fs::write(to.join("settings.json"), b"{}").expect("seed");
 
-        mirror_sidecars(&from, &to);
+        mirror_shelf(&from, &ShelfNames::Pstate, &to);
 
-        assert!(!to.join(&far_out).exists(), "an out-of-range seat was copied");
-        assert!(
-            to.join(&too_many_bays).exists(),
-            "an out-of-range bay's sidecar was deleted"
+        assert!(!to.join(legacy_from).exists(), "a legacy sidecar was copied by a shelf read by identity");
+        assert!(!to.join(padded).exists(), "a non-canonical state name was copied");
+        assert_eq!(
+            std::fs::read(to.join(legacy_to)).ok().as_deref(),
+            Some(&b"/x/B.vst3\0the way back"[..]),
+            "a legacy sidecar in the destination was deleted or rewritten"
         );
+        assert!(to.join(fourth_bay).exists(), "a file no state is named was deleted");
         assert!(to.join("settings.json").exists(), "the settings file was eaten");
         let _ = std::fs::remove_dir_all(&from);
         let _ = std::fs::remove_dir_all(&to);
     }
 
+    /// **A leaving lane's plugin states are written by its TRACK, while its
+    /// plugins live, and the ledger forgets that lane alone** (W4-integrate,
+    /// done-when "Removal"; the bridge's half, that the hook is called before
+    /// the lane goes, is `engine_bridge`'s
+    /// `a_removed_tracks_states_go_to_the_shelf_first_and_its_undo_restores_them`).
+    /// A comp dialled on the lane at slot 2, another on slot 3's: the hook
+    /// writes `pstate-t40-c0-b0.bin` (the track's bay, whatever row it stood
+    /// on) holding what the comp is PLAYING, owned by the comp; it forgets
+    /// slot 2's bay and keeps slot 3's; and it drops no plugin, because the
+    /// lane takes its plugins home and the callback may still be running
+    /// them. Onto a scratch shelf, which is why the hook takes the folder.
+    #[test]
+    fn a_leaving_lanes_states_are_written_by_its_track_while_its_plugins_live() {
+        use crate::desk_plan::Slot;
+        use crate::engine_bridge::{lane_bay, LaneAt};
+        let shelf = scratch("forget-lane");
+        let comp = crate::builtin_fx::COMP_PATH;
+        let spec = crate::builtin_fx::spec_for(comp).expect("the comp has a spec");
+        let mut v = spec.defaults();
+        v[1] = 1.0;
+        let dial = crate::builtin_fx::state_text(spec, &v, &[]).into_bytes();
+        let mut e = crate::instrument::Engine::offline(48_000, tangent_record::audio::Timebase::new())
+            .expect("an offline engine");
+        let lane = LaneAt { slot: Slot(2), gen: 1 };
+        let at = lane_bay(lane.slot, Rack::Chain(0), 0).expect("the lane's first bay");
+        let other = lane_bay(Slot(3), Rack::Chain(0), 0).expect("another lane's bay");
+        e.load_insert_at(at.0, at.1, Some(std::path::Path::new(comp)), Some(&dial)).expect("the comp loads");
+        e.load_insert_at(other.0, other.1, Some(std::path::Path::new(comp)), None).expect("the other loads");
+        let playing = e.save_insert_state_at(at.0, at.1).expect("the comp's state");
+        let mut ledger: InsertLedger = [(at, comp.to_owned()), (other, comp.to_owned())].into_iter().collect();
+        let id = TrackId(40);
+
+        DesktopApp::forget_lane(&mut ledger, &shelf, &e, id, lane);
+
+        let sb = SeatBay::new(Node::Track(id), Rack::Chain(0), 0);
+        assert_eq!(
+            crate::shelf::read_state(&shelf, sb, comp),
+            Some(playing),
+            "the leaving lane's comp was not written down by its track as it was playing"
+        );
+        assert_eq!(
+            crate::shelf::shelf_states(&shelf),
+            [sb].into_iter().collect(),
+            "the hook wrote a bay that was not the leaving lane's"
+        );
+        assert!(!ledger.contains_key(&at), "the ledger still holds the leaving lane's bay");
+        assert!(ledger.contains_key(&other), "the ledger forgot another lane's bay");
+        assert!(e.insert_at(at.0, at.1).is_some(), "the hook dropped a plugin the lane takes home");
+        let _ = std::fs::remove_dir_all(&shelf);
+    }
+
     /// **The mirror as it was, kept as the yardstick.** A shelf walk that asks
-    /// the SEAT SPACE which seats have files, rather than asking the shelf.
-    /// Deliberately frozen: it is the shape the numbers in `mirror_sidecars`'s
-    /// doc were measured against, and it is here so the comparison can be
-    /// re-run on any machine and any volume instead of taken on trust.
-    fn per_seat_mirror(from: &std::path::Path, to: &std::path::Path) {
-        for strip in 0..TOTAL_SEATS {
-            for bay in 0..INSERTS {
-                let src = from.join(sidecar_name(strip, bay));
-                let dst = to.join(sidecar_name(strip, bay));
-                sidecar_fs_call();
-                sidecar_fs_call();
+    /// the SEAT SPACE which bays have files, rather than asking the shelf:
+    /// every bay of the frozen V32 map, by its identity name. Deliberately
+    /// frozen: it is the shape the numbers in `shelf::mirror_shelf`'s doc
+    /// were measured against, and it is here so the comparison can be re-run
+    /// on any machine and any volume instead of taken on trust. Answers the
+    /// filesystem calls it made.
+    fn per_seat_mirror(from: &std::path::Path, to: &std::path::Path) -> usize {
+        let ids = identity_ids(32);
+        let mut calls = 0;
+        for seat in 0..V32_TOTAL_SEATS {
+            for bay in 0..tangent_ui::desk_id::BAYS {
+                let Some(sb) = crate::engine_bridge::seat_bay_at(&ids, seat, bay) else {
+                    continue;
+                };
+                let src = from.join(state_file_name(sb));
+                let dst = to.join(state_file_name(sb));
+                calls += 2;
                 if src.is_file() {
                     let _ = std::fs::copy(&src, &dst);
                 } else {
@@ -36026,6 +36174,7 @@ mod sidecar_walk_probe {
                 }
             }
         }
+        calls
     }
 
     /// Throwaway probe: what does one shelf mirror cost, in filesystem calls
@@ -36040,20 +36189,19 @@ mod sidecar_walk_probe {
     #[test]
     #[ignore]
     fn what_the_shelf_walk_costs_at_project_open() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let from = scratch("probe-from");
         let to = scratch("probe-to");
         // **A REAL shelf when one is named.** `TANGENT_PROBE_SHELF=<project>/state`
-        // copies that session's sidecars in, because the shelf read costs one
-        // `is_file` and one `copy` per file it finds and a real project holds
-        // more than the two seats the synthetic case seeds. The synthetic
-        // shelf stays the default so the number in the doc above can be
-        // re-run on any machine with nothing installed.
+        // copies that session's state files in, because the shelf read costs
+        // one `is_file` and one copy per file it finds and a real project
+        // holds more than the two bays the synthetic case seeds. The
+        // synthetic shelf stays the default so the number in the doc above
+        // can be re-run on any machine with nothing installed.
         let seeded = match std::env::var_os("TANGENT_PROBE_SHELF") {
             Some(dir) => {
                 let mut n = 0usize;
                 for e in std::fs::read_dir(&dir).expect("the shelf named by TANGENT_PROBE_SHELF").flatten() {
-                    if sidecar_seat_bay(&e.file_name().to_string_lossy()).is_some() {
+                    if tangent_ui::desk_id::parse_state_file_name(&e.file_name().to_string_lossy()).is_some() {
                         std::fs::copy(e.path(), from.join(e.file_name())).expect("seed");
                         n += 1;
                     }
@@ -36064,16 +36212,16 @@ mod sidecar_walk_probe {
         };
         // A warm pass each, so neither number is a cold directory cache.
         per_seat_mirror(&from, &to);
-        mirror_sidecars(&from, &to);
+        mirror_shelf(&from, &ShelfNames::Pstate, &to);
 
         let t = std::time::Instant::now();
-        let ((), was_calls) = fs_calls(|| per_seat_mirror(&from, &to));
+        let was_calls = per_seat_mirror(&from, &to);
         let was = t.elapsed();
         let t = std::time::Instant::now();
-        let ((), calls) = fs_calls(|| mirror_sidecars(&from, &to));
+        let ((), calls) = fs_calls(|| mirror_shelf(&from, &ShelfNames::Pstate, &to));
         let one = t.elapsed();
         println!(
-            "{TOTAL_SEATS} seats x {INSERTS} bays = {INSERT_SPACE} seat/bays, {seeded} occupied\n  \
+            "{V32_INSERT_SPACE} seat/bays, {seeded} occupied\n  \
              per-seat walk = {was_calls} filesystem calls, {was:?} ({:.1}% of a 16.6ms frame)\n  \
              shelf read    = {calls} filesystem calls, {one:?} ({:.1}% of a 16.6ms frame)\n  \
              a project open runs two mirrors: {was_calls_2} calls / {:?} before, \
@@ -36110,8 +36258,8 @@ mod sidecar_walk_probe {
     #[test]
     #[ignore]
     fn what_the_insert_reconcile_scans_every_frame() {
-        let mut wanted: Vec<String> = vec![String::new(); INSERT_SPACE];
-        let mut loaded: Vec<Option<String>> = vec![None; INSERT_SPACE];
+        let mut wanted: Vec<String> = vec![String::new(); V32_INSERT_SPACE];
+        let mut loaded: Vec<Option<String>> = vec![None; V32_INSERT_SPACE];
         // A plausible desk: eight channels with an effect in bay 0, the
         // master with two, all of them already loaded — the settled state,
         // which is the state the app is in for all but a handful of frames.
@@ -36143,7 +36291,7 @@ mod sidecar_walk_probe {
         }
         let owned = t.elapsed() / n;
         println!(
-            "reconcile walk over {INSERT_SPACE} seat/bays, settled ({outstanding} outstanding, {hits} pending) = {walk:?} per frame ({:.2}% of 16.6 ms); the retired inserts_pending walk was {owned:?} more under the splash",
+            "reconcile walk over {V32_INSERT_SPACE} seat/bays, settled ({outstanding} outstanding, {hits} pending) = {walk:?} per frame ({:.2}% of 16.6 ms); the retired inserts_pending walk was {owned:?} more under the splash",
             walk.as_secs_f64() / 0.0166 * 100.0
         );
     }
@@ -36168,118 +36316,181 @@ mod sidecar_walk_probe {
         }
     }
 
-    /// **The one-launch shuffles are gated, and the gate is the only way in.**
+    /// **The global shelf is converted ONCE, at launch, before any project
+    /// opens, and nothing renames a sidecar in place any more** (design 6.6).
     ///
-    /// The survey said the v20 walk runs at every launch. It does not: each
-    /// `shift_insert_states_for_*` sits inside `if me.app.take_*()`, the take
-    /// is a `mem::take` of a flag `Settings` raises only while parsing a file
-    /// from the era before the shift, and `settings.rs` already pins that a
-    /// file of today's era does not raise it. A source scan, because the
-    /// shuffles run inside `DesktopApp::new` and that cannot be built in a
-    /// test — the precedent is `a_restarted_engine_is_told_the_tempo_map_again`
-    /// above. What it stops is somebody "simplifying" the call out of its `if`
-    /// and handing every launch six thousand `exists()` calls.
+    /// The one-launch shuffles this replaces renamed the live shelf's
+    /// sidecars in place, each behind a flag `Settings` raised while parsing
+    /// a file from before its shift, and they ran AFTER
+    /// `open_project_at_launch`, behind flags that lived only in memory while
+    /// the load could already have saved the settings in their new shape. The
+    /// conversion copies instead, from the durable pending marker or this
+    /// launch's own set (read off the settings BEFORE the app takes them),
+    /// and it must stand before the open, or the project the launch reopens
+    /// reads its plugins' states by names nothing has written yet. A source
+    /// scan, because `DesktopApp::new` cannot be built in a test.
     #[test]
-    fn every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag() {
+    fn the_global_shelf_converts_once_before_the_launch_opens_a_project() {
         let whole = include_str!("desktop.rs");
-        // Production only - everything above `mod tests` - because the table
-        // below spells the call sites out and would otherwise find itself.
+        // Production only - everything above `mod tests` - because the
+        // strings below would otherwise find themselves.
         let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
-        for (call, gate) in [
-            ("shift_insert_states_for_v13();", "take_desk_state_shift()"),
-            ("shift_insert_states_for_v14();", "take_desk_state_shift_v14()"),
-            ("shift_insert_states_for_v18();", "take_pad_state_shift_v18()"),
-            ("shift_insert_states_for_v19();", "take_desk_state_shift_v19()"),
-            ("shift_insert_states_for_v20();", "take_desk_state_shift_v20()"),
-        ] {
-            let at = src.find(call).unwrap_or_else(|| panic!("{call} is gone"));
-            // Exactly one call site, or the gate below only covers one of them.
-            assert!(
-                !src[at + call.len()..].contains(call),
-                "{call} is called twice; the gate only covers the first"
-            );
-            let before = &src[at.saturating_sub(200)..at];
-            assert!(
-                before.contains(&format!("if me.app.{gate} {{")),
-                "{call} is not immediately inside `if me.app.{gate}`, so its \
-                 walk across the whole seat space runs on every launch"
-            );
-        }
+        assert!(!src.contains("fn shift_insert_states_for_v"), "an in-place shelf shuffle is back");
+        let new_at = src
+            .find("    pub fn new(\n        cc: &eframe::CreationContext<'_>,")
+            .expect("DesktopApp::new");
+        let new = &src[new_at..];
+        let set = new.find("let shuffles = settings.shelf_shuffles();").expect("the launch's set is read");
+        let app = new.find("TangentApp::new(&cc.egui_ctx, settings, caps)").expect("the app takes the settings");
+        let call = "crate::shelf::convert_global_shelf(shuffles)";
+        let convert = new.find(call).expect("the launch converts the global shelf");
+        let open = new.find("me.open_project_at_launch();").expect("the launch opens a project");
+        assert!(set < app, "the shuffle set is read after the app has taken the settings");
+        assert!(convert < open, "the shelf is converted after the launch's project has opened");
+        assert_eq!(src.matches(call).count(), 1, "the global shelf is converted on more than one road");
+        // An owed conversion keeps the flags up: taken, the first format-2
+        // settings write would name the empty set to the launch that has to
+        // finish the copy.
+        let owed = new.find("if converted.owed {").expect("the launch asks whether the conversion is owed");
+        let taken = new.find("me.app.take_desk_state_shift(),").expect("the flags are taken");
+        let otherwise = new[owed..taken].rfind("} else {").map(|n| owed + n);
+        assert!(
+            convert < owed && otherwise.is_some_and(|e| e < taken),
+            "the shuffle flags are taken whether or not the conversion finished"
+        );
     }
 
-    /// **A project written before the seat space grew still loads.** The v20
-    /// shuffle steps every sidecar at or above the old channel block up by the
-    /// growth, and the whole point is that the plugin whose knobs are in it
-    /// finds them again at its new seat.
+    /// **The two roads to a NEW home write their owed mirror down before
+    /// their document lands, and the launch pays one before it opens
+    /// anything** (design 6.6; the mechanism and its crash test are
+    /// `shelf`'s, `a_kill_between_a_new_homes_document_and_its_mirror_reopens_with_every_state`).
+    /// Save As and the first save ask the plugins for their states and write
+    /// the owed mirror down first, then let the app write the document,
+    /// then mirror, and only then take the record away; the launch pays a
+    /// record still standing after the shelf's conversion and before the
+    /// template replaces the live shelf. A source scan, because `DesktopApp`
+    /// cannot be built in a test.
     #[test]
-    fn the_v20_shuffle_lands_a_sixteen_channel_sidecar_at_its_new_seat() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("v20");
-        let path = dir.join("settings.json");
-        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
-        // And the media roots, or the app resolves the owner's own Documents.
-        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", path.with_file_name("Tangent Media")) };
-
-        let grow = tangent_ui::recorder::CHANNELS - 16;
-        // The sixteen-channel era's master (19), its first pad (20), and the
-        // last seat that era had (2068).
-        let movers = [(19usize, 0usize), (20, 2), (2068, 1)];
-        for (seat, bay) in movers {
-            std::fs::write(insert_state_path(seat, bay), format!("{seat}-{bay}")).expect("seed");
-        }
-        std::fs::write(insert_state_path(3, 0), b"stays").expect("seed");
-
-        shift_insert_states_for_v20();
-
-        for (seat, bay) in movers {
+    fn a_new_homes_mirror_is_owed_before_its_document_and_paid_at_launch() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn run_chore_now(").expect("run_chore_now");
+        let chores = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        for arm in ["Chore::SaveCopy(path) => {", "Chore::SaveFirst(path) => {"] {
+            let body = &chores[chores.find(arm).unwrap_or_else(|| panic!("{arm} is gone"))..];
+            let body = &body[..body.find("\n            }\n").expect("the arm's end")];
+            let owe = body.find("self.owe_states_to_new_home(purpose, &path);").expect("the mirror is owed");
+            let save = body.find("self.app.finish_save_choice(purpose, &path);").expect("the save");
+            let mirror = body.find("self.copy_states_to_project();").expect("the mirror");
+            let paid = body.find("crate::shelf::mirror_paid(&crate::shelf::global_dir());").expect("the record goes");
+            assert!(owe < save && save < mirror && mirror < paid, "{arm} lands its document before its mirror is owed");
             assert!(
-                !insert_state_path(seat, bay).exists(),
-                "seat {seat} bay {bay} was left behind at its old number"
-            );
-            assert_eq!(
-                std::fs::read(insert_state_path(seat + grow, bay)).expect("moved"),
-                format!("{seat}-{bay}").into_bytes(),
-                "seat {seat} bay {bay} did not arrive at {}",
-                seat + grow
+                !body.contains("self.save_plugin_states();"),
+                "{arm} asks the plugins for their states after the document lands"
             );
         }
-        assert_eq!(
-            std::fs::read(insert_state_path(3, 0)).expect("stayed"),
-            b"stays",
-            "a seat below the old channel block was moved"
-        );
-        // SAFETY: still under `SIDECAR_ENV`.
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        let at = src.find("fn owe_states_to_new_home(").expect("owe_states_to_new_home");
+        let owe = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let knobs = owe.find("self.save_plugin_states();").expect("the knobs go onto the live shelf");
+        let home = owe.find("self.app.save_choice_dir(purpose, path)").expect("the app names the home");
+        let record = owe.find("crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home);").expect("the record");
+        assert!(knobs < home && home < record, "the record is written before the knobs are on the live shelf");
+        let new_at = src
+            .find("    pub fn new(\n        cc: &eframe::CreationContext<'_>,")
+            .expect("DesktopApp::new");
+        let new = &src[new_at..];
+        let convert = new.find("crate::shelf::convert_global_shelf(shuffles)").expect("the conversion");
+        let pay = new.find("crate::shelf::pay_owed_mirror(&crate::shelf::global_dir())").expect("the launch pays");
+        let open = new.find("me.open_project_at_launch();").expect("the launch opens a project");
+        assert!(convert < pay && pay < open, "an owed mirror is paid after the launch's template replaced the live shelf");
+        assert_eq!(src.matches("crate::shelf::pay_owed_mirror(").count(), 1, "an owed mirror is paid on more than one road");
+    }
+
+    /// **A shelf written before the seat space grew converts to its bays.**
+    /// The 16-channel era's v20 rename stepped every sidecar at or above the
+    /// old channel block up by sixteen; the conversion COPIES each file to
+    /// the identity name of the bay that rename would have put it on, and
+    /// leaves every legacy file exactly where and as it was: the master
+    /// (19), the first pad (20), the last seat that era had (2068), and a
+    /// channel below the block (3), which no rename moved.
+    #[test]
+    fn the_v20_conversion_copies_a_sixteen_channel_shelf_to_its_bays() {
+        use tangent_ui::desk_lift::ShelfShuffles;
+        let dir = scratch("v20");
+        let track = |n: u32, rack: Rack, bay: u8| SeatBay::new(Node::Track(TrackId(n)), rack, bay);
+        // Seat, bay, and the V32 bay a v20 desk lifts it to (Appendix A),
+        // spelled out rather than worked out by the map under test.
+        let movers = [
+            (19usize, 0usize, SeatBay::new(Node::Master, Rack::Chain(0), 0)),
+            (20, 2, track(0, Rack::Pad(0), 2)),
+            (2068, 1, track(15, Rack::Pad(127), 1)),
+            (3, 0, track(3, Rack::Chain(0), 0)),
+        ];
+        for (seat, bay, _) in movers {
+            std::fs::write(dir.join(format!("insert-state-{seat}-{bay}.bin")), format!("{seat}-{bay}")).expect("seed");
+        }
+        let before = shelf_bytes(&dir);
+
+        let done = crate::shelf::convert_shelf_in(&dir, ShelfShuffles::V20);
+
+        for (seat, bay, sb) in movers {
+            assert_eq!(
+                std::fs::read(dir.join(state_file_name(sb))).ok(),
+                Some(format!("{seat}-{bay}").into_bytes()),
+                "seat {seat} bay {bay} did not arrive at {sb}"
+            );
+            let legacy = format!("insert-state-{seat}-{bay}.bin");
+            assert_eq!(
+                std::fs::read(dir.join(&legacy)).ok().as_ref(),
+                before.get(&legacy),
+                "{legacy} was moved or rewritten: a release build reads it"
+            );
+        }
+        assert_eq!(done.copied, movers.len(), "not every sidecar was copied");
+        assert!(dir.join(tangent_ui::settings::SHELF_DONE_NAME).is_file(), "the conversion is not marked done");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Throwaway probe: what the one-launch v20 shuffle costs WHEN IT RUNS,
-    /// which is once ever. Ignored by default; run with `--ignored
-    /// --nocapture`.
+    /// Every file in `dir`, by name, with its bytes.
+    fn shelf_bytes(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .expect("the shelf")
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).expect("read")))
+            .collect()
+    }
+
+    /// Throwaway probe: what the global shelf's one conversion costs WHEN IT
+    /// RUNS, which is once ever: over an empty shelf, and over one holding a
+    /// sidecar for every bay of the V32 map. Ignored by default; run with
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore]
-    fn what_the_one_launch_shuffle_costs() {
-        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("v20-probe");
-        let path = dir.join("settings.json");
-        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
-        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
-        // And the media roots, or the app resolves the owner's own Documents.
-        unsafe { std::env::set_var("TANGENT_MEDIA_ROOT", path.with_file_name("Tangent Media")) };
+    fn what_the_one_launch_conversion_costs() {
+        use tangent_ui::desk_lift::ShelfShuffles;
+        let empty = scratch("convert-empty");
+        let ((), calls) = fs_calls(|| {
+            crate::shelf::convert_shelf_in(&empty, ShelfShuffles::V20);
+        });
+        let full = scratch("convert-full");
+        for seat in 0..V32_TOTAL_SEATS {
+            for bay in 0..tangent_ui::desk_id::BAYS {
+                std::fs::write(full.join(format!("insert-state-{seat}-{bay}.bin")), b"/x/P.vst3\0k").expect("seed");
+            }
+        }
         let t = std::time::Instant::now();
-        shift_insert_states_for_v20();
-        let one = t.elapsed();
-        // SAFETY: still under `SIDECAR_ENV`.
-        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        let (done, full_calls) = fs_calls(|| crate::shelf::convert_shelf_in(&full, ShelfShuffles::NONE));
+        let took = t.elapsed();
         println!(
-            "v20 shuffle over an empty shelf = {} exists() calls, {one:?}\n  \
-             gated: it runs on the ONE launch that crosses the shift, and \
-             `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag` \
-             is what keeps it that way",
-            3 * (2069 - 16)
+            "conversion over an empty shelf = {calls} filesystem calls\n  \
+             over {V32_INSERT_SPACE} sidecars = {full_calls} calls, {took:?}, {} copied\n  \
+             it runs on the ONE launch that finds no `.shelf-v23`, and \
+             `the_global_shelf_converts_once_before_the_launch_opens_a_project` \
+             is what keeps it there",
+            done.copied
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&full);
     }
 
     // ── what an export takes off the shelf, and what it must not ────────────
@@ -36289,6 +36500,13 @@ mod sidecar_walk_probe {
     /// `mix_channels` like any audio track the owner would put a compressor
     /// on.
     const EXPORT_SEAT: usize = 2;
+
+    /// The export lane's first bay, by the engine's name for it: the lane at
+    /// slot `EXPORT_SEAT`'s own rack.
+    fn export_bay() -> crate::engine_bridge::EngineBay {
+        crate::engine_bridge::lane_bay(crate::desk_plan::Slot(EXPORT_SEAT as u32), Rack::Chain(0), 0)
+            .expect("the export lane's first bay")
+    }
 
     /// A compressor squeezing hard enough that its presence is not a matter
     /// of opinion: −30 dB threshold, 20:1, the fastest attack and release the
@@ -36397,7 +36615,7 @@ mod sidecar_walk_probe {
             e.render_offline(&mut out);
             e.drain_stems(&mut drained);
         }
-        let wide = tangent_ui::recorder::CHANNELS * 2;
+        let wide = e.stem_frame_width();
         (0..drained.len() / wide)
             .map(|f| drained[f * wide + EXPORT_SEAT * 2].abs())
             .fold(0.0f32, f32::max)
@@ -36468,7 +36686,7 @@ mod sidecar_walk_probe {
     /// is process-global and `SIDECAR_ENV` is the one lock that makes writing
     /// a sidecar safe while the rest of the suite runs beside it.
     ///
-    /// Revert-check: make `desk_insert_state` return `saved_insert_state`
+    /// Revert-check: make `desk_insert_state` return `shelf::saved_state`
     /// alone and the first assertion goes red — the mirror comes up at the
     /// shelf's defaults and passes the clip through untouched.
     #[test]
@@ -36478,13 +36696,10 @@ mod sidecar_walk_probe {
         // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", dir.join("settings.json")) };
 
-        // The shelf: the same unit, at the knobs it is born with.
-        write_insert_state(
-            EXPORT_SEAT,
-            0,
-            crate::builtin_fx::COMP_PATH,
-            &idle_comp_state(),
-        );
+        // The shelf: the same unit, at the knobs it is born with, in the
+        // bay's own state file.
+        let sb = crate::engine_bridge::seat_bay_at(&identity_ids(32), EXPORT_SEAT, 0).expect("the lane's bay");
+        crate::shelf::write_state(sb, crate::builtin_fx::COMP_PATH, &idle_comp_state());
         // The desk: the same unit, dialled in and never saved.
         let desk = engine_with_comp(Some(&deep_comp_state()));
 
@@ -36495,9 +36710,9 @@ mod sidecar_walk_probe {
         .expect("offline engine");
         furnish_mirror_bay(
             &mut from_desk,
-            Some(&desk),
-            EXPORT_SEAT,
-            0,
+            Some((&desk, export_bay())),
+            export_bay(),
+            Some(sb),
             crate::builtin_fx::COMP_PATH,
         )
         .expect("the mirror seats the comp");
@@ -36515,8 +36730,8 @@ mod sidecar_walk_probe {
         furnish_mirror_bay(
             &mut from_shelf,
             None,
-            EXPORT_SEAT,
-            0,
+            export_bay(),
+            Some(sb),
             crate::builtin_fx::COMP_PATH,
         )
         .expect("the mirror seats the comp");

@@ -3160,8 +3160,9 @@ pub fn holds_only_scratch(dir: &std::path::Path) -> bool {
     // **A document's legacy bytes are Tangent's own file** (design 6.7): the
     // first format-2 save keeps them beside the document, so a scratch that
     // was ever saved over a legacy one carries them, and a sweep that read
-    // them as somebody's work would keep every such scratch for ever.
-    let pre_v8 = [crate::arrangement::DOC_NAME, crate::arrangement::DOC_NAME_LEGACY]
+    // them as somebody's work would keep every such scratch for ever. The
+    // kit sidecar's are kept the same way (`DrumpadDoc::keep_pre_v8`).
+    let pre_v8 = [crate::arrangement::DOC_NAME, crate::arrangement::DOC_NAME_LEGACY, crate::drumpad::FILE_NAME]
         .map(|d| format!("{d}{}", crate::arrangement::PRE_V8_SUFFIX));
     entries.into_iter().all(|e| {
         let Ok(e) = e else {
@@ -14207,6 +14208,46 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         } else {
             chosen
         })
+    }
+
+    /// **The folder a save panel's answer will make the project's home**,
+    /// asked BEFORE the save runs: [`Self::chosen_project_dir`]'s answer for
+    /// Save As (`ProjectCopy`, wrapped in the project's name) and for the
+    /// first save (`ProjectFirst`, wrapped in the name typed), and `None`
+    /// where that save refuses (the template shelf, said by the save itself
+    /// when it runs) or for any other purpose.
+    ///
+    /// For the host's plugin states (design 6.6: no save road may leave a
+    /// plugin at its defaults). Both roads write the document into a folder
+    /// that holds no `state/` until the host mirrors the live shelf into it
+    /// a moment later, so the host writes down that the mirror is owed to
+    /// this folder before the document lands, and a launch after a kill in
+    /// between pays it. The wraps are the two roads' own, word for word.
+    pub fn save_choice_dir(
+        &mut self,
+        purpose: crate::ports::SavePurpose,
+        target: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let wrap = match purpose {
+            crate::ports::SavePurpose::ProjectCopy => {
+                let n = self.project_name();
+                let n = n.trim().to_owned();
+                if n.is_empty() { "Untitled".to_owned() } else { n }
+            }
+            crate::ports::SavePurpose::ProjectFirst => {
+                let stem = target
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if stem.trim().is_empty() { "Untitled".to_owned() } else { stem }
+            }
+            _ => return None,
+        };
+        // Asked first so a refusal says nothing here: the save says it.
+        if inside_template_shelf(target, &self.project_root()) {
+            return None;
+        }
+        self.chosen_project_dir(target, &wrap)
     }
 
     /// **The FIRST save of a session: the panel names its home, and the
@@ -49273,8 +49314,12 @@ mod tests {
         let doc =
             crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&shelf));
         let desk = doc.desk.expect("the seed left the desk out");
+        // Compared as the desks they WRITE: format 2 writes rows, so the
+        // shipped desk's short arrays come back at the desk's width.
+        let written = |d: &crate::arrangement::DeskSnap| d.to_value_as(crate::desk_format::Format::current());
         assert_eq!(
-            desk, TangentApp::template_desk(),
+            written(&desk),
+            written(&TangentApp::template_desk()),
             "the seed captured the session that was open"
         );
         assert_ne!(
@@ -55671,8 +55716,10 @@ mod tests {
         // in the snapshot a document is saved from, so the next launch and
         // the next open find the arms this session left.
         assert_eq!(app.settings.channel_armed, Some(2), "the arm was not kept");
-        assert!(
-            app.settings.to_json().contains("\"channel_armed\""),
+        // In the file as each row's `arm`: read back, the file says it.
+        assert_eq!(
+            Settings::from_json(&app.settings.to_json()).channel_armed,
+            Some(2),
             "the arm never reached the settings file"
         );
         assert_eq!(
@@ -55765,7 +55812,10 @@ mod tests {
         let doc = app.project_doc.clone();
 
         // Strip the six keys out of the document on disk, the way a file
-        // written by an older build simply would not have them.
+        // written by an older build simply would not have them: in the
+        // LEGACY shape, which is the only one an older build wrote.
+        let saved = crate::arrangement::Arrangement::load_from(&doc);
+        saved.save_to_as(&doc, crate::desk_format::Format::Legacy);
         let text = std::fs::read_to_string(&doc).expect("the document");
         let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
         let desk = value
@@ -75335,7 +75385,9 @@ mod folder_tests {
         desk.set_bay(3 * INSERTS, dialogs::DRUMPAD_PATH);
         desk.set_bay(2 * INSERTS, "/x/EP.vst3");
         arr.desk = Some(desk);
-        arr.save_to(&doc);
+        // The v7 tail is a LEGACY document's key: a format-2 desk names each
+        // plugin by its bay, never by a number a file can make up.
+        arr.save_to_as(&doc, crate::desk_format::Format::Legacy);
         let text = std::fs::read_to_string(&doc).expect("the document");
         let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
         json["desk"].as_object_mut().expect("a desk").insert(
@@ -78945,9 +78997,13 @@ mod folder_tests {
         let mut arr = crate::arrangement::Arrangement::default();
         arr.desk = Some(snap.clone());
         let back = crate::arrangement::Arrangement::from_json(&arr.to_json());
-        assert_eq!(
-            back.desk.as_ref().unwrap(),
-            &snap,
+        let read = back.desk.as_ref().unwrap();
+        // As the desks they write (format 2 writes rows, so arrays the live
+        // desk keeps short come back at its width), and the flags by name.
+        let written = |d: &crate::arrangement::DeskSnap| d.to_value_as(crate::desk_format::Format::current());
+        assert_eq!(written(read), written(&snap), "the folders did not survive the document");
+        assert!(
+            read.is_folder[1] && read.in_folder[2] && read.in_folder[3] && read.folder_shut[1],
             "the folders did not survive the document"
         );
 

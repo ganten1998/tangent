@@ -948,7 +948,9 @@ pub fn open_inputs(shared: &Shared) -> Vec<(String, String, bool)> {
             }
         }
     }
-    out.truncate(tangent_ui::recorder::INPUTS);
+    // As many as the capture keeps picks for: its own number, which the
+    // engine's inputs are.
+    out.truncate(tangent_record::audio::MAX_PICKS);
     out
 }
 

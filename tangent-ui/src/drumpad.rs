@@ -125,6 +125,30 @@ impl DrumpadDoc {
             .map_or_else(|| std::path::PathBuf::from(FILE_NAME), |d| d.join(FILE_NAME))
     }
 
+    /// **A legacy sidecar's bytes, kept once before the first format-2
+    /// write replaces them** (design 6.7): `drumpad.json.pre-v8` beside it,
+    /// temp and rename, when the file on disk is not format 2 (no
+    /// `track_kits`) and no backup already stands. The format-2 writer
+    /// writes no `lane_kits`, no top-level kit and no `primary_lane`, which
+    /// are all a release build reads, so without this the first kit write
+    /// after the switch took every drum lane's kit away from the project a
+    /// restored `<doc>.pre-v8` hands back. Restoring the two `.pre-v8`
+    /// files hands it back whole.
+    pub(crate) fn keep_pre_v8(path: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let format2 = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|v| v.get(TRACK_KITS).is_some());
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(crate::arrangement::PRE_V8_SUFFIX);
+        let backup = std::path::PathBuf::from(backup);
+        if !format2 && !backup.exists() {
+            crate::settings::write_atomic(&backup, &bytes);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pads.iter().all(|p| p.path.is_empty())
     }
@@ -363,6 +387,7 @@ impl DrumpadDoc {
         }
         let path = Self::sidecar(doc);
         let text = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        Self::keep_pre_v8(&path);
         crate::settings::write_atomic(&path, text.as_bytes());
     }
 
@@ -610,14 +635,23 @@ mod tests {
             "an out-of-range hint put a kit somewhere"
         );
 
-        // And the top level still says what an old build would read, so a
-        // project saved here does not come up empty over there.
-        DrumpadDoc::save_all_beside(&kits, 3, &doc);
+        // And the LEGACY writer's top level still says what an old build
+        // would read, so a project it saved does not come up empty over
+        // there. The format-2 sidecar names each kit by its track and writes
+        // no top-level kit and no lane key at all (design 6.8).
+        let identity = crate::desk_legacy::identity_ids(kits.len());
+        DrumpadDoc::save_all_beside_as(&kits, &identity, 3, &doc, crate::desk_format::Format::Legacy);
         let old_reader = DrumpadDoc::load_beside(&doc);
         assert_eq!(
             old_reader.pads[36].path, "media/kick.wav",
             "an older build would open this project with no kit at all"
         );
+        DrumpadDoc::save_all_beside(&kits, 3, &doc);
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(DrumpadDoc::sidecar(&doc)).expect("the sidecar"))
+            .expect("json");
+        for legacy in ["lane_kits", "primary_lane", "pads", "master"] {
+            assert!(root.get(legacy).is_none(), "the format-2 sidecar still writes `{legacy}`");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -681,6 +715,15 @@ mod tests {
             Some(&Value::from(1)),
             "a real stranger on a lane kit was lost"
         );
+        // The one-kit reader is an older build's, which only ever met the
+        // LANES-era root: written by the legacy writer for it.
+        DrumpadDoc::save_all_beside_as(
+            &kits,
+            &crate::desk_legacy::identity_ids(kits.len()),
+            3,
+            &doc,
+            crate::desk_format::Format::Legacy,
+        );
         let one = DrumpadDoc::load_beside(&doc);
         assert!(one.extra.is_empty(), "the one-kit reader kept the root's keys: {:?}", one.extra);
         let _ = std::fs::remove_dir_all(&dir);
@@ -709,7 +752,15 @@ mod tests {
         kits[2].pads[0].path = "media/snare.wav".into();
         kits[2].pads[0].params.pan = 0.25;
         kits[2].extra.insert("swing".into(), Value::from(0.24));
-        DrumpadDoc::save_all_beside(&kits, 1, &doc);
+        // The LEGACY writer's bytes, which a format-2 sidecar no longer
+        // writes (design 6.8) and every legacy project still holds.
+        DrumpadDoc::save_all_beside_as(
+            &kits,
+            &crate::desk_legacy::identity_ids(kits.len()),
+            1,
+            &doc,
+            crate::desk_format::Format::Legacy,
+        );
         let written = std::fs::read_to_string(DrumpadDoc::sidecar(&doc)).expect("the sidecar");
 
         // The old road, verbatim.
