@@ -786,6 +786,86 @@ fn a_record_and_an_export_hold_the_desk_shape_and_let_add_append() {
     }
 }
 
+/// **A paste or a MIDI gesture that would give an empty row a kind or an
+/// input waits with its line and changes nothing** (design 7.13, the
+/// done-when's holds). Each asked the hold inside its gesture and went on
+/// past the refusal: a paste onto an empty row under a record left a counted
+/// track with no kind wearing the copy's input, bays and clips, and a MIDI
+/// item drawn, or a `.mid` dropped, on a bare lane landed its clip on a row
+/// the refused binding never made a MIDI track. Under an export and under a
+/// record: Paste Track onto the empty row in place, Paste Track below onto
+/// the empty row under a track and below the last row (one reused, one
+/// appended), a MIDI item drawn on the empty row, and a `.mid` dropped on
+/// it, below the last lane and through the media picker. The desk, the
+/// clips and the history are as they were, and the line is the hold's. With
+/// nothing held the same paste lands, so the hold is what stopped it.
+#[test]
+fn a_held_paste_or_midi_gesture_onto_an_empty_row_changes_nothing() {
+    let root = project_scratch("w6-held-empty");
+    let mid = root.join("c.mid");
+    one_note_smf(&mid);
+    // What each says, when it answers rather than notifies.
+    type Gesture = fn(&mut TangentApp, &std::path::Path) -> Option<String>;
+    let gestures: [(&str, &str, Gesture); 7] = [
+        ("Paste Track onto the empty row", "Tracks keep their kind", |a, _| {
+            a.paste_track_at(3);
+            None
+        }),
+        ("Paste Track below onto the empty row under a track", "Tracks keep their kind", |a, _| {
+            let _ = a.paste_track_below(2);
+            None
+        }),
+        ("Paste Track below the last row", "Tracks keep their kind", |a, _| {
+            let last = a.desk_extent() - 1;
+            let _ = a.paste_track_below(last);
+            None
+        }),
+        ("a MIDI item drawn on the empty row", "Inputs stay as they are", |a, _| {
+            a.land_drawn_midi_item(3, 0.0, 8.0);
+            None
+        }),
+        ("a .mid dropped on the empty row", "Inputs stay as they are", |a, mid| a.import_midi_at(mid, 3, 0.0).err()),
+        ("a .mid dropped below the last lane", "Inputs stay as they are", |a, mid| {
+            let below = a.desk_extent();
+            a.import_midi_at(mid, below, 0.0).err()
+        }),
+        ("a .mid picked onto the empty row", "Inputs stay as they are", |a, mid| {
+            a.insert_media_files(3, &[mid.to_path_buf()], 0.0).into_iter().next()
+        }),
+    ];
+    for (exporting, tag, during) in [(true, "held-empty-export", "while an export runs"), (false, "held-empty-record", "while the arrangement records")] {
+        let mut s = desk(6);
+        // An empty row among the tracks: what a paste lands on in place, and
+        // what a draw or a drop would make a MIDI track of.
+        s.rows[3] = TrackRow::vacant(s.rows[3].id);
+        let (_ctx, mut app) = app_on(s, tiers::supporter(tag));
+        // A project, so an import that went past its hold would get as far
+        // as its row.
+        app.bootstrap_project(&root.join(tag));
+        // An audio track with an input on the clipboard.
+        app.copy_track(0);
+        app.recorder.exporting = exporting;
+        app.recorder.arr_recording = !exporting;
+        for (name, line, go) in gestures {
+            let (rows, clips, was_at) = (app.settings.rows.clone(), app.arrangement.clips.len(), moments(&app));
+            app.messages.clear();
+            let answered = go(&mut app, &mid);
+            assert_eq!(app.settings.rows, rows, "{during}: {name} changed the desk");
+            assert_eq!(app.arrangement.clips.len(), clips, "{during}: {name} landed a clip");
+            assert_eq!(moments(&app), was_at, "{during}: the held {name} left a moment");
+            let said = answered.or_else(|| app.messages.notes().last().map(|n| n.text.clone())).unwrap_or_default();
+            assert!(said.starts_with(line) && said.contains(during), "{during}: {name} said {said:?}");
+        }
+        // Nothing held: the same paste lands.
+        app.recorder.exporting = false;
+        app.recorder.arr_recording = false;
+        app.paste_track_at(3);
+        assert_eq!(app.channel_kind(3), app.channel_kind(0), "with nothing held the paste did not land");
+        let _ = std::fs::remove_dir_all(tiers::dir(tag));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// **Undo and redo across Add, Insert, Paste and Remove** restore the rows
 /// with their ids and every fact, one gesture per moment, on a free desk
 /// under its cap (the cap sentinel watching every commit) and on a
@@ -883,6 +963,19 @@ fn strips_and_lanes_are_sized_by_the_count_asked_for_not_by_the_desk() {
     let _ = std::fs::remove_dir_all(tiers::dir("sized"));
 }
 
+/// A standard MIDI file of one note, written at `path`.
+fn one_note_smf(path: &std::path::Path) {
+    let track: &[u8] = &[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0, 0x00, 0xFF, 0x2F, 0x00];
+    let mut smf = Vec::new();
+    smf.extend_from_slice(b"MThd");
+    smf.extend_from_slice(&6u32.to_be_bytes());
+    smf.extend_from_slice(&[0, 0, 0, 1, 0, 96]);
+    smf.extend_from_slice(b"MTrk");
+    smf.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    smf.extend_from_slice(track);
+    std::fs::write(path, smf).expect("the midi file");
+}
+
 /// **A MIDI item drawn on an empty lane, and a MIDI file dropped below the
 /// last one, are each one moment**: the binding that makes the lane a MIDI
 /// track commits a moment of its own, so each was two, and the first Ctrl+Z
@@ -892,15 +985,7 @@ fn strips_and_lanes_are_sized_by_the_count_asked_for_not_by_the_desk() {
 fn a_midi_item_drawn_or_dropped_on_an_empty_lane_is_one_moment() {
     let root = project_scratch("w6-midi-moment");
     let mid = root.join("c.mid");
-    let track: &[u8] = &[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0, 0x00, 0xFF, 0x2F, 0x00];
-    let mut smf = Vec::new();
-    smf.extend_from_slice(b"MThd");
-    smf.extend_from_slice(&6u32.to_be_bytes());
-    smf.extend_from_slice(&[0, 0, 0, 1, 0, 96]);
-    smf.extend_from_slice(b"MTrk");
-    smf.extend_from_slice(&(track.len() as u32).to_be_bytes());
-    smf.extend_from_slice(track);
-    std::fs::write(&mid, smf).expect("the midi file");
+    one_note_smf(&mid);
     let (_ctx, mut app) = app_on(
         Settings {
             show_welcome: false,

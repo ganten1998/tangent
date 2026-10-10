@@ -10175,6 +10175,12 @@ impl TangentApp {
         if let Some(line) = self.track_refusal_text(usize::from(grows || !self.row_counted(lane))) {
             return Err(line);
         }
+        // Then the binding's hold (`midi_bind_hold_line`), before a row is
+        // made or a moment held: under a running record or export the lane
+        // stays as it is and the file is not taken in.
+        if let Some(line) = self.midi_bind_hold_line(lane) {
+            return Err(line.to_owned());
+        }
         let name = file
             .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
@@ -10201,9 +10207,11 @@ impl TangentApp {
         };
         // A .mid landing on a BARE lane makes it a MIDI track — the
         // lane-draw's own ritual, so the lane arms and records like one.
-        // A lane that already IS something keeps its kind.
-        if self.channel_kind(lane).is_none() {
-            self.set_channel_input_spec(lane, "midi:all");
+        // A lane that already IS something keeps its kind. A binding that
+        // does not take lands no clip on a row it never made a track.
+        if self.channel_kind(lane).is_none() && !self.set_channel_input_spec(lane, "midi:all") {
+            self.commit_undo_moment();
+            return Err(format!("{name} was not taken in: the lane could not become a MIDI track"));
         }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: import.pedal,
@@ -11953,13 +11961,27 @@ impl TangentApp {
     /// `folders_held`, `routes_held`) with their own lines; they keep the
     /// lines and are one decision now.
     fn desk_shape_held_for(&mut self, what: ShapeChange) -> bool {
+        match self.desk_shape_hold_line(what) {
+            Some(why) => {
+                self.notify(crate::notify::Kind::Info, why);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **The line [`Self::desk_shape_held_for`] says, without saying it**:
+    /// `None` when nothing holds `what`. For the roads that answer a
+    /// `Result` and hand their refusal to a caller that already reports
+    /// errors (`import_midi_at`), as `track_refusal_text` is the gate's.
+    fn desk_shape_hold_line(&self, what: ShapeChange) -> Option<&'static str> {
         let (export, record) = (self.recorder.exporting, self.recorder.arr_recording);
         let held = match what {
             ShapeChange::Folder | ShapeChange::Route => export,
             _ => export || record,
         };
         if !held {
-            return false;
+            return None;
         }
         let why = match (what, export) {
             (ShapeChange::Order, true) => {
@@ -11995,8 +12017,55 @@ impl TangentApp {
                 "Routes and sidechains stay as they are while an export runs - it is playing through them."
             }
         };
-        self.notify(crate::notify::Kind::Info, why);
-        true
+        Some(why)
+    }
+
+    /// **The line a gesture that makes row `lane` a MIDI track waits with**,
+    /// or `None` when it may go ahead: a MIDI item drawn on a lane, or a
+    /// `.mid` dropped on one, binds a row with no kind to every MIDI device,
+    /// and that binding is its input and its kind at once, which a running
+    /// record or export holds (design 7.13). Past the desk is the row a drop
+    /// below the last lane would append, which is bound the same way. A lane
+    /// that is already a track keeps its kind and binds nothing, so nothing
+    /// holds it. Asked BEFORE the gesture's moment, so a held one lands
+    /// nothing: it used to land its clip on a row whose binding the hold
+    /// had just refused.
+    fn midi_bind_hold_line(&self, lane: usize) -> Option<&'static str> {
+        let binds = lane >= self.desk_extent()
+            || (self.channel_kind(lane).is_none() && self.channel_input_spec(lane) != "midi:all");
+        if binds {
+            self.desk_shape_hold_line(ShapeChange::Input)
+        } else {
+            None
+        }
+    }
+
+    /// **Whether a pasted track landing on row `at` waits**, saying the line
+    /// when it does: the paste gives the empty row the copy's kind and input
+    /// (`paste_track_inner`), which a running record or export holds (design
+    /// 7.13). Past the desk is the row a paste below the last one appends,
+    /// as empty as a vacant row. Asked by both paste roads before their
+    /// moment and before any row is opened or minted, so a held paste
+    /// changes nothing: the kind hold used to refuse inside the paste, which
+    /// then went on to write the name, the input, the bays and the clips
+    /// onto a counted track with no kind.
+    fn paste_held(&mut self, at: usize) -> bool {
+        let Some(copy) = self.track_clipboard.as_ref() else {
+            return false;
+        };
+        let (kind, input) = if at < self.desk_extent() {
+            (self.channel_kind(at), self.channel_input_spec(at))
+        } else {
+            (None, "")
+        };
+        let what = if copy.kind != kind {
+            ShapeChange::Kind
+        } else if copy.input != input {
+            ShapeChange::Input
+        } else {
+            return false;
+        };
+        self.desk_shape_held_for(what)
     }
 
     /// [`Self::desk_shape_held_for`] for a reorder: the hold the drags ask.
@@ -12354,15 +12423,24 @@ impl TangentApp {
         if !self.row_counted(lane) && !self.admit_tracks(1) {
             return;
         }
+        // **The binding's hold, before the moment** (`midi_bind_hold_line`):
+        // under a running record or export a bare lane stays bare and the
+        // item is not drawn, rather than landing on a row with no kind.
+        if let Some(line) = self.midi_bind_hold_line(lane) {
+            self.notify(crate::notify::Kind::Info, line);
+            return;
+        }
         // **ONE moment for the draw**: the lane made a MIDI track (its
         // binding commits a moment of its own) and the item drawn on it.
         // It was two, and the first Ctrl+Z took the item back and left a
         // track nobody had asked for: one gesture, one moment.
         self.begin_one_moment();
-        if self.channel_kind(lane).is_none() {
-            // Drawing a MIDI item on a bare lane makes it a
-            // track — through the spec, the one authority.
-            let _ = self.set_channel_input_spec(lane, "midi:all");
+        // Drawing a MIDI item on a bare lane makes it a track, through the
+        // spec, the one authority; a binding that does not take (a lane
+        // past the desk) draws nothing on a row it never made a track.
+        if self.channel_kind(lane).is_none() && !self.set_channel_input_spec(lane, "midi:all") {
+            self.commit_undo_moment();
+            return;
         }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -12423,16 +12501,26 @@ impl TangentApp {
     fn open_row(&mut self, at: usize, member: bool) -> Option<usize> {
         let width = self.desk_extent();
         let at = at.min(width);
-        if at < width && self.row_reusable(at) && self.row(at).is_some_and(|r| r.in_folder == member) {
+        let between = self.opens_between(at, member);
+        if at < width && !between {
             return Some(at);
         }
-        if at < width && self.desk_shape_held_for(ShapeChange::Insert) {
+        if between && self.desk_shape_held_for(ShapeChange::Insert) {
             return None;
         }
         let mut row = crate::desk_model::TrackRow::vacant(self.mint_id()?);
         row.in_folder = member;
         self.desk_insert(at, vec![row]).ok()?;
         Some(at)
+    }
+
+    /// **Whether [`Self::open_row`] would put a new row BETWEEN others at
+    /// `at`**: short of the end of the desk, with no empty row standing there
+    /// for it to use (one that holds nothing and is in, or out of, the folder
+    /// run as `member` asks). The one spelling of that rule, so a road that
+    /// asks its holds before opening a row asks the ones the opening will.
+    fn opens_between(&self, at: usize, member: bool) -> bool {
+        at < self.desk_extent() && !(self.row_reusable(at) && self.row(at).is_some_and(|r| r.in_folder == member))
     }
 
     /// **Whether row `n` holds nothing at all**, so a new track may stand on
@@ -12589,11 +12677,20 @@ impl TangentApp {
         if !self.admit_tracks(1) {
             return false;
         }
+        // **The desk's shape hold, before the moment and before a row is
+        // opened.** A paste between two rows waits as an insert does
+        // (`open_row` says that line); one onto the empty row standing there,
+        // or onto a row appended at the end, gives it the copy's kind and
+        // input, which wait too (`paste_held`). Asked after `open_row`, a
+        // held paste left the row it had appended behind.
+        let member = self.is_folder(n) || self.in_folder(n);
+        if !self.opens_between(n + 1, member) && self.paste_held(n + 1) {
+            return false;
+        }
         // The same gesture `insert_track_below` is: a row opened and then
         // the paste. Held after the clipboard check, so a paste with nothing
         // on it holds nothing.
         self.begin_one_moment();
-        let member = self.is_folder(n) || self.in_folder(n);
         let Some(at) = self.open_row(n + 1, member) else {
             self.commit_undo_moment();
             return false;
@@ -12828,8 +12925,14 @@ impl TangentApp {
             return;
         };
         // Always a new track (the refusals above leave only empty rows), so
-        // always asked, and before the hold below.
+        // always asked, and before the moment's hold below.
         if !self.admit_tracks(1) {
+            return;
+        }
+        // **The desk's shape hold, before anything is written**: the copy's
+        // kind and input land on this row, and under a running record or
+        // export they wait with the line (`paste_held`).
+        if self.paste_held(into) {
             return;
         }
         // **ONE moment for the paste.** A track is a kind, a name, a colour,
@@ -31674,6 +31777,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let mut errors = Vec::new();
         let mut lane = lane;
         for (i, path) in files.iter().enumerate() {
+            // **A .mid that would make its row a MIDI track waits out a
+            // record or an export**, asked before its row is found, made or
+            // turned into a bare track below (`import_midi_at` asks it too,
+            // too late to take those back). The first file's row is the one
+            // it was aimed at; every later one lands on a new track, which
+            // is a row with no kind like the one past the desk.
+            if Self::is_midi_path(path) {
+                let aimed = if i == 0 { lane } else { self.desk_extent() };
+                if let Some(line) = self.midi_bind_hold_line(aimed) {
+                    errors.push(line.to_owned());
+                    continue;
+                }
+            }
             // The first file on the row it was aimed at (a drop below the
             // last row grows one); each after it on the first row a new
             // track may take, and past every one of them a new last row. A
