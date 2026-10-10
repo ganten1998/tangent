@@ -14645,7 +14645,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A Save As is a name somebody CHOSE: the copy is a kept project,
         // never a scratch a new session may reclaim.
         self.arrangement.named = true;
-        self.arrangement.save_to(&doc);
+        // With the desk as it stands now, through the one writer: see
+        // `write_session_doc` for the track a stale copy left out.
+        self.write_session_doc(&doc);
         self.project_doc = doc.clone();
         self.note_doc_rows();
         self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -18407,26 +18409,50 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn save_project_doc(&mut self) {
         // The folder is born the moment something real is kept.
         self.materialize_project_dir();
-        self.arrangement.desk = Some(self.desk_snapshot());
         self.mark_project_saved();
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
-            // **And the kit sidecar with it, by the rows just written.**
-            // Today's bytes file each kit under its LANE, and a save is what
-            // moves the document's rows on disk: the save never wrote the
-            // sidecar, so a project saved after a drag reopened with the kit
-            // on the row the drum track had left and the drum track silent.
-            // Between saves the sidecar files kits by the rows this wrote
-            // (`drumpad_save`), never by rows the document has not saved.
-            // An absent sidecar and an empty one read alike, so a desk with
-            // no kit and no sidecar writes none.
-            if crate::drumpad::DrumpadDoc::sidecar(&doc).exists()
-                || self.drumpad_kits.values().any(|k| !k.is_empty())
-            {
-                self.save_kits_beside(&doc);
-            }
-            self.note_doc_rows();
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            // Nothing on disk to write to (no project yet): the document in
+            // memory still carries the desk on screen, as a save leaves it.
+            self.arrangement.desk = Some(self.desk_snapshot());
+            return;
+        };
+        self.write_session_doc(&doc);
+        // **And the kit sidecar with it, by the rows just written.**
+        // Today's bytes file each kit under its LANE, and a save is what
+        // moves the document's rows on disk: the save never wrote the
+        // sidecar, so a project saved after a drag reopened with the kit on
+        // the row the drum track had left and the drum track silent. Between
+        // saves the sidecar files kits by the rows this wrote
+        // (`drumpad_save`), never by rows the document has not saved. An
+        // absent sidecar and an empty one read alike, so a desk with no kit
+        // and no sidecar writes none.
+        if crate::drumpad::DrumpadDoc::sidecar(&doc).exists()
+            || self.drumpad_kits.values().any(|k| !k.is_empty())
+        {
+            self.save_kits_beside(&doc);
         }
+        self.note_doc_rows();
+    }
+
+    /// **The one writer of the session's document**: the desk as the
+    /// session shows it, taken off the live settings at the moment of the
+    /// write, then the document at `doc`. Every save road that writes the
+    /// session comes through here (Save, the first save, the save-backs,
+    /// Save As).
+    ///
+    /// The document carries a copy of the desk, refreshed by the edits that
+    /// go through `arr_save_edits` and by a save, but not by every edit:
+    /// adding a track (`add_bare_track`) or giving a row its kind
+    /// (`set_channel_kind`) writes the settings and leaves the copy as it
+    /// was. Save As wrote that copy as it stood, so a track added and then
+    /// Saved As was missing from the copy's document while the copy's kit
+    /// sidecar, written from the live rows, held its kit: the two files of
+    /// one project described two desks. Refreshed here, no road can write a
+    /// desk older than the one on screen (`a_save_writes_the_desk_the_session_shows`
+    /// keeps the roads to this one writer).
+    fn write_session_doc(&mut self, doc: &std::path::Path) {
+        self.arrangement.desk = Some(self.desk_snapshot());
+        self.arrangement.save_to(doc);
     }
 
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
@@ -84452,3 +84478,8 @@ mod lane_refs_tests {
         );
     }
 }
+
+/// **The save roads' own tests** (W5-save-gaps), in their own file.
+#[cfg(test)]
+#[path = "app_save_tests.rs"]
+mod save_tests;
