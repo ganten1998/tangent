@@ -525,3 +525,61 @@ fn every_first_format_2_write_keeps_a_release_builds_kit_to_go_back_to() {
     restores("the launch's reclaim", &scratch, &want);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// **The document a save writes is known before it is written**
+/// (W5-save-gaps 4): `session_doc_text` is, byte for byte, what
+/// `save_project_doc` then writes, and `save_choice_doc_text` what the first
+/// save and Save As write into their homes. The host writes it down with
+/// the mirror a save road owes the project's `state/`, and a launch after a
+/// kill pays that debt when the document on disk is the road's: a text that
+/// drifted from the write would read every road as one that never wrote,
+/// and a Save of knobs alone (whose bytes do not change) would have its
+/// debt let go, the knobs with it. Asked of the first save of a scratch, a
+/// Save with unsaved work, a Save with none (it rewrites the very bytes on
+/// disk), a Save As, and a release build's document's first format-2 write.
+#[test]
+fn the_document_a_save_writes_is_known_before_it_is_written() {
+    use crate::arrangement::doc_in;
+    let root = project_scratch("save-gaps-doc-text");
+    let read = |doc: &std::path::Path| std::fs::read_to_string(doc).expect("the document");
+    let (_ctx, mut app) = headless(Caps::DESKTOP);
+    app.bootstrap_project(&root.join("Projects"));
+
+    // The first save of a scratch.
+    let said = app.save_choice_doc_text();
+    assert!(app.save_project_first(&root.join("Projects").join("Song.tan")), "fixture: no first save");
+    let doc = app.project_doc().expect("the project").to_path_buf();
+    assert_eq!(read(&doc), said, "the first save wrote another document than it said it would");
+
+    // Save, with unsaved work: a fader moved and a track added.
+    app.settings.master_gain = 0.3;
+    app.arr_save_edits();
+    assert!(app.add_bare_track(4), "fixture: no track was added");
+    let said = app.session_doc_text();
+    assert_ne!(said, read(&doc), "fixture: the session holds nothing unsaved");
+    app.save_project_doc();
+    assert_eq!(read(&doc), said, "Save wrote another document than it said it would");
+
+    // Save, with nothing unsaved: the very bytes on disk, said and written.
+    let on_disk = read(&doc);
+    assert_eq!(app.session_doc_text(), on_disk, "a session with nothing unsaved says another document than the one on disk");
+    app.save_project_doc();
+    assert_eq!(read(&doc), on_disk, "a Save with nothing unsaved changed the document's bytes");
+
+    // Save As.
+    let said = app.save_choice_doc_text();
+    assert!(app.save_project_as(&root.join("Copy")), "the copy was not made");
+    assert_eq!(read(&doc_in(&root.join("Copy"))), said, "Save As wrote another document than it said it would");
+
+    // A release build's document, written in format 2 for the first time.
+    let legacy = root.join("Legacy");
+    std::fs::create_dir_all(legacy.join("media")).expect("the legacy project");
+    std::fs::write(doc_in(&legacy), include_str!("../../tests/fixtures/eras/doc-v7.json")).expect("the legacy document");
+    let (_c2, mut old) = headless(Caps::DESKTOP);
+    old.open_project(&doc_in(&legacy));
+    assert!(old.doc_legacy_states().is_some(), "fixture: the document is not a release build's");
+    let said = old.session_doc_text();
+    old.save_project_doc();
+    assert_eq!(read(&doc_in(&legacy)), said, "a release build's document's first format-2 write wrote another than it said");
+    let _ = std::fs::remove_dir_all(&root);
+}

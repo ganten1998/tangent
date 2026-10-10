@@ -11470,7 +11470,11 @@ impl DesktopApp {
                 if discarded {
                     self.discard_outgoing_scratch();
                 } else {
-                    self.copy_states_to_project();
+                    // Owed before it is made, as on every road that mirrors:
+                    // see `owe_states_beside_own_document`.
+                    let debt = self.owe_states_beside_own_document();
+                    let whole = self.copy_states_to_project();
+                    crate::shelf::mirror_settled(debt, whole);
                 }
                 let template = self.templates_dir().join("default");
                 let _ = std::fs::remove_file(tangent_ui::arrangement::doc_in(&template));
@@ -11829,11 +11833,15 @@ impl DesktopApp {
                     // into a brand-new Untitled folder.
                     //
                     // The mirror is owed before the document lands, as on
-                    // every save road: see `owe_states_to_own_home`.
+                    // every save road: see `owe_states_to_own_home`; and
+                    // with nothing unsaved, beside the document as it
+                    // stands, as an Open's save-back owes it.
                     let mut debt = None;
                     if !discarded && self.app.project_dirty_exact() {
                         debt = self.owe_states_to_own_home();
                         self.app.save_project_doc();
+                    } else if !discarded {
+                        debt = self.owe_states_beside_own_document();
                     }
                     // AFTER that write, because it is the write that gives an
                     // unmaterialised scratch a folder to be shelved into —
@@ -11922,9 +11930,11 @@ impl DesktopApp {
     /// points at stay readable until a mirror like this one replaces them.
     ///
     /// **Answers whether the folder now holds what the live shelf holds**
-    /// (`shelf::mirror_whole`), for the save roads that owe it a mirror: one
-    /// that did not land whole leaves their debt standing
-    /// (`shelf::mirror_settled`). A session with no folder was owed nothing
+    /// (`shelf::mirror_into_home`), for the save roads that owe it a mirror:
+    /// one that did not land whole leaves their debt standing
+    /// (`shelf::mirror_settled`), and a whole one takes every debt still
+    /// owed to the folder, the road's own and any older one, because nothing
+    /// older may be paid over it. A session with no folder was owed nothing
     /// there, and says so.
     fn copy_states_to_project(&mut self) -> bool {
         let Some(dir) = self.project_state_dir() else {
@@ -11934,11 +11944,10 @@ impl DesktopApp {
         // for a state shelf alone - "no untitled folders PERIOD". The
         // states still live on the global shelf; a session worth keeping
         // materialises through a real writer first.
-        if !dir.parent().is_some_and(std::path::Path::is_dir) {
+        let Some(home) = dir.parent().filter(|home| home.is_dir()) else {
             return true;
-        }
-        let _ = std::fs::create_dir_all(&dir);
-        let whole = crate::shelf::mirror_whole(&crate::shelf::global_dir(), &crate::shelf::ShelfNames::Pstate, &dir);
+        };
+        let whole = crate::shelf::mirror_into_home(&crate::shelf::global_dir(), home);
         self.clear_legacy_marker();
         whole
     }
@@ -12037,8 +12046,9 @@ impl DesktopApp {
     ///   document it costs the save nothing;
     /// - the mirror owed to the home the app will choose
     ///   (`TangentApp::save_choice_dir`) is written down beside the live
-    ///   shelf, with the states it owes, and the launch that finds it
-    ///   standing pays it (`shelf::pay_owed_mirror`).
+    ///   shelf, with the states it owes and the document the save writes
+    ///   there (`TangentApp::save_choice_doc_text`), and the launch that
+    ///   finds it standing pays it (`shelf::pay_owed_mirror`).
     ///
     /// The road settles the debt once it has mirrored
     /// (`shelf::mirror_settled`).
@@ -12050,7 +12060,8 @@ impl DesktopApp {
     ) -> Option<crate::shelf::OwedMirror> {
         self.save_plugin_states();
         let home = self.app.save_choice_dir(purpose, path)?;
-        crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home)
+        let doc = self.app.save_choice_doc_text();
+        crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home, crate::shelf::RoadDoc::Writes(doc.as_bytes()))
     }
 
     /// **The roads that write the session's document IN PLACE, made safe to
@@ -12065,14 +12076,36 @@ impl DesktopApp {
     /// shelf the relaunch replaces with the template's.
     ///
     /// So the mirror owed to the session's own folder is written down
-    /// first, with the states it owes (`shelf::owe_mirror`), by a caller
-    /// whose knobs are already on the live shelf (`save_plugin_states`), and
-    /// the road settles it once it has mirrored. `None` when the session
-    /// has no home to owe, or nothing could be written down.
+    /// first, with the states it owes and the document the road is about to
+    /// write (`TangentApp::session_doc_text`: the same bytes, when knobs
+    /// alone were turned, as the document it finds), by a caller whose
+    /// knobs are already on the live shelf (`save_plugin_states`), and the
+    /// road settles it once it has mirrored. `None` when the session has no
+    /// home to owe, or nothing could be written down.
     #[cfg(feature = "recorder")]
     fn owe_states_to_own_home(&mut self) -> Option<crate::shelf::OwedMirror> {
         let home = self.app.project_doc()?.parent()?.to_path_buf();
-        crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home)
+        let doc = self.app.session_doc_text();
+        crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home, crate::shelf::RoadDoc::Writes(doc.as_bytes()))
+    }
+
+    /// **The roads that mirror into the session's own folder and write no
+    /// document, made safe to kill partway through the mirror**: the
+    /// save-backs of an Open and a New when nothing is unsaved, a quit
+    /// (`on_exit`), and Reset Template letting the outgoing session go. A
+    /// knob turned in a plugin's own window never dirties the document, so
+    /// these are the roads its knobs reach the project by, and a kill in the
+    /// middle of one left `state/` with some plugins on their new knobs and
+    /// the rest on the old ones, the live shelf about to be replaced with
+    /// the template's. The mirror is owed first, beside the document as it
+    /// stands (`shelf::RoadDoc::Stands`), by a caller whose knobs are
+    /// already on the live shelf, and settled once it has run. `None` when
+    /// the session has no folder and document to owe, or nothing could be
+    /// written down.
+    #[cfg(feature = "recorder")]
+    fn owe_states_beside_own_document(&mut self) -> Option<crate::shelf::OwedMirror> {
+        let home = self.app.project_doc()?.parent()?.to_path_buf();
+        crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home, crate::shelf::RoadDoc::Stands)
     }
 
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
@@ -12303,12 +12336,17 @@ impl DesktopApp {
         // **The mirror is owed before the document lands** - the first
         // write of a scratch's folder most of all, whose `state/` the
         // mirror below makes - and settled once it has: see
-        // `owe_states_to_own_home`.
+        // `owe_states_to_own_home`. **And when nothing is unsaved**, owed
+        // all the same beside the document as it stands: this mirror is the
+        // road the knobs take, and a kill partway through it left the
+        // project half on new knobs (`owe_states_beside_own_document`).
         let discarded = self.app.take_outgoing_discarded();
         let mut debt = None;
         if !discarded && self.app.project_dirty_exact() {
             debt = self.owe_states_to_own_home();
             self.app.save_project_doc();
+        } else if !discarded {
+            debt = self.owe_states_beside_own_document();
         }
         // **And the shelf AFTER that write**, which is the line that gives an
         // unmaterialised scratch a folder at all — see
@@ -20582,10 +20620,16 @@ impl eframe::App for DesktopApp {
         // them would mean a project that opens with its instruments reset
         // even when the answer was Save. Not when it was "Don't Save": the
         // discarded knobs would sit beside a document that never named them.
+        //
+        // Owed before it is made, as on every road that mirrors: a quit
+        // killed partway through (a logout that does not wait) left the
+        // project half on new knobs. See `owe_states_beside_own_document`.
         if self.app.take_outgoing_discarded() {
             self.discard_outgoing_scratch();
         } else {
-            self.copy_states_to_project();
+            let debt = self.owe_states_beside_own_document();
+            let whole = self.copy_states_to_project();
+            crate::shelf::mirror_settled(debt, whole);
         }
     }
 }
@@ -30785,7 +30829,9 @@ mod tests {
         let exit = between("fn on_exit(&mut self", "\n}\n");
         assert!(
             exit.contains("if self.app.take_outgoing_discarded() {\n            self.discard_outgoing_scratch();")
-                && exit.contains("} else {\n            self.copy_states_to_project();"),
+                && exit.contains(
+                    "} else {\n            let debt = self.owe_states_beside_own_document();\n            let whole = self.copy_states_to_project();"
+                ),
             "a Quit answered Don't Save shelves the discarded plugin states"
         );
         // An arrangement take makes a scratch real through the one door that
@@ -36553,8 +36599,12 @@ mod sidecar_walk_probe {
         let owe = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
         let knobs = owe.find("self.save_plugin_states();").expect("the knobs go onto the live shelf");
         let home = owe.find("self.app.save_choice_dir(purpose, path)").expect("the app names the home");
-        let record = owe.find("crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home)").expect("the record");
+        let doc = owe.find("let doc = self.app.save_choice_doc_text();").expect("the app names the document it writes there");
+        let record = owe
+            .find("crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home, crate::shelf::RoadDoc::Writes(doc.as_bytes()))")
+            .expect("the record");
         assert!(knobs < home && home < record, "the record is written before the knobs are on the live shelf");
+        assert!(doc < record, "the record is written without the document the save leaves");
         let new_at = src
             .find("    pub fn new(\n        cc: &eframe::CreationContext<'_>,")
             .expect("DesktopApp::new");

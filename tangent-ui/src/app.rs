@@ -18483,6 +18483,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arrangement.save_to(doc);
     }
 
+    /// **The document `save_project_doc` writes, as the bytes it writes**,
+    /// asked before it writes them: the one serialisation
+    /// `write_session_doc` makes (the live desk, this build's format),
+    /// without the write.
+    ///
+    /// For the host's plugin states (design 6.6). The host writes down the
+    /// mirror a save road owes the project's `state/` before the document
+    /// lands, and a launch after a kill pays it when the document on disk
+    /// is the road's. Going by the document the road found, that launch
+    /// could tell a road that wrote from one that never got there only when
+    /// the write changed the file, and a save of knobs alone (a knob turned
+    /// in a plugin's own window never dirties the document) rewrites the
+    /// very bytes it found: its debt was let go, and the knobs with it.
+    /// `the_document_a_save_writes_is_known_before_it_is_written` holds the
+    /// two to one text.
+    pub fn session_doc_text(&self) -> String {
+        self.arrangement.to_json_with_desk(Some(&self.desk_snapshot()))
+    }
+
+    /// **The document Save As and the first save write into the home
+    /// [`Self::save_choice_dir`] names**, as the bytes they write: the
+    /// session's ([`Self::session_doc_text`]), NAMED, both roads' word that
+    /// a person chose the place. Asked before the save runs, for the same
+    /// debt.
+    pub fn save_choice_doc_text(&self) -> String {
+        let mut named = self.arrangement.clone_without_desk();
+        named.named = true;
+        named.to_json_with_desk(Some(&self.desk_snapshot()))
+    }
+
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
     /// stays in the project, the way the × keeps material.
     /// COPY the selected clips — the band's set and the single selection
