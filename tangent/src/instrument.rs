@@ -357,11 +357,11 @@ const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 
 /// **The width of the legacy desk, as the engine's own number.** Every
 /// engine is built with this many lanes installed, row r at slot r (design 3),
-/// and the engine's frozen seat map, its arm word and its automation lanes
-/// reach exactly this far: a lane past it has no pad racks and no curve to
-/// name it until the waves that give it them. (Its plugin racks, through
-/// their `HostRack`s, and its instruments are reached by identity at any
-/// slot.) The bridge keeps every lane below it until then.
+/// and the engine's frozen seat map and its arm word reach exactly this far:
+/// a lane past it has no pad racks until the wave that gives it them. (Its
+/// plugin racks, through their `HostRack`s, its instruments and its curves
+/// are reached at any slot.) The bridge gives a new track a slot below it
+/// whenever one is free or on its way home (`Bridge::install`).
 pub(crate) const LEGACY_LANES: usize = 32;
 
 /// How many pads the drumpad has: the identity grammar's (`desk_id::PADS`),
@@ -1518,15 +1518,30 @@ impl DelayLine {
 
 /// Every automated control's value for one block.
 ///
-/// Plain arrays rather than a lookup, because the audio thread asks for
-/// these twelve times a block and an `Option<f32>` in an array is a load and
+/// Plain tables rather than a lookup, because the audio thread asks for
+/// these twelve times a block and an `Option<f32>` in a table is a load and
 /// a branch.
-#[derive(Debug, Clone, Copy)]
+///
+/// **One row per slot of the spine** (W6-rows-unlimited). They were
+/// `[_; CHANNELS]` arrays on the renderer, so a lane past slot 31 had no row
+/// to be read from and every curve drawn on it (fader, pan, send, mute)
+/// moved nothing, live or in an export, while the bridge was already
+/// installing lanes there. They live on the spine now (`Wide::auto`), bought
+/// on the host at the spine's capacity, so a Grow brings them with every
+/// other per-slot table. Not `Clone`: a copy of `written` would keep its
+/// entries and lose the room bought for them.
+#[derive(Debug)]
 pub struct AutoNow {
-    gain: [Option<f32>; CHANNELS],
-    pan: [Option<f32>; CHANNELS],
-    send: [Option<f32>; CHANNELS],
-    mute: [Option<bool>; CHANNELS],
+    gain: Box<[Option<f32>]>,
+    pan: Box<[Option<f32>]>,
+    send: Box<[Option<f32>]>,
+    mute: Box<[Option<bool>]>,
+    /// **The slots a curve wrote this chunk**, so the next chunk clears those
+    /// and no others: clearing every row of a thousand-lane spine each chunk
+    /// would be the walk over the desk that reading the curves instead
+    /// ([`automation_now_into`]) exists to avoid. A slot goes in once a
+    /// chunk, so its length is bought at the tables' and it never grows.
+    written: Vec<u32>,
     /// **The MASTER's fader**, when a curve is driving it.
     ///
     /// Its own field rather than a seventeenth element of `gain`: the arrays
@@ -1545,17 +1560,95 @@ pub struct AutoNow {
     master_mute: Option<bool>,
 }
 
-impl Default for AutoNow {
-    fn default() -> Self {
+impl AutoNow {
+    /// Every table at `lanes` slots, nothing automated. The only call that
+    /// allocates, made on the host with the spine it belongs to.
+    fn with_capacity(lanes: usize) -> Self {
         Self {
-            gain: [None; CHANNELS],
-            pan: [None; CHANNELS],
-            send: [None; CHANNELS],
-            mute: [None; CHANNELS],
+            gain: vec![None; lanes].into_boxed_slice(),
+            pan: vec![None; lanes].into_boxed_slice(),
+            send: vec![None; lanes].into_boxed_slice(),
+            mute: vec![None; lanes].into_boxed_slice(),
+            written: Vec::with_capacity(lanes),
             master_gain: None,
             master_pan: None,
             master_mute: None,
         }
+    }
+
+    /// **Nothing automated**, in place: the slots the last chunk wrote, and
+    /// the master's three. No allocation.
+    fn clear(&mut self) {
+        self.clear_lanes();
+        self.master_gain = None;
+        self.master_pan = None;
+        self.master_mute = None;
+    }
+
+    /// The slots the last chunk wrote, back to their faders.
+    fn clear_lanes(&mut self) {
+        for &lane in &self.written {
+            let at = lane as usize;
+            for row in [&mut self.gain, &mut self.pan, &mut self.send] {
+                if let Some(v) = row.get_mut(at) {
+                    *v = None;
+                }
+            }
+            if let Some(v) = self.mute.get_mut(at) {
+                *v = None;
+            }
+        }
+        self.written.clear();
+    }
+
+    /// **Whether a curve may write slot `lane` this chunk**, noting it the
+    /// first time one does so the next chunk clears it. `false` for a slot
+    /// past the tables, and for one that could not be noted: a value that
+    /// would never be cleared is a fader stuck where a curve once left it.
+    fn mark(&mut self, lane: usize) -> bool {
+        let fresh = match (self.gain.get(lane), self.pan.get(lane), self.send.get(lane), self.mute.get(lane)) {
+            (Some(g), Some(p), Some(s), Some(m)) => g.is_none() && p.is_none() && s.is_none() && m.is_none(),
+            _ => return false,
+        };
+        if !fresh {
+            return true;
+        }
+        let Ok(at) = u32::try_from(lane) else {
+            return false;
+        };
+        if self.written.len() == self.written.capacity() {
+            return false;
+        }
+        self.written.push(at);
+        true
+    }
+
+    /// Every slot's value and the master's into `to`, as far as its tables
+    /// reach: a Grow lands between two chunks. No allocation.
+    fn carry_into(&self, to: &mut Self) {
+        to.clear();
+        carry_rows(&self.gain, &mut to.gain);
+        carry_rows(&self.pan, &mut to.pan);
+        carry_rows(&self.send, &mut to.send);
+        carry_rows(&self.mute, &mut to.mute);
+        let reach = to.gain.len();
+        for &lane in &self.written {
+            if (lane as usize) < reach && to.written.len() < to.written.capacity() {
+                to.written.push(lane);
+            }
+        }
+        to.master_gain = self.master_gain;
+        to.master_pan = self.master_pan;
+        to.master_mute = self.master_mute;
+    }
+}
+
+/// The tables at the widest desk word's reach, for the tests that build
+/// one by hand. The engine's own come with its spine.
+#[cfg(test)]
+impl Default for AutoNow {
+    fn default() -> Self {
+        Self::with_capacity(DESK_WORD_LANES)
     }
 }
 
@@ -4765,7 +4858,23 @@ pub(crate) fn param_slot(lane: usize, bay: usize, master: usize) -> Option<(usiz
         // fold, exactly as the plugin state does.
         return Some((tangent_ui::recorder::folder_extra_seat(lane), bay - INSERTS));
     }
-    (lane < CHANNELS && bay < INSERTS).then_some((lane, bay))
+    if lane < CHANNELS {
+        return (bay < INSERTS).then_some((lane, bay));
+    }
+    // **A lane past the frozen map** (W6-rows-unlimited): its two chains'
+    // seats in the range after it (`lane_seat`), bays 0..2 its own rack's
+    // and 3..5 its extra rack's, the same split as a legacy lane's. It
+    // answered `None`, so a plugin curve on the thirty-third track was
+    // dropped here, live and in every export. Checked arithmetic: a curve
+    // naming a slot no spine reaches lands on no seat rather than wrapping
+    // onto a real one.
+    let rack = match bay / INSERTS {
+        0 => CHAIN_OWN,
+        1 => CHAIN_EXTRA,
+        _ => return None,
+    };
+    let seat = (lane - CHANNELS).checked_mul(LANE_RACKS)?.checked_add(RACK_SEATS + rack)?;
+    Some((seat, bay % INSERTS))
 }
 
 /// The sidechain feed a caller hands [`run_rack`], on exactly ONE pass per
@@ -6053,10 +6162,12 @@ impl DeskLanes {
     }
 
     /// **Reload every set from a plan** (design 7.6): the lanes by their
-    /// flags, at their slots, whatever the slot. Automation stays in its own
-    /// space, so only the first thirty-two slots go into `suspend` and the
-    /// master's own flag into `suspend_master`: a curve names a legacy row or
-    /// the master, never a slot past them. The four specials
+    /// flags, at their slots, whatever the slot. `suspend` takes every slot
+    /// too, since a curve names any slot (W6-rows-unlimited: it stopped at the
+    /// thirty-second, so a hand on the fader of a lane past it was argued
+    /// with by that lane's own curve), and the master's own flag goes into
+    /// `suspend_master`: the master's curves are filed under a number no slot
+    /// is (`CurveOwners::held` asks it first). The four specials
     /// listen to MIDI unless the plan sets their own `MIDI_OFF`: the shim
     /// word's strip bits 32 to 35 say the same thing, and dropping it here
     /// opened the arm gate on every instrument in the drum bus, click,
@@ -6099,7 +6210,7 @@ impl DeskLanes {
             if f.contains(F::PHASE) {
                 self.phase.insert(at);
             }
-            if f.contains(F::SUSPEND) && at < CHANNELS {
+            if f.contains(F::SUSPEND) {
                 self.suspend.insert(at);
             }
         }
@@ -7468,6 +7579,26 @@ struct Wide {
     /// not move rather than a block that does not render. Refilled every
     /// chunk by `resolve_automation`, so a Grow carries none of it.
     auto_params: Vec<Vec<tangent_host::ParamPoint>>,
+    /// **What every automated control reads THIS block.**
+    ///
+    /// Resolved once at the top of `render` and then asked twelve times —
+    /// seven gain reads and five pan reads scattered across the routing
+    /// fold, the live monitor, the arrangement clips, the file preview, the
+    /// drum pads and the three MIDI paths in `mix_channels`. Resolving it
+    /// per site would be twelve binary searches instead of one and, far
+    /// worse, twelve chances to leave one out: a version that automated only
+    /// `mix_clips` would look exactly right on an audio clip and do nothing
+    /// at all to a MIDI lane or a live input.
+    ///
+    /// `None` means nothing automates that control, which is what leaves the
+    /// fader in charge — the automation OVERRIDES the fader while a curve is
+    /// there and is silent otherwise. Not a multiplier: a volume curve is
+    /// the fader's position, the way every desk means it.
+    ///
+    /// **Here rather than on the renderer** (W6-rows-unlimited): it is one
+    /// row per slot (see [`AutoNow`]), so a Grow has to bring it at the new
+    /// capacity, and the shell is the only door a Grow has.
+    auto: AutoNow,
 }
 
 /// **How many rack seats a spine of `lanes` slots has**: the frozen map's,
@@ -7557,6 +7688,7 @@ impl Wide {
             // walks it; a plan carries its route order already sorted
             // (`DeskPlan::routes`).
             route_deps: (0..CHANNELS).map(|_| LaneSet::with_capacity(CHANNELS)).collect(),
+            auto: AutoNow::with_capacity(lanes),
         }
     }
 }
@@ -7628,6 +7760,7 @@ impl crate::lane_bank::SpineExt for Wide {
             carry_set(from, into);
         }
         self.desk.carry_into(&mut to.desk);
+        self.auto.carry_into(&mut to.auto);
     }
 }
 
@@ -8304,45 +8437,81 @@ fn fill_automation_params(
 /// see `resolve_automation`. `param_lanes` keeps a lane those land on from
 /// PARKING, and `Renderer::ui_held` keeps an edit for a lane served from its
 /// grain ring that block, which runs no rack, until the lane's rack runs.
+///
+/// **Written into `now` in place, walked from the CURVES** (W6-rows-unlimited),
+/// as the plugin parameters are (`fill_automation_params`): it asked each of
+/// the thirty-two lanes for its four curves, and a lane past them was never
+/// asked, so a fader curve on the thirty-third track moved nothing. Asking
+/// every slot of a spine that grows with the desk would be four list scans
+/// per lane per chunk, where a song has a handful of curves. The slots the
+/// last chunk wrote go back to their faders first (`AutoNow::written`), so a
+/// curve taken away, held by a hand or of another generation leaves its
+/// control to the fader on the next chunk, as the per-lane walk did.
+fn automation_now_into(
+    automation: &tangent_ui::automation::Automation,
+    suspend: &LaneSet,
+    whose: &CurveOwners<'_>,
+    secs: f64,
+    now: &mut AutoNow,
+) {
+    use tangent_ui::automation::AutoParam;
+    now.clear_lanes();
+    let mut last = None;
+    for curve in automation.curves() {
+        // **A control plays its FIRST curve**, as `Automation::value_at`
+        // reads it: the list is sorted by lane and control, so a second
+        // curve for one control is the very next entry.
+        let key = (curve.lane, curve.param);
+        if last == Some(key) {
+            continue;
+        }
+        last = Some(key);
+        // The desk's own four; a plugin's parameters are filed per bay.
+        if !matches!(curve.param, AutoParam::Gain | AutoParam::Pan | AutoParam::Send | AutoParam::Mute) {
+            continue;
+        }
+        // The master's curves are read on their own (`AutoNow::master_gain`).
+        let lane = curve.lane.index_or(whose.master);
+        if lane == whose.master || suspend.contains(lane) || !whose.plays(lane) {
+            continue;
+        }
+        let Some(value) = curve.value_at(secs) else {
+            continue;
+        };
+        if !now.mark(lane) {
+            continue;
+        }
+        match curve.param {
+            AutoParam::Gain => now.gain[lane] = Some(value as f32),
+            AutoParam::Pan => now.pan[lane] = Some(value as f32),
+            AutoParam::Send => now.send[lane] = Some(value as f32),
+            // A switch written as a curve: heard below half, muted above it.
+            AutoParam::Mute => now.mute[lane] = Some(value >= 0.5),
+            _ => {}
+        }
+    }
+}
+
+/// [`automation_now_into`] into tables of its own, for the tests that ask
+/// it about two positions and compare the answers.
+#[cfg(test)]
 fn automation_now(
     automation: &tangent_ui::automation::Automation,
     suspend: &LaneSet,
     whose: &CurveOwners<'_>,
     secs: f64,
 ) -> AutoNow {
-    use tangent_ui::automation::AutoParam;
     let mut now = AutoNow::default();
-        for lane in 0..CHANNELS {
-            if suspend.contains(lane) || !whose.plays(lane) {
-                now.gain[lane] = None;
-                now.pan[lane] = None;
-                now.send[lane] = None;
-                now.mute[lane] = None;
-                continue;
-            }
-            now.gain[lane] = automation
-                .value_at(lane, AutoParam::Gain, secs)
-                .map(|v| v as f32);
-            now.pan[lane] = automation
-                .value_at(lane, AutoParam::Pan, secs)
-                .map(|v| v as f32);
-            now.send[lane] = automation
-                .value_at(lane, AutoParam::Send, secs)
-                .map(|v| v as f32);
-            // A switch written as a curve: heard below half, muted above it.
-            now.mute[lane] = automation
-                .value_at(lane, AutoParam::Mute, secs)
-                .map(|v| v >= 0.5);
-        }
-
+    automation_now_into(automation, suspend, whose, secs, &mut now);
     now
 }
 
 /// **An automation list as the callback holds it**: the curves and whose
 /// they are. `gens` is empty for today's `set_automation`, whose curves play
 /// on whatever lane holds the row; `set_automation_slotted` fills it, one
-/// generation per slot below [`CHANNELS`], and a slot's curves play only on
-/// the lane of that generation. Swapped whole, like every schedule.
+/// generation per slot up to the widest a curve names, and a slot's curves
+/// play only on the lane of that generation. Swapped whole, like every
+/// schedule.
 pub(crate) struct AutoList {
     curves: tangent_ui::automation::Automation,
     gens: Vec<u32>,
@@ -8392,14 +8561,15 @@ impl CurveOwners<'_> {
 /// **The arrangement's automation, by slot and generation** (contract C8,
 /// `Engine::set_automation_slotted`).
 ///
-/// A curve's `lane` names a SLOT below [`CHANNELS`], or the master
-/// (`master`, which the bridge reads off `LaneId::Master.auto_lane()`, the one
-/// home of that arithmetic, so the engine reads no constant for it); `gens`
-/// says, per slot a curve names, which lane it was drawn for. A curve whose
-/// slot is missing from `gens`, or holds a lane of another generation, is
-/// silent until that lane lands. Curves for slots past 31 cannot be said yet:
-/// `Curve::lane` is the row space whose next number IS the master's
-/// (MERGE-ME(W6-rows-unlimited): `AutoLane`).
+/// A curve's `lane` names a SLOT, any slot (`AutoLane::Row(slot)`), or the
+/// master (`master`, a number the bridge files the master's curves under that
+/// no slot reaches, so the engine reads no constant for it); `gens` says, per
+/// slot a curve names, which lane it was drawn for. A curve whose slot is
+/// missing from `gens`, or holds a lane of another generation, is silent
+/// until that lane lands. A lane past slot 31 plays its curves as any other
+/// does (W6-rows-unlimited): its fader, pan, send and mute rows are the
+/// spine's (`AutoNow`), its plugins' parameters land on its own seats
+/// (`param_slot`), and a hand on its fader holds them (`DeskLanes::suspend`).
 #[derive(Clone, Debug, Default)]
 pub struct SlotAutomation {
     pub curves: tangent_ui::automation::Automation,
@@ -9955,22 +10125,9 @@ struct Renderer {
     bar_clock: BarClock,
     /// The tempo and meter maps the click and the ruler share.
     maps: Maps,
-    /// **What every automated control reads THIS block.**
-    ///
-    /// Resolved once at the top of `render` and then asked twelve times —
-    /// seven gain reads and five pan reads scattered across the routing
-    /// fold, the live monitor, the arrangement clips, the file preview, the
-    /// drum pads and the three MIDI paths in `mix_channels`. Resolving it
-    /// per site would be twelve binary searches instead of one and, far
-    /// worse, twelve chances to leave one out: a version that automated only
-    /// `mix_clips` would look exactly right on an audio clip and do nothing
-    /// at all to a MIDI lane or a live input.
-    ///
-    /// `None` means nothing automates that control, which is what leaves the
-    /// fader in charge — the automation OVERRIDES the fader while a curve is
-    /// there and is silent otherwise. Not a multiplier: a volume curve is
-    /// the fader's position, the way every desk means it.
-    auto: AutoNow,
+    // **What every automated control reads THIS block** is the spine's
+    // (`Wide::auto`), one row per slot, so a Grow brings it at the new
+    // capacity (W6-rows-unlimited: it was a thirty-two-lane field here).
     /// **The bare drumpad bus's compensation line.** A drum lane's own is in
     /// its pad bank (`PadBank::pdc`); the bare drumpad has no lane.
     ///
@@ -10456,10 +10613,15 @@ impl Renderer {
         let n = self.plan.lanes.len().min(ext.mute_rank.len());
         for r in 0..n {
             let at = self.plan.lanes[r].slot.0 as usize;
-            // A lane's Mute curve, where the automation can name it: the
-            // shim's own bit for a legacy row, which `muted_now` has already
-            // folded the curve into.
-            ext.mute_rank[r] = (at < CHANNELS).then(|| muted & word_bit(at) != 0);
+            // A lane's Mute curve: the shim's own bit for a legacy row, which
+            // `muted_now` has already folded the curve into, and the lane's
+            // own row past them (W6-rows-unlimited), where `None` leaves the
+            // plan's MUTED flag in charge as the button is.
+            ext.mute_rank[r] = if at < CHANNELS {
+                Some(muted & word_bit(at) != 0)
+            } else {
+                ext.auto.mute.get(at).copied().flatten()
+            };
         }
         crate::desk_plan::resolve_heard(&self.plan, &ext.mute_rank[..n], &mut ext.heard_rank[..n]);
         for r in 0..n {
@@ -12193,7 +12355,7 @@ impl Renderer {
             // **A curve on the master overrides its fader**, exactly as a
             // channel's does — see `lane_gain_of`. The stored position is
             // what the hand left; the curve is what the song says.
-            let master = match self.auto.master_gain {
+            let master = match self.spine.ext.auto.master_gain {
                 Some(pos) => tangent_ui::recorder::fader_to_gain(pos).clamp(0.0, 8.0),
                 None => Shared::f32_of(&self.shared.master_gain),
             };
@@ -12203,14 +12365,14 @@ impl Renderer {
             // the fade is the curve author's job - and balance rides the
             // same equal-power law as a channel, applied here with the
             // gain, before the mono fold, after the limiter.
-            let master = if self.auto.master_mute == Some(true)
+            let master = if self.spine.ext.auto.master_mute == Some(true)
                 || self.shared.master_mute.load(Ordering::Relaxed)
             {
                 0.0
             } else {
                 master
             };
-            let (bal_l, bal_r) = match self.auto.master_pan {
+            let (bal_l, bal_r) = match self.spine.ext.auto.master_pan {
                 Some(pos) => pan_gains(pos * 2.0 - 1.0),
                 None => (1.0, 1.0),
             };
@@ -13171,7 +13333,7 @@ impl Renderer {
                     1.0
                 } else {
                     lane_gain_of(
-                        &self.auto,
+                        &self.spine.ext.auto,
                         &self.shared,
                         (self.plan.gen != 0).then_some(&self.spine.ext.desk.phase),
                         strip.index(),
@@ -13217,12 +13379,12 @@ impl Renderer {
             let send = if is_folder {
                 0.0
             } else {
-                lane_send_of(&self.auto, &self.shared, Strip::Channel(lane))
+                lane_send_of(&self.spine.ext.auto, &self.shared, Strip::Channel(lane))
             };
             let (pan_l, pan_r) = if is_folder {
                 (1.0, 1.0)
             } else {
-                pan_gains(lane_pan_of(&self.auto, &self.shared, lane))
+                pan_gains(lane_pan_of(&self.spine.ext.auto, &self.shared, lane))
             };
             let mut peak = [0.0f32; 2];
             // The jack's own level, pre-fader, for an armed strip's meter.
@@ -13646,12 +13808,12 @@ impl Renderer {
 
     fn lane_gain(&self, lane: usize) -> f32 {
         let phase = self.plan_drives().then_some(&self.spine.ext.desk.phase);
-        lane_gain_of(&self.auto, &self.shared, phase, lane)
+        lane_gain_of(&self.spine.ext.auto, &self.shared, phase, lane)
     }
 
     /// The same for pan, with the curve's `0..1` laid back onto `-1..1`.
     fn lane_pan(&self, lane: usize) -> f32 {
-        lane_pan_of(&self.auto, &self.shared, lane)
+        lane_pan_of(&self.spine.ext.auto, &self.shared, lane)
     }
 
     /// The send lane `i` is actually feeding the effects bus at.
@@ -13661,7 +13823,7 @@ impl Renderer {
     /// nothing automates those. Out-of-range lanes fall through to the
     /// atomic, which is the honest answer for a strip no curve can name.
     fn lane_send(&self, strip: Strip) -> f32 {
-        lane_send_of(&self.auto, &self.shared, strip)
+        lane_send_of(&self.spine.ext.auto, &self.shared, strip)
     }
 
     /// Resolve every automated control for this block.
@@ -13792,7 +13954,7 @@ impl Renderer {
         if self.automation.is_empty() {
             // The overwhelmingly common song. One branch instead of sixty-four
             // lookups, and it leaves every fader exactly where it was.
-            self.auto = AutoNow::default();
+            self.spine.ext.auto.clear();
             return;
         }
         let secs = at as f64 / self.rate.max(1.0);
@@ -13820,26 +13982,27 @@ impl Renderer {
         for ch in self.spine.ext.curve_lanes.iter() {
             self.spine.ext.param_lanes.insert(ch);
         }
-        self.auto = automation_now(&self.automation, suspend, &whose, secs);
+        automation_now_into(&self.automation, suspend, &whose, secs, &mut self.spine.ext.auto);
         // **The master's own curve**, read at the lane the list files it
         // under (`AutoList::master`, the UI's `LaneId::Master.auto_lane()`).
         // Suspended by the same rule a channel is: a fader being HELD is the
         // hand talking, and a curve must not argue with it mid-gesture.
         let master = self.auto_master;
+        let now = &mut self.spine.ext.auto;
         if master_held {
-            self.auto.master_gain = None;
-            self.auto.master_pan = None;
-            self.auto.master_mute = None;
+            now.master_gain = None;
+            now.master_pan = None;
+            now.master_mute = None;
         } else {
-            self.auto.master_gain = self
+            now.master_gain = self
                 .automation
                 .value_at(master, AutoParam::Gain, secs)
                 .map(|v| v as f32);
-            self.auto.master_pan = self
+            now.master_pan = self
                 .automation
                 .value_at(master, AutoParam::Pan, secs)
                 .map(|v| v as f32);
-            self.auto.master_mute = self
+            now.master_mute = self
                 .automation
                 .value_at(master, AutoParam::Mute, secs)
                 .map(|v| v >= 0.5);
@@ -14005,7 +14168,7 @@ impl Renderer {
     fn muted_now(&self, muted: u64) -> u64 {
         let mut out = muted;
         for lane in 0..CHANNELS {
-            match self.auto.mute[lane] {
+            match self.spine.ext.auto.mute.get(lane).copied().flatten() {
                 Some(true) => out |= word_bit(lane),
                 Some(false) => out &= !word_bit(lane),
                 None => {}
@@ -19705,7 +19868,6 @@ impl Engine {
             maps: Maps::default(),
             maps_incoming,
             maps_retiring,
-            auto: AutoNow::default(),
             bare_pad_pdc: DelayLine::new(),
             automation: tangent_ui::automation::Automation::default(),
             auto_incoming,
@@ -23309,7 +23471,12 @@ impl Engine {
     /// lanes' Install moves their controls from the block they land and a
     /// curve for a lane that has gone moves nobody's.
     pub fn set_automation_slotted(&mut self, auto: SlotAutomation) {
-        let mut gens = vec![0u32; CHANNELS];
+        // **As wide as the widest slot a curve names**: the table stopped at
+        // the legacy thirty-two, so a curve for a lane past them found no
+        // generation, `CurveOwners::plays` answered no, and it was silent on
+        // a lane the bridge had already installed (W6-rows-unlimited).
+        let wide = auto.gens.iter().map(|(s, _)| s.0 as usize + 1).max().unwrap_or(0);
+        let mut gens = vec![0u32; wide.max(CHANNELS)];
         for (slot, gen) in auto.gens {
             if let Some(g) = gens.get_mut(slot.0 as usize) {
                 *g = gen;
@@ -26602,7 +26769,6 @@ mod tests {
             maps: Maps::default(),
             maps_incoming: RingBuffer::<Maps>::new(2).1,
             maps_retiring: RingBuffer::<Maps>::new(2).0,
-            auto: AutoNow::default(),
             bare_pad_pdc: DelayLine::new(),
             automation: tangent_ui::automation::Automation::default(),
             auto_incoming: RingBuffer::<AutoList>::new(2).1,
@@ -31562,7 +31728,19 @@ mod tests {
             None,
             "a channel grew a seventh bay"
         );
-        assert_eq!(param_slot(CHANNELS + 5, 0, MASTER_AUTO_LANE), None, "a lane nobody has");
+        // **A lane past the frozen map keeps its curves on its own two
+        // chains' seats** (W6-rows-unlimited: this asserted `None`, "a lane
+        // nobody has", while no curve could name one; the bridge installs
+        // lanes there now and files their curves under the slot): bays 0..2
+        // on its own rack's seat, 3..5 on its extra rack's, the seats its
+        // racks read their queues from (`lane_seat`), and no seventh.
+        let past = CHANNELS + 5;
+        assert_eq!(param_slot(past, 1, MASTER_AUTO_LANE), Some((lane_seat(past, CHAIN_OWN), 1)));
+        assert_eq!(param_slot(past, INSERTS + 2, MASTER_AUTO_LANE), Some((lane_seat(past, CHAIN_EXTRA), 2)));
+        assert_eq!(param_slot(past, INSERTS * 2, MASTER_AUTO_LANE), None, "a lane past 31 grew a seventh bay");
+        assert_eq!(lane_of_seat(lane_seat(past, CHAIN_EXTRA)), Some(past), "the seat is not the lane's");
+        // A slot no spine reaches lands on no seat rather than wrapping.
+        assert_eq!(param_slot(usize::MAX - 1, 0, MASTER_AUTO_LANE), None, "a slot past every seat wrapped");
 
         // The master keeps its original rack exactly where it was — this is
         // the assertion that stops a saved curve moving to another plugin.
@@ -37510,13 +37688,12 @@ mod slot_engine {
                     _ => &d.suspend,
                 };
                 for &b in &subjects {
-                    // `midi_on` is the complement; `suspend` is automation
-                    // space, where only the rows below 32 are lanes and 32 is
-                    // the MASTER's curves: a lane past 31 suspends nothing,
-                    // and above all not the master.
+                    // `midi_on` is the complement. `suspend` is every slot's
+                    // own too (W6-rows-unlimited: a curve names any slot, so
+                    // this pinned a lane past 31 as suspending nothing while
+                    // no curve could name one), and never the master's.
                     let want = match name {
                         "midi_off" => b != a,
-                        "suspend" => b == a && a < CHANNELS,
                         _ => b == a,
                     };
                     assert_eq!(set.contains(b), want, "{name} on lane {a}, read at lane {b} ({lanes} lanes)");
@@ -37613,8 +37790,7 @@ mod slot_engine {
     /// `set_automation_slotted`): a gain curve on slot 31 moves lane 31 and
     /// not 0, 1 or 32; drawn for another generation it moves nothing; and
     /// the master's curve, which the row space files at 32, leaves lane 32's
-    /// stem alone. Curves can name no slot past 31 yet (see the MERGE-ME
-    /// below).
+    /// stem alone. A slot past 31 is the next test's.
     #[test]
     fn a_slotted_curve_plays_on_its_own_generation_and_the_masters_is_not_slot_32() {
         use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
@@ -37649,12 +37825,10 @@ mod slot_engine {
         assert_eq!(stale[0], plain[0], "a curve drawn for another generation moved lane 31");
     }
 
-    /// **MERGE-ME(W6-rows-unlimited): a curve on a lane past 31.**
-    /// `Curve::lane` is the row space, whose next number is the master's, so
-    /// no curve can name slot 40 until `AutoLane`; this is the gap, written
-    /// down as the test that will pass when it closes.
+    /// **A curve on a lane past 31 moves it** (the gap this test was written
+    /// down as, ignored, until `Curve::lane` could name a slot there; W6
+    /// closed the naming with `AutoLane` and the playing here).
     #[test]
-    #[ignore = "MERGE-ME(W6-rows-unlimited): Curve::lane cannot name a slot past 31 until AutoLane"]
     fn a_curve_on_a_lane_past_31_moves_it() {
         use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
         let render = |curve: bool| {
@@ -37672,6 +37846,94 @@ mod slot_engine {
             bits(&column(&stems, e.stem_frame_width() / 2, 40))
         };
         assert_ne!(render(true), render(false), "lane 40's curve did not move it");
+    }
+
+    /// **Every control a curve moves reaches a lane past 31, and only that
+    /// lane** (W6-rows-unlimited): on slot 40 a fader curve, a pan curve, a
+    /// mute curve and a curve on its trim's level each change what the lane
+    /// makes or what reaches the master, while lane 39 beside it renders bit
+    /// for bit as it did; a hand on lane 40's fader (its plan's SUSPEND) holds
+    /// its fader curve off it, and a curve drawn for another generation moves
+    /// nothing. The fader, pan, send and mute rows stopped at slot 31, the
+    /// generation table did too, and a plugin curve past it found no seat, so
+    /// every one of these was silent on a lane the bridge had installed.
+    #[test]
+    fn every_control_a_curve_moves_reaches_a_lane_past_31() {
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let trim_id = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("trim").params[0].id;
+        // What lane 40 made, what lane 39 made, and the master.
+        type Heard = (Vec<u32>, Vec<u32>, Vec<u32>);
+        let render = |curve: Option<(AutoParam, f64)>, held: bool, stale: bool| -> Heard {
+            let mut e = wide(41);
+            trim(&mut e, 40);
+            let gen = e.lane_gen(Slot(40)).expect("a lane");
+            let flags = |s: usize| if s == 40 && held { LaneFlags::SUSPEND } else { LaneFlags::default() };
+            let inputs = plan(&e, 41, &flags);
+            e.publish_plan(&inputs).expect("the plan goes");
+            if let Some((param, value)) = curve {
+                let mut curves = Automation::default();
+                curves.set(Curve::sanitised(40, param, vec![Point { at_s: 0.0, value, shape: Shape::Hold }]));
+                let gens = vec![(Slot(40), if stale { gen + 1 } else { gen })];
+                e.set_automation_slotted(SlotAutomation { curves, gens, master: MASTER_AUTO_LANE });
+            }
+            e.set_clips_slotted(vec![clip_at(&e, 39, 0x39), clip_at(&e, 40, 0x40)]);
+            let (master, stems) = roll(&mut e, 4);
+            let width = e.stem_frame_width() / 2;
+            (bits(&column(&stems, width, 40)), bits(&column(&stems, width, 39)), bits(&master))
+        };
+        let plain = render(None, false, false);
+        assert!(plain.0.iter().any(|b| *b != 0) && plain.1.iter().any(|b| *b != 0), "fixture: a lane is silent");
+        for (what, param, value) in [
+            ("a fader curve", AutoParam::Gain, 0.1),
+            ("a pan curve", AutoParam::Pan, 0.0),
+            ("a mute curve", AutoParam::Mute, 1.0),
+            ("a curve on its trim", AutoParam::Plugin { bay: 0, id: trim_id }, 0.1),
+        ] {
+            let got = render(Some((param, value)), false, false);
+            assert!(got.0 != plain.0 || got.2 != plain.2, "{what} on lane 40 moved nothing");
+            assert_eq!(got.1, plain.1, "{what} on lane 40 moved lane 39");
+        }
+        let held = render(Some((AutoParam::Gain, 0.1)), true, false);
+        assert_eq!((held.0, held.2), (plain.0.clone(), plain.2.clone()), "a hand on lane 40's fader did not hold its curve off");
+        let stale = render(Some((AutoParam::Gain, 0.1)), false, true);
+        assert_eq!((stale.0, stale.2), (plain.0, plain.2), "a curve drawn for another generation moved lane 40");
+    }
+
+    /// **The tables a curve writes are cleared by the next chunk's walk**:
+    /// a slot written one chunk and named by no curve the next goes back to
+    /// its fader, past slot 31 as below it, so a curve taken away (or of a
+    /// lane that left) cannot leave a fader stuck where it last put it.
+    #[test]
+    fn a_curve_taken_away_leaves_its_control_to_the_fader_on_any_slot() {
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let at = |value| vec![Point { at_s: 0.0, value, shape: Shape::Hold }];
+        let mut both = Automation::default();
+        for lane in [3usize, 40] {
+            for param in [AutoParam::Gain, AutoParam::Pan, AutoParam::Send, AutoParam::Mute] {
+                both.set(Curve::sanitised(lane, param, at(0.75)));
+            }
+        }
+        let none = LaneSet::with_capacity(DESK_WORD_LANES);
+        let mut now = AutoNow::with_capacity(DESK_WORD_LANES);
+        automation_now_into(&both, &none, &CurveOwners::EVERY, 1.0, &mut now);
+        for lane in [3usize, 40] {
+            assert_eq!(
+                (now.gain[lane], now.pan[lane], now.send[lane], now.mute[lane]),
+                (Some(0.75), Some(0.75), Some(0.75), Some(true)),
+                "lane {lane}'s curves were not read"
+            );
+        }
+        let mut one = Automation::default();
+        one.set(Curve::sanitised(3, AutoParam::Gain, at(0.5)));
+        automation_now_into(&one, &none, &CurveOwners::EVERY, 1.0, &mut now);
+        assert_eq!(now.gain[3], Some(0.5));
+        assert_eq!((now.pan[3], now.send[3], now.mute[3]), (None, None, None), "lane 3 kept a curve it lost");
+        assert_eq!(
+            (now.gain[40], now.pan[40], now.send[40], now.mute[40]),
+            (None, None, None, None),
+            "lane 40 kept the curves it lost"
+        );
+        assert_eq!(now.written, vec![3], "the next chunk would clear more, or less, than was written");
     }
 
     /// **A plan route between lanes past 31 is dropped, onto nobody**: until
@@ -40348,7 +40610,12 @@ mod lanesets {
     /// Two spellings of one rule (the identity kernel's, keyed by `SeatBay`,
     /// and the engine's, keyed by flat seat) that must never drift: a drift
     /// moves somebody's curve onto another plugin. Compared through the
-    /// frozen V32 seat map, which is the space `param_slot` answers in.
+    /// frozen V32 seat map for the legacy rows and the master, the space
+    /// `param_slot` answers in for them, and past them through the seat the
+    /// engine gives that lane's rack (`RackAddr::seat`, the range after the
+    /// map). W6-rows-unlimited: a lane past 31 was pinned here as filing
+    /// nowhere, which held while no curve could name one; the bridge files
+    /// curves under any slot now, and `param_slot` answers for them.
     #[test]
     fn auto_key_files_every_bay_where_param_slot_does() {
         use tangent_ui::desk_id::{auto_key, Node, TrackId};
@@ -40363,12 +40630,15 @@ mod lanesets {
                 Node::Track(TrackId(lane as u32))
             };
             for bay in 0..INSERTS * 3 {
-                let want = auto_key(node, bay)
-                    .and_then(|sb| {
+                let want = auto_key(node, bay).and_then(|sb| {
+                    if lane <= V32_CHANNELS {
                         let owner = unbind(sb.seat.node, &ids)?;
-                        encode_v32(owner, sb.seat.rack, sb.bay)
-                    })
-                    .map(|flat| (flat / INSERTS, flat % INSERTS));
+                        encode_v32(owner, sb.seat.rack, sb.bay).map(|flat| (flat / INSERTS, flat % INSERTS))
+                    } else {
+                        let seat = RackAddr::of(RackOwner::Lane(Slot(lane as u32)), sb.seat.rack)?.seat()?;
+                        Some((seat, usize::from(sb.bay)))
+                    }
+                });
                 assert_eq!(
                     param_slot(lane, bay, MASTER_AUTO_LANE),
                     want,
@@ -40377,7 +40647,7 @@ mod lanesets {
                 filed += usize::from(want.is_some());
             }
         }
-        assert_eq!(filed, (CHANNELS + 1) * INSERTS * 2, "not every real bay was compared");
+        assert_eq!(filed, 64 * INSERTS * 2, "not every real bay was compared");
     }
 
     /// **The desk words decode to exactly their bits, and buy nothing.**

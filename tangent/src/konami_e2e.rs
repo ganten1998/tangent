@@ -26,14 +26,17 @@ use std::path::{Path, PathBuf};
 use tangent_core::license::LicenseStore;
 use tangent_record::audio::Timebase;
 use tangent_ui::app::{TangentApp, TrackRefusal};
-use tangent_ui::desk_id::TrackId;
+use tangent_ui::automation::{AutoParam, Shape};
+use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
 use tangent_ui::dialogs::DialogAction;
 use tangent_ui::host::Caps;
 use tangent_ui::ports::ProjectRequest;
 use tangent_ui::settings::{ResetScope, Settings};
 
 use crate::composite::tiers;
-use crate::engine_bridge::{full_build, BuildFor, Built};
+use crate::desk_plan::Slot;
+use crate::engine_bridge::{full_build, full_build_with, BuildFor, Bridge, Built, Furnish};
+use crate::instrument::Engine;
 
 const RATE: u32 = 48_000;
 
@@ -437,6 +440,264 @@ fn undo_and_redo_cross_the_free_cap_through_the_key_feed() {
     assert_eq!(app.track_ids(), at_cap, "the redo did not land the desk where the gestures left it");
     let _ = std::fs::remove_dir_all(&root);
     for tag in [TAG, "konami-undo-free"] {
+        let _ = std::fs::remove_dir_all(tiers::dir(tag));
+    }
+}
+
+/// The bay a track's Trim stands in: its own rack's first.
+fn trim_bay(id: TrackId) -> SeatBay {
+    SeatBay::new(Node::Track(id), Rack::Chain(0), 0)
+}
+
+/// **A Trim in each of `ids`' first bays, and a noise clip on each**, through
+/// the app's own roads (a clip dropped on a track that exists is an edit; a
+/// plugin picked into a bay is `set_plugin`).
+fn dress_tracks(app: &mut TangentApp, wav: &Path, ids: &[TrackId]) {
+    for &id in ids {
+        let row = app.row_of(id).expect("the track's row");
+        app.import_audio_at(wav, row, 0.0).unwrap_or_else(|e| panic!("the clip on row {row}: {e}"));
+        app.set_plugin(trim_bay(id), Some(crate::builtin_fx::TRIM_PATH));
+    }
+}
+
+/// **Furnish a live engine as the host does each frame**: the bridge's
+/// shape, a Trim at its defaults seated in each of `ids`' first bays (the
+/// host's reconcile), the clips at their lanes and the curves at theirs
+/// (`push_automation`).
+fn furnish_live(app: &TangentApp, e: &mut Engine, p: &mut Bridge, ids: &[TrackId]) {
+    for _ in 0..4 {
+        p.sync(app, e);
+    }
+    let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("the trim");
+    let state = crate::builtin_fx::state_text(spec, &spec.defaults(), &[]).into_bytes();
+    for &id in ids {
+        let (rack, bay) = p.engine_bay(trim_bay(id)).expect("the track has a lane");
+        if e.insert_at(rack, bay).is_none() {
+            e.load_insert_at(rack, bay, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&state))
+                .expect("the trim loads")
+                .expect("and seats");
+        }
+    }
+    let doc = app.clip_doc().expect("a project");
+    let (placed, midi, unread) = crate::desktop::export_clip_placement(app.arrangement(), &app.frozen_lanes(), RATE, |rel| {
+        tangent_ui::arrangement::Arrangement::resolve(&doc, rel)
+    });
+    assert!(unread.is_empty(), "the live engine could not read {unread:?}");
+    e.set_clips_slotted(p.slot_clips(placed));
+    e.set_midi_slotted(p.slot_midi(midi));
+    e.set_automation_slotted(p.slot_automation(&app.engine_automation()));
+}
+
+/// **The loudest each of `slots` makes once the trims and faders have
+/// slewed**: a tenth of a second rendered from zero and its meters cleared,
+/// then a sixth more read.
+fn settled_peaks(e: &mut Engine, slots: &[Slot]) -> Vec<f32> {
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    let mut out = vec![0.0f32; 1024 * 2];
+    let mut run = |e: &mut Engine, blocks: usize| {
+        for _ in 0..blocks {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+    };
+    run(e, (RATE as usize / 10).div_ceil(1024));
+    for s in slots {
+        let _ = e.lane_reading(*s);
+    }
+    run(e, (RATE as usize / 6).div_ceil(1024));
+    slots
+        .iter()
+        .map(|s| {
+            let ([a, b], _) = e.lane_reading(*s);
+            a.max(b)
+        })
+        .collect()
+}
+
+/// **What the export hears of `ids`**: an engine furnished by `full_build`
+/// with the live engine's knobs (the export's own road, which reads the
+/// Trims off the live racks rather than the shelf), each track read at the
+/// slot that build gave it. Answers the slots too.
+fn offline_peaks(app: &TangentApp, live: (&Engine, &Bridge), ids: &[TrackId]) -> (Vec<Slot>, Vec<f32>) {
+    let spec = tangent_ui::ports::ProjectExportSpec {
+        rate: RATE,
+        ..Default::default()
+    };
+    let mut ctx = Furnish {
+        live: Some(live),
+        ..Default::default()
+    };
+    let Built { engine: mut e, bridge } =
+        full_build_with(app, RATE, Timebase::new(), BuildFor::Export(spec), &mut ctx).expect("an offline engine");
+    assert!(ctx.refused.is_empty(), "the export refused {:?}", ctx.refused);
+    let slots: Vec<Slot> = ids.iter().map(|id| bridge.lane_of(*id).expect("the export gave the track a lane").slot).collect();
+    let peaks = settled_peaks(&mut e, &slots);
+    (slots, peaks)
+}
+
+/// **The saved document with these curves drawn, opened again**: per
+/// `(track, control, value)` a curve held at `value` from the top of the
+/// song, written where a save writes curves (the document's `automation`,
+/// by row), since this crate has no gesture that draws one. The tracks keep
+/// their ids across the open, so a live bridge keeps their lanes.
+///
+/// **Two points, never one**: a lone point is its control's base, and an
+/// open sets the control to it (`reconcile_auto_bases`), so a fader curve
+/// of one point would arrive as the fader itself and be heard on a slot no
+/// curve plays on.
+fn reopen_with_curves(app: &mut TangentApp, curves: &[(TrackId, AutoParam, f64)]) {
+    let doc = app.project_doc().expect("the saved project").to_path_buf();
+    let text = std::fs::read_to_string(&doc).expect("the document");
+    let mut json: serde_json::Value = serde_json::from_str(&text).expect("the document parses");
+    let list: Vec<serde_json::Value> = curves
+        .iter()
+        .map(|(id, param, v)| {
+            serde_json::json!({
+                "lane": app.row_of(*id).expect("the track's row"),
+                "param": param.key(),
+                "points": [
+                    { "at": 0.0, "v": v, "shape": Shape::Hold.key() },
+                    { "at": 30.0, "v": v, "shape": Shape::Hold.key() },
+                ],
+            })
+        })
+        .collect();
+    json.as_object_mut().expect("a document").insert("automation".to_owned(), serde_json::Value::Array(list));
+    std::fs::write(&doc, serde_json::to_string_pretty(&json).expect("json")).expect("the document written");
+    app.open_project(&doc);
+    assert!(app.take_desk_reload(), "the reopen applied no desk");
+    let ids: Vec<TrackId> = curves.iter().map(|(id, _, _)| *id).collect();
+    assert!(ids.iter().all(|id| app.row_of(*id).is_some()), "a track did not come back from the reopen");
+    assert_eq!(app.engine_automation().curves().len(), curves.len(), "the reopened song lost a curve");
+}
+
+/// **Each of `ids` follows a fader curve and a curve on its Trim's level,
+/// live and in the export**: against the same song with no curve, held at
+/// a twentieth of the fader's travel and at the Trim's floor, each track's
+/// lane makes less than half of what it made, on the live engine and on the
+/// export's. `what` names the desk for the failure.
+fn curves_are_heard(what: &str, app: &mut TangentApp, e: &mut Engine, p: &mut Bridge, ids: &[TrackId]) {
+    let trim_id = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).expect("the trim").params[0].id;
+    let faders = |app: &TangentApp| -> Vec<f32> { ids.iter().map(|id| app.channel_gain(app.row_of(*id).expect("its row"))).collect() };
+    let resting = faders(app);
+    furnish_live(app, e, p, ids);
+    let live_slots: Vec<Slot> = ids.iter().map(|id| p.lane_of(*id).expect("a live lane").slot).collect();
+    let plain_live = settled_peaks(e, &live_slots);
+    let (_, plain_offline) = offline_peaks(app, (&*e, &*p), ids);
+    for (i, id) in ids.iter().enumerate() {
+        assert!(plain_live[i] > 0.0 && plain_offline[i] > 0.0, "{what}: track {id:?} is silent with no curve");
+    }
+    for (control, param, value) in [
+        ("a fader curve", AutoParam::Gain, 0.05),
+        ("a curve on its Trim", AutoParam::Plugin { bay: 0, id: trim_id }, 0.0),
+    ] {
+        let curves: Vec<(TrackId, AutoParam, f64)> = ids.iter().map(|id| (*id, param, value)).collect();
+        reopen_with_curves(app, &curves);
+        // What moves the lane is the curve, never a fader the open moved.
+        assert_eq!(faders(app), resting, "{what}: the reopen moved a fader");
+        furnish_live(app, e, p, ids);
+        let slots: Vec<Slot> = ids.iter().map(|id| p.lane_of(*id).expect("a live lane").slot).collect();
+        assert_eq!(slots, live_slots, "{what}: the reopen moved a live lane");
+        let live = settled_peaks(e, &slots);
+        let (offline_slots, offline) = offline_peaks(app, (&*e, &*p), ids);
+        for (i, id) in ids.iter().enumerate() {
+            assert!(
+                live[i] < plain_live[i] * 0.5,
+                "{what}: {control} on track {id:?} (live slot {:?}) did not move it live: {} against {}",
+                slots[i],
+                live[i],
+                plain_live[i]
+            );
+            assert!(
+                offline[i] < plain_offline[i] * 0.5,
+                "{what}: {control} on track {id:?} (export slot {:?}) did not move it in the export: {} against {}",
+                offline_slots[i],
+                offline[i],
+                plain_offline[i]
+            );
+        }
+    }
+}
+
+/// **A track's curves play wherever its lane sits, live and in the export**
+/// (the W6 fixer's blocker). The engine read fader, pan, send and mute
+/// curves for the legacy thirty-two slots only, and dropped a plugin curve
+/// past them, while this lane's bridge seats lanes at any slot; a fresh
+/// install's first Ctrl/Cmd+T took slot 32 live (every hidden row of the
+/// shipped desk holds a lane, and the one it reused was still on its way
+/// home), where the export, built fresh, gives it its row's. So:
+///
+/// - on a free install's stock desk, the first Ctrl/Cmd+T waits for the lane
+///   of the hidden row it reuses and takes that slot, the one the export
+///   gives it; a track Insert Track puts between two others lands past the
+///   legacy slots live (the hidden rows below hold theirs) and on its row's
+///   in the export; and each follows a fader curve and a Trim curve in both;
+/// - a cheater's fortieth track, on slot 39 live and offline, does the same.
+#[test]
+fn a_tracks_curves_play_live_and_in_the_export_wherever_its_lane_sits() {
+    const TAG: &str = "konami-curves";
+    let root = scratch("curves");
+    let wav = root.join("noise.wav");
+    noise_wav(&wav, 0xc0de);
+
+    // A free install on the stock desk of hidden rows, its live engine
+    // seated as at launch: every hidden row's lane at its own slot.
+    let (_ctx, mut app) = app_on(tiers::free(TAG));
+    app.bootstrap_project(&root.join("Projects"));
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("a live engine");
+    let mut p = Bridge::new();
+    p.sync(&app, &mut e);
+    app.add_track();
+    let first = app.selected_track().expect("Add selects its track");
+    let first_row = app.row_of(first).expect("its row");
+    p.sync(&app, &mut e);
+    assert_eq!(p.lane_of(first), None, "the new track took a slot while the hidden row's lane was still leaving");
+    for _ in 0..3 {
+        p.sync(&app, &mut e);
+    }
+    let lane = p.lane_of(first).expect("the new track never got a lane");
+    assert_eq!(lane.slot, Slot(first_row as u32), "the first Ctrl/Cmd+T is not on its row's slot, the export's");
+    // A second under it, its lane seated, so Insert Track below the first
+    // lands between two tracks.
+    app.add_track();
+    let second = app.selected_track().expect("Add selects its track");
+    for _ in 0..4 {
+        p.sync(&app, &mut e);
+    }
+    assert!(
+        p.lane_of(second).is_some_and(|l| (l.slot.0 as usize) < crate::instrument::LEGACY_LANES),
+        "the second Ctrl/Cmd+T did not take a legacy slot"
+    );
+    assert!(app.insert_track_below(app.row_of(first).expect("its row")), "Insert Track was refused");
+    let inserted = app.selected_track().expect("Insert selects its track");
+    dress_tracks(&mut app, &wav, &[first, inserted]);
+    assert!(app.save_project_first(&root.join("Stock.tan")), "the save did not land");
+    furnish_live(&app, &mut e, &mut p, &[first, inserted]);
+    assert!(
+        p.lane_of(inserted).expect("a lane").slot.0 as usize >= crate::instrument::LEGACY_LANES,
+        "fixture: the inserted track did not land past the legacy slots live"
+    );
+    let rows: Vec<Slot> = [first, inserted].iter().map(|id| Slot(app.row_of(*id).expect("its row") as u32)).collect();
+    assert_eq!(offline_peaks(&app, (&e, &p), &[first, inserted]).0, rows, "fixture: the export did not seat each on its row's slot");
+    curves_are_heard("the stock desk", &mut app, &mut e, &mut p, &[first, inserted]);
+
+    // A cheater's forty-one tracks, the fortieth on slot 39.
+    let cheat_root = scratch("curves-cheat");
+    let (_c, mut cheat) = cheaters_desk(&cheat_root, "konami-curves-cheat", 41);
+    let fortieth = cheat.track_ids()[39];
+    cheat.set_plugin(trim_bay(fortieth), Some(crate::builtin_fx::TRIM_PATH));
+    assert!(cheat.save_project_first(&cheat_root.join("Wide.tan")), "the cheater's save did not land");
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("a live engine");
+    let mut p = Bridge::new();
+    furnish_live(&cheat, &mut e, &mut p, &[fortieth]);
+    assert_eq!(p.lane_of(fortieth).expect("a lane").slot, Slot(39), "fixture: the fortieth track is not on slot 39");
+    curves_are_heard("the cheater's desk", &mut cheat, &mut e, &mut p, &[fortieth]);
+
+    for dir in [&root, &cheat_root] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    for tag in [TAG, "konami-curves-cheat"] {
         let _ = std::fs::remove_dir_all(tiers::dir(tag));
     }
 }
