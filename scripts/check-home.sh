@@ -29,16 +29,25 @@
 # and nothing in them is opened. A change there means a road that reached
 # them without HOME (an absolute path, the password database), and it fails
 # the run, whoever else was running. **Tangent running is not an excuse**:
-# this was a note when Tangent was open, because its own writes (its log, a
-# debounced settings save) look the same as a test's, and that switched the
-# net off exactly when the owner's app was open, which is most of the time,
-# for exactly the files a stray test would write. A test's write cannot be
-# told from the app's without opening the owner's files, so a change while
-# Tangent ran fails like any other and says so: close it and run again.
-# What that costs, measured with the owner's Tangent open through the
+# any change was a note while Tangent was open, because its own writes look
+# the same as a test's, and that switched the net off exactly when the
+# owner's app was open, which is most of the time, for exactly the files a
+# stray test would write. A test's write cannot be told from the app's
+# without opening the owner's files, so a settings save, a project or
+# anything else a running Tangent writes fails like a test's would, and
+# says so: close it and run again.
+#
+# **One file is the running app's alone: its log** (`.config/tangent/
+# tangent.log`, and the `.1` it rotates to), modified while Tangent runs.
+# Only `main` attaches it, on `config::dir`, which a test build sends to
+# its scratch home, so no test reaches it; and the gate's own load makes
+# the open app write it: the first gate run under this rule failed on an
+# audio dropout the owner's Tangent logged mid-run. That is noted, never
+# failed; the log made, deleted or written with Tangent closed fails like
+# anything else. Measured with the owner's Tangent open through the
 # W8-safe-tests rounds: it wrote nothing there in two windows of 4 and 32
-# minutes, and saved its settings once in a third; so an open Tangent costs
-# a run when it writes, and never hides one.
+# minutes, saved its settings once in a third, and logged a dropout in a
+# fourth.
 #
 # **`features` proves no build that ships carries `test-home`, and every
 # test build that links tangent-core does.** Resolver 2 gives a
@@ -172,8 +181,8 @@ run() {
   listing "$real" > "$work/real.before"
   if tangent_running; then
     was_running=1
-    echo "check-home: Tangent is running: whatever it writes in its folders during this run fails" >&2
-    echo "  the run, since a test's write cannot be told from its own" >&2
+    echo "check-home: Tangent is running: whatever it writes in its folders during this run but its" >&2
+    echo "  log fails the run, since a test's write cannot be told from its own" >&2
   fi
   touch "$work/stamp"
 
@@ -199,19 +208,32 @@ run() {
 
   listing "$real" > "$work/real.after"
   touched "$real" "$work/stamp" > "$work/real.touched"
+  tangent_running && was_running=1
+  # The running app's own log, set apart from what it touched (see the
+  # header): written to, with the app running, and nothing else.
+  : > "$work/real.log"
+  if [ "$was_running" = 1 ]; then
+    grep -Fx -e "$real/.config/tangent/tangent.log" -e "$real/.config/tangent/tangent.log.1" \
+      "$work/real.touched" > "$work/real.log" || true
+    grep -vFx -e "$real/.config/tangent/tangent.log" -e "$real/.config/tangent/tangent.log.1" \
+      "$work/real.touched" > "$work/real.rest" || true
+    mv "$work/real.rest" "$work/real.touched"
+  fi
   if ! cmp -s "$work/real.before" "$work/real.after" || [ -s "$work/real.touched" ]; then
-    tangent_running && was_running=1
     echo "check-home: the run changed the real Tangent folders under $real:" >&2
     diff "$work/real.before" "$work/real.after" | grep '^[<>]' \
       | sed -e 's/^</    gone:/' -e 's/^>/    made:/' >&2 || true
     sed 's/^/    touched: /' "$work/real.touched" >&2
     if [ "$was_running" = 1 ]; then
-      echo "  Tangent was running, and its own writes (its log, a settings save) cannot be told from a" >&2
-      echo "  test's without opening them: close it and run again." >&2
+      echo "  Tangent was running, and what it writes there (a settings save, a project) cannot be" >&2
+      echo "  told from a test's without opening it: close it and run again." >&2
     else
       echo "  Tangent was not running: a road reached them without HOME." >&2
     fi
     bad=1
+  elif [ -s "$work/real.log" ]; then
+    echo "check-home: note: Tangent, running, wrote its own log during the run (no test reaches it):" >&2
+    sed 's/^/    /' "$work/real.log" >&2
   fi
   rm -rf "$work"
 
@@ -306,11 +328,15 @@ features() {
 # its Tangent folders, dated long ago), so the real folders `run` watches
 # are its own, and nothing of anybody's is read or written. The app is
 # stood in for by a `sleep` (CHECK_HOME_APP), so the branch where Tangent is
-# running, which a note once let pass, is exercised whether or not Tangent
-# is open; with the old note in place, the first two cases pass the run and
-# fail this.
+# running is exercised whether or not Tangent is open. Revert checks: the
+# old note (any change while the app runs) passes four runs this wants
+# failed, the first two among them; the log's exception widened to whatever
+# the app touched passes the first and the log-and-setting one; no
+# exception at all fails the run that writes only the log. Where no `pgrep`
+# can see a process the app is never seen running, and the cases that need
+# it say so.
 selftest() {
-  local t self stand=0 fails=0
+  local t self stand=0 fails=0 sees=1
   t="$(mktemp -d "${TMPDIR:-/tmp}/tangent-check-home-selftest.XXXXXX")"
   self="$(pwd -P)/scripts/check-home.sh"
   sleep 600 &
@@ -318,19 +344,30 @@ selftest() {
   # Not a job this shell reports on when the trap ends it.
   disown "$stand"
   trap "kill $stand 2>/dev/null; rm -rf '$t'" EXIT
-  CHECK_HOME_APP=sleep tangent_running \
-    || { echo "check-home selftest: cannot see its stand-in for the app" >&2; exit 1; }
+  if ! command -v pgrep >/dev/null 2>&1; then
+    sees=0
+  elif ! CHECK_HOME_APP=sleep tangent_running; then
+    echo "check-home selftest: cannot see its stand-in for the app" >&2
+    exit 1
+  fi
   local r="$t/real"
   mkdir -p "$r/.config/tangent" "$r/Documents/Tangent Media/Projects/Untitled"
   printf '{}\n' > "$r/.config/tangent/settings.json"
   printf 'konami\n' > "$r/.config/tangent/cheat.unlock"
+  printf '[decoy] tangent starting\n' > "$r/.config/tangent/tangent.log"
   printf '{}\n' > "$r/Documents/Tangent Media/Projects/Untitled/project.tan"
   find "$r/.config/tangent" "$r/Documents/Tangent Media" -exec touch -t 200001010000 {} +
 
   # expect_run <pass|fail> <running|absent> <what> <command...>
   expect_run() {
     local want="$1" app=tangent-check-home-absent what="$3" got=0
-    [ "$2" = running ] && app=sleep
+    if [ "$2" = running ]; then
+      app=sleep
+      if [ "$sees" = 0 ]; then
+        printf '  %-62s %s\n' "$what" "skipped (no pgrep: the app is never seen)"
+        return
+      fi
+    fi
     shift 3
     # TMPDIR in the selftest's folder: a failed run keeps its home for a
     # look, and these fail on purpose.
@@ -350,6 +387,15 @@ selftest() {
     rm "$r/.config/tangent/cheat.unlock"
   expect_run fail absent "a real project made while the app is closed fails" \
     touch "$r/Documents/Tangent Media/Projects/Untitled/second.tan"
+  # The running app's own log, and only while it runs.
+  expect_run pass running "the app's own log, written while it runs, is noted" \
+    sh -c 'printf x >> "$1/.config/tangent/tangent.log"' _ "$r"
+  expect_run fail absent "the app's log written while it is closed fails" \
+    sh -c 'printf x >> "$1/.config/tangent/tangent.log"' _ "$r"
+  expect_run fail running "the log and a setting written while the app runs fails" \
+    sh -c 'printf x >> "$1/.config/tangent/tangent.log"; printf x >> "$1/.config/tangent/settings.json"' _ "$r"
+  expect_run fail running "the app's log deleted while it runs fails" \
+    rm "$r/.config/tangent/tangent.log"
   # The scratch home's decoys, reached through HOME.
   expect_run fail running "a decoy setting written through HOME fails" \
     sh -c 'printf x >> "$HOME/.config/tangent/settings.json"'

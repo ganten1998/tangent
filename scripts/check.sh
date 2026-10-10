@@ -93,9 +93,9 @@ echo "==> cargo test --workspace  (in a scratch home it watches: no test reaches
 # fresh folder seeded with decoys where Tangent keeps a person's files, the
 # real folders are watched read-only, and a run that creates, changes or
 # deletes anything in either fails here, naming it, Tangent open or not
-# (close it first: its own writes cannot be told from a test's). The
-# selftest holds `run` to that with stub commands before anything relies on
-# it.
+# (close it first: but for its log, which no test reaches, what it writes
+# cannot be told from a test's write). The selftest holds `run` to that
+# with stub commands before anything relies on it.
 scripts/check-home.sh selftest
 scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-fast
 
