@@ -20854,9 +20854,7 @@ pub struct Engine {
     auto_to_audio: Producer<AutoList>,
     auto_from_audio: Consumer<AutoList>,
     /// The sends' curves' pair: see [`Engine::set_send_curves`].
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by `set_send_curves`, the slot API W7-buses-ui's bridge calls"))]
     send_curves_to_audio: Producer<Vec<SendCurve>>,
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by `set_send_curves`, the slot API W7-buses-ui's bridge calls"))]
     send_curves_from_audio: Consumer<Vec<SendCurve>>,
     track_to_audio: Producer<Schedule<Placed>>,
     track_from_audio: Consumer<Schedule<Placed>>,
@@ -21591,7 +21589,6 @@ impl Engine {
 
     /// **A send's level, into every plan published and not yet home**, by
     /// the send's identity: [`Engine::set_route_gain`]'s rule for sends.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge carries bus sends and their levels from W7-buses-ui"))]
     pub fn set_send_level(&self, from: crate::desk_plan::SendFrom, to: crate::desk_plan::SendTo, level: f32) -> usize {
         use crate::desk_plan::{PlanSendFrom, PlanSendTo, SendFrom, SendTo};
         let mut hit = 0;
@@ -26098,7 +26095,6 @@ impl Engine {
     /// send is found by its two ends, so a plan republished for a reorder
     /// keeps its curves. The list it replaces comes home and is dropped
     /// here, on the next call. `Busy` when the last one has not landed yet.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge carries bus sends and their curves from W7-buses-ui"))]
     pub fn set_send_curves(&mut self, curves: Vec<SendCurve>) -> Result<(), EngineBusy> {
         while self.send_curves_from_audio.pop().is_ok() {}
         self.send_curves_to_audio.push(curves).map_err(|_| EngineBusy::Busy)
