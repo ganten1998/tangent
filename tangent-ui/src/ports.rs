@@ -1277,8 +1277,9 @@ pub struct BuiltinFaceParam {
 /// the host whenever the bay loads or changes — the `push_fx_params`
 /// precedent, with values.
 ///
-/// `strip` is the SEAT (the flat rack-seat space, stride `INSERTS`), the
-/// addressing every insert road here already speaks. An empty `params` with
+/// Pushed FOR a bay, by its identity (`TangentApp::set_bay_face`): it
+/// carried the host's `(seat, bay)` in two fields, which no track past the
+/// frozen map's thirty-two rows has (W7-slot-gaps). An empty `params` with
 /// an empty `path` clears the entry: the bay unloaded or holds a plugin.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BuiltinFace {
@@ -1291,8 +1292,6 @@ pub struct BuiltinFace {
     /// IR's file path) - pushed so a face can SHOW what is loaded without
     /// a second road. Appended; empty for units that carry none.
     pub extra: Vec<(String, String)>,
-    pub strip: usize,
-    pub slot: usize,
     /// The unit's sentinel path (`"@tangent-comp"`), which is what routes a
     /// click on the chip to the right face.
     pub path: String,

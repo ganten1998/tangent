@@ -671,10 +671,10 @@ pub struct TangentApp {
     /// Which are bypassed — kept, drawn, editable, and not applied.
     arr_auto_bypassed: HashSet<AutoRow>,
     /// Per rack, what each of its three bays offers an automation lane, by
-    /// identity. Pushed by the host — see [`Self::set_fx_params`].
+    /// identity. Pushed by the host — see [`Self::set_rack_fx_params`].
     fx_params: HashMap<crate::desk_id::SeatKey, [crate::ports::FxParams; recorder::INSERTS]>,
     /// Per bay, by identity, a loaded built-in effect's spec and current
-    /// values. Pushed by the host on load/change ([`Self::set_builtin_face`]),
+    /// values. Pushed by the host on load/change ([`Self::set_bay_face`]),
     /// mirrored optimistically by a local drag ([`Self::set_bay_param`]).
     builtin_faces: HashMap<crate::desk_id::SeatBay, crate::ports::BuiltinFace>,
     /// **What the automation has an open built-in face at right now**, by
@@ -962,8 +962,8 @@ pub struct TangentApp {
     /// The bay whose editor should open the moment its plugin loads — the
     /// pick that just happened, never a restore at launch — by identity, so
     /// a reorder before the load lands opens the bay that was picked. The
-    /// host takes it after a successful `load_insert`; see
-    /// `take_open_insert_on_load`.
+    /// host takes it after a successful `load_insert_at`; see
+    /// `take_open_bay_on_load`.
     open_insert_on_load: Option<crate::desk_id::SeatBay>,
     /// The empty channel being asked MIDI or AUDIO, if any.
     /// Whether SHIFT is down this frame — the arm button's ADDITIVE
@@ -12860,8 +12860,8 @@ impl TangentApp {
     /// The deed is the host's — see `RecorderRequest::PasteInsert` — because
     /// the unit's live state is what makes a paste a paste rather than a
     /// second copy of the plugin at its factory defaults. The request names
-    /// both bays by the host's `(seat, bay)`, worked out from the bays'
-    /// identities as the rows stand now.
+    /// both bays by identity, so a paste onto a track past the frozen map's
+    /// thirty-two rows is a paste like any other (W7-slot-gaps).
     ///
     /// **A paste is a copy, so it hands the host no relabels** (a move does:
     /// `trade_bays`). The source keeps its plugin, so the inverse of a
@@ -12878,16 +12878,7 @@ impl TangentApp {
         if from == sb {
             return;
         }
-        let (Some((from_strip, from_bay)), Some((to_strip, to_bay))) = (self.legacy_seat(from), self.legacy_seat(sb))
-        else {
-            return;
-        };
-        self.request_recorder(recorder::RecorderRequest::PasteInsert {
-            from_strip,
-            from_bay,
-            to_strip,
-            to_bay,
-        });
+        self.request_recorder(recorder::RecorderRequest::PasteInsert { from, to: sb });
     }
 
     /// **Put the copied track on `into`.**
@@ -19779,10 +19770,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.open_bay_face(from);
             return;
         }
-        // The host names both bays by its `(seat, bay)`, as the rows stand.
-        let Some((strip, bay)) = self.legacy_seat(from) else {
-            return;
-        };
         // **A drop ON A BAY means that bay**, and there are three things it
         // can mean, decided by what is there and where it is. The owner's
         // three sentences, in his order: "drag slot 1 into unoccupied slot
@@ -19797,35 +19784,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Dropped where it was picked up: nothing at all.
                 return;
             }
-            let Some((to_strip, to_bay)) = self.legacy_seat(onto) else {
-                return;
-            };
             // The same STRIP, however many racks its slots are spread
             // across: a channel's slots 0..2 and 3..5 are two racks of one
             // track, and a move between them is a move, not a copy.
             let home = shown_on(from);
             let same_strip = home.is_some() && home == shown_on(onto);
+            // **Both bays by identity** (W7-slot-gaps): the host's
+            // `(seat, bay)` had no seat for a track past the frozen map's
+            // thirty-two rows, so a drag there sent nothing at all.
             let req = if self.plugin(onto).is_some() {
-                recorder::RecorderRequest::SwapInserts {
-                    a_strip: strip,
-                    a_bay: bay,
-                    b_strip: to_strip,
-                    b_bay: to_bay,
-                }
+                recorder::RecorderRequest::SwapInserts { a: from, b: onto }
             } else if same_strip {
-                recorder::RecorderRequest::MoveInsert {
-                    from_strip: strip,
-                    from_bay: bay,
-                    to_strip,
-                    to_bay,
-                }
+                recorder::RecorderRequest::MoveInsert { from, to: onto }
             } else {
-                recorder::RecorderRequest::CopyInsert {
-                    from_strip: strip,
-                    from_bay: bay,
-                    to_strip,
-                    to_bay: Some(to_bay),
-                }
+                recorder::RecorderRequest::CopyInsert { from, to: onto.seat.node, to_bay: Some(onto) }
             };
             self.request_recorder(req);
             return;
@@ -19838,19 +19810,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // strip the carried bay is SHOWN on rather than with the bay:
         // dropping a plugin from a track's lower rack onto that same track's
         // paint is a drop where it already is, and used to copy it back into
-        // the track's first free bay. The host's request names the strip by
-        // its legacy strip index, its own form until its road moves onto
-        // identities (C11), crossed through the frozen map and nowhere else.
+        // the track's first free bay. The request names the strip by what it
+        // is (W7-slot-gaps: by its legacy strip index, which no track past
+        // the frozen map's rows has, so a drop there sent nothing).
         let home = shown_on(from);
         if let Some(to) = to.filter(|t| home.is_none() || home != Some(self.strip_node(*t))) {
-            if let Some(to_strip) = crate::desk_legacy::v32_strip(to) {
-                self.request_recorder(recorder::RecorderRequest::CopyInsert {
-                    from_strip: strip,
-                    from_bay: bay,
-                    to_strip,
-                    to_bay: None,
-                });
-            }
+            self.request_recorder(recorder::RecorderRequest::CopyInsert {
+                from,
+                to: self.strip_node(to),
+                to_bay: None,
+            });
         }
     }
 
@@ -19862,12 +19831,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// consumes the moment the new instance lands — the same road a fresh
     /// pick's window takes. This is the app's half: a kit-drawn face open on
     /// the old bay re-points to the new one, so the panel is the instance
-    /// the hand just made and not the one it left. At the host's
-    /// `(seat, bay)`s.
-    pub fn follow_insert_face(&mut self, from: (usize, usize), to: (usize, usize)) {
-        let (Some(from), Some(to)) = (self.legacy_bay(from.0, from.1), self.legacy_bay(to.0, to.1)) else {
-            return;
-        };
+    /// the hand just made and not the one it left. By identity.
+    pub fn follow_bay_face(&mut self, from: crate::desk_id::SeatBay, to: crate::desk_id::SeatBay) {
         if self.open_insert_on_load == Some(from) {
             self.open_insert_on_load = Some(to);
         }
@@ -19879,12 +19844,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Arm the window to open when THIS bay's plugin next lands — the flag
-    /// `take_open_insert_on_load` answers. The host arms it after a copy, a
-    /// move or a swap whose source had its window up, at its `(seat, bay)`.
-    pub fn open_insert_when_loaded(&mut self, seat: usize, bay: usize) {
-        if let Some(sb) = self.legacy_bay(seat, bay) {
-            self.open_insert_on_load = Some(sb);
-        }
+    /// `take_open_bay_on_load` answers. The host arms it after a copy, a
+    /// move or a swap whose source had its window up.
+    pub fn open_bay_when_loaded(&mut self, sb: crate::desk_id::SeatBay) {
+        self.open_insert_on_load = Some(sb);
     }
 
     /// The chip that follows the hand while an insert is being carried.
@@ -22853,8 +22816,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             song_s: self.recorder.position_s,
             dark: self.settings.me_dark,
             pad_names: {
+                // By the row's own first bay, at any row (W7-slot-gaps: it
+                // read the row number as a seat, which from row 32 on is
+                // another rack's: the specials', then other tracks').
                 let drum_lane = (0..self.desk_extent()).find(|n| {
-                    self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH)
+                    self.row_plugin(*n, 0) == Some(dialogs::DRUMPAD_PATH)
                 });
                 (Some(clip.lane) == drum_lane).then(|| {
                     std::array::from_fn(|i| self.pad_label(i))
@@ -25045,7 +25011,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
         let drum_lane = (0..self.desk_extent())
-            .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
+            .find(|n| self.row_plugin(*n, 0) == Some(dialogs::DRUMPAD_PATH));
         let lane = self
             .midi_edit
             .as_ref()
@@ -30458,19 +30424,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Pushed in by the host, which is the only side that can read a VST3
     /// edit controller — and which reads it on the main thread, once, when
     /// the bay changes. Polling it per frame would be a COM call per
-    /// parameter per plugin per frame. `seat` is the host's (the frozen
-    /// map's, under the rows as they stand), kept by the rack's identity.
-    pub fn set_fx_params(&mut self, seat: usize, bays: [crate::ports::FxParams; recorder::INSERTS]) {
-        if let Some(sb) = self.legacy_bay(seat, 0) {
-            self.fx_params.insert(sb.seat, bays);
-        }
+    /// parameter per plugin per frame. `rack` is the rack by identity, so a
+    /// track's lists are its own wherever its row stands, past the frozen
+    /// map's thirty-two rows included (W7-slot-gaps: the host named the rack
+    /// by its seat there, which no such track has).
+    pub fn set_rack_fx_params(&mut self, rack: crate::desk_id::SeatKey, bays: [crate::ports::FxParams; recorder::INSERTS]) {
+        self.fx_params.insert(rack, bays);
     }
 
     /// The word a bay's chip shows, for anything that has to name the plugin
-    /// in it — the automation menu says exactly what the chip says. At the
-    /// host's `(seat, bay)`, the host's form.
-    pub fn insert_short_name(&self, seat: usize, bay: usize) -> String {
-        self.insert(seat, bay).map(insert_chip_name).unwrap_or_default().to_owned()
+    /// in it — the automation menu says exactly what the chip says.
+    pub fn bay_short_name(&self, sb: crate::desk_id::SeatBay) -> String {
+        self.plugin(sb).map(insert_chip_name).unwrap_or_default().to_owned()
     }
 
     /// **A lane's base level: its first node, or the control if it has none.**
@@ -30735,15 +30700,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **A built-in bay's face data, pushed by the host** on load and on any
-    /// change of tenant — the `set_fx_params` precedent with values. An
+    /// change of tenant — the `set_rack_fx_params` precedent with values. An
     /// empty face (no path, no params) CLEARS the entry: the bay unloaded,
-    /// or holds a plugin whose window is the engine's business. The face
-    /// names its bay by the host's `(seat, bay)`; it is kept by the bay's
-    /// identity, so a reorder moves no face onto another track's bay.
-    pub fn set_builtin_face(&mut self, mut face: crate::ports::BuiltinFace) {
-        let Some(key) = self.legacy_bay(face.strip, face.slot) else {
-            return;
-        };
+    /// or holds a plugin whose window is the engine's business. Kept by the
+    /// bay's identity, so a reorder moves no face onto another track's bay,
+    /// and pushed by it (W7-slot-gaps: the host named the bay by its
+    /// `(seat, bay)`, which no track past the frozen map's rows has, so a
+    /// face there never drew).
+    pub fn set_bay_face(&mut self, key: crate::desk_id::SeatBay, mut face: crate::ports::BuiltinFace) {
         if face.path.is_empty() && face.params.is_empty() {
             self.builtin_faces.remove(&key);
             self.insert_gr.remove(&key);
@@ -30793,17 +30757,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **The automation's overlay for one open built-in face**, from the
-    /// host at its `(seat, bay)` — `None` withdraws it. See
+    /// host, by the bay's identity — `None` withdraws it. See
     /// `builtin_faces_live`.
-    pub fn set_live_face(
-        &mut self,
-        seat: usize,
-        bay: usize,
-        face: Option<crate::ports::BuiltinFace>,
-    ) {
-        let Some(sb) = self.legacy_bay(seat, bay) else {
-            return;
-        };
+    pub fn set_live_bay_face(&mut self, sb: crate::desk_id::SeatBay, face: Option<crate::ports::BuiltinFace>) {
         match face {
             Some(f) => {
                 self.builtin_faces_live.insert(sb, f);
@@ -30825,13 +30781,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 _ => None,
             })
             .collect()
-    }
-
-    /// [`Self::open_face_bays`] at the host's `(seat, bay)`s, under the rows
-    /// as they stand: what the host evaluates the automation for each frame
-    /// — nothing else is looking.
-    pub fn open_face_seats(&self) -> Vec<(usize, usize)> {
-        self.open_face_bays().into_iter().filter_map(|sb| self.legacy_seat(sb)).collect()
     }
 
     // ── the sampler's two doors ─────────────────────────────────────────
@@ -30946,21 +30895,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.sampler_media = files;
     }
 
-    /// **The next sample a face asked to load** — the host's `(seat, bay)`
-    /// and the file, oldest first, taken off the queue as it is read.
-    /// `None` when nothing is waiting. The bay is kept by identity until
-    /// this moment, so the seat is where its track stands NOW. A load whose
-    /// track this desk no longer holds is dropped: there is no bay to bind
-    /// it into. The file is what the bay is to store: `media/<name>`,
-    /// relative to the project it was copied into, or the path as given when
-    /// no project is open (see `sample_into_project`).
-    pub fn take_sampler_load(&mut self) -> Option<(usize, usize, std::path::PathBuf)> {
+    /// **The next sample a face asked to load** — the bay, by identity, and
+    /// the file, oldest first, taken off the queue as it is read. `None`
+    /// when nothing is waiting. A load whose track this desk no longer holds
+    /// is dropped: there is no bay to bind it into. The file is what the bay
+    /// is to store: `media/<name>`, relative to the project it was copied
+    /// into, or the path as given when no project is open (see
+    /// `sample_into_project`). By identity (W7-slot-gaps): the host's
+    /// `(seat, bay)` had no seat for a track past the frozen map's rows, so
+    /// a file chosen there was dropped here.
+    pub fn take_sampler_load(&mut self) -> Option<(crate::desk_id::SeatBay, std::path::PathBuf)> {
         while let Some((sb, path)) = self.sampler_load.pop_front() {
-            if let Some((seat, bay)) = self.legacy_seat(sb) {
-                return Some((seat, bay, path));
+            if self.bay_on_desk(sb) {
+                return Some((sb, path));
             }
         }
         None
+    }
+
+    /// **Whether a bay is one this desk holds**: a special's always, a
+    /// track's while its track stands on a row.
+    fn bay_on_desk(&self, sb: crate::desk_id::SeatBay) -> bool {
+        sb.seat.node.track().is_none_or(|id| self.row_of(id).is_some())
     }
 
     /// **Bring a file the sampler is about to play INTO the project, and
@@ -31007,11 +30963,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// forwards to the engine, and mirrors the value into the local face
     /// first — optimistically, so the knob under the pointer never waits a
     /// frame to show its own drag. The engine-side ledger remains the
-    /// durable truth; the next `set_builtin_face` push overwrites this
+    /// durable truth; the next `set_bay_face` push overwrites this
     /// mirror with it, and the two agree unless the engine refused the value
     /// (out-of-range id), in which case the refusal shows by the knob
-    /// snapping back. The request names the bay by the host's `(seat, bay)`
-    /// as the rows stand.
+    /// snapping back. The request names the bay by identity.
     pub fn set_bay_param(&mut self, sb: crate::desk_id::SeatBay, id: u32, value: f32) {
         let value = if value.is_finite() { value.clamp(0.0, 1.0) } else { return };
         if let Some(face) = self.builtin_faces.get_mut(&sb) {
@@ -31020,14 +30975,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.pending_inserts.insert((sb, id), (value, 30));
-        if let Some((strip, slot)) = self.legacy_seat(sb) {
-            self.request_recorder(recorder::RecorderRequest::SetInsertParam {
-                strip,
-                slot,
-                id,
-                value,
-            });
-        }
+        self.request_recorder(recorder::RecorderRequest::SetInsertParam { bay: sb, id, value });
     }
 
     /// **Set one knob on a built-in bay from words typed into its
@@ -31041,24 +30989,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         }
         self.pending_inserts.remove(&(sb, id));
-        if let Some((strip, slot)) = self.legacy_seat(sb) {
-            self.request_recorder(recorder::RecorderRequest::TypeInsertParam {
-                strip,
-                slot,
-                id,
-                text,
-            });
-        }
+        self.request_recorder(recorder::RecorderRequest::TypeInsertParam { bay: sb, id, text });
     }
 
     /// The compressor face's meter for one bay, forwarded per frame by the
-    /// host at its `(seat, bay)` — positive dB of gain reduction, already
+    /// host by the bay's identity — positive dB of gain reduction, already
     /// max-held over the frame's blocks on the engine side.
-    pub fn set_insert_gr(&mut self, seat: usize, bay: usize, gr_db: f32) {
+    pub fn set_bay_gr(&mut self, sb: crate::desk_id::SeatBay, gr_db: f32) {
         if gr_db.is_finite() && gr_db >= 0.0 {
-            if let Some(sb) = self.legacy_bay(seat, bay) {
-                self.insert_gr.insert(sb, gr_db);
-            }
+            self.insert_gr.insert(sb, gr_db);
         }
     }
 
@@ -32819,8 +32758,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **Open a bay**: its face, its editor, its instrument's panel, or the
     /// picker for an empty one - the one door every bay press comes
-    /// through, by identity.
-    fn open_bay_face(&mut self, sb: crate::desk_id::SeatBay) {
+    /// through, by identity, and the host's dev hook's (`IVORY_OPEN_EDITOR`).
+    pub fn open_bay_face(&mut self, sb: crate::desk_id::SeatBay) {
         // The desk's latched pair, which is the right keyboard for every
         // caller here: a press on a rack bay happens in the MAIN window.
         // The amp's pedal chips are the one gesture that does not, and they
@@ -32855,20 +32794,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Some(path) if crate::faces::suite_unit(path).is_some() => {
                 self.open_unit_face(sb);
             }
-            Some(_) => {
-                if let Some((strip, bay)) = self.legacy_seat(sb) {
-                    self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
-                }
-            }
+            // The plugin's own window, asked of the host by the bay itself.
+            Some(_) => self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(sb)),
             None => self.open_insert_picker(sb),
-        }
-    }
-
-    /// [`Self::open_bay_face`] at the host's `(seat, bay)`: its dev hook's
-    /// form.
-    pub fn open_insert_face(&mut self, seat: usize, bay: usize) {
-        if let Some(sb) = self.legacy_bay(seat, bay) {
-            self.open_bay_face(sb);
         }
     }
 
@@ -32876,7 +32804,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// whether the gesture was spent here, so the caller knows not to open
     /// anything.
     ///
-    /// Split out of [`Self::open_insert_face`] when the amp's pedal chips
+    /// Split out of [`Self::open_bay_face`] when the amp's pedal chips
     /// needed the same two gestures, and split rather than copied for the
     /// reason that function's own comment already makes: one door means the
     /// gesture reaches every surface at once and no surface can disagree
@@ -32947,20 +32875,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.aim_tap(sb, true);
     }
 
-    /// Aim the engine's one insert tap at a bay, or take it off: the host's
-    /// request names the bay by its desk index and displayed slot (or, past
-    /// the strips, its seat), as the rows stand now.
+    /// Aim the engine's one insert tap at a bay, or take it off, by the
+    /// bay's identity (W7-slot-gaps: the request named it by its desk index
+    /// and displayed slot, which no track past the frozen map's rows has, so
+    /// an analyzer there drew nothing).
     fn aim_tap(&mut self, sb: crate::desk_id::SeatBay, on: bool) {
-        let at = crate::desk_id::display_slot(sb)
-            .and_then(|slot| {
-                let strip = crate::desk_legacy::unbind(sb.seat.node, &self.settings.desk_ids())
-                    .and_then(crate::desk_legacy::encode_v32_strip)?;
-                Some((strip, slot))
-            })
-            .or_else(|| self.legacy_seat(sb));
-        if let Some((strip, slot)) = at {
-            self.request_recorder(recorder::RecorderRequest::SetInsertTap { strip, slot, on });
-        }
+        self.request_recorder(recorder::RecorderRequest::SetInsertTap { bay: sb, on });
     }
 
     /// **A pedal chip's whole answer**, in the amp face's own terms.
@@ -33017,9 +32937,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     && p != dialogs::DRUMPAD_PATH
                     && p != dialogs::KEYS_PATH =>
             {
-                if let Some((strip, bay)) = self.legacy_seat(sb) {
-                    self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
-                }
+                self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(sb));
                 None
             }
             _ => self.build_insert_picker(sb),
@@ -33224,14 +33142,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Whether THIS bay's editor should open now that its plugin has loaded.
     ///
     /// Answers once — the flag is taken — and only for the bay a pick just
-    /// aimed at. The host asks after every successful `load_insert`, at its
-    /// `(seat, bay)`, and the distinction this draws is the one that
+    /// aimed at. The host asks after every successful `load_insert_at`, by
+    /// the bay's identity, and the distinction this draws is the one that
     /// matters: a plugin the user just chose opens its window; thirty-six
     /// bays restored at launch open none. The aim is the bay's identity, so
     /// a reorder between the pick and the load opens the bay that was
     /// picked.
-    pub fn take_open_insert_on_load(&mut self, seat: usize, bay: usize) -> bool {
-        if self.open_insert_on_load.is_some() && self.open_insert_on_load == self.legacy_bay(seat, bay) {
+    pub fn take_open_bay_on_load(&mut self, sb: crate::desk_id::SeatBay) -> bool {
+        if self.open_insert_on_load == Some(sb) {
             self.open_insert_on_load = None;
             return true;
         }
@@ -35178,15 +35096,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.plugin(self.row_bay(n, bay)?)
     }
 
-    /// **The bay the host names `(seat, bay)`**, by the frozen map under the
-    /// rows as they stand. The host's one crossing; nothing in this file
-    /// asks it of a bay of its own.
+    /// **The bay the frozen map names `(seat, bay)`** under the rows as they
+    /// stand: the tests' way to name the legacy fixtures' bays. Nothing the
+    /// host is handed or asks crosses it any more (W7-slot-gaps retired the
+    /// seat-form adapters with the overlay that still went through it): the
+    /// frozen map has no seat for a track past its thirty-second row.
+    #[cfg(test)]
     fn legacy_bay(&self, seat: usize, bay: usize) -> Option<crate::desk_id::SeatBay> {
         crate::desk_legacy::bay_at(&self.settings.desk_ids(), seat, bay)
     }
 
-    /// [`Self::legacy_bay`]'s inverse, for what the app hands the host: a
-    /// request that still names a bay by seat.
+    /// [`Self::legacy_bay`]'s inverse, for the tests.
+    #[cfg(test)]
     fn legacy_seat(&self, sb: crate::desk_id::SeatBay) -> Option<(usize, usize)> {
         crate::desk_legacy::seat_of(&self.settings.desk_ids(), sb)
     }
@@ -35225,13 +35146,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **Every bypassed bay**, by identity (C11): what the host publishes.
     pub fn bypass(&self) -> &std::collections::BTreeSet<crate::desk_id::SeatBay> {
         &self.settings.bypass
-    }
-
-    /// What the host's `(seat, bay)` holds: [`Self::plugin`] through the
-    /// frozen map under the rows as they stand. The host's form, kept
-    /// beside the identity one until its lane moves off it (C11).
-    pub fn insert(&self, seat: usize, bay: usize) -> Option<&str> {
-        self.plugin(self.legacy_bay(seat, bay)?)
     }
 
     /// Put an effect in one, or take one out.
@@ -35392,16 +35306,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         self.save_settings();
         self.undo_commit();
-    }
-
-    /// [`Self::set_plugin`] at the host's `(seat, bay)`: the host's form
-    /// (its copy, move and paste roads), kept beside the identity one until
-    /// its lane moves off it (C11). A seat the frozen map cannot place
-    /// under the rows as they stand is no bay, and nothing is written.
-    pub fn set_insert(&mut self, seat: usize, bay: usize, path: Option<&str>) {
-        if let Some(sb) = self.legacy_bay(seat, bay) {
-            self.set_plugin(sb, path);
-        }
     }
 
     /// **What a bay's plugin curves become when it changes tenant**, from
@@ -35584,14 +35488,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.commit_undo_moment();
     }
 
-    /// [`Self::trade_bays`] at the host's `(seat, bay)`s: its move and swap
-    /// roads' form, kept until its lane moves off it (C11).
-    pub fn trade_inserts(&mut self, a: (usize, usize), b: (usize, usize)) {
-        if let (Some(a), Some(b)) = (self.legacy_bay(a.0, a.1), self.legacy_bay(b.0, b.1)) {
-            self.trade_bays(a, b);
-        }
-    }
-
     /// Whose board an amp seated in bay `sb` should seed, and with what -
     /// asked with a lookup instead of the settings so the once-only rule
     /// can be tested as plain logic. `pedal_filled(pedal, bay)` answers
@@ -35683,18 +35579,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.bypass.contains(&sb)
     }
 
-    /// [`Self::bay_bypassed`] at the host's `(seat, bay)`.
-    pub fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
-        self.legacy_bay(seat, bay).is_some_and(|sb| self.bay_bypassed(sb))
-    }
-
-    /// Every bypassed bay at the host's `(seat, bay)`s, under the rows as
-    /// they stand: the form the host published before [`Self::bypass`],
-    /// kept until its lane moves off it (C11).
-    pub fn insert_bypass(&self) -> Vec<(usize, usize)> {
-        self.settings.bypass.iter().filter_map(|sb| self.legacy_seat(*sb)).collect()
-    }
-
     /// Take one bay out of circuit, or put it back. Answers what it now is.
     ///
     /// Saved on the spot, like every other desk fact a click changes: the
@@ -35712,14 +35596,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.save_settings();
         self.undo_commit();
         on
-    }
-
-    /// [`Self::toggle_bay_bypass`] at the host's `(seat, bay)`.
-    pub fn toggle_insert_bypass(&mut self, seat: usize, bay: usize) -> bool {
-        match self.legacy_bay(seat, bay) {
-            Some(sb) => self.toggle_bay_bypass(sb),
-            None => false,
-        }
     }
 
     /// **Put one bay in a STATED position** rather than flipping whatever it
@@ -35745,14 +35621,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.save_settings();
         }
         moved
-    }
-
-    /// [`Self::set_bay_bypass`] at the host's `(seat, bay)`.
-    pub fn set_insert_bypass(&mut self, seat: usize, bay: usize, on: bool) -> bool {
-        match self.legacy_bay(seat, bay) {
-            Some(sb) => self.set_bay_bypass(sb, on),
-            None => false,
-        }
     }
 
     /// A short name for the audio interface, used on every one of its inputs.
@@ -36787,10 +36655,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // bay disagreed about which kit you were looking at.
                     let want = self
                         .selected_row()
-                        .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        .filter(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         .or_else(|| {
                             (0..self.desk_extent())
-                                .find(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                                .find(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         });
                     match want {
                         Some(ch) => self.open_drumpad_for(ch),
@@ -37947,11 +37815,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::SetInsertIr { bay, path } => {
-                // The host names the bay by its `(seat, bay)`, as the rows
-                // stand now.
-                if let Some((strip, slot)) = self.legacy_seat(bay) {
-                    self.request_recorder(recorder::RecorderRequest::SetInsertIr { strip, slot, path });
-                }
+                // By the bay itself, as the face names it.
+                self.request_recorder(recorder::RecorderRequest::SetInsertIr { bay, path });
             }
             // **The sampler's load, refused out loud when it cannot be
             // one.** A MIDI clip is not a sample and neither is a kit or a
@@ -38832,7 +38697,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // somebody wants to look at NOW — the built-in's face is
                     // the patch picker and opens here; a VST3's is a window
                     // only the host can make, so the host is told to make it
-                    // the moment the load lands. See `take_open_insert_on_load`.
+                    // the moment the load lands. See `take_open_bay_on_load`.
                     match path.as_deref() {
                         Some(dialogs::BUILTIN_PATH) if strip != usize::MAX => self.open_patch_picker(strip),
                         Some(dialogs::DRUMPAD_PATH) if strip != usize::MAX => self.open_drumpad_for(strip),
@@ -43727,13 +43592,10 @@ impl TangentApp {
                 if convolver && !loaded.impulse.is_empty() {
                     let file = std::path::Path::new(&loaded.impulse);
                     if !loaded.impulse.starts_with('\u{1f}') && file.is_file() {
-                        if let Some((strip, slot)) = self.legacy_seat(sb) {
-                            self.request_recorder(recorder::RecorderRequest::SetInsertIr {
-                                strip,
-                                slot,
-                                path: loaded.impulse.clone(),
-                            });
-                        }
+                        self.request_recorder(recorder::RecorderRequest::SetInsertIr {
+                            bay: sb,
+                            path: loaded.impulse.clone(),
+                        });
                     } else {
                         let name = file
                             .file_name()
@@ -44286,6 +44148,59 @@ impl TangentApp {
         } else {
             word
         }
+    }
+}
+
+#[cfg(test)]
+impl TangentApp {
+    // **The legacy fixtures' bay names, for the tests only.** Many tests
+    // build the frozen V32 desk and name its bays by `(seat, bay)`, the
+    // host's form before W7-slot-gaps retired it: nothing the host is handed
+    // or calls speaks it now (a track past the thirty-second row has no
+    // seat), so these live here, beside the other fixtures, and nowhere a
+    // road can reach them.
+
+    /// What the frozen map's `(seat, bay)` holds.
+    fn insert(&self, seat: usize, bay: usize) -> Option<&str> {
+        self.plugin(self.legacy_bay(seat, bay)?)
+    }
+
+    /// Seat a plugin at the frozen map's `(seat, bay)`, or empty it.
+    fn set_insert(&mut self, seat: usize, bay: usize, path: Option<&str>) {
+        if let Some(sb) = self.legacy_bay(seat, bay) {
+            self.set_plugin(sb, path);
+        }
+    }
+
+    /// Whether the frozen map's `(seat, bay)` is bypassed.
+    fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
+        self.legacy_bay(seat, bay).is_some_and(|sb| self.bay_bypassed(sb))
+    }
+
+    /// Every bypassed bay at its frozen-map `(seat, bay)`.
+    fn insert_bypass(&self) -> Vec<(usize, usize)> {
+        self.settings.bypass.iter().filter_map(|sb| self.legacy_seat(*sb)).collect()
+    }
+
+    /// [`Self::toggle_bay_bypass`] at the frozen map's `(seat, bay)`.
+    fn toggle_insert_bypass(&mut self, seat: usize, bay: usize) -> bool {
+        self.legacy_bay(seat, bay).is_some_and(|sb| self.toggle_bay_bypass(sb))
+    }
+
+    /// [`Self::set_bay_bypass`] at the frozen map's `(seat, bay)`.
+    fn set_insert_bypass(&mut self, seat: usize, bay: usize, on: bool) -> bool {
+        self.legacy_bay(seat, bay).is_some_and(|sb| self.set_bay_bypass(sb, on))
+    }
+
+    /// [`Self::take_open_bay_on_load`] at the frozen map's `(seat, bay)`.
+    fn take_open_insert_on_load(&mut self, seat: usize, bay: usize) -> bool {
+        self.legacy_bay(seat, bay).is_some_and(|sb| self.take_open_bay_on_load(sb))
+    }
+
+    /// A face pushed for the frozen map's `(seat, bay)`.
+    fn set_builtin_face_at(&mut self, seat: usize, bay: usize, face: crate::ports::BuiltinFace) {
+        let sb = self.legacy_bay(seat, bay).expect("a legacy bay");
+        self.set_bay_face(sb, face);
     }
 }
 
@@ -54980,7 +54895,7 @@ mod tests {
         assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
         assert_eq!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::OpenInsertEditor(1, 1))
+            Some(recorder::RecorderRequest::OpenInsertEditor(app.legacy_bay(1, 1).expect("a bay")))
         );
     }
 
@@ -55094,9 +55009,7 @@ mod tests {
         let (strip, slot) = (2, 0);
         let sb = app.strip_slot_bay(recorder::StripRef::Row(strip), slot).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
             path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
             params: vec![crate::ports::BuiltinFaceParam {
                 id: 0,
@@ -55142,15 +55055,15 @@ mod tests {
         );
         assert_eq!(
             bound,
-            Some((seat, bay, std::path::PathBuf::from("media/kick.wav"))),
+            Some((sb, std::path::PathBuf::from("media/kick.wav"))),
             "the preset's sample was not bound to this project's own copy"
         );
         assert!(copied, "the preset's sample was not copied into the project it was loaded in");
         assert!(
             knobs.iter().any(|r| matches!(
                 r,
-                recorder::RecorderRequest::SetInsertParam { strip: s, slot: b, value, .. }
-                    if *s == seat && *b == bay && (*value - 0.25).abs() < 1e-6
+                recorder::RecorderRequest::SetInsertParam { bay: b, value, .. }
+                    if *b == sb && (*value - 0.25).abs() < 1e-6
             )),
             "the preset's knobs did not go out: {knobs:?}"
         );
@@ -55181,9 +55094,7 @@ mod tests {
         let (strip, slot) = (2, 0);
         let sb = app.strip_slot_bay(recorder::StripRef::Row(strip), slot).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
             path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
             ..Default::default()
         });
@@ -55244,9 +55155,7 @@ mod tests {
             steps: 0,
             value: 0.5,
         };
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
             path: "@tangent-ir".to_owned(),
             params: vec![knob(0, "mix"), knob(1, "trim")],
             ..Default::default()
@@ -55268,12 +55177,10 @@ mod tests {
         };
         let asked = land(&mut app, &plate);
         let turned = asked.iter().position(|r| {
-            matches!(r, recorder::RecorderRequest::SetInsertParam { strip: s, slot: b, id: 0, .. }
-                if *s == seat && *b == bay)
+            matches!(r, recorder::RecorderRequest::SetInsertParam { bay: b, id: 0, .. } if *b == sb)
         });
         let bound = asked.iter().position(|r| {
-            matches!(r, recorder::RecorderRequest::SetInsertIr { strip: s, slot: b, path }
-                if *s == seat && *b == bay && *path == plate)
+            matches!(r, recorder::RecorderRequest::SetInsertIr { bay: b, path } if *b == sb && *path == plate)
         });
         let missing = land(&mut app, &gone);
         let sent_missing = missing
@@ -56724,9 +56631,7 @@ mod tests {
             steps: 0,
             value,
         };
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: 0,
-            slot: 0,
+        app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: "@tangent-comp".to_owned(),
             params: vec![param(0.9)],
             ..Default::default()
@@ -56737,9 +56642,7 @@ mod tests {
             "the knob's shield let an old echo through after the reorder"
         );
         // The stranger's own echo at the old seat is not shielded.
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: 2,
-            slot: 0,
+        app.set_builtin_face_at(2, 0, crate::ports::BuiltinFace {
             path: "@tangent-comp".to_owned(),
             params: vec![param(0.9)],
             ..Default::default()
@@ -56752,14 +56655,14 @@ mod tests {
         );
         // The load goes to the bay on the row it stands on now.
         let load = app.take_sampler_load().expect("the load was dropped in the reorder");
-        assert_eq!((load.0, load.1), (0, 1), "the load was handed to the row the track left");
+        assert_eq!(app.legacy_seat(load.0), Some((0, 1)), "the load was handed to the row the track left");
         // And the paste reads the bay that was copied, on its new row.
         let into = slot_key(app.row_node(4), 0).expect("a bay");
         app.paste_fx(into);
         let mut pasted = None;
         while let Some(r) = app.take_recorder_request() {
-            if let recorder::RecorderRequest::PasteInsert { from_strip, from_bay, to_strip, to_bay } = r {
-                pasted = Some((from_strip, from_bay, to_strip, to_bay));
+            if let recorder::RecorderRequest::PasteInsert { from, to } = r {
+                pasted = app.legacy_seat(from).zip(app.legacy_seat(to)).map(|(f, t)| (f.0, f.1, t.0, t.1));
             }
         }
         assert_eq!(pasted, Some((0, 2, 4, 0)), "the paste read the row the copy was taken on, not the bay");
@@ -62619,7 +62522,7 @@ mod tests {
     /// back — in BOTH views, on a track's rack and on a FOLDER's second one
     /// — and a plain click still opens the plugin.**
     ///
-    /// Driven at the event level rather than through `open_insert_face`,
+    /// Driven at the event level rather than through `open_bay_face`,
     /// because what is actually being asserted is that a real press with a
     /// real modifier reaches that function at all. The two views arm the bay
     /// differently (the mixer through `Hit::Insert`, the arrangement through
@@ -62681,7 +62584,7 @@ mod tests {
                 );
                 let mut opened = false;
                 while let Some(r) = app.take_recorder_request() {
-                    opened |= r == recorder::RecorderRequest::OpenInsertEditor(seat, 0);
+                    opened |= app.legacy_bay(seat, 0).is_some_and(|sb| r == recorder::RecorderRequest::OpenInsertEditor(sb));
                 }
                 assert!(opened, "{where_}: a plain click on seat {seat} opened nothing");
 
@@ -62694,7 +62597,7 @@ mod tests {
                 );
                 let mut opened = false;
                 while let Some(r) = app.take_recorder_request() {
-                    opened |= r == recorder::RecorderRequest::OpenInsertEditor(seat, 0);
+                    opened |= app.legacy_bay(seat, 0).is_some_and(|sb| r == recorder::RecorderRequest::OpenInsertEditor(sb));
                 }
                 assert!(
                     !opened,
@@ -64894,12 +64797,8 @@ mod tests {
         assert!(
             matches!(
                 req,
-                Some(recorder::RecorderRequest::PasteInsert {
-                    from_strip: 0,
-                    from_bay: 1,
-                    to_bay: 0,
-                    to_strip,
-                }) if to_strip == lower
+                Some(recorder::RecorderRequest::PasteInsert { from, to })
+                    if Some(from) == app.legacy_bay(0, 1) && Some(to) == app.legacy_bay(lower, 0)
             ),
             "paste asked for {req:?}"
         );
@@ -64937,12 +64836,8 @@ mod tests {
         assert!(
             matches!(
                 req,
-                Some(recorder::RecorderRequest::CopyInsert {
-                    from_strip: 0,
-                    from_bay: 1,
-                    to_strip: 4,
-                    to_bay: None,
-                })
+                Some(recorder::RecorderRequest::CopyInsert { from, to, to_bay: None })
+                    if Some(from) == app.legacy_bay(0, 1) && to == app.row_node(4)
             ),
             "{req:?}"
         );
@@ -64957,7 +64852,7 @@ mod tests {
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), None);
         let req = app.take_recorder_request();
         assert!(
-            matches!(req, Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))),
+            matches!(req, Some(recorder::RecorderRequest::OpenInsertEditor(b)) if Some(b) == app.legacy_bay(0, 1)),
             "a click on a loaded bay asked for {req:?}"
         );
         assert_eq!(app.bay_carry, None);
@@ -64989,12 +64884,8 @@ mod tests {
         assert!(
             matches!(
                 req,
-                Some(recorder::RecorderRequest::SwapInserts {
-                    a_strip: 0,
-                    a_bay: 1,
-                    b_strip: 0,
-                    b_bay: 0
-                })
+                Some(recorder::RecorderRequest::SwapInserts { a, b })
+                    if Some(a) == app.legacy_bay(0, 1) && Some(b) == app.legacy_bay(0, 0)
             ),
             "a drop on a loaded bay asked for {req:?}"
         );
@@ -65010,14 +64901,11 @@ mod tests {
         app.set_insert(4, 2, Some("/x/Verb.vst3"));
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(4, 2));
+        let req = app.take_recorder_request();
         assert!(matches!(
-            app.take_recorder_request(),
-            Some(recorder::RecorderRequest::SwapInserts {
-                a_strip: 0,
-                a_bay: 1,
-                b_strip: 4,
-                b_bay: 2
-            })
+            req,
+            Some(recorder::RecorderRequest::SwapInserts { a, b })
+                if Some(a) == app.legacy_bay(0, 1) && Some(b) == app.legacy_bay(4, 2)
         ));
 
         // **An EMPTY bay on another channel is a copy INTO THAT BAY** — the
@@ -65026,9 +64914,10 @@ mod tests {
         app.set_insert(4, 2, None);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(4, 2));
+        let req = app.take_recorder_request();
         assert!(matches!(
-            app.take_recorder_request(),
-            Some(recorder::RecorderRequest::CopyInsert { to_strip: 4, to_bay: Some(2), .. })
+            req,
+            Some(recorder::RecorderRequest::CopyInsert { to_bay: Some(t), .. }) if Some(t) == app.legacy_bay(4, 2)
         ));
 
         // **An EMPTY bay on the SAME channel is a move** — "drag slot 1
@@ -65038,14 +64927,11 @@ mod tests {
         assert!(app.insert(0, 2).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(0, 2));
+        let req = app.take_recorder_request();
         assert!(matches!(
-            app.take_recorder_request(),
-            Some(recorder::RecorderRequest::MoveInsert {
-                from_strip: 0,
-                from_bay: 1,
-                to_strip: 0,
-                to_bay: 2,
-            })
+            req,
+            Some(recorder::RecorderRequest::MoveInsert { from, to })
+                if Some(from) == app.legacy_bay(0, 1) && Some(to) == app.legacy_bay(0, 2)
         ));
 
         // **And the same channel's OTHER RACK is still the same channel** —
@@ -65057,15 +64943,12 @@ mod tests {
         assert!(app.insert(lower, 0).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(lower, 0));
+        let req = app.take_recorder_request();
         assert!(
             matches!(
-                app.take_recorder_request(),
-                Some(recorder::RecorderRequest::MoveInsert {
-                    from_strip: 0,
-                    from_bay: 1,
-                    to_bay: 0,
-                    to_strip,
-                }) if to_strip == lower
+                req,
+                Some(recorder::RecorderRequest::MoveInsert { from, to })
+                    if Some(from) == app.legacy_bay(0, 1) && Some(to) == app.legacy_bay(lower, 0)
             ),
             "a carry into the same track's lower rack was not a move"
         );
@@ -65076,15 +64959,12 @@ mod tests {
         let elsewhere = recorder::folder_extra_seat(4);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(elsewhere, 1));
+        let req = app.take_recorder_request();
         assert!(
             matches!(
-                app.take_recorder_request(),
-                Some(recorder::RecorderRequest::CopyInsert {
-                    from_strip: 0,
-                    from_bay: 1,
-                    to_bay: Some(1),
-                    to_strip,
-                }) if to_strip == elsewhere
+                req,
+                Some(recorder::RecorderRequest::CopyInsert { from, to_bay: Some(t), .. })
+                    if Some(from) == app.legacy_bay(0, 1) && Some(t) == app.legacy_bay(elsewhere, 1)
             ),
             "a carry into another track's lower rack was not a copy"
         );
@@ -66757,16 +66637,13 @@ mod tests {
             value,
         };
         let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
-        let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         let face = |params| crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
             path: "@tangent-eq".into(),
             params,
             ..Default::default()
         };
-        app.set_builtin_face(face(vec![param(22, 0.2), param(23, 0.5)]));
-        app.set_live_face(seat, bay, Some(face(vec![param(22, 0.8)])));
+        app.set_bay_face(sb, face(vec![param(22, 0.2), param(23, 0.5)]));
+        app.set_live_bay_face(sb, Some(face(vec![param(22, 0.8)])));
         app.apply_dialog_action(DialogAction::SetInsertParamPair {
             bay: sb,
             id_a: 22,
@@ -66780,7 +66657,7 @@ mod tests {
         assert_eq!(saved(&app, 22), Some(0.2), "the curve's frequency was written into the setting");
         assert_eq!(saved(&app, 23), Some(0.9), "the gain the hand moved was not written");
         // No curve: the same gesture writes both, as it always did.
-        app.set_live_face(seat, bay, None);
+        app.set_live_bay_face(sb, None);
         app.apply_dialog_action(DialogAction::SetInsertParam { bay: sb, id: 22, value: 0.4 });
         assert_eq!(saved(&app, 22), Some(0.4));
     }
@@ -66806,16 +66683,13 @@ mod tests {
             value,
         };
         let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
-        let (seat, bay) = app.legacy_seat(sb).expect("a seat");
         let face = |params| crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
             path: "@tangent-eq".into(),
             params,
             ..Default::default()
         };
-        app.set_builtin_face(face(vec![param(22, 0.2), param(23, 0.5)]));
-        app.set_live_face(seat, bay, Some(face(vec![param(22, 0.8)])));
+        app.set_bay_face(sb, face(vec![param(22, 0.2), param(23, 0.5)]));
+        app.set_live_bay_face(sb, Some(face(vec![param(22, 0.8)])));
         // What Init sends: every pushed knob at its default.
         app.apply_dialog_action(DialogAction::SetInsertParamsMany {
             bay: sb,
@@ -67005,22 +66879,17 @@ mod tests {
         };
         let sb = app.strip_slot_bay(recorder::StripRef::Row(2), 1).expect("a shown bay");
         let (seat, bay) = app.legacy_seat(sb).expect("a seat");
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
             path: "@tangent-eq".into(),
             params: vec![param(21, 0.6), param(22, 0.2)],
             curve_db: vec![-1.0; 4],
             ..Default::default()
         });
         app.dialog = Some(Dialog::InsertFace { bay: sb, live: Box::default() });
-        assert_eq!(app.open_face_seats(), vec![(seat, bay)], "the host would not look at this face");
-        app.set_live_face(
-            seat,
-            bay,
+        assert_eq!(app.open_face_bays(), vec![sb], "the host would not look at this face");
+        app.set_live_bay_face(
+            sb,
             Some(crate::ports::BuiltinFace {
-                strip: seat,
-                slot: bay,
                 path: "@tangent-eq".into(),
                 params: vec![param(22, 0.8)],
                 curve_db: vec![-9.0; 4],
@@ -67045,7 +66914,7 @@ mod tests {
         let saved = app.bay_face(sb).and_then(|f| f.params.iter().find(|p| p.id == 22));
         assert_eq!(saved.map(|p| p.value), Some(0.2), "the overlay was written into the saved face");
         // Withdrawn: the window rests at the saved setting again.
-        app.set_live_face(seat, bay, None);
+        app.set_live_bay_face(sb, None);
         let _ = run_frame(&ctx, &mut app);
         assert_eq!(shown(&app, 22).map(|p| p.0), Some(0.2), "the overlay outlived its curve");
     }
@@ -70684,9 +70553,7 @@ mod tests {").expect("the tests module")];
     fn app_with_a_face_over_the_mixer() -> (egui::Context, TangentApp) {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.set_insert(0, 0, Some("@tangent-comp"));
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: 0,
-            slot: 0,
+        app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: "@tangent-comp".to_owned(),
             params: Vec::new(),
             curve_db: Vec::new(),
@@ -70727,9 +70594,7 @@ mod tests {").expect("the tests module")];
                 app.set_insert(recorder::amp_pedal_seat(ch, p), 0, None);
             }
         }
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: seat,
-            slot: bay,
+        app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
             path: crate::faces_amp::AMP_PATH.to_owned(),
             params: Vec::new(),
             curve_db: Vec::new(),
@@ -70742,7 +70607,7 @@ mod tests {").expect("the tests module")];
         app.set_insert(recorder::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
         app.mixer_open = true;
         pointer_frame(&ctx, &mut app, Vec::new());
-        app.open_insert_face(seat, bay);
+        app.open_bay_face(app.legacy_bay(seat, bay).expect("a bay"));
         pointer_frame(&ctx, &mut app, Vec::new());
         (ctx, app)
     }
@@ -71005,9 +70870,7 @@ mod tests {").expect("the tests module")];
         for p in 0..recorder::AMP_PEDALS {
             app.set_insert(recorder::amp_pedal_seat(0, p), 0, None);
         }
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: 0,
-            slot: 0,
+        app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: crate::faces_amp::AMP_PATH.to_owned(),
             params: Vec::new(),
             curve_db: Vec::new(),
@@ -71018,7 +70881,7 @@ mod tests {").expect("the tests module")];
         // window and opens no slot of ours at all.
         app.set_insert(recorder::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
         app.mixer_open = true;
-        app.open_insert_face(0, 0);
+        app.open_bay_face(app.legacy_bay(0, 0).expect("a bay"));
         for _ in 0..3 {
             pointer_frame(&ctx, &mut app, Vec::new());
         }
@@ -71322,7 +71185,7 @@ mod tests {").expect("the tests module")];
         let mut armed_pedal = false;
         while let Some(r) = app.take_recorder_request() {
             armed_pedal |= r
-                == recorder::RecorderRequest::SetInsertTap { strip: seat, slot: 0, on: true };
+                == recorder::RecorderRequest::SetInsertTap { bay: app.legacy_bay(seat, 0).expect("a bay"), on: true };
         }
         assert!(armed_pedal, "the pedal's window opened without taking the tap");
 
@@ -71338,9 +71201,9 @@ mod tests {").expect("the tests module")];
         let (mut off, mut back) = (false, false);
         while let Some(r) = app.take_recorder_request() {
             off |= r
-                == recorder::RecorderRequest::SetInsertTap { strip: seat, slot: 0, on: false };
+                == recorder::RecorderRequest::SetInsertTap { bay: app.legacy_bay(seat, 0).expect("a bay"), on: false };
             back |= r
-                == recorder::RecorderRequest::SetInsertTap { strip: 0, slot: 0, on: true };
+                == recorder::RecorderRequest::SetInsertTap { bay: app.legacy_bay(0, 0).expect("a bay"), on: true };
         }
         assert!(off, "the closed pedal window left the tap pointed at its bay");
         assert!(back, "the amp did not get the tap back when the pedal closed");
@@ -77748,7 +77611,7 @@ mod folder_tests {
         }
         a.arr_save_edits();
         let before = a.hist_at;
-        a.trade_inserts((3, 0), (3, 1));
+        a.trade_bays(a.legacy_bay(3, 0).expect("a bay"), a.legacy_bay(3, 1).expect("a bay"));
         assert_eq!((a.insert(3, 0), a.insert(3, 1)), (Some("@tangent-comp"), Some("@tangent-eq")));
         assert_eq!(level(&a, 1, 2), Some(0.2), "the EQ's curve did not follow it to bay 2");
         assert_eq!(level(&a, 0, 5), Some(0.7), "the compressor's curve did not follow it to bay 1");
@@ -77756,7 +77619,7 @@ mod folder_tests {
         assert!(a.arr_auto_is_open(AutoLane::Row(3), at(1, 2)) && !a.arr_auto_is_open(AutoLane::Row(3), at(0, 2)), "the row did not follow its curve");
         assert_eq!(a.hist_at, before + 1, "the swap left {} moments", a.hist_at - before);
         // A move into an empty bay is the same trade with nobody coming back.
-        a.trade_inserts((3, 1), (3, 2));
+        a.trade_bays(a.legacy_bay(3, 1).expect("a bay"), a.legacy_bay(3, 2).expect("a bay"));
         assert_eq!((a.insert(3, 1), a.insert(3, 2)), (None, Some("@tangent-eq")));
         assert_eq!(level(&a, 2, 2), Some(0.2), "the EQ's curve did not follow it into the empty bay");
         assert_eq!(level(&a, 1, 2), None, "the EQ's curve stayed on the bay it left");
@@ -82971,7 +82834,7 @@ mod sampler_road_tests {
             bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: dragged.to_string_lossy().into_owned(),
         });
-        let stored = app.take_sampler_load().map(|(_, _, p)| p);
+        let stored = app.take_sampler_load().map(|(_, p)| p);
         let copied = scratch.join("media").join("Loop.wav").is_file();
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
@@ -83032,7 +82895,7 @@ mod sampler_road_tests {
             bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: library.join("Upright.wav").to_string_lossy().into_owned(),
         });
-        let (_, _, upright) = app.take_sampler_load().expect("the library file was not queued");
+        let (_, upright) = app.take_sampler_load().expect("the library file was not queued");
         // A take: written into the scratch, which the take makes real, and
         // dragged out of the arrangement as the timeline plays it.
         app.materialize_project_dir();
@@ -83048,7 +82911,7 @@ mod sampler_road_tests {
             bay: app.strip_slot_bay(recorder::StripRef::Row(0), 0).expect("a bay"),
             path: dragged.to_string_lossy().into_owned(),
         });
-        let (_, _, take) = app.take_sampler_load().expect("the take was not queued");
+        let (_, take) = app.take_sampler_load().expect("the take was not queued");
         let mut in_media: Vec<String> = std::fs::read_dir(scratch.join("media"))
             .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default();
@@ -83147,12 +83010,12 @@ mod sampler_road_tests {
             path: "/m/Takes/two.aiff".to_owned(),
         });
         let first = app.take_sampler_load().expect("nothing queued");
-        assert_eq!(first.2, std::path::PathBuf::from("/m/Takes/one.wav"));
-        assert_eq!(first.1, 0, "the first bay came back as something else");
+        assert_eq!(first.1, std::path::PathBuf::from("/m/Takes/one.wav"));
+        assert_eq!(first.0.bay, 0, "the first bay came back as something else");
         let second = app.take_sampler_load().expect("only one queued");
-        assert_eq!(second.2, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_eq!(second.1, std::path::PathBuf::from("/m/Takes/two.aiff"));
         assert_eq!(
-            second.1, 2,
+            second.0.bay, 2,
             "the bay was thrown away, so the host would bind this into bay 0 \
              and the sampler in bay 2 would play nothing"
         );
@@ -83371,9 +83234,7 @@ mod sampler_road_tests {
     #[test]
     fn saving_a_sampler_preset_carries_the_file_it_is_playing() {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
-        app.set_builtin_face(crate::ports::BuiltinFace {
-            strip: 0,
-            slot: 0,
+        app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
             params: vec![crate::ports::BuiltinFaceParam {
                 id: 0,

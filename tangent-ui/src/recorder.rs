@@ -2338,11 +2338,16 @@ pub enum RecorderRequest {
     /// header, where there is no bay under the hand to mean. The owner, on
     /// the first version choosing for him every time: "it always takes the
     /// first empty slot -- change this to be per slot freedom."
+    ///
+    /// **By identity** (W7-slot-gaps): the bay copied from, the strip it is
+    /// copied onto, and the bay the hand chose there, if it chose one. They
+    /// were the host's `(seat, bay)`s through the frozen map, which has no
+    /// seat for a track past its thirty-second row, so a drag on track 33
+    /// sent nothing at all.
     CopyInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: Option<usize>,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::Node,
+        to_bay: Option<crate::desk_id::SeatBay>,
     },
     /// Bring these clips up so their loudest point sits just under full
     /// scale.
@@ -2374,14 +2379,15 @@ pub enum RecorderRequest {
     /// only thing the UI can do about it is ask for it to be dropped.
     ResetLoudness,
     /// Open one insert's OWN editor — the plugin's window, with its presets
-    /// and its knobs: `(desk index, bay)`.
+    /// and its knobs: the bay, by identity (it was the host's `(seat, bay)`,
+    /// which no track past the frozen map's rows has).
     ///
     /// A request rather than a dialog, because the window is not ours: the
     /// plugin draws into a native window the host creates after the frame. VST3
     /// requires it on the main thread, and creating an AppKit window with an
     /// egui frame still on the stack is the same re-entrancy the folder picker
     /// avoids.
-    OpenInsertEditor(usize, usize),
+    OpenInsertEditor(crate::desk_id::SeatBay),
     /// The green button: audition from the playhead. Pressed while
     /// auditioning, it PAUSES in place; Stop is what returns to the edit
     /// cursor. The host ignores it while the arrangement records or an export
@@ -2454,15 +2460,14 @@ pub enum RecorderRequest {
     PreviewFile(std::path::PathBuf),
     /// Silence the preview — the explorer closed.
     PreviewStop,
-    /// **Turn one knob on a built-in insert, live.** `strip` is the SEAT and
-    /// `slot` the bay — the same addressing `OpenInsertEditor` carries, so a
-    /// sender converts through `seat_bay` exactly once, on its side. `id` is
-    /// the unit's own stable param id and `value` normalised 0..=1; the host
-    /// forwards to `Engine::set_insert_param`, which writes the durable
-    /// ledger and rides the lock-free ring to the audio thread. The sender
-    /// mirrors optimistically (`TangentApp::set_insert_param`), so a face
-    /// never waits a frame to see its own drag.
-    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// **Turn one knob on a built-in insert, live.** `bay` is the bay by
+    /// identity, as `OpenInsertEditor` carries it. `id` is the unit's own
+    /// stable param id and `value` normalised 0..=1; the host forwards to
+    /// `Engine::set_insert_param_at`, which writes the durable ledger and
+    /// rides the lock-free ring to the audio thread. The sender mirrors
+    /// optimistically (`TangentApp::set_bay_param`), so a face never waits
+    /// a frame to see its own drag.
+    SetInsertParam { bay: crate::desk_id::SeatBay, id: u32, value: f32 },
     /// **Set one knob on a built-in insert from words typed into its
     /// reading.** Same addressing as `SetInsertParam`; `text` is what the
     /// hand typed - "-12", "440", "1.5k", "off". The host reads it on the
@@ -2471,12 +2476,11 @@ pub enum RecorderRequest {
     /// reading shows the number it landed on. Words the unit cannot read
     /// change nothing. The sender does NOT mirror this one: it has no value
     /// to mirror, which is the whole reason the words travel.
-    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
-    /// **Aim the engine's ONE insert tap at a mixer slot, or take it off**
-    /// — the feed behind an EQ face's analyzer and an imager face's
-    /// vectorscope. `strip` and `slot` are DESK terms (`Strip::index` and
-    /// the strip's Nth slot); the host owns the `seat_bay` translation, the
-    /// same way it owns it for `OpenInsertEditor`.
+    TypeInsertParam { bay: crate::desk_id::SeatBay, id: u32, text: String },
+    /// **Aim the engine's ONE insert tap at a bay, or take it off** — the
+    /// feed behind an EQ face's analyzer and an imager face's vectorscope.
+    /// `bay` by identity, as `OpenInsertEditor` carries it: the host aims
+    /// the tap at that bay's lane, wherever its row stands.
     ///
     /// A request because the tap is the engine's: this crate cannot reach
     /// `Engine::set_insert_tap` — the firewall is the whole point — so the
@@ -2493,7 +2497,7 @@ pub enum RecorderRequest {
     /// live and the one below it is holding its last picture, which is the
     /// right answer for a needle nobody is looking at and much better than
     /// the alternative of a second tap nothing in the engine has.
-    SetInsertTap { strip: usize, slot: usize, on: bool },
+    SetInsertTap { bay: crate::desk_id::SeatBay, on: bool },
     // ── presets ─────────────────────────────────────────────────────────
     // The preset road's three requests, at the END because the enum is
     // append-only across parallel lanes. All three are requests for the
@@ -2574,14 +2578,14 @@ pub enum RecorderRequest {
     /// Write the last finished capture into `IRs/<name>.wav` (32-bit float
     /// stereo) and re-push the shelf rows.
     IrSave { name: String },
-    /// Point a loaded Tangent IR bay at another impulse file. `strip` is
-    /// the SEAT (the `SetInsertParam` convention). The host rewrites the
+    /// Point a loaded Tangent IR bay at another impulse file. `bay` by
+    /// identity (the `SetInsertParam` convention). The host rewrites the
     /// bay's state sidecar and reloads the bay, because an IR is applied
     /// to an instance before it crosses to the audio thread - a swap IS a
     /// reload, honestly.
-    SetInsertIr { strip: usize, slot: usize, path: String },
+    SetInsertIr { bay: crate::desk_id::SeatBay, path: String },
     /// **Exchange two loaded insert bays, settings and all.** Appended at
-    /// the END, this enum's law. Both addresses are SEATS, like every other
+    /// the END, this enum's law. Both bays by identity, like every other
     /// bay-shaped request here.
     ///
     /// The owner: "dragging occupied fx slot x to any other occupied slot
@@ -2598,10 +2602,8 @@ pub enum RecorderRequest {
     /// bare paths exchanged in the settings would swap the units and hand
     /// each of them the other's factory defaults.
     SwapInserts {
-        a_strip: usize,
-        a_bay: usize,
-        b_strip: usize,
-        b_bay: usize,
+        a: crate::desk_id::SeatBay,
+        b: crate::desk_id::SeatBay,
     },
     /// **Carry a unit to an EMPTY bay of the SAME STRIP.** The owner: "drag
     /// slot 1 into unoccupied slot two? it moves." A swap needs two units
@@ -2611,19 +2613,15 @@ pub enum RecorderRequest {
     /// to move into. Host-side for `CopyInsert`'s reason: the unit's live
     /// state travels with it.
     ///
-    /// **Two seats, not one**, because a strip's six slots are not one rack:
-    /// a channel's 0..2 are its own seat and its 3..5 its folder-extra one
-    /// (see [`seat_bay`] and [`rack_owner`]). One `strip` field could only
-    /// ever express a move INSIDE a group of three, which is precisely the
-    /// fault the owner reported — "drag only works between each group of 3".
-    /// Whether the two seats are the same STRIP is the caller's question and
-    /// `rack_owner` is where it is answered; this carries whatever the
-    /// caller decided a move.
+    /// **Two bays, not one**, because a strip's six slots are not one rack:
+    /// a channel's 0..2 are its own rack and its 3..5 its second. One rack
+    /// field could only ever express a move INSIDE a group of three, which
+    /// is precisely the fault the owner reported — "drag only works between
+    /// each group of 3". Whether the two bays are the same STRIP is the
+    /// caller's question; this carries whatever the caller decided a move.
     MoveInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: usize,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::SeatBay,
     },
     // ── the DX7 bank builder ────────────────────────────────────────────
     //
@@ -2701,10 +2699,8 @@ pub enum RecorderRequest {
     /// PLAYING at is the thing being pasted, and only the host can ask a
     /// live instance for it. Appended at the END, this enum's law.
     PasteInsert {
-        from_strip: usize,
-        from_bay: usize,
-        to_strip: usize,
-        to_bay: usize,
+        from: crate::desk_id::SeatBay,
+        to: crate::desk_id::SeatBay,
     },
 }
 

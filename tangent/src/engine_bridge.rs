@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 use tangent_record::audio::Timebase;
 use tangent_ui::app::TangentApp;
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
-use tangent_ui::desk_legacy::{bind, decode_v32_strip};
 use tangent_ui::automation::AutoLane;
 use tangent_ui::recorder::{ChannelKind, MidiRoute, StripRef};
 use tangent_ui::routing::Target;
@@ -442,15 +441,20 @@ pub fn desk_bays(app: &TangentApp) -> BTreeMap<SeatBay, String> {
     app.plugins().iter().filter(|(_, p)| !p.is_empty()).map(|(sb, p)| (*sb, p.clone())).collect()
 }
 
-/// **The bay at the host's `(seat, bay)`, by identity**, under row ids
-/// `ids`: the frozen map's crossing (`desk_legacy::bay_at`), for the host's
-/// roads that still hold a seat.
+/// **The bay the frozen map names `(seat, bay)`, by identity**, under row
+/// ids `ids` (`desk_legacy::bay_at`): the tests' way to name their legacy
+/// fixtures' bays. No road of the host's holds a seat any more
+/// (W7-slot-gaps): the frozen map has none for a track past its
+/// thirty-second row.
+#[cfg(test)]
 pub fn seat_bay_at(ids: &[TrackId], seat: usize, bay: usize) -> Option<SeatBay> {
     tangent_ui::desk_legacy::bay_at(ids, seat, bay)
 }
 
 /// **Where the frozen map keeps a bay**, `(seat, bay)`, under row ids
-/// `ids`: [`seat_bay_at`]'s inverse. `None` for a track no row holds.
+/// `ids`: [`seat_bay_at`]'s inverse, for the tests. `None` for a track no
+/// row holds.
+#[cfg(test)]
 pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
     tangent_ui::desk_legacy::seat_of(ids, sb)
 }
@@ -553,21 +557,6 @@ pub fn track_bay(app: &TangentApp, id: TrackId, rack: Rack, bay: u8) -> Option<&
 /// instrument.
 pub fn row_instrument(app: &TangentApp, row: usize) -> Option<&str> {
     track_bay(app, app.track_at(row)?, Rack::Chain(0), 0)
-}
-
-/// **The node a strip of the app's desk is**, for the roads that still hand
-/// the host a strip (a face, a drop on a column): the frozen strip space
-/// (`decode_v32_strip`) bound to the desk's rows, so a track is named by its
-/// identity and no strip index is turned into a seat by hand.
-pub fn strip_node(app: &TangentApp, strip: usize) -> Option<Node> {
-    bind(decode_v32_strip(strip)?, &app.track_ids())
-}
-
-/// **The bay of a strip's displayed slot, by identity** (`desk_id::slot_key`,
-/// the one display-slot resolver: the master's two racks show the other way
-/// round).
-pub fn strip_slot(app: &TangentApp, strip: usize, slot: usize) -> Option<SeatBay> {
-    tangent_ui::desk_id::slot_key(strip_node(app, strip)?, slot)
 }
 
 /// **The plugin path in a bay, by identity**, off the app's map.
@@ -790,8 +779,9 @@ impl Bridge {
         }
     }
 
-    /// **The engine's name for the app's `(seat, bay)`**, under the app's
-    /// rows now: the app still keeps its bays by position.
+    /// **The engine's name for the frozen map's `(seat, bay)`** under the
+    /// app's rows now, for the tests' legacy fixtures (see [`seat_bay_at`]).
+    #[cfg(test)]
     pub fn engine_seat(&self, app: &TangentApp, seat: usize, bay: usize) -> Option<EngineBay> {
         self.engine_bay(seat_bay_at(&app.track_ids(), seat, bay)?)
     }
@@ -811,12 +801,6 @@ impl Bridge {
         };
         let sb = SeatBay::new(node, addr.desk_rack()?, u8::try_from(bay).ok()?);
         sb.is_valid().then_some(sb)
-    }
-
-    /// **The app's `(seat, bay)` for the engine's bay**, under the app's rows
-    /// now.
-    pub fn app_seat(&self, app: &TangentApp, at: EngineBay) -> Option<(usize, usize)> {
-        app_seat_of(&app.track_ids(), self.bay_at_engine(at)?)
     }
 
     /// Every row whose first bay holds `sentinel`, with its lane: the drum,
@@ -1149,14 +1133,16 @@ impl Bridge {
     ///
     /// **The lowest free slot below [`LEGACY_LANES`] first, and one on its
     /// way home there is waited for** (a frame or two, design 7.13), before
-    /// any slot past them is taken. The engine still keeps some parts only
-    /// for the legacy slots (a drum lane's pad effect racks; routes, sends
-    /// and keys until W6-engine-buses-sends), and an export builds its
-    /// engine fresh with row r at slot r: a track Ctrl/Cmd+T made on a
-    /// shipped desk's hidden row took slot 32 the frame that row's old lane
-    /// started home, so live it lost what its export had. Waiting for the
-    /// lane it replaces gives it the slot the export gives it. A slot past
-    /// them is taken only when none below is free or coming free.
+    /// any slot past them is taken. An export builds its engine fresh with
+    /// row r at slot r: a track Ctrl/Cmd+T made on a shipped desk's hidden
+    /// row took slot 32 the frame that row's old lane started home, so live
+    /// it stood on another slot than its export gave it, and while the
+    /// engine kept parts for the legacy slots alone (routes, sends and keys
+    /// until W6-engine-buses-sends; a drum lane's pad effects and a
+    /// sampler's file until W7-slot-gaps) it lost what its export had.
+    /// Nothing is kept that way now; the wait still gives a track the slot
+    /// its export gives it, so the two engines agree slot for slot. A slot
+    /// past them is taken only when none below is free or coming free.
     fn install(&mut self, app: &TangentApp, e: &mut Engine, rows: &[(usize, TrackId)]) -> Vec<Slot> {
         let legacy = u32::try_from(LEGACY_LANES).unwrap_or(u32::MAX);
         let mut taken: BTreeSet<Slot> = self.lanes.values().map(|h| h.at.slot).collect();
@@ -2684,7 +2670,7 @@ mod tests {
                 let mut ctx = Furnish {
                     live: Some((&live, &live_bridge)),
                     dx7: (0..CHANNELS)
-                        .filter(|ch| app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
+                        .filter(|ch| row_instrument(&app, *ch) == Some(tangent_ui::dialogs::BUILTIN_PATH))
                         .map(|ch| (ch, factory_voice(&app, ch)))
                         .collect(),
                     ..Furnish::default()
@@ -3703,8 +3689,8 @@ mod tests {
     /// a Plan without it, then Remove"), and a new track never takes its
     /// slot while it fades: it WAITS for a legacy slot on its way home, and
     /// takes one below thirty-two once it is (`Bridge::install`; W6 had it
-    /// take slot 32 at once, where the engine still keeps a drum lane's pad
-    /// racks only for the legacy slots and an export gives the track its
+    /// take slot 32 at once, where the engine then kept a drum lane's pad
+    /// racks only for the legacy slots, and an export gives the track its
     /// row's). Driven on an offline engine through the live road
     /// (`stage_removals_for_test`), a block rendered between frames for the
     /// callback that takes each op.
