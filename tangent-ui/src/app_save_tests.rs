@@ -371,7 +371,8 @@ fn a_removed_drum_tracks_kit_leaves_the_disk_with_the_save_and_not_before() {
     let back = reopened();
     assert_eq!(back.row_of(drums), None, "fixture: the saved document still holds the drum track");
     assert!(
-        (0..recorder::CHANNELS).all(|r| back.kit_at(r).pads[36].path.is_empty()),
+        // As many rows as the saved desk has: the removal took one (W6).
+        (0..back.desk_extent()).all(|r| back.kit_at(r).pads[36].path.is_empty()),
         "a saved removal left the kit on a row of the document"
     );
     app.undo();
@@ -447,7 +448,7 @@ fn every_first_format_2_write_keeps_a_release_builds_kit_to_go_back_to() {
         std::fs::create_dir_all(&back).expect("a restore");
         std::fs::write(back.join(crate::arrangement::DOC_NAME), &want.0).expect("restored document");
         std::fs::write(back.join(FILE_NAME), &want.1).expect("restored kit");
-        let (kits, panel) = DrumpadDoc::load_all_beside(&crate::arrangement::doc_in(&back), recorder::CHANNELS, None);
+        let (kits, panel) = DrumpadDoc::load_all_beside(&crate::arrangement::doc_in(&back), crate::desk_lift::V32_CHANNELS, None);
         assert_eq!((kits[2].pads[36].path.as_str(), panel), ("media/kick.wav", Some(2)), "{what}: the restored kit is not on lane 2");
         let reopened = crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(&back));
         assert!(

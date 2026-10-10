@@ -30,7 +30,6 @@ use crate::arrangement::{
     Anchor, ArrClip, ArrMarker, ArrNote, ArrPedal, Arrangement, ClipKind, DeskSnap,
 };
 use crate::automation::{AutoParam, Automation, Curve, Point, Shape};
-use crate::recorder::CHANNELS;
 use crate::settings::Settings;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -308,7 +307,8 @@ fn automation(lanes: usize, song_s: f64) -> Automation {
     if lanes > 2 {
         curves.push(Curve::sanitised(2, AutoParam::Send, pts(48, false)));
     }
-    curves.push(Curve::sanitised(CHANNELS, AutoParam::Gain, pts(16, false)));
+    // The master's, by name (W6): no lane number past the rows means it.
+    curves.push(Curve::sanitised(crate::automation::AutoLane::Master, AutoParam::Gain, pts(16, false)));
     Automation::from_curves(curves)
 }
 
@@ -357,18 +357,11 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             quantize_sensitivity: s.quantize_sensitivity,
             quantize_fit: s.quantize_fit.clone(),
         }),
-        kinds: s.channel_kinds.to_vec(),
-        icons: s.channel_icons.to_vec(),
-        names: s.strip_names.clone(),
-        colors: s.strip_colors.to_vec(),
+        // The rows whole, as the live desk says them (`desk_view`): every
+        // late row fact said.
+        rows: s.rows.clone(),
+        row_says: crate::arrangement::Says::ROWS,
         plugins: s.plugins.clone(),
-        sends: s.strip_sends.to_vec(),
-        muted: s.strip_muted,
-        soloed: s.strip_soloed,
-        gains: s.channel_gains.to_vec(),
-        pans: s.channel_pans.to_vec(),
-        inputs: s.channel_inputs.clone(),
-        midi_inputs: s.channel_midi_inputs.clone(),
         drums_gain: s.drums_gain,
         drums_pan: s.drums_pan,
         metronome_gain: s.metronome_gain,
@@ -378,22 +371,9 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         sig_beats: sig.beats,
         sig_unit: sig.unit,
         metronome_on: s.metronome_on,
-        tracks_added: s.tracks_added as u32,
-        is_folder: s.strip_is_folder.clone(),
-        in_folder: s.strip_in_folder.clone(),
-        folder_shut: s.strip_folder_shut.clone(),
-        armed: s.channel_armed.unwrap_or(0),
-        phase: Some(s.strip_phase),
-        to_theory: Some(s.strip_to_theory.clone()),
         routes: Some(s.routes.clone()),
         insert_keys: Some(s.insert_keys.clone()),
         bypass: Some(s.bypass.clone()),
-        instruments: Some(crate::arrangement::Instruments {
-            dx7_cartridge: s.strip_dx7_cartridge.clone(),
-            dx7_patch: s.strip_dx7_patch.clone(),
-            keys_patch: s.strip_keys_patch.clone(),
-            keys_params: s.strip_keys_params.clone(),
-        }),
         rack: Some(crate::arrangement::Rack {
             reverb: s.reverb_mix,
             delay: s.delay_mix,
@@ -443,8 +423,6 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             capo_style: s.capo_style.clone(),
             tuning: s.fretboard_tuning.clone(),
         }),
-        frozen: Some(s.frozen_lanes.clone()),
-        ids: crate::arrangement::RowIds(s.track_ids.clone()),
         next_id: crate::arrangement::Aside(s.next_track_id),
         legacy_states: crate::arrangement::Aside(None),
         dropped: crate::arrangement::Aside(Vec::new()),
@@ -1090,7 +1068,9 @@ fn perf_doc_bytes() {
         for (bay, path) in bays {
             s.set_legacy_insert(*bay, path);
         }
-        s.strip_names = vec!["drums".into(), "keys".into(), "gtr".into()];
+        for (row, name) in s.rows.iter_mut().zip(["drums", "keys", "gtr"]) {
+            row.name = name.into();
+        }
         arr.desk = Some(desk_of(&s));
         let json = arr.to_json();
         // The desk's insert seats alone, by the same writer.

@@ -114,11 +114,29 @@ impl DeskIndex {
             };
             parent.push(p);
         }
+        let class: Vec<RowClass> = (0..n)
+            .map(|row| {
+                let f = &facts[row];
+                if f.kind.is_some() || f.added || f.folder || clips[row] > 0 {
+                    RowClass::Counted
+                } else if f.in_folder || f.residue {
+                    RowClass::Placeholder
+                } else {
+                    RowClass::Vacant
+                }
+            })
+            .collect();
+        // **Drawn: every row not inside a shut folder and not Vacant**
+        // (design section 4). A vacant row is no track and holds nothing
+        // anybody made, so the views leave it out: a legacy desk's thirty
+        // empty rows, and a pedalboard an older build left on a removed
+        // track's row, take no strip and no lane. The one place a new
+        // track goes is the trailing add after the last drawn row.
         let shut = |row: usize| facts[row].folder && facts[row].shut;
         let mut shown = Vec::with_capacity(n);
         let mut rank = vec![HIDDEN; n];
         for row in 0..n {
-            let hidden = parent[row].is_some_and(|f| shut(f as usize));
+            let hidden = parent[row].is_some_and(|f| shut(f as usize)) || class[row] == RowClass::Vacant;
             if !hidden {
                 rank[row] = shown.len() as u32;
                 shown.push(row as u32);
@@ -135,18 +153,6 @@ impl DeskIndex {
             }
             run = if facts[row].in_folder && !facts[row].folder { run + 1 } else { 0 };
         }
-        let class: Vec<RowClass> = (0..n)
-            .map(|row| {
-                let f = &facts[row];
-                if f.kind.is_some() || f.added || f.folder || clips[row] > 0 {
-                    RowClass::Counted
-                } else if f.in_folder || f.residue {
-                    RowClass::Placeholder
-                } else {
-                    RowClass::Vacant
-                }
-            })
-            .collect();
         let counted = class.iter().filter(|c| **c == RowClass::Counted).count();
         Self { generation, facts, clips, shown, rank, parent, children, class, counted }
     }
@@ -210,7 +216,7 @@ impl DeskIndex {
         &self.shown[a..b]
     }
 
-    /// Whether a row is inside a shut folder.
+    /// Whether a row is not drawn: inside a shut folder, or Vacant.
     pub fn hidden(&self, row: usize) -> bool {
         self.rank.get(row).is_some_and(|r| *r == HIDDEN)
     }
@@ -370,7 +376,11 @@ mod tests {
                 let ix = DeskIndex::build(7, facts.clone(), clips.clone());
                 let mut rank = 0;
                 for row in 0..rows {
-                    let hidden = frozen::lane_hidden(&facts, row);
+                    let f = facts[row];
+                    let vacant =
+                        !(f.kind.is_some() || f.added || f.folder || clips[row] > 0 || f.in_folder || f.residue);
+                    // A vacant row is not drawn either (section 4).
+                    let hidden = frozen::lane_hidden(&facts, row) || vacant;
                     assert_eq!(ix.hidden(row), hidden, "row {row} of {facts:?}");
                     assert_eq!(ix.parent(row), frozen::folder_of(&facts, row), "row {row}");
                     assert_eq!(ix.in_folder(row), frozen::in_folder(&facts, row), "row {row}");

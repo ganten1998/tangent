@@ -694,7 +694,7 @@ mod tests {
     use crate::desk_id::{Rack, MAX_CHAIN};
     use crate::desk_legacy::identity_ids;
     use crate::desk_lift::era_of_desk;
-    use crate::desk_model::{picture, V22Desk};
+    use crate::desk_model::picture;
     use crate::era_corpus::{DOCUMENTS, SETTINGS};
     use crate::settings::Settings;
 
@@ -702,35 +702,35 @@ mod tests {
         serde_json::to_string(&write(m)).expect("serialisable")
     }
 
-    /// A fixture's desk, through the legacy chain and `from_v22`.
-    fn settings_model(text: &str) -> (V22Desk, DeskRead) {
-        let v = V22Desk::from_settings(&Settings::from_json(text));
-        let read = DeskModel::from_v22(&v, &identity_ids(32));
-        (v, read)
+    /// A fixture's desk, through the live legacy reader: the settings
+    /// file's dense arrays read onto rows once, under the identity rule
+    /// (`DeskModel::from_v22`, which that reader calls). Its own ids are
+    /// the identity's.
+    fn settings_model(text: &str) -> DeskRead {
+        let s = Settings::from_json(text);
+        assert_eq!(s.desk_ids(), identity_ids(32), "a legacy settings file is the identity desk");
+        s.desk_model()
     }
 
-    /// A document's desk, through the legacy chain and `from_v22`, marked
-    /// with the era its desk was written in, as the persistence lane will
-    /// mark it. Fields the document does not say come from a vacant desk.
-    fn document_model(text: &str) -> (V22Desk, DeskRead) {
+    /// A document's desk, through the live legacy reader, marked with the
+    /// era its desk was written in as the reader marks it. Fields the
+    /// document does not say hold a vacant row's values.
+    fn document_model(text: &str) -> DeskRead {
         let a = Arrangement::from_json(text);
         let snap = a.desk.as_ref().expect("every era fixture has a desk");
-        let v = V22Desk::from_snap(snap, &V22Desk::vacant());
         let raw: Value = serde_json::from_str(text).expect("json");
-        let mut read = DeskModel::from_v22(&v, &identity_ids(32));
-        read.model.legacy_states = Some(era_of_desk(&raw["desk"]));
-        (v, read)
+        let read = snap.desk_model();
+        assert_eq!(read.model.legacy_states, Some(era_of_desk(&raw["desk"])), "the reader marks the era");
+        read
     }
 
-    fn every_fixture() -> Vec<(&'static str, V22Desk, DeskRead)> {
+    fn every_fixture() -> Vec<(&'static str, DeskRead)> {
         let mut out = Vec::new();
         for (name, text) in SETTINGS {
-            let (v, r) = settings_model(text);
-            out.push((name, v, r));
+            out.push((name, settings_model(text)));
         }
         for (name, text) in DOCUMENTS {
-            let (v, r) = document_model(text);
-            out.push((name, v, r));
+            out.push((name, document_model(text)));
         }
         out
     }
@@ -740,25 +740,13 @@ mod tests {
     /// the same model with nothing dropped.
     #[test]
     fn every_era_fixture_writes_reads_and_rewrites_to_the_same_bytes() {
-        for (name, _, read) in every_fixture() {
+        for (name, read) in every_fixture() {
             assert!(read.dropped.is_empty(), "{name}: the legacy desk lost {:?}", read.dropped);
             let first = text_of(&read.model);
             let back = read_str(&first).unwrap_or_else(|e| panic!("{name}: refused {:?}", e.why));
             assert!(back.dropped.is_empty(), "{name}: {:?}", back.dropped);
             assert_eq!(back.model, read.model, "{name} read back differently");
             assert_eq!(text_of(&back.model), first, "{name} rewrote differently");
-        }
-    }
-
-    /// **The dense input comes back**: `from_v22 -> write -> read -> to_v22`
-    /// returns each fixture's dense desk exactly, ids included.
-    #[test]
-    fn every_era_fixture_returns_its_dense_desk_through_format_2() {
-        for (name, v, read) in every_fixture() {
-            let back = read_str(&text_of(&read.model)).expect("readable");
-            let (dense, ids) = back.model.to_v22().expect("32 rows");
-            assert_eq!(ids, identity_ids(32), "{name}");
-            assert_eq!(dense, v, "{name} came back as a different dense desk");
         }
     }
 
@@ -774,7 +762,7 @@ mod tests {
     #[test]
     #[ignore = "prints the pictures the goldens pin"]
     fn print_pictures() {
-        for (name, _, read) in every_fixture() {
+        for (name, read) in every_fixture() {
             println!("=== {name}\n{}", picture(&read.model));
         }
         for (name, read) in v24_lifted() {
@@ -786,7 +774,7 @@ mod tests {
         crate::desk_lift::with_v24_lift(|| {
             let (_, s) = SETTINGS.iter().find(|(n, _)| *n == "settings-v20-27.json").expect("fixture");
             let (_, d) = DOCUMENTS.iter().find(|(n, _)| *n == "doc-v6-27.json").expect("fixture");
-            vec![("settings-v20-27.json", settings_model(s).1), ("doc-v6-27.json", document_model(d).1)]
+            vec![("settings-v20-27.json", settings_model(s)), ("doc-v6-27.json", document_model(d))]
         })
     }
 
@@ -798,7 +786,7 @@ mod tests {
     #[test]
     fn every_era_fixture_is_its_literal_desk() {
         let seen: Vec<(&str, String)> =
-            every_fixture().into_iter().map(|(n, _, r)| (n, picture(&r.model))).collect();
+            every_fixture().into_iter().map(|(n, r)| (n, picture(&r.model))).collect();
         assert_eq!(seen.len(), PICTURES.len(), "the tables are out of step");
         for ((name, got), (want_name, want)) in seen.iter().zip(PICTURES) {
             assert_eq!(*name, want_name, "the tables are out of step");
@@ -1421,7 +1409,7 @@ bypass
 routes 
 keys "#),
         ("doc-v4-11.json", r#"rows 32 next_id 32 legacy v8-pads16
-t0 midi added mute name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added mute icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 added name="s2" color=102 send fx 0.03
 t3 added name="s3" color=103 send fx 0.04
@@ -1438,7 +1426,7 @@ bypass
 routes 
 keys "#),
         ("doc-v5-18.json", r#"rows 32 next_id 32 legacy v16-no-drum-bus
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 added name="s2" color=102 send fx 0.03
 t3 added solo name="s3" color=103 send fx 0.04
@@ -1462,7 +1450,7 @@ bypass
 routes 
 keys "#),
         ("doc-v5-19.json", r#"rows 32 next_id 32 legacy v16
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 added solo name="s2" color=102 send fx 0.03
 t3 name="s3" color=103 send fx 0.04
@@ -1487,7 +1475,7 @@ bypass
 routes 
 keys "#),
         ("doc-v6-27.json", r#"rows 32 next_id 32 legacy v32
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 name="s2" color=102 send fx 0.03
 t3 name="s3" color=103 send fx 0.04
@@ -1520,7 +1508,7 @@ bypass
 routes 
 keys "#),
         ("doc-v6-35.json", r#"rows 32 next_id 32 legacy v32
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added name="s1" color=101 send fx 0.02
 t2 name="s2" color=102 send fx 0.03
 t3 name="s3" color=103 send fx 0.04
@@ -1561,7 +1549,7 @@ bypass
 routes 
 keys "#),
         ("doc-v7.json", r#"rows 32 next_id 32 legacy v32
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 mute name="s2" color=102 send fx 0.03
 t3 name="s3" color=103 send fx 0.04
@@ -1639,7 +1627,7 @@ bypass
 routes 
 keys "#),
         ("doc-v6-27.json", r#"rows 32 next_id 32 legacy v24
-t0 midi added name="s0" color=100 input="midi:all" send fx 0.01
+t0 midi added icon=1 name="s0" color=100 input="midi:all" send fx 0.01
 t1 midi added arm name="s1" color=101 send fx 0.02
 t2 name="s2" color=102 send fx 0.03
 t3 name="s3" color=103 send fx 0.04
