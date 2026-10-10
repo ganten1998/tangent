@@ -1901,6 +1901,11 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
   - the ganten.neocities.org card updated;
   - the first post-W8 install is the moment real config and projects migrate (backups `settings.pre-v23.json` and `<doc>.pre-v8`; legacy sidecars never touched).
 
+**Carried in from wave 7 (2026-10-10, at f0685db, integrated gate green: 3976 passed, 0 failed):**
+- **The render goldens differ between debug and release.** `render_golden::every_desk_renders_its_golden` passes in the debug gate and fails under `cargo test --release` on one desk, `auto-pan` (`e585ba2096f0df42` against the recorded `5728be85fdd7db3a`); the scale lane saw it at its base, so it predates W7. Shipped builds are release, so find which arithmetic in the auto-pan road the optimiser changes (a curve or pan-law evaluation, a const fold, an inlined `mul_add`), and decide with evidence whether it is benign: make the goldens hold in both profiles (the same bits from both is the target; a road whose result depends on the profile is a defect unless proven to be only libm's last bit), and add `cargo test --release` of `render_golden` to check.sh.
+- **The pool on a live device is unmeasured** (docs/PERF-UNLIMITED.md section 7): put it on the owner's checklist with exactly what to watch (a 1,024-lane idle desk and a 64-lane [EQ, comp, plate] desk at 128 frames, the overload counter), and do not run it yourself: launching Tangent is the owner's.
+- Remote runs (void over `ssh void`, bsdbox, Windows): use them if reachable; if a box is not reachable, say so in the report and leave its item for the owner rather than inventing a result.
+
 ---
 
 ## 14. Owner calls (each has a default; nothing blocks on them)
