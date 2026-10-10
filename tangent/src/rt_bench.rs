@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tangent_record::audio::Timebase;
-use tangent_ui::recorder::{Desk, STRIPS};
+use tangent_ui::recorder::Desk;
 
 use crate::builtin_fx::{
     ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH, IR_PATH,
@@ -134,10 +134,11 @@ fn noise(seconds: f64) -> Arc<tangent_record::decode::Clip> {
 /// Nothing sends, nothing is muted, nothing is soloed — the desk every shape
 /// starts from, so no shape is quietly paying for the effects bus.
 fn quiet_desk() -> Desk {
+    // Each array as wide as the desk's own type says: no width named here.
     Desk {
-        send: [0.0; STRIPS],
-        muted: [false; STRIPS],
-        soloed: [false; STRIPS],
+        send: std::array::from_fn(|_| 0.0),
+        muted: std::array::from_fn(|_| false),
+        soloed: std::array::from_fn(|_| false),
     }
 }
 

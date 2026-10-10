@@ -204,8 +204,8 @@ pub const fn era_written(sends_len: usize, inserts_len: usize) -> DeskEra {
     }
 }
 
-/// **Whether the readers lift the 24-channel window yet. Off, and on only
-/// together with the copy-only shelf.**
+/// **Whether the readers lift the 24-channel window. On only together with
+/// the copy-only shelf.**
 ///
 /// The lift moves a 27-sends desk's drum bus, click, fx return and master
 /// up eight seats (24..27 to 32..35) and every pad with them. Its plugin
@@ -223,16 +223,16 @@ pub const fn era_written(sends_len: usize, inserts_len: usize) -> DeskEra {
 /// the window's own legacy names for other plugins; the only safe
 /// destination is the identity names (`pstate-<seatbay>.bin`), and those
 /// arrive with `shelf.rs`'s `convert_global_shelf` and its pstate-then-legacy
-/// project reader (W4-integrate checkpoint (B)). Until then the window opens
-/// as it always did: buses and master on channels 24..27, each plugin beside
-/// its own file, nothing renamed and nothing overwritten.
+/// project reader (W4-integrate checkpoint (B)). Before them the window
+/// opened as it always had: buses and master on channels 24..27, each plugin
+/// beside its own file, nothing renamed and nothing overwritten.
 ///
-/// MERGE-ME(W4-integrate (B)): delete this const and read
-/// `desk_format::WRITE_V8` in its place, in the commit that lands
-/// `convert_global_shelf` and the pstate names, so the lift, its
-/// `ShelfShuffles::V24` and the copy that honours them switch on together.
+/// **On with the copy-only shelf, by being the same switch**: the lift, its
+/// `ShelfShuffles::V24` and the copy that honours them (`shelf.rs`'s
+/// `convert_global_shelf`, and the pstate-then-legacy project reader) turn
+/// on together, in the commit that flipped [`crate::desk_format::WRITE_V8`].
 /// `era_corpus::the_v24_lift_waits_for_the_copy_only_shelf` holds the order.
-pub const V24_LIFT: bool = false;
+pub const V24_LIFT: bool = crate::desk_format::WRITE_V8;
 
 /// [`V24_LIFT`], or a test that asked for the lifted picture.
 pub fn v24_lift_on() -> bool {

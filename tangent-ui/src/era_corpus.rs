@@ -354,19 +354,21 @@ fn every_fixture_round_trips_once_opened() {
 }
 
 fn round_trips() {
+    // Compared by the pictures a legacy file and a format-2 one must agree
+    // on (`settings_picture`, `observe_document_model`): what this build
+    // writes is format 2, which spells a name or an input the legacy array
+    // stopped short of as an empty one, and a desk by its rows.
     for (name, text) in SETTINGS {
         let once = Settings::from_json(text).to_json();
         let twice = Settings::from_json(&once).to_json();
         assert_eq!(once, twice, "{name} is not a fixed point");
-        assert_eq!(observe_settings(&once).lines().take(7).collect::<Vec<_>>(),
-            observe_settings(text).lines().take(7).collect::<Vec<_>>(),
-            "{name} changed through a save");
+        assert_eq!(settings_picture(&once), settings_picture(text), "{name} changed through a save");
     }
     for (name, text) in DOCUMENTS {
         let once = Arrangement::from_json(text).to_json();
         let twice = Arrangement::from_json(&once).to_json();
         assert_eq!(once, twice, "{name} is not a fixed point");
-        assert_eq!(observe_document(&once), observe_document(text), "{name} changed through a save");
+        assert_eq!(observe_document_model(&once), observe_document_model(text), "{name} changed through a save");
     }
 }
 
@@ -576,21 +578,20 @@ fn run_in_place(set: ShelfShuffles, shelf: &mut std::collections::BTreeMap<usize
 /// where the renames deleted or overwrote it.
 #[test]
 fn the_composed_shelf_map_is_the_frozen_in_place_renames() {
-    // The transcription is the host's code: its loop headers, verbatim.
+    // **The transcription is the code the host ran**, held verbatim to its
+    // loop headers for as long as that code stood (`run_in_place` above),
+    // and frozen with it since: the copy-only conversion replaced it
+    // (W4-integrate (B); 1e82dbe is the last tree that renamed in place).
+    // What the host must now be is a COPY through this map, never a rename.
     let host = include_str!("../../tangent/src/desktop.rs");
-    for line in [
-        "let _ = std::fs::remove_file(insert_state_path(8, bay));",
-        "for old in 9..=11 {",
-        "for old in (8..=10).rev() {",
-        "for pad in (0..16usize).rev() {",
-        "let _ = std::fs::rename(&from, insert_state_path(12 + 36 + pad, bay));",
-        "for old in (8..(12 + 128)).rev() {",
-        "let _ = std::fs::rename(&from, insert_state_path(old + 8, bay));",
-        "for old in (16..2069).rev() {",
-        "let grow = 16;",
-    ] {
-        assert!(host.contains(line), "the host's shuffles changed: `{line}` is gone");
-    }
+    // Production only: the host's own tests spell the name to forbid it.
+    let host = &host[..host.find("\nmod tests {").unwrap_or(host.len())];
+    assert!(!host.contains("fn shift_insert_states_for_v"), "an in-place shelf rename is back in the host");
+    let shelf = include_str!("../../tangent/src/shelf.rs");
+    assert!(
+        shelf.contains("legacy_shelf_seat(set, legacy)"),
+        "the global shelf's conversion no longer copies through this map"
+    );
     let version = [ShelfShuffles::V13, ShelfShuffles::V14, ShelfShuffles::V18, ShelfShuffles::V19];
     for bits in 0..16u8 {
         for widen in [ShelfShuffles::NONE, ShelfShuffles::V20, ShelfShuffles::V24] {
@@ -714,25 +715,33 @@ fn legacy_shelf(tag: &str, legacy: &[Value]) -> std::path::PathBuf {
 
 /// **A 24-channel-window shelf survives a load and a save untouched.**
 ///
-/// Until the copy-only shelf conversion lands, the host reads and writes
+/// Until the copy-only shelf conversion landed, the host read and wrote
 /// plugin state by SEAT over the legacy names, on the global shelf for the
 /// settings desk and in a project's `state/` for a document. So the window
-/// must open with every plugin on the seat the file had it at, and a whole
+/// had to open with every plugin on the seat the file had it at, and a whole
 /// session (open, every plugin's read, a save, a reopen, the reads and the
-/// save again) must leave every legacy file byte for byte as it was, each
+/// save again) had to leave every legacy file byte for byte as it was, each
 /// plugin having found its own knobs. Under the lift it would not: the drum
 /// bus at seat 32 opens what is the window's channel 0 pad 4 and writes over
-/// it, which is why the lift waits (`crate::desk_lift::V24_LIFT`); that half
+/// it, which is why the lift waited (`crate::desk_lift::V24_LIFT`); that half
 /// is asserted too, so this test cannot pass by testing nothing.
+///
+/// **The lift is on now, with the shelf that makes it safe**: the host names
+/// every state by its bay's identity and only ever READS a legacy name
+/// (`tangent/src/shelf.rs`), so the by-seat host above is the history this
+/// transcription keeps, and the window's survival through the real
+/// conversion and the real reader is `tangent`'s
+/// `shelf::tests::every_era_projects_states_reach_their_own_bays` and
+/// `shelf::tests::the_global_shelf_converts_every_settings_era`.
 #[test]
 fn a_24_channel_window_shelf_survives_a_load_and_save_untouched() {
-    // The transcription is the host's naming.
-    let host = include_str!("../../tangent/src/desktop.rs");
+    // The transcription is the host's legacy naming, which it now only reads.
+    let host = include_str!("../../tangent/src/shelf.rs");
     for line in [
-        "const SIDECAR_PREFIX: &str = \"insert-state-\";",
-        "format!(\"{SIDECAR_PREFIX}{strip}-{bay}.bin\")",
+        "const LEGACY_PREFIX: &str = \"insert-state-\";",
+        "format!(\"{LEGACY_PREFIX}{seat}-{bay}.bin\")",
     ] {
-        assert!(host.contains(line), "the host's sidecar names changed: `{line}` is gone");
+        assert!(host.contains(line), "the host's legacy sidecar names changed: `{line}` is gone");
     }
 
     let (_, text) = SETTINGS.iter().find(|(n, _)| *n == "settings-v20-27.json").expect("fixture");
@@ -982,45 +991,34 @@ fn fnv(text: &str) -> u64 {
     h
 }
 
-/// **What the production writers wrote for every fixture at the base**
-/// (8084254), captured there and pinned: the hash and the length of
-/// `Settings::from_json(text).to_json()` and of the document's `to_json()`.
-const PRODUCTION_BYTES: [(&str, u64, usize); 18] = [
-    ("settings-v12.json", 0xf2b5_0d33_d369_311a, 23187),
-    ("settings-v17-pads16.json", 0x33fc_2468_6db6_7d8d, 23168),
-    ("settings-v18.json", 0xf837_b7b6_8d3a_3a1e, 23183),
-    ("settings-v19.json", 0xa10b_eb30_f03d_85f6, 23390),
-    ("settings-v20-27.json", 0x6749_240e_4e50_fe95, 23516),
-    ("settings-v20.json", 0x6501_aca1_728f_9e30, 23670),
-    ("settings-v21.json", 0xce41_8e74_9440_552a, 23238),
-    ("settings-v22.json", 0x4d1e_2fc8_57b0_f9d5, 23327),
-    ("daw-3x.json", 0x9d49_2fab_6cc6_84cd, 23121),
-    ("daw-4x.json", 0x4b0d_518a_9bfd_2fea, 23160),
-    ("daw-5x.json", 0xe3ce_89c6_2404_ec31, 23136),
-    ("doc-v4-11.json", 0x8022_967e_d61c_df02, 3998),
-    ("doc-v5-18.json", 0x034e_4de8_22bc_84c2, 4492),
-    ("doc-v5-19.json", 0x8b14_0bda_8dc1_d662, 4412),
-    ("doc-v6-27.json", 0xecf4_6192_5c48_b856, 4758),
-    ("doc-v6-35.json", 0xa352_fb96_d82a_f0bd, 5108),
-    ("doc-v7.json", 0xdaca_0860_9b93_ff8c, 5334),
-    ("default", 0x4136_3fd9_3a12_4b45, 22805),
-];
+/// **What production writes for the default settings**, pinned at the
+/// flip (W4-integrate (B)): the format-2 file a fresh install's first save
+/// writes, stamp included. The fixtures' are `FORMAT2_BYTES` below.
+const DEFAULT_V2_BYTES: (u64, usize) = (0x2b4e_95dd_5375_0895, 29341);
 
-/// **Production writes today's bytes**, stamps included, for every fixture
-/// and for the default settings: format 2 is behind the one switch, and
-/// with it off nothing a user's install writes moved by a byte.
+/// **Production writes the format-2 bytes**, stamps included, for every
+/// fixture and for the default settings: `WRITE_V8` is on, so what a user's
+/// install writes is exactly what the format-2 writers write, and the legacy
+/// desk is never written again. Until the flip this pinned the base's legacy
+/// bytes (8084254) for the same fixtures, which no writer of this tree
+/// writes any more: the legacy writer now stamps what this build is.
 #[test]
-fn production_writes_are_the_bases_bytes() {
-    assert!(!crate::desk_format::WRITE_V8, "the switch is W4's to flip; re-pin this then");
-    let written = SETTINGS
-        .iter()
-        .map(|(n, t)| (*n, Settings::from_json(t).to_json()))
-        .chain(DOCUMENTS.iter().map(|(n, t)| (*n, Arrangement::from_json(t).to_json())))
-        .chain(std::iter::once(("default", Settings::default().to_json())));
-    for ((name, text), (want_name, hash, len)) in written.zip(PRODUCTION_BYTES) {
-        assert_eq!(name, want_name, "the tables are out of step");
-        assert_eq!((fnv(&text), text.len()), (hash, len), "{name} is not the base's bytes");
+fn production_writes_the_format_2_bytes() {
+    assert!(crate::desk_format::WRITE_V8, "the switch is off: production writes the legacy desk");
+    // `to_json` is the DAW blob's text (compact); the file is the same map
+    // pretty-printed, which `FORMAT2_BYTES` pins through `settings_v2`.
+    let compact = |s: &Settings| Value::Object(s.to_map_as(Format::V2)).to_string();
+    for (name, text) in SETTINGS {
+        let s = Settings::from_json(text);
+        assert_eq!(s.to_json(), compact(&s), "{name}: production does not write the format-2 desk");
     }
+    for (name, text) in DOCUMENTS {
+        let a = Arrangement::from_json(text);
+        assert_eq!(a.to_json(), document_v2(&a), "{name}: production does not write the format-2 desk");
+    }
+    let default = Settings::default().to_json();
+    assert_eq!(default, compact(&Settings::default()), "the default settings are not written as format 2");
+    assert_eq!((fnv(&default), default.len()), DEFAULT_V2_BYTES, "the default settings' bytes drifted");
 }
 
 /// `observe_settings` without its shuffle line (a format-2 file raises
@@ -1272,7 +1270,10 @@ const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
     ("settings-v17-pads16.json", 0x9acb_8826_ea59_4245, 69631),
     ("settings-v18.json", 0x41cb_5151_6266_38a2, 69632),
     ("settings-v19.json", 0x0ff0_f786_81db_ebac, 70932),
-    ("settings-v20-27.json", 0xbee3_aa56_2a6b_446b, 72152),
+    // Lifted (`desk_lift::V24_LIFT`, on with the switch since W4-integrate
+    // (B)): the window's buses and master on the specials, its pads on
+    // their rows. Unlifted it wrote 0xbee3_aa56_2a6b_446b, 72152.
+    ("settings-v20-27.json", 0x1837_62b4_50b0_2490, 72160),
     ("settings-v20.json", 0x6c84_131e_295a_79e2, 73277),
     ("settings-v21.json", 0xd14a_bb30_2ea1_663b, 72084),
     ("settings-v22.json", 0x3c53_5ed0_cffe_362f, 72119),
@@ -1282,7 +1283,8 @@ const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
     ("doc-v4-11.json", 0x75fe_6a61_d6f4_4f52, 66404),
     ("doc-v5-18.json", 0xe83f_2527_0597_ca23, 67366),
     ("doc-v5-19.json", 0x24c8_a60c_df96_8da8, 67363),
-    ("doc-v6-27.json", 0xba6f_3803_9396_0a03, 68492),
+    // Lifted, as `settings-v20-27.json`. Unlifted: 0xba6f_3803_9396_0a03, 68492.
+    ("doc-v6-27.json", 0x039a_e051_1784_61ce, 68512),
     ("doc-v6-35.json", 0xb19e_49b7_f61b_6f5e, 69099),
     ("doc-v7.json", 0x70ed_b76d_6ec3_0318, 69323),
 ];

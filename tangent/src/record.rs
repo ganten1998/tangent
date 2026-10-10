@@ -2794,6 +2794,14 @@ impl Session {
 // Free space
 // ───────────────────────────────────────────────────────────────────────────
 
+/// **A desk's strip flags as the take manifest keeps them**: one bit per
+/// strip of the first thirty-two, the shape `take.json`'s `muted` and
+/// `soloed` have always had. The manifest's own format, so it is spelled
+/// here and not by the host; a wider desk is the manifest's to grow.
+pub fn manifest_mask(flags: &[bool]) -> u32 {
+    flags.iter().take(32).enumerate().fold(0u32, |m, (i, on)| if *on { m | 1 << i } else { m })
+}
+
 /// Bytes available to this user on the volume holding `path`.
 ///
 /// **Available, not free.** On every Unix filesystem some blocks are reserved
