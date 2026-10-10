@@ -363,23 +363,28 @@ const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 /// bridge keeps every lane below it until then.
 pub(crate) const LEGACY_LANES: usize = 32;
 
-/// How many pads the drumpad has. The UI's number, mirrored the way
-/// [`CHANNELS`] is.
-pub const PADS: usize = tangent_ui::recorder::DRUM_PADS;
+/// How many pads the drumpad has: the identity grammar's (`desk_id::PADS`),
+/// the number a pad rack's `Rack::Pad(n)` counts to, which no desk width
+/// moves.
+pub const PADS: usize = tangent_ui::desk_id::PADS;
 
-/// Every rack the engine owns: the strips, the master, and one per PAD —
+/// Every rack seat one engine owns: the strips, the master, and one per PAD —
 /// the pads' bays ride the same index space as everything else, seats
-/// `STRIPS + 1 ..`, so loading, editors and state sidecars need no second
-/// machinery. See `pad_rack_index`.
-pub const RACK_SEATS: usize = tangent_ui::recorder::TOTAL_SEATS;
+/// `STRIPS + 1 ..`, so loading, editors and state files need no second
+/// machinery. See `pad_rack_index`. **The frozen V32 seat map**
+/// (`desk_legacy::V32_TOTAL_SEATS`, design Appendix A): an engine's seats ARE
+/// that map for every lane below [`LEGACY_LANES`], row r's at slot r, so the
+/// number is the map's and never the UI's live desk.
+pub const RACK_SEATS: usize = tangent_ui::desk_legacy::V32_TOTAL_SEATS;
 
-/// **The lane the MASTER's automation curves are stored under.**
-///
-/// One past the channels, and the same number `tangent_ui`'s
-/// `arrangement_panel::MASTER_LANE` uses — the document is written by one
-/// and read by the other, so the two have to agree and this is where that is
-/// said on this side.
-pub const MASTER_AUTO_LANE: usize = CHANNELS;
+/// **The lane the MASTER's automation curves are filed under, for the shims
+/// and the tests.** One past the legacy lanes, as `tangent_ui`'s
+/// `LaneId::Master.auto_lane()` answers today. The live path never reads it:
+/// the bridge says where the master's curves are with the curves themselves
+/// ([`SlotAutomation::master`]), so the one home of that arithmetic stays
+/// the UI's and the engine cannot disagree with it.
+#[cfg(test)]
+pub const MASTER_AUTO_LANE: usize = LEGACY_LANES;
 
 /// Where channel `ch`'s pad `i` keeps its bays. Declared in the UI beside
 /// the rest of the seat map; re-exported here so the engine names it the
@@ -710,21 +715,28 @@ pub enum Strip {
     Fx,
 }
 
-/// How many general channels the desk has. Mirrors the UI's constant; the
-/// `From` impl below is what keeps the two enums provably the same shape.
-pub const CHANNELS: usize = tangent_ui::recorder::CHANNELS;
+/// How many general channels one engine's legacy strip space holds: its
+/// [`LEGACY_LANES`], the engine's own number and never the UI's live desk
+/// width (design (C) of W4-integrate). The `From` impl below is what keeps
+/// the two strip enums provably the same shape while the UI's desk is the
+/// same thirty-two.
+pub const CHANNELS: usize = LEGACY_LANES;
 
-/// How many inputs of one interface the desk has room for.
-///
-/// **Asserted equal to `tangent_record::audio::MAX_PICKS`** — the capture cannot
-/// keep more than that, and a desk with more strips than the capture has picks
-/// would draw channels nothing can ever fill. `tangent-ui` declares its own copy
-/// because it may not reach either of these; the test below is what keeps all
-/// three the same number.
-pub const INPUTS: usize = tangent_ui::recorder::INPUTS;
+/// How many inputs of one interface the engine keeps picks for: the
+/// capture's own number (`tangent_record::audio::MAX_PICKS`), which is where
+/// the channels are actually kept. A desk with more strips than the capture
+/// has picks would draw channels nothing can ever fill.
+pub const INPUTS: usize = tangent_record::audio::MAX_PICKS;
 
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;
+
+/// The master's own rack seat in the engine's seat space, after the
+/// channels and the three buses (Appendix A: 35).
+pub(crate) const MASTER_SEAT: usize = STRIPS;
+
+/// The master's second rack, after the legacy pad block (Appendix A: 164).
+pub(crate) const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + PADS;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
@@ -4151,7 +4163,6 @@ impl<T> Schedule<T> {
 
 /// **A clip for a lane by slot and generation** (contract C8,
 /// `set_clips_slotted`). `placed.strip` is ignored and set to the slot.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone)]
 pub struct SlotPlaced {
     pub slot: Slot,
@@ -4160,7 +4171,6 @@ pub struct SlotPlaced {
 }
 
 /// A MIDI clip for a lane by slot and generation (`set_midi_slotted`).
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone)]
 pub struct SlotPlacedMidi {
     pub slot: Slot,
@@ -4720,7 +4730,8 @@ struct SeatParam {
 ///
 /// `auto_params` is a flat table of `seat * INSERTS + bay`, and this is the
 /// only place that decides which row a curve belongs to. `None` is a curve
-/// naming something that cannot hold one.
+/// naming something that cannot hold one. `master` is the lane the master's
+/// curves are filed under, the automation list's own (`AutoList::master`).
 ///
 /// A channel is its own seat. The MASTER's strip carries six bays in two
 /// racks: bays 0..2 are its ORIGINAL rack and 3..5 the one added above it.
@@ -4747,12 +4758,12 @@ struct SeatParam {
 /// window could write from any of them: in the seat space, the two rows one
 /// and two past the channels are the DRUM BUS and the CLICK. A master curve
 /// filed by the old rule would have been read back by the drum bus's rack.
-pub(crate) fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
-    if lane == MASTER_AUTO_LANE {
+pub(crate) fn param_slot(lane: usize, bay: usize, master: usize) -> Option<(usize, usize)> {
+    if lane == master {
         return if bay < INSERTS {
-            Some((tangent_ui::recorder::MASTER_SEAT, bay))
+            Some((MASTER_SEAT, bay))
         } else if bay < INSERTS * 2 {
-            Some((tangent_ui::recorder::MASTER_EXTRA_SEAT, bay - INSERTS))
+            Some((MASTER_EXTRA_SEAT, bay - INSERTS))
         } else {
             None
         };
@@ -5234,7 +5245,7 @@ mod engine_parts {
         let mut out: Vec<Vec<tangent_host::ParamPoint>> =
             (0..seats).map(|_| Vec::with_capacity(8)).collect();
         let mut touched = LaneSet::with_capacity(CHANNELS);
-        fill_automation_params(&doc, &none, &CurveOwners::EVERY, 7.5, &mut out, &mut touched);
+        fill_automation_params(&doc, &none, false, &CurveOwners::EVERY, 7.5, &mut out, &mut touched);
         assert!(!touched.is_empty(), "no lane was reported awake, so nothing was written");
         let wrote: Vec<f32> = out.iter().flatten().map(|p| p.value as f32).collect();
         assert_eq!(wrote.len(), 1, "expected exactly the one automated bay");
@@ -5246,7 +5257,7 @@ mod engine_parts {
         for q in &mut out {
             q.clear();
         }
-        fill_automation_params(&doc, &none, &CurveOwners::EVERY, 2.5, &mut out, &mut touched);
+        fill_automation_params(&doc, &none, false, &CurveOwners::EVERY, 2.5, &mut out, &mut touched);
         let early: Vec<f64> = out.iter().flatten().map(|p| p.value).collect();
         assert!((early[0] - 0.25).abs() < 1e-6, "the bay took {} at 2.5 s", early[0]);
     }
@@ -5876,7 +5887,7 @@ mod engine_parts {
             }
         }
         // A pad, a bus and the master stay in the bank.
-        for seat in [pad_rack_index(0, 0), Strip::Fx.index(), tangent_ui::recorder::MASTER_SEAT] {
+        for seat in [pad_rack_index(0, 0), Strip::Fx.index(), MASTER_SEAT] {
             assert!(lane_rack_of_seat(seat).is_none(), "seat {seat} was routed to a lane");
             assert!(r.racks[seat].is_some(), "seat {seat} lost its bank rack");
         }
@@ -5917,7 +5928,7 @@ fn seat_is_frozen(frozen: &LaneSet, seat: usize) -> bool {
 /// the master strip's, so both ask its bit; every other seat here is a strip
 /// already.
 fn chain_strip(at: usize) -> usize {
-    if at == tangent_ui::recorder::MASTER_EXTRA_SEAT { STRIPS } else { at }
+    if at == MASTER_EXTRA_SEAT { STRIPS } else { at }
 }
 
 /// **How many lanes a desk word can name**: the width of the widest one, the
@@ -5961,9 +5972,15 @@ struct DeskLanes {
     keys: LaneSet,
     /// `Shared::frozen`.
     frozen: LaneSet,
-    /// `Shared::auto_suspend`, in automation-lane space: the channels, then
-    /// [`MASTER_AUTO_LANE`].
+    /// The lanes whose hand is on a control, by slot: their curves hold
+    /// still (`Shared::auto_suspend`'s channel bits, or a plan's SUSPEND).
     suspend: LaneSet,
+    /// **The master's own hand on its fader**, kept apart from `suspend`: the
+    /// master is no lane of the desk's, and its curves are filed under
+    /// whatever lane the automation list says (`AutoList::master`), which the
+    /// desk does not know. The shim word's bit for it sat one past the
+    /// legacy lanes.
+    suspend_master: bool,
     /// **Which lanes' polarity is flipped**, from a plan's PHASE flags. Read
     /// only while a plan drives; the shim's word answers otherwise (see
     /// `lane_gain_of`).
@@ -5996,6 +6013,7 @@ impl DeskLanes {
             keys: set(),
             frozen: set(),
             suspend: set(),
+            suspend_master: false,
             phase: set(),
             strip_midi: [true; 4],
         }
@@ -6019,6 +6037,7 @@ impl DeskLanes {
         carry_set(&self.keys, &mut to.keys);
         carry_set(&self.frozen, &mut to.frozen);
         carry_set(&self.suspend, &mut to.suspend);
+        to.suspend_master = self.suspend_master;
         carry_set(&self.phase, &mut to.phase);
         to.strip_midi = self.strip_midi;
     }
@@ -6033,16 +6052,21 @@ impl DeskLanes {
         load_word(&mut self.builtins, load32(&shared.builtin_strips));
         load_word(&mut self.keys, load32(&shared.keys_strips));
         load_word(&mut self.frozen, load32(&shared.frozen));
-        load_word(&mut self.suspend, shared.auto_suspend.load(Ordering::Relaxed));
+        // The channels' bits, and the master's one past the legacy lanes,
+        // which is the shim word's own layout and nobody's lane.
+        let suspend = shared.auto_suspend.load(Ordering::Relaxed);
+        let master_bit = 1u64 << LEGACY_LANES;
+        load_word(&mut self.suspend, suspend & !master_bit);
+        self.suspend_master = suspend & master_bit != 0;
         let off = shared.midi_off.load(Ordering::Relaxed);
         self.strip_midi = std::array::from_fn(|i| off & (1u64 << (CHANNELS + i)) == 0);
     }
 
     /// **Reload every set from a plan** (design 7.6): the lanes by their
     /// flags, at their slots, whatever the slot. Automation stays in its own
-    /// space (the channels, then [`MASTER_AUTO_LANE`]), so only the first
-    /// thirty-two slots and the master go into `suspend`: a curve names a
-    /// legacy row or the master, never a slot past them. The four specials
+    /// space, so only the first thirty-two slots go into `suspend` and the
+    /// master's own flag into `suspend_master`: a curve names a legacy row or
+    /// the master, never a slot past them. The four specials
     /// listen to MIDI unless the plan sets their own `MIDI_OFF`: the shim
     /// word's strip bits 32 to 35 say the same thing, and dropping it here
     /// opened the arm gate on every instrument in the drum bus, click,
@@ -6089,9 +6113,7 @@ impl DeskLanes {
                 self.suspend.insert(at);
             }
         }
-        if plan.specials.master.contains(F::SUSPEND) {
-            self.suspend.insert(MASTER_AUTO_LANE);
-        }
+        self.suspend_master = plan.specials.master.contains(F::SUSPEND);
         let sp = &plan.specials;
         // The shim's order: drum bus, click, return, master (`Strip::index`
         // past the channels, then the master).
@@ -6748,7 +6770,6 @@ impl Lane {
 /// **A part a lane takes after it was built** (design 7.4, contract C8),
 /// riding the op ring FIFO behind the lane's Install so it can never reach a
 /// lane that does not exist yet.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 pub enum LanePart {
     /// The pad racks' and voices' home, for a lane that becomes a drum lane.
     Pads(Box<PadBank>),
@@ -6853,7 +6874,6 @@ const OP_RING: usize = 64;
 /// **What a lane is, as the host asks for it** (contract C8). The kind is
 /// the host's record; the engine builds the same lane for every kind and the
 /// plan's flags say how it plays.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code, reason = "the host's vocabulary: the bridge names every kind, the engine builds one lane for all")]
 pub enum LaneKind {
@@ -6864,7 +6884,6 @@ pub enum LaneKind {
     Empty,
 }
 
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneSpec {
     pub kind: LaneKind,
@@ -6874,7 +6893,6 @@ pub struct LaneSpec {
 
 /// **Who owns a rack**, by identity (contract C8): a lane by its slot, or
 /// one of the four strips that are not rows.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RackOwner {
     Lane(Slot),
@@ -6886,7 +6904,6 @@ pub enum RackOwner {
 
 /// One rack: its owner, and which of the owner's racks (a lane's are
 /// `[own, extra, pedal 0..7]`; a strip's are `[own, extra]`).
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RackAddr {
     pub owner: RackOwner,
@@ -6897,7 +6914,7 @@ impl RackAddr {
     /// The engine-private seat this rack answers to. `None` for a rack the
     /// owner does not have.
     fn seat(self) -> Option<usize> {
-        use tangent_ui::recorder::{bus_extra_seat, MASTER_EXTRA_SEAT, MASTER_SEAT};
+        use tangent_ui::recorder::bus_extra_seat;
         let r = usize::from(self.rack);
         match self.owner {
             // `[own, extra, pedal 0..7]`, then pad `p` as `LANE_RACKS + p`
@@ -6937,7 +6954,6 @@ impl RackAddr {
 /// its old lane is home waits a frame or two), or a capture is running on
 /// the pick; the host asks again next frame. The rest are requests that
 /// will never go through as asked.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineBusy {
     /// The op ring is full: the callback has not caught up. Retry.
@@ -7021,7 +7037,7 @@ fn lane_seat(slot: usize, rack: usize) -> usize {
 /// a rack by its seat and must now name it by identity. `None` for a seat no
 /// rack answers to.
 fn seat_addr(seat: usize) -> Option<RackAddr> {
-    use tangent_ui::recorder::{bus_extra_of, MASTER_EXTRA_SEAT, MASTER_SEAT};
+    use tangent_ui::recorder::bus_extra_of;
     let at = |owner: RackOwner, rack: usize| Some(RackAddr { owner, rack: u16::try_from(rack).ok()? });
     if let Some((slot, rack)) = lane_rack_of_seat(seat) {
         return at(RackOwner::Lane(Slot(u32::try_from(slot).ok()?)), rack);
@@ -8098,6 +8114,7 @@ fn lane_range(first: Option<&[u32]>, ch: usize, len: usize) -> std::ops::Range<u
 fn fill_automation_params(
     automation: &tangent_ui::automation::Automation,
     suspend: &LaneSet,
+    master_held: bool,
     whose: &CurveOwners<'_>,
     secs: f64,
     out: &mut [Vec<tangent_host::ParamPoint>],
@@ -8110,7 +8127,7 @@ fn fill_automation_params(
                 continue;
             };
             let lane = curve.lane;
-            if suspend.contains(lane) || !whose.plays(lane) {
+            if whose.held(lane, suspend, master_held) || !whose.plays(lane) {
                 continue;
             }
             // **The MASTER's rack is a block past the channels'.**
@@ -8125,7 +8142,7 @@ fn fill_automation_params(
             // 3..5 the one added above it — appended, never renumbered, so a
             // curve already drawn still names its own plugin. See
             // `TangentApp::master_bay`, which is the same rule on the way in.
-            let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay)) else {
+            let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay), whose.master) else {
                 continue;
             };
             let Some(value) = curve.value_at(secs) else {
@@ -8214,6 +8231,10 @@ fn automation_now(
 pub(crate) struct AutoList {
     curves: tangent_ui::automation::Automation,
     gens: Vec<u32>,
+    /// The lane the master's curves are filed under in `curves`, carried
+    /// WITH them so the two can never disagree and the render path names no
+    /// constant for it. See [`SlotAutomation::master`].
+    master: usize,
 }
 
 /// **The generation check for curves** (design 7.5): who a curve's `lane`
@@ -8223,19 +8244,33 @@ struct CurveOwners<'a> {
     table: &'a [u32],
     /// The spine's generation per slot.
     gens: &'a [u32],
+    /// The master's lane in the list ([`AutoList::master`]): no slot, and
+    /// always playing.
+    master: usize,
 }
 
 impl CurveOwners<'_> {
     /// Today's list: every curve plays on whatever lane holds its row.
     #[cfg(test)]
-    const EVERY: CurveOwners<'static> = CurveOwners { table: &[], gens: &[] };
+    const EVERY: CurveOwners<'static> = CurveOwners { table: &[], gens: &[], master: MASTER_AUTO_LANE };
 
-    /// Whether curves naming `lane` play this chunk. The master's lane
-    /// ([`MASTER_AUTO_LANE`]) is no slot and always plays.
+    /// Whether curves naming `lane` play this chunk. The master's lane is no
+    /// slot and always plays.
     fn plays(&self, lane: usize) -> bool {
         self.table.is_empty()
-            || lane == MASTER_AUTO_LANE
+            || lane == self.master
             || self.table.get(lane).is_some_and(|g| self.gens.get(lane) == Some(g))
+    }
+
+    /// Whether a hand on the control holds `lane`'s curves this chunk: the
+    /// lane's own bit in `suspend`, or the master's flag for the master's
+    /// lane, which is no lane of the desk's (`DeskLanes::suspend_master`).
+    fn held(&self, lane: usize, suspend: &LaneSet, master_held: bool) -> bool {
+        if lane == self.master {
+            master_held
+        } else {
+            suspend.contains(lane)
+        }
     }
 }
 
@@ -8243,16 +8278,19 @@ impl CurveOwners<'_> {
 /// `Engine::set_automation_slotted`).
 ///
 /// A curve's `lane` names a SLOT below [`CHANNELS`], or the master
-/// ([`MASTER_AUTO_LANE`]); `gens` says, per slot a curve names, which lane
-/// it was drawn for. A curve whose slot is missing from `gens`, or holds a
-/// lane of another generation, is silent until that lane lands. Curves for
-/// slots past 31 cannot be said yet: `Curve::lane` is the row space whose
-/// next number IS the master's (MERGE-ME(W6-rows-unlimited): `AutoLane`).
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+/// (`master`, which the bridge reads off `LaneId::Master.auto_lane()`, the one
+/// home of that arithmetic, so the engine reads no constant for it); `gens`
+/// says, per slot a curve names, which lane it was drawn for. A curve whose
+/// slot is missing from `gens`, or holds a lane of another generation, is
+/// silent until that lane lands. Curves for slots past 31 cannot be said yet:
+/// `Curve::lane` is the row space whose next number IS the master's
+/// (MERGE-ME(W6-rows-unlimited): `AutoLane`).
 #[derive(Clone, Debug, Default)]
 pub struct SlotAutomation {
     pub curves: tangent_ui::automation::Automation,
     pub gens: Vec<(Slot, u32)>,
+    /// The lane the master's curves are filed under in `curves`.
+    pub master: usize,
 }
 
 /// **One LANE's timeline audio for one span, as a pure function of that span.**
@@ -9194,7 +9232,7 @@ fn run_rack(
 }
 
 /// Whether a rack seats the amp in any bay — the switch that arms a
-/// channel's pedal racks (see `recorder::AMP_PEDAL_SEATS`). Asked on the
+/// channel's pedal racks (the board's seats, Appendix A). Asked on the
 /// audio thread, so it is a match on the INSTANCE actually seated rather
 /// than a string compare or a second ledger that could drift from what the
 /// hand-off ring has delivered: between the bay being filled and the ring
@@ -9836,6 +9874,10 @@ struct Renderer {
     /// list from today's API, whose curves play on whatever lane holds the
     /// row, as they always have. See [`curve_plays`].
     auto_gens: Vec<u32>,
+    /// The lane `automation` files the master's curves under
+    /// (`AutoList::master`), swapped in with them. `usize::MAX` names no
+    /// lane, which is right while no list has arrived: there are no curves.
+    auto_master: usize,
     maps_incoming: Consumer<Maps>,
     maps_retiring: Producer<Maps>,
     /// Frames left during which a count-in click is still SOUNDING.
@@ -12002,7 +12044,7 @@ impl Renderer {
             // still in the seat they were in, in the same place in the
             // chain, with three empty bays added in front of them (and an
             // empty rack returns immediately).
-            self.run_insert_chain(tangent_ui::recorder::MASTER_EXTRA_SEAT, false, n);
+            self.run_insert_chain(MASTER_EXTRA_SEAT, false, n);
             self.run_insert_chain(STRIPS, false, n);
             // **A curve on the master overrides its fader**, exactly as a
             // channel's does — see `lane_gain_of`. The stored position is
@@ -13470,6 +13512,7 @@ impl Renderer {
                 // the OLD curves and the old generations together.
                 std::mem::swap(&mut self.automation, &mut next.curves);
                 std::mem::swap(&mut self.auto_gens, &mut next.gens);
+                std::mem::swap(&mut self.auto_master, &mut next.master);
                 let _ = self.auto_retiring.push(next);
             }
         }
@@ -13596,10 +13639,12 @@ impl Renderer {
         // **Whose curve plays**, checked at use (design 7.5): a curve drawn
         // for a lane of another generation is skipped, every chunk, and
         // never dropped.
-        let whose = CurveOwners { table: &self.auto_gens, gens: &self.spine.gens };
+        let whose = CurveOwners { table: &self.auto_gens, gens: &self.spine.gens, master: self.auto_master };
+        let master_held = self.spine.ext.desk.suspend_master;
         fill_automation_params(
             &self.automation,
             suspend,
+            master_held,
             &whose,
             secs,
             &mut self.spine.ext.auto_params,
@@ -13609,26 +13654,27 @@ impl Renderer {
             self.spine.ext.param_lanes.insert(ch);
         }
         self.auto = automation_now(&self.automation, suspend, &whose, secs);
-        // **The master's own curve**, read at the lane the UI addresses it
-        // by — one past the channels. Suspended by the same rule a channel
-        // is: a fader being HELD is the hand talking, and a curve must not
-        // argue with it mid-gesture.
-        if self.spine.ext.desk.suspend.contains(MASTER_AUTO_LANE) {
+        // **The master's own curve**, read at the lane the list files it
+        // under (`AutoList::master`, the UI's `LaneId::Master.auto_lane()`).
+        // Suspended by the same rule a channel is: a fader being HELD is the
+        // hand talking, and a curve must not argue with it mid-gesture.
+        let master = self.auto_master;
+        if master_held {
             self.auto.master_gain = None;
             self.auto.master_pan = None;
             self.auto.master_mute = None;
         } else {
             self.auto.master_gain = self
                 .automation
-                .value_at(MASTER_AUTO_LANE, AutoParam::Gain, secs)
+                .value_at(master, AutoParam::Gain, secs)
                 .map(|v| v as f32);
             self.auto.master_pan = self
                 .automation
-                .value_at(MASTER_AUTO_LANE, AutoParam::Pan, secs)
+                .value_at(master, AutoParam::Pan, secs)
                 .map(|v| v as f32);
             self.auto.master_mute = self
                 .automation
-                .value_at(MASTER_AUTO_LANE, AutoParam::Mute, secs)
+                .value_at(master, AutoParam::Mute, secs)
                 .map(|v| v >= 0.5);
         }
     }
@@ -13776,7 +13822,7 @@ impl Renderer {
         self.shared.max_latency.store(max, Ordering::Relaxed);
         // ...and the READOUT is the whole of it, because a figure that hides
         // latency somebody is paying is worth nothing.
-        let master = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, tangent_ui::recorder::STRIPS);
+        let master = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, STRIPS);
         self.shared
             .total_latency
             .store(max.saturating_add(master), Ordering::Relaxed);
@@ -17913,7 +17959,7 @@ fn unpack_aim(w: u64) -> Option<(usize, usize, u32)> {
 /// aims are `(slot, gen, rack, bay)`). `slot` is a [`RackOwner`], as in
 /// [`UiParam`], so the strips that are not rows can be aimed at; `gen` is
 /// read for a lane only.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+#[cfg_attr(not(test), allow(dead_code, reason = "the tap by identity: the host still aims it by seat (`set_insert_tap`) until the SeatBay maps of W5-identity-maps"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapAim {
     pub slot: RackOwner,
@@ -18180,7 +18226,6 @@ pub struct Engine {
 /// host, the way `start_inner` builds the bank: a two-deep pair per bay,
 /// because at most one handoff per bay is ever in flight and the spare is
 /// what lets `Rack::swap` check for room before it commits.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 fn new_rack() -> (Rack, [Handoff; INSERTS]) {
     let mut ends = Vec::with_capacity(INSERTS);
     let mut incoming = Vec::with_capacity(INSERTS);
@@ -18208,10 +18253,10 @@ fn new_rack() -> (Rack, [Handoff; INSERTS]) {
 /// whole, and sends it down the op ring; nothing here waits on the callback,
 /// and a ring with no room is [`EngineBusy::Busy`], for the caller to try
 /// again next frame. Nothing is ever dropped on the floor.
-#[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
 impl Engine {
     /// How many slots the spine has room for, the ones on their way in
     /// included.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge keeps every lane below LEGACY_LANES until W5-engine-memory-inputs grows the spine"))]
     pub fn lane_capacity(&self) -> usize {
         self.slot_capacity
     }
@@ -18228,6 +18273,7 @@ impl Engine {
     /// **A lane's numbers**, for the host to write its fader, pan and send
     /// into and read its meters from (design 7.2). Made on the host when the
     /// lane is installed; `None` for a slot that never held one.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the bridge stores levels through `set_lane_levels`; a lane's own atomics are read by later waves"))]
     pub fn lane_shared(&self, slot: Slot) -> Option<&LaneShared> {
         self.shared.lanes.cells(slot.0 as usize)
     }
@@ -18549,6 +18595,7 @@ impl Engine {
     /// [`Engine::set_send_level`], which reach every plan still in flight as
     /// well: a cell written only here is lost if a queued plan with other
     /// edges swaps in after it.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: route gains go through `set_route_gain`; the table itself is W6-engine-buses-sends'"))]
     pub fn plan_gains(&self) -> Option<Arc<[AtomicU32]>> {
         let playing = self.shared.plan_gen.load(Ordering::Relaxed);
         self.plan_shadows
@@ -18561,7 +18608,6 @@ impl Engine {
     /// (design 7.6), found in each by its edge's identity: the plans number
     /// their edges differently. Only a gain on the same side of zero belongs
     /// here; a crossing republishes. Answers how many plans took it.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
     pub fn set_route_gain(&self, from: Slot, to: crate::desk_plan::RouteEnd, gain: f32) -> usize {
         use crate::desk_plan::{RouteEnd, RouteTo};
         let mut hit = 0;
@@ -18588,7 +18634,7 @@ impl Engine {
 
     /// **A send's level, into every plan published and not yet home**, by
     /// the send's identity: [`Engine::set_route_gain`]'s rule for sends.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: plan sends are W6-engine-buses-sends'"))]
     pub fn set_send_level(&self, from: crate::desk_plan::SendFrom, to: crate::desk_plan::SendTo, level: f32) -> usize {
         use crate::desk_plan::{PlanSendFrom, PlanSendTo, SendFrom, SendTo};
         let mut hit = 0;
@@ -18617,6 +18663,7 @@ impl Engine {
     /// **[`Engine::load_insert`], by rack identity** (contract C8): a lane's
     /// rack by its slot, or a strip's. `Ok(None)` for a rack that does not
     /// exist, as `load_insert` answers a seat that does not.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the host loads by the engine seat a lane's rack answers to until W5-identity-maps' HostRack"))]
     pub fn load_insert_at(
         &mut self,
         addr: RackAddr,
@@ -18631,6 +18678,7 @@ impl Engine {
     }
 
     /// Empty one bay, by rack identity.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the host unloads by the engine seat a lane's rack answers to until W5-identity-maps' HostRack"))]
     pub fn unload_insert_at(&mut self, addr: RackAddr, bay: usize) -> Result<(), String> {
         let Some(seat) = addr.seat() else {
             return Ok(());
@@ -18705,6 +18753,7 @@ impl Engine {
     /// **An offline engine with room for `lanes` slots from the start**:
     /// no Grow ever needs to land, and every lane can be installed before
     /// the first block (design 7.13, offline export and freeze).
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: every offline engine is built at the legacy width until W7-scale-and-budgets"))]
     pub fn offline_sized(rate: u32, timebase: Timebase, lanes: usize) -> Result<Self, String> {
         let mut e = Self::offline(rate, timebase)?;
         if lanes > e.slot_capacity {
@@ -19341,6 +19390,7 @@ impl Engine {
             auto_incoming,
             auto_retiring,
             auto_gens: Vec::new(),
+            auto_master: usize::MAX,
             track_incoming,
             track_retiring,
             click_incoming,
@@ -20794,7 +20844,9 @@ impl Engine {
         }
     }
 
-    /// One general channel's fader.
+    /// One general channel's fader: a shim on the legacy lanes (the host
+    /// stores every lane's level by slot through `set_lane_levels`).
+    #[cfg(test)]
     pub fn set_channel_gain(&self, ch: usize, linear: f32) {
         self.shared.set_channel_gain(ch, linear);
     }
@@ -21791,7 +21843,6 @@ impl Engine {
     /// gives; each entry plays only on the lane of its own generation, so a
     /// list sent before its lanes' Install sounds from the block they land,
     /// and an entry for a lane that has gone sounds on nobody.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
     pub fn set_clips_slotted(&mut self, mut clips: Vec<SlotPlaced>) {
         clips.sort_by_key(|c| c.slot);
         let gens = clips.iter().map(|c| c.gen).collect();
@@ -21827,7 +21878,6 @@ impl Engine {
 
     /// **The arrangement's MIDI, by slot and generation** (contract C8):
     /// `set_clips_slotted`'s rule for notes and pedals.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
     pub fn set_midi_slotted(&mut self, mut clips: Vec<SlotPlacedMidi>) {
         clips.sort_by_key(|c| c.slot);
         let gens = clips.iter().map(|c| c.gen).collect();
@@ -22076,7 +22126,6 @@ impl Engine {
     /// **How many floats one frame of [`Engine::drain_stems`] is**: two per
     /// slot of the desk as it stood when the stem tap was last armed. Read it
     /// after arming and a block, as the export does before it slices.
-    #[allow(dead_code, reason = "the stem writer's width is W5-engine-memory-inputs' host side; the engine's tests read it until then")]
     pub fn stem_frame_width(&self) -> usize {
         self.shared.stem_width.load(Ordering::Relaxed)
     }
@@ -22119,7 +22168,7 @@ impl Engine {
     /// **Aim the insert tap by rack identity** (contract C8), or disarm it
     /// with `None`. The callback checks the generation at use: an aim at a
     /// lane that is no longer the one in its slot taps nothing.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the tap by identity: the host still aims it by seat (`set_insert_tap`) until the SeatBay maps of W5-identity-maps"))]
     pub fn set_insert_tap_at(&mut self, aim: Option<TapAim>) {
         let word = aim.map_or(0, |a| {
             let seat = RackAddr { owner: a.slot, rack: a.rack }.seat().unwrap_or(usize::MAX);
@@ -22416,7 +22465,7 @@ impl Engine {
     /// layout that lands behind a ring the renderer has not taken in yet
     /// joins it (`lane_bank::apply_ops`). A full ring parks the plan here
     /// and `retire_tick` sends it, so this never refuses.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the monitor plan and capture rings are W5-engine-memory-inputs'"))]
     pub fn set_monitor_plan(&mut self, mut plan: crate::lane_bank::MonitorPlan) -> Result<(), EngineBusy> {
         self.drain_retired_ops();
         plan.fresh = true;
@@ -22431,7 +22480,7 @@ impl Engine {
     /// `Busy` while the pick is capturing (`set_arr_capture` has its bit): a
     /// take's ring is never replaced under it, and the callback would refuse
     /// the op anyway. `TooMany` for a pick past the engine's picks.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: the monitor plan and capture rings are W5-engine-memory-inputs'"))]
     pub fn set_capture_ring(&mut self, pick: PickId, ring: Option<Producer<f32>>) -> Result<(), EngineBusy> {
         self.drain_retired_ops();
         let at = pick.0 as usize;
@@ -22640,7 +22689,7 @@ impl Engine {
     /// The same swap protocol as [`Engine::set_maps`], for the same reason.
     #[cfg(test)]
     pub fn set_automation(&mut self, auto: tangent_ui::automation::Automation) {
-        self.send_automation(AutoList { curves: auto, gens: Vec::new() });
+        self.send_automation(AutoList { curves: auto, gens: Vec::new(), master: MASTER_AUTO_LANE });
     }
 
     /// **The arrangement's automation by slot and generation** (contract
@@ -22648,7 +22697,6 @@ impl Engine {
     /// slot's generation names, checked at use, so a list sent before its
     /// lanes' Install moves their controls from the block they land and a
     /// curve for a lane that has gone moves nobody's.
-    #[cfg_attr(not(test), allow(dead_code, reason = "the slot API: W4-integrate wires the bridge onto it, and until then the tests are its only caller"))]
     pub fn set_automation_slotted(&mut self, auto: SlotAutomation) {
         let mut gens = vec![0u32; CHANNELS];
         for (slot, gen) in auto.gens {
@@ -22656,7 +22704,7 @@ impl Engine {
                 *g = gen;
             }
         }
-        self.send_automation(AutoList { curves: auto.curves, gens });
+        self.send_automation(AutoList { curves: auto.curves, gens, master: auto.master });
     }
 
     /// One automation list onto its ring, the old one dropped here.
@@ -23536,8 +23584,10 @@ pub fn plugin_test(filter: Option<String>) {
         None => println!("state:    this instrument handed over none"),
     }
 
+    // Each layer's lane at the layer gain, centred, sending nothing: what a
+    // fresh lane holds but the fader. By slot, as the bridge stores levels.
     for ch in 0..LAYERS {
-        engine.set_channel_gain(ch, LAYER_GAIN);
+        engine.set_lane_levels(Slot(ch as u32), LAYER_GAIN, 0.0, 0.0);
     }
     engine.set_metronome_gain(0.6);
     engine.set_beats_per_bar(4);
@@ -25035,7 +25085,7 @@ mod tests {
 
         // A limiter on the MASTER only. Everything downstream of every
         // channel, so it pulls nothing out of phase with anything.
-        seat(&shared, tangent_ui::recorder::STRIPS, 0, 30);
+        seat(&shared, MASTER_SEAT, 0, 30);
         r.publish_latency();
         assert_eq!(
             shared.max_latency.load(Ordering::Relaxed),
@@ -25945,6 +25995,7 @@ mod tests {
             auto_incoming: RingBuffer::<AutoList>::new(2).1,
             auto_retiring: RingBuffer::<AutoList>::new(2).0,
             auto_gens: Vec::new(),
+            auto_master: usize::MAX,
             count_in_tail: 0,
             chunks: 0,
             metro_gain: 1.0,
@@ -27190,7 +27241,7 @@ mod tests {
         e.set_drum_strips(1 << 5);
         if let Some((path, state)) = insert {
             e.load_insert(
-                tangent_ui::recorder::MASTER_SEAT,
+                MASTER_SEAT,
                 0,
                 Some(Path::new(path)),
                 state.as_deref(),
@@ -27820,14 +27871,14 @@ mod tests {
         const A: usize = 2;
         const B: usize = 5;
         let mut set = tangent_ui::settings::Settings::default();
-        set.channel_inputs = vec![String::new(); tangent_ui::recorder::CHANNELS];
-        set.channel_kinds = [0; tangent_ui::recorder::CHANNELS];
+        set.channel_inputs = vec![String::new(); tangent_ui::desk_legacy::V32_CHANNELS];
+        set.channel_kinds = [0; tangent_ui::desk_legacy::V32_CHANNELS];
         for ch in [A, B] {
             set.channel_kinds[ch] = ChannelKind::as_u8(Some(ChannelKind::Midi));
         }
         set.channel_inputs[A] = "midi:Keyboard A".to_owned();
         set.channel_inputs[B] = "midi:Keyboard B".to_owned();
-        set.channel_midi_inputs = vec![MidiInputSel::EVERYTHING; tangent_ui::recorder::CHANNELS];
+        set.channel_midi_inputs = vec![MidiInputSel::EVERYTHING; tangent_ui::desk_legacy::V32_CHANNELS];
         // Wire channel 2 is what a keyboard's own display calls CH 3.
         set.channel_midi_inputs[A] = MidiInputSel {
             devices: vec!["Keyboard A".to_owned()],
@@ -27853,7 +27904,7 @@ mod tests {
 
         // The slot table the desktop's connections would have claimed.
         let slots = vec!["Keyboard A".to_owned(), "Keyboard B".to_owned()];
-        let kinds: Vec<_> = (0..tangent_ui::recorder::CHANNELS)
+        let kinds: Vec<_> = (0..tangent_ui::desk_legacy::V32_CHANNELS)
             .map(|ch| ChannelKind::from_u8(back.channel_kinds[ch]))
             .collect();
         let routes =
@@ -27925,8 +27976,7 @@ mod tests {
         // with routing, and would pass "no other track heard it" perfectly.
         // So first, with every lane admitting everything (the desk as it was
         // before any of this existed), one note has to reach BOTH.
-        e.set_midi_routes(&[tangent_ui::recorder::MidiRoute::EVERYTHING;
-            tangent_ui::recorder::CHANNELS]);
+        e.set_midi_routes(&[tangent_ui::recorder::MidiRoute::EVERYTHING; CHANNELS]);
         hw.push(MidiEvent {
             stamp: 0,
             src: 0,
@@ -28963,7 +29013,7 @@ mod tests {
     #[test]
     fn the_live_road_moves_the_comp_and_the_meter_answers() {
         use crate::builtin_fx::COMP_PATH;
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let spec = crate::builtin_fx::spec_for(COMP_PATH).unwrap();
 
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
@@ -29056,7 +29106,7 @@ mod tests {
     #[test]
     fn a_denoise_learn_freezes_into_the_ledger_and_survives_a_reload() {
         use crate::builtin_fx::DENOISE_PATH;
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let spec = crate::builtin_fx::spec_for(DENOISE_PATH).unwrap();
 
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
@@ -29256,7 +29306,7 @@ mod tests {
             let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
             let state = crate::builtin_fx::state_text(spec, &[trim_gain], &[]).into_bytes();
             e.load_insert(
-                tangent_ui::recorder::MASTER_SEAT,
+                MASTER_SEAT,
                 bay,
                 Some(Path::new(crate::builtin_fx::TRIM_PATH)),
                 Some(&state),
@@ -29303,7 +29353,7 @@ mod tests {
     /// post-rack in both, measures 1.0 and fails.
     #[test]
     fn the_insert_tap_hears_the_armed_bay_after_its_effect() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let (post, _) = tap_fixture(Some((seat, 0)), Some(0), 1.0);
         let (pre, _) = tap_fixture(Some((seat, 0)), Some(1), 1.0);
         let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -29326,7 +29376,7 @@ mod tests {
     /// read really is PRE-bay: none of that lift may reach the tap.
     #[test]
     fn an_insert_tap_on_an_empty_bay_hears_what_the_bay_would_see() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         // Unity tenant in the armed bay: the tap is the bay's input, exactly.
         let (through, _) = tap_fixture(Some((seat, 0)), Some(0), 0.5);
         // Armed bay EMPTY, loud trim in the NEXT bay: the same input.
@@ -29351,7 +29401,7 @@ mod tests {
     /// an offline render can actually measure.
     #[test]
     fn a_disarmed_insert_tap_drains_empty_and_the_mix_never_knows_the_difference() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let (tap_armed, mix_armed) = tap_fixture(Some((seat, 0)), Some(0), 1.0);
         let (tap_off, mix_off) = tap_fixture(None, Some(0), 1.0);
         assert!(!tap_armed.is_empty(), "the armed control tapped nothing");
@@ -29373,13 +29423,13 @@ mod tests {
     /// drained frame after a catch-up is live audio again.
     #[test]
     fn a_full_insert_tap_ring_drops_whole_frames_and_recovers() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
         e.set_channel_gain(5, 0.05);
         e.set_drum_strips(1 << 5);
         e.load_insert(
-            tangent_ui::recorder::MASTER_SEAT,
+            MASTER_SEAT,
             0,
             Some(Path::new(crate::builtin_fx::TRIM_PATH)),
             None,
@@ -29572,7 +29622,7 @@ mod tests {
     /// the meter are the edge's doing and nobody else's.
     #[test]
     fn a_keyed_master_comp_ducks_the_mix_only_while_the_edge_is_armed() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         let run = |keys: &[(usize, usize, usize)]| -> (f32, f32) {
             // Lane 2 arrives only through lane 15, whose fader is closed.
             let mut e = key_engine(
@@ -29865,7 +29915,7 @@ mod tests {
     /// holds that end.
     #[test]
     fn a_bypassed_bay_passes_the_audio_through_bit_for_bit() {
-        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let seat = MASTER_SEAT;
         // The key tests' compressor: fast, deep, and audibly doing something
         // to a steady signal — and, like every unit in the suite, reporting
         // no latency, so the empty-bay run and the loaded ones are aligned
@@ -30867,39 +30917,39 @@ mod tests {
         // A channel is its own row - and its bays 3..5 are its FOLDER
         // seat's now, born with the six-bay folder strips. Plain order, no
         // master_bay twin: bay numbering and display order agree.
-        assert_eq!(param_slot(0, 0), Some((0, 0)));
-        assert_eq!(param_slot(7, 2), Some((7, 2)));
+        assert_eq!(param_slot(0, 0, MASTER_AUTO_LANE), Some((0, 0)));
+        assert_eq!(param_slot(7, 2, MASTER_AUTO_LANE), Some((7, 2)));
         assert_eq!(
-            param_slot(7, INSERTS),
+            param_slot(7, INSERTS, MASTER_AUTO_LANE),
             Some((tangent_ui::recorder::folder_extra_seat(7), 0)),
             "a channel's fourth bay is its folder seat's first"
         );
         assert_eq!(
-            param_slot(7, INSERTS * 2),
+            param_slot(7, INSERTS * 2, MASTER_AUTO_LANE),
             None,
             "a channel grew a seventh bay"
         );
-        assert_eq!(param_slot(CHANNELS + 5, 0), None, "a lane nobody has");
+        assert_eq!(param_slot(CHANNELS + 5, 0, MASTER_AUTO_LANE), None, "a lane nobody has");
 
         // The master keeps its original rack exactly where it was — this is
         // the assertion that stops a saved curve moving to another plugin.
         // Named by SEAT, because the row is the seat now.
         for bay in 0..INSERTS {
             assert_eq!(
-                param_slot(MASTER_AUTO_LANE, bay),
-                Some((tangent_ui::recorder::MASTER_SEAT, bay)),
+                param_slot(MASTER_AUTO_LANE, bay, MASTER_AUTO_LANE),
+                Some((tangent_ui::desk_lift::V32_MASTER, bay)),
                 "the master's original rack moved"
             );
         }
         // And the second rack is APPENDED after it.
         for bay in 0..INSERTS {
             assert_eq!(
-                param_slot(MASTER_AUTO_LANE, INSERTS + bay),
-                Some((tangent_ui::recorder::MASTER_EXTRA_SEAT, bay)),
+                param_slot(MASTER_AUTO_LANE, INSERTS + bay, MASTER_AUTO_LANE),
+                Some((tangent_ui::desk_lift::V32_PAD_BLOCK + tangent_ui::desk_lift::PADS, bay)),
                 "the master's second rack has no row"
             );
         }
-        assert_eq!(param_slot(MASTER_AUTO_LANE, INSERTS * 2), None, "a seventh bay");
+        assert_eq!(param_slot(MASTER_AUTO_LANE, INSERTS * 2, MASTER_AUTO_LANE), None, "a seventh bay");
 
         // **The master's rows are not somebody else's seat.**
         //
@@ -30911,7 +30961,7 @@ mod tests {
         // curve would now be read back by the drum bus's rack — audible, and
         // attributable to anything but automation.
         for bay in 0..INSERTS * 2 {
-            let (seat, _) = param_slot(MASTER_AUTO_LANE, bay).expect("the master lost a bay");
+            let (seat, _) = param_slot(MASTER_AUTO_LANE, bay, MASTER_AUTO_LANE).expect("the master lost a bay");
             assert_ne!(
                 seat,
                 Strip::Drums.index(),
@@ -30932,8 +30982,8 @@ mod tests {
         // them would put six bays in a rack that holds three, and `get_mut`
         // would drop the last three without a word.
         assert_ne!(
-            param_slot(MASTER_AUTO_LANE, 0).map(|s| s.0),
-            param_slot(MASTER_AUTO_LANE, INSERTS).map(|s| s.0),
+            param_slot(MASTER_AUTO_LANE, 0, MASTER_AUTO_LANE).map(|s| s.0),
+            param_slot(MASTER_AUTO_LANE, INSERTS, MASTER_AUTO_LANE).map(|s| s.0),
             "both of the master's racks answer to one seat"
         );
 
@@ -30941,7 +30991,7 @@ mod tests {
         // engine writes through `get_mut`, so a table one row short would
         // drop the automation silently rather than fail.
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let widest = param_slot(MASTER_AUTO_LANE, INSERTS * 2 - 1).expect("no last bay");
+        let widest = param_slot(MASTER_AUTO_LANE, INSERTS * 2 - 1, MASTER_AUTO_LANE).expect("no last bay");
         assert!(
             e.auto_params_len_for_test() > widest.0 * INSERTS + widest.1,
             "the automation table is smaller than the bays it is handed"
@@ -34966,18 +35016,25 @@ mod tests {
         );
     }
 
-    /// **Three copies of one number.**
+    /// **The engine's own numbers are the capture's and the frozen map's.**
     ///
-    /// `tangent-ui` declares its own `INPUTS` because it may not reach across
-    /// the firewall, and `tangent-record` declares `MAX_PICKS` because that is
-    /// where the channels are actually kept. A desk with more strips than the
-    /// capture has picks would draw channels nothing can ever fill; fewer, and
-    /// an input the user chose would be captured and never heard.
+    /// `tangent-record` declares `MAX_PICKS` because that is where the
+    /// channels are actually kept, and the engine's picks ARE that number now,
+    /// not a copy of the UI's: a desk with more strips than the capture has
+    /// picks would draw channels nothing can ever fill. The engine's strip
+    /// space is the frozen V32 map's (design Appendix A), whatever the UI's
+    /// live desk grows to.
     #[test]
     fn the_desk_has_as_many_inputs_as_the_capture_can_keep() {
         assert_eq!(INPUTS, tangent_record::audio::MAX_PICKS);
-        assert_eq!(INPUTS, tangent_ui::recorder::INPUTS);
-        assert_eq!(STRIPS, tangent_ui::recorder::STRIPS, "the desks disagree");
+        assert_eq!(STRIPS, tangent_ui::desk_legacy::V32_STRIPS, "the strip space left the frozen map");
+        assert_eq!(MASTER_SEAT, tangent_ui::desk_lift::V32_MASTER, "the master's seat left the frozen map");
+        assert_eq!(
+            MASTER_EXTRA_SEAT,
+            tangent_ui::desk_lift::V32_EXTRA_PADS - 1,
+            "the master's second rack left the frozen map"
+        );
+        assert_eq!(RACK_SEATS, tangent_ui::desk_legacy::V32_TOTAL_SEATS);
         // And every UI strip maps onto a host strip at the same index, which
         // is what makes the mute masks and the send array the same arrays.
         for ui in tangent_ui::recorder::Strip::all() {
@@ -36828,7 +36885,7 @@ mod slot_engine {
                     assert_eq!(set.contains(b), want, "{name} on lane {a}, read at lane {b} ({lanes} lanes)");
                 }
                 if name == "suspend" {
-                    assert_eq!(d.suspend.contains(MASTER_AUTO_LANE), false, "lane {a}'s suspend reached the master's curves");
+                    assert!(!d.suspend_master, "lane {a}'s suspend reached the master's curves");
                 }
             }
         }
@@ -36934,7 +36991,11 @@ mod slot_engine {
                 let at = |value| vec![Point { at_s: 0.0, value, shape: Shape::Hold }];
                 curves.set(Curve::sanitised(lane, AutoParam::Gain, at(0.1)));
                 curves.set(Curve::sanitised(MASTER_AUTO_LANE, AutoParam::Gain, at(0.2)));
-                e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(lane as u32), gen)] });
+                e.set_automation_slotted(SlotAutomation {
+                    curves,
+                    gens: vec![(Slot(lane as u32), gen)],
+                    master: MASTER_AUTO_LANE,
+                });
             }
             e.set_clips_slotted(lanes.iter().map(|&s| clip_at(&e, s, 0x500 + s as u32)).collect());
             let (_, stems) = roll(&mut e, 6);
@@ -36967,7 +37028,7 @@ mod slot_engine {
             if curve {
                 let mut curves = Automation::default();
                 curves.set(Curve::sanitised(40, AutoParam::Gain, vec![Point { at_s: 0.0, value: 0.1, shape: Shape::Hold }]));
-                e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(40), gen)] });
+                e.set_automation_slotted(SlotAutomation { curves, gens: vec![(Slot(40), gen)], master: MASTER_AUTO_LANE });
             }
             e.set_clips_slotted(vec![clip_at(&e, 40, 0x40)]);
             let (_, stems) = roll(&mut e, 4);
@@ -37528,7 +37589,7 @@ mod slot_engine {
     /// lanes and the strips, and its own past it** (contract C8).
     #[test]
     fn a_rack_address_names_one_seat() {
-        use tangent_ui::recorder::{amp_pedal_seat, bus_extra_seat, folder_extra_seat, MASTER_EXTRA_SEAT, MASTER_SEAT};
+        use tangent_ui::recorder::{amp_pedal_seat, bus_extra_seat, folder_extra_seat};
         let lane = |s: u32, r: u16| RackAddr { owner: RackOwner::Lane(Slot(s)), rack: r }.seat();
         assert_eq!(lane(3, 0), Some(3));
         assert_eq!(lane(3, 1), Some(folder_extra_seat(3)));
@@ -39435,7 +39496,7 @@ mod lanesets {
             format!("let bit = 1u32 << ch{low};"),
             format!("if mask & (1 << lane{high}) != 0 {{"),
             format!("let lane = strip.min(CHANNELS - {});", 1),
-            format!("strip: clip.lane.min(tangent_ui::recorder::CHANNELS - {}),", 1),
+            format!("strip: clip.lane.min(tangent_ui::recorder::{} - {}),", "CHANNELS", 1),
         ] {
             assert_eq!(lane_clamps("planted", &line).len(), 1, "missed: {line}");
         }
@@ -39666,7 +39727,7 @@ mod lanesets {
                     })
                     .map(|flat| (flat / INSERTS, flat % INSERTS));
                 assert_eq!(
-                    param_slot(lane, bay),
+                    param_slot(lane, bay, MASTER_AUTO_LANE),
                     want,
                     "lane {lane} bay {bay}: the engine and the identity kernel disagree"
                 );
@@ -39716,8 +39777,12 @@ mod lanesets {
                 assert_eq!(desk.keys.contains(lane), bit32(lo.rotate_left(11), lane), "keys {lane}");
                 assert_eq!(desk.frozen.contains(lane), bit32(lo.rotate_left(17), lane), "frozen {lane}");
                 assert_eq!(desk.midi_on.contains(lane), lane < 64 && !bit64(w, lane), "midi {lane}");
-                assert_eq!(desk.suspend.contains(lane), bit64(w.rotate_left(5), lane), "suspend {lane}");
+                // The word's bit one past the legacy lanes is the master's
+                // own, which is no lane: it decodes to `suspend_master`.
+                let suspend = bit64(w.rotate_left(5), lane) && lane != LEGACY_LANES;
+                assert_eq!(desk.suspend.contains(lane), suspend, "suspend {lane}");
             }
+            assert_eq!(desk.suspend_master, bit64(w.rotate_left(5), LEGACY_LANES), "the master's suspend");
         }
     }
 
@@ -39780,7 +39845,6 @@ mod lanesets {
     /// heard every note whatever the master's own bit said.
     #[test]
     fn the_master_racks_ask_the_masters_own_midi_bit() {
-        use tangent_ui::recorder::{MASTER_EXTRA_SEAT, MASTER_SEAT};
         assert_eq!(chain_strip(MASTER_EXTRA_SEAT), STRIPS);
         assert_eq!(chain_strip(MASTER_SEAT), STRIPS);
         assert_eq!(chain_strip(Strip::Fx.index()), Strip::Fx.index());

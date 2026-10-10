@@ -685,29 +685,6 @@ impl LanePool {
         self.hands.len() + 1
     }
 
-    /// **Run `work(ch)` for every lane in the mask `lanes`**, lowest first,
-    /// through [`Self::run_list`].
-    ///
-    /// The thirty-two-lane form the engine was written against, kept so that
-    /// no caller changes in the same commit as the pool. It goes once the
-    /// engine walks a lane list of its own.
-    ///
-    /// It does since W2-engine-lanesets (`mix_channels` claims through
-    /// `run_list`), so only this file's own tests call it; C6 keeps it as
-    /// the shim until W4, and the lint is told so rather than the shim cut.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn run(&self, lanes: u32, work: &(dyn Fn(usize) + Sync)) {
-        // On the stack: this is the audio thread, and the mask has at most
-        // as many lanes as it has bits.
-        let mut list = [0u32; u32::BITS as usize];
-        let mut n = 0;
-        for ch in lane_iter(lanes) {
-            list[n] = ch as u32;
-            n += 1;
-        }
-        self.run_list(&list[..n], &|lane, _hand| work(lane));
-    }
-
     /// **Run `work(lane, hand)` for every entry of `list`, and return when
     /// all of them have finished.**
     ///
@@ -839,7 +816,7 @@ impl Drop for LanePool {
 ///
 /// The plain path reaches it with every index claimed and only waits. The
 /// other path is the caller's own lane panicking: before this guard existed
-/// that unwind left `run` straight past the barrier, and the frame it tore
+/// that unwind left `run_list` straight past the barrier, and the frame it tore
 /// down was the very closure and lane list the workers were still running
 /// through. Waiting here, in a destructor, holds the frame until the last
 /// worker has let go of it.
@@ -946,12 +923,6 @@ impl Drop for MarkGone<'_> {
 /// done, and short enough that a worker which has not been scheduled at all
 /// gets the core rather than the spinner. See [`Barrier`].
 const SPINS_BEFORE_YIELD: u32 = 2_000;
-
-/// The set bits of `lanes`, low to high. `run`'s alone; see its note.
-#[cfg_attr(not(test), allow(dead_code))]
-fn lane_iter(lanes: u32) -> impl Iterator<Item = usize> {
-    (0..u32::BITS as usize).filter(move |ch| lanes & (1u32 << ch) != 0)
-}
 
 /// **How many indices one claim takes: half of an even share of what is
 /// left**, and never fewer than one.
@@ -1235,14 +1206,15 @@ mod tests {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
         let pool = LanePool::new(4, None, Some(plan));
         let counts: Vec<AtomicUsize> = (0..32).map(|_| AtomicUsize::new(0)).collect();
-        let lanes = 0b1010_1111_0000_1111_0101_0101_1111_0000u32;
+        // A scattered half of thirty-two lanes, as the list the engine walks.
+        let lanes: Vec<u32> = [4u32, 5, 6, 7, 8, 10, 12, 14, 16, 17, 18, 19, 24, 25, 26, 27, 29, 31].into();
         for _ in 0..200 {
-            pool.run(lanes, &|ch| {
+            pool.run_list(&lanes, &|ch, _hand| {
                 counts[ch].fetch_add(1, Ordering::Relaxed);
             });
         }
         for ch in 0..32 {
-            let want = if lanes & (1u32 << ch) != 0 { 200 } else { 0 };
+            let want = if lanes.contains(&(ch as u32)) { 200 } else { 0 };
             assert_eq!(
                 counts[ch].load(Ordering::Relaxed),
                 want,
@@ -1258,11 +1230,11 @@ mod tests {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
         let pool = LanePool::new(1, None, Some(plan));
         let seen = AtomicUsize::new(0);
-        pool.run(0, &|_| {
+        pool.run_list(&[], &|_, _| {
             seen.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(seen.load(Ordering::Relaxed), 0, "an empty ask ran something");
-        pool.run(0b101, &|_| {
+        pool.run_list(&[0, 2], &|_, _| {
             seen.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(seen.load(Ordering::Relaxed), 2);
