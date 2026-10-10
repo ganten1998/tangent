@@ -36,7 +36,7 @@
 //! ones, so no legacy lane index ever moved, and a migrated desk binds through
 //! [`identity_ids`]: legacy row r is `TrackId(r)`.
 
-use crate::desk_id::{Node, Rack, TrackId, AMP_PEDALS, BAYS, PADS};
+use crate::desk_id::{Node, Rack, SeatBay, TrackId, AMP_PEDALS, BAYS, PADS};
 
 /// Channels on the legacy desk.
 pub const V32_CHANNELS: usize = 32;
@@ -257,6 +257,199 @@ pub fn identity_ids(rows: usize) -> Vec<TrackId> {
     (0..rows).map_while(|r| u32::try_from(r).ok()).map(TrackId).collect()
 }
 
+// ── A legacy (seat, bay) and an identity, under a desk's row ids ────────────
+//
+// The one road between the two that the live code may take: the host still
+// names a bay by the frozen map's `(seat, bay)` until its own lane moves it
+// onto identities (C11's rule: a new form beside the old, the old deleted by
+// the lane that stops using it), and the legacy files and their pickers
+// speak it. Every crossing goes through these two, so none of them does a
+// sum of its own.
+
+/// **The bay a legacy `(seat, bay)` is, by identity**, under row ids `ids`:
+/// the seat through the frozen map, its row through [`bind`]. `None` for a
+/// seat past the map, a bay past the third, or a row the ids do not reach.
+pub fn bay_at(ids: &[TrackId], seat: usize, bay: usize) -> Option<SeatBay> {
+    let (owner, rack) = decode_v32_seat(seat)?;
+    let sb = SeatBay::new(bind(owner, ids)?, rack, u8::try_from(bay).ok()?);
+    sb.is_valid().then_some(sb)
+}
+
+/// [`bay_at`]'s inverse: where the frozen map keeps a bay, under `ids`.
+/// `None` for a track no row holds, a row past the map, or a rack it never
+/// had a seat for.
+pub fn seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
+    let owner = unbind(sb.seat.node, ids)?;
+    Some((encode_v32_seat(owner, sb.seat.rack)?, usize::from(sb.bay)))
+}
+
+/// **A legacy FLAT bay** (`strip_inserts[i]`, an `insert-state-S-B.bin`'s
+/// `S * 3 + B`) **by identity**, under row ids `ids`: [`decode_v32`] and
+/// [`bind`].
+pub fn bay_of_flat(ids: &[TrackId], flat: usize) -> Option<SeatBay> {
+    let (owner, rack, bay) = decode_v32(flat)?;
+    let sb = SeatBay::new(bind(owner, ids)?, rack, bay);
+    sb.is_valid().then_some(sb)
+}
+
+/// [`bay_of_flat`]'s inverse: the flat bay the frozen map keeps a bay at,
+/// under `ids`.
+pub fn flat_of(ids: &[TrackId], sb: SeatBay) -> Option<usize> {
+    encode_v32(unbind(sb.seat.node, ids)?, sb.seat.rack, sb.bay)
+}
+
+/// **A dense legacy bay table, by identity**: `inserts[flat]` is the plugin
+/// in the bay [`decode_v32`] says, its row bound through `ids`. Empty cells
+/// and cells naming no row are left out: a seat a reader cannot place is a
+/// plugin no row of this desk holds.
+pub fn bind_bays(inserts: &[String], ids: &[TrackId]) -> std::collections::BTreeMap<SeatBay, String> {
+    inserts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.is_empty())
+        .filter_map(|(flat, p)| Some((bay_of_flat(ids, flat)?, p.clone())))
+        .collect()
+}
+
+/// [`bind_bays`]'s inverse: bays by identity as the dense legacy table, a
+/// full [`V32_INSERT_SPACE`] of cells, each track at the row `ids` gives
+/// it. A bay with no flat cell (a track no row holds) is left out.
+pub fn dense_bays(plugins: &std::collections::BTreeMap<SeatBay, String>, ids: &[TrackId]) -> Vec<String> {
+    let mut dense = vec![String::new(); V32_INSERT_SPACE];
+    for (sb, path) in plugins {
+        if let Some(cell) = flat_of(ids, *sb).and_then(|f| dense.get_mut(f)) {
+            cell.clone_from(path);
+        }
+    }
+    dense
+}
+
+// ── The frozen seat map under its old names ────────────────────────────────
+//
+// **Retired here from `recorder` (W5).** The live app names every bay by
+// identity, so nothing in it computes a seat any more; these are the same
+// functions at the frozen V32 literals, kept for the readers that still
+// speak the frozen map: the engine's legacy shims and their tests, the
+// host's tests, the era corpus. `recorder` re-exports the names those
+// readers spell until each moves off them. Each is a second formulation of
+// [`decode_v32`]'s map, and the tests below hold the two to each other.
+
+/// The master's own seat: the one after the 35 strips.
+pub const MASTER_SEAT: usize = MASTER;
+
+/// The master's second rack, past the first pad block.
+pub const MASTER_EXTRA_SEAT: usize = MASTER_EXTRA;
+
+/// Where the pads of drum lanes past the first block begin.
+pub const EXTRA_PAD_SEATS: usize = EXTRA_PADS;
+
+/// Where the folder-extra seats begin, one per channel.
+pub const FOLDER_EXTRA_SEATS: usize = FOLDER_EXTRA;
+
+/// Where the amp-pedal seats begin, seven per channel.
+pub const AMP_PEDAL_SEATS: usize = PEDALS;
+
+/// Where the buses' extra seats begin, one per bus.
+pub const BUS_EXTRA_SEATS: usize = BUS_EXTRA;
+
+/// The buses: every strip past the channels (drums, click, fx).
+pub const BUSES: usize = V32_STRIPS - V32_CHANNELS;
+
+/// Every legacy rack seat ([`V32_TOTAL_SEATS`]).
+pub const TOTAL_SEATS: usize = V32_TOTAL_SEATS;
+
+/// The legacy flat bay space ([`V32_INSERT_SPACE`]).
+pub const INSERT_SPACE: usize = V32_INSERT_SPACE;
+
+/// **Which seat and bay a strip's Nth DISPLAYED slot was**, by the strip's
+/// legacy index: the master's first three slots are its extra rack, a
+/// channel's and a bus's 3..5 their second seats.
+pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
+    if desk_index == MASTER && slot >= BAYS {
+        (MASTER, slot - BAYS)
+    } else if desk_index == MASTER {
+        (MASTER_EXTRA, slot)
+    } else if desk_index < V32_CHANNELS && slot >= BAYS {
+        (folder_extra_seat(desk_index), slot - BAYS)
+    } else if desk_index < V32_STRIPS && slot >= BAYS {
+        (bus_extra_seat(desk_index), slot - BAYS)
+    } else {
+        (desk_index, slot)
+    }
+}
+
+/// **Which strip a rack seat's slots are shown on**, or `None` for a seat
+/// no strip shows (a pad, a pedal).
+pub fn rack_owner(seat: usize) -> Option<usize> {
+    if seat <= MASTER {
+        return Some(seat);
+    }
+    if seat == MASTER_EXTRA {
+        return Some(MASTER);
+    }
+    folder_extra_of(seat).or_else(|| bus_extra_of(seat))
+}
+
+/// The bus whose extra seat this is, as its strip index.
+pub fn bus_extra_of(seat: usize) -> Option<usize> {
+    seat.checked_sub(BUS_EXTRA).filter(|i| *i < BUSES).map(|i| V32_CHANNELS + i)
+}
+
+/// Channel `ch`'s folder-extra seat.
+pub const fn folder_extra_seat(ch: usize) -> usize {
+    FOLDER_EXTRA + ch
+}
+
+/// Which channel's folder-extra seat this is.
+pub fn folder_extra_of(seat: usize) -> Option<usize> {
+    seat.checked_sub(FOLDER_EXTRA).filter(|ch| *ch < V32_CHANNELS)
+}
+
+/// Channel `ch`'s pedal `pedal` seat.
+pub const fn amp_pedal_seat(ch: usize, pedal: usize) -> usize {
+    PEDALS + ch * AMP_PEDALS + pedal
+}
+
+/// Which channel's which pedal a seat is.
+pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
+    let at = seat.checked_sub(PEDALS)?;
+    let ch = at / AMP_PEDALS;
+    (ch < V32_CHANNELS).then_some((ch, at % AMP_PEDALS))
+}
+
+/// **Whose pedalboard a rack seat wears**: a channel's own seat and its
+/// folder-extra seat both answer the channel; nothing else has a board.
+pub fn pedal_owner(seat: usize) -> Option<usize> {
+    if seat < V32_CHANNELS {
+        return Some(seat);
+    }
+    folder_extra_of(seat)
+}
+
+/// Bus `desk_index`'s extra seat; anything that is not a bus gets the
+/// first, the "answer rather than panic" its neighbours make.
+pub const fn bus_extra_seat(desk_index: usize) -> usize {
+    if desk_index < V32_CHANNELS || desk_index >= V32_STRIPS {
+        return BUS_EXTRA;
+    }
+    BUS_EXTRA + (desk_index - V32_CHANNELS)
+}
+
+/// Where channel `ch`'s pad `pad` kept its bays: channel 0 in the original
+/// block after the master, every other channel appended.
+pub const fn pad_rack_index(ch: usize, pad: usize) -> usize {
+    if ch == 0 {
+        ROW0_PADS + pad
+    } else {
+        EXTRA_PADS + (ch - 1) * PADS + pad
+    }
+}
+
+/// Channel 0's pad `pad` seat: the original pad block.
+pub const fn pad_insert_index(pad: usize) -> usize {
+    ROW0_PADS + pad
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,17 +503,17 @@ mod tests {
     fn the_frozen_numbers_are_still_the_live_desks() {
         assert_eq!(V32_CHANNELS, recorder::CHANNELS);
         assert_eq!(V32_STRIPS, recorder::STRIPS);
-        assert_eq!(V32_TOTAL_SEATS, recorder::TOTAL_SEATS);
-        assert_eq!(V32_INSERT_SPACE, recorder::INSERT_SPACE);
+        assert_eq!(V32_TOTAL_SEATS, TOTAL_SEATS);
+        assert_eq!(V32_INSERT_SPACE, INSERT_SPACE);
         assert_eq!(BAYS, recorder::INSERTS);
         assert_eq!(PADS, recorder::DRUM_PADS);
         assert_eq!(AMP_PEDALS, recorder::AMP_PEDALS);
-        assert_eq!(MASTER, recorder::MASTER_SEAT);
-        assert_eq!(MASTER_EXTRA, recorder::MASTER_EXTRA_SEAT);
-        assert_eq!(EXTRA_PADS, recorder::EXTRA_PAD_SEATS);
-        assert_eq!(FOLDER_EXTRA, recorder::FOLDER_EXTRA_SEATS);
-        assert_eq!(PEDALS, recorder::AMP_PEDAL_SEATS);
-        assert_eq!(BUS_EXTRA, recorder::BUS_EXTRA_SEATS);
+        assert_eq!(MASTER, MASTER_SEAT);
+        assert_eq!(MASTER_EXTRA, MASTER_EXTRA_SEAT);
+        assert_eq!(EXTRA_PADS, EXTRA_PAD_SEATS);
+        assert_eq!(FOLDER_EXTRA, FOLDER_EXTRA_SEATS);
+        assert_eq!(PEDALS, AMP_PEDAL_SEATS);
+        assert_eq!(BUS_EXTRA, BUS_EXTRA_SEATS);
     }
 
     /// The strip a legacy owner's slots are drawn on, in `Strip::index` space.
@@ -334,15 +527,15 @@ mod tests {
             let row = LegacyOwner::Row(ch as u16);
             for pad in 0..PADS {
                 assert_eq!(
-                    decode_v32_seat(recorder::pad_rack_index(ch, pad)),
+                    decode_v32_seat(pad_rack_index(ch, pad)),
                     Some((row, Rack::Pad(pad as u8))),
                     "pad_rack_index({ch}, {pad})"
                 );
             }
-            assert_eq!(decode_v32_seat(recorder::folder_extra_seat(ch)), Some((row, Rack::Chain(1))));
+            assert_eq!(decode_v32_seat(folder_extra_seat(ch)), Some((row, Rack::Chain(1))));
             for p in 0..AMP_PEDALS {
                 assert_eq!(
-                    decode_v32_seat(recorder::amp_pedal_seat(ch, p)),
+                    decode_v32_seat(amp_pedal_seat(ch, p)),
                     Some((row, Rack::Pedal(p as u8))),
                     "amp_pedal_seat({ch}, {p})"
                 );
@@ -350,13 +543,13 @@ mod tests {
         }
         for d in V32_CHANNELS..V32_STRIPS {
             assert_eq!(
-                decode_v32_seat(recorder::bus_extra_seat(d)),
+                decode_v32_seat(bus_extra_seat(d)),
                 Some((decode_v32_strip(d).unwrap(), Rack::Chain(1)))
             );
         }
         for pad in 0..PADS {
             assert_eq!(
-                decode_v32_seat(recorder::pad_insert_index(pad)),
+                decode_v32_seat(pad_insert_index(pad)),
                 Some((LegacyOwner::Row(0), Rack::Pad(pad as u8)))
             );
         }
@@ -367,27 +560,27 @@ mod tests {
                 Some((o, Rack::Chain(_))) => Some(strip_of(o)),
                 _ => None,
             };
-            assert_eq!(recorder::rack_owner(seat), shown, "rack_owner({seat})");
+            assert_eq!(rack_owner(seat), shown, "rack_owner({seat})");
             let board = match decoded {
                 Some((LegacyOwner::Row(r), Rack::Chain(_))) => Some(r as usize),
                 _ => None,
             };
-            assert_eq!(recorder::pedal_owner(seat), board, "pedal_owner({seat})");
+            assert_eq!(pedal_owner(seat), board, "pedal_owner({seat})");
             let folder = match decoded {
                 Some((LegacyOwner::Row(r), Rack::Chain(1))) => Some(r as usize),
                 _ => None,
             };
-            assert_eq!(recorder::folder_extra_of(seat), folder, "folder_extra_of({seat})");
+            assert_eq!(folder_extra_of(seat), folder, "folder_extra_of({seat})");
             let pedal = match decoded {
                 Some((LegacyOwner::Row(r), Rack::Pedal(p))) => Some((r as usize, p as usize)),
                 _ => None,
             };
-            assert_eq!(recorder::amp_pedal_of(seat), pedal, "amp_pedal_of({seat})");
+            assert_eq!(amp_pedal_of(seat), pedal, "amp_pedal_of({seat})");
             let bus_extra = match decoded {
                 Some((o, Rack::Chain(1))) if bus_offset(o).is_some() => Some(strip_of(o)),
                 _ => None,
             };
-            assert_eq!(recorder::bus_extra_of(seat), bus_extra, "bus_extra_of({seat})");
+            assert_eq!(bus_extra_of(seat), bus_extra, "bus_extra_of({seat})");
         }
     }
 
@@ -399,7 +592,7 @@ mod tests {
         for desk_index in 0..=V32_STRIPS {
             let node = bind(decode_v32_strip(desk_index).unwrap(), &ids).unwrap();
             for slot in 0..BAYS * STRIP_RACKS {
-                let (seat, bay) = recorder::seat_bay(desk_index, slot);
+                let (seat, bay) = seat_bay(desk_index, slot);
                 let sb = slot_key(node, slot).unwrap();
                 let owner = unbind(sb.seat.node, &ids).unwrap();
                 assert_eq!(
@@ -425,15 +618,15 @@ mod tests {
         };
         for lane in 0..V32_CHANNELS {
             for bay in 0..BAYS * MAX_CHAIN {
-                let (seat, b) = recorder::seat_bay(lane, bay);
+                let (seat, b) = seat_bay(lane, bay);
                 assert_eq!(flat(auto_key(Node::Track(ids[lane]), bay).unwrap()), seat * BAYS + b);
             }
         }
         for bay in 0..BAYS * MAX_CHAIN {
             let (seat, b) = if bay < recorder::INSERTS {
-                (recorder::MASTER_SEAT, bay)
+                (MASTER_SEAT, bay)
             } else {
-                (recorder::MASTER_EXTRA_SEAT, bay - recorder::INSERTS)
+                (MASTER_EXTRA_SEAT, bay - recorder::INSERTS)
             };
             assert_eq!(flat(auto_key(Node::Master, bay).unwrap()), seat * BAYS + b, "master bay {bay}");
         }
@@ -441,7 +634,7 @@ mod tests {
         for d in V32_CHANNELS..V32_STRIPS {
             let node = bind(decode_v32_strip(d).unwrap(), &ids).unwrap();
             for bay in 0..BAYS * MAX_CHAIN {
-                let (seat, b) = recorder::seat_bay(d, bay);
+                let (seat, b) = seat_bay(d, bay);
                 assert_eq!(flat(auto_key(node, bay).unwrap()), seat * BAYS + b);
             }
         }
@@ -461,7 +654,7 @@ mod tests {
             assert_eq!(decode_v32_strip(strip.index()), Some(expect), "{strip:?}");
         }
         assert_eq!(recorder::Strip::all().len(), V32_STRIPS);
-        assert_eq!(decode_v32_strip(recorder::MASTER_SEAT), Some(LegacyOwner::Master));
+        assert_eq!(decode_v32_strip(MASTER_SEAT), Some(LegacyOwner::Master));
     }
 
     #[test]

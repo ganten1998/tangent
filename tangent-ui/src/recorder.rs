@@ -1214,24 +1214,6 @@ pub const INPUTS: usize = 32;
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;
 
-/// The master's own seat in the insert space. Seats `0..STRIPS` are the
-/// channels and the buses; this is the one after them.
-pub const MASTER_SEAT: usize = STRIPS;
-
-/// **The master's SECOND rack.**
-///
-/// A seat of its own, past the pads, holding the master's extra three bays.
-///
-/// **Why a seat and not six bays on one.** `INSERTS` is the stride of the
-/// persisted `strip_inserts` array and of the `insert-state-<seat>-<bay>.bin`
-/// sidecars; raising it to six would change the stride for every strip on
-/// the desk, need a migration for every saved session, and hand the
-/// arrangement's track headers six bays they have no room to draw. An extra
-/// seat is three more entries appended to an array that already grows by
-/// appending, one more rack in the engine, and no other file learns
-/// anything.
-pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
-
 /// **How many bays a strip shows: six on the master and on every CHANNEL.**
 ///
 /// It used to be three on a channel, six on the master, and six on a channel
@@ -1269,128 +1251,20 @@ pub fn bays_at(desk_index: usize) -> usize {
     bays_on(Strip::all().get(desk_index).copied())
 }
 
-/// **Which rack seat and which bay a strip's Nth slot really is.**
+/// **The seat map's old names, retired to `desk_legacy` (W5).**
 ///
-/// Everything but the master answers itself. The master's first three slots
-/// are its EXTRA rack and its last three are its original one, and that
-/// order is deliberate: the new bays were added above the old ones on the
-/// strip, a rack runs top to bottom, and a session that already had plugins
-/// in the master must keep hearing them in the same place in the chain.
-///
-/// One function, because the alternative is every call site remembering the
-/// rule — and a call site that forgets it edits somebody else's plugin.
-pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
-    if desk_index == MASTER_SEAT && slot >= INSERTS {
-        (MASTER_SEAT, slot - INSERTS)
-    } else if desk_index == MASTER_SEAT {
-        (MASTER_EXTRA_SEAT, slot)
-    } else if desk_index < CHANNELS && slot >= INSERTS {
-        // A FOLDER's slots 3..5 - and, unlike the master's, in the plain
-        // order: the extra rack goes BELOW the original, so slot and bay
-        // numbering agree with the automation's and no `master_bay` twin
-        // is needed. See `FOLDER_EXTRA_SEATS`.
-        (folder_extra_seat(desk_index), slot - INSERTS)
-    } else if desk_index < STRIPS && slot >= INSERTS {
-        // A BUS's slots 3..5, in the same plain order a channel's take. See
-        // `BUS_EXTRA_SEATS`.
-        (bus_extra_seat(desk_index), slot - INSERTS)
-    } else {
-        (desk_index, slot)
-    }
-}
-
-/// **Which STRIP a rack seat belongs to**, and the exact inverse of
-/// [`seat_bay`] in the only respect anybody asks about: the desk index whose
-/// slots live in that seat.
-///
-/// [`seat_bay`] is a one-way street and was enough while the only question
-/// anybody asked of a bay was where to read it. The question a DRAG asks is
-/// different — "is this the same strip I picked it up from" — and in seat
-/// space the answer was wrong for exactly the bays that live in a second
-/// rack: a channel's slots 0..2 are its own seat and its 3..5 are its
-/// folder-extra one, so carrying a plugin from slot 1 to slot 5 of ONE track
-/// read as a move between two tracks and copied it instead of moving it.
-/// That is the owner's "drag only works between each group of 3".
-///
-/// A seat that is nobody's rack — a drum pad, an amp pedal — answers `None`.
-/// Those are racks a strip OWNS but not racks a strip SHOWS, and a carry
-/// that is not between two shown bays is not a carry this answers for.
-pub fn rack_owner(seat: usize) -> Option<usize> {
-    if seat <= MASTER_SEAT {
-        // The channels, the three buses, and the master's own seat.
-        return Some(seat);
-    }
-    if seat == MASTER_EXTRA_SEAT {
-        return Some(MASTER_SEAT);
-    }
-    if let Some(ch) = folder_extra_of(seat) {
-        return Some(ch);
-    }
-    if let Some(bus) = bus_extra_of(seat) {
-        return Some(bus);
-    }
-    None
-}
-
-/// The BUS whose extra seat this is, if it is one — [`bus_extra_seat`]'s
-/// inverse, and [`folder_extra_of`]'s sibling. See [`rack_owner`], which is
-/// the question both of them exist to answer.
-pub fn bus_extra_of(seat: usize) -> Option<usize> {
-    seat.checked_sub(BUS_EXTRA_SEATS)
-        .filter(|i| *i < BUSES)
-        .map(|i| CHANNELS + i)
-}
-
-/// **Where the pads of drum lanes past the FIRST block begin.**
-///
-/// A drum instrument loads a full instance per channel, so every channel
-/// that carries a drumpad needs its own hundred and twenty-eight pad racks.
-/// They are APPENDED, after everything that already had a seat — the note on
-/// `MASTER_EXTRA_SEAT` says why that is the safe direction: an appended seat
-/// changes no index anybody has already written down, and this array grows
-/// by appending.
-///
-/// Channel 0 keeps the ORIGINAL pad block at `STRIPS + 1`. That is what a
-/// project written before lanes existed used, and `Settings::from_json`
-/// moves it when such a project's drumpad turns out to be on another
-/// channel. See `pad_rack_index`.
-pub const EXTRA_PAD_SEATS: usize = MASTER_EXTRA_SEAT + 1;
-
-/// **Where the FOLDER extra seats begin** - one appended seat per channel,
-/// so a group can wear six bays the way the master does. Appended after
-/// every pad block, for the reason `MASTER_EXTRA_SEAT` records: an appended
-/// seat changes no index anybody has already written down.
-///
-/// Unlike the master's, a folder's extra bays sit BELOW its original three.
-/// There was no legacy strip to keep the look of, so display order,
-/// automation-bay order and chain order all agree here: slots and bays 0..2
-/// are the channel's own seat, 3..5 the extra one.
-pub const FOLDER_EXTRA_SEATS: usize = EXTRA_PAD_SEATS + (CHANNELS - 1) * DRUM_PADS;
-
-/// Channel `ch`'s folder-extra seat. One function, same reason as
-/// `pad_rack_index`: a call site that recomputes this edits somebody
-/// else's plugin.
-pub const fn folder_extra_seat(ch: usize) -> usize {
-    FOLDER_EXTRA_SEATS + ch
-}
-
-/// The inverse: which channel's extra rack a seat is, or `None` for a seat
-/// outside the folder-extra block.
-///
-/// It did not exist while nothing needed to travel BACK. `folder_extra_seat`
-/// is a one-way street — every reader either knew the channel already or was
-/// content to ask about a seat it had just built — and the price of that was
-/// the pedalboard: a folder wears six bays, three of them seated past every
-/// pad block, and the board that arms behind an amp is the CHANNEL's. With no
-/// way home from the seat, the amp face in a folder's slots 3..5 could only
-/// say "on channel strips only", and the engine could only run the board for
-/// a lane whose own rack held the amp. Both were answering a question about
-/// the seat when the question was about the channel. See [`pedal_owner`],
-/// which is the question they should have been asking.
-pub fn folder_extra_of(seat: usize) -> Option<usize> {
-    seat.checked_sub(FOLDER_EXTRA_SEATS)
-        .filter(|ch| *ch < CHANNELS)
-}
+/// The app names every plugin bay by identity (`desk_id::SeatBay`) and
+/// works out no seat, so the map is the frozen legacy one and lives with the
+/// rest of it. These names stay re-exported for the readers that still
+/// speak it by this path: the engine's legacy shims and its tests, the
+/// host's tests, the render goldens. Each lane that moves its last reader
+/// off a name deletes it here; no live code in this crate may name one
+/// (`no_live_code_works_out_a_seat` holds that).
+pub use crate::desk_legacy::{
+    amp_pedal_of, amp_pedal_seat, bus_extra_of, bus_extra_seat, folder_extra_of, folder_extra_seat,
+    pad_insert_index, pad_rack_index, pedal_owner, rack_owner, seat_bay, BUSES, BUS_EXTRA_SEATS,
+    EXTRA_PAD_SEATS, FOLDER_EXTRA_SEATS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
+};
 
 /// How many pedal seats each channel owns for the amp's pedalboard.
 ///
@@ -1419,155 +1293,6 @@ pub const AMP_DEFAULT_BOARD: [&str; AMP_PEDALS] = [
     "@tangent-plate",
 ];
 
-/// **Where the amp-pedal seats begin** - seven appended seats per channel,
-/// the pedalboard the amp wears when it sits in a channel bay. Appended
-/// after the folder-extra block, for the reason `MASTER_EXTRA_SEAT`
-/// records: an appended seat changes no index anybody has already written
-/// down, the settings reader re-pads `strip_inserts` to the grown
-/// `INSERT_SPACE`, and the state sidecars are named by seat index going
-/// forward.
-///
-/// A pedal seat is an ordinary rack - VST3s are legal tenants - that the
-/// engine runs IN ORDER over the amp's input, before the amp's own bay.
-/// Only a CHANNEL's amp gets them: an amp on the master, a bus or a
-/// folder's extra rack plays bare in v1.
-pub const AMP_PEDAL_SEATS: usize = FOLDER_EXTRA_SEATS + CHANNELS;
-
-/// Channel `ch`'s pedal `pedal` seat. One function, same reason as
-/// `pad_rack_index`: a call site that recomputes this edits somebody
-/// else's plugin.
-pub const fn amp_pedal_seat(ch: usize, pedal: usize) -> usize {
-    AMP_PEDAL_SEATS + ch * AMP_PEDALS + pedal
-}
-
-/// The inverse: which channel's which pedal a seat is, or `None` for a
-/// seat outside the pedal block. What lets a reorder carry a picker aimed
-/// at a pedal without the call site re-deriving the block's shape.
-pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
-    if seat < AMP_PEDAL_SEATS {
-        return None;
-    }
-    let at = seat - AMP_PEDAL_SEATS;
-    let ch = at / AMP_PEDALS;
-    (ch < CHANNELS).then_some((ch, at % AMP_PEDALS))
-}
-
-/// **Whose pedalboard a rack seat wears** — the one question every part of
-/// the amp's board should be asking, and the one none of them used to.
-///
-/// A channel answers itself. A folder's EXTRA seat answers the channel that
-/// owns it, because a folder is a channel with six bays and a channel has
-/// exactly one board (`AMP_PEDALS` seats, appended once per channel). The
-/// master, the buses, the pads and the pedal seats themselves answer `None`:
-/// there is no board there and never was.
-///
-/// **Why one function rather than the test each caller was making.** Three
-/// places asked `seat < CHANNELS` and meant "does this seat get a board" —
-/// the amp face's chip row, the picker the chips open, and the
-/// default-board seeding — and the engine asked a fourth version of it by
-/// running the board only in the lane pass, which a folder never reaches.
-/// All four agreed, and all four were wrong the same way: an amp dropped
-/// into a folder's second rack drew no board, and an amp in a folder's FIRST
-/// rack drew a board that made no sound. Answering it in one place is the
-/// argument `pad_rack_index` and `amp_pedal_seat` already make on this
-/// module — a call site that recomputes the seat map edits somebody else's
-/// plugin — with the sharper version for this map: a call site that
-/// recomputes it here does not edit the wrong plugin, it silently declines
-/// to run the right one.
-///
-/// A folder's two racks therefore SHARE one board. That is the v1 answer to
-/// "a channel owns one board and a folder wants it twice", and it is written
-/// here rather than left to the caller: the board runs once, at the top of
-/// the fold, over the summed group — see the engine's `run_pedalboard`.
-pub fn pedal_owner(seat: usize) -> Option<usize> {
-    if seat < CHANNELS {
-        return Some(seat);
-    }
-    folder_extra_of(seat)
-}
-
-/// **Where the BUSES' extra bays begin** — one appended seat per bus, so a
-/// bus can wear six the way a channel and the master already do.
-///
-/// The CLICK is the one bus with a column on the desk, and the owner asked
-/// for it to match a track: "make the click have 6 fx slots so it matches the
-/// layout of the other tracks". The other two are mapped anyway rather than
-/// special-cased, because a seat map with a hole in it is a hole somebody
-/// finds by loading a plugin into it.
-///
-/// Appended, for the reason `MASTER_EXTRA_SEAT` records at length: an
-/// appended seat changes no index anybody has already written down, and this
-/// array grows by appending.
-pub const BUS_EXTRA_SEATS: usize = AMP_PEDAL_SEATS + CHANNELS * AMP_PEDALS;
-
-/// The number of buses — every strip past the channels. Three: the drum bus,
-/// the click and the effects return.
-pub const BUSES: usize = STRIPS - CHANNELS;
-
-/// Bus `desk_index`'s extra seat. `desk_index` is a DESK index in
-/// `Strip::index` space, so `CHANNELS..STRIPS`; anything else is not a bus
-/// and gets the first seat, which is the same "answer rather than panic"
-/// `pad_rack_index` and its neighbours make.
-pub const fn bus_extra_seat(desk_index: usize) -> usize {
-    if desk_index < CHANNELS || desk_index >= STRIPS {
-        return BUS_EXTRA_SEATS;
-    }
-    BUS_EXTRA_SEATS + (desk_index - CHANNELS)
-}
-
-/// Every rack seat: strips, master, the first pad block, the master's
-/// extra, a pad block for each channel after the first, a folder-extra
-/// seat per channel, seven pedal seats per channel, and one extra seat per
-/// bus.
-pub const TOTAL_SEATS: usize = BUS_EXTRA_SEATS + BUSES;
-
-/// **The channel permutation lifted onto the WHOLE seat space.** Channel
-/// rows move, each folder-extra seat follows its channel, and every other
-/// seat - buses, master, pads, the master's extra - stays put, per the
-/// reorder rule written on the desktop's permute machinery. `order[new] =
-/// old`, and the same here.
-pub fn seat_order(order: &[usize]) -> Vec<usize> {
-    let mut full: Vec<usize> = (0..TOTAL_SEATS).collect();
-    for (new, old) in order.iter().enumerate() {
-        if new < CHANNELS && *old < CHANNELS {
-            full[new] = *old;
-            full[folder_extra_seat(new)] = folder_extra_seat(*old);
-            // The pedalboard travels with its channel too, exactly as the
-            // folder-extra seat does: a reorder that left the pedals behind
-            // would hand one channel's board to whoever took its row.
-            for pedal in 0..AMP_PEDALS {
-                full[amp_pedal_seat(new, pedal)] = amp_pedal_seat(*old, pedal);
-            }
-        } else if new != *old {
-            // A SEAT-space entry - the drumpad's pad-FX swap permutes pad
-            // seats directly - passes through untouched. Dropping these to
-            // identity silently parted two pads' plugins from their state
-            // files on every swap.
-            if let (Some(slot), true) = (full.get_mut(new), *old < TOTAL_SEATS) {
-                *slot = *old;
-            }
-        }
-    }
-    full
-}
-
-/// **Where channel `ch`'s pad `pad` keeps its bays.**
-///
-/// One function, because the alternative is every call site remembering
-/// that channel 0 is the odd one out — and a call site that forgets edits
-/// somebody else's plugin.
-pub const fn pad_rack_index(ch: usize, pad: usize) -> usize {
-    if ch == 0 {
-        STRIPS + 1 + pad
-    } else {
-        EXTRA_PAD_SEATS + (ch - 1) * DRUM_PADS + pad
-    }
-}
-
-/// How long the whole insert space is: every strip, the master, every pad of
-/// every channel, and the master's second rack.
-pub const INSERT_SPACE: usize = TOTAL_SEATS * INSERTS;
-
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
 /// How many pads the drumpad addresses: EVERY MIDI key. Pad `n` IS note
@@ -1588,12 +1313,6 @@ pub const DRUM_PAGE_ANCHOR: usize = 4;
 
 /// How many pages the band offers: bases 4, 20, …, 116.
 pub const DRUM_PAGES: usize = 8;
-
-/// Where pad `i`'s insert bays live in the strip-indexed insert space:
-/// after every strip and the master. One seat map, mirrored by the engine.
-pub const fn pad_insert_index(pad: usize) -> usize {
-    STRIPS + 1 + pad
-}
 
 /// The MIDI note of pad 0. ZERO now — pad `n` answers note `n`, the whole
 /// keyboard. The classic kit's C1 home (36) is where the default PAGE
@@ -1758,8 +1477,9 @@ impl std::fmt::Display for Column {
 ///
 /// The ONE home of strip-index arithmetic until the specials leave strip
 /// space (W5). The desk arrays (`strip_names`, `strip_sends`, the mute and
-/// solo masks, the meter holds, the insert seats) are laid out as the rows,
-/// then the drum bus, the click and the effects return, then the master;
+/// solo masks, the meter holds) are laid out as the rows, then the drum
+/// bus, the click and the effects return, then the master; the plugin bays
+/// are not among them any more, being keyed by identity (`desk_id::SeatBay`);
 /// every other piece of code asks this type where something lives instead
 /// of adding a width to an index. The views do no such sums at all: a scan
 /// (`no_view_code_does_strip_index_arithmetic`) holds them to it, so the day
@@ -5311,7 +5031,7 @@ mod tests {
     fn a_folders_six_slots_have_their_own_appended_seats() {
         use super::{
             amp_pedal_of, amp_pedal_seat, bays_on, folder_extra_seat, pad_rack_index, seat_bay,
-            seat_order, Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
+            Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
             MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
         };
         // The counts: **every channel wears six**, folder or not — the
@@ -5380,39 +5100,10 @@ mod tests {
             "the last pedal bay is past the end of the insert space"
         );
 
-        // **seat_order carries the extra seat AND the pedalboard with its
-        // channel** and moves nothing else - two channel rows, two folder
-        // seats and two boards of seven for one swap, identity elsewhere.
-        let mut order: Vec<usize> = (0..CHANNELS).collect();
-        order.swap(2, 5);
-        let full = seat_order(&order);
-        assert_eq!(full.len(), TOTAL_SEATS);
-        assert_eq!(full[2], 5);
-        assert_eq!(full[5], 2);
-        assert_eq!(full[folder_extra_seat(2)], folder_extra_seat(5));
-        assert_eq!(full[folder_extra_seat(5)], folder_extra_seat(2));
-        for pedal in 0..AMP_PEDALS {
-            assert_eq!(full[amp_pedal_seat(2, pedal)], amp_pedal_seat(5, pedal));
-            assert_eq!(full[amp_pedal_seat(5, pedal)], amp_pedal_seat(2, pedal));
-        }
-        assert_eq!(full[MASTER_SEAT], MASTER_SEAT);
-        assert_eq!(full[MASTER_EXTRA_SEAT], MASTER_EXTRA_SEAT);
-        assert_eq!(
-            (0..TOTAL_SEATS).filter(|i| full[*i] != *i).count(),
-            4 + 2 * AMP_PEDALS,
-            "the swap moved more than its own rows"
-        );
-
-        // And a SEAT-space permutation - the pad-FX swap's shape - passes
-        // through instead of collapsing to identity, which silently parted
-        // two pads' plugins from their state files.
-        let (a, b) = (pad_rack_index(0, 3), pad_rack_index(0, 7));
-        let mut pads: Vec<usize> = (0..TOTAL_SEATS.min(b + 1).max(b + 1)).collect();
-        pads[a] = b;
-        pads[b] = a;
-        let lifted = seat_order(&pads);
-        assert_eq!(lifted[a], b, "the pad swap was dropped");
-        assert_eq!(lifted[b], a, "the pad swap was dropped");
+        // `seat_order`, which lifted a channel order onto every seat, is
+        // gone with the seats themselves (W5): a reorder moves no plugin, so
+        // there is no order to lift, and a pad swap is a relabel of two
+        // pads' bays by identity (`TangentApp::swap_pads`).
     }
 
     /// **A folder-extra seat names its own channel, and nothing else does.**
@@ -6827,6 +6518,94 @@ mod strip_ref_tests {
             "let m = MASTER_LANE;",
         ] {
             assert!(!banned_in(planted).is_empty(), "the scan is blind to `{planted}`");
+        }
+    }
+
+    /// **The seat map's names** (`desk_legacy`'s retired half): none may be
+    /// spelled by live code outside the map, because each one is a way to
+    /// work out a seat, and a bay is named by identity now.
+    const RETIRED_SEAT_NAMES: [&str; 21] = [
+        "seat_bay", "rack_owner", "bus_extra_of", "folder_extra_seat", "folder_extra_of", "amp_pedal_seat",
+        "amp_pedal_of", "pedal_owner", "bus_extra_seat", "pad_rack_index", "pad_insert_index", "seat_order",
+        "MASTER_SEAT", "MASTER_EXTRA_SEAT", "EXTRA_PAD_SEATS", "FOLDER_EXTRA_SEATS", "AMP_PEDAL_SEATS",
+        "BUS_EXTRA_SEATS", "TOTAL_SEATS", "INSERT_SPACE", "BUSES",
+    ];
+
+    /// Every line of `code` that spells a retired seat name, as a word.
+    fn seat_names_in(code: &str) -> Vec<String> {
+        code.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| RETIRED_SEAT_NAMES.contains(&w))
+            })
+            .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
+            .collect()
+    }
+
+    /// The modules `lib.rs` compiles only under test: whatever they spell is
+    /// a fixture's business.
+    fn test_only_modules(lib: &str) -> Vec<String> {
+        let lines: Vec<&str> = lib.lines().collect();
+        lines
+            .windows(2)
+            .filter(|w| w[0].trim() == "#[cfg(test)]")
+            .filter_map(|w| {
+                let rest = w[1].trim().strip_prefix("pub(crate) ").unwrap_or(w[1].trim());
+                Some(format!("{}.rs", rest.strip_prefix("mod ")?.trim_end_matches(';').trim()))
+            })
+            .collect()
+    }
+
+    /// **No live code in this crate works out a seat** (W5-identity-maps:
+    /// "no seat arithmetic in tangent-ui outside desk_legacy"). The seat
+    /// map's names are spelled only in `desk_legacy`, which IS the frozen
+    /// map, and in the one re-export above that the host's readers still
+    /// reach it by. Every other file names a bay by identity; a host-facing
+    /// `(seat, bay)` crosses through `desk_legacy::bay_at` and `seat_of`,
+    /// which are the map, not arithmetic on it. Test modules are left to
+    /// their fixtures.
+    ///
+    /// Revert-check: put `let (seat, bay) = recorder::seat_bay(n, bay);`
+    /// back into `apply_arrange_action`'s `HdrBay` arm and this names it.
+    #[test]
+    fn no_live_code_works_out_a_seat() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib = std::fs::read_to_string(dir.join("lib.rs")).expect("lib.rs");
+        let skip = test_only_modules(&lib);
+        assert!(skip.iter().any(|m| m == "era_corpus.rs"), "fixture: the test-only modules were not found: {skip:?}");
+        let mut bad = Vec::new();
+        let mut read = 0;
+        for entry in std::fs::read_dir(&dir).expect("the source dir") {
+            let path = entry.expect("an entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if !name.ends_with(".rs") || name == "desk_legacy.rs" || skip.contains(&name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            read += 1;
+            let mut code = code_of(&text);
+            if name == "recorder.rs" {
+                // The re-export the host's readers use, and nothing else.
+                let at = code.find("pub use crate::desk_legacy::{").expect("the re-export");
+                let end = at + code[at..].find("};").expect("its end") + 2;
+                code.replace_range(at..end, "");
+            }
+            for hit in seat_names_in(&code) {
+                bad.push(format!("{name}:{hit}"));
+            }
+        }
+        assert!(read > 40, "the scan read {read} files: it is not reading the crate");
+        assert!(bad.is_empty(), "live code works out a seat:\n  {}", bad.join("\n  "));
+        // And the scan sees what it bans.
+        for planted in [
+            "let (seat, bay) = recorder::seat_bay(n, bay);",
+            "self.set_insert(recorder::MASTER_SEAT, 2, None);",
+            "let seat = crate::desk_legacy::amp_pedal_seat(ch, 2);",
+        ] {
+            assert!(!seat_names_in(planted).is_empty(), "the scan is blind to `{planted}`");
         }
     }
 }

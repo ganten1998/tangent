@@ -90,7 +90,7 @@ pub(crate) fn observe_settings(text: &str) -> String {
         format!(
             "inserts {}",
             occupied(
-                s.strip_inserts
+                s.legacy_inserts()
                     .iter()
                     .take(V32_INSERT_SPACE)
                     .enumerate()
@@ -120,7 +120,7 @@ pub(crate) fn observe_document(text: &str) -> String {
         format!("colors {}", json(&d.colors)),
         format!("sends {}", json(&d.sends)),
         format!("names {}", json(&d.names)),
-        format!("inserts {}", occupied(d.inserts.iter().map(|(b, p)| (*b, p.as_str())))),
+        format!("inserts {}", occupied(d.legacy_bays().iter().map(|(b, p)| (*b, p.as_str())))),
         format!("muted {:#x} soloed {:#x} phase {:?}", d.muted, d.soloed, d.phase),
         format!("tracks_added {:#x} armed {:#x}", d.tracks_added, d.armed),
         format!("curves {}", curves.join(" ")),
@@ -409,10 +409,10 @@ fn a_27_sends_file_lifts() {
     assert_eq!(&s.strip_colors[32..36], &[124, 125, 126, 127], "the buses and master");
     assert_eq!(&s.strip_colors[24..32], &[0; 8], "the widened channels came up painted");
     assert_eq!(s.strip_names[35], "s27", "the master's name");
-    assert_eq!(s.strip_inserts[32 * 3], "/x/s24.vst3", "the drum bus's bay");
-    assert_eq!(s.strip_inserts[35 * 3 + 2], "/x/s27b2.vst3", "the master's bay");
-    assert_eq!(s.strip_inserts[164 * 3 + 1], "/x/master-extra.vst3", "the master's extra rack");
-    assert_eq!(s.strip_inserts[(165 + 2 * 128 + 5) * 3], "/x/c3pad5.vst3", "channel 3's pad 5");
+    assert_eq!(s.legacy_inserts()[32 * 3], "/x/s24.vst3", "the drum bus's bay");
+    assert_eq!(s.legacy_inserts()[35 * 3 + 2], "/x/s27b2.vst3", "the master's bay");
+    assert_eq!(s.legacy_inserts()[164 * 3 + 1], "/x/master-extra.vst3", "the master's extra rack");
+    assert_eq!(s.legacy_inserts()[(165 + 2 * 128 + 5) * 3], "/x/c3pad5.vst3", "channel 3's pad 5");
     assert_eq!(s.strip_muted, (1 << 33) | (1 << 2), "the muted click");
     assert_eq!(s.strip_soloed, (1 << 34) | (1 << 21), "the soloed fx");
     assert_eq!(s.strip_phase, (1 << 32) | (1 << 35) | (1 << 3), "the inverted drum bus and master");
@@ -421,7 +421,8 @@ fn a_27_sends_file_lifts() {
     let a = Arrangement::from_json(text);
     let d = a.desk.as_ref().expect("a desk");
     assert_eq!(&d.colors[32..36], &[124, 125, 126, 127], "the document's buses and master");
-    let seat = |bay: usize| d.inserts.iter().find(|(b, _)| *b == bay).map(|(_, p)| p.as_str());
+    let bays = d.legacy_bays();
+    let seat = |bay: usize| bays.iter().find(|(b, _)| *b == bay).map(|(_, p)| p.as_str());
     assert_eq!(seat(32 * 3), Some("/x/drumbus.vst3"));
     assert_eq!(seat(35 * 3 + 2), Some("/x/master.vst3"));
     assert_eq!(d.muted, (1 << 33) | (1 << 23), "the document's muted click");
@@ -495,8 +496,9 @@ fn provenance_agrees_with_the_reader(window: DeskEra) {
         let desk = read.desk.expect("a desk");
         let dense = doc["desk"]["inserts"].as_array().map_or(0, Vec::len);
         let tail = doc["desk"]["inserts_tail"].as_object().map_or(0, |t| t.len());
-        assert_eq!(desk.inserts.len(), dense + tail, "{name}: a bay was lost or made up");
-        for (bay, path) in &desk.inserts {
+        let flat = desk.legacy_bays();
+        assert_eq!(flat.len(), dense + tail, "{name}: a bay was lost or made up");
+        for (bay, path) in &flat {
             let legacy: u32 = path.strip_prefix("/tag/").and_then(|n| n.parse().ok()).expect("tag");
             assert_eq!(
                 p.legacy_bay(*bay as u32),
@@ -751,9 +753,9 @@ fn a_24_channel_window_shelf_survives_a_load_and_save_untouched() {
         let dir = legacy_shelf(tag, &legacy);
         let before = shelf_bytes(&dir);
         let opened = Settings::from_json(text);
-        let lost = host_load_and_save(&dir, opened.strip_inserts.iter().map(String::as_str).enumerate());
+        let lost = host_load_and_save(&dir, opened.legacy_inserts().iter().map(String::as_str).enumerate());
         let reopened = Settings::from_json(&opened.to_json());
-        host_load_and_save(&dir, reopened.strip_inserts.iter().map(String::as_str).enumerate());
+        host_load_and_save(&dir, reopened.legacy_inserts().iter().map(String::as_str).enumerate());
         let after = shelf_bytes(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         (before, after, lost, opened.shelf_shuffles())
@@ -777,10 +779,10 @@ fn a_24_channel_window_shelf_survives_a_load_and_save_untouched() {
         let before = shelf_bytes(&dir);
         let opened = Arrangement::from_json(text);
         let desk = opened.desk.as_ref().expect("a desk");
-        let lost = host_load_and_save(&dir, desk.inserts.iter().map(|(b, p)| (*b, p.as_str())));
+        let lost = host_load_and_save(&dir, desk.legacy_bays().iter().map(|(b, p)| (*b, p.as_str())));
         let reopened = Arrangement::from_json(&opened.to_json());
         let desk = reopened.desk.as_ref().expect("a desk");
-        host_load_and_save(&dir, desk.inserts.iter().map(|(b, p)| (*b, p.as_str())));
+        host_load_and_save(&dir, desk.legacy_bays().iter().map(|(b, p)| (*b, p.as_str())));
         let after = shelf_bytes(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         (before, after, lost)
@@ -1251,7 +1253,7 @@ fn a_refused_desk_refuses_the_open_and_rides_a_daw_blob() {
     b["theme_name"] = Value::from("Kept Theme");
     let s = Settings::from_json(&b.to_string());
     assert_eq!(s.theme_name, "Kept Theme", "a refused desk cost another setting");
-    assert_eq!(s.strip_inserts, Settings::default().strip_inserts, "the desk is not the default desk");
+    assert_eq!(s.legacy_inserts(), Settings::default().legacy_inserts(), "the desk is not the default desk");
     assert_eq!(s.extra.get("desk_refused"), Some(&b["desk"]), "the raw desk was not kept");
     assert!(s.desk_notice.as_deref().is_some_and(|n| n.contains("could not be read")), "the refusal was not said");
     let saved = Settings::from_json(&s.to_json());
