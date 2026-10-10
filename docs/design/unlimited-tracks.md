@@ -1799,6 +1799,23 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 - *A pad's bay has no engine name while its lane has no pad bank* (`Bridge::engine_bay`), and the engine makes no pad rack for such a lane (`HostSlot::banked`): a pad effect seated before its track's kit now waits for the kit rather than going home with its rack.
 - *A lane that comes or goes leaves no record of a sampler's file at its slot* (`forget_moved_slots`): the file is the lane's own, and marking every installed slot owed made a wide desk's reload hand an empty file to each new lane first.
 
+### W7-join
+
+**Added 2026-10-10 at the W7-buses-ui + W7-slot-gaps merge (a187cfd).** What only the merged tree can finish: the two lanes' hand-offs to each other, the review findings both lanes' skeptics upheld but whose fix rounds left them (low severity), and one defect seen but not fixed. The merge itself already joined the plan's sends: `Bridge::plan_sends` = `knob_sends` (Fx entries) + `read_sends` (sends to buses), carried between plans by buses-ui's one `carry_scales` (keep it the only carry).
+
+1. **Send curves play.** Give `engine_bridge::send_bus_of` its body (`AutoParam::SendTo { to } => Some(to)`), make `slot_gaps::send_to` answer `AutoParam::SendTo { to: bus }`, and set `tangent_ui::automation::SEND_CURVES_PLAY = true` in the same commit. Mind buses-ui's note at the switch: the engine names a send by its two ends, so one engine curve would drive a strip's pre- AND post-fader sends to one bus together, while the app's curve belongs to the post-fader send alone: make the engine curve drive only the send the app's curve names (or prove the twin cannot reach the engine and pin it). `bus_e2e::the_send_curve_switch_says_what_an_export_plays` and the app tests' "played" branches must pass with the switch on; the "not played" branches go (the switch can be removed outright if nothing else reads it).
+2. **Un-ignore the two MERGE-ME width tests** in `tangent/src/slot_gaps.rs` (`a_key_reaches_a_comp_on_a_bus_past_slot_31_as_on_row_1_live_and_in_the_export`, `a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export`). They have never run: make them pass for real (fix the code, not the numbers), and add the bridge-level key-to-bus test and the live/export bridge tests for item 6 of W7-slot-gaps (dry stem, bare drum bus or click into a lookahead bus) now that the bridge marks bus lanes.
+3. **Upheld review findings left open (W7-buses-ui):**
+   - The UI and the bridge disagree on what a bus send is: the UI counts any send whose target is a Track node, the bridge plays only sends whose target row is a bus. Make them one rule, in one function both read (a send to a non-bus row stays legal in format 2 per the round-trip test, but it must not be offered, drawn or counted as a send in the UI).
+   - Pasting a copied bus mints the row's id twice (`paste_track_inner` then `set_channel_kind`). Mint once.
+   - `retarget_row` rewrites `AutoParam::SendTo { to }` curves but not the UI automation state keyed by (Node, AutoParam): `arr_auto_open`, `arr_auto_armed` and their kin. Rewrite those too.
+4. **Seen, not fixed (W7-slot-gaps fix round):** picking the drumpad into a track's first bay does not mark the kit owed; if another drum lane's kit has already landed, `reload_pads` does not run and this track's kit is not sent until another kit edit or a reopen. Prove with a test, then fix.
+5. **Tidy:** the `cfg_attr(not(test), allow(dead_code))` on `Engine::set_send_level` is stale (the bridge calls it in production): remove it. Update this document's "Still bound to the legacy slots" bullet and the W7-slot-gaps note to say what the join finished.
+
+**Files.** tangent/src/engine_bridge.rs, tangent/src/slot_gaps.rs, tangent/src/bus_e2e.rs, tangent/src/instrument.rs, tangent/src/desktop.rs, tangent-ui/src/{app.rs, app_bus_tests.rs, automation.rs, desk_model.rs, mixer_panel.rs, dialogs.rs}, this document. One lane; no siblings.
+
+**Done when.** Every item has a test that fails with its fix reverted; the two width tests run un-ignored at {31, 32, 33, 40, 200}; no MERGE-ME naming W7-buses-ui or W7-slot-gaps item 5 remains; the full gate is green.
+
 ### W7-scale-and-budgets
 
 **Goal.** Measure and tune at scale:
