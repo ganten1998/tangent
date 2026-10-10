@@ -14210,6 +14210,46 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         })
     }
 
+    /// **The folder a save panel's answer will make the project's home**,
+    /// asked BEFORE the save runs: [`Self::chosen_project_dir`]'s answer for
+    /// Save As (`ProjectCopy`, wrapped in the project's name) and for the
+    /// first save (`ProjectFirst`, wrapped in the name typed), and `None`
+    /// where that save refuses (the template shelf, said by the save itself
+    /// when it runs) or for any other purpose.
+    ///
+    /// For the host's plugin states (design 6.6: no save road may leave a
+    /// plugin at its defaults). Both roads write the document into a folder
+    /// that holds no `state/` until the host mirrors the live shelf into it
+    /// a moment later, so the host writes down that the mirror is owed to
+    /// this folder before the document lands, and a launch after a kill in
+    /// between pays it. The wraps are the two roads' own, word for word.
+    pub fn save_choice_dir(
+        &mut self,
+        purpose: crate::ports::SavePurpose,
+        target: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let wrap = match purpose {
+            crate::ports::SavePurpose::ProjectCopy => {
+                let n = self.project_name();
+                let n = n.trim().to_owned();
+                if n.is_empty() { "Untitled".to_owned() } else { n }
+            }
+            crate::ports::SavePurpose::ProjectFirst => {
+                let stem = target
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if stem.trim().is_empty() { "Untitled".to_owned() } else { stem }
+            }
+            _ => return None,
+        };
+        // Asked first so a refusal says nothing here: the save says it.
+        if inside_template_shelf(target, &self.project_root()) {
+            return None;
+        }
+        self.chosen_project_dir(target, &wrap)
+    }
+
     /// **The FIRST save of a session: the panel names its home, and the
     /// session moves there whole.** `true` when it did.
     ///
