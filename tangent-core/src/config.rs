@@ -19,28 +19,21 @@
 //! scanned in the background by somebody else's DAW must not be deleting
 //! directories in the user's home.
 //!
-//! **An internal build keeps its own directory.** While [`STAGING`] is on
-//! (the unlimited-tracks branch, until its last wave), the answer is
-//! `~/.config/tangent-staging`: a build that writes settings, plugin states
-//! and a licence in a format no release can read must never be pointed at
-//! the release install by accident. `TANGENT_CONFIG_DIR` points either kind
-//! of build anywhere, which makes using real files a deliberate act.
+//! **`TANGENT_CONFIG_DIR` points a build anywhere**, a developer's switch:
+//! a build under test, or one pointed at a copy of somebody's files, reads
+//! and writes there and leaves `~/.config/tangent` alone. The
+//! unlimited-tracks branch kept its internal builds in
+//! `~/.config/tangent-staging` this way round, automatically, until its last
+//! wave; the first build after it is the one that opens the real directory
+//! and migrates it (settings.json is copied to `settings.pre-v23.json` before
+//! the first format-2 write, and no legacy plugin-state file is renamed or
+//! deleted).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The directory name in use since 5.0.
 const NAME: &str = "tangent";
-
-/// **This build is an internal one**, and keeps its config (and, through
-/// `Settings::media_root`, its media) apart from the release install's.
-/// True on the unlimited-tracks branch from its first wave and deleted in
-/// its last; nothing on the branch may touch the owner's real files before
-/// then.
-pub const STAGING: bool = true;
-
-/// The internal build's directory name, beside the release one.
-const STAGING_NAME: &str = "tangent-staging";
 
 /// The override, honoured by every build. An empty value is not a path:
 /// it would put the config in the working directory.
@@ -55,19 +48,18 @@ fn config_root() -> PathBuf {
         .join(".config")
 }
 
-/// `~/.config/tangent`, or `~/.config/tangent-staging` in an internal
-/// build, or `TANGENT_CONFIG_DIR` when it is set.
+/// `~/.config/tangent`, or `TANGENT_CONFIG_DIR` when it is set.
 pub fn dir() -> PathBuf {
-    dir_from(std::env::var_os(OVERRIDE), config_root(), STAGING)
+    dir_from(std::env::var_os(OVERRIDE), config_root())
 }
 
-/// [`dir`] with its three inputs named, so the choice can be tested
-/// without touching the process environment or the real home.
-fn dir_from(over: Option<OsString>, root: PathBuf, staging: bool) -> PathBuf {
+/// [`dir`] with its two inputs named, so the choice can be tested without
+/// touching the process environment or the real home.
+fn dir_from(over: Option<OsString>, root: PathBuf) -> PathBuf {
     if let Some(p) = over.filter(|p| !p.is_empty()) {
         return PathBuf::from(p);
     }
-    root.join(if staging { STAGING_NAME } else { NAME })
+    root.join(NAME)
 }
 
 /// `dir()` with a file name on the end.
@@ -87,14 +79,7 @@ pub fn file(name: &str) -> PathBuf {
 /// never ran a pre-5.0 build is the common case, not a fault.
 ///
 /// Answers whether it removed anything, for the log.
-///
-/// **Never in an internal build**: deleting anything in the real home is
-/// the release's business, and [`STAGING`] exists so that nothing on the
-/// branch touches it.
 pub fn purge_pre_5_0() -> bool {
-    if STAGING {
-        return false;
-    }
     let old = config_root().join(PRE_5_0);
     // `is_dir` follows symlinks, and a symlink here would make the recursive
     // delete walk into wherever it points. Refuse anything that is not a real
@@ -112,30 +97,25 @@ pub fn purge_pre_5_0() -> bool {
 mod tests {
     use super::*;
 
-    /// **One name per kind of build, and the override wins.** Was "one
-    /// name, always"; an internal build now answers its own name, which is
-    /// the whole of the change, so both answers are pinned here through the
-    /// pure chooser rather than by reading the process environment.
+    /// **One name, and the override wins.** It was one name until the
+    /// unlimited-tracks branch gave its internal builds a twin
+    /// (`tangent-staging`), and it is one name again since that branch's
+    /// last wave; pinned through the pure chooser rather than by reading the
+    /// process environment, so the override's answer is pinned too.
     #[test]
-    fn the_config_directory_is_tangent_or_its_staging_twin_and_nothing_else() {
+    fn the_config_directory_is_tangent_and_the_override_wins() {
         let root = PathBuf::from("/home/someone/.config");
-        assert_eq!(dir_from(None, root.clone(), false), root.join("tangent"));
-        assert_eq!(dir_from(None, root.clone(), true), root.join("tangent-staging"));
-        // The override wins in both kinds of build; an empty one does not.
+        assert_eq!(dir_from(None, root.clone()), root.join("tangent"));
+        // The override wins; an empty one does not.
         let over = Some(OsString::from("/elsewhere/cfg"));
-        assert_eq!(dir_from(over.clone(), root.clone(), true), PathBuf::from("/elsewhere/cfg"));
-        assert_eq!(dir_from(over, root.clone(), false), PathBuf::from("/elsewhere/cfg"));
-        assert_eq!(dir_from(Some(OsString::new()), root.clone(), true), root.join("tangent-staging"));
+        assert_eq!(dir_from(over, root.clone()), PathBuf::from("/elsewhere/cfg"));
+        assert_eq!(dir_from(Some(OsString::new()), root.clone()), root.join("tangent"));
 
-        // And the live answer is the chooser's, on this build's switch.
+        // And the live answer is the chooser's.
         let d = dir();
-        assert_eq!(d, dir_from(std::env::var_os(OVERRIDE), config_root(), STAGING));
+        assert_eq!(d, dir_from(std::env::var_os(OVERRIDE), config_root()));
         if std::env::var_os(OVERRIDE).is_none() {
-            assert!(
-                d.ends_with(if STAGING { STAGING_NAME } else { NAME }),
-                "the config directory is {}",
-                d.display()
-            );
+            assert!(d.ends_with(NAME), "the config directory is {}", d.display());
         }
         assert_eq!(
             file("license.key"),
@@ -146,15 +126,6 @@ mod tests {
             !d.to_string_lossy().contains(PRE_5_0),
             "the pre-5.0 name is still reachable as a read path"
         );
-    }
-
-    /// **An internal build is staged, and its purge deletes nothing.**
-    /// The branch's builds share a machine with the owner's release install;
-    /// this is the switch that keeps them apart until the last wave.
-    #[test]
-    fn this_branch_is_staged_and_its_purge_is_inert() {
-        assert!(STAGING, "the unlimited-tracks branch builds are internal until wave 8");
-        assert!(!purge_pre_5_0(), "an internal build purged something in the real home");
     }
 
     /// **The purge takes a real directory and refuses a symlink.**

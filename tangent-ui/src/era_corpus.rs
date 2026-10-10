@@ -968,11 +968,15 @@ fn outside_test_modules(src: &str) -> Vec<(usize, &str)> {
 }
 
 /// **No code but the two choosers spells the real config directory or the
-/// real media root**, so STAGING cannot be routed around by a second copy
-/// of either path. `tangent_core::config::dir` is the config's only home
-/// and `Settings::default_media_root` the media's; a test fixture that names
-/// a folder of that name under a temp root is not a path to the owner's
-/// files, so tests are read past their `#[cfg(test)]`.
+/// real media root**, so `TANGENT_CONFIG_DIR` and `TANGENT_MEDIA_ROOT`
+/// cannot be routed around by a second copy of either path.
+/// `tangent_core::config::dir` is the config's only home and
+/// `Settings::default_media_root` the media's; a test fixture that names a
+/// folder of that name under a temp root is not a path to the owner's
+/// files, so tests are read past their `#[cfg(test)]`. The staging twins
+/// the unlimited-tracks branch gave its internal builds
+/// (`~/.config/tangent-staging`, `Documents/Tangent Media Staging`) went
+/// with its last wave, and no code may spell either again.
 #[test]
 fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -995,7 +999,14 @@ fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
                 let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
                 for (n, line) in outside_test_modules(&src) {
                     let line = line.split("//").next().unwrap_or("");
-                    for spelled in ["\"Tangent Media", "\".config\"", "\".config/", "join(\"tangent\")", "\"tangent-staging\""] {
+                    for spelled in [
+                        "\"Tangent Media",
+                        "\".config\"",
+                        "\".config/",
+                        "join(\"tangent\")",
+                        "\"tangent-staging",
+                        "Media Staging",
+                    ] {
                         if !line.contains(spelled) {
                             continue;
                         }
@@ -1003,14 +1014,14 @@ fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
                             // The chooser, and the per-thread test root.
                             "\"Tangent Media" => {
                                 rel == "tangent-ui/src/settings.rs"
-                                    && (line.contains("Tangent Media Staging") || line.contains("test_path()"))
+                                    && (line.contains(".join(\"Tangent Media\")") || line.contains("test_path()"))
                             }
                             "\".config\"" => {
                                 rel == "tangent-core/src/config.rs"
                                 // The XDG user-dirs file, not Tangent's config.
                                 || rel == "tangent-record/src/take.rs"
                             }
-                            "\"tangent-staging\"" => rel == "tangent-core/src/config.rs",
+                            // The staging twins, anywhere.
                             _ => false,
                         };
                         if !allowed {
