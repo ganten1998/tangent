@@ -12,12 +12,22 @@
 //!   channel MOVES it there"), and the engine enforces it by closing the
 //!   channel's direct path to the master for as long as such a route exists
 //!   (`route_direct` in `instrument.rs`). For a COPY — the classic reverb
-//!   feed — the strip's SEND knob into the effects bus is the copy; calling
-//!   both of them "send" is how you end up expecting to hear a track twice.
+//!   feed — a SEND is the copy: the strip's knob into the effects return,
+//!   or a send to any bus or return row (`desk_model::Send`, which lives on
+//!   the strip, not here). Calling both of them "send" is how you end up
+//!   expecting to hear a track twice.
 //!
 //! **No duplicates**, by the owner's word: the same channel to the same
 //! destination twice is two faders fighting over one path, and nobody means
 //! that. [`Routes::add`] refuses it rather than silently merging.
+//!
+//! **And no count.** The table is as long as the desk makes it, on every
+//! tier: a route is not a track, and the engine plans every route it is
+//! handed (`desk_plan::RouteTable`, built on the UI thread and moved in
+//! whole), so there is no fixed table on the audio thread for a cap to
+//! protect any more. What a picker refuses is a route that would close a
+//! loop (`desk_topology::would_cycle`), which is a fact about the desk and
+//! not a number.
 //!
 //! **Both ends by identity** ([`Node`], [`SeatBay`]). A route used to name
 //! its tracks by row and a key its bay by strip and slot, so every
@@ -34,16 +44,6 @@ use serde_json::{Map, Value};
 
 use crate::desk_id::{display_slot, slot_key, Node, SeatBay, TrackId};
 use crate::desk_legacy::{bind, decode_v32_strip, encode_v32_strip, unbind, LegacyOwner};
-
-/// How many routes the desk carries at most.
-///
-/// The engine's routing table is a fixed array of atomics read on the audio
-/// thread (`MAX_ROUTES` in `instrument.rs`, which must stay this number), and
-/// `set_routes` publishes only this many entries. Sixty-four is four routes
-/// per channel on a sixteen-channel desk, past anything a person builds by
-/// hand — the ceiling exists so the audio thread never allocates, not to
-/// ration anybody.
-pub const MAX_ROUTES: usize = 64;
 
 /// Where a route sends the audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,25 +104,22 @@ impl Route {
 pub struct Routes(pub Vec<Route>);
 
 impl Routes {
-    /// Add a route unless the exact same one already exists, or the desk is
-    /// already carrying [`MAX_ROUTES`].
+    /// Add a route unless the exact same one already exists.
     ///
     /// Returns whether it was added, so the caller can say why nothing
     /// happened. "The exact same one" is source AND destination: the bass to
     /// 3/4 and the bass to 5/6 are two different routes, and the drums to
     /// 3/4 is a third.
     ///
-    /// The cap is refused HERE, not merely clamped downstream: the engine's
-    /// `set_routes` publishes only the first `MAX_ROUTES` entries to the
-    /// audio thread, so a sixty-fifth route accepted into this list would be
-    /// stored, saved, drawn on the strip — and silently never sound. A fader
-    /// that moves and does nothing, forever, is exactly the failure `prune`'s
-    /// docs warn about, so the refusal happens where the caller can still say
-    /// no out loud.
+    /// **No count is refused here, on any tier.** There was a ceiling of
+    /// sixty-four, because the engine kept its routes in a fixed table of
+    /// atomics on the audio thread and published only that many: a
+    /// sixty-fifth accepted here would have been stored, drawn and never
+    /// heard. The engine plans every route it is handed now (`DeskPlan`, on
+    /// the UI thread), so the thousandth sounds like the first and a ceiling
+    /// would only ration people (design section 9: routes are unlimited for
+    /// everybody).
     pub fn add(&mut self, route: Route) -> bool {
-        if self.0.len() >= MAX_ROUTES {
-            return false;
-        }
         if self.0.iter().any(|r| r.from == route.from && r.target == route.target) {
             return false;
         }
@@ -471,12 +468,10 @@ impl LaneRoutes {
                 _ => continue,
             };
             // Not `push`: a hand-edited file with the same route twice must
-            // not produce two faders over one path. **And not a cap**,
-            // which is for a GESTURE (`Routes::add` refuses a route the
-            // engine would not play, while somebody is there to hear why):
-            // a read that stopped at the cap cut every route past the
-            // sixty-fourth out of the file at the next save, with nobody
-            // told. Every route is read.
+            // not produce two faders over one path. **And not a cap**: a
+            // read that stopped at the old sixty-four cut every route past
+            // the sixty-fourth out of the file at the next save, with
+            // nobody told. Every route is read, as every route is played.
             let route = LaneRoute { from: from.max(0) as usize, target, gain };
             if !out.0.iter().any(|r| r.from == route.from && r.target == route.target) {
                 out.0.push(route);
@@ -695,29 +690,35 @@ mod tests {
         assert!(r.any_hardware());
     }
 
+    /// **The sixty-fifth route is stored like the first, and so is the
+    /// thousandth** (inverted from
+    /// `a_sixty_fifth_route_is_refused_rather_than_stored_and_never_sounding`).
+    ///
+    /// The table used to stop at sixty-four because the engine published
+    /// only that many to the audio thread, and a route held past them would
+    /// have been remembered and never played. The engine plans every route
+    /// it is handed now (the tangent crate's bridge tests hear the
+    /// thousandth), so the only refusal left is the duplicate, on every
+    /// tier.
     #[test]
-    fn a_sixty_fifth_route_is_refused_rather_than_stored_and_never_sounding() {
-        // The engine publishes only the first MAX_ROUTES entries to the audio
-        // thread, so anything held past that would be a route the settings
-        // file remembers and the desk never plays. `add` must say no while
-        // somebody is still there to hear it.
+    fn a_sixty_fifth_route_is_stored_like_the_first_and_so_is_the_thousandth() {
         let mut r = Routes::default();
-        for i in 0..MAX_ROUTES as u32 {
+        for i in 0..1_000u32 {
             assert!(
                 r.add(Route::new(t(i % 16), Target::Node(t(16 + i)))),
-                "route {i} is under the cap and distinct, it should fit"
+                "route {i} is distinct, it is stored"
             );
         }
-        // Not a duplicate of anything above — the refusal is the cap alone.
-        assert!(
-            !r.add(Route::new(t(0), Target::Hardware { first: 0, stereo: true })),
-            "route MAX_ROUTES + 1 must be refused"
-        );
-        assert_eq!(r.0.len(), MAX_ROUTES);
-        // Taking one off makes room again: the cap is a ceiling, not a latch.
-        r.remove(0);
+        assert_eq!(r.0.len(), 1_000, "no route past a count was refused");
+        // The sixty-fifth is where the old ceiling stood: it is the route it
+        // was asked to be, in its place.
+        assert_eq!(r.0[64], Route::new(t(0), Target::Node(t(80))));
+        // A route to the jacks after them all, which the old cap refused
+        // while not being a duplicate of anything.
         assert!(r.add(Route::new(t(0), Target::Hardware { first: 0, stereo: true })));
-        assert_eq!(r.0.len(), MAX_ROUTES);
+        // And the one refusal that is left is still the duplicate.
+        assert!(!r.add(Route::new(t(0), Target::Hardware { first: 0, stereo: true })));
+        assert_eq!(r.0.len(), 1_001);
     }
 
     #[test]

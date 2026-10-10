@@ -27,6 +27,9 @@ pub mod desk_model;
 /// Format 2: the one desk reader and writer for settings and documents,
 /// and the one switch every format-2 side effect reads.
 pub mod desk_format;
+/// Which way audio flows between the desk's strips, and the one question a
+/// route or send picker asks of it: would this close a loop.
+pub mod desk_topology;
 pub mod dialogs;
 pub mod face;
 pub mod faces;

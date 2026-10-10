@@ -848,6 +848,47 @@ mod tests {
         assert!(matches!(read(&unstamped), Err(DeskRefused { why: Structural::BadShape(_), .. })));
     }
 
+    /// **A desk of buses, returns and sends is written as it stands and read
+    /// back whole** (W7-buses-ui): a bus row's kind by name, every send to a
+    /// bus by the bus's identity with its side of the fader, a strip's sends
+    /// in the order they were made (the order a bus sums them in), a route
+    /// into a bus and a key taken from one; and the bytes are a fixed point.
+    #[test]
+    fn a_desk_of_buses_and_sends_round_trips_whole_and_in_order() {
+        let mut m = DeskModel::empty();
+        for n in 0..5u32 {
+            let mut r = TrackRow::vacant(TrackId(10 + n));
+            r.kind = Some(if n >= 3 { RowKind::Bus } else { RowKind::Audio });
+            r.name = if n >= 3 { format!("Return {}", n - 2) } else { format!("T{n}") };
+            m.append(r).expect("append");
+        }
+        let (bus_a, bus_b) = (Node::Track(TrackId(13)), Node::Track(TrackId(14)));
+        m.rows[0].sends = vec![
+            Send { to: Node::Fx, level: 0.5, pre: false },
+            Send { to: bus_b, level: 0.25, pre: true },
+            Send { to: bus_a, level: 1.0, pre: false },
+            Send { to: bus_b, level: 0.75, pre: false },
+        ];
+        m.rows[3].sends.push(Send { to: bus_b, level: 0.5, pre: false });
+        m.specials.drums.sends.push(Send { to: bus_a, level: 0.125, pre: false });
+        m.routes.push(RouteEdge { from: Node::Track(TrackId(11)), to: RouteTo::Node(bus_a), gain: 0.5 });
+        m.keys.push(SideKey { seat: SeatBay::new(Node::Track(TrackId(12)), Rack::Chain(0), 1), from: bus_a });
+        let desk = write(&m);
+        let text = serde_json::to_string(&desk).expect("text");
+        assert!(text.contains(r#""kind":"bus""#), "a bus is not written by its kind's name");
+        assert!(text.contains(r#"{"to":"t14","level":0.25,"pre":true}"#), "a pre-fader send is not written as it is");
+        let back = read(&desk).expect("readable");
+        assert!(back.dropped.is_empty(), "{:?}", back.dropped);
+        assert_eq!(back.model, m, "the desk did not read back whole");
+        assert_eq!(
+            back.model.rows[0].sends.iter().map(|s| (s.to, s.pre)).collect::<Vec<_>>(),
+            vec![(Node::Fx, false), (bus_b, true), (bus_a, false), (bus_b, false)],
+            "the sends came back in another order"
+        );
+        assert_eq!(serde_json::to_string(&write(&back.model)).expect("text"), text, "the bytes are no fixed point");
+        assert_eq!(back.model.counted(&[]), 3, "a bus was counted");
+    }
+
     /// **The documented shape, written exactly** (design Appendix D), and
     /// a model with every field away from its default round-trips whole.
     #[test]
