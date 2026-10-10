@@ -935,3 +935,85 @@ fn a_midi_item_drawn_or_dropped_on_an_empty_lane_is_one_moment() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(tiers::dir("midi-moment"));
 }
+
+/// **`src` with every `#[cfg(test)]` item and every `//` comment blanked**:
+/// the production code a scan reads. An item ends at its first line's `;`,
+/// or at the line that closes it at its own indent, which is how rustfmt
+/// lays out every item here.
+fn production_code(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let (mut skipping, mut armed): (Option<String>, Option<String>) = (None, None);
+    for line in src.lines() {
+        if let Some(close) = skipping.as_deref() {
+            if line == close {
+                skipping = None;
+            }
+            out.push('\n');
+            continue;
+        }
+        let t = line.trim_start();
+        let indent = &line[..line.len() - t.len()];
+        if let Some(at) = armed.take() {
+            if t.starts_with("#[") || t.starts_with("//") {
+                armed = Some(at);
+            } else if !t.ends_with(';') && !t.ends_with(',') {
+                skipping = Some(format!("{at}}}"));
+            }
+            out.push('\n');
+            continue;
+        }
+        if t == "#[cfg(test)]" || t.starts_with("#[cfg(all(test") {
+            armed = Some(indent.to_owned());
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line.split("//").next().unwrap_or(""));
+        out.push('\n');
+    }
+    out
+}
+
+/// **Persistence and drawing are tier-blind** (design 11.2 item 11, 5.6): a
+/// desk past the cap opens, saves and draws whole on every tier because
+/// nothing that reads, writes or lays it out asks about the licence. The
+/// one licence-aware fact a view draws is the trailing add's padlock, read
+/// in `app` through `track_cap` (`trailing_plus`), never in these files.
+/// The engine half of the same scan is the tangent crate's `konami_e2e`.
+#[test]
+fn persistence_and_drawing_never_read_the_licence() {
+    let files: [(&str, &str); 14] = [
+        ("arrangement.rs", include_str!("arrangement.rs")),
+        ("settings.rs", include_str!("settings.rs")),
+        ("desk_format.rs", include_str!("desk_format.rs")),
+        ("desk_model.rs", include_str!("desk_model.rs")),
+        ("desk_lift.rs", include_str!("desk_lift.rs")),
+        ("desk_legacy.rs", include_str!("desk_legacy.rs")),
+        ("desk_id.rs", include_str!("desk_id.rs")),
+        ("drumpad.rs", include_str!("drumpad.rs")),
+        ("automation.rs", include_str!("automation.rs")),
+        ("routing.rs", include_str!("routing.rs")),
+        ("mixer_panel.rs", include_str!("mixer_panel.rs")),
+        ("arrangement_panel.rs", include_str!("arrangement_panel.rs")),
+        ("recorder_panel.rs", include_str!("recorder_panel.rs")),
+        ("desk_index.rs", include_str!("desk_index.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        let code = production_code(src);
+        for word in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let lower = word.to_ascii_lowercase();
+            let licence = lower.contains("license")
+                || lower.contains("licence")
+                || ["is_supporter", "track_cap", "cheated", "licensed", "FREE_TRACKS", "may_add_tracks", "counted_tracks"]
+                    .contains(&word);
+            if licence {
+                bad.push(format!("{name} reads `{word}`"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "persistence or drawing reads the licence:\n  {}", bad.join("\n  "));
+    // The scan sees what it is scanning for: a planted read is found.
+    let planted = "fn draw() {\n    let cap = app.track_cap();\n}\n#[cfg(test)]\nmod tests {\n    fn x() { app.license.cheated(); }\n}\n";
+    let code = production_code(planted);
+    assert!(code.contains("track_cap") && !code.contains("cheated"), "the scan's own reading is wrong:\n{code}");
+}
