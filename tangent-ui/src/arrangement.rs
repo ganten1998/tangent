@@ -356,39 +356,6 @@ const V5_MUSICAL_TIME: u64 = 5;
 /// the same sequence of occupied seats.
 pub const V7_SPARSE_SEATS: u64 = 7;
 
-/// **Every key the legacy writer spells a document desk's strip space in**:
-/// what a format-2 desk says in its rows, plugins, routes and keys instead.
-/// Everything else in a document's `desk` (the buses' faders, the tempo, the
-/// rack, the view) is a scalar that never lived in strip space and keeps
-/// its key in both shapes.
-const LEGACY_DOC_DESK_KEYS: [&str; 25] = [
-    "kinds",
-    "icons",
-    "names",
-    "colors",
-    "inserts",
-    "inserts_tail",
-    "sends",
-    "muted",
-    "soloed",
-    "gains",
-    "pans",
-    "inputs",
-    "midi_inputs",
-    "tracks_added",
-    "is_folder",
-    "in_folder",
-    "folder_shut",
-    "armed",
-    "phase",
-    "to_theory",
-    "routes",
-    "insert_keys",
-    "insert_bypass",
-    "instruments",
-    "frozen",
-];
-
 /// The seats a document's desk carries as a plain array: every strip and
 /// the master, `(35 + 1) * 3`. See [`V7_SPARSE_SEATS`].
 ///
@@ -1272,48 +1239,33 @@ pub fn lane_pedal_in_song_time<'a>(clips: impl IntoIterator<Item = &'a ArrClip>)
 }
 
 /// The DESK a session carries — what makes a project a SESSION rather
-/// than a clip list: which channels are what, what stands in their bays,
-/// their names, colours, faders and sends, and the transport's musical
-/// facts. Captured into the document on every save; APPLIED only on an
-/// explicit open (launch reopens the last project against the settings
-/// that are already its live desk).
+/// than a clip list: which tracks there are and what they are, what stands
+/// in their bays, their names, colours, faders and sends, and the
+/// transport's musical facts. Captured into the document on every save;
+/// APPLIED only on an explicit open (launch reopens the last project against
+/// the settings that are already its live desk).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeskSnap {
-    pub kinds: Vec<u8>,
-    /// Channel badges, `Settings::channel_icons` — empty in older docs.
-    pub icons: Vec<u8>,
-    /// The ROWS' names, colours, sends, mutes and solos (and `phase`'s
-    /// polarity below), by row, as `Settings` keeps them: the specials'
-    /// are in [`Self::specials`]. A legacy document's strip arrays are split
-    /// into the two as they are read (`from_value_legacy`).
-    pub names: Vec<String>,
-    pub colors: Vec<i64>,
+    /// **The rows, in lane order**, each carrying everything true of one
+    /// track and its identity (`Settings::rows`' own shape): as many as the
+    /// desk has, and no more. A legacy document's dense arrays are read onto
+    /// rows once, at the frozen legacy width under the identity rule (legacy
+    /// row r is `TrackId(r)`, `DeskModel::from_v22`), so no undo moment, no
+    /// apply and no writer ever meets a per-channel array again.
+    ///
+    /// A row fact the document does not SAY ([`Says::PHASE`],
+    /// [`Says::TO_THEORY`], [`Says::INSTRUMENTS`]) holds the vacant row's
+    /// value here and the live desk's stands for it when the snapshot is
+    /// applied, row for row; see [`Self::says`].
+    pub rows: Vec<crate::desk_model::TrackRow>,
     /// **Every seated plugin, by the bay it sits in** (`Settings::plugins`):
     /// sparse, never an empty path. Dense it was 13,167 strings a snapshot,
     /// copied into every undo moment; see [`V7_SPARSE_SEATS`]. By identity
     /// like the live desk's, so a moment taken before a reorder and one
-    /// after it hold the same bays, and only `ids` says the rows moved. A
-    /// legacy document's seats are bound to its rows' identities as it is
+    /// after it hold the same bays, and only the rows say where they moved.
+    /// A legacy document's seats are bound to its rows' identities as it is
     /// read (`from_value_legacy`).
     pub plugins: std::collections::BTreeMap<crate::desk_id::SeatBay, String>,
-    pub sends: Vec<f64>,
-    pub muted: u64,
-    pub soloed: u64,
-    pub gains: Vec<f64>,
-    pub pans: Vec<f64>,
-    pub inputs: Vec<String>,
-    /// **Which MIDI devices each channel listens to, and on which channel.**
-    ///
-    /// Beside `inputs` rather than folded into it, because `inputs` is what a
-    /// build without this feature reads and it must go on saying exactly what
-    /// it said. Trimmed of trailing defaults, so a document whose tracks all
-    /// listen to everything carries nothing extra — see
-    /// `recorder::trim_midi_inputs`.
-    ///
-    /// Absent in every document written before this, and derived from
-    /// `inputs` when it is: see `from_value`, which reconciles the two the
-    /// same way the settings file does.
-    pub midi_inputs: Vec<crate::recorder::MidiInputSel>,
     pub drums_gain: f64,
     pub drums_pan: f64,
     pub metronome_gain: f64,
@@ -1323,95 +1275,32 @@ pub struct DeskSnap {
     pub sig_beats: u8,
     pub sig_unit: u8,
     pub metronome_on: bool,
-    /// **Which channels EXIST**, one bit each.
-    ///
-    /// A desk is not only how the strips are set — it is which of them are
-    /// there at all, and this was the one part of that not written down. So
-    /// opening a document (or making a New one from a template) applied its
-    /// levels, names and bays over whatever rows happened to be on screen
-    /// and left the rows themselves behind: the owner's "click new track →
-    /// no channels are deleted".
-    ///
-    /// Appended, and absent in every document written before this. See
-    /// `from_value`, which reconstructs it from the rest of the snapshot
-    /// rather than assuming an empty desk — a v4 document that says nothing
-    /// about its rows still knows which ones it described.
-    pub tracks_added: u32,
-    /// **The folder skeleton** — `strip_is_folder` per channel, as the
-    /// settings spell it.
-    ///
-    /// Appended, and absent in every document before this. The three
-    /// folder vectors lived only in the shared settings file, which made a
-    /// folder a property of the MACHINE rather than of the song: opening
-    /// any project (or File > New) wore the previous session's folder
-    /// shape over a desk that never had one, and undo restored every
-    /// other per-channel fact while the folder flags kept their
-    /// post-gesture values. Carried here they ride the same snapshot
-    /// everything else rides — the document, the template, and every undo
-    /// moment. Absent reads as FLAT, never as "keep whatever is live":
-    /// a document that says nothing about folders has none, and
-    /// preserving the live flags instead is exactly the bleed these
-    /// fields end.
-    pub is_folder: Vec<bool>,
-    /// `strip_in_folder` per channel — see `is_folder`.
-    pub in_folder: Vec<bool>,
-    /// `strip_folder_shut` per channel — see `is_folder`. A stale shut
-    /// flag is the worst of the three: it HIDES the next project's real
-    /// lanes, not just indents its empty ones.
-    pub folder_shut: Vec<bool>,
-    /// **Which channels are ARMED** — record-ready and live — one bit each.
-    ///
-    /// Appended, and absent in every document written before this. Arming
-    /// used to be recomputed at every launch and never written down: a
-    /// session opened with the DX7's channel live and nothing else, whatever
-    /// the project had been left holding. The owner: "record arming and
-    /// other related states like mute and solo are also remembered and
-    /// respected by loading projects ... load my default with the piano
-    /// still hooked up and theory-view bound and arm a few extra tracks."
-    /// Mute and solo have ridden this snapshot since it existed; the arm is
-    /// the one desk switch that did not, which is the whole of the fault.
-    ///
-    /// Absent reads as [`armed_by_default`] — the shipped rule, computed
-    /// from THIS snapshot's own kinds and bays — never as "keep whatever
-    /// the session had". An old project therefore opens exactly as it
-    /// always did, and one written since opens as it was left. Deriving
-    /// rather than defaulting to zero is also what keeps the asterisk
-    /// honest: a document whose desk differs from the live one only in a
-    /// field it does not carry is not a document with unsaved changes.
-    pub armed: u32,
+    /// **Which of the late row facts the rows SAY** (polarity, the theory
+    /// switch, the instruments' patches, the freezes), one bit each of
+    /// [`Says`]. Stored, because rows have no `None` to say "this document
+    /// predates the key" with: a legacy document from before a key leaves
+    /// its bit clear and the live desk's value stands for it at the apply,
+    /// so nothing an old project sounds like changes because a field was
+    /// added. A format-2 desk and a live desk say every one. The late facts
+    /// that are not a row's say themselves by their `Option`s below.
+    pub row_says: Says,
     // ── **What a desk is, continued** ──────────────────────────────────
     //
-    // Everything below travels the same road as everything above, and
-    // every one of them reached this struct late — they lived in the
-    // SETTINGS alone, which made each of them a property of the machine
-    // rather than of the song: open any project and it wore the last
-    // session's polarity, its theory sends, its routing, its sidechains,
-    // its bypasses and its piano patches. The owner, having been shown the
+    // Everything below reached this struct late — it lived in the SETTINGS
+    // alone, which made each of these a property of the machine rather than
+    // of the song: open any project and it wore the last session's routing,
+    // its sidechains and its bypasses. The owner, having been shown the
     // list: "all the things you flagged should be in document."
     //
     // **`None` means the document does not SAY**, and is not the same as an
-    // empty one — which is why each is an `Option` where the fields above
-    // are plain. A file written before its key predates the whole idea of
+    // empty one. A file written before its key predates the whole idea of
     // carrying it, so the live value stands and nothing changes for that
     // project; a file written since always carries one (`to_snap` has an
     // opinion for every field), and then the document wins outright.
     //
-    // This is deliberately NOT the folder fields' rule one screen up, where
-    // absent reads as FLAT. That rule is a judgement about HARM, not a law:
-    // a stale folder flag HIDES lanes, so keeping it was worse than
-    // dropping it. Here the harm runs the other way — zeroing a routing
-    // table or resetting every piano to patch 0 would change what an old
-    // project SOUNDS like, silently, on first open. Nothing audible may
-    // change because a field was added.
-    /// **Which rows are polarity-inverted**, one bit each — `strip_phase`,
-    /// the Ø switch. The one per-strip signal switch that never travelled
-    /// beside `muted` and `soloed`. `Some` says the specials' too
-    /// ([`Self::specials`]): they were one mask, and a document from before
-    /// the key said neither.
-    pub phase: Option<u64>,
-    /// **Which channels send their MIDI to the theory view** — the note
-    /// switch, `strip_to_theory`.
-    pub to_theory: Option<Vec<bool>>,
+    // Nothing audible may change because a field was added: zeroing a
+    // routing table would change what an old project SOUNDS like, silently,
+    // on first open.
     /// **The desk's routing table** — `Routes`, every route's source,
     /// destination and gain. Song content by any reading: where a channel's
     /// audio GOES is not a property of the computer it is played on.
@@ -1423,11 +1312,6 @@ pub struct DeskSnap {
     /// **Which bays are bypassed** — out of circuit but still loaded. By
     /// identity, as `plugins` is keyed.
     pub bypass: Option<std::collections::BTreeSet<crate::desk_id::SeatBay>>,
-    /// **What the built-in instruments are playing.** The DX7's cartridge
-    /// and patch per strip, the Keys patch and its knobs. The most audible
-    /// of the six: without it a saved song's pianos play whatever patch the
-    /// last session happened to leave on that channel.
-    pub instruments: Option<Instruments>,
     // ── **The rack, the levels, and the rest of what a song is** ───────
     //
     // The SECOND wave to reach this struct late, and it reached it for the
@@ -1447,8 +1331,8 @@ pub struct DeskSnap {
     /// opens through whatever reverb the last one was using. See [`Rack`].
     pub rack: Option<Rack>,
     /// `track_gain`, the backing track's level — the one member of
-    /// `recorder::Gains` that never travelled. `channels`, `metronome`,
-    /// `master` and `fx_return` are the plain fields above.
+    /// `recorder::Gains` that never travelled. `metronome`, `master` and
+    /// `fx_return` are the plain fields above.
     pub track_gain: Option<f64>,
     /// `master_mono`: the master folded to mono on the way out.
     pub master_mono: Option<bool>,
@@ -1481,34 +1365,17 @@ pub struct DeskSnap {
     /// document written before it, which reads as "keep whatever the app
     /// has" rather than as a set of zeroes.
     pub view: Option<View>,
-    /// **Which lanes are frozen, and to what file.** See [`FrozenLane`].
-    ///
-    /// The one desk field where "the document does not say" does NOT mean
-    /// "the live value stands": a freeze is a fact about THIS document's
-    /// media folder, so a document that carries no `frozen` has nothing
-    /// frozen, and opening it thaws whatever the last one had. The live
-    /// desk always says `Some`, empty when nothing is frozen.
-    pub frozen: Option<Vec<FrozenLane>>,
     /// **The drum bus, the click, the effects return and the master**: each
-    /// one's name, colour, sends, mute, solo and polarity (W5), which sat at
-    /// strips 32..=35 of `names`, `colors`, `sends` and the masks while the
-    /// specials were strip space. Always said: a legacy document's are read
-    /// off its strip arrays, a format-2 desk writes them, the live desk has
-    /// them. A special's polarity counts only when `phase` is said.
+    /// one's name, colour, sends, mute, solo and polarity (W5). Always said:
+    /// a legacy document's are read off its strip arrays, a format-2 desk
+    /// writes them, the live desk has them. A special's polarity counts only
+    /// when the rows' does ([`Says::PHASE`]): they were one mask.
     pub specials: crate::desk_model::Specials,
     // ── **Identity** (W3) ──────────────────────────────────────────────
-    //
-    // Appended, and spelt in the document only by a format-2 desk.
-    /// **Which track each row is**, in lane order (`Settings::track_ids`).
-    /// EMPTY means the document does not say, which is every legacy
-    /// document: the identity rule then speaks for it (legacy row r is
-    /// `TrackId(r)` in every era), and `apply_desk_snapshot` reads it so.
-    /// See [`RowIds`], which makes the two spellings one value.
-    pub ids: RowIds,
     /// The next id the desk mints (`Settings::next_track_id`); zero on a
     /// desk that does not say, where the ids it holds decide. Bookkeeping,
-    /// not the desk: it moves only when `ids` does, so two snapshots that
-    /// agree on the rows are equal whatever it says ([`Aside`]).
+    /// not the desk: it moves only when a row's id does, so two snapshots
+    /// that agree on the rows are equal whatever it says ([`Aside`]).
     pub next_id: Aside<u64>,
     /// **Which legacy shape this document's `state/` folder was written
     /// in**, while any plugin there may still have only its legacy sidecar
@@ -1522,45 +1389,6 @@ pub struct DeskSnap {
     /// the opener's one notice. Never written and never hashed; empty on
     /// every snapshot but a document just read.
     pub dropped: Aside<Vec<crate::desk_format::Dropped>>,
-}
-
-/// **A desk's row ids, where "does not say" and the identity desk are one
-/// value.** A legacy document cannot spell ids, and the identity rule says
-/// what they are (legacy row r is `TrackId(r)`), so an empty list and the
-/// identity list of the dense desk's width are the same rows: equal, and
-/// hashed alike ([`RowIds::rows`]). Without that, a live identity desk
-/// written by the legacy writer would read back as a different desk.
-#[derive(Debug, Clone, Default)]
-pub struct RowIds(pub Vec<crate::desk_id::TrackId>);
-
-impl RowIds {
-    /// The ids as they are meant: the identity desk when none are said.
-    pub fn rows(&self) -> std::borrow::Cow<'_, [crate::desk_id::TrackId]> {
-        rows_meant(&self.0)
-    }
-}
-
-/// [`RowIds::rows`] over a borrowed list: the one place "empty" becomes the
-/// identity desk, for the snapshot and for `DeskRef`'s walk alike.
-fn rows_meant(ids: &[crate::desk_id::TrackId]) -> std::borrow::Cow<'_, [crate::desk_id::TrackId]> {
-    if ids.is_empty() {
-        std::borrow::Cow::Owned(crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS))
-    } else {
-        std::borrow::Cow::Borrowed(ids)
-    }
-}
-
-impl PartialEq for RowIds {
-    fn eq(&self, other: &Self) -> bool {
-        self.rows() == other.rows()
-    }
-}
-
-impl std::ops::Deref for RowIds {
-    type Target = Vec<crate::desk_id::TrackId>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
 }
 
 /// **A note the reader keeps beside a desk that is not part of the desk**:
@@ -1577,12 +1405,13 @@ impl<T> PartialEq for Aside<T> {
     }
 }
 
-/// **Which of the late fields a snapshot SAYS**, one bit each: the
-/// `Option`s on [`DeskSnap`] read as a set. A format-2 desk says all of them;
-/// a legacy document says what its build knew, and the live desk stands for
-/// the rest. Derived from the `Option`s while they exist rather than stored
-/// beside them, so the two can never disagree; it becomes the stored half
-/// when the dense fields give way to the model.
+/// **Which of the late fields a snapshot SAYS**, one bit each. A format-2
+/// desk says all of them; a legacy document says what its build knew, and
+/// the live desk stands for the rest. The four that are facts of a ROW
+/// ([`Says::ROWS`]: polarity, the theory switch, the instruments, the
+/// freezes) are stored ([`DeskSnap::row_says`]), because a row has no
+/// `None` to say it with; the rest are derived from their `Option`s, so the
+/// two halves can never disagree ([`DeskSnap::says`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Says(pub u32);
 
@@ -1609,32 +1438,19 @@ impl Says {
     pub const FROZEN: Self = Self(1 << 19);
     /// Every field: what a live desk and a format-2 desk say.
     pub const ALL: Self = Self((1 << 20) - 1);
+    /// The late facts that live on a row: what [`DeskSnap::row_says`] holds.
+    pub const ROWS: Self =
+        Self(Self::PHASE.0 | Self::TO_THEORY.0 | Self::INSTRUMENTS.0 | Self::FROZEN.0);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
-}
 
-/// **What the built-in instruments are set to**, per strip.
-///
-/// One field of [`DeskSnap`] rather than four, because they are one fact —
-/// what the desk's own instruments are playing — and because four keys that
-/// must be read and written together are four chances to carry three of
-/// them. The vectors are the settings' own, trimmed of nothing: they are
-/// short (one entry per strip) and a sparse form would buy bytes at the cost
-/// of a second shape to get right.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Instruments {
-    /// `strip_dx7_cartridge`: the file each strip's DX7 has open.
-    pub dx7_cartridge: Vec<String>,
-    /// `strip_dx7_patch`: which voice of it is selected.
-    pub dx7_patch: Vec<usize>,
-    /// `strip_keys_patch`: which Keys patch the strip plays.
-    pub keys_patch: Vec<usize>,
-    /// `strip_keys_params`: the Keys knobs, stride-8 per strip. See
-    /// `Settings::strip_keys_params`, whose own note explains why the
-    /// stride is what it is and why it may never shrink.
-    pub keys_params: Vec<f64>,
+    /// Both sets at once.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 /// **The recorder's EFFECTS RACK** — the eight knobs across the band and
@@ -1844,27 +1660,26 @@ pub struct FrozenLane {
     pub len_s: f64,
 }
 
-/// **Which channels a desk arms when nothing says otherwise.**
+/// **Which row a desk arms when nothing says otherwise.**
 ///
 /// All arms off, save one, by the owner's rule: a project must be openable
 /// without headphones and without being blasted, and the one exception is the
-/// channel that makes the piano sound — the one whose first bay holds the
-/// built-in DX7.
+/// row that makes the piano sound — the first MIDI row whose first bay holds
+/// the built-in DX7. `kinds` is a byte per row (`RowKind::byte`), as many as
+/// the desk has.
 ///
 /// One rule, two callers: `app::default_armed` asks it about a `Settings` and
 /// [`DeskSnap::from_value`] asks it about a document that carries no `armed`
 /// key. A second copy of it is a launch and an open that disagree about what
 /// a silent desk means.
-pub fn armed_by_default(kinds: &[u8], mut bay0: impl FnMut(usize) -> bool) -> u32 {
-    (0..crate::recorder::CHANNELS.min(32))
-        .find(|n| kinds.get(*n).copied().unwrap_or(0) == 1 && bay0(*n))
-        .map_or(0, |n| 1 << n)
+pub fn armed_by_default(kinds: &[u8], mut bay0: impl FnMut(usize) -> bool) -> Option<usize> {
+    (0..kinds.len()).find(|n| kinds[*n] == 1 && bay0(*n))
 }
 
 /// **The desk by reference** — every field of [`DeskSnap`] borrowed from
 /// wherever it lives, so the once-a-frame fingerprint can walk the LIVE
-/// desk without first cloning thousands of seat strings into a snapshot it
-/// throws away a microsecond later.
+/// desk without first cloning every row into a snapshot it throws away a
+/// microsecond later.
 ///
 /// This is THE walk, and the one derivation. `DeskSnap::hash_into` goes
 /// through `as_ref`, the snapshot the app takes is built by `to_snap`, and
@@ -1876,19 +1691,12 @@ pub fn armed_by_default(kinds: &[u8], mut bay0: impl FnMut(usize) -> bool) -> u3
 /// to a fader the quit prompt can see.
 #[derive(Clone, Copy)]
 pub struct DeskRef<'a> {
-    pub kinds: &'a [u8],
-    pub icons: &'a [u8],
-    pub names: &'a [String],
-    pub colors: &'a [i64],
+    /// See [`DeskSnap::rows`].
+    pub rows: &'a [crate::desk_model::TrackRow],
+    /// See [`DeskSnap::row_says`]. The LIVE desk says every one.
+    pub row_says: Says,
     /// See [`DeskSnap::plugins`].
     pub plugins: &'a std::collections::BTreeMap<crate::desk_id::SeatBay, String>,
-    pub sends: &'a [f64],
-    pub muted: u64,
-    pub soloed: u64,
-    pub gains: &'a [f64],
-    pub pans: &'a [f64],
-    pub inputs: &'a [String],
-    pub midi_inputs: &'a [crate::recorder::MidiInputSel],
     pub drums_gain: f64,
     pub drums_pan: f64,
     pub metronome_gain: f64,
@@ -1898,29 +1706,17 @@ pub struct DeskRef<'a> {
     pub sig_beats: u8,
     pub sig_unit: u8,
     pub metronome_on: bool,
-    pub tracks_added: u32,
-    pub is_folder: &'a [bool],
-    pub in_folder: &'a [bool],
-    pub folder_shut: &'a [bool],
-    /// See [`DeskSnap::armed`]. A mask, like `muted` and `soloed` beside it.
-    pub armed: u32,
-    /// The six that arrived late — see the block on [`DeskSnap`]. Borrowed
-    /// like everything else here so the once-a-frame walk clones nothing;
-    /// `None` is a document that does not say, and the LIVE desk always
-    /// says, so `desk_view` fills every one of them.
-    pub phase: Option<u64>,
-    /// See [`DeskSnap::to_theory`].
-    pub to_theory: Option<&'a [bool]>,
-    /// See [`DeskSnap::routes`].
+    /// The late fields that are not a row's — see the block on
+    /// [`DeskSnap`]. Borrowed like everything else here so the once-a-frame
+    /// walk clones nothing; `None` is a document that does not say, and the
+    /// LIVE desk always says, so `desk_view` fills every one of them.
     pub routes: Option<&'a crate::routing::Routes>,
     /// See [`DeskSnap::insert_keys`].
     pub insert_keys: Option<&'a crate::routing::KeyEdges>,
     /// See [`DeskSnap::bypass`].
     pub bypass: Option<&'a std::collections::BTreeSet<crate::desk_id::SeatBay>>,
-    /// See [`DeskSnap::instruments`].
-    pub instruments: Option<InstrumentsRef<'a>>,
     /// The second late wave — see the block on [`DeskSnap`]. Borrowed on
-    /// the same terms as the six above: the once-a-frame walk clones
+    /// the same terms as the three above: the once-a-frame walk clones
     /// nothing, and `desk_view` fills every one of them.
     pub rack: Option<RackRef<'a>>,
     /// See [`DeskSnap::track_gain`].
@@ -1947,12 +1743,8 @@ pub struct DeskRef<'a> {
     pub look: Option<LookRef<'a>>,
     /// See [`DeskSnap::view`].
     pub view: Option<ViewRef<'a>>,
-    /// See [`DeskSnap::frozen`].
-    pub frozen: Option<&'a [FrozenLane]>,
-    /// See [`DeskSnap::ids`].
-    pub ids: &'a [crate::desk_id::TrackId],
     /// See [`DeskSnap::next_id`]. Not hashed: it moves only when an id is
-    /// minted, which moves `ids`.
+    /// minted, which moves a row.
     pub next_id: u64,
     /// See [`DeskSnap::specials`].
     pub specials: &'a crate::desk_model::Specials,
@@ -2081,31 +1873,13 @@ impl ViewRef<'_> {
     }
 }
 
-/// [`Instruments`] borrowed — see [`DeskRef`].
-#[derive(Clone, Copy)]
-pub struct InstrumentsRef<'a> {
-    pub dx7_cartridge: &'a [String],
-    pub dx7_patch: &'a [usize],
-    pub keys_patch: &'a [usize],
-    pub keys_params: &'a [f64],
-}
-
 impl DeskRef<'_> {
     /// The one place a desk is copied into an owned snapshot.
     pub fn to_snap(&self) -> DeskSnap {
         DeskSnap {
-            kinds: self.kinds.to_vec(),
-            icons: self.icons.to_vec(),
-            names: self.names.to_vec(),
-            colors: self.colors.to_vec(),
+            rows: self.rows.to_vec(),
+            row_says: self.row_says,
             plugins: self.plugins.iter().filter(|(_, p)| !p.is_empty()).map(|(b, p)| (*b, p.clone())).collect(),
-            sends: self.sends.to_vec(),
-            muted: self.muted,
-            soloed: self.soloed,
-            gains: self.gains.to_vec(),
-            pans: self.pans.to_vec(),
-            inputs: self.inputs.to_vec(),
-            midi_inputs: self.midi_inputs.to_vec(),
             drums_gain: self.drums_gain,
             drums_pan: self.drums_pan,
             metronome_gain: self.metronome_gain,
@@ -2115,22 +1889,9 @@ impl DeskRef<'_> {
             sig_beats: self.sig_beats,
             sig_unit: self.sig_unit,
             metronome_on: self.metronome_on,
-            tracks_added: self.tracks_added,
-            is_folder: self.is_folder.to_vec(),
-            in_folder: self.in_folder.to_vec(),
-            folder_shut: self.folder_shut.to_vec(),
-            armed: self.armed,
-            phase: self.phase,
-            to_theory: self.to_theory.map(<[bool]>::to_vec),
             routes: self.routes.cloned(),
             insert_keys: self.insert_keys.cloned(),
             bypass: self.bypass.cloned(),
-            instruments: self.instruments.map(|i| Instruments {
-                dx7_cartridge: i.dx7_cartridge.to_vec(),
-                dx7_patch: i.dx7_patch.to_vec(),
-                keys_patch: i.keys_patch.to_vec(),
-                keys_params: i.keys_params.to_vec(),
-            }),
             rack: self.rack.map(|r| Rack {
                 reverb: r.reverb,
                 delay: r.delay,
@@ -2169,8 +1930,6 @@ impl DeskRef<'_> {
                 capo_style: n.capo_style.to_owned(),
                 tuning: n.tuning.to_owned(),
             }),
-            frozen: self.frozen.map(<[FrozenLane]>::to_vec),
-            ids: RowIds(self.ids.to_vec()),
             next_id: Aside(self.next_id),
             specials: self.specials.clone(),
             // The document's own, which the app carries across: see
@@ -2190,63 +1949,34 @@ impl DeskRef<'_> {
     /// is what catches that, and it catches it by MUTATING every field
     /// rather than by reading this list; `the_cheap_dirty_answer_and_the_
     /// exact_one_agree` does the same from the settings side.
+    ///
+    /// **A term here is an UNDOABLE field.** This walk is what an undo
+    /// moment is compared by (`TangentApp::walk`), so adding one is three
+    /// jobs, not one: add it here; give every gesture that writes it exactly
+    /// one commit (or make it part of what `commit_view_change` commits once
+    /// a frame: `View`, `Feel` and the view on show); and make
+    /// `apply_desk_snapshot` restore every value it can hold, sentinels
+    /// included - a value the apply declines leaves undo re-applying that
+    /// moment on every press.
     fn hash_into(&self, f: &mut Fingerprint) {
-        f.len(self.kinds.len());
-        for k in self.kinds {
-            f.u64(u64::from(*k));
-        }
-        f.len(self.icons.len());
-        for i in self.icons {
-            f.u64(u64::from(*i));
-        }
-        f.len(self.names.len());
-        for n in self.names {
-            f.str(n);
-        }
-        f.len(self.colors.len());
-        for c in self.colors {
-            f.u64(*c as u64);
+        // **Which late row facts the rows say**, then **every row whole**:
+        // its identity and every fact of it, the late ones only when said
+        // (a fact the document does not say is no fact of the document's).
+        // Counted first, so the words parse back into exactly one desk. A
+        // reorder moves rows and so moves these words; nothing below them.
+        f.u64(u64::from(self.row_says.0));
+        f.len(self.rows.len());
+        for r in self.rows {
+            hash_row(f, r, self.row_says);
         }
         // The occupied bays, counted first so the words parse back into
         // exactly one desk, then each as its bay by identity and its path.
-        // A reorder moves no bay, so it moves none of these words: `ids`
-        // below is what says the rows moved.
+        // A reorder moves no bay, so it moves none of these words.
         let plugins = || self.plugins.iter().filter(|(_, p)| !p.is_empty());
         f.len(plugins().count());
         for (bay, path) in plugins() {
             hash_bay(f, *bay);
             f.str(path);
-        }
-        f.len(self.sends.len());
-        for s in self.sends {
-            f.f64(*s);
-        }
-        f.u64(self.muted);
-        f.u64(self.soloed);
-        f.len(self.gains.len());
-        for g in self.gains {
-            f.f64(*g);
-        }
-        f.len(self.pans.len());
-        for p in self.pans {
-            f.f64(*p);
-        }
-        f.len(self.inputs.len());
-        for i in self.inputs {
-            f.str(i);
-        }
-        // The device sets, in the hash for the reason everything else is: the
-        // dirty bit is what offers to save, and a setup somebody built in the
-        // MIDI Inputs dialog that the document did not notice is a setup they
-        // lose on the next close. 255 for "every channel" — never a real wire
-        // channel, so it cannot collide with one.
-        f.len(self.midi_inputs.len());
-        for sel in self.midi_inputs {
-            f.len(sel.devices.len());
-            for d in &sel.devices {
-                f.str(d);
-            }
-            f.u64(u64::from(sel.channel.unwrap_or(255)));
         }
         f.f64(self.drums_gain);
         f.f64(self.drums_pan);
@@ -2257,28 +1987,11 @@ impl DeskRef<'_> {
         f.u64(u64::from(self.sig_beats));
         f.u64(u64::from(self.sig_unit));
         f.bool(self.metronome_on);
-        f.u64(u64::from(self.tracks_added));
-        for v in [self.is_folder, self.in_folder, self.folder_shut] {
-            f.len(v.len());
-            for b in v {
-                f.bool(*b);
-            }
-        }
-        f.u64(u64::from(self.armed));
-        // **The six that arrived late.** Each hashes its ABSENCE distinctly
-        // from an empty one — a document that does not carry routes and a
-        // document that carries none are different documents, and the whole
-        // meaning of `None` here rests on telling them apart.
+        // **The late fields that are not a row's.** Each hashes its ABSENCE
+        // distinctly from an empty one — a document that does not carry
+        // routes and a document that carries none are different documents,
+        // and the whole meaning of `None` here rests on telling them apart.
         let opt = |f: &mut Fingerprint, present: bool| f.bool(present);
-        opt(f, self.phase.is_some());
-        f.u64(self.phase.unwrap_or(0));
-        opt(f, self.to_theory.is_some());
-        if let Some(v) = self.to_theory {
-            f.len(v.len());
-            for b in v {
-                f.bool(*b);
-            }
-        }
         opt(f, self.routes.is_some());
         if let Some(r) = self.routes {
             f.len(r.0.len());
@@ -2311,25 +2024,6 @@ impl DeskRef<'_> {
             f.len(b.len());
             for bay in b {
                 hash_bay(f, *bay);
-            }
-        }
-        opt(f, self.instruments.is_some());
-        if let Some(i) = self.instruments {
-            f.len(i.dx7_cartridge.len());
-            for c in i.dx7_cartridge {
-                f.str(c);
-            }
-            f.len(i.dx7_patch.len());
-            for p in i.dx7_patch {
-                f.u64(*p as u64);
-            }
-            f.len(i.keys_patch.len());
-            for p in i.keys_patch {
-                f.u64(*p as u64);
-            }
-            f.len(i.keys_params.len());
-            for v in i.keys_params {
-                f.f64(*v);
             }
         }
         // **The second late wave**, on the first wave's terms: each hashes
@@ -2400,39 +2094,14 @@ impl DeskRef<'_> {
             f.str(n.capo_style);
             f.str(n.tuning);
         }
-        opt(f, self.frozen.is_some());
-        if let Some(fr) = self.frozen {
-            f.u64(fr.len() as u64);
-            for z in fr {
-                f.u64(z.lane as u64);
-                f.str(&z.path);
-                f.u64(z.len_s.to_bits());
-            }
-        }
-        // **Appended, and that is the rule for every field added here**: the
-        // fingerprint is a walk in declaration order, so a term inserted
-        // among the others moves every existing document's hash and reads as
-        // "everything changed" the first time an old session is opened.
-        //
-        // **And a term here is an UNDOABLE field.** This walk is what an
-        // undo moment is compared by (`TangentApp::walk`), so adding one is
-        // three jobs, not one: append it here; give every gesture that
-        // writes it exactly one commit (or make it part of what
-        // `commit_view_change` commits once a frame: `View`, `Feel` and the
-        // view on show); and make
-        // `apply_desk_snapshot` restore every value it can hold, sentinels
-        // included - a value the apply declines leaves undo re-applying
-        // that moment on every press.
         opt(f, self.look.is_some());
         if let Some(l) = self.look {
             f.str(l.theme);
             f.u64(l.palette as u64);
             f.bool(l.palette_auto);
-            // Appended, per the rule above: a term inserted among the
-            // others moves every existing document's hash.
             f.str(l.view);
         }
-        // The arrangement's grid and window, appended by the same rule.
+        // The arrangement's grid and window.
         opt(f, self.view.is_some());
         if let Some(v) = self.view {
             f.bool(v.snap);
@@ -2446,27 +2115,14 @@ impl DeskRef<'_> {
             f.f64(v.quantize_swing_pct);
             f.f64(v.quantize_strength_pct);
             f.f64(v.quantize_window_ms);
-            // Appended after the block's first eleven, by the same rule.
             f.f64(v.visible_at);
             f.f64(v.quantize_sensitivity);
             f.str(if v.quantize_fit == "auto" { "" } else { v.quantize_fit });
         }
-        // **The rows' ids, appended by the same rule** (W3). A reorder
-        // moves them with everything else; a fresh track mints one. So a
-        // moment holds its rows' identities and an undo puts them back,
-        // and two desks that differ only in which track is which row are
-        // different desks, as a format-2 file writes them.
-        // As meant: a desk that does not say is the identity desk.
-        let ids = rows_meant(self.ids);
-        f.len(ids.len());
-        for id in ids.iter() {
-            f.u64(u64::from(id.0));
-        }
-        // **The specials, appended by the same rule** (W5): each one's
-        // name, paint, sends and switches, which the strip arrays above
-        // carried at strips 32..=35 until the specials left strip space. A
-        // special's polarity is hashed only when `phase` is said, as the
-        // rows' are.
+        // **The specials** (W5): each one's name, paint, sends and switches.
+        // A special's polarity is hashed only when the rows' is said: they
+        // were one mask, and a document from before the key said neither.
+        let phase_said = self.row_says.contains(Says::PHASE);
         for (node, sp) in self.specials.iter() {
             hash_node(f, node);
             f.str(&sp.name);
@@ -2479,8 +2135,89 @@ impl DeskRef<'_> {
             }
             f.bool(sp.mute);
             f.bool(sp.solo);
-            f.bool(self.phase.is_some() && sp.phase);
+            f.bool(phase_said && sp.phase);
         }
+    }
+}
+
+/// **One row into the fingerprint**: its identity and every fact of it,
+/// exhaustively (a field added to the row and not here is a compile error,
+/// not a desk change the title bar cannot see), the late facts only when the
+/// desk `says` them.
+fn hash_row(f: &mut Fingerprint, r: &crate::desk_model::TrackRow, says: Says) {
+    let crate::desk_model::TrackRow {
+        id,
+        kind,
+        added,
+        icon,
+        name,
+        color,
+        gain,
+        pan,
+        input,
+        midi,
+        mute,
+        solo,
+        phase,
+        arm,
+        theory,
+        folder,
+        in_folder,
+        shut,
+        sends,
+        dx7,
+        keys,
+        frozen,
+    } = r;
+    f.u64(u64::from(id.0));
+    f.u64(u64::from(crate::desk_model::RowKind::byte(*kind)));
+    f.bool(*added);
+    f.u64(u64::from(*icon));
+    f.str(name);
+    f.u64(*color as u64);
+    f.f64(*gain);
+    f.f64(*pan);
+    f.str(input);
+    // The device set, in the hash for the reason everything else is: the
+    // dirty bit is what offers to save, and a setup somebody built in the
+    // MIDI Inputs dialog that the document did not notice is a setup they
+    // lose on the next close. 255 for "every channel" — never a real wire
+    // channel, so it cannot collide with one.
+    f.len(midi.devices.len());
+    for d in &midi.devices {
+        f.str(d);
+    }
+    f.u64(u64::from(midi.channel.unwrap_or(255)));
+    f.bool(*mute);
+    f.bool(*solo);
+    f.bool(*arm);
+    f.bool(*folder);
+    f.bool(*in_folder);
+    f.bool(*shut);
+    f.len(sends.len());
+    for s in sends {
+        hash_node(f, s.to);
+        f.f64(s.level);
+        f.bool(s.pre);
+    }
+    f.bool(says.contains(Says::PHASE) && *phase);
+    f.bool(says.contains(Says::TO_THEORY) && *theory);
+    if says.contains(Says::INSTRUMENTS) {
+        f.str(&dx7.cart);
+        f.u64(dx7.patch as u64);
+        f.u64(keys.patch as u64);
+        f.len(keys.params.len());
+        for p in &keys.params {
+            f.f64(*p);
+        }
+    }
+    match frozen.as_ref().filter(|_| says.contains(Says::FROZEN)) {
+        Some(z) => {
+            f.u64(1);
+            f.str(&z.path);
+            f.u64(z.len_s.to_bits());
+        }
+        None => f.u64(0),
     }
 }
 
@@ -2488,18 +2225,9 @@ impl DeskSnap {
     /// This snapshot by reference — see [`DeskRef`].
     pub fn as_ref(&self) -> DeskRef<'_> {
         DeskRef {
-            kinds: &self.kinds,
-            icons: &self.icons,
-            names: &self.names,
-            colors: &self.colors,
+            rows: &self.rows,
+            row_says: self.row_says,
             plugins: &self.plugins,
-            sends: &self.sends,
-            muted: self.muted,
-            soloed: self.soloed,
-            gains: &self.gains,
-            pans: &self.pans,
-            inputs: &self.inputs,
-            midi_inputs: &self.midi_inputs,
             drums_gain: self.drums_gain,
             drums_pan: self.drums_pan,
             metronome_gain: self.metronome_gain,
@@ -2509,22 +2237,9 @@ impl DeskSnap {
             sig_beats: self.sig_beats,
             sig_unit: self.sig_unit,
             metronome_on: self.metronome_on,
-            tracks_added: self.tracks_added,
-            is_folder: &self.is_folder,
-            in_folder: &self.in_folder,
-            folder_shut: &self.folder_shut,
-            armed: self.armed,
-            phase: self.phase,
-            to_theory: self.to_theory.as_deref(),
             routes: self.routes.as_ref(),
             insert_keys: self.insert_keys.as_ref(),
             bypass: self.bypass.as_ref(),
-            instruments: self.instruments.as_ref().map(|i| InstrumentsRef {
-                dx7_cartridge: &i.dx7_cartridge,
-                dx7_patch: &i.dx7_patch,
-                keys_patch: &i.keys_patch,
-                keys_params: &i.keys_params,
-            }),
             rack: self.rack.as_ref().map(|r| RackRef {
                 reverb: r.reverb,
                 delay: r.delay,
@@ -2578,23 +2293,19 @@ impl DeskSnap {
                 capo_style: &n.capo_style,
                 tuning: &n.tuning,
             }),
-            frozen: self.frozen.as_deref(),
-            ids: &self.ids.0,
             next_id: self.next_id.0,
             specials: &self.specials,
         }
     }
 
-    /// **Which late fields this snapshot says.** See [`Says`].
+    /// **Which late fields this snapshot says**: the row facts it stores
+    /// ([`Self::row_says`]) and the rest by their `Option`s. See [`Says`].
     pub fn says(&self) -> Says {
-        let mut bits = 0;
+        let mut bits = self.row_says.0 & Says::ROWS.0;
         for (on, s) in [
-            (self.phase.is_some(), Says::PHASE),
-            (self.to_theory.is_some(), Says::TO_THEORY),
             (self.routes.is_some(), Says::ROUTES),
             (self.insert_keys.is_some(), Says::KEYS),
             (self.bypass.is_some(), Says::BYPASS),
-            (self.instruments.is_some(), Says::INSTRUMENTS),
             (self.rack.is_some(), Says::RACK),
             (self.track_gain.is_some(), Says::TRACK_GAIN),
             (self.master_mono.is_some(), Says::MASTER_MONO),
@@ -2608,7 +2319,6 @@ impl DeskSnap {
             (self.notation.is_some(), Says::NOTATION),
             (self.look.is_some(), Says::LOOK),
             (self.view.is_some(), Says::VIEW),
-            (self.frozen.is_some(), Says::FROZEN),
         ] {
             if on {
                 bits |= s.0;
@@ -2617,25 +2327,16 @@ impl DeskSnap {
         Says(bits)
     }
 
-    /// **This snapshot's rows' ids as a reader binds them**: the ids it
-    /// says when they are one distinct id per row of the dense desk, else
-    /// the identity rule (a legacy document, or a struct built by hand).
+    /// **This snapshot's rows' ids**, in lane order.
     pub fn row_ids(&self) -> Vec<crate::desk_id::TrackId> {
-        let n = crate::desk_lift::V32_CHANNELS;
-        let said = self.ids.len() == n
-            && self.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
-        if said {
-            self.ids.0.clone()
-        } else {
-            crate::desk_legacy::identity_ids(n)
-        }
+        self.rows.iter().map(|r| r.id).collect()
     }
 
     /// **Bay `bay` of row `row`'s own rack** (its first chain), by the
     /// identity this snapshot gives the row.
     pub fn row_bay(&self, row: usize, bay: usize) -> Option<crate::desk_id::SeatBay> {
         use crate::desk_id::{Node, Rack, SeatBay};
-        let id = *self.row_ids().get(row)?;
+        let id = self.rows.get(row)?.id;
         Some(SeatBay::new(Node::Track(id), Rack::Chain(0), u8::try_from(bay).ok()?))
     }
 
@@ -2669,7 +2370,8 @@ impl DeskSnap {
 
     /// **The occupied bays as the frozen map's flat numbers**, ascending,
     /// under this snapshot's rows: the legacy writer's view, and the era
-    /// corpus's.
+    /// corpus's. A bay of a row past the legacy width has no flat number and
+    /// is not here.
     pub fn legacy_bays(&self) -> Vec<(usize, String)> {
         let ids = self.row_ids();
         let mut out: Vec<(usize, String)> = self
@@ -2716,118 +2418,117 @@ impl DeskSnap {
     /// fader levels of the buses, the tempo, the rack, the view. Those were
     /// never strip space, so they have nothing to move to.
     pub(crate) fn to_value_as(&self, format: crate::desk_format::Format) -> Value {
-        let legacy = self.to_value_legacy();
-        if format == crate::desk_format::Format::Legacy {
-            return legacy;
-        }
-        let Value::Object(scalars) = legacy else {
-            return legacy;
+        let legacy = format == crate::desk_format::Format::Legacy;
+        let Value::Object(keys) = self.write_keys(legacy) else {
+            return Value::Null;
         };
+        if legacy {
+            return Value::Object(keys);
+        }
         let Value::Object(mut desk) = crate::desk_format::write(&self.desk_model().model) else {
             return Value::Null;
         };
-        for (k, v) in scalars {
-            if !LEGACY_DOC_DESK_KEYS.contains(&k.as_str()) {
-                desk.insert(k, v);
-            }
+        for (k, v) in keys {
+            desk.insert(k, v);
         }
         Value::Object(desk)
     }
 
-    /// **This snapshot as the format-2 model**: its dense strip fields by
-    /// row id (identity when it does not say), the marker it carries. A
-    /// late field the snapshot does not say reads as vacant, which no live
-    /// snapshot reaches: the live desk says every one.
+    /// **This snapshot as the format-2 model**: its rows as they are (a
+    /// late row fact it does not say holds the vacant row's value, which no
+    /// live snapshot reaches: the live desk says every one), its bays, its
+    /// wiring (none where it does not say), the marker it carries.
     pub fn desk_model(&self) -> crate::desk_format::DeskRead {
-        use crate::desk_model::{DeskModel, V22Desk};
-        let dense = V22Desk::from_snap(self, &V22Desk::vacant());
-        let ids = self.row_ids();
-        let mut read = DeskModel::from_v22(&dense, &ids);
-        read.model.next_id = read.model.next_id.max(self.next_id.0);
-        read.model.legacy_states = self.legacy_states.0;
+        // **A row fact the snapshot does not SAY is written as the vacant
+        // row's** (`row_says`): the format-2 desk says every row fact, and
+        // what a document that never said one stands for is nothing, the
+        // live desk's value being the apply's to keep.
+        let vacant = crate::desk_model::TrackRow::vacant(crate::desk_id::TrackId(0));
+        let rows = self
+            .rows
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                if !self.row_says.contains(Says::PHASE) {
+                    r.phase = vacant.phase;
+                }
+                if !self.row_says.contains(Says::TO_THEORY) {
+                    r.theory = vacant.theory;
+                }
+                if !self.row_says.contains(Says::INSTRUMENTS) {
+                    (r.dx7, r.keys) = (vacant.dx7.clone(), vacant.keys.clone());
+                }
+                if !self.row_says.contains(Says::FROZEN) {
+                    r.frozen = None;
+                }
+                r
+            })
+            .collect();
+        let model = crate::desk_model::DeskModel {
+            next_id: self
+                .next_id
+                .0
+                .max(self.rows.iter().map(|r| u64::from(r.id.0) + 1).max().unwrap_or(0)),
+            rows,
+            specials: self.specials.clone(),
+            plugins: self.plugins.iter().filter(|(_, p)| !p.is_empty()).map(|(b, p)| (*b, p.clone())).collect(),
+            bypass: self.bypass.clone().unwrap_or_default(),
+            routes: self.routes.as_ref().map(crate::desk_model::route_edges).unwrap_or_default(),
+            keys: self.insert_keys.as_ref().map(crate::desk_model::side_keys).unwrap_or_default(),
+            legacy_states: self.legacy_states.0,
+        };
+        let mut read = crate::desk_format::DeskRead { model, dropped: Vec::new() };
+        read.dropped = read.model.prune();
         read
     }
 
-    /// **This snapshot's strip facts in the legacy STRIP SPACE**: the rows'
-    /// arrays and masks with the specials joined at their frozen strips
-    /// (`desk_legacy::write_specials`, Appendix A), polarity zero where the
-    /// snapshot does not say it. What the legacy writer spells; nothing live
-    /// reads it.
-    pub(crate) fn strip_space(&self) -> crate::settings::StripSpace {
-        let rows = |mask: u64| crate::desk_legacy::strip_mask_of(mask, |_| false);
-        let mut v = crate::settings::StripSpace {
-            names: self.names.clone(),
-            colors: self.colors.clone(),
-            sends: self.sends.clone(),
-            muted: rows(self.muted),
-            soloed: rows(self.soloed),
-            phase: rows(self.phase.unwrap_or(0)),
-        };
-        crate::desk_legacy::write_specials(
-            &self.specials,
-            &mut v.names,
-            &mut v.colors,
-            &mut v.sends,
-            (&mut v.muted, &mut v.soloed, &mut v.phase),
-        );
-        if self.phase.is_none() {
-            v.phase = 0;
-        }
-        v
-    }
-
-    fn to_value_legacy(&self) -> Value {
+    /// **The document's desk keys, in the order every build wrote them**:
+    /// the dense legacy desk among them when `legacy` (the rows' arrays and
+    /// masks in strip space, at the legacy width, for the tests that build
+    /// a legacy document: no production road writes one since format 2,
+    /// `desk_format::WRITE_V8`), and the scalars alone otherwise, which a
+    /// format-2 desk carries beside its one desk object under the keys they
+    /// always had.
+    fn write_keys(&self, legacy: bool) -> Value {
         let mut m = Map::new();
-        let nums = |v: &[f64]| {
-            Value::Array(v.iter().map(|x| serde_json::json!(x)).collect())
-        };
-        m.insert(
-            "kinds".into(),
-            Value::Array(self.kinds.iter().map(|k| Value::Number((*k as u64).into())).collect()),
-        );
-        // Always written: an all-zero row is an OPINION (every badge
-        // auto), and omitting it let the previous project's badges bleed
-        // into a document that carried none.
-        m.insert(
-            "icons".into(),
-            Value::Array(
-                self.icons.iter().map(|k| Value::Number((*k as u64).into())).collect(),
-            ),
-        );
-        // **The desk in strip space**, the shape these keys always had: the
-        // rows' arrays with the specials joined at their frozen strips.
-        // Polarity only when said.
-        let crate::settings::StripSpace { names, colors, sends, muted, soloed, phase } = self.strip_space();
-        m.insert(
-            "names".into(),
-            Value::Array(names.iter().map(|n| Value::String(n.clone())).collect()),
-        );
-        m.insert(
-            "colors".into(),
-            Value::Array(colors.iter().map(|c| Value::Number((*c).into())).collect()),
-        );
-        // The head whole, the far seats sparse — see `V7_SPARSE_SEATS`.
+        let nums = |v: &[f64]| Value::Array(v.iter().map(|x| serde_json::json!(x)).collect());
+        // The legacy width of rows, and their ids, for the dense keys.
+        let rows = &self.rows[..self.rows.len().min(crate::desk_lift::V32_CHANNELS)];
         let ids = self.row_ids();
-        let mut head = vec![Value::String(String::new()); HEAD_BAYS];
         let mut tail = Map::new();
-        for (bay, path) in self.legacy_bays() {
-            match head.get_mut(bay) {
-                Some(slot) => *slot = Value::String(path),
-                None => {
-                    tail.insert(bay.to_string(), Value::String(path));
+        if legacy {
+            m.insert(
+                "kinds".into(),
+                Value::Array(rows.iter().map(|r| Value::from(crate::desk_model::RowKind::byte(r.kind))).collect()),
+            );
+            // Always written: an all-zero row is an OPINION (every badge
+            // auto), and omitting it let the previous project's badges bleed
+            // into a document that carried none.
+            m.insert("icons".into(), Value::Array(rows.iter().map(|r| Value::from(r.icon)).collect()));
+            // **The desk in strip space**, the shape these keys always had:
+            // the rows' arrays with the specials joined at their frozen
+            // strips. Polarity only when said.
+            let crate::settings::StripSpace { names, colors, sends, muted, soloed, .. } = self.strip_space();
+            m.insert("names".into(), Value::Array(names.iter().map(|n| Value::String(n.clone())).collect()));
+            m.insert("colors".into(), Value::Array(colors.iter().map(|c| Value::from(*c)).collect()));
+            // The head whole, the far seats sparse — see `V7_SPARSE_SEATS`.
+            let mut head = vec![Value::String(String::new()); HEAD_BAYS];
+            for (bay, path) in self.legacy_bays() {
+                match head.get_mut(bay) {
+                    Some(slot) => *slot = Value::String(path),
+                    None => {
+                        tail.insert(bay.to_string(), Value::String(path));
+                    }
                 }
             }
+            m.insert("inserts".into(), Value::Array(head));
+            m.insert("sends".into(), nums(&sends));
+            m.insert("muted".into(), Value::Number(muted.into()));
+            m.insert("soloed".into(), Value::Number(soloed.into()));
+            m.insert("gains".into(), nums(&rows.iter().map(|r| r.gain).collect::<Vec<_>>()));
+            m.insert("pans".into(), nums(&rows.iter().map(|r| r.pan).collect::<Vec<_>>()));
+            m.insert("inputs".into(), Value::Array(rows.iter().map(|r| Value::String(r.input.clone())).collect()));
         }
-        m.insert("inserts".into(), Value::Array(head));
-        m.insert("sends".into(), nums(&sends));
-        m.insert("muted".into(), Value::Number(muted.into()));
-        m.insert("soloed".into(), Value::Number(soloed.into()));
-        m.insert("gains".into(), nums(&self.gains));
-        m.insert("pans".into(), nums(&self.pans));
-        m.insert(
-            "inputs".into(),
-            Value::Array(self.inputs.iter().map(|i| Value::String(i.clone())).collect()),
-        );
         m.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
         m.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
         m.insert("metronome_gain".into(), serde_json::json!(self.metronome_gain));
@@ -2837,87 +2538,76 @@ impl DeskSnap {
         m.insert("sig_beats".into(), Value::Number(u64::from(self.sig_beats).into()));
         m.insert("sig_unit".into(), Value::Number(u64::from(self.sig_unit).into()));
         m.insert("metronome_on".into(), Value::Bool(self.metronome_on));
-        // Appended, at the END — the settings file's own rule, and this
-        // struct answers to it for the same reason.
-        m.insert("tracks_added".into(), Value::Number(u64::from(self.tracks_added).into()));
-        // Always written, all-false included: like the icons above, a flat
-        // desk is an OPINION, and omitting it would let the previous
-        // session's folders bleed into a document that carries none.
-        let bools =
-            |v: &[bool]| Value::Array(v.iter().map(|b| Value::Bool(*b)).collect());
-        m.insert("is_folder".into(), bools(&self.is_folder));
-        m.insert("in_folder".into(), bools(&self.in_folder));
-        m.insert("folder_shut".into(), bools(&self.folder_shut));
-        // **The MIDI device sets, at the END and sparse** — the settings
-        // file's own rule and its own shape, so a document from a desk
-        // nobody has narrowed keeps its byte-for-byte form and an older
-        // build meets no key it has to know to ignore.
-        if let Some(v) = crate::recorder::write_midi_inputs(&self.midi_inputs) {
-            m.insert("midi_inputs".into(), v);
-        }
-        // **The six late fields, at the END and only when they are SAID.**
-        //
-        // `None` is a snapshot taken from a document that predates the key
-        // (see the block on the struct), and writing a default for it would
-        // invent an opinion the document never held. A LIVE desk always has
-        // one — `desk_view` fills every field — so a document saved by this
-        // build carries all six, and one that carries none is one nobody
-        // has re-saved yet.
-        if self.phase.is_some() {
-            m.insert("phase".into(), Value::Number(phase.into()));
-        }
-        if let Some(v) = self.to_theory.as_ref() {
-            m.insert(
-                "to_theory".into(),
-                Value::Array(v.iter().map(|b| Value::Bool(*b)).collect()),
-            );
-        }
-        if let Some(v) = self.routes.as_ref() {
-            m.insert("routes".into(), v.to_lanes(&ids).to_json());
-        }
-        if let Some(v) = self.insert_keys.as_ref() {
-            m.insert("insert_keys".into(), v.to_lanes(&ids).to_json());
-        }
-        if let Some(v) = self.bypass.as_ref() {
-            let seats = v.iter().filter_map(|sb| crate::desk_legacy::seat_of(&ids, *sb)).collect();
-            m.insert("insert_bypass".into(), crate::settings::BypassBays(seats).to_json());
-        }
-        if let Some(i) = self.instruments.as_ref() {
-            let mut im = Map::new();
-            im.insert(
-                "dx7_cartridge".into(),
-                Value::Array(
-                    i.dx7_cartridge.iter().map(|c| Value::String(c.clone())).collect(),
-                ),
-            );
-            let nums = |v: &[usize]| {
-                Value::Array(v.iter().map(|n| Value::from(*n as u64)).collect())
+        if legacy {
+            let mask = |f: fn(&crate::desk_model::TrackRow) -> bool| {
+                rows.iter().enumerate().filter(|(_, r)| f(r)).fold(0u64, |acc, (n, _)| acc | 1 << n)
             };
-            im.insert("dx7_patch".into(), nums(&i.dx7_patch));
-            im.insert("keys_patch".into(), nums(&i.keys_patch));
-            im.insert(
-                "keys_params".into(),
-                Value::Array(i.keys_params.iter().map(|v| serde_json::json!(v)).collect()),
-            );
-            m.insert("instruments".into(), Value::Object(im));
+            // Appended, at the END — the settings file's own rule, and this
+            // struct answers to it for the same reason.
+            m.insert("tracks_added".into(), Value::Number(mask(|r| r.added).into()));
+            // Always written, all-false included: like the icons above, a
+            // flat desk is an OPINION, and omitting it would let the previous
+            // session's folders bleed into a document that carries none.
+            let bools = |f: fn(&crate::desk_model::TrackRow) -> bool| {
+                Value::Array(rows.iter().map(|r| Value::Bool(f(r))).collect())
+            };
+            m.insert("is_folder".into(), bools(|r| r.folder));
+            m.insert("in_folder".into(), bools(|r| r.in_folder));
+            m.insert("folder_shut".into(), bools(|r| r.shut));
+            // **The MIDI device sets, at the END and sparse** — the settings
+            // file's own rule and its own shape.
+            let mut sels: Vec<crate::recorder::MidiInputSel> = rows.iter().map(|r| r.midi.clone()).collect();
+            crate::recorder::trim_midi_inputs(&mut sels);
+            if let Some(v) = crate::recorder::write_midi_inputs(&sels) {
+                m.insert("midi_inputs".into(), v);
+            }
+            // **The late fields, at the END and only when they are SAID.**
+            if self.row_says.contains(Says::PHASE) {
+                m.insert("phase".into(), Value::Number(self.strip_space().phase.into()));
+            }
+            if self.row_says.contains(Says::TO_THEORY) {
+                m.insert("to_theory".into(), bools(|r| r.theory));
+            }
+            if let Some(v) = self.routes.as_ref() {
+                m.insert("routes".into(), v.to_lanes(&ids).to_json());
+            }
+            if let Some(v) = self.insert_keys.as_ref() {
+                m.insert("insert_keys".into(), v.to_lanes(&ids).to_json());
+            }
+            if let Some(v) = self.bypass.as_ref() {
+                let seats = v.iter().filter_map(|sb| crate::desk_legacy::seat_of(&ids, *sb)).collect();
+                m.insert("insert_bypass".into(), crate::settings::BypassBays(seats).to_json());
+            }
+            if self.row_says.contains(Says::INSTRUMENTS) {
+                let mut im = Map::new();
+                im.insert(
+                    "dx7_cartridge".into(),
+                    Value::Array(rows.iter().map(|r| Value::String(r.dx7.cart.clone())).collect()),
+                );
+                let counts = |v: Vec<usize>| Value::Array(v.into_iter().map(|n| Value::from(n as u64)).collect());
+                im.insert("dx7_patch".into(), counts(rows.iter().map(|r| r.dx7.patch).collect()));
+                im.insert("keys_patch".into(), counts(rows.iter().map(|r| r.keys.patch).collect()));
+                im.insert(
+                    "keys_params".into(),
+                    Value::Array(rows.iter().flat_map(|r| r.keys.params.iter().map(|v| serde_json::json!(v))).collect()),
+                );
+                m.insert("instruments".into(), Value::Object(im));
+            }
+            // **The ARM mask, at the END and always written**, all-zero
+            // included. A desk with nothing armed is an OPINION, and omitting
+            // it would send the reader to `armed_by_default`, which would arm
+            // the piano on a project somebody deliberately left silent.
+            m.insert("armed".into(), Value::Number(mask(|r| r.arm).into()));
+            // Appended, at the END, and only when a seat past the head is
+            // occupied.
+            if !tail.is_empty() {
+                m.insert("inserts_tail".into(), Value::Object(tail));
+            }
         }
-        // **The ARM mask, at the END and always written**, all-zero
-        // included. A desk with nothing armed is an OPINION — the same
-        // argument the folder bools above make — and omitting it would send
-        // the reader to `armed_by_default`, which would arm the piano on a
-        // project somebody deliberately left silent.
-        m.insert("armed".into(), Value::Number(u64::from(self.armed).into()));
-        // Appended, at the END, and only when a seat past the head is
-        // occupied: a desk that never had one keeps its shape, and a build
-        // that has never heard of the key reads the head as it always did.
-        if !tail.is_empty() {
-            m.insert("inserts_tail".into(), Value::Object(tail));
-        }
-        // **The second late wave, at the END and only when SAID** — the six
-        // above's rule, word for word, and appended after `inserts_tail` so
-        // that not one key a previous build wrote moves position. A LIVE
-        // desk always says, so a document saved by this build carries all
-        // eleven and wins outright from then on.
+        // **The second late wave, at the END and only when SAID**, appended
+        // after `inserts_tail` so that not one key a previous build wrote
+        // moves position. A LIVE desk always says, so a document saved by
+        // this build carries all of them and wins outright from then on.
         if let Some(r) = self.rack.as_ref() {
             let mut rm = Map::new();
             for (k, v) in [
@@ -3026,24 +2716,62 @@ impl DeskSnap {
             nm.insert("tuning".into(), Value::String(n.tuning.clone()));
             m.insert("notation".into(), Value::Object(nm));
         }
-        if let Some(fr) = self.frozen.as_ref() {
-            let rows = fr
+        if legacy && self.row_says.contains(Says::FROZEN) {
+            let frozen = rows
                 .iter()
-                .map(|z| {
+                .enumerate()
+                .filter_map(|(lane, r)| {
+                    let z = r.frozen.as_ref()?;
                     let mut zm = Map::new();
-                    zm.insert("lane".into(), Value::Number((z.lane as u64).into()));
+                    zm.insert("lane".into(), Value::Number((lane as u64).into()));
                     zm.insert("path".into(), Value::String(z.path.clone()));
                     zm.insert(
                         "len_s".into(),
-                        serde_json::Number::from_f64(z.len_s)
-                            .map_or(Value::Null, Value::Number),
+                        serde_json::Number::from_f64(z.len_s).map_or(Value::Null, Value::Number),
                     );
-                    Value::Object(zm)
+                    Some(Value::Object(zm))
                 })
                 .collect();
-            m.insert("frozen".into(), Value::Array(rows));
+            m.insert("frozen".into(), Value::Array(frozen));
         }
         Value::Object(m)
+    }
+
+    /// **This snapshot's strip facts in the legacy STRIP SPACE**: the rows'
+    /// arrays and masks (the legacy width of rows) with the specials joined
+    /// at their frozen strips (`desk_legacy::write_specials`, Appendix A),
+    /// polarity zero where the snapshot does not say it. What the legacy
+    /// writer spells; nothing live reads it.
+    pub(crate) fn strip_space(&self) -> crate::settings::StripSpace {
+        let rows = &self.rows[..self.rows.len().min(crate::desk_lift::V32_CHANNELS)];
+        let mask = |f: fn(&crate::desk_model::TrackRow) -> bool| {
+            rows.iter().enumerate().filter(|(_, r)| f(r)).fold(0u64, |acc, (n, _)| acc | 1 << n)
+        };
+        let phase_said = self.row_says.contains(Says::PHASE);
+        let strip = |m: u64| crate::desk_legacy::strip_mask_of(m, |_| false);
+        let mut names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+        while names.last().is_some_and(String::is_empty) {
+            names.pop();
+        }
+        let mut v = crate::settings::StripSpace {
+            names,
+            colors: rows.iter().map(|r| r.color).collect(),
+            sends: rows.iter().map(|r| crate::desk_model::fx_send_level(&r.sends)).collect(),
+            muted: strip(mask(|r| r.mute)),
+            soloed: strip(mask(|r| r.solo)),
+            phase: strip(if phase_said { mask(|r| r.phase) } else { 0 }),
+        };
+        crate::desk_legacy::write_specials(
+            &self.specials,
+            &mut v.names,
+            &mut v.colors,
+            &mut v.sends,
+            (&mut v.muted, &mut v.soloed, &mut v.phase),
+        );
+        if !phase_said {
+            v.phase = 0;
+        }
+        v
     }
 
     /// **A document's `desk` object, read**: dispatched on its SHAPE (a
@@ -3055,8 +2783,7 @@ impl DeskSnap {
     /// A legacy desk carries its era as `legacy_states`, so the first
     /// format-2 save of it still knows which names its `state/` folder's
     /// plugin files wear.
-    fn from_value(v: &Value) -> Result<Option<Self>, crate::desk_format::DeskRefused> {
-        use crate::desk_format::{DeskRefused, Structural};
+    pub(crate) fn from_value(v: &Value) -> Result<Option<Self>, crate::desk_format::DeskRefused> {
         if !crate::desk_format::is_format2(v) {
             let era = crate::desk_lift::era_of_desk(v);
             return Ok(Self::from_value_legacy(v).map(|mut d| {
@@ -3070,37 +2797,39 @@ impl DeskSnap {
             return Ok(None);
         };
         let read = crate::desk_format::read(v)?;
-        // The live desk is still 32 wide (W6 removes the width), and a
-        // desk past it cannot be put on it without hiding rows: refused
-        // like a structural fault, the file untouched.
-        let Some((dense, mut ids)) = read.model.to_v22() else {
-            return Err(DeskRefused {
-                why: Structural::BadShape("more rows than this build's desk holds"),
-                raw: v.clone(),
-            });
-        };
-        let mut next = read.model.next_id;
-        crate::desk_model::DeskModel::pad_ids(&mut ids, &mut next, crate::desk_lift::V32_CHANNELS);
-        // The ids first: the bays and the wiring are bound to them.
-        d.ids = RowIds(ids);
-        dense.into_snap(&mut d);
-        d.next_id = Aside(next);
-        d.legacy_states = Aside(read.model.legacy_states);
+        // **Every row the document holds, as long as the desk is**: nothing
+        // padded to a width and nothing past one refused or hidden. A
+        // format-2 desk says every late fact.
+        let crate::desk_model::DeskModel { next_id, rows, specials, plugins, bypass, routes, keys, legacy_states } =
+            read.model;
+        d.rows = rows;
+        d.row_says = Says::ROWS;
+        d.specials = specials;
+        d.plugins = plugins;
+        d.bypass = Some(bypass);
+        d.routes = Some(crate::desk_model::routes_of(&routes));
+        d.insert_keys = Some(crate::desk_model::key_edges_of(&keys));
+        d.next_id = Aside(next_id);
+        d.legacy_states = Aside(legacy_states);
         d.dropped = Aside(read.dropped);
         Ok(Some(d))
     }
 
+    /// **A legacy document's desk, onto rows**: the dense arrays and masks
+    /// as the file holds them, lifted by its era to the frozen V32 shape
+    /// ([`lift_eras`]), gathered into the dense desk (`V22Desk`) and read
+    /// onto rows ONCE by `DeskModel::from_v22` under the identity rule
+    /// (legacy row r is `TrackId(r)`). A row past the end of a short array
+    /// is the vacant row's, which is what reading it as nothing always gave
+    /// the document; a late row fact the file does not carry leaves its bit
+    /// out of [`Self::row_says`], and the live desk stands for it.
     fn from_value_legacy(v: &Value) -> Option<Self> {
         let m = v.as_object()?;
         let f = |k: &str, d: f64| m.get(k).and_then(Value::as_f64).unwrap_or(d);
         let strings = |k: &str| -> Vec<String> {
             m.get(k)
                 .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .map(|x| x.as_str().unwrap_or_default().to_owned())
-                        .collect()
-                })
+                .map(|a| a.iter().map(|x| x.as_str().unwrap_or_default().to_owned()).collect())
                 .unwrap_or_default()
         };
         let floats = |k: &str| -> Vec<f64> {
@@ -3110,8 +2839,7 @@ impl DeskSnap {
                 .unwrap_or_default()
         };
         // Absent in every document before the folder fields — and absent
-        // means FLAT (see the struct), so the default is the empty vec
-        // that `apply_desk_snapshot` reads as all-false.
+        // means FLAT, the vacant row's value.
         let bools = |k: &str| -> Vec<bool> {
             m.get(k)
                 .and_then(Value::as_array)
@@ -3160,11 +2888,7 @@ impl DeskSnap {
                     &mut soloed_v,
                     &mut phase_v,
                 );
-                dense
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, p)| !p.is_empty())
-                    .collect()
+                dense.into_iter().enumerate().filter(|(_, p)| !p.is_empty()).collect()
             }
             // The fully sparse shape: today's desk, nothing to lift.
             Some(Value::Object(o)) => pairs_of(o),
@@ -3177,53 +2901,192 @@ impl DeskSnap {
             pairs.extend(pairs_of(tail));
         }
         let inserts = Self::canonical(pairs);
-        let bay_at = |n: usize| {
-            inserts.binary_search_by_key(&n, |(b, _)| *b).is_ok()
-        };
+        let bay_at = |n: usize| inserts.binary_search_by_key(&n, |(b, _)| *b).is_ok();
         // The rows a legacy desk's seats and lanes are bound to: the
-        // identity rule, legacy row r is `TrackId(r)` (`RowIds`).
-        let legacy_ids = RowIds(Vec::new()).rows().into_owned();
-        // **The strip arrays, split** (W5): the rows' entries for the rows,
-        // and the four specials' off their frozen strips (`desk_legacy`),
-        // AFTER the era lifts, which moved them by the file's own shape. A
-        // special an array does not reach reads as nothing set.
-        let mut specials = crate::desk_model::Specials::default();
-        crate::desk_legacy::read_specials(&mut specials, &names_v, &colors_v, &sends_v, (muted_v, soloed_v, phase_v));
+        // identity rule, legacy row r is `TrackId(r)`.
+        let legacy_ids = crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS);
         // Where a row's own strip and its first bays sat in the legacy maps,
-        // for the two reconstructions below.
+        // for the reconstructions below.
         let strip_of = |n: usize| crate::desk_legacy::v32_strip(crate::recorder::StripRef::Row(n));
         let bay_of = |n: usize, b: usize| {
             let owner = crate::desk_legacy::LegacyOwner::Row(u16::try_from(n).ok()?);
             crate::desk_legacy::encode_v32(owner, crate::desk_id::Rack::Chain(0), u8::try_from(b).ok()?)
         };
-        Some(Self {
-            kinds: kinds_v.clone(),
-            icons: m
-                .get("icons")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8)).collect())
-                .unwrap_or_default(),
-            names: crate::desk_legacy::strip_rows(&names_v),
-            colors: crate::desk_legacy::strip_rows(&colors_v),
-            sends: crate::desk_legacy::strip_rows(&sends_v),
-            muted: crate::desk_legacy::strip_mask_rows(muted_v),
-            soloed: crate::desk_legacy::strip_mask_rows(soloed_v),
-            gains: floats("gains"),
-            pans: floats("pans"),
-            inputs: strings("inputs"),
-            // **Absent in every older document, and derived from `inputs`
-            // rather than assumed empty** — the `tracks_added` rule below,
-            // for the same reason: a document that named a port per track
-            // still says which keyboards those tracks wanted, and reading
-            // nothing would silently widen every one of them to the whole
-            // room. `reconcile_midi_inputs` does both jobs at once, because
-            // an older build that rewrote `inputs` and carried this key
-            // through unread leaves exactly the same disagreement.
-            midi_inputs: {
-                let mut sels = crate::recorder::read_midi_inputs(m.get("midi_inputs"));
-                crate::recorder::reconcile_midi_inputs(&mut sels, &inputs_v);
-                sels
+        let width = crate::desk_lift::V32_CHANNELS;
+        // **Which rows EXIST**: absent in older documents, and reconstructed
+        // rather than assumed empty. A v4 desk said which rows it described
+        // by describing them: a channel with a kind, a name, a colour, an
+        // input or a plugin in a bay is a channel that was there. Defaulting
+        // to zero would open every old project with no tracks on it. Read
+        // AFTER the era lifts, so a channel row is a channel row — before,
+        // an eight-channel-era desk's drum strip sat where channel 8 does
+        // today and could pass for one.
+        let tracks_added = m.get("tracks_added").and_then(Value::as_u64).map_or_else(
+            || {
+                let mut bits = 0u32;
+                for n in 0..width {
+                    let kind = kinds_v.get(n).copied().unwrap_or(0) != 0;
+                    let at = strip_of(n);
+                    let named = at.and_then(|at| names_v.get(at)).is_some_and(|s| !s.is_empty());
+                    let coloured = at.and_then(|at| colors_v.get(at)).copied().unwrap_or(0) != 0;
+                    let input = inputs_v.get(n).is_some_and(|s| !s.is_empty());
+                    let bay = (0..crate::recorder::INSERTS).any(|b| bay_of(n, b).is_some_and(bay_at));
+                    if kind || named || coloured || input || bay {
+                        bits |= 1 << n;
+                    }
+                }
+                bits
             },
+            |v| v as u32,
+        );
+        // **Which rows are ARMED**: absent in older documents, and DERIVED
+        // rather than assumed empty — the shipped rule, asked of this
+        // document's own desk, so a project from before the arm was written
+        // down opens the way it always opened (the DX7's channel live,
+        // nothing else). Read AFTER the era lifts, like `tracks_added`.
+        let armed = m.get("armed").and_then(Value::as_u64).map_or_else(
+            || {
+                armed_by_default(&kinds_v, |n| {
+                    // `bay_at` only answers WHETHER a seat is occupied; the
+                    // rule asks WHAT is in it. Seat 0 of the channel's own
+                    // rack, which is where an instrument sits.
+                    let Some(seat) = bay_of(n, 0) else {
+                        return false;
+                    };
+                    inserts
+                        .binary_search_by_key(&seat, |(b, _)| *b)
+                        .ok()
+                        .and_then(|i| inserts.get(i))
+                        .is_some_and(|(_, p)| p == crate::dialogs::BUILTIN_PATH)
+                })
+                .map_or(0, |n| 1u32 << n)
+            },
+            |v| v as u32,
+        );
+        // The dense desk, the frozen V32 shape, as the file says it: each
+        // array over the vacant desk's from the front, a short one leaving
+        // the vacant values past its end and a long one cut at the width.
+        fn fill<T>(dst: &mut [T], src: Vec<T>) {
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = s;
+            }
+        }
+        let mut dense = crate::desk_model::V22Desk::vacant();
+        fill(&mut dense.kinds, kinds_v.clone());
+        // **The badges**: a document from before them DERIVES them, the drum
+        // where the drumpad stands and auto everywhere else, instead of
+        // leaving the last project's badges on this one's tracks.
+        match m.get("icons").and_then(Value::as_array) {
+            Some(a) => fill(
+                &mut dense.icons,
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8))
+                    .collect(),
+            ),
+            None => {
+                for (n, icon) in dense.icons.iter_mut().enumerate() {
+                    let drum = bay_of(n, 0).and_then(|seat| {
+                        inserts.binary_search_by_key(&seat, |(b, _)| *b).ok().and_then(|i| inserts.get(i))
+                    });
+                    *icon = u8::from(drum.is_some_and(|(_, p)| p == crate::dialogs::DRUMPAD_PATH));
+                }
+            }
+        }
+        fill(&mut dense.gains, floats("gains"));
+        fill(&mut dense.pans, floats("pans"));
+        fill(&mut dense.inputs, inputs_v.clone());
+        // **The device sets: absent in every older document, and derived
+        // from `inputs` rather than assumed empty** — the `tracks_added`
+        // rule, for the same reason: a document that named a port per track
+        // still says which keyboards those tracks wanted.
+        let mut sels = crate::recorder::read_midi_inputs(m.get("midi_inputs"));
+        crate::recorder::reconcile_midi_inputs(&mut sels, &inputs_v);
+        fill(&mut dense.midi_inputs, sels);
+        dense.tracks_added = tracks_added;
+        dense.armed = armed;
+        fill(&mut dense.is_folder, bools("is_folder"));
+        fill(&mut dense.in_folder, bools("in_folder"));
+        fill(&mut dense.folder_shut, bools("folder_shut"));
+        // The strip arrays, AFTER the era lifts, in strip space: the dense
+        // desk splits them onto the rows and the specials (`from_v22`).
+        fill(&mut dense.names, names_v);
+        fill(&mut dense.colors, colors_v);
+        fill(&mut dense.sends, sends_v);
+        dense.muted = muted_v;
+        dense.soloed = soloed_v;
+        // **The late row facts: absent means the document does not SAY**,
+        // and its bit stays out of `row_says`. Not "empty", and not a
+        // default: the live value stands for a document written before the
+        // key, so nothing an old project sounds like changes because a field
+        // was added.
+        let mut row_says = Says::default();
+        if let Some(p) = phase_v {
+            dense.phase = p;
+            row_says = row_says.with(Says::PHASE);
+        }
+        if let Some(a) = m.get("to_theory").and_then(Value::as_array) {
+            fill(&mut dense.to_theory, a.iter().map(|v| v.as_bool().unwrap_or(false)).collect());
+            row_says = row_says.with(Says::TO_THEORY);
+        }
+        if let Some(im) = m.get("instruments").and_then(Value::as_object) {
+            let strings = |k: &str| -> Vec<String> {
+                im.get(k)
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(|v| v.as_str().unwrap_or_default().to_owned()).collect())
+                    .unwrap_or_default()
+            };
+            let counts = |k: &str| -> Vec<usize> {
+                im.get(k)
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect())
+                    .unwrap_or_default()
+            };
+            // Length-clamped like every other vector read out of a document:
+            // the file is content and may say anything. A short list reads as
+            // the shipped values past its end.
+            fill(&mut dense.dx7_cartridge, strings("dx7_cartridge"));
+            fill(&mut dense.dx7_patch, counts("dx7_patch"));
+            fill(&mut dense.keys_patch, counts("keys_patch"));
+            fill(
+                &mut dense.keys_params,
+                im.get("keys_params")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+                    .unwrap_or_default(),
+            );
+            row_says = row_says.with(Says::INSTRUMENTS);
+        }
+        // **A freeze is a fact about THIS document's media folder**, so a
+        // document that carries no `frozen` has nothing frozen: the one late
+        // row fact whose absence is no fact of the live desk's. Its bit says
+        // only whether the file carried the key.
+        if let Some(rows) = m.get("frozen").and_then(Value::as_array) {
+            for r in rows {
+                let Some(zm) = r.as_object() else { continue };
+                let (Some(lane), Some(path)) = (
+                    zm.get("lane").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()),
+                    zm.get("path").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let len_s = zm.get("len_s").and_then(Value::as_f64).unwrap_or(0.0);
+                if path.is_empty() || !len_s.is_finite() {
+                    continue;
+                }
+                // The first entry for a lane wins, and a lane past the
+                // legacy width is no row of a legacy desk.
+                if let Some(slot @ None) = dense.frozen.get_mut(lane) {
+                    *slot = Some(crate::desk_model::Frozen { path: path.to_owned(), len_s: len_s.max(0.0) });
+                }
+            }
+            row_says = row_says.with(Says::FROZEN);
+        }
+        dense.inserts = inserts.iter().cloned().collect();
+        let crate::desk_format::DeskRead { model, dropped: _ } = crate::desk_model::DeskModel::from_v22(&dense, &legacy_ids);
+        Some(Self {
+            rows: model.rows,
+            row_says,
+            plugins: model.plugins,
             drums_gain: f("drums_gain", 1.0),
             drums_pan: f("drums_pan", 0.0),
             metronome_gain: f("metronome_gain", 0.7),
@@ -3232,81 +3095,7 @@ impl DeskSnap {
             tempo_bpm: f("tempo_bpm", 120.0),
             sig_beats: m.get("sig_beats").and_then(Value::as_u64).unwrap_or(4) as u8,
             sig_unit: m.get("sig_unit").and_then(Value::as_u64).unwrap_or(4) as u8,
-            metronome_on: m
-                .get("metronome_on")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            // **Absent in older documents, and reconstructed rather than
-            // assumed empty.** A v4 desk said which rows it described by
-            // describing them: a channel with a kind, a name, a colour, an
-            // input or a plugin in a bay is a channel that was there.
-            // Defaulting to zero would open every old project with no
-            // tracks on it. Read AFTER the era lifts, so a channel row is
-            // a channel row — before, an eight-channel-era desk's drum
-            // strip sat where channel 8 does today and could pass for one.
-            tracks_added: m
-                .get("tracks_added")
-                .and_then(Value::as_u64)
-                .map_or_else(
-                    || {
-                        let mut bits = 0u32;
-                        for n in 0..crate::recorder::CHANNELS.min(32) {
-                            let kind = kinds_v.get(n).copied().unwrap_or(0) != 0;
-                            let at = strip_of(n);
-                            let named =
-                                at.and_then(|at| names_v.get(at)).is_some_and(|s| !s.is_empty());
-                            let coloured = at.and_then(|at| colors_v.get(at)).copied().unwrap_or(0) != 0;
-                            let input =
-                                inputs_v.get(n).is_some_and(|s| !s.is_empty());
-                            let bay = (0..crate::recorder::INSERTS)
-                                .any(|b| bay_of(n, b).is_some_and(bay_at));
-                            if kind || named || coloured || input || bay {
-                                bits |= 1 << n;
-                            }
-                        }
-                        bits
-                    },
-                    |v| v as u32,
-                ),
-            is_folder: bools("is_folder"),
-            in_folder: bools("in_folder"),
-            folder_shut: bools("folder_shut"),
-            // **Absent in older documents, and DERIVED rather than assumed
-            // empty** — the `tracks_added` bargain one field up, for the
-            // same two reasons. A project from before the arm was written
-            // down opens the way it always opened (the DX7's channel live,
-            // nothing else), and the fingerprint sees the same mask the live
-            // desk resolved to, so an old document does not come up wearing
-            // an asterisk it did not earn. Read AFTER the era lifts, like
-            // `tracks_added`, so a channel row is a channel row.
-            armed: m.get("armed").and_then(Value::as_u64).map_or_else(
-                || {
-                    armed_by_default(&kinds_v, |n| {
-                        // `bay_at` only answers WHETHER a seat is occupied;
-                        // the rule asks WHAT is in it, so the pairs are read
-                        // directly. Seat 0 of the channel's own rack, which
-                        // is where an instrument sits.
-                        let Some(seat) = bay_of(n, 0) else {
-                            return false;
-                        };
-                        inserts
-                            .binary_search_by_key(&seat, |(b, _)| *b)
-                            .ok()
-                            .and_then(|i| inserts.get(i))
-                            .is_some_and(|(_, p)| p == crate::dialogs::BUILTIN_PATH)
-                    })
-                },
-                |v| v as u32,
-            ),
-            // **The six late fields: absent is `None`, which means the
-            // document does not SAY** — see the block on the struct. Not
-            // "empty", and not a default: the live value stands for a
-            // document written before the key, so nothing an old project
-            // sounds like changes because a field was added.
-            phase: phase_v.map(crate::desk_legacy::strip_mask_rows),
-            to_theory: m.get("to_theory").and_then(Value::as_array).map(|a| {
-                a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()
-            }),
+            metronome_on: m.get("metronome_on").and_then(Value::as_bool).unwrap_or(false),
             // By lane, strip and seat in the file; by identity from here,
             // under the identity rule every legacy document obeys.
             routes: m.get("routes").map(|v| {
@@ -3321,38 +3110,6 @@ impl DeskSnap {
                     .iter()
                     .filter_map(|&(seat, bay)| crate::desk_legacy::bay_at(&legacy_ids, seat, bay))
                     .collect()
-            }),
-            instruments: m.get("instruments").and_then(Value::as_object).map(|im| {
-                let strings = |k: &str| {
-                    im.get(k)
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .map(|v| v.as_str().unwrap_or_default().to_owned())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-                let counts = |k: &str| {
-                    im.get(k)
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect()
-                        })
-                        .unwrap_or_default()
-                };
-                Instruments {
-                    dx7_cartridge: strings("dx7_cartridge"),
-                    dx7_patch: counts("dx7_patch"),
-                    keys_patch: counts("keys_patch"),
-                    keys_params: im
-                        .get("keys_params")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()
-                        })
-                        .unwrap_or_default(),
-                }
             }),
             // **The second late wave: absent is `None`**, on the first
             // wave's rule — the live value stands for a document written
@@ -3565,29 +3322,13 @@ impl DeskSnap {
                     tuning: s("tuning", ""),
                 }
             }),
-            frozen: m.get("frozen").and_then(Value::as_array).map(|rows| {
-                rows.iter()
-                    .filter_map(|r| {
-                        let zm = r.as_object()?;
-                        let lane = usize::try_from(zm.get("lane")?.as_u64()?).ok()?;
-                        let path = zm.get("path")?.as_str()?.to_owned();
-                        let len_s = zm.get("len_s").and_then(Value::as_f64).unwrap_or(0.0);
-                        (lane < crate::recorder::CHANNELS && !path.is_empty() && len_s.is_finite())
-                            .then_some(FrozenLane { lane, path, len_s: len_s.max(0.0) })
-                    })
-                    .collect()
-            }),
-            plugins: inserts
-                .iter()
-                .filter_map(|(flat, p)| Some((crate::desk_legacy::bay_of_flat(&legacy_ids, *flat)?, p.clone())))
-                .collect(),
             // A legacy desk does not say its ids: the identity rule speaks
-            // for it (see `DeskSnap::ids`). `from_value` sets the rest.
-            ids: RowIds(Vec::new()),
-            next_id: Aside(0),
+            // for it, and the counter stands above them. `from_value` sets
+            // the rest.
+            next_id: Aside(width as u64),
             legacy_states: Aside(None),
             dropped: Aside(Vec::new()),
-            specials,
+            specials: model.specials,
         })
     }
 }
@@ -4035,10 +3776,13 @@ impl Arrangement {
                 .unwrap_or(0.0)
         };
         // The desk's era, for the master's automation lane below: the
-        // stamp alone cannot tell the 24-channel window from 32.
+        // stamp alone cannot tell the 24-channel window from 32. And whether
+        // the desk is format 2, whose curves name their rows as they are and
+        // the master by name, so no era bounds them.
         let era = map
             .get("desk")
             .map_or(crate::desk_lift::DeskEra::V32, crate::desk_lift::era_of_desk);
+        let v2_desk = map.get("desk").is_some_and(crate::desk_format::is_format2);
         let (desk, refused) = match map.shift_remove("desk").as_ref().map(DeskSnap::from_value) {
             None => (None, None),
             Some(Ok(desk)) => (desk, None),
@@ -4052,17 +3796,7 @@ impl Arrangement {
         // the sort of thing somebody notices as "it sounds wrong" and never
         // reports as a bug.
         let (tempo, meter) = Self::read_maps(&mut map, version, desk.as_ref());
-        let mut automation = Self::read_automation(&mut map, version, era);
-        // **The master lane moved when the desk grew.** MASTER_LANE was the
-        // channel count, so documents written at sixteen channels keep their
-        // master curves at lane 16 and the 24-channel window's at 24, each an
-        // ordinary channel on the V32 desk. `master_auto_lane` says which,
-        // from the stamp and the era; the lift lands it on V32's master lane,
-        // a literal, per the migration rule. A no-op for a V32 document.
-        automation.remap_lane(
-            crate::desk_lift::master_auto_lane(version, era),
-            crate::desk_lift::V32_MASTER_LANE,
-        );
+        let automation = Self::read_automation(&mut map, version, era, v2_desk);
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -4429,8 +4163,9 @@ impl Arrangement {
         map: &mut Map<String, Value>,
         version: u64,
         era: crate::desk_lift::DeskEra,
+        v2_desk: bool,
     ) -> crate::automation::Automation {
-        use crate::automation::{AutoParam, Automation, Curve, Point, Shape};
+        use crate::automation::{AutoLane, AutoParam, Automation, Curve, Point, Shape};
         let Some(Value::Array(list)) = map.shift_remove("automation") else {
             return Automation::default();
         };
@@ -4441,26 +4176,30 @@ impl Arrangement {
                 // A format-2 document names the master's curves by target
                 // (`automation::MASTER_TARGET`); it lands on V32's master
                 // lane, the in-memory lane every era's master is lifted to.
-                let lane = crate::automation::persisted_lane(o, crate::desk_lift::V32_MASTER_LANE)?;
-                // A curve naming a channel this desk does not have is
-                // DROPPED rather than clamped onto channel 15: a level
-                // landing on the wrong instrument is worse than one that
-                // does not land at all, and it would be silent.
-                //
-                // **The MASTER is one past the channels and is real.** It is
-                // a bus rather than one of the channels, and it keeps its
-                // curves under `arrangement_panel::MASTER_LANE` — so the
-                // bound is "past the master", not "past the channels", or
-                // the master's automation is silently discarded every time
-                // the document is read back.
-                //
-                // **The master of the document's ERA**, at the frozen
-                // literals (`desk_lift::lift_curve_lane`): 32 for a V32
-                // document, exactly the bound this always was; 24 and 16
-                // for the older ones, whose builds never wrote past it.
-                // Only the lane is judged here; `from_map` moves the
-                // master's curves onto V32's master lane.
-                crate::desk_lift::lift_curve_lane(version, era, lane)?;
+                // Where the curve says it lives: a row by its lane, or the
+                // master by name (`automation::MASTER_TARGET`).
+                let lane = match crate::automation::persisted_lane(o)? {
+                    // **A format-2 document's rows are the desk's own**, as
+                    // many as it has: no era bounds them, and the master is
+                    // never a number one of them could reach.
+                    AutoLane::Row(row) if v2_desk => {
+                        (row < crate::desk_id::MAX_ROWS).then_some(AutoLane::Row(row))?
+                    }
+                    // **A legacy document filed its master at the lane one
+                    // past its era's channels** (`desk_lift::lift_curve_lane`,
+                    // at the frozen literals: 32 for a V32 document, 24 and
+                    // 16 for the older ones, whose builds never wrote past
+                    // it), which lands on the master by name. A curve
+                    // naming a channel past that is DROPPED rather than
+                    // clamped onto the last one: a level landing on the
+                    // wrong instrument is worse than one that does not land
+                    // at all, and it would be silent.
+                    AutoLane::Row(row) => match crate::desk_lift::lift_curve_lane(version, era, row)? {
+                        crate::desk_lift::V32_MASTER_LANE => AutoLane::Master,
+                        row => AutoLane::Row(row),
+                    },
+                    AutoLane::Master => AutoLane::Master,
+                };
                 let param = AutoParam::from_key(o.get("param")?.as_str()?)?;
                 let points = o
                     .get("points")?
@@ -4776,13 +4515,20 @@ impl Arrangement {
                             let mut o = Map::new();
                             // The master by NAME in format 2 (see
                             // `automation::MASTER_TARGET`); a row by lane.
-                            if v2 && c.lane == crate::desk_lift::V32_MASTER_LANE {
-                                o.insert(
-                                    "target".into(),
-                                    Value::String(crate::automation::MASTER_TARGET.into()),
-                                );
-                            } else {
-                                o.insert("lane".into(), Value::Number((c.lane as u64).into()));
+                            // A legacy document (the tests' legacy writer
+                            // alone since format 2) spelt the master at
+                            // V32's lane one past the channels.
+                            match c.lane {
+                                crate::automation::AutoLane::Master if v2 => {
+                                    o.insert(
+                                        "target".into(),
+                                        Value::String(crate::automation::MASTER_TARGET.into()),
+                                    );
+                                }
+                                lane => {
+                                    let n = lane.index_or(crate::desk_lift::V32_MASTER_LANE);
+                                    o.insert("lane".into(), Value::Number((n as u64).into()));
+                                }
                             }
                             o.insert("param".into(), Value::String(c.param.key().to_owned()));
                             // Only on a curve that is waiting for its plugin.
@@ -5032,7 +4778,12 @@ impl Arrangement {
             f.u64(1);
             f.len(self.automation.curves().len());
             for c in self.automation.curves() {
-                f.len(c.lane);
+                // A row by its lane; the master by a word no row's lane can
+                // be, so a curve moved between the two is a change.
+                match c.lane {
+                    crate::automation::AutoLane::Row(r) => f.len(r),
+                    crate::automation::AutoLane::Master => f.u64(u64::MAX),
+                }
                 // The VARIANT rather than `AutoParam::key`, which allocates a
                 // `String` per curve. The mapping is one-to-one with the
                 // spelling — that is what `from_key` round-tripping means —
@@ -5099,6 +4850,20 @@ fn Settings_dir() -> PathBuf {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default()
+}
+
+/// `Settings::word`'s twin on a snapshot's rows, for the same tests.
+#[cfg(test)]
+impl DeskSnap {
+    pub(crate) fn word(&self, f: fn(&crate::desk_model::TrackRow) -> bool) -> u64 {
+        self.rows.iter().take(64).enumerate().filter(|(_, r)| f(r)).fold(0, |w, (n, _)| w | 1 << n)
+    }
+
+    pub(crate) fn set_word(&mut self, f: fn(&mut crate::desk_model::TrackRow) -> &mut bool, word: u64) {
+        for (n, r) in self.rows.iter_mut().enumerate() {
+            *f(r) = n < 64 && (word >> n) & 1 == 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5705,7 +5470,7 @@ mod tests {
                 {"lane": 2, "param": "nonesuch", "points": [{"at": 0, "v": 0.5}]}]}"#,
         );
         assert_eq!(a.automation.curves().len(), 1, "{:?}", a.automation.curves());
-        assert_eq!(a.automation.curves()[0].lane, 1);
+        assert_eq!(a.automation.curves()[0].lane, crate::automation::AutoLane::Row(1));
         // A parameter from a newer build is dropped for the same reason: it
         // is better to lose one curve than to apply it to the wrong control.
         assert!(a.automation.get(2, crate::automation::AutoParam::Gain).is_none());
@@ -6076,14 +5841,43 @@ mod tests {
         let mut a = Arrangement::default();
         a.version = ARRANGEMENT_VERSION;
         a.named = true;
+        // **The rows**, the shipped thirty-two under the identity ids, the
+        // first three carrying every row fact said (W6: the desk's own form,
+        // where it was a set of ragged arrays a legacy writer padded).
+        let rows = {
+            use crate::desk_id::{Node, TrackId};
+            use crate::desk_model::{Dx7, Frozen, RowKind, Send, TrackRow};
+            let mut rows: Vec<TrackRow> = (0..32).map(|r| TrackRow::vacant(TrackId(r))).collect();
+            rows[0].kind = Some(RowKind::Midi);
+            rows[1].kind = Some(RowKind::Audio);
+            rows[1].icon = 3;
+            (rows[0].name, rows[2].name) = ("drums".into(), "gtr".into());
+            (rows[0].color, rows[2].color) = (3, 11);
+            rows[1].sends = vec![Send { to: Node::Fx, level: 0.25, pre: false }];
+            rows[1].mute = true;
+            rows[2].solo = true;
+            (rows[1].gain, rows[1].pan) = (0.5, -0.5);
+            rows[0].input = "midi:Keystation 88".into();
+            rows[0].midi = crate::recorder::MidiInputSel { devices: vec!["Keystation 88".into()], channel: Some(2) };
+            for row in &mut rows[..3] {
+                row.added = true;
+            }
+            rows[0].folder = true;
+            rows[1].in_folder = true;
+            (rows[0].arm, rows[2].arm) = (true, true);
+            rows[1].phase = true;
+            (rows[0].theory, rows[2].theory) = (true, true);
+            rows[0].dx7 = Dx7 { cart: "ROM1A.syx".into(), patch: 7 };
+            (rows[0].keys.patch, rows[1].keys.patch) = (2, 3);
+            (rows[0].keys.params[0], rows[0].keys.params[1]) = (0.25, 0.5);
+            rows[1].frozen = Some(Frozen { path: "media/frozen-02-1.wav".into(), len_s: 12.5 });
+            rows
+        };
         a.desk = Some(DeskSnap {
-            kinds: vec![1, 2, 0],
-            icons: vec![0, 3],
-            names: vec!["drums".into(), String::new(), "gtr".into()],
-            colors: vec![3, 0, 11],
-            // By identity, on the identity rows this desk does not spell:
-            // row 0's bay 1, and row 16's second rack (the far seat 4149 of
-            // the frozen map).
+            rows,
+            row_says: Says::ROWS,
+            // By identity, on the identity rows: row 0's bay 1, and row 16's
+            // second rack (the far seat 4149 of the frozen map).
             plugins: [(1, "reverb"), (4149 * 3, "brusfri")]
                 .into_iter()
                 .map(|(flat, p)| {
@@ -6091,16 +5885,6 @@ mod tests {
                     (crate::desk_legacy::bay_of_flat(&ids, flat).expect("a bay"), p.to_owned())
                 })
                 .collect(),
-            sends: vec![0.0, 0.25],
-            muted: 0b0010,
-            soloed: 0b0100,
-            gains: vec![1.0, 0.5],
-            pans: vec![0.0, -0.5],
-            inputs: vec!["midi:Keystation 88".into(), String::new()],
-            midi_inputs: vec![crate::recorder::MidiInputSel {
-                devices: vec!["Keystation 88".into()],
-                channel: Some(2),
-            }],
             drums_gain: 0.9,
             drums_pan: 0.1,
             metronome_gain: 0.7,
@@ -6110,16 +5894,9 @@ mod tests {
             sig_beats: 3,
             sig_unit: 4,
             metronome_on: true,
-            tracks_added: 0b0111,
-            is_folder: vec![true, false],
-            in_folder: vec![false, true],
-            folder_shut: vec![false, false],
-            armed: 0b0101,
-            // The six late fields, every one of them SAID — this fixture is
-            // the round-trip's subject and a `None` here would test the
-            // absent road twice and the present one never.
-            phase: Some(0b0010),
-            to_theory: Some(vec![true, false, true]),
+            // The late fields, every one of them SAID — this fixture is the
+            // round-trip's subject and a `None` here would test the absent
+            // road twice and the present one never.
             routes: Some(crate::routing::Routes(vec![crate::routing::Route {
                 from: crate::desk_id::Node::Track(crate::desk_id::TrackId(1)),
                 target: crate::routing::Target::Hardware { first: 2, stereo: true },
@@ -6135,12 +5912,6 @@ mod tests {
                 crate::desk_id::Rack::Chain(0),
                 2,
             )])),
-            instruments: Some(Instruments {
-                dx7_cartridge: vec!["ROM1A.syx".into(), String::new()],
-                dx7_patch: vec![7, 0],
-                keys_patch: vec![2, 3],
-                keys_params: vec![0.25, 0.5],
-            }),
             // The second late wave, every one of them SAID, for the reason
             // the six above are: this fixture is the round-trip's subject,
             // and a `None` here would test the absent road twice and the
@@ -6214,15 +5985,8 @@ mod tests {
                 capo_style: "silver".into(),
                 tuning: "Drop D".into(),
             }),
-            frozen: Some(vec![FrozenLane {
-                lane: 1,
-                path: "media/frozen-02-1.wav".into(),
-                len_s: 12.5,
-            }]),
-            // A legacy document says no ids; the reader's notes compare
-            // equal whatever they say.
-            ids: RowIds(Vec::new()),
-            next_id: Aside(0),
+            // Bookkeeping: the reader's notes compare equal whatever they say.
+            next_id: Aside(32),
             legacy_states: Aside(None),
             dropped: Aside(Vec::new()),
             // Every special with something said (W5), each fact one a
@@ -6398,9 +6162,11 @@ mod tests {
             0,
         )
         .expect("row 1's first bay");
-        snap.kinds = vec![0, 1, 0];
+        for (n, row) in snap.rows.iter_mut().enumerate() {
+            row.kind = (n == 1).then_some(crate::desk_model::RowKind::Midi);
+        }
         snap.set_bay(seat, crate::dialogs::BUILTIN_PATH);
-        snap.armed = 1 << 1;
+        snap.set_word(|r| &mut r.arm, 1 << 1);
 
         // A document from before the arm was written down is a LEGACY one:
         // a format-2 desk says every row's arm.
@@ -6409,16 +6175,16 @@ mod tests {
         assert!(obj.remove("armed").is_some(), "the key was never written");
         let back = DeskSnap::from_value(&value).ok().flatten().expect("the desk should read");
         assert_eq!(
-            back.armed,
+            back.word(|r| r.arm),
             1 << 1,
             "a document with no arm key did not fall back to the shipped rule"
         );
 
         // Written, and read back as itself — including the silent desk.
-        for mask in [0u32, 1 << 1, 0b1010] {
-            snap.armed = mask;
+        for mask in [0u64, 1 << 1, 0b1010] {
+            snap.set_word(|r| &mut r.arm, mask);
             let read = DeskSnap::from_value(&snap.to_value()).ok().flatten().expect("the desk should read");
-            assert_eq!(read.armed, mask, "the arm mask did not round trip");
+            assert_eq!(read.word(|r| r.arm), mask, "the arm mask did not round trip");
         }
     }
 
@@ -6601,12 +6367,19 @@ mod tests {
         moves_both("the version stamp", |a| a.version += 1);
         moves_both("the id counter, above the clips", |a| a.next_id += 50);
         moves_both("the desk going away", |a| a.desk = None);
-        moves_both("a channel kind", |a| a.desk.as_mut().unwrap().kinds[0] = 2);
-        moves_both("a channel badge", |a| a.desk.as_mut().unwrap().icons[1] = 5);
-        moves_both("a strip name", |a| {
-            a.desk.as_mut().unwrap().names[0] = "kit".into();
-        });
-        moves_both("a strip colour", |a| a.desk.as_mut().unwrap().colors[2] = 4);
+        // **Every fact of a row on its own line** (W6: the rows are the
+        // desk), each one a field `hash_row` walks.
+        fn row(a: &mut Arrangement, n: usize) -> &mut crate::desk_model::TrackRow {
+            &mut a.desk.as_mut().unwrap().rows[n]
+        }
+        fn unsay(a: &mut Arrangement, what: Says) {
+            let d = a.desk.as_mut().unwrap();
+            d.row_says = Says(d.row_says.0 & !what.0);
+        }
+        moves_both("a channel kind", |a| row(a, 0).kind = Some(crate::desk_model::RowKind::Audio));
+        moves_both("a channel badge", |a| row(a, 1).icon = 5);
+        moves_both("a strip name", |a| row(a, 0).name = "kit".into());
+        moves_both("a strip colour", |a| row(a, 2).color = 4);
         moves_both("a plugin in a bay", |a| {
             a.desk.as_mut().unwrap().set_bay(1, "eq");
         });
@@ -6619,14 +6392,14 @@ mod tests {
         moves_both("a seat arriving in the head", |a| {
             a.desk.as_mut().unwrap().set_bay(0, "eq");
         });
-        moves_both("a send", |a| a.desk.as_mut().unwrap().sends[1] = 0.3);
-        moves_both("a mute", |a| a.desk.as_mut().unwrap().muted ^= 1);
-        moves_both("a solo", |a| a.desk.as_mut().unwrap().soloed ^= 1);
-        moves_both("a fader", |a| a.desk.as_mut().unwrap().gains[0] = 0.4);
-        moves_both("a pan", |a| a.desk.as_mut().unwrap().pans[0] = 0.2);
-        moves_both("an input", |a| {
-            a.desk.as_mut().unwrap().inputs[1] = "in 2".into();
-        });
+        moves_both("a send", |a| crate::desk_model::set_fx_send_level(&mut row(a, 1).sends, 0.3));
+        moves_both("a mute", |a| row(a, 0).mute ^= true);
+        moves_both("a solo", |a| row(a, 0).solo ^= true);
+        moves_both("a fader", |a| row(a, 0).gain = 0.4);
+        moves_both("a pan", |a| row(a, 0).pan = 0.2);
+        moves_both("an input", |a| row(a, 1).input = "in 2".into());
+        moves_both("a MIDI device set", |a| row(a, 1).midi.channel = Some(9));
+        moves_both("a row's identity", |a| row(a, 5).id = crate::desk_id::TrackId(77));
         moves_both("the drum bus", |a| a.desk.as_mut().unwrap().drums_gain = 0.5);
         moves_both("the drum bus pan", |a| a.desk.as_mut().unwrap().drums_pan = -0.2);
         moves_both("the click", |a| a.desk.as_mut().unwrap().metronome_gain = 0.2);
@@ -6638,15 +6411,18 @@ mod tests {
         moves_both("the click switch", |a| {
             a.desk.as_mut().unwrap().metronome_on = false;
         });
-        moves_both("which rows exist", |a| a.desk.as_mut().unwrap().tracks_added = 1);
-        moves_both("a folder", |a| a.desk.as_mut().unwrap().is_folder[1] = true);
-        moves_both("what is inside a folder", |a| {
-            a.desk.as_mut().unwrap().in_folder[0] = true;
+        moves_both("which rows exist", |a| a.desk.as_mut().unwrap().set_word(|r| &mut r.added, 1));
+        moves_both("a folder", |a| row(a, 1).folder = true);
+        moves_both("what is inside a folder", |a| row(a, 0).in_folder = true);
+        moves_both("a shut folder", |a| row(a, 0).shut = true);
+        moves_both("an ARM", |a| row(a, 0).arm ^= true);
+        moves_both("a row arriving", |a| {
+            let next = crate::desk_model::TrackRow::vacant(crate::desk_id::TrackId(40));
+            a.desk.as_mut().unwrap().rows.push(next);
         });
-        moves_both("a shut folder", |a| {
-            a.desk.as_mut().unwrap().folder_shut[0] = true;
+        moves_both("a row leaving", |a| {
+            a.desk.as_mut().unwrap().rows.pop();
         });
-        moves_both("an ARM", |a| a.desk.as_mut().unwrap().armed ^= 1);
         // **The specials** (W5), each fact on its own line: they were the
         // strip arrays' slots past the rows until they left strip space, and
         // a fact that hashed nowhere would be an edit no asterisk sees.
@@ -6666,16 +6442,10 @@ mod tests {
         // The six that arrived late, each moved and each REMOVED: absence is
         // a different document from an empty one, and the whole meaning of
         // `None` rests on the walk telling them apart.
-        moves_both("a polarity", |a| {
-            *a.desk.as_mut().unwrap().phase.as_mut().unwrap() ^= 1;
-        });
-        moves_both("polarity going unsaid", |a| a.desk.as_mut().unwrap().phase = None);
-        moves_both("a theory send", |a| {
-            a.desk.as_mut().unwrap().to_theory.as_mut().unwrap()[0] ^= true;
-        });
-        moves_both("the theory sends going unsaid", |a| {
-            a.desk.as_mut().unwrap().to_theory = None;
-        });
+        moves_both("a polarity", |a| row(a, 0).phase ^= true);
+        moves_both("polarity going unsaid", |a| unsay(a, Says::PHASE));
+        moves_both("a theory send", |a| row(a, 0).theory ^= true);
+        moves_both("the theory sends going unsaid", |a| unsay(a, Says::TO_THEORY));
         moves_both("a route's gain", |a| {
             a.desk.as_mut().unwrap().routes.as_mut().unwrap().0[0].gain = 0.25;
         });
@@ -6708,22 +6478,11 @@ mod tests {
         moves_both("the bypasses going unsaid", |a| {
             a.desk.as_mut().unwrap().bypass = None;
         });
-        moves_both("a DX7 patch", |a| {
-            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().dx7_patch[0] = 31;
-        });
-        moves_both("a DX7 cartridge", |a| {
-            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().dx7_cartridge[0] =
-                "ROM2A.syx".into();
-        });
-        moves_both("a Keys patch", |a| {
-            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().keys_patch[1] = 6;
-        });
-        moves_both("a Keys knob", |a| {
-            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().keys_params[0] = 0.9;
-        });
-        moves_both("the instruments going unsaid", |a| {
-            a.desk.as_mut().unwrap().instruments = None;
-        });
+        moves_both("a DX7 patch", |a| row(a, 0).dx7.patch = 31);
+        moves_both("a DX7 cartridge", |a| row(a, 0).dx7.cart = "ROM2A.syx".into());
+        moves_both("a Keys patch", |a| row(a, 1).keys.patch = 6);
+        moves_both("a Keys knob", |a| row(a, 0).keys.params[0] = 0.9);
+        moves_both("the instruments going unsaid", |a| unsay(a, Says::INSTRUMENTS));
         // ── **The second late wave** ───────────────────────────────────
         //
         // Every knob of the rack on its own line. The eight hash in one
@@ -6776,16 +6535,12 @@ mod tests {
         });
         moves_both("the varispeed going unsaid", |a| desk(a).varispeed = None);
         moves_both("a lane freezing", |a| {
-            desk(a).frozen = Some(vec![FrozenLane {
-                lane: 0,
-                path: "media/frozen-01-7.wav".into(),
-                len_s: 3.0,
-            }]);
+            row(a, 0).frozen = Some(crate::desk_model::Frozen { path: "media/frozen-01-7.wav".into(), len_s: 3.0 });
         });
         moves_both("a frozen lane's file", |a| {
-            desk(a).frozen.as_mut().unwrap()[0].path = "media/frozen-02-8.wav".into();
+            row(a, 1).frozen.as_mut().unwrap().path = "media/frozen-02-8.wav".into();
         });
-        moves_both("the freeze going unsaid", |a| desk(a).frozen = None);
+        moves_both("the freeze going unsaid", |a| unsay(a, Says::FROZEN));
         moves_both("the click's division", |a| {
             desk(a).click.as_mut().unwrap().div = 0;
         });
@@ -7094,26 +6849,18 @@ mod tests {
         let legacy = |a: &Arrangement| a.to_json_with_desk_as(a.desk.as_ref(), crate::desk_format::Format::Legacy);
         let written = serde_json::from_str::<Value>(&legacy(&a)).expect("json");
         // **The desk as that shape reads back**, which every variant below
-        // must read as. The fixture's specials sit at strips 32..=35 of the
-        // legacy arrays (W5 joins them there), so its three-entry rows come
-        // back as wide as the strips they reach; everything it SAYS reads
-        // back as it was, which is checked here first.
+        // must read as. The fixture is the shipped thirty-two rows under the
+        // identity ids, the legacy shape's own width, and its specials sit
+        // at strips 32..=35 of the legacy arrays (W5 joins them there), so
+        // every row and every special reads back as it was.
         let fixture = a.desk.clone().expect("a desk");
         let d = Arrangement::from_json(&legacy(&a)).desk.expect("the legacy shape reads");
         assert_eq!(d.specials, fixture.specials, "the legacy shape lost a special");
-        assert_eq!(&d.names[..fixture.names.len()], &fixture.names[..], "the legacy shape lost a row's name");
-        assert_eq!(&d.colors[..fixture.colors.len()], &fixture.colors[..], "the legacy shape lost a row's paint");
-        assert_eq!(&d.sends[..fixture.sends.len()], &fixture.sends[..], "the legacy shape lost a row's send");
-        assert!(
-            d.names[fixture.names.len()..].iter().all(String::is_empty)
-                && d.colors[fixture.colors.len()..].iter().all(|c| *c == 0)
-                && d.sends[fixture.sends.len()..].iter().all(|v| *v == 0.0),
-            "the legacy shape invented a row"
-        );
-        let mut levelled = d.clone();
-        (levelled.names, levelled.colors, levelled.sends) =
-            (fixture.names.clone(), fixture.colors.clone(), fixture.sends.clone());
-        assert_eq!(levelled, fixture, "the legacy shape read something else differently");
+        assert_eq!(d.rows.len(), fixture.rows.len(), "the legacy shape invented or lost a row");
+        for (n, (got, want)) in d.rows.iter().zip(&fixture.rows).enumerate() {
+            assert_eq!(got, want, "the legacy shape read row {n} differently");
+        }
+        assert_eq!(d, fixture, "the legacy shape read something else differently");
         let desk = written.get("desk").and_then(Value::as_object).expect("a desk object");
         let head = desk.get("inserts").and_then(Value::as_array).expect("the head array");
         assert_eq!(head.len(), HEAD_BAYS, "the head is not written whole");
@@ -7121,8 +6868,16 @@ mod tests {
         let tail = desk.get("inserts_tail").and_then(Value::as_object).expect("a tail");
         assert_eq!(tail.get("12447"), Some(&Value::String("brusfri".into())));
         assert_eq!(tail.len(), 1, "a head seat leaked into the tail");
-        assert!(legacy(&a).matches("\"\"").count() < 200, "thousands of empties again");
-        assert!(a.to_json().matches("\"\"").count() < 200, "thousands of empties in format 2");
+        // **Hundreds, never thousands**: the legacy shape writes its head
+        // whole and one string per strip in each of its string arrays (the
+        // names, the inputs, the cartridges: a 32-row desk, the fixture's
+        // width since the snapshot became rows), where the dense seats were
+        // 13,167 of them. Format 2 writes a row's strings, a handful each.
+        let legacy_bound = HEAD_BAYS + 4 * (crate::desk_legacy::V32_STRIPS + 1);
+        let empties = legacy(&a).matches("\"\"").count();
+        assert!(empties < legacy_bound, "thousands of empties again: {empties}");
+        let empties = a.to_json().matches("\"\"").count();
+        assert!(empties < legacy_bound, "thousands of empties in format 2: {empties}");
 
         // The dense shape every earlier build wrote.
         let mut dense = vec![Value::String(String::new()); crate::recorder::INSERT_SPACE];

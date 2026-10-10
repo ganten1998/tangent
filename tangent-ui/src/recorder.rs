@@ -369,7 +369,8 @@ pub struct RecorderView<'a> {
 /// and the arrangement view's window when it is open to steer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScrubView {
-    /// `(lane, start_frac, len_frac, colour)` per clip, fractions of the
+    /// `(row, start_frac, len_frac, colour)` per clip, the row as its drawn
+    /// rank (the timeline's own stacking), fractions of the
     /// SPAN — the same axis the seek and the playhead already run on. The
     /// colour indexes `mixer_panel::STRIP_COLORS`; zero is the desk's wood
     /// and draws as the timeline's own green.
@@ -382,10 +383,10 @@ pub struct ScrubView {
     /// longer, so the rectangle is always telling the truth. Zero means
     /// "no document": the wave face falls back to the track's own length.
     pub domain_s: f64,
-    /// **How many rows the overview stacks**: the desk's extent, handed in.
-    /// It read the desk's compile-time width, which tied a picture of the
-    /// song to a capacity constant; the desk says how deep it is now, and
-    /// zero (no document) draws one row. Appended.
+    /// **How many rows the overview stacks**: the rows the desk draws,
+    /// handed in. It read the desk's compile-time width, which tied a
+    /// picture of the song to a capacity constant; the desk says how deep it
+    /// is now, and zero (no document) draws one row. Appended.
     pub rows: usize,
 }
 
@@ -464,17 +465,17 @@ impl RecorderView<'_> {
     }
 }
 
-/// The four things with a volume control, as linear gains.
+/// The four things with a volume control that are not tracks, as linear
+/// gains.
 ///
 /// Linear rather than dB because that is what the audio path multiplies by;
 /// the band converts for display and for the fader's travel. A struct rather
 /// than four loose floats so that adding a fifth source is one field and not
-/// five call sites.
+/// five call sites. **A track's fader is its row's** (`TrackRow::gain`, read
+/// through `TangentApp::channel_gain`): an array of them here was as wide as
+/// the fixed desk, and a desk has no width.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gains {
-    /// One per general channel — the fader of each of the eight, whatever
-    /// the channel's kind.
-    pub channels: [f32; CHANNELS],
     /// The click. Applies to what you hear; whether it reaches the FILE is
     /// `metronome_in_take`, which is a separate question with a separate
     /// answer.
@@ -534,8 +535,8 @@ pub enum ChannelKind {
     Audio,
 }
 
-/// **Which lanes are shut off from LIVE MIDI**, one bit per channel, set = shut
-/// off. The engine's `midi_off`.
+/// **Which lanes are shut off from LIVE MIDI**, one flag per row, set = shut
+/// off. The engine's `MIDI_OFF` lane flag.
 ///
 /// Three rules, in order:
 ///
@@ -562,41 +563,26 @@ pub enum ChannelKind {
 /// Logic and Cubase both sound the selected instrument track without a record
 /// arm, so this desk is now deliberately stricter than they are.
 ///
-/// It is one mask rather than a gate per rule because the mask's EDGE is what
+/// It is one flag rather than a gate per rule because the flag's EDGE is what
 /// releases the notes a silenced lane was holding. A second gate would have no
 /// edge of its own and would strand them sounding.
 ///
-/// **Only the CHANNEL bits are ever set.** The engine's `Strip` numbering runs
-/// past the channels — drums, click, fx — and those racks read this same mask
-/// for their own bit. They have never been gated by it and must not start
-/// being: a mask built as "everything off, then open the live ones" reaches
-/// them, where the old "nothing off, then close the dead ones" did not, and
-/// the click's own effect would have gone deaf to the keyboard.
-pub fn live_midi_off(
-    kinds: &[Option<ChannelKind>],
-    armed: u32,
-    editor_lane: Option<usize>,
-) -> u32 {
+/// **Only the ROWS are answered.** The drum bus, the click and the effects
+/// return have never been gated by this and must not start being: the
+/// click's own effect would go deaf to the keyboard. Their flags are the
+/// bridge's own, apart from this.
+pub fn live_midi_off(kinds: &[Option<ChannelKind>], armed: &[bool], editor_lane: Option<usize>) -> Vec<bool> {
+    // **One answer per ROW, as long as the desk is**: `off[r]` says row r is
+    // shut off. It was a u32 with a bit per channel, which a desk past
+    // thirty-two rows could not say at all, and `1 << lane.min(31)` folded
+    // an editor open on row 40 onto row 31.
+    let midi = |r: usize| kinds.get(r).copied().flatten() == Some(ChannelKind::Midi);
     // Rule 3 short-circuits, but still answers to rule 1: an editor somehow
     // open on an audio lane silences the desk rather than opening it.
-    // The channels' bits, and no others. See the note above.
-    let all = ((1u64 << CHANNELS.min(32)) - 1) as u32;
     if let Some(lane) = editor_lane {
-        return if kinds.get(lane).copied().flatten() == Some(ChannelKind::Midi) {
-            all & !(1u32 << lane.min(31))
-        } else {
-            all
-        };
+        return (0..kinds.len()).map(|r| !(r == lane && midi(r))).collect();
     }
-    let mut off = all;
-    for ch in 0..CHANNELS.min(32) {
-        let live =
-            kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi) && armed & (1 << ch) != 0;
-        if live {
-            off &= !(1u32 << ch);
-        }
-    }
-    off
+    (0..kinds.len()).map(|r| !(midi(r) && armed.get(r).copied().unwrap_or(false))).collect()
 }
 
 // ── which DEVICES, and which CHANNEL, one track listens to ──────────────────
@@ -846,7 +832,10 @@ pub fn read_midi_inputs(stored: Option<&Value>) -> Vec<MidiInputSel> {
     };
     for (k, v) in o {
         let Ok(ch) = k.parse::<usize>() else { continue };
-        if ch >= CHANNELS {
+        // A hostile file's bound, never a desk's width: the reader grows the
+        // list to the highest row named, so the most a file can ask for is
+        // the most rows any desk may hold.
+        if ch >= crate::desk_id::MAX_ROWS {
             continue;
         }
         let Some(row) = v.as_object() else { continue };
@@ -928,25 +917,35 @@ pub fn write_midi_inputs(sels: &[MidiInputSel]) -> Option<Value> {
 /// anything stored for an audio or unbound channel is meaningless.
 pub fn reconcile_midi_inputs(sels: &mut Vec<MidiInputSel>, legacy: &[String]) {
     for (ch, spec) in legacy.iter().enumerate() {
-        let Some(from_legacy) = MidiInputSel::from_legacy(spec) else {
-            if let Some(slot) = sels.get_mut(ch) {
-                *slot = MidiInputSel::EVERYTHING;
-            }
+        if MidiInputSel::from_legacy(spec).is_none() && sels.get(ch).is_none() {
             continue;
-        };
+        }
         while sels.len() <= ch {
             sels.push(MidiInputSel::EVERYTHING);
         }
-        let held = &mut sels[ch];
-        let contradicts = match from_legacy.devices.first() {
-            None => !held.devices.is_empty(),
-            Some(port) => !held.devices.iter().any(|d| d == port),
-        };
-        if contradicts {
-            held.devices = from_legacy.devices;
-        }
+        reconcile_midi_input(&mut sels[ch], spec);
     }
     trim_midi_inputs(sels);
+}
+
+/// **[`reconcile_midi_inputs`]' rule for ONE track**: its device set against
+/// its own input spec, the string an older build actually wrote winning
+/// where the two contradict, the channel surviving. A spec that is not a
+/// MIDI spec at all leaves the default set: a set stored for an audio or
+/// unbound track is meaningless. What a row of the desk holds both of
+/// (`TrackRow::midi`, `TrackRow::input`), so the rule is applied per row.
+pub fn reconcile_midi_input(sel: &mut MidiInputSel, spec: &str) {
+    let Some(from_legacy) = MidiInputSel::from_legacy(spec) else {
+        *sel = MidiInputSel::EVERYTHING;
+        return;
+    };
+    let contradicts = match from_legacy.devices.first() {
+        None => !sel.devices.is_empty(),
+        Some(port) => !sel.devices.iter().any(|d| d == port),
+    };
+    if contradicts {
+        sel.devices = from_legacy.devices;
+    }
 }
 
 /// Drop trailing defaults, so a desk nobody has narrowed holds an EMPTY
@@ -1017,14 +1016,16 @@ pub fn live_midi_routes(
     sels: &[MidiInputSel],
     kinds: &[Option<ChannelKind>],
     slots: &[String],
-) -> [MidiRoute; CHANNELS] {
-    std::array::from_fn(|ch| {
-        if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
-            return MidiRoute::EVERYTHING;
-        }
-        sels.get(ch)
-            .map_or(MidiRoute::EVERYTHING, |s| s.route(slots))
-    })
+) -> Vec<MidiRoute> {
+    // One per row, as long as the desk is.
+    (0..kinds.len())
+        .map(|ch| {
+            if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
+                return MidiRoute::EVERYTHING;
+            }
+            sels.get(ch).map_or(MidiRoute::EVERYTHING, |s| s.route(slots))
+        })
+        .collect()
 }
 
 /// **Every device any track asks for, deduplicated, in desk order.**
@@ -1038,7 +1039,7 @@ pub fn live_midi_routes(
 /// input and would put a nonsense name in the open set.
 pub fn wanted_midi_devices(sels: &[MidiInputSel], kinds: &[Option<ChannelKind>]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for ch in 0..CHANNELS {
+    for ch in 0..kinds.len() {
         if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
             continue;
         }
@@ -1070,6 +1071,25 @@ impl ChannelKind {
         }
     }
 
+    /// **What a row of this kind is** (`desk_model::RowKind`): the same
+    /// two kinds, by name rather than by byte.
+    pub const fn row_kind(self) -> crate::desk_model::RowKind {
+        match self {
+            ChannelKind::Midi => crate::desk_model::RowKind::Midi,
+            ChannelKind::Audio => crate::desk_model::RowKind::Audio,
+        }
+    }
+
+    /// [`Self::row_kind`]'s inverse. A bus row is no channel kind: it has
+    /// no input, hears no MIDI and takes no clips (design section 9).
+    pub const fn of_row(kind: crate::desk_model::RowKind) -> Option<Self> {
+        match kind {
+            crate::desk_model::RowKind::Midi => Some(ChannelKind::Midi),
+            crate::desk_model::RowKind::Audio => Some(ChannelKind::Audio),
+            crate::desk_model::RowKind::Bus => None,
+        }
+    }
+
     /// The other one — the icon's click.
     pub fn cycled(self) -> Self {
         match self {
@@ -1084,36 +1104,29 @@ impl ChannelKind {
 // THE TAKE IS WHAT WAS PLAYED. One gesture records the moment — audio, MIDI
 // and video together — and keeps it whole; assembling a performance out of
 // the best bars of seven passes is a different program, with an editing
-// timeline this one deliberately does not grow. Play it again instead. Like
-// the take's own shape, this is a limit you can feel the shape of, not a
-// feature that has not arrived yet.
+// timeline this one deliberately does not grow. Play it again instead. This
+// is a limit you can feel the shape of, not a feature that has not arrived
+// yet; the desk's own size is not such a limit (see the principle below).
 
-/// How many general channels this build's desk can CARRY today - the
-/// capacity the engine tables, settings arrays and seat indices are still
-/// sized to.
-///
-/// **The principle this number serves is the reverse of the one it was
-/// written for** (docs/design/unlimited-tracks.md, section 2):
-///
-/// The desk is the list of tracks that exist, plus one place to add the
-/// next. It grows by appending and the machine is its only limit: no part
-/// of its shape is a compile-time number. A licence decides how many tracks
-/// an install may CREATE: thirty-two free, no limit with a supporter key or
-/// a certain code. It never hides, silences or truncates a track that
-/// exists: a project with more tracks than this install may create opens
-/// whole, plays whole and saves whole, and only the next new track is
-/// refused. Buses, returns, sends and routes are unlimited on every tier and
-/// are not tracks. Every track, bus and plugin seat has an identity that
-/// does not depend on where it sits, so adding, removing or reordering
-/// tracks renumbers nothing on disk and moves no plugin.
-///
-/// Until that lands this constant is the build's CEILING, not a tier: the
-/// free tier is [`FREE_TRACKS`], asked through [`track_cap`], and the two
-/// happen to agree at thirty-two. A supporter who reaches it is told so
-/// (`TrackRefusal::Ceiling`). It is deleted when the desk becomes a list;
-/// no wider interim value is ever built, because `Shared` and the
-/// stack-held engine tables stop fitting near thirty-five lanes.
-pub const CHANNELS: usize = 32;
+// **The desk has no width** (docs/design/unlimited-tracks.md, section 2):
+//
+// The desk is the list of tracks that exist, plus one place to add the next.
+// It grows by appending and the machine is its only limit: no part of its
+// shape is a compile-time number. A licence decides how many tracks an
+// install may CREATE: thirty-two free, no limit with a supporter key or a
+// certain code. It never hides, silences or truncates a track that exists: a
+// project with more tracks than this install may create opens whole, plays
+// whole and saves whole, and only the next new track is refused. Buses,
+// returns, sends and routes are unlimited on every tier and are not tracks.
+// Every track, bus and plugin seat has an identity that does not depend on
+// where it sits, so adding, removing or reordering tracks renumbers nothing
+// on disk and moves no plugin.
+//
+// So there is no constant here for how many channels the desk carries: it
+// was `CHANNELS`, the capacity every settings array, engine table and seat
+// index was sized to, and it is gone. A desk is `Settings::rows`, as long as
+// it is; the legacy files' frozen width is `desk_lift::V32_CHANNELS`, read
+// only by the readers of those files.
 
 /// **How many tracks a free install may CREATE: thirty-two.**
 ///
@@ -1200,17 +1213,6 @@ pub const LIMITER_SHIPS_AT: f32 = 47.0 / 48.0;
 /// number this app made up.
 pub const INSERTS: usize = 3;
 
-/// How many inputs of one interface the desk has room for.
-///
-/// **`tangent_record::audio::MAX_PICKS`'s twin**, the same number counted
-/// where the capture happens. This crate cannot reach that one (see the
-/// firewall), so the host asserts they agree. A literal rather than
-/// `CHANNELS`, because an input is a property of the interface and not of
-/// the desk: the two only ever agreed by accident, and the day the desk
-/// stops being a fixed width this must not move with it. Both go when the
-/// picks become one per bound track.
-pub const INPUTS: usize = 32;
-
 /// **How many bays a strip shows: six on the master and on every CHANNEL.**
 ///
 /// It used to be three on a channel, six on the master, and six on a channel
@@ -1286,8 +1288,8 @@ pub const AMP_DEFAULT_BOARD: [&str; AMP_PEDALS] = [
 
 /// How many pads the drumpad addresses: EVERY MIDI key. Pad `n` IS note
 /// `n` — the 4×4 window the panel shows is a PAGE over this space, stepped
-/// by the bank band on its left. The engine mirrors this the way it
-/// mirrors [`CHANNELS`].
+/// by the bank band on its left. The engine reads this one number
+/// (`desk_id::PADS`) rather than keeping a copy of its own.
 pub const DRUM_PADS: usize = 128;
 
 /// One visible PAGE of the pads: the 4×4 the hands know.
@@ -1546,30 +1548,27 @@ impl StripRef {
         }
     }
 
-    /// **The lane the automation store files this strip's curves under.**
+    /// **Whose curves this strip's are**, in the automation store: a track's
+    /// sit on its row, the master's on [`AutoLane::Master`], by name. Only
+    /// tracks and the master have curves, so a bus has none.
     ///
-    /// The automation's own lane space, and the reason it is spelt out: a
-    /// track's curves sit on its row, and the MASTER's on the lane one past
-    /// the rows. Only tracks and the master have curves, so a bus has no
-    /// lane. The master's lane becomes `AutoLane::Master` in W6 and this
-    /// goes.
-    pub const fn auto_lane(self) -> Option<usize> {
+    /// [`AutoLane::Master`]: crate::automation::AutoLane::Master
+    pub const fn auto_lane(self) -> Option<crate::automation::AutoLane> {
+        use crate::automation::AutoLane;
         match self {
-            StripRef::Row(row) => Some(row),
-            StripRef::Master => Some(CHANNELS),
+            StripRef::Row(row) => Some(AutoLane::Row(row)),
+            StripRef::Master => Some(AutoLane::Master),
             StripRef::Drums | StripRef::Click | StripRef::Fx => None,
         }
     }
 
-    /// The strip a stored automation lane belongs to: a track's row, the
-    /// master's lane, or nothing past it.
-    pub const fn from_auto_lane(lane: usize) -> Option<StripRef> {
-        if lane < CHANNELS {
-            Some(StripRef::Row(lane))
-        } else if lane == CHANNELS {
-            Some(StripRef::Master)
-        } else {
-            None
+    /// The strip a stored automation lane belongs to: a track's row, or the
+    /// master.
+    pub const fn from_auto_lane(lane: crate::automation::AutoLane) -> StripRef {
+        use crate::automation::AutoLane;
+        match lane {
+            AutoLane::Row(row) => StripRef::Row(row),
+            AutoLane::Master => StripRef::Master,
         }
     }
 }
@@ -1666,7 +1665,6 @@ impl Default for Gains {
     /// hand within a minute otherwise.
     fn default() -> Self {
         Self {
-            channels: [1.0; CHANNELS],
             metronome: 0.5,
             master: 1.0,
             track: 1.0,
@@ -1720,6 +1718,11 @@ pub struct ArrRecView {
     pub notes: Vec<crate::arrangement::ArrNote>,
 }
 
+/// **The strips that are not rows and have a meter of their own**, in the
+/// order [`RecorderState::special_peaks`] holds them: the drum bus, the click
+/// and the effects return. The master's meter is [`RecorderState::master`].
+pub const SPECIAL_METERS: [StripRef; 3] = [StripRef::Drums, StripRef::Click, StripRef::Fx];
+
 #[derive(Debug, Clone)]
 pub struct RecorderState {
     /// The playhead, in seconds from 0:00 — what the readout and the waveform
@@ -1744,12 +1747,17 @@ pub struct RecorderState {
     pub arr_rec: Option<ArrRecView>,
     pub state: RecordState,
     pub elapsed_s: f64,
-    /// The loudest thing each strip made since the last frame, at its
-    /// LEGACY strip (`desk_legacy::v32_strip`): the host's meter push still
-    /// speaks strip space, and this is its form, kept beside the desk by
-    /// identity until the host's meters move onto rows and specials (C11).
-    /// Read by the views through `TangentApp::strip_meter`, never by index.
-    pub strip_peaks: [[f32; 2]; crate::desk_legacy::V32_STRIPS],
+    /// **The loudest thing each ROW made since the last frame**, by row, as
+    /// long as the desk is: the host reads each track's lane by its slot and
+    /// puts the reading on the row the track stands on. Read by the views
+    /// through `TangentApp::strip_meter`, never by index. It was one array
+    /// in the legacy strip space (thirty-two rows, then the buses), which
+    /// had no place for a thirty-third track's meter.
+    pub row_peaks: Vec<[f32; 2]>,
+    /// The same for the three strips that are not rows: the drum bus, the
+    /// click and the effects return, in that order ([`SPECIAL_METERS`]).
+    /// The master's is [`Self::master`].
+    pub special_peaks: [[f32; 2]; 3],
     pub meters: Meters,
     /// The output's levels and the limiter's reduction. See the same two
     /// fields on [`RecorderView`].
@@ -1759,10 +1767,10 @@ pub struct RecorderState {
     /// times a second. The WINDOW is a setting and is not stored here — see
     /// `TangentApp::recorder_layout_view`, which puts the two together.
     pub loudness: Loudness,
-    /// What each lane's CLIPS are sounding, as a pitch mask. Playback only —
-    /// the live notes are already in the app's own hands, because it is the
-    /// thing that received them.
-    pub lane_sounding: [u128; CHANNELS],
+    /// What each row's CLIPS are sounding, as a pitch mask, by row. Playback
+    /// only — the live notes are already in the app's own hands, because it
+    /// is the thing that received them.
+    pub lane_sounding: Vec<u128>,
     /// The output directory, shortened for display.
     pub dest: String,
     /// The PROJECT and EXPORT folders, likewise. See the same two fields on
@@ -1778,8 +1786,10 @@ pub struct RecorderState {
     pub camera_name: Option<String>,
     /// The camera named in settings is not present right now.
     pub camera_missing: bool,
-    /// The inputs of the interface that are open, one strip each.
-    pub inputs: [InputState; INPUTS],
+    /// The inputs of the interface that are open, one strip each, as many
+    /// as the interface has open: a property of the device, never of the
+    /// desk.
+    pub inputs: Vec<InputState>,
     pub audio_name: Option<String>,
     pub audio_missing: bool,
     pub preview: Option<Preview>,
@@ -1813,9 +1823,7 @@ pub struct RecorderState {
     pub play_pending: bool,
 }
 
-/// Hand-written because `strip_peaks` is a thirty-five-row array and std
-/// only derives `Default` for arrays up to thirty-two — the desk outgrew
-/// the derive the day it went to thirty-two channels plus its three buses.
+/// Hand-written: the record state's own default is not every field's.
 impl Default for RecorderState {
     fn default() -> Self {
         Self {
@@ -1826,12 +1834,13 @@ impl Default for RecorderState {
             arr_rec: None,
             state: RecordState::default(),
             elapsed_s: 0.0,
-            strip_peaks: [[0.0; 2]; crate::desk_legacy::V32_STRIPS],
+            row_peaks: Vec::new(),
+            special_peaks: [[0.0; 2]; 3],
             meters: Meters::default(),
             master: Meters::default(),
             gr_db: 0.0,
             loudness: Loudness::default(),
-            lane_sounding: [0; CHANNELS],
+            lane_sounding: Vec::new(),
             dest: String::new(),
             project_dest: String::new(),
             export_dest: String::new(),
@@ -4242,6 +4251,9 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The shipped desk's thirty-two rows, the width these tests were written
+    // against: a legacy number since the desk became the rows that exist.
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     /// **A field opens on its reading, and the first thing typed replaces
     /// it.**
@@ -4376,7 +4388,7 @@ mod tests {
     /// pad.
     #[test]
     fn every_channels_pads_have_their_own_seats_and_nothing_moved() {
-        use super::{pad_rack_index, CHANNELS, DRUM_PADS, MASTER_EXTRA_SEAT, TOTAL_SEATS};
+        use super::{pad_rack_index, DRUM_PADS, MASTER_EXTRA_SEAT, TOTAL_SEATS};
         use crate::desk_legacy::V32_STRIPS as STRIPS;
         // Channel 0 keeps the ORIGINAL block. This is the assertion that
         // stops a saved session's pad plugins from moving.
@@ -4470,20 +4482,23 @@ mod tests {
     #[test]
     fn live_midi_reaches_armed_lanes_and_the_editors_lane_alone() {
         use super::{live_midi_off, ChannelKind};
-        let off = |ch: usize, m: u32| m & (1 << ch) != 0;
+        // One answer per row (W6): `true` is deaf.
+        let off = |ch: usize, m: &[bool]| m[ch];
         let mut kinds = vec![None; CHANNELS];
         kinds[0] = Some(ChannelKind::Midi);
         kinds[1] = Some(ChannelKind::Midi);
         kinds[2] = Some(ChannelKind::Audio);
+        let armed = |rows: &[usize], n: usize| -> Vec<bool> { (0..n).map(|r| rows.contains(&r)).collect() };
+        let width = kinds.len();
 
         // Nothing armed: silence. The editor is the ONE exception below.
-        let m = live_midi_off(&kinds, 0, None);
-        assert!(off(0, m) && off(1, m) && off(2, m));
+        let m = live_midi_off(&kinds, &armed(&[], width), None);
+        assert!(off(0, &m) && off(1, &m) && off(2, &m));
 
         // ARMED sounds, and it is the only thing that does.
-        let m = live_midi_off(&kinds, 1 << 1, None);
-        assert!(!off(1, m), "an armed MIDI lane takes no notes");
-        assert!(off(0, m));
+        let m = live_midi_off(&kinds, &armed(&[1], width), None);
+        assert!(!off(1, &m), "an armed MIDI lane takes no notes");
+        assert!(off(0, &m));
 
         // **An UNARMED lane is silent whatever else is true of it.** This is
         // the owner's 2026-09-07 ruling and the regression guard for it: the
@@ -4492,38 +4507,43 @@ mod tests {
         // heard. There is no selection in this function's arguments any more,
         // which is the strongest form the rule can take — but the case worth
         // naming is lane 0 live while lane 1 is the armed one.
-        let m = live_midi_off(&kinds, 1 << 1, None);
-        assert!(off(0, m), "an unarmed MIDI lane was handed the keyboard");
+        let m = live_midi_off(&kinds, &armed(&[1], width), None);
+        assert!(off(0, &m), "an unarmed MIDI lane was handed the keyboard");
 
         // An armed AUDIO lane is still an audio lane. Rule 1 outranks rule 2.
-        let m = live_midi_off(&kinds, 1 << 2, None);
-        assert!(off(2, m), "an audio lane was handed a note");
+        let m = live_midi_off(&kinds, &armed(&[2], width), None);
+        assert!(off(2, &m), "an audio lane was handed a note");
 
         // **The editor takes the desk.** Both lanes armed, editor open on
         // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, pianoteq
         // on track 2, audition note, it triggers BOTH".
-        let m = live_midi_off(&kinds, 0b11, Some(1));
-        assert!(!off(1, m), "the edited lane went quiet");
-        assert!(off(0, m), "the other armed instrument sounded too");
+        let m = live_midi_off(&kinds, &armed(&[0, 1], width), Some(1));
+        assert!(!off(1, &m), "the edited lane went quiet");
+        assert!(off(0, &m), "the other armed instrument sounded too");
 
         // **And the editor still needs no arm** — the one road to an audition
         // that survived rule 2 losing its selection clause.
-        let m = live_midi_off(&kinds, 0, Some(1));
-        assert!(!off(1, m), "the editor's own lane needs arming now");
+        let m = live_midi_off(&kinds, &armed(&[], width), Some(1));
+        assert!(!off(1, &m), "the editor's own lane needs arming now");
 
         // And an editor somehow open on an audio lane silences every
         // CHANNEL rather than opening the desk up.
-        let all = ((1u64 << CHANNELS) - 1) as u32;
-        assert_eq!(live_midi_off(&kinds, 0b11, Some(2)), all);
+        assert!(live_midi_off(&kinds, &armed(&[0, 1], width), Some(2)).iter().all(|o| *o));
 
-        // **The strips past the channels are never in this mask.** Drums,
-        // click and fx read it for their own bit and have never been gated
-        // by it; a mask built as "everything off, then open the live ones"
-        // reaches them where the old one did not.
-        for (armed, ed) in [(0u32, None), (0b11, Some(1)), (0, Some(1))] {
-            let m = live_midi_off(&kinds, armed, ed);
-            assert_eq!(m & !all, 0, "a strip past the channels was gated: {m:#x}");
+        // **One answer per row, as many as the desk has, and no more.** The
+        // strips past the rows (drums, click, fx) read their own flags and
+        // were never in this answer; it was a word that stopped at row
+        // thirty-one, and it is a list now (W6).
+        for (rows, ed) in [(vec![], None), (vec![0, 1], Some(1)), (vec![], Some(1))] {
+            assert_eq!(live_midi_off(&kinds, &armed(&rows, width), ed).len(), width);
         }
+        // **A row past the old word hears its keys**: an armed MIDI track on
+        // row forty of a desk of forty-one.
+        let mut wide = vec![None; 41];
+        wide[40] = Some(ChannelKind::Midi);
+        let m = live_midi_off(&wide, &armed(&[40], 41), None);
+        assert!(!off(40, &m), "an armed track past row thirty-one took no notes");
+        assert!(m[..40].iter().all(|o| *o));
     }
 
 
@@ -4913,7 +4933,7 @@ mod tests {
     fn a_folders_six_slots_have_their_own_appended_seats() {
         use super::{
             amp_pedal_of, amp_pedal_seat, bays_on, folder_extra_seat, pad_rack_index, seat_bay,
-            Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
+            Strip, AMP_PEDALS, DRUM_PADS, INSERTS, INSERT_SPACE,
             MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
         };
         use crate::desk_legacy::V32_STRIPS as STRIPS;
@@ -5011,7 +5031,7 @@ mod tests {
     fn a_folder_extra_seat_names_its_own_channel_and_nothing_else() {
         use super::{
             amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, AMP_PEDALS,
-            CHANNELS, MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
+            MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
         };
         for ch in 0..CHANNELS {
             assert_eq!(
@@ -5481,8 +5501,9 @@ mod fader_tests {
     #[test]
     fn the_click_starts_under_the_music_and_out_of_the_file() {
         let k = Knobs::default();
+        // The rows' faders are their own now (W6), not one of the knobs.
         assert!(
-            k.gains.channels.iter().all(|g| k.gains.metronome < *g),
+            crate::settings::Settings::default().rows.iter().all(|r| k.gains.metronome < r.gain as f32),
             "the click starts under EVERY channel, not just the first"
         );
         assert!(!k.metronome_in_take, "a click in the file is a ruined take");
@@ -6180,7 +6201,7 @@ mod missing_tests {
     /// eight is not something anybody can act on.
     #[test]
     fn a_channel_says_which_one() {
-        for i in 0..crate::recorder::CHANNELS {
+        for i in 0..crate::desk_lift::V32_CHANNELS {
             let said = Strip::Channel(i).label();
             assert_eq!(said, format!("channel {}", i + 1));
         }
@@ -6204,6 +6225,8 @@ fn resting_analyzer() -> &'static crate::analyzer::Analyzer {
 /// strip-index arithmetic (docs/design/unlimited-tracks.md, W2-views-windowed).
 #[cfg(test)]
 mod strip_ref_tests {
+    // The shipped desk's thirty-two rows, a legacy width (W6).
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
     use super::*;
 
     /// **A column, its strip and its settings' key agree, by name.** The
@@ -6270,11 +6293,15 @@ mod strip_ref_tests {
         for (i, r) in legacy.iter().enumerate() {
             assert_eq!(crate::desk_legacy::v32_strip(*r), Some(i));
         }
-        assert_eq!(StripRef::Master.auto_lane(), Some(CHANNELS));
+        // **The master's lane is the master's by name** (W6): no number
+        // past the rows means it, so a row at any width is a row.
+        use crate::automation::AutoLane;
+        assert_eq!(StripRef::Master.auto_lane(), Some(AutoLane::Master));
         assert_eq!(StripRef::Drums.auto_lane(), None, "the drum bus took the master's lane");
-        assert_eq!(StripRef::from_auto_lane(CHANNELS), Some(StripRef::Master));
-        assert_eq!(StripRef::from_auto_lane(3), Some(StripRef::Row(3)));
-        assert_eq!(StripRef::from_auto_lane(CHANNELS * 2), None);
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Master), StripRef::Master);
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Row(3)), StripRef::Row(3));
+        assert_eq!(StripRef::from_auto_lane(AutoLane::Row(CHANNELS)), StripRef::Row(CHANNELS));
+        assert_eq!(StripRef::Row(CHANNELS * 2).auto_lane(), Some(AutoLane::Row(CHANNELS * 2)));
     }
 
     /// The code a scan reads: comments dropped, and every top-level

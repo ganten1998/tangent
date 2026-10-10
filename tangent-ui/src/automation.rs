@@ -41,10 +41,61 @@ pub const MASTER_TARGET: &str = "master";
 /// `lane`, or the master by `target`. `None` for a curve that says neither
 /// (or names a target this build does not have), which the reader drops
 /// rather than guesses at.
-pub fn persisted_lane(o: &serde_json::Map<String, serde_json::Value>, master_lane: usize) -> Option<usize> {
+pub fn persisted_lane(o: &serde_json::Map<String, serde_json::Value>) -> Option<AutoLane> {
     match o.get("target") {
-        Some(t) => (t.as_str()? == MASTER_TARGET).then_some(master_lane),
-        None => usize::try_from(o.get("lane")?.as_u64()?).ok(),
+        Some(t) => (t.as_str()? == MASTER_TARGET).then_some(AutoLane::Master),
+        None => usize::try_from(o.get("lane")?.as_u64()?).ok().map(AutoLane::Row),
+    }
+}
+
+/// **Whose curve it is**: the track on a row, or the master.
+///
+/// **A name for the master, never a number.** Its curves used to be filed
+/// under the lane one past the rows (the channel count), which was a safe
+/// number only while the rows stopped at a fixed count. A desk that grows by
+/// appending reaches that number with its next track, and a curve drawn on
+/// the thirty-third track would then have played on the master's fader, or
+/// the master's on the new track's. No row can reach a name. Rows still go
+/// by their position, because a row's curves are a positional unit that the
+/// structural edits carry with it (design section 0).
+///
+/// Ordered rows first, then the master: the order a document has always
+/// listed its curves in, when the master's number sat past every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AutoLane {
+    /// The track on this row.
+    Row(usize),
+    /// The master's own fader, pan, mute and bays.
+    Master,
+}
+
+impl AutoLane {
+    /// The row, or `None` for the master.
+    pub const fn row(self) -> Option<usize> {
+        match self {
+            AutoLane::Row(r) => Some(r),
+            AutoLane::Master => None,
+        }
+    }
+
+    /// **This lane as a number in a list that names the master by
+    /// `master`**: the engine's lane space, where the bridge has already
+    /// put each row's curves on its track's slot and says which number the
+    /// master's curves are filed under (`SlotAutomation::master`). A row is
+    /// its own number.
+    pub const fn index_or(self, master: usize) -> usize {
+        match self {
+            AutoLane::Row(r) => r,
+            AutoLane::Master => master,
+        }
+    }
+}
+
+/// A bare number is a row: the shape every caller that names a track's
+/// lane, and the engine's slot space, already speak.
+impl From<usize> for AutoLane {
+    fn from(row: usize) -> Self {
+        AutoLane::Row(row)
     }
 }
 
@@ -269,7 +320,7 @@ pub struct Point {
 /// One control's automation over the whole song.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Curve {
-    pub lane: usize,
+    pub lane: AutoLane,
     pub param: AutoParam,
     /// Sorted by time, never empty once [`Curve::sanitised`] has been. A
     /// curve with no points is not written down at all — see
@@ -298,7 +349,8 @@ impl Curve {
     /// The same bargain [`crate::tempo::TempoMap::sanitised`] makes, and for
     /// the same reason — a document is a file somebody can edit by hand, so
     /// "the file said so" guarantees nothing.
-    pub fn sanitised(lane: usize, param: AutoParam, mut points: Vec<Point>) -> Self {
+    pub fn sanitised(lane: impl Into<AutoLane>, param: AutoParam, mut points: Vec<Point>) -> Self {
+        let lane = lane.into();
         points.retain(|p| p.at_s.is_finite() && p.value.is_finite() && p.at_s >= 0.0);
         for p in &mut points {
             p.value = p.value.clamp(0.0, 1.0);
@@ -527,22 +579,25 @@ impl Automation {
     }
 
     /// Move every curve on `from` to `to` — the era lift's tool. The master
-    /// lane IS the channel count, so when the desk grew from sixteen to
-    /// twenty-four every pre-6 document's master curves sat at 16, which is
-    /// an ordinary channel now.
-    pub fn remap_lane(&mut self, from: usize, to: usize) {
+    /// lane WAS the channel count, so every older document's master curves
+    /// sit at the number its era's desk ended at (16, 24 or 32), an ordinary
+    /// row's number now, and are moved onto [`AutoLane::Master`] by name.
+    pub fn remap_lane(&mut self, from: impl Into<AutoLane>, to: impl Into<AutoLane>) {
+        let (from, to) = (from.into(), to.into());
         for c in &mut self.curves {
             if c.lane == from {
                 c.lane = to;
             }
         }
+        self.curves.sort_by_key(|c| (c.lane, c.param));
     }
 
     pub fn is_empty(&self) -> bool {
         self.curves.is_empty()
     }
 
-    pub fn get(&self, lane: usize, param: AutoParam) -> Option<&Curve> {
+    pub fn get(&self, lane: impl Into<AutoLane>, param: AutoParam) -> Option<&Curve> {
+        let lane = lane.into();
         self.curves.iter().find(|c| c.lane == lane && c.param == param)
     }
 
@@ -556,7 +611,7 @@ impl Automation {
     /// starts at or after `t`. A plugin parameter is read at the chunk's
     /// position too, and a lane carrying one is not rendered ahead, so it
     /// hears its curve on that same chunk - see the engine's `grain_ok`.
-    pub fn value_at(&self, lane: usize, param: AutoParam, seconds: f64) -> Option<f64> {
+    pub fn value_at(&self, lane: impl Into<AutoLane>, param: AutoParam, seconds: f64) -> Option<f64> {
         self.get(lane, param)?.value_at(seconds)
     }
 
@@ -573,7 +628,8 @@ impl Automation {
     }
 
     /// The curve for a control, made if it is not there yet.
-    pub fn entry(&mut self, lane: usize, param: AutoParam) -> &mut Curve {
+    pub fn entry(&mut self, lane: impl Into<AutoLane>, param: AutoParam) -> &mut Curve {
+        let lane = lane.into();
         if self.get(lane, param).is_none() {
             self.curves.push(Curve::sanitised(lane, param, Vec::new()));
             self.curves.sort_by_key(|c| (c.lane, c.param));

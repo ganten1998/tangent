@@ -518,13 +518,13 @@ impl Strip {
 
 /// **The strip-space desk**: what each legacy strip sends to the effects
 /// bus, and what is heard. It was the live `recorder::Desk` the app built
-/// for the bridge every frame; the bridge reads the desk by identity now
-/// (`TangentApp::strip_send`, `strip_heard_muted`), and this shape is
-/// kept, re-exported as `recorder::Desk`, for the readers that speak strip
-/// space: the engine's legacy shims and their tests, and the host's take
-/// facts (`TangentApp::desk`), each until it moves onto the desk by what a
-/// strip is (C11: a new form beside the old, the old deleted by the lane
-/// that stops using it).
+/// for the bridge every frame; the bridge and the host's take facts read
+/// the desk by identity now (`TangentApp::strip_send`, `strip_heard_muted`,
+/// W6), and this shape is kept, re-exported as `recorder::Desk`, for the
+/// one reader left that speaks strip space: the engine's cfg(test)
+/// `set_desk` shim and the goldens and benches that drive it, until that
+/// lane moves them (C11: the old form is deleted by the lane that stops
+/// using it).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct V32Desk {
     /// How much of each strip goes to the effects bus, 0..=1, at its legacy
@@ -745,9 +745,9 @@ mod tests {
 
     #[test]
     fn the_frozen_numbers_are_still_the_live_desks() {
-        assert_eq!(V32_CHANNELS, recorder::CHANNELS);
-        // `V32_STRIPS` has no live twin to agree with: the specials left
-        // strip space (W5), so the strip count lives here alone.
+        // `V32_CHANNELS` and `V32_STRIPS` have no live twin to agree with:
+        // the specials left strip space (W5) and the desk is the list of
+        // rows that exist (W6), so the widths live here alone.
         assert_eq!(V32_TOTAL_SEATS, TOTAL_SEATS);
         assert_eq!(V32_INSERT_SPACE, INSERT_SPACE);
         assert_eq!(BAYS, recorder::INSERTS);
