@@ -355,6 +355,14 @@ fn retire_deadline(offline: bool) -> Instant {
 /// Peak-hold fall rate, matching `tangent-record`'s meter so the two read the same.
 const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 
+/// **The width of the legacy desk, as the engine's own number.** Every
+/// engine is built with this many lanes installed, row r at slot r (design 3),
+/// and the engine's frozen seat map, its 32-bit instrument and arm words and
+/// its automation lanes reach exactly this far: a lane past it has no pad
+/// racks and no curve to name it until the waves that give it them. The
+/// bridge keeps every lane below it until then.
+pub(crate) const LEGACY_LANES: usize = 32;
+
 /// How many pads the drumpad has. The UI's number, mirrored the way
 /// [`CHANNELS`] is.
 pub const PADS: usize = tangent_ui::recorder::DRUM_PADS;
@@ -771,27 +779,6 @@ impl From<tangent_ui::recorder::Strip> for Strip {
     }
 }
 
-/// Whether a strip is heard, given the mute and solo masks.
-///
-/// **Solo is exclusive and mute loses to it.** With anything soloed, only the
-/// soloed strips are heard — including a soloed strip that is also muted,
-/// because pressing solo on a muted channel is unambiguously a request to hear
-/// it and the alternative is a solo button that sometimes does nothing.
-/// Permute the first `order.len()` rows of a per-seat table: `order[new] =
-/// old`. Rows past the permutation — the buses, the master, the pads — keep
-/// their seats, because nothing about a channel reorder moves them.
-fn permute_rows<T: Default>(rows: &mut [T], order: &[usize]) {
-    let n = order.len().min(rows.len());
-    let mut held: Vec<T> = Vec::with_capacity(n);
-    for new in 0..n {
-        let old = order[new].min(rows.len().saturating_sub(1));
-        held.push(std::mem::take(&mut rows[old]));
-    }
-    for (new, v) in held.into_iter().enumerate() {
-        rows[new] = v;
-    }
-}
-
 /// **One lane's bit in a strip-space word, or no bit at all.**
 ///
 /// The mute and solo words are still strip masks until the plan's
@@ -804,6 +791,12 @@ fn word_bit(n: usize) -> u64 {
     u32::try_from(n).ok().and_then(|s| 1u64.checked_shl(s)).unwrap_or(0)
 }
 
+/// Whether a strip is heard, given the mute and solo masks.
+///
+/// **Solo is exclusive and mute loses to it.** With anything soloed, only the
+/// soloed strips are heard — including a soloed strip that is also muted,
+/// because pressing solo on a muted channel is unambiguously a request to hear
+/// it and the alternative is a solo button that sometimes does nothing.
 fn strip_is_heard(strip: Strip, muted: u64, soloed: u64) -> bool {
     // Soloed by name: heard, whatever its own mute says. Pressing solo on a
     // muted channel is unambiguously a request to hear it, and the
@@ -4145,6 +4138,7 @@ pub(crate) struct Schedule<T> {
 }
 
 impl<T> Schedule<T> {
+    #[cfg(test)]
     fn plain(items: Vec<T>) -> Self {
         Self { items, gens: Vec::new() }
     }
@@ -17823,6 +17817,7 @@ pub const MAX_ROUTES: usize = tangent_ui::routing::MAX_ROUTES;
 /// `hardware` says which kind of destination it is, and `stereo` only means
 /// anything for hardware. Bit 31 marks the word as occupied, so a zeroed
 /// slot can never read as "channel 0 to channel 0".
+#[cfg(test)]
 fn pack_route(from: usize, target: usize, hardware: bool, stereo: bool) -> u32 {
     (from as u32 & 0xff)
         | ((target as u32 & 0xff) << 8)
@@ -18057,7 +18052,12 @@ pub struct Engine {
     /// here rather than queueing behind it. See `set_clips`.
     track_pending: Option<Schedule<Placed>>,
     midi_pending: Option<Schedule<PlacedMidi>>,
+    /// The kit ring the legacy shim swaps a lane's kit on: the host's road
+    /// is `attach` now (a kit by its lane and generation), so only the shim
+    /// and its tests push here.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the legacy kit shim's ring: the bridge attaches kits"))]
     pad_to_audio: Producer<(usize, PadKit)>,
+    #[cfg_attr(not(test), allow(dead_code, reason = "the legacy kit shim's ring: the bridge attaches kits"))]
     pad_from_audio: Consumer<(usize, PadKit)>,
     /// The sampler's pair, same protocol, same reason: a decoded file is a
     /// `Vec` of megabytes and the callback may not free one.
@@ -18232,6 +18232,52 @@ impl Engine {
         self.shared.lanes.cells(slot.0 as usize)
     }
 
+    /// **Whether `slot` can take an Install now**: no lane there and none on
+    /// its way home. The bridge's allocator asks before it names a slot, so
+    /// an Install is never refused for a lane still leaving (design 7.13: an
+    /// id that comes back before its old lane is home waits for it).
+    pub fn slot_free(&self, slot: Slot) -> bool {
+        self.host_slots.get(slot.0 as usize).is_none_or(|h| !h.live && !h.leaving)
+    }
+
+    /// Whether this engine is pulled by hand (an export, a freeze, the
+    /// probe) rather than by a device's callback.
+    pub fn is_offline(&self) -> bool {
+        self.offline.is_some()
+    }
+
+    /// **The generation of the plan the callback is playing**, 0 for none:
+    /// how the bridge knows a RETIRING plan has been taken before it sends
+    /// the Remove that follows it (design 7.13).
+    pub fn plan_playing(&self) -> u64 {
+        self.shared.plan_gen.load(Ordering::Relaxed)
+    }
+
+    /// **A lane's fader, pan and Fx send, by slot** (design 8, step 5: the
+    /// bridge "writes continuous values into LaneShared"). Scale-only, so a
+    /// store each and never a plan; sanitised exactly as the strip-indexed
+    /// setters these replace sanitised them, so the same knob is the same
+    /// bits whichever road wrote it.
+    pub fn set_lane_levels(&self, slot: Slot, gain: f32, pan: f32, send: f32) {
+        let at = slot.0 as usize;
+        self.shared.set_channel_gain(at, gain);
+        self.shared.set_channel_pan(at, pan);
+        if let Some(l) = self.shared.lanes.cells(at) {
+            l.send.store(send.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// **The Fx sends of the two strips that are not rows and send**: the
+    /// drum bus and the click. The return's own send cell is never read (it
+    /// cannot send to itself) and the master has none.
+    pub fn set_special_sends(&self, drums: f32, click: f32) {
+        for (strip, v) in [(Strip::Drums, drums), (Strip::Click, click)] {
+            if let Some(cell) = self.shared.send_cell(strip) {
+                cell.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The host's ends of every seat a lane's racks answer to, made to
     /// exist. The per-seat tables grow on the host and never on the
     /// callback: a seat is the engine's private name for a rack.
@@ -18388,6 +18434,14 @@ impl Engine {
             let at = slot.0 as usize;
             if let Some(cells) = self.shared.lanes.ensure(at) {
                 cells.reset(at);
+            }
+            // **A fresh lane holds no instrument.** The one that held this
+            // slot took its DX7 and keyboard home in its box, so the host's
+            // record of what it shipped there is forgotten with it, or the
+            // new track's instrument would never be sent.
+            if let Some(bit) = 1u32.checked_shl(slot.0) {
+                self.dx7_lanes_have &= !bit;
+                self.keys_lanes_have &= !bit;
             }
             let gen = self.mint_gen();
             list.push((slot, Some(self.build_lane(at, gen, spec))));
@@ -20581,6 +20635,22 @@ impl Engine {
     /// follow up with each new lane's cartridge voice — the patch, voicing
     /// and width need no follow-up, being per-lane atomics a fresh instance
     /// reads before its first strike.
+    /// **[`Engine::sync_instrument_lanes`], by slot** (the bridge's road): the
+    /// lanes that should hold a DX7 and those that should hold the modelled
+    /// keyboard, as slot lists; answers the slots a DX7 was just shipped to,
+    /// each of which wants its strip's voice. A slot past the instrument
+    /// words is not served in this wave (see [`LEGACY_LANES`]).
+    pub fn sync_instruments(&mut self, dx7: &[Slot], keys: &[Slot]) -> Vec<Slot> {
+        let word = |slots: &[Slot]| {
+            slots
+                .iter()
+                .filter_map(|s| 1u32.checked_shl(s.0))
+                .fold(0u32, |w, b| w | b)
+        };
+        let (made, _) = self.sync_instrument_lanes(word(dx7), word(keys));
+        dx7.iter().copied().filter(|s| 1u32.checked_shl(s.0).is_some_and(|b| made & b != 0)).collect()
+    }
+
     pub fn sync_instrument_lanes(&mut self, dx7_mask: u32, keys_mask: u32) -> (u32, u32) {
         // The displaced instances come home to die here, not in the callback.
         while self.dx7_from_audio.pop().is_ok() {}
@@ -20614,122 +20684,9 @@ impl Engine {
         made
     }
     /// **Every channel the drumpad is on.** See `Shared::drum_strips`.
+    #[cfg(test)]
     pub fn set_drum_strips(&self, mask: u32) {
         self.shared.drum_strips.store(mask, Ordering::Relaxed);
-    }
-
-    /// **Who each channel folds into.** `-1` is "straight to the master",
-    /// which is every channel until somebody makes a folder.
-    ///
-    /// Refused unless every parent is LOWER than its child: that is what
-    /// makes the graph a forest rather than a graph, and it is what lets the
-    /// renderer fold the deepest first in one descending pass. The settings
-    /// model can only produce such an arrangement — membership is the
-    /// nearest folder ABOVE — so a violation here is a bug on the way in,
-    /// and taking none of it beats taking half.
-    /// **Move a reorder's plugins instead of rebuilding them.**
-    ///
-    /// A track that moves takes its plugins with it. The instance at the old
-    /// seat and the instance the new seat wants are the SAME instance, with
-    /// the same state already in it — so tearing it down and building
-    /// another from the bundle is pure waste, and it is expensive waste: a
-    /// sampler costs a second or more to instantiate and restore, the
-    /// reconcile does one bay per frame, and a folder is inserted ABOVE its
-    /// children so nearly every row moves. The owner, twice: "any and every
-    /// operation regarding dragging children in and out produces spinning
-    /// wheel for 2-5 seconds", then "still 5-10 seconds lag".
-    ///
-    /// Two passes, and the order matters. Everything that moves is taken out
-    /// FIRST, so every moving seat is empty before anything is put back and
-    /// a cycle — two tracks swapping — cannot overwrite one of its own
-    /// members. Nothing that stays is touched at all.
-    ///
-    /// Returns the seats it could NOT move, for the caller to rebuild the
-    /// slow way. A seat is unmovable when the callback has stalled or does
-    /// not hand the box back in time; that is rare, and answering honestly
-    /// beats a silent hole where a plugin used to be.
-    #[must_use]
-    pub fn permute_channel_inserts(&mut self, order: &[usize]) -> Vec<usize> {
-        // The channel order, lifted onto the whole seat space: a channel's
-        // folder-extra seat travels WITH it, everything else stays put.
-        let full = tangent_ui::recorder::seat_order(order);
-        let order = full.as_slice();
-        let mut failed = Vec::new();
-        let mut taken: Vec<(usize, usize, PluginBox)> = Vec::new();
-        // ── take everything that moves ───────────────────────────────────
-        for (new, old) in order.iter().enumerate() {
-            if new == *old {
-                continue;
-            }
-            for bay in 0..INSERTS {
-                // An empty seat has nothing to carry, and asking costs a
-                // round trip through the audio thread.
-                if self
-                    .inserts_loaded
-                    .get(*old)
-                    .and_then(|r| r.get(bay))
-                    .is_none_or(Option::is_none)
-                {
-                    continue;
-                }
-                match self.hand_off_exchange(*old, bay, PluginBox(None)) {
-                    Ok(Some(b)) => taken.push((new, bay, b)),
-                    // Nothing came back, or the ring refused. Either way this
-                    // seat is not carried; the caller rebuilds it.
-                    Ok(None) | Err(_) => failed.push(new),
-                }
-            }
-        }
-        // ── and put it where it now belongs ──────────────────────────────
-        for (new, bay, b) in taken {
-            if let Some(back) = self.hand_off_insert(new, bay, b) {
-                // The destination refused. The plugin is dropped with
-                // `back`, and the seat is named so it is rebuilt.
-                drop(back);
-                failed.push(new);
-            }
-        }
-        // ── everything else keyed to a seat travels with it ──────────────
-        //
-        // The box is only half of what a seat owns. Its latency lives in a
-        // shared per-seat cell the delay compensation reads, and the host
-        // keeps the editor window, the state handle and the loaded name
-        // beside it. A box that moved without them would play through the
-        // wrong compensation and answer to another track's window.
-        let pick = |order: &[usize], n: usize| order.get(n).copied().unwrap_or(n);
-        let lat: Vec<u32> = (0..RACK_SEATS * INSERTS)
-            .map(|i| {
-                let (seat, bay) = (i / INSERTS, i % INSERTS);
-                self.shared
-                    .seat_cell(SeatKind::Latency, pick(order, seat) * INSERTS + bay)
-                    .map_or(0, |c| c.load(Ordering::Relaxed))
-            })
-            .collect();
-        for (i, v) in lat.into_iter().enumerate() {
-            if let Some(c) = self.shared.seat_cell(SeatKind::Latency, i) {
-                c.store(v, Ordering::Relaxed);
-            }
-        }
-        permute_rows(&mut self.inserts_loaded, order);
-        permute_rows(&mut self.insert_keyable, order);
-        permute_rows(&mut self.insert_editors, order);
-        // **And the controller each window is opened FROM**, beside the
-        // window it opens. Left at the old seat, opening a carried plugin's
-        // window opened the previous tenant's editor, titled as the new one,
-        // its knobs moving a plugin on another track - and a seat that had
-        // been empty answered "nothing is loaded".
-        permute_rows(&mut self.insert_editor_handles, order);
-        // An LV2 bay's port ledger IS its state (`save_insert_state` reads it
-        // first) and its window's values, so it rides with the box too.
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        permute_rows(&mut self.insert_lv2, order);
-        permute_rows(&mut self.insert_builtin, order);
-        permute_rows(&mut self.insert_state_handles, order);
-        permute_rows(&mut self.insert_latency_handles, order);
-        permute_rows(&mut self.insert_state_errors, order);
-        failed.sort_unstable();
-        failed.dedup();
-        failed
     }
 
     /// What the aligners are currently aiming at, in frames.
@@ -20758,6 +20715,16 @@ impl Engine {
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
+    /// **Who each channel folds into.** `-1` is "straight to the master",
+    /// which is every channel until somebody makes a folder.
+    ///
+    /// Refused unless every parent is LOWER than its child: that is what
+    /// makes the graph a forest rather than a graph, and it is what lets the
+    /// renderer fold the deepest first in one descending pass. The settings
+    /// model can only produce such an arrangement — membership is the
+    /// nearest folder ABOVE — so a violation here is a bug on the way in,
+    /// and taking none of it beats taking half.
+    #[cfg(test)]
     pub fn set_folders(&self, parents: [i32; CHANNELS]) -> bool {
         for (ch, p) in parents.iter().enumerate() {
             if *p >= 0 && (*p as usize) >= ch {
@@ -20783,11 +20750,13 @@ impl Engine {
     }
 
     /// Every channel the built-in instrument is on.
+    #[cfg(test)]
     pub fn set_builtin_strips(&self, mask: u32) {
         self.shared.builtin_strips.store(mask, Ordering::Relaxed);
     }
 
     /// Every channel whose first bay holds the modelled keyboard.
+    #[cfg(test)]
     pub fn set_keys_strips(&self, mask: u32) {
         self.shared.keys_strips.store(mask, Ordering::Relaxed);
     }
@@ -20832,6 +20801,7 @@ impl Engine {
 
     /// Which channel each capture pick feeds: desk indices, `None` unbound.
     /// The live punch: `Some(frame)` while lane records over its clips.
+    #[cfg(test)]
     pub fn set_punches(&self, punches: [Option<u64>; CHANNELS]) {
         for (ch, p) in punches.into_iter().enumerate() {
             if let Some(l) = self.shared.lanes.cells(ch) {
@@ -20891,6 +20861,7 @@ impl Engine {
     /// Pushed whole, like mute and solo: the UI computes it from every
     /// channel's kind and arm switch, and the audio thread reads it per chunk.
     /// Zero is every channel armed, which is the desk as it has always been.
+    #[cfg(test)]
     pub fn set_midi_off(&self, mask: u64) {
         self.shared.midi_off.store(mask, Ordering::Relaxed);
     }
@@ -20901,6 +20872,7 @@ impl Engine {
     /// `tangent_ui::recorder::live_midi_routes`. See `Shared::midi_src` for
     /// why this is separate from `set_midi_off`, and `MidiEvent::src` for how
     /// the device identity gets here at all.
+    #[cfg(test)]
     pub fn set_midi_routes(&self, routes: &[tangent_ui::recorder::MidiRoute; CHANNELS]) {
         for (ch, r) in routes.iter().enumerate() {
             if let Some(c) = self.shared.lanes.cells(ch) {
@@ -20911,6 +20883,7 @@ impl Engine {
     }
 
     /// Which channels are armed — live to the room. See `Shared::armed`.
+    #[cfg(test)]
     pub fn set_armed(&self, mask: u32) {
         self.shared.armed.store(mask, Ordering::Relaxed);
     }
@@ -21331,6 +21304,7 @@ impl Engine {
     /// sent somewhere nobody chose. A publish with neither fault needs two
     /// tables and an index to flip between them, which is a different
     /// change from reordering two stores.
+    #[cfg(test)]
     pub fn set_routes(&self, routes: &tangent_ui::routing::Routes) {
         use tangent_ui::routing::Target;
         let n = routes.0.len().min(MAX_ROUTES);
@@ -21377,6 +21351,7 @@ impl Engine {
     /// the outcome the paragraph above rules out.
     // `&self`, like `set_routes`: the whole write is interior atomics, and
     // the publish path holds the engine by shared reference.
+    #[cfg(test)]
     pub fn set_insert_keys(&self, keys: &[(usize, usize, usize)]) {
         self.write_insert_keys(keys, CHANNELS);
     }
@@ -21384,6 +21359,7 @@ impl Engine {
     /// The key table's one writer: clear, fill, count. A source at or past
     /// `max_src` is refused (the shim names only the thirty-two rows; a plan
     /// names any slot). A seat no rack answers to is refused by the cell.
+    #[cfg(test)]
     fn write_insert_keys(&self, keys: &[(usize, usize, usize)], max_src: usize) {
         self.shared.insert_key_n.store(0, Ordering::Release);
         for (_, cell) in self.shared.seat_cells(SeatKind::Key) {
@@ -21435,6 +21411,7 @@ impl Engine {
     // interior atomics and the publish path holds the engine by shared
     // reference.
     /// Which channel seats are frozen - see `Shared::frozen`.
+    #[cfg(test)]
     pub fn set_frozen(&self, mask: u32) {
         if self.shared.frozen.load(Ordering::Relaxed) != mask {
             self.shared.frozen.store(mask, Ordering::Relaxed);
@@ -21779,6 +21756,7 @@ impl Engine {
     /// not come) is parked, retried by the tick, and replaced by anything
     /// newer that arrives meanwhile — the list that would have been
     /// overtaken anyway. `track_loaded` is stored at the call, as before.
+    #[cfg(test)]
     pub fn set_clips(&mut self, mut clips: Vec<Placed>) {
         // **Sorted by lane, here on the host thread**, so that the audio
         // thread can hand each lane its own run instead of walking the whole
@@ -21827,6 +21805,7 @@ impl Engine {
     /// Hand the audio thread the arrangement's MIDI schedule, whole — the
     /// same swap protocol as `set_clips`, so the old list drops HERE, never
     /// in the callback, and the same park-and-retry instead of a wait.
+    #[cfg(test)]
     pub fn set_midi_clips(&mut self, mut clips: Vec<PlacedMidi>) {
         // Lane-sorted on the host thread, exactly as `set_clips` is and for
         // the same two reasons: so the audio thread can walk one lane's run
@@ -21902,6 +21881,7 @@ impl Engine {
     /// **`lane` is which channel's kit this is.** A drum instrument loads a
     /// full instance per channel, so a bare kit could not say whose it was;
     /// the lane travels with it on the same ring.
+    #[cfg(test)]
     pub fn set_pad_kit(&mut self, lane: usize, kit: PadKit) -> bool {
         while self.pad_from_audio.pop().is_ok() {}
         if self.pad_to_audio.push((lane, kit)).is_err() {
@@ -22045,6 +22025,7 @@ impl Engine {
 
     /// One channel's pan, -1..1, centre unity. Pushed each frame with the
     /// gains, by the same rule.
+    #[cfg(test)]
     pub fn set_channel_pan(&self, ch: usize, pan: f32) {
         self.shared.set_channel_pan(ch, pan);
     }
@@ -22506,6 +22487,7 @@ impl Engine {
     /// answered from a half-written state, and the `From` below is exhaustive —
     /// which is what makes the UI's strip order and this one provably the same
     /// rather than the same by inspection.
+    #[cfg(test)]
     pub fn set_desk(&self, desk: &tangent_ui::recorder::Desk) {
         let mut muted = 0u64;
         let mut soloed = 0u64;
@@ -22648,6 +22630,7 @@ impl Engine {
     /// An atomic rather than a ring: it is one word, it changes as often as
     /// a hand touches a fader, and it must take effect on the very next
     /// block or the control fights the hand.
+    #[cfg(test)]
     pub fn set_auto_suspend(&self, mask: u64) {
         self.shared.auto_suspend.store(mask, Ordering::Relaxed);
     }
@@ -22655,6 +22638,7 @@ impl Engine {
     /// Hand the audio thread every automation curve, whole.
     ///
     /// The same swap protocol as [`Engine::set_maps`], for the same reason.
+    #[cfg(test)]
     pub fn set_automation(&mut self, auto: tangent_ui::automation::Automation) {
         self.send_automation(AutoList { curves: auto, gens: Vec::new() });
     }
@@ -22710,6 +22694,7 @@ impl Engine {
     /// still two atomics — a callback can still catch them mid-change — but the
     /// window is one store apart rather than a whole UI frame.
     /// **Which strips are polarity-inverted**, one bit per `Strip::index`.
+    #[cfg(test)]
     pub fn set_strip_phase(&self, mask: u64) {
         self.shared.strip_phase.store(mask, Ordering::Relaxed);
     }
@@ -31486,58 +31471,6 @@ mod tests {
     }
 
     #[test]
-    fn a_permutation_carries_a_seats_record_to_its_new_index() {
-        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        // Latency is the one piece that lives in shared memory rather than
-        // beside the box, so it is the one most easily left behind.
-        e.set_seat_latency_for_test(2, 0, 128);
-        e.set_seat_latency_for_test(5, 1, 64);
-        // Move channel 2 to 3 and 5 to 2, everything else where it was.
-        let mut order: Vec<usize> = (0..CHANNELS).collect();
-        order[3] = 2;
-        order[2] = 5;
-        order[5] = 3;
-        let stranded = e.permute_channel_inserts(&order);
-        // Nothing was loaded, so nothing could fail to move.
-        assert!(stranded.is_empty(), "empty seats were stranded: {stranded:?}");
-        assert_eq!(e.seat_latency_for_test(3, 0), 128, "seat 2's latency did not follow");
-        assert_eq!(e.seat_latency_for_test(2, 1), 64, "seat 5's latency did not follow");
-        assert_eq!(e.seat_latency_for_test(2, 0), 0, "a stale figure was left behind");
-
-        // The identity permutation moves nothing and strands nothing.
-        let same: Vec<usize> = (0..CHANNELS).collect();
-        assert!(e.permute_channel_inserts(&same).is_empty());
-        assert_eq!(e.seat_latency_for_test(3, 0), 128, "identity disturbed a seat");
-    }
-
-    /// **A carried plugin takes every per-seat record with it** - the
-    /// controller its window is opened from, and (Linux/FreeBSD) the LV2
-    /// port ledger its state is read from.
-    ///
-    /// Left behind, a reorder opened the PREVIOUS tenant's editor from the
-    /// bay that now holds another plugin, titled as the new one, its knobs
-    /// moving a plugin on another track. A source scan: both records are
-    /// filled only by loading a hosted VST3 or LV2 plugin, which a test
-    /// engine of built-in units never does, so the test above cannot see
-    /// them.
-    #[test]
-    fn a_permutation_carries_every_per_seat_record_with_the_box() {
-        let whole = include_str!("instrument.rs");
-        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
-        let at = src.find("pub fn permute_channel_inserts(").expect("the carry");
-        let body = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
-        // Both records are read before anything panics, so one run names
-        // each one left behind.
-        let mut left: Vec<String> = Vec::new();
-        for field in ["insert_editor_handles", "insert_lv2"] {
-            if !body.contains(&format!("permute_rows(&mut self.{field},")) {
-                left.push(format!("the carry leaves `{field}` at the seat the plugin left"));
-            }
-        }
-        assert!(left.is_empty(), "{}", left.join("; "));
-    }
-
-    #[test]
     fn a_parent_that_is_not_above_its_child_is_refused() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let mut bad = [-1i32; CHANNELS];
@@ -39870,8 +39803,23 @@ mod lanesets {
 /// key and bypass tables as their non-zero cells), so a push that lands one
 /// bit differently is a different readback. Tests only, and a READ: nothing
 /// here can change what the engine plays.
+///
+/// **Once the bridge publishes plans, the words come out of the newest
+/// plan** (W4-integrate): the structure the shim words carried (arm, live
+/// MIDI, frozen, the instrument and drum strips, suspend, polarity, mute,
+/// solo, folders, punches, MIDI routes, routes, keys) rides the plan, and is
+/// decoded back into exactly the words the shim would have held, slot for
+/// bit, so the golden recorded against the shim judges the plan. What stays
+/// an atomic (sends, the bypass cells, the render-ahead) is read where it
+/// lives either way.
 #[cfg(test)]
 impl Engine {
+    /// How many plans the callback has refused (design 7.4): every test of
+    /// the bridge asserts it stays zero.
+    pub(crate) fn plan_refused_for_test(&self) -> u32 {
+        self.shared.plan_refused.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn desk_readback(&self) -> serde_json::Value {
         let sh = &self.shared;
         let ld32 = |a: &AtomicU32| a.load(Ordering::Relaxed);
@@ -39882,7 +39830,7 @@ impl Engine {
                 .filter(|(_, x)| *x != 0)
                 .collect()
         };
-        serde_json::json!({
+        let mut words = serde_json::json!({
             "armed": ld32(&sh.armed),
             "midi_off": sh.midi_off.load(Ordering::Relaxed),
             "frozen": ld32(&sh.frozen),
@@ -39904,6 +39852,109 @@ impl Engine {
             "insert_key": seat_cells(SeatKind::Key),
             "insert_bypass": seat_cells(SeatKind::Bypass),
             "grain": ld32(&sh.grain),
-        })
+        });
+        if let Some(plan) = self.plan_shadows.last() {
+            for (k, v) in plan_words(plan) {
+                words[k] = v;
+            }
+        }
+        words
     }
+}
+
+/// **A plan, as the shim words it replaces** (see `desk_readback`): each
+/// lane's flags at its SLOT's bit, the specials' at theirs (strip bits 32 to
+/// 35, which no lane owns in the 32-wide words), the parents, punches and
+/// MIDI routes per slot, the routes packed as `set_routes` packs them and
+/// the keys as the cells `publish_plan_keys` writes. A slot past the word is
+/// not a bit (the shim had none for it); a test of a wider desk reads the
+/// plan itself.
+#[cfg(test)]
+fn plan_words(plan: &DeskPlan) -> Vec<(&'static str, serde_json::Value)> {
+    use crate::desk_plan::{LaneFlags as F, RouteTo};
+    let bit = |slot: usize| if slot < 64 { 1u64 << slot } else { 0 };
+    let word = |f: F, max: usize| -> u64 {
+        plan.lanes
+            .iter()
+            .filter(|l| l.flags.contains(f) && (l.slot.0 as usize) < max)
+            .fold(0, |w, l| w | bit(l.slot.0 as usize))
+    };
+    let sp = &plan.specials;
+    let specials = |f: F, master: bool| -> u64 {
+        let mut w = 0;
+        for (strip, flags) in [(Strip::Drums, sp.drums), (Strip::Click, sp.click), (Strip::Fx, sp.fx)] {
+            if flags.contains(f) {
+                w |= strip.bit();
+            }
+        }
+        if master && sp.master.contains(f) {
+            w |= 1u64 << STRIPS;
+        }
+        w
+    };
+    let per_slot = |f: &dyn Fn(&crate::desk_plan::PlanLane) -> serde_json::Value, idle: serde_json::Value| {
+        (0..CHANNELS)
+            .map(|c| {
+                plan.rank_of(Slot(c as u32))
+                    .and_then(|r| plan.lanes.get(r as usize))
+                    .map_or_else(|| idle.clone(), f)
+            })
+            .collect::<Vec<_>>()
+    };
+    let routes: Vec<(u32, u32)> = plan
+        .routes
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let from = plan.lanes.get(e.from as usize)?.slot.0 as usize;
+            let (target, hardware, stereo) = match e.to {
+                RouteTo::Lane(r) => (plan.lanes.get(r as usize)?.slot.0 as usize, false, false),
+                RouteTo::Hardware { first, stereo } => (usize::from(first), true, stereo),
+            };
+            Some((pack_route(from, target, hardware, stereo), plan.gain(e.gain).to_bits()))
+        })
+        .collect();
+    let mut keys: Vec<(usize, u32)> = plan
+        .keys
+        .keys
+        .iter()
+        .filter_map(|k| {
+            let src = plan.lanes.get(k.from as usize)?.slot.0 as usize;
+            Some((k.seat as usize * INSERTS + usize::from(k.bay), pack_key(src)))
+        })
+        .collect();
+    keys.sort_unstable();
+    let master_suspend = if sp.master.contains(F::SUSPEND) { 1u64 << MASTER_AUTO_LANE } else { 0 };
+    vec![
+        ("armed", serde_json::json!(word(F::ARMED, 32))),
+        ("midi_off", serde_json::json!(word(F::MIDI_OFF, 64) | specials(F::MIDI_OFF, true))),
+        ("frozen", serde_json::json!(word(F::FROZEN, 32))),
+        ("drum_strips", serde_json::json!(word(F::DRUM, 32))),
+        ("builtin_strips", serde_json::json!(word(F::BUILTIN, 32))),
+        ("keys_strips", serde_json::json!(word(F::KEYS, 32))),
+        ("auto_suspend", serde_json::json!(word(F::SUSPEND, 32) | master_suspend)),
+        ("strip_phase", serde_json::json!(word(F::PHASE, 32) | specials(F::PHASE, true))),
+        ("muted", serde_json::json!(word(F::MUTED, 32) | specials(F::MUTED, false))),
+        ("soloed", serde_json::json!(word(F::SOLOED, 32) | specials(F::SOLOED, false))),
+        (
+            "folder_of",
+            serde_json::json!(per_slot(
+                &|l| serde_json::json!(l
+                    .parent
+                    .and_then(|p| plan.lanes.get(p as usize))
+                    .map_or(-1, |p| p.slot.0 as i64)),
+                serde_json::json!(-1)
+            )),
+        ),
+        (
+            "punch",
+            serde_json::json!(per_slot(&|l| serde_json::json!(l.punch.unwrap_or(u64::MAX)), serde_json::json!(u64::MAX))),
+        ),
+        ("midi_src", serde_json::json!(per_slot(&|l| serde_json::json!(l.midi.src), serde_json::json!(u32::MAX)))),
+        ("midi_chan", serde_json::json!(per_slot(&|l| serde_json::json!(l.midi.chan), serde_json::json!(u32::MAX)))),
+        ("routes", serde_json::json!(routes.iter().map(|r| r.0).collect::<Vec<_>>())),
+        ("route_gain", serde_json::json!(routes.iter().map(|r| r.1).collect::<Vec<_>>())),
+        ("insert_key_n", serde_json::json!(keys.len())),
+        ("insert_key", serde_json::json!(keys)),
+    ]
 }
