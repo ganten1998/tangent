@@ -40,7 +40,9 @@ use tangent_ui::automation::AutoLane;
 use tangent_ui::recorder::{ChannelKind, MidiRoute, StripRef};
 use tangent_ui::routing::Target;
 
-use crate::desk_plan::{InKey, InLane, InRoute, LaneFlags, PickId, PlanInputs, RouteEnd, Slot, SpecialFlags};
+use crate::desk_plan::{
+    InKey, InLane, InRoute, InSend, LaneFlags, PickId, PlanInputs, RouteEnd, SendFrom, SendTo, Slot, SpecialFlags,
+};
 use crate::desktop::{
     arm_stem_tap, effect_params_from, export_clip_placement, furnish_mirror_bay, is_instrument_sentinel,
     keys_patch_of, leaf_of, mirror_sampler_samples,
@@ -1279,7 +1281,11 @@ impl Bridge {
                 .with(F::MUTED, muted(row))
                 .with(F::SOLOED, soloed(row))
                 .with(F::PHASE, app.strip_inverted(StripRef::Row(row)))
-                .with(F::SUSPEND, app.auto_suspended(AutoLane::Row(row)));
+                .with(F::SUSPEND, app.auto_suspended(AutoLane::Row(row)))
+                // **A bus row** (design 9): its rack runs once over what is
+                // routed and sent to it, it is solo-safe, and it is the only
+                // lane a send may land on (`desk_plan::SendTo`).
+                .with(F::BUS, app.channel_kind(row) == Some(ChannelKind::Bus));
             let parent = parents
                 .get(row)
                 .and_then(|p| usize::try_from(*p).ok())
@@ -1332,7 +1338,52 @@ impl Bridge {
         // **The wiring, by identity** (`read_desk`): the routing table pruned
         // against the device, and the sidechain keys, in the engine's names.
         let (routes, keys) = self.read_desk(app, outs);
-        PlanInputs { lanes, specials, routes, sends: Vec::new(), keys }
+        PlanInputs { lanes, specials, routes, sends: self.read_sends(app), keys }
+    }
+
+    /// **The desk's sends to buses, read by identity** (W7-buses-ui, design
+    /// 9): every strip's sends whose bus is a bus row on this desk, in the
+    /// engine's names, the sender's lane (or the drum bus, or the click) and
+    /// the bus's lane, at the send's own level and side of the fader.
+    ///
+    /// **In the order of the senders' identities, not their rows**: a bus
+    /// sums its sends in the order it is handed them (`desk_plan::InSend`),
+    /// and f32 addition does not commute bit for bit, so an order by row
+    /// would change a bus's last bits on every reorder. By track id, each
+    /// strip's own sends in the order they were made, then the drum bus's
+    /// and the click's: no reorder moves a send, in the plan as on the desk.
+    ///
+    /// **The knob's send into the effects return is not here.** The engine
+    /// plays a strip's knob for a strip the plan carries no Fx entry for
+    /// (`set_lane_levels`), which is today's sound bit for bit; carrying the
+    /// knob as its post-fader Fx entry is the engine half of the sends
+    /// (W7-slot-gaps item 5), and this list leaves that road to it.
+    pub fn read_sends(&self, app: &TangentApp) -> Vec<InSend> {
+        // Each laned track's row and lane this frame, by identity, so the
+        // senders walk in id order and a bus is found in one look.
+        let laned: BTreeMap<TrackId, (usize, Slot)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, (id, at))| Some((*id, (row, at.as_ref()?.slot))))
+            .collect();
+        let bus_lane = |n: Node| -> Option<Slot> {
+            let (row, slot) = *laned.get(&n.track()?)?;
+            (app.channel_kind(row) == Some(ChannelKind::Bus)).then_some(slot)
+        };
+        let mut out = Vec::new();
+        let mut push = |from: SendFrom, s: StripRef| {
+            for x in app.strip_sends(s) {
+                let Some(to) = bus_lane(x.to) else { continue };
+                out.push(InSend { from, to: SendTo::Lane(to), level: x.level as f32, pre: x.pre });
+            }
+        };
+        for (row, slot) in laned.values() {
+            push(SendFrom::Lane(*slot), StripRef::Row(*row));
+        }
+        push(SendFrom::Drums, StripRef::Drums);
+        push(SendFrom::Click, StripRef::Click);
+        out
     }
 
     /// **The continuous values, by slot**: each row's fader, pan and Fx send
