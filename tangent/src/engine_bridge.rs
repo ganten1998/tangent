@@ -1463,9 +1463,11 @@ impl Bridge {
     }
 
     /// **The desk's sends to buses, read by identity** (W7-buses-ui, design
-    /// 9): every strip's sends whose bus is a bus row on this desk, in the
-    /// engine's names, the sender's lane (or the drum bus, or the click) and
-    /// the bus's lane, at the send's own level and side of the fader.
+    /// 9): every strip's sends to a bus by the one rule the app shows them by
+    /// (`desk_model::bus_sends` over `TangentApp::bus_ids`), in the engine's
+    /// names, the sender's lane (or the drum bus, or the click) and the
+    /// bus's lane, at the send's own level and side of the fader. A bus
+    /// waiting for its lane is sent nothing until it has one.
     ///
     /// **In the order of the senders' identities, not their rows**: a bus
     /// sums its sends in the order it is handed them (`desk_plan::InSend`),
@@ -1485,14 +1487,11 @@ impl Bridge {
             .enumerate()
             .filter_map(|(row, (id, at))| Some((*id, (row, at.as_ref()?.slot))))
             .collect();
-        let bus_lane = |n: Node| -> Option<Slot> {
-            let (row, slot) = *laned.get(&n.track()?)?;
-            (app.channel_kind(row) == Some(ChannelKind::Bus)).then_some(slot)
-        };
+        let buses = app.bus_ids();
         let mut out = Vec::new();
         let mut push = |from: SendFrom, s: StripRef| {
-            for x in app.strip_sends(s) {
-                let Some(to) = bus_lane(x.to) else { continue };
+            for x in tangent_ui::desk_model::bus_sends(app.strip_sends(s), &buses) {
+                let Some(&(_, to)) = x.to.track().and_then(|id| laned.get(&id)) else { continue };
                 out.push(InSend { from, to: SendTo::Lane(to), level: x.level as f32, pre: x.pre });
             }
         };

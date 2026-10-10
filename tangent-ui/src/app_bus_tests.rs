@@ -172,6 +172,56 @@ fn a_sends_side_of_the_fader_is_one_gesture_and_a_bus_is_sent_to_once() {
     assert_eq!(app.strip_send_to(StripRef::Row(0), na, false), Some(0.3), "the flip's undo");
 }
 
+/// **A send aimed at a track that is no bus is not offered, drawn or
+/// counted, and no gesture reaches it** (W7-join: the one rule,
+/// `desk_model::bus_sends`, which the bridge plays sends by). A file can say
+/// one: row 0 sends first to track 1, a MIDI track, and then to a return.
+/// The strip draws one send row, the return's, so nothing is left for a +N
+/// chip; that row's drag moves the return's send and the stray keeps its
+/// level; the routing window lists the return alone; the automation menu
+/// offers the return's curve alone. The stray stays on the desk for the
+/// file. The app counted every send aimed at a track, so the stray took the
+/// strip's first row, which the bridge never played.
+#[test]
+fn a_send_aimed_at_a_track_that_is_no_bus_is_not_offered_drawn_or_counted() {
+    use crate::desk_model::Send;
+    let mut s = desk(2);
+    let ret = TrackId(600);
+    let mut r = TrackRow::vacant(ret);
+    r.kind = Some(RowKind::Bus);
+    r.name = "Return 1".to_owned();
+    s.rows.push(r);
+    s.next_track_id = 601;
+    let (stray, bus) = (Node::Track(s.rows[1].id), Node::Track(ret));
+    s.rows[0].sends.push(Send { to: stray, level: 0.5, pre: false });
+    s.rows[0].sends.push(Send { to: bus, level: 0.25, pre: false });
+    let (_ctx, mut app) = app_on(s, tiers::free("bus-stray"));
+    assert_eq!(app.strip_bus_sends(StripRef::Row(0)).iter().map(|x| x.to).collect::<Vec<_>>(), vec![bus]);
+    // Drawn: one row, the return's.
+    let drawn: Vec<(String, f32)> =
+        app.mixer_view().strips[Column::Track(0)].sends.iter().map(|x| (x.label.clone(), x.level)).collect();
+    assert_eq!(drawn, vec![("Return 1".to_owned(), 0.25)], "the strip draws a send nothing plays");
+    // Its row is the return's: a drag moves the return's send alone.
+    app.apply_mixer_hit(Hit::SendLevel(Column::Track(0), 0), 0.75);
+    assert_eq!(app.strip_send_to(StripRef::Row(0), bus, false), Some(0.75), "the first send row is not the return's");
+    assert_eq!(app.strip_send_to(StripRef::Row(0), stray, false), Some(0.5), "a drag moved the send to a track");
+    // Listed: the return alone.
+    let Dialog::Routing { sends, .. } = app.routing_dialog(0, RoutingPage::Main) else {
+        panic!("not the routing window");
+    };
+    assert_eq!(sends.iter().map(|(row, ..)| *row).collect::<Vec<_>>(), vec![2], "the routing window lists a send to a track");
+    // Offered a curve: the return's alone.
+    app.arr_open_automation_menu(AutoLane::Row(0));
+    let Some(Dialog::Automation { groups, .. }) = &app.dialog else {
+        panic!("not the automation menu");
+    };
+    let offered: Vec<String> =
+        groups.iter().find(|g| g.name == "Sends").expect("no Sends group").rows.iter().map(|r| r.key.clone()).collect();
+    assert_eq!(offered, vec![format!("send:t{}", ret.0)], "the menu offers a curve on a send to a track");
+    // And the file's stray stays where the file put it.
+    assert!(app.settings.rows[0].sends.iter().any(|x| x.to == stray), "the stray left the desk");
+}
+
 /// **A bus refuses clips and inputs** (design 9: no clips, no input chip,
 /// never hears MIDI, never frozen), on every road that could give it one,
 /// and a file dropped on it makes a new track instead.
@@ -439,6 +489,34 @@ fn a_bus_made_a_track_asks_the_cap_and_keeps_its_identity() {
     assert_eq!(app.counted_tracks(), 2);
 }
 
+/// **A copied bus pastes under one new identity, minted once** (W7-join),
+/// as a copied track does. Pasted onto an empty row, each takes the next id
+/// the counter gives and moves it by one. `paste_track_inner` minted the
+/// row's id and then gave it the bus kind, and `set_channel_kind`, finding
+/// a row that was no strip becoming one, minted a second over the first:
+/// one id burned a paste, and everything the first had been handed
+/// retargeted to the second.
+#[test]
+fn a_copied_bus_pastes_under_one_new_identity() {
+    let mut s = desk(2);
+    let mut ret = TrackRow::vacant(TrackId(650));
+    ret.kind = Some(RowKind::Bus);
+    ret.name = "Return 1".to_owned();
+    s.rows.push(ret);
+    s.rows.push(TrackRow::vacant(TrackId(700)));
+    s.rows.push(TrackRow::vacant(TrackId(701)));
+    s.next_track_id = 702;
+    let (_ctx, mut app) = app_on(s, tiers::free("bus-paste-mint"));
+    for (from, onto) in [(2, 3), (0, 4)] {
+        app.copy_track(from);
+        let next = app.settings.next_track_id;
+        app.paste_track(onto);
+        assert_eq!(app.is_bus(onto), from == 2, "fixture: the paste onto row {onto}");
+        assert_eq!(app.settings.next_track_id, next + 1, "the paste of row {from} minted {} ids", app.settings.next_track_id - next);
+        assert_eq!(app.track_id_at(onto), TrackId(next as u32), "the paste of row {from} does not wear the id it was minted");
+    }
+}
+
 /// **The track menu's New Bus and New Return, and the routing window's
 /// own two**: each one moment, at the end of the desk, never the cap's; the
 /// window's makes the bus and routes or sends the channel to it in that
@@ -593,6 +671,69 @@ fn the_sentinel_catches_a_road_that_leaves_a_clip_on_a_bus() {
     // A road with no refusal of its own: the clip straight onto the bus.
     app.arrangement.add_clip(crate::arrangement::ArrClip { lane: bus, len_s: 1.0, ..Default::default() });
     app.undo_commit();
+}
+
+/// **The automation rows that draw a send into a row follow the row to its
+/// new identity** (W7-join: `retarget_row`). A file has row 0 sending to
+/// row 2, a placeholder with no kind, and to Return 1 (id 705); row 0's
+/// curves on both sends have their rows open, the one on row 2's send armed,
+/// bypassed, focused, last written and copied from, and chosen by its place
+/// among row 0's rows. Row 2 is made a bus, which gives it a new identity
+/// (706). Every one of those now names the send by the new id: the open row
+/// is the curve's own, and its bypass still keeps the curve out of what
+/// plays. The choice by place goes, since the new id sorts the row after
+/// Return 1's. Keyed by the old id, the rows named a send that no longer
+/// existed and the bypassed curve played.
+#[test]
+fn the_rows_that_draw_a_send_into_a_row_follow_it_to_its_new_identity() {
+    use crate::automation::{AutoParam, Point, Shape};
+    use crate::desk_model::Send;
+    let mut s = desk(2);
+    let (old, ret) = (TrackId(700), TrackId(705));
+    s.rows.push(TrackRow::vacant(old));
+    let mut r = TrackRow::vacant(ret);
+    r.kind = Some(RowKind::Bus);
+    r.name = "Return 1".to_owned();
+    s.rows.push(r);
+    s.next_track_id = 706;
+    s.rows[0].sends.push(Send { to: Node::Track(old), level: 0.5, pre: false });
+    s.rows[0].sends.push(Send { to: Node::Track(ret), level: 0.25, pre: false });
+    let (_ctx, mut app) = app_on(s, tiers::free("bus-retarget-rows"));
+    let owner = app.owner_at(0);
+    let (was, other) = (AutoParam::SendTo { to: old }, AutoParam::SendTo { to: ret });
+    for p in [was, other] {
+        app.arrangement.automation.entry(0, p).put(Point { at_s: 1.0, value: 0.5, shape: Shape::Linear });
+        app.arr_auto_open.insert((owner, p));
+    }
+    app.arr_auto_armed.insert((owner, was));
+    app.arr_auto_bypassed.insert((owner, was));
+    app.arr_auto_focus = Some((owner, was));
+    app.auto_clipboard_from = Some((owner, was));
+    app.auto_clipboard_rows = vec![(owner, was)];
+    app.arr_auto_last.insert((owner, was), (1.0, 0.5));
+    assert_eq!(app.arr_auto_rows(AutoLane::Row(0)), vec![was, other], "fixture: the rows' order");
+    app.arr_auto_sel = Some((owner, 0));
+    app.set_channel_kind(2, Some(ChannelKind::Bus));
+    let now = app.track_id_at(2);
+    assert_ne!(now, old, "fixture: the row kept its identity");
+    let is = AutoParam::SendTo { to: now };
+    assert_eq!(app.arr_auto_rows(AutoLane::Row(0)), vec![other, is], "the open rows do not name the send by its new id");
+    for (field, has) in [
+        ("armed", app.arr_auto_armed.contains(&(owner, is))),
+        ("bypassed", app.arr_auto_bypassed.contains(&(owner, is))),
+        ("focused", app.arr_auto_focus == Some((owner, is))),
+        ("copied from", app.auto_clipboard_from == Some((owner, is))),
+        ("copied rows", app.auto_clipboard_rows == vec![(owner, is)]),
+        ("last written", app.arr_auto_last.contains_key(&(owner, is))),
+    ] {
+        assert!(has, "the row's {field} state stayed on the old id");
+    }
+    assert!(
+        !app.engine_automation().curves().iter().any(|c| c.param == is),
+        "the bypassed curve plays now that its bus wears a new id"
+    );
+    assert!(app.engine_automation().curves().iter().any(|c| c.param == other), "fixture: the other curve");
+    assert_eq!(app.arr_auto_sel, None, "a choice by place survived its row moving to another place");
 }
 
 /// **A row that takes a new identity keeps what is sent to it**

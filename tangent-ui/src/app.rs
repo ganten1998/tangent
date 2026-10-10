@@ -545,16 +545,18 @@ fn counted_in(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arr
 #[cfg(test)]
 fn bus_faults(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arrangement) -> usize {
     let bus = |r: &crate::desk_model::TrackRow| r.kind == Some(crate::desk_model::RowKind::Bus);
-    let buses: std::collections::BTreeSet<crate::desk_id::TrackId> =
-        desk.rows.iter().filter(|r| bus(r)).map(|r| r.id).collect();
+    let buses = crate::desk_model::buses_of(&desk.rows);
     let clips = arr.clips.iter().filter(|c| desk.rows.get(c.lane).is_some_and(|r| bus(r))).count();
     let switched = desk.rows.iter().filter(|r| bus(r) && (!r.input.is_empty() || r.arm)).count();
-    let stray = desk
+    // Aimed at a track, and no send to a bus by the one rule.
+    let stray: usize = desk
         .rows
         .iter()
-        .flat_map(|r| &r.sends)
-        .filter(|x| x.to.track().is_some_and(|t| !buses.contains(&t)))
-        .count();
+        .map(|r| {
+            r.sends.iter().filter(|x| x.to.track().is_some()).count()
+                - crate::desk_model::bus_sends(&r.sends, &buses).count()
+        })
+        .sum();
     clips + switched + stray
 }
 
@@ -13092,12 +13094,20 @@ impl TangentApp {
         self.desk_index_dirty();
         // A track's strip facts are its row's (W5).
         let at = into;
-        // A paste is a NEW track, never the source again: its own id. Before
-        // `set_channel_kind`, which then finds the row counted.
+        // A paste is a NEW strip, never the source again: its own id, minted
+        // ONCE, here. Before `set_channel_kind`, which mints for a row that
+        // was no strip and so has to find this one already a strip: a
+        // track counted (added), a bus a bus. A copied bus went in as a row
+        // that was neither, and its kind minted a second id over the first,
+        // burning one and retargeting everything the first had been given.
         self.mint_row_id(into);
         if let Some(row) = self.row_mut(into) {
             // A bus is a strip by its kind, never an added track.
-            row.added = copy.kind != Some(recorder::ChannelKind::Bus);
+            let bus = copy.kind == Some(recorder::ChannelKind::Bus);
+            row.added = !bus;
+            if bus {
+                row.kind = Some(crate::desk_model::RowKind::Bus);
+            }
         }
         self.set_channel_kind(into, copy.kind);
         if let Some(name) = self.row_mut(at).map(|r| &mut r.name) {
@@ -13308,20 +13318,64 @@ impl TangentApp {
             *t = track(*t);
         }
         let node = |n: Node| if n == Node::Track(from) { Node::Track(to) } else { n };
+        // **A row names its control too, and a send's control names its
+        // bus** (`AutoParam::SendTo`): the rows that draw a curve on another
+        // track's send into this row follow it to its new id, as the curves
+        // themselves do below. Keyed by the old id they named a send that no
+        // longer exists: the row stayed open over nothing, its arm and
+        // bypass were lost, and the curve's own row came back closed.
+        let param = |p: crate::automation::AutoParam| {
+            if p.send_to() == Some(from) {
+                crate::automation::AutoParam::SendTo { to }
+            } else {
+                p
+            }
+        };
+        let row = |(o, p): AutoRow| (node(o), param(p));
+        // The owners whose rows draw a send into this row: their rows sort
+        // by the bus's id (`auto_rows_of`), so the new one may stand
+        // elsewhere among them, and a choice that names a row by its place
+        // there would name another row.
+        let resorted: Vec<(Node, Vec<crate::automation::AutoParam>)> = self
+            .arr_auto_open
+            .iter()
+            .filter(|(_, p)| p.send_to() == Some(from))
+            .map(|(o, _)| *o)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|o| (o, self.auto_rows_of(o)))
+            .collect();
         let rows = |set: &mut HashSet<AutoRow>| {
-            *set = set.drain().map(|(o, p)| (node(o), p)).collect();
+            *set = set.drain().map(row).collect();
         };
         rows(&mut self.arr_auto_open);
         rows(&mut self.arr_auto_armed);
         rows(&mut self.arr_auto_bypassed);
-        self.arr_auto_focus = self.arr_auto_focus.map(|(o, p)| (node(o), p));
-        self.auto_clipboard_from = self.auto_clipboard_from.map(|(o, p)| (node(o), p));
-        for (o, _) in &mut self.auto_clipboard_rows {
-            *o = node(*o);
+        self.arr_auto_focus = self.arr_auto_focus.map(row);
+        self.auto_clipboard_from = self.auto_clipboard_from.map(row);
+        for r in &mut self.auto_clipboard_rows {
+            *r = row(*r);
+        }
+        if let Some(d) = self.arr_auto_drag_from.as_mut() {
+            d.lead.1 = param(d.lead.1);
+            d.lead_now.1 = param(d.lead_now.1);
+            for (_, p, _, _) in &mut d.curves {
+                *p = param(*p);
+            }
         }
         self.arr_auto_modes = self.arr_auto_modes.drain().map(|(o, m)| (node(o), m)).collect();
         self.arr_auto_latched = self.arr_auto_latched.drain().map(node).collect();
-        self.arr_auto_last = self.arr_auto_last.drain().map(|((o, p), v)| ((node(o), p), v)).collect();
+        self.arr_auto_last = self.arr_auto_last.drain().map(|(k, v)| (row(k), v)).collect();
+        for (o, before) in resorted {
+            let after = self.auto_rows_of(node(o));
+            if before.iter().map(|p| param(*p)).ne(after.iter().copied()) {
+                // Renumbered: the choices that name its slots go, as they do
+                // when a bay move renumbers a lane's rows.
+                self.arr_auto_sel = self.arr_auto_sel.filter(|(s, _)| *s != o);
+                self.arr_auto_hot = self.arr_auto_hot.filter(|(s, _, _)| *s != o);
+                self.arr_auto_nodes.retain(|(s, _, _)| *s != o);
+            }
+        }
         self.arr_auto_sel = self.arr_auto_sel.map(|(o, s)| (node(o), s));
         self.arr_auto_hot = self.arr_auto_hot.map(|(o, s, i)| (node(o), s, i));
         for (o, _, _) in &mut self.arr_auto_nodes {
@@ -15763,10 +15817,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// then by id — which is the order the menu offers them in, so the rows
     /// and the menu read the same way down.
     fn arr_auto_rows(&self, lane: AutoLane) -> Vec<crate::automation::AutoParam> {
+        match self.auto_owner(lane) {
+            Some(owner) => self.auto_rows_of(owner),
+            None => Vec::new(),
+        }
+    }
+
+    /// [`Self::arr_auto_rows`] by whose rows they are, wherever that owner
+    /// stands (or whether it stands on a lane at all).
+    fn auto_rows_of(&self, owner: crate::desk_id::Node) -> Vec<crate::automation::AutoParam> {
         use crate::automation::AutoParam;
-        let Some(owner) = self.auto_owner(lane) else {
-            return Vec::new();
-        };
         let mut out: Vec<AutoParam> = self
             .arr_auto_open
             .iter()
@@ -35231,19 +35291,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// **A strip's sends to BUSES**, in the order they were made: every send
-    /// but the ones into the effects return, which its knob answers for.
-    /// What the strip's send rows draw and the routing window lists.
+    /// **The desk's buses and returns, by identity**
+    /// (`desk_model::buses_of`): what a send is judged against, here and by
+    /// the bridge (`Bridge::read_sends`).
+    pub fn bus_ids(&self) -> std::collections::BTreeSet<crate::desk_id::TrackId> {
+        crate::desk_model::buses_of(&self.settings.rows)
+    }
+
+    /// **A strip's sends to BUSES**, in the order they were made, by the one
+    /// rule the bridge plays them by (`desk_model::bus_sends`): every send
+    /// aimed at a bus row of this desk. Not the knob's entry into the
+    /// effects return, which the knob answers for, and not a send a file
+    /// aims at a row that is no bus, which nothing plays. What the strip's
+    /// send rows draw (and the +N chip counts), the routing window lists and
+    /// the automation menu offers a curve for.
     pub fn strip_bus_sends(&self, s: recorder::StripRef) -> Vec<crate::desk_model::Send> {
-        self.strip_sends(s).iter().filter(|x| x.to.track().is_some()).copied().collect()
+        let buses = self.bus_ids();
+        crate::desk_model::bus_sends(self.strip_sends(s), &buses).copied().collect()
     }
 
     /// **The k-th send to a bus of the strip in column `col`**, the one its
-    /// k-th send row draws: by place in the strip's own list, translated to
-    /// the send here, so the panel never holds a send of its own.
+    /// k-th send row draws: by place in the strip's own list of sends to
+    /// buses ([`Self::strip_bus_sends`]), translated to the send here, so the
+    /// panel never holds a send of its own.
     fn strip_bus_send_at(&self, col: recorder::Column, k: usize) -> Option<(recorder::StripRef, crate::desk_model::Send)> {
         let sr = col.strip_ref();
-        self.strip_sends(sr).iter().filter(|x| x.to.track().is_some()).nth(k).map(|x| (sr, *x))
+        self.strip_bus_sends(sr).get(k).map(|x| (sr, *x))
     }
 
     /// The level of a strip's send to `to` on one side of its fader, when

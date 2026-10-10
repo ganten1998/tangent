@@ -218,6 +218,60 @@ fn a_bus_row_is_a_bus_lane_and_its_sends_reach_the_plan() {
     assert!(p4.sends.is_empty(), "a send into a track reached the plan");
 }
 
+/// **The app and the bridge read one rule for what a send to a bus is**
+/// (W7-join: `desk_model::bus_sends`). A desk a file made, every kind of
+/// send on it: row 0 sends to a track that is no bus, then to the return
+/// after its fader and to the bus before it, and its knob feeds the effects
+/// return; row 1 sends to the return; the drum bus sends to the track and to
+/// the bus. The plan's sends to buses are exactly the sends the app draws on
+/// each strip (`TangentApp::strip_bus_sends`), in the senders' identities'
+/// order, and none of them is aimed at the track. The app used to draw every
+/// send aimed at a track, and the bridge played only those aimed at a bus.
+#[test]
+fn the_app_and_the_bridge_read_one_rule_for_a_send_to_a_bus() {
+    use tangent_ui::desk_model::Send;
+    let mut s = desk(2);
+    s.rows[2].kind = Some(RowKind::Bus);
+    s.rows[2].name = "Return 1".to_owned();
+    s.rows[3].kind = Some(RowKind::Bus);
+    s.rows[3].name = "Bus 1".to_owned();
+    let (track, ret, bus) = (Node::Track(s.rows[1].id), Node::Track(s.rows[2].id), Node::Track(s.rows[3].id));
+    s.rows[0].sends.extend([
+        Send { to: track, level: 0.5, pre: false },
+        Send { to: ret, level: 0.75, pre: false },
+        Send { to: bus, level: 0.25, pre: true },
+        Send { to: Node::Fx, level: 0.6, pre: false },
+    ]);
+    s.rows[1].sends.push(Send { to: ret, level: 1.0, pre: false });
+    s.specials.drums.sends.extend([Send { to: track, level: 1.0, pre: false }, Send { to: bus, level: 0.4, pre: false }]);
+    let (_ctx, app) = app_on(s, tiers::free("buses-one-rule"));
+    let (b, p) = plan_of(&app);
+    let lane = |n: Node| -> Slot {
+        let row = app.row_of(n.track().expect("a track")).expect("on the desk");
+        b.lane(row).expect("a lane").slot
+    };
+    let drawn = |from: SendFrom, s: StripRef| -> Vec<InSend> {
+        app.strip_bus_sends(s)
+            .iter()
+            .map(|x| InSend { from, to: SendTo::Lane(lane(x.to)), level: x.level as f32, pre: x.pre })
+            .collect()
+    };
+    let mut rows: Vec<(tangent_ui::desk_id::TrackId, usize)> =
+        (0..app.desk_extent()).filter_map(|r| Some((app.track_at(r)?, r))).collect();
+    rows.sort_unstable();
+    let mut want: Vec<InSend> = rows.iter().flat_map(|&(id, r)| drawn(SendFrom::Lane(lane(Node::Track(id))), StripRef::Row(r))).collect();
+    want.extend(drawn(SendFrom::Drums, StripRef::Drums));
+    let played: Vec<InSend> = p.sends.iter().filter(|x| x.to != SendTo::Fx).cloned().collect();
+    assert_eq!(played, want, "the plan plays other sends to buses than the app draws");
+    assert_eq!(played.len(), 4, "fixture: the desk's sends to buses");
+    let to_track = SendTo::Lane(lane(track));
+    assert!(p.sends.iter().all(|x| x.to != to_track), "a send to a track that is no bus reached the plan");
+    assert!(
+        [StripRef::Row(0), StripRef::Drums].iter().all(|s| app.strip_bus_sends(*s).iter().all(|x| x.to != track)),
+        "the app draws a send to a track that is no bus"
+    );
+}
+
 /// **A send's level moved is carried into the plan that plays, and
 /// publishes no plan** (design 7.6: what only scales stays a number). A
 /// drag writes the level on every pointer move, and the bridge used to read
