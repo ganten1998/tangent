@@ -227,7 +227,7 @@ pub fn least_of<T>(tries: usize, mut f: impl FnMut() -> T) -> (T, Counted) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instrument::{Engine, Placed, CHANNELS};
+    use crate::instrument::{Engine, Placed, LEGACY_LANES};
     use crate::render_golden::{noise, offline};
     use std::path::Path;
     use std::sync::Arc;
@@ -275,7 +275,7 @@ mod tests {
         let clip = noise(4.0, 0x51ed);
         let len = clip.frames() as u64;
         e.set_clips(
-            (0..CHANNELS)
+            (0..LEGACY_LANES)
                 .map(|lane| Placed {
                     clip: Arc::clone(&clip),
                     strip: lane,
@@ -288,7 +288,7 @@ mod tests {
                 })
                 .collect(),
         );
-        for lane in 0..CHANNELS {
+        for lane in 0..LEGACY_LANES {
             e.load_insert(lane, 0, Some(Path::new(crate::builtin_fx::EQ_PATH)), None)
                 .expect("the EQ loads")
                 .expect("the bay reports it");
@@ -428,7 +428,7 @@ mod tests {
             e.render_offline(&mut out);
             e.drain_stems(&mut stems);
         }
-        let wide = CHANNELS * 2;
+        let wide = LEGACY_LANES * 2;
         let lane = |l: usize| -> Vec<f32> {
             stems
                 .chunks_exact(wide)

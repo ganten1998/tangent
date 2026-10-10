@@ -421,7 +421,7 @@ pub const fn lift_curve_lane(version: u64, era: DeskEra, lane: usize) -> Option<
     }
 }
 
-/// **The V32 seat of drum lane `ch`'s pad `pad`** (`recorder::pad_rack_index`
+/// **The V32 seat of drum lane `ch`'s pad `pad`** (`desk_legacy::pad_rack_index`
 /// at 32 channels, frozen): channel 0 keeps the legacy block after the
 /// master, every other channel its own block after the master's extra rack.
 pub const fn v32_pad_seat(ch: usize, pad: usize) -> usize {

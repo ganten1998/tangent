@@ -6884,7 +6884,7 @@ mod tests {
         assert!(empties < legacy_bound, "thousands of empties in format 2: {empties}");
 
         // The dense shape every earlier build wrote.
-        let mut dense = vec![Value::String(String::new()); crate::recorder::INSERT_SPACE];
+        let mut dense = vec![Value::String(String::new()); crate::desk_legacy::V32_INSERT_SPACE];
         dense[1] = Value::String("reverb".into());
         dense[12447] = Value::String("brusfri".into());
         let mut old = written.clone();
@@ -6926,7 +6926,7 @@ mod tests {
         // spends twenty on any bay at all, and everything downstream sizes
         // a dense space by the bay — so these are a terabyte and a wrap to
         // zero, not seats. The last real seat stays, the first past it goes.
-        let space = crate::recorder::INSERT_SPACE;
+        let space = crate::desk_legacy::V32_INSERT_SPACE;
         let past = serde_json::json!({
             "18446744073709551615": "usize-max",
             "100000000000": "a terabyte of strings",
@@ -6978,7 +6978,7 @@ mod tests {
         let a = a_document_with_everything_in_it();
         let mut d = a.desk.clone().expect("a desk");
         let clean = d.clone();
-        let far = crate::desk_legacy::bay_of_flat(&d.row_ids(), crate::recorder::INSERT_SPACE - 1).expect("a bay");
+        let far = crate::desk_legacy::bay_of_flat(&d.row_ids(), crate::desk_legacy::V32_INSERT_SPACE - 1).expect("a bay");
         d.plugins.insert(far, String::new());
         let mut with = Fingerprint::recording(0);
         d.as_ref().hash_into(&mut with);
