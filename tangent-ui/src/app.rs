@@ -2709,7 +2709,15 @@ struct TrackCopy {
     /// one road's lane move (Paste Track Below) and by no other, so a copy
     /// taken before a drag reorder sent the host to the states of whatever
     /// track had moved into that row.
-    from_id: crate::desk_id::TrackId,
+    ///
+    /// **`None` once the session stands in another document**, with
+    /// `files_at` (`forget_document_tracks`): an id names a track only in
+    /// the document that minted it, every document mints from 32, and the
+    /// legacy rows are `t0`..`t31` in all of them, so the next document's
+    /// `t40` is somebody else's track. The copy itself still pastes there;
+    /// its paste asks the host for no plugin states (its bays load at their
+    /// defaults) rather than for a stranger's.
+    from_id: Option<crate::desk_id::TrackId>,
     /// **Which row holds the source's plugin-state files, by that row's
     /// id**, for the host's lane form of the insert-state note while plugin
     /// states are named by lane (W4-integrate names them by track, and the
@@ -2717,7 +2725,8 @@ struct TrackCopy {
     /// is removed - a cut is a copy and then a removal - the row the
     /// removal emptied in place, which keeps the files and moves with them
     /// through a reorder, as the source's lane used to be carried by hand.
-    files_at: crate::desk_id::TrackId,
+    /// `None` with `from_id`.
+    files_at: Option<crate::desk_id::TrackId>,
     kind: Option<recorder::ChannelKind>,
     name: String,
     color: i64,
@@ -6933,8 +6942,8 @@ impl TangentApp {
         // on this row's files until the host keeps them by track: the row
         // keeps them, under its new id. See `TrackCopy::files_at`.
         let emptied = self.track_id_at(n);
-        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == gone) {
-            copy.files_at = emptied;
+        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == Some(gone)) {
+            copy.files_at = Some(emptied);
         }
         use crate::recorder::Strip;
         let d = Settings::default();
@@ -12758,8 +12767,8 @@ impl TangentApp {
         self.auto_clipboard_rows.clear();
         self.auto_clipboard_from = None;
         self.track_clipboard = Some(TrackCopy {
-            from_id: self.track_id_at(n),
-            files_at: self.track_id_at(n),
+            from_id: Some(self.track_id_at(n)),
+            files_at: Some(self.track_id_at(n)),
             kind: self.channel_kind(n),
             name: self
                 .settings
@@ -13004,7 +13013,13 @@ impl TangentApp {
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
         // defaults, which is a different instrument wearing the same name.
-        self.insert_state_copy = Some((copy.from_id, self.track_id_at(into), copy.files_at));
+        // A copy from another document names no track here (`from_id`), so
+        // it asks for nothing: defaults, rather than this document's track
+        // that happens to wear the same id.
+        self.insert_state_copy = copy
+            .from_id
+            .zip(copy.files_at)
+            .map(|(from, files_at)| (from, self.track_id_at(into), files_at));
         self.select_alone(into);
         self.save_settings();
         // No commit here: the hold in `paste_track` is what ends this
@@ -13148,8 +13163,8 @@ impl TangentApp {
             *o = node(*o);
         }
         // The row whose files hold a cut track's states is still that row.
-        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == from) {
-            copy.files_at = to;
+        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == Some(from)) {
+            copy.files_at = Some(to);
         }
     }
 
@@ -14263,16 +14278,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.auto_clipboard_rows.clear();
     }
 
-    /// **The selection lets go of the last document's tracks.** It names
-    /// tracks by id, and an id means something only in the document that
-    /// minted it: kept across an open, `t40` would select whatever track
-    /// the next document gave that id, or nothing at all. The design's rule
-    /// for every entry keyed by a track: inert while its track is gone,
-    /// purged when the session changes.
+    /// **The session lets go of the last document's tracks.** The
+    /// selection, the copied track's source and a paste's note for the host
+    /// name tracks by id, and an id means something only in the document
+    /// that minted it: kept across an open, `t40` would select whatever
+    /// track the next document gave that id, and a paste there would have
+    /// the host copy that track's plugin states onto the pasted one. The
+    /// design's rule for every entry keyed by a track: inert while its
+    /// track is gone, purged when the session changes.
+    ///
+    /// The copied track itself stays - a copy made in one project pastes
+    /// into another, as copied automation nodes do - with no source: its
+    /// paste asks the host for no states (`TrackCopy::from_id`).
     fn forget_document_tracks(&mut self) {
         self.selected_channel = None;
         self.selected_tracks.clear();
         self.sel_anchor = None;
+        if let Some(copy) = self.track_clipboard.as_mut() {
+            copy.from_id = None;
+            copy.files_at = None;
+        }
+        self.insert_state_copy = None;
     }
 
     /// **On open, a lone base node and its control are made to agree.**
@@ -83377,6 +83403,48 @@ mod lane_refs_tests {
                 run();
             }
         }
+    }
+
+    /// **A track copied in one project pastes into another asking the host
+    /// for no plugin states.** Ids are per document, every document mints
+    /// from 32 and the legacy rows are `t0`..`t31` in all of them, so the
+    /// copy's source names another track in the next one: pasted there, the
+    /// note sent the host to that track's plugin states (in either form),
+    /// and the pasted track loaded a stranger's settings. The copy keeps
+    /// what it holds, and a note still waiting at the switch goes with it.
+    #[test]
+    fn a_track_copied_in_one_project_pastes_into_another_asking_for_no_states() {
+        let root = project_scratch("lane-refs-cross-doc");
+        // Project B: its row 1 is its own track, with its own plugin.
+        let (_cb, mut other) = headless(Caps::DESKTOP);
+        other.bootstrap_project(&root.join("B"));
+        other.set_insert(1, 0, Some("/x/b.vst3"));
+        other.save_project_doc();
+        let b_doc = other.project_doc().expect("project B").to_path_buf();
+        drop(other);
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("A"));
+        app.set_insert(1, 0, Some("/x/a.vst3"));
+        let source = app.track_id_at(1);
+        app.copy_track(1);
+        app.paste_track(6);
+        assert!(app.insert_state_copy.is_some(), "fixture: the paste in A left no note");
+
+        app.open_project(&b_doc);
+        assert_eq!(app.insert(1, 0), Some("/x/b.vst3"), "fixture: B did not open");
+        assert_eq!(app.track_id_at(1), source, "fixture: B's row 1 does not wear the copied track's id");
+        assert_eq!(app.insert_state_copy, None, "a note from A waited across the switch");
+        assert!(app.track_on_clipboard(), "the switch threw the copied track away");
+
+        app.paste_track(6);
+        assert_eq!(app.insert(6, 0), Some("/x/a.vst3"), "the paste lost what the copy held");
+        assert_eq!(app.insert(1, 0), Some("/x/b.vst3"), "fixture: B's own track changed");
+        let note = app.insert_state_copy;
+        assert_eq!(app.take_insert_state_copy(), None, "the host was sent to B's track's states by row");
+        app.insert_state_copy = note;
+        assert_eq!(app.take_insert_state_copy_ids(), None, "the host was sent to B's track's states by id");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The route labels are the routes' words, after every edit that
