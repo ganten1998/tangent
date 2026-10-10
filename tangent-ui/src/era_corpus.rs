@@ -967,20 +967,71 @@ fn outside_test_modules(src: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// **The spellings of a real path**: Tangent's media root, its config
+/// directory, and the staging twins the unlimited-tracks branch gave its
+/// internal builds, which no code may spell again.
+const REAL_PATH_SPELLINGS: [&str; 6] = [
+    "\"Tangent Media",
+    "\".config\"",
+    "\".config/",
+    "join(\"tangent\")",
+    "\"tangent-staging",
+    "Media Staging",
+];
+
+/// **The lines that may spell one, each exactly as written and once**, in
+/// the file named: the config chooser's `.config`, the XDG user-dirs file's
+/// (not Tangent's config), and the media chooser's two answers, the real
+/// default and this crate's per-thread test root.
+///
+/// **An exemption names a LINE, and the line spends it** (design
+/// W8-safe-tests). It was a file and a fragment: any line of settings.rs
+/// holding `.join("Tangent Media")` or `test_path()` passed, so a second
+/// hard-coded media root beside the chooser passed as the chooser, and so
+/// did the chooser's own line written twice.
+const REAL_PATH_LINES: [(&str, &str); 4] = [
+    ("tangent-core/src/config.rs", "home().unwrap_or_else(|| PathBuf::from(\".\")).join(\".config\")"),
+    ("tangent-record/src/take.rs", ".unwrap_or_else(|| home.join(\".config\"));"),
+    ("tangent-ui/src/settings.rs", ".join(\"Tangent Media\")"),
+    ("tangent-ui/src/settings.rs", "return test_path().with_file_name(\"Tangent Media\");"),
+];
+
+/// **Where `src`, the file at `rel`, spells a real path off the lines that
+/// may**, one entry per line, with the indices of the [`REAL_PATH_LINES`]
+/// it spent. Tests are read past their `#[cfg(test)]` module: a fixture
+/// that names a folder of that name under a temp root is not a path to the
+/// owner's files.
+fn real_path_spellings(rel: &str, src: &str) -> (Vec<String>, Vec<usize>) {
+    let mut found = Vec::new();
+    let mut spent: Vec<usize> = Vec::new();
+    for (n, line) in outside_test_modules(src) {
+        let line = line.split("//").next().unwrap_or("");
+        if !REAL_PATH_SPELLINGS.iter().any(|s| line.contains(s)) {
+            continue;
+        }
+        let exempt = (0..REAL_PATH_LINES.len())
+            .find(|k| REAL_PATH_LINES[*k] == (rel, line.trim()) && !spent.contains(k));
+        match exempt {
+            Some(k) => spent.push(k),
+            None => found.push(format!("{rel}:{}: {}", n + 1, line.trim())),
+        }
+    }
+    (found, spent)
+}
+
 /// **No code but the two choosers spells the real config directory or the
 /// real media root**, so `TANGENT_CONFIG_DIR` and `TANGENT_MEDIA_ROOT`
 /// cannot be routed around by a second copy of either path.
 /// `tangent_core::config::dir` is the config's only home and
-/// `Settings::default_media_root` the media's; a test fixture that names a
-/// folder of that name under a temp root is not a path to the owner's
-/// files, so tests are read past their `#[cfg(test)]`. The staging twins
-/// the unlimited-tracks branch gave its internal builds
+/// `Settings::default_media_root` the media's ([`REAL_PATH_LINES`]). The
+/// staging twins the unlimited-tracks branch gave its internal builds
 /// (`~/.config/tangent-staging`, `Documents/Tangent Media Staging`) went
 /// with its last wave, and no code may spell either again.
 #[test]
 fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = Vec::new();
+    let mut spent = Vec::new();
     for krate in ["tangent", "tangent-ui", "tangent-core", "tangent-host", "tangent-record", "plugin"] {
         let mut stack = vec![root.join(krate).join("src")];
         while let Some(dir) = stack.pop() {
@@ -997,42 +1048,47 @@ fn nothing_but_the_choosers_spells_the_real_config_or_media_path() {
                 }
                 let src = std::fs::read_to_string(&p).expect("source");
                 let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
-                for (n, line) in outside_test_modules(&src) {
-                    let line = line.split("//").next().unwrap_or("");
-                    for spelled in [
-                        "\"Tangent Media",
-                        "\".config\"",
-                        "\".config/",
-                        "join(\"tangent\")",
-                        "\"tangent-staging",
-                        "Media Staging",
-                    ] {
-                        if !line.contains(spelled) {
-                            continue;
-                        }
-                        let allowed = match spelled {
-                            // The chooser, and the per-thread test root.
-                            "\"Tangent Media" => {
-                                rel == "tangent-ui/src/settings.rs"
-                                    && (line.contains(".join(\"Tangent Media\")") || line.contains("test_path()"))
-                            }
-                            "\".config\"" => {
-                                rel == "tangent-core/src/config.rs"
-                                // The XDG user-dirs file, not Tangent's config.
-                                || rel == "tangent-record/src/take.rs"
-                            }
-                            // The staging twins, anywhere.
-                            _ => false,
-                        };
-                        if !allowed {
-                            found.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                        }
-                    }
-                }
+                let (hits, lines) = real_path_spellings(&rel, &src);
+                found.extend(hits);
+                spent.extend(lines);
             }
         }
     }
     assert!(found.is_empty(), "a second spelling of a real path: {found:#?}");
+    // Every exemption still names a line that is there, or it would excuse
+    // the next line written the same way.
+    for (k, (file, line)) in REAL_PATH_LINES.iter().enumerate() {
+        assert!(spent.contains(&k), "{file} no longer has `{line}`: the exemption names nothing, drop or move it");
+    }
+}
+
+/// **A second media root beside the chooser fails the scan, the chooser's
+/// own line written again included** (design W8-safe-tests). Planted in
+/// settings.rs beside the two lines that may, and the two lines alone in
+/// another file. Revert check: the fragment rule this replaced passes the
+/// first four.
+#[test]
+fn a_second_media_root_beside_the_chooser_fails_the_scan_when_planted() {
+    let chooser = "fn default_media_root() -> PathBuf {\n    documents()\n        .join(\"Tangent Media\")\n}\n\
+                   fn media_root(&self) -> PathBuf {\n    return test_path().with_file_name(\"Tangent Media\");\n}\n";
+    let (hits, spent) = real_path_spellings("tangent-ui/src/settings.rs", chooser);
+    assert!(hits.is_empty(), "the chooser itself was refused: {hits:?}");
+    assert_eq!(spent, [2, 3]);
+    for plant in [
+        "    let elsewhere = home.join(\"Documents\").join(\"Tangent Media\");",
+        "        .join(\"Tangent Media\")",
+        "    let root = test_path().with_file_name(\"Tangent Media\");",
+        "    return test_path().with_file_name(\"Tangent Media\");",
+        "    let root = PathBuf::from(\"Tangent Media\"); // test_path()",
+        "    let twin = documents().join(\"Tangent Media Staging\");",
+    ] {
+        let src = format!("{chooser}fn second() -> PathBuf {{\n{plant}\n}}\n");
+        let (hits, _) = real_path_spellings("tangent-ui/src/settings.rs", &src);
+        assert_eq!(hits.len(), 1, "passed as the chooser: {plant}");
+    }
+    let (hits, spent) = real_path_spellings("tangent/src/desktop.rs", chooser);
+    assert_eq!(hits.len(), 2, "the chooser's lines passed in another file");
+    assert!(spent.is_empty());
 }
 
 
