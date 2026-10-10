@@ -10,9 +10,10 @@
 //! carries a bus as a bus and every send to one, in an order no reorder
 //! moves; that a send's level moves as a number in that plan, never as a
 //! plan of its own; that a send is heard, through its bus and nowhere else;
-//! that the switch the app's send curves wait on says what an export
-//! plays; that a free desk's hundred buses and thousand sends reach one
-//! plan; and that a route loop a legacy file saved plays exactly as the
+//! that a send's curve plays in an export, on its own send and never the
+//! cue beside it; that a free desk's hundred buses and thousand sends reach
+//! one plan; that the app and the bridge read one rule for what a send to a
+//! bus is; and that a route loop a legacy file saved plays exactly as the
 //! legacy shim played it, which is the road the render goldens pin.
 //!
 //! **Nothing here touches the real home**: the licence stores are temp
@@ -340,20 +341,57 @@ fn a_send_is_heard_through_its_bus_and_nowhere_else() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// **The send curve switch says what an export plays**
-/// (`tangent_ui::automation::SEND_CURVES_PLAY`, which the A menu's Sends
-/// group, a send row's writes and a lone base all wait on): a curve on a
-/// track's send to a return changes the export exactly when the switch says
-/// a send's curve is played. The curve holds the send at nothing for the
-/// whole song, written where a save writes curves and opened as a song is.
-/// Played, the return hears nothing; not played (today), the export is the
-/// export of the same song with no curve, bit for bit. The commit that
-/// maps `AutoParam::SendTo` onto the engine's send curves (W7-slot-gaps
-/// item 5) fails this until it sets the switch, and a switch set with
-/// nothing behind it fails it too.
+/// **The saved song at `doc`, opened again with `curves` for its automation
+/// and, given `sends`, those for the sends of track `from`**: what its
+/// export makes, and what the lane of track `to` meters. Written where a
+/// save writes them (the document and its format-2 desk) and opened as a
+/// song is, so the curves and sends reach the export by every road a real
+/// song's do.
+fn reopen_heard(
+    app: &mut TangentApp,
+    doc: &Path,
+    curves: serde_json::Value,
+    sends: Option<(tangent_ui::desk_id::TrackId, serde_json::Value)>,
+    to: tangent_ui::desk_id::TrackId,
+) -> (Vec<f32>, f32) {
+    let text = std::fs::read_to_string(doc).expect("the document");
+    let mut json: serde_json::Value = serde_json::from_str(&text).expect("the document parses");
+    json.as_object_mut().expect("a document").insert("automation".to_owned(), curves);
+    if let Some((from, sends)) = sends {
+        let rows = json["desk"]["rows"].as_array_mut().expect("the document carries a format-2 desk");
+        let row = rows.iter_mut().find(|r| r["id"] == serde_json::json!(from.0)).expect("the sender's row");
+        row["sends"] = sends;
+    }
+    std::fs::write(doc, serde_json::to_string_pretty(&json).expect("json")).expect("the document written");
+    app.open_project(doc);
+    let (master, lanes) = heard(app);
+    (master, lanes[app.row_of(to).expect("the bus's row")])
+}
+
+/// A curve holding a track's send to `to` at `level` for the whole song.
+fn held_send_curve(to: tangent_ui::desk_id::TrackId, level: f64) -> serde_json::Value {
+    use tangent_ui::automation::{AutoParam, Shape};
+    serde_json::json!([{
+        "lane": 0,
+        "param": AutoParam::SendTo { to }.key(),
+        "points": [
+            { "at": 0.0, "v": level, "shape": Shape::Hold.key() },
+            { "at": 30.0, "v": level, "shape": Shape::Hold.key() },
+        ],
+    }])
+}
+
+/// **A curve on a track's send to a return plays in the export**
+/// (`AutoParam::SendTo`, W7-join): the curve holds the send at nothing for
+/// the whole song, written where a save writes curves and opened as a song
+/// is, and the return hears nothing while the export is no longer the
+/// curveless song's. While the engine played no send curve this was the
+/// test of a switch that shut every door to one (`SEND_CURVES_PLAY`,
+/// `the_send_curve_switch_says_what_an_export_plays`); the switch went with
+/// the engine's half arriving, and this is its played branch.
 #[test]
-fn the_send_curve_switch_says_what_an_export_plays() {
-    use tangent_ui::automation::{AutoParam, Shape, SEND_CURVES_PLAY};
+fn a_send_curve_plays_in_the_export() {
+    use tangent_ui::automation::AutoParam;
     let root = scratch("send-curve");
     let wav = root.join("noise.wav");
     noise_wav(&wav, 0x5e4d);
@@ -365,41 +403,61 @@ fn the_send_curve_switch_says_what_an_export_plays() {
     let to = app.track_at(bus).expect("the return's track");
     assert!(app.save_project_first(&root.join("Send.tan")), "the save did not land");
     let doc = app.project_doc().expect("the saved project").to_path_buf();
-    // The saved song, opened again with `curves` for its automation: what
-    // its export makes, and what its return's lane meters.
-    let reopen = |app: &mut TangentApp, curves: serde_json::Value| {
-        let text = std::fs::read_to_string(&doc).expect("the document");
-        let mut json: serde_json::Value = serde_json::from_str(&text).expect("the document parses");
-        json.as_object_mut().expect("a document").insert("automation".to_owned(), curves);
-        std::fs::write(&doc, serde_json::to_string_pretty(&json).expect("json")).expect("the document written");
-        app.open_project(&doc);
-        let (master, lanes) = heard(app);
-        (master, lanes[app.row_of(to).expect("the return's row")])
-    };
-    let (plain, return_plain) = reopen(&mut app, serde_json::json!([]));
-    let curve = serde_json::json!([{
-        "lane": 0,
-        "param": AutoParam::SendTo { to }.key(),
-        "points": [
-            { "at": 0.0, "v": 0.0, "shape": Shape::Hold.key() },
-            { "at": 30.0, "v": 0.0, "shape": Shape::Hold.key() },
-        ],
-    }]);
-    let (curved, return_curved) = reopen(&mut app, curve);
+    let (plain, return_plain) = reopen_heard(&mut app, &doc, serde_json::json!([]), None, to);
+    let (curved, return_curved) = reopen_heard(&mut app, &doc, held_send_curve(to, 0.0), None, to);
     assert!(return_plain > 0.0, "fixture: the return hears nothing with no curve");
     assert!(
         app.automation().curves().iter().any(|c| c.param == AutoParam::SendTo { to }),
         "fixture: the song lost its send's curve"
     );
     assert_eq!(app.strip_send_to(StripRef::Row(0), Node::Track(to), false), Some(1.0), "fixture: the open moved the send");
-    let same = return_curved.to_bits() == return_plain.to_bits()
-        && curved.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits());
-    if SEND_CURVES_PLAY {
-        assert_eq!(return_curved, 0.0, "the switch says a send's curve plays, and the return heard one held at nothing");
-        assert!(!same, "the switch says a send's curve plays, and the export did not change");
-    } else {
-        assert!(same, "a send's curve changed the export while the switch says none is played");
-    }
+    assert_eq!(return_curved, 0.0, "the return heard a send its curve holds at nothing");
+    assert!(
+        curved.iter().zip(&plain).any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the send's curve did not change the export"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A send's curve rides its own send and leaves the cue beside it**
+/// (W7-join: the engine names a send by its two ends, and the app's curve
+/// is the post-fader send's alone). A track a file has sending to one
+/// return from both sides of its fader, the pre-fader cue at a half and the
+/// post-fader send at full, and a curve holding the post-fader send at
+/// nothing: the export is bit for bit the song with no curve and that send
+/// at nothing, and the return still hears the cue. One engine curve named
+/// by its ends alone drove both sends, and the cue fell silent with it.
+#[test]
+fn a_send_curve_rides_its_own_send_and_leaves_the_cue_beside_it() {
+    let root = scratch("send-curve-twin");
+    let wav = root.join("noise.wav");
+    noise_wav(&wav, 0x7a1e);
+    let (_ctx, mut app) = app_on(desk(0), tiers::free("buses-send-curve-twin"));
+    app.bootstrap_project(&root.join("Projects"));
+    app.import_audio_at(&wav, 0, 0.0).expect("a track with a sound");
+    let bus = app.new_bus(BusRole::Return).expect("a return");
+    assert!(app.add_send(StripRef::Row(0), bus));
+    let (from, to) = (app.track_at(0).expect("the track"), app.track_at(bus).expect("the return's track"));
+    assert!(app.save_project_first(&root.join("Twin.tan")), "the save did not land");
+    let doc = app.project_doc().expect("the saved project").to_path_buf();
+    let twins = |post: f64| {
+        let bus = Node::Track(to).to_string();
+        serde_json::json!([
+            { "to": bus, "level": post, "pre": false },
+            { "to": bus, "level": 0.5, "pre": true },
+        ])
+    };
+    let (curved, return_curved) = reopen_heard(&mut app, &doc, held_send_curve(to, 0.0), Some((from, twins(1.0))), to);
+    assert_eq!(
+        (app.strip_send_to(StripRef::Row(0), Node::Track(to), false), app.strip_send_to(StripRef::Row(0), Node::Track(to), true)),
+        (Some(1.0), Some(0.5)),
+        "fixture: the file's twins did not open"
+    );
+    let (shut, return_shut) = reopen_heard(&mut app, &doc, serde_json::json!([]), Some((from, twins(0.0))), to);
+    assert!(return_shut > 0.0, "fixture: the cue alone is silent");
+    assert_eq!(return_curved.to_bits(), return_shut.to_bits(), "the return heard the curve take its cue as well as its send");
+    let first = curved.iter().zip(&shut).position(|(a, b)| a.to_bits() != b.to_bits());
+    assert_eq!(first, None, "the curved export is not the song with the post-fader send at nothing");
     let _ = std::fs::remove_dir_all(&root);
 }
 
