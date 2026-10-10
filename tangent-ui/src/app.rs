@@ -7534,6 +7534,9 @@ impl TangentApp {
         use crate::settings::StripSwitch;
         let g = self.settings.knobs().gains;
         let index = self.desk_index();
+        // The desk's buses, once for every strip drawn: what each strip's
+        // sends are judged against (`desk_model::bus_sends`).
+        let buses = self.bus_ids();
         // **The inputs that are open, and one spare to add to.** Four empty
         // microphone columns is not a rack with room in it, it is a desk that
         // is mostly plus signs. The first is always drawn — it is the band's
@@ -7687,11 +7690,10 @@ impl TangentApp {
                 },
                 // **The strip's sends to buses**, each by its bus's name as
                 // the desk names it now: a bus renamed or moved is read
-                // fresh, since a send names its bus by identity.
+                // fresh, since a send names its bus by identity. By the one
+                // rule `strip_bus_sends` and the bridge read.
                 sends: match s {
-                    Strip::Channel(_) if !empty => self
-                        .strip_bus_sends(sr)
-                        .into_iter()
+                    Strip::Channel(_) if !empty => crate::desk_model::bus_sends(self.strip_sends(sr), &buses)
                         .map(|x| crate::mixer_panel::SendRow {
                             label: self.node_label(x.to),
                             level: x.level as f32,
