@@ -235,9 +235,9 @@ pub(crate) struct Lexed {
     pub(crate) bare: String,
     /// **What ships, strings and all**: the text with its comments, char
     /// literals and test items blanked, and every other string as written.
-    /// What reads a path a shipped string spells, on the line it spells it
-    /// (`era_corpus::real_path_spellings`): `code` blanks the strings, and
-    /// `bare` keeps the tests.
+    /// What reads a path or a name a shipped string spells, on the line it
+    /// spells it (`era_corpus::real_path_spellings`, and `ban_scan`'s home
+    /// variables): `code` blanks the strings, and `bare` keeps the tests.
     pub(crate) live: String,
 }
 
