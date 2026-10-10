@@ -1601,6 +1601,20 @@ impl PickTable {
         }
     }
 
+    /// **The held picks that read nothing now**, as of the last
+    /// [`Self::bind`]: a record holds each, and the device as it is open has
+    /// none of the input it read at the press (an interface reopened with
+    /// fewer inputs). The tee writes a pick's ring only while the pick reads
+    /// (`Renderer::mix_monitor` skips one of width 0), so each of these is a
+    /// take that has stopped growing, and the host says so.
+    pub fn held_reading_nothing(&self) -> Vec<PickId> {
+        self.held
+            .keys()
+            .copied()
+            .filter(|p| self.picks.get(p.0 as usize).is_none_or(|e| e.width == 0))
+            .collect()
+    }
+
     /// **A track's pick**, as of the last [`Self::bind`].
     pub fn pick_of(&self, id: TrackId) -> Option<PickId> {
         self.picks.iter().find(|e| e.track == Some(id)).map(|e| e.pick)
@@ -1736,6 +1750,12 @@ impl Bridge {
     /// The record is over. See [`PickTable::release`].
     pub fn release_picks(&mut self, picks: &[PickId]) {
         self.picks.release(picks);
+    }
+
+    /// The held picks that read nothing now: see
+    /// [`PickTable::held_reading_nothing`].
+    pub fn held_reading_nothing(&self) -> Vec<PickId> {
+        self.picks.held_reading_nothing()
     }
 }
 
@@ -3743,6 +3763,40 @@ mod tests {
         rows.push(input_row(4, Some(Mono(0)), false));
         t.bind(&rows, &s);
         assert_eq!(t.pick_of(TrackId(4)), Some(held), "a released pick is not free again");
+    }
+
+    /// **A held pick whose input left the device reads nothing, and is
+    /// named** (W6: the capture tee made loud). An interface reopened with
+    /// two inputs under a record that holds a pick on inputs 3 and 4: that
+    /// pick reads nothing (the tee skips it, so its take stops growing), and
+    /// `held_reading_nothing` names it and only it; a pick still reading, an
+    /// unheld pick reading nothing, and a held pick whose input came back are
+    /// not named.
+    #[test]
+    fn a_held_pick_whose_input_left_the_device_reads_nothing_and_is_named() {
+        use ChannelPick::{Mono, Stereo};
+        let mut t = PickTable::default();
+        let rows = vec![
+            input_row(1, Some(Stereo(2, 3)), true),
+            input_row(2, Some(Mono(0)), true),
+            input_row(3, Some(Mono(3)), false),
+        ];
+        t.bind(&rows, &stream(4));
+        let (a, b) = (t.pick_of(TrackId(1)).expect("a pick"), t.pick_of(TrackId(2)).expect("a pick"));
+        t.hold(&[a, b]);
+        assert!(t.held_reading_nothing().is_empty(), "a held pick that reads was named");
+        // The interface comes back with two inputs: 3 and 4 are gone, 1 is not.
+        t.bind(&rows, &stream(2));
+        assert_eq!(t.picks()[a.0 as usize].width, 0, "fixture: the pick on the lost inputs still reads");
+        assert_eq!(t.held_reading_nothing(), vec![a], "the take on the lost inputs was not named, or another was");
+        // Back to four: reading again, named no more.
+        t.bind(&rows, &stream(4));
+        assert!(t.held_reading_nothing().is_empty(), "a held pick whose input came back is still named");
+        // Released, nothing records through it: a pick reading nothing is
+        // nobody's take.
+        t.release(&[a, b]);
+        t.bind(&rows, &stream(2));
+        assert!(t.held_reading_nothing().is_empty(), "a released pick was named");
     }
 
     /// **A pick a record holds on a stream opened whole keeps reading the
