@@ -162,7 +162,13 @@ fn heard(app: &TangentApp) -> (Vec<f32>, Vec<f32>) {
 /// of the sends into it.
 #[test]
 fn a_bus_row_is_a_bus_lane_and_its_sends_reach_the_plan() {
-    let (_ctx, mut app) = app_on(desk(3), tiers::free("buses-plan"));
+    // A desk read with a send aimed at a TRACK (a hand-edited file can say
+    // one; the reader keeps it, and no gesture makes one): only a bus takes
+    // a send, so the plan carries none for it.
+    let mut s = desk(3);
+    let stray = Node::Track(s.rows[2].id);
+    s.rows[1].sends.push(tangent_ui::desk_model::Send { to: stray, level: 1.0, pre: false });
+    let (_ctx, mut app) = app_on(s, tiers::free("buses-plan"));
     let bus = app.new_bus(BusRole::Return).expect("a return");
     let to = app.track_at(bus).map(Node::Track).expect("the return's track");
     let first = app.track_at(0).expect("row 0's track");
