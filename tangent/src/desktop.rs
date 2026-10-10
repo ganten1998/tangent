@@ -16049,7 +16049,16 @@ impl DesktopApp {
             return;
         }
         let slotted = self.bridge.slot_automation(&want);
+        // **The sends' own curves, beside them** (`Bridge::send_curves`,
+        // W7-slot-gaps): a level drawn on a send to a bus, by the send's two
+        // ends. First, because their ring answers Busy while the last list is
+        // still on its way in, and then this frame pushes neither and the
+        // next asks again, so the two never disagree about which song plays.
+        let sends = self.bridge.send_curves(&want, &crate::engine_bridge::send_bus_of);
         if let Some(e) = self.recorder.engine.as_mut() {
+            if e.set_send_curves(sends).is_err() {
+                return;
+            }
             e.set_automation_slotted(slotted);
             self.pushed_auto = Some(want);
         }
