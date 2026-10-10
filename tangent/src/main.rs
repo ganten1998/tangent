@@ -703,7 +703,7 @@ fn install_panic_hook() {
 /// Python QSharedMemory key "tangent-midi-monitor"; a crashed instance never
 /// blocks relaunch (the OS releases the lock with the process).
 fn acquire_single_instance() -> bool {
-    let Some(_home) = dirs::home_dir() else {
+    let Some(_home) = tangent_core::config::home() else {
         return true; // no home dir: don't block launching
     };
     let dir = tangent_core::config::dir();
@@ -1475,5 +1475,66 @@ mod log_tests {
         assert!(is_fake_map_noise("wgpu_hal::gles::adapter", "Fake map"));
         assert!(!is_fake_map_noise("wgpu_hal::gles::adapter", "GL error: out of memory"));
         assert!(!is_fake_map_noise("tangent::desktop", "Fake map"));
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use tangent_ui::settings::Settings;
+
+    /// **This test build resolves no real home.** `cfg(test)` is per crate:
+    /// the tangent-core and tangent-ui this binary's tests link are ordinary
+    /// builds, so the config directory (settings, the live plugin shelf, the
+    /// licence and its Konami marker, the taught chords, the log), the media
+    /// folders, the theme shelf and the old take folder all resolved under
+    /// the owner's real home until `test-home` (this crate's
+    /// `[dev-dependencies]`) moved `tangent_core::config::home` to a scratch
+    /// folder for test builds. Every path is only named here, nothing is
+    /// created; a developer's switch that points one elsewhere on purpose
+    /// wins, so that one is left out. Revert check: the dev-dependency line
+    /// without the feature fails the first assertion (`cargo test -p
+    /// tangent`; a workspace run unifies tangent-ui's line in, and
+    /// `scripts/check.sh` names this test in a `-p tangent` leg for that
+    /// reason).
+    #[test]
+    fn this_test_build_keeps_every_home_path_in_a_scratch_folder() {
+        assert!(
+            tangent_core::config::TEST_HOME,
+            "the binary's tests link a tangent-core without test-home: they resolve the owner's real home"
+        );
+        let home = tangent_core::config::home().expect("a test build always has a home");
+        assert!(
+            home.starts_with(std::env::temp_dir()),
+            "the binary's tests resolve {} as home",
+            home.display()
+        );
+        let mut named = Vec::new();
+        if std::env::var_os("TANGENT_CONFIG_DIR").is_none() {
+            named.push(("the config directory", tangent_core::config::dir()));
+            named.push(("the licence", tangent_core::license::LicenseStore::default_path()));
+            named.push(("the taught chords", tangent_core::overrides::OverrideStore::default_path()));
+            if std::env::var_os("IVORY_SETTINGS_PATH").is_none() {
+                named.push(("the settings file", Settings::path()));
+                named.push(("the user themes", tangent_ui::theme::user_dir()));
+                #[cfg(feature = "recorder")]
+                named.push(("the live plugin shelf", crate::shelf::global_dir()));
+            }
+        }
+        if std::env::var_os("TANGENT_MEDIA_ROOT").is_none() {
+            let s = Settings::default();
+            for root in s.media_roots() {
+                named.push(("a media folder", root));
+            }
+            named.push(("the DX7 banks", s.sysex_root()));
+        }
+        named.push(("the documents folder", tangent_core::config::documents().expect("documents")));
+        named.push(("the video folder", tangent_core::config::videos().expect("videos")));
+        assert!(named.len() >= 3, "nothing was checked");
+        let real: Vec<String> = named
+            .iter()
+            .filter(|(_, p)| !p.starts_with(&home))
+            .map(|(what, p)| format!("{what}: {}", p.display()))
+            .collect();
+        assert!(real.is_empty(), "outside the scratch home {}:\n  {}", home.display(), real.join("\n  "));
     }
 }
