@@ -3552,6 +3552,7 @@ dependencies = [
  "ed25519-compact",
  "serde",
  "serde_json",
+ "tangent-core",
 ]
 
 [[package]]

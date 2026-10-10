@@ -84,22 +84,25 @@ echo "==> cargo test --workspace  (in a scratch home it watches: no test reaches
 # **In a home it watches, and every test leg below too** (design
 # W8-safe-tests). The fix is in the build: every road to a person's home is
 # `tangent_core::config::home`, which a test build sends to a scratch folder
-# (tangent-core's `test-home`, turned on only by the binary's and
-# tangent-ui's [dev-dependencies]; `cfg(test)` is per crate and never reached
-# the copies another crate's tests link, which resolved the owner's real
-# `~/.config/tangent` once the internal builds' staging folder was gone).
-# `scripts/check-home.sh run` is the proof and the net: HOME is a fresh
-# folder seeded with decoys where Tangent keeps a person's files, the real
-# folders are watched read-only, and a run that creates, changes or deletes
-# anything in either fails here, naming it.
+# (tangent-core's `test-home`, turned on only by [dev-dependencies] lines:
+# the binary's, tangent-ui's, and tangent-core's own for its `tests/`;
+# `cfg(test)` holds only while a crate compiles as its own unit tests and
+# never reached the copies everything else links, which resolved the
+# owner's real `~/.config/tangent` once the internal builds' staging folder
+# was gone). `scripts/check-home.sh run` is the proof and the net: HOME is a
+# fresh folder seeded with decoys where Tangent keeps a person's files, the
+# real folders are watched read-only, and a run that creates, changes or
+# deletes anything in either fails here, naming it.
 scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-fast
 
 echo "==> no build that ships carries test-home  (resolver 2 keeps it in test builds)"
 # A dev-dependency's features reach test builds alone, so `cargo build` and
 # every artifact resolve the real home. Read the way a build resolves
 # features: the binary with every feature on every target and the plugin,
-# dev edges off (neither may carry it), and the binary's test build, dev
-# edges on (it must, or the check could not see the feature at all).
+# dev edges off (neither may carry it), and each member's test build alone,
+# dev edges on, as the `-p` legs below build it (every one that links
+# tangent-core must carry it, tangent-core's own included, or its tests
+# resolve the real home, and the check could not see the feature at all).
 scripts/check-home.sh features
 
 echo "==> cargo test --release  (the render and export goldens, in the profile that ships)"
@@ -183,6 +186,9 @@ named_leg 14 -p tangent --bin tangent -- --exact \
   slot_gaps::no_host_road_names_a_bay_by_the_frozen_maps_seat
 
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
+# The crate alone is also the one build where its integration tests get
+# `test-home` from nothing but its own dev-dependency line (the workspace
+# run above unifies the binary's in): `tests/test_home.rs` pins it here.
 scripts/check-home.sh run cargo test -p tangent-core
 
 echo "==> cargo test -p tangent-core --test differential -- --ignored  (full 13,133-row sweep)"

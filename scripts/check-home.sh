@@ -4,12 +4,14 @@
 # **The fix is in the build.** Every road to a person's home goes through
 # `tangent_core::config::home` (`tangent-ui`'s `ban_scan` refuses a second
 # one), and a test build turns that road into a scratch folder of its own:
-# tangent-core's `test-home` feature, which only the binary's and
-# tangent-ui's `[dev-dependencies]` turn on. `#[cfg(test)]` could not do it,
-# because it is per crate: the tangent-core and tangent-ui the binary's tests
-# link are ordinary builds, and they resolved the owner's real
-# `~/.config/tangent`, `Documents/Tangent Media` and `Movies/Tangent` once
-# the internal builds' staging folder was gone (design W8-safe-tests).
+# tangent-core's `test-home` feature, which only `[dev-dependencies]` lines
+# turn on (the binary's, tangent-ui's, and tangent-core's own, naming
+# itself, for its integration tests). `#[cfg(test)]` could not do it,
+# because it holds only while a crate compiles as its own unit tests: the
+# tangent-core and tangent-ui the binary's tests link, and the tangent-core
+# its own `tests/` link, are ordinary builds, and they resolved the owner's
+# real `~/.config/tangent`, `Documents/Tangent Media` and `Movies/Tangent`
+# once the internal builds' staging folder was gone (design W8-safe-tests).
 #
 # **`run` is the proof, and the net.** It runs a command (check.sh's test
 # legs) with HOME pointed at a fresh folder seeded with decoys where Tangent
@@ -29,14 +31,17 @@
 # run unless Tangent itself was running, whose own writes (its log, a
 # debounced settings save) look the same; then it is reported, not judged.
 #
-# **`features` proves no build that ships carries `test-home`.** Resolver 2
-# gives a dev-dependency's features to test builds alone; `cargo tree`
-# resolves features the way a build does, so the shipped configurations
-# (every feature of the binary, on every target, and the plugin, which is
-# its own workspace) are read with dev edges off, and the test build with
-# them on, which must carry it: a check that cannot see the feature where it
-# is would pass for the wrong reason. And since an artifact is whatever the
-# scripts build, no script outside the gate may build a test, bench or
+# **`features` proves no build that ships carries `test-home`, and every
+# test build that links tangent-core does.** Resolver 2 gives a
+# dev-dependency's features to test builds alone; `cargo tree` resolves
+# features the way a build does, so the shipped configurations (every
+# feature of the binary, on every target, and the plugin, which is its own
+# workspace) are read with dev edges off, and each workspace member's test
+# build with them on, alone, as check.sh's `-p` legs build it: one that
+# links tangent-core must carry it (tangent-core's own included), or its
+# tests resolve the real home; and a check that cannot see the feature where
+# it is would pass for the wrong reason. And since an artifact is whatever
+# the scripts build, no script outside the gate may build a test, bench or
 # example target, which would resolve dev-dependency features into the
 # binary built beside it.
 #
@@ -205,38 +210,54 @@ run() {
 }
 
 # tangent-core's features in one resolution: `cargo tree` with the given
-# arguments, the `{f}` of the first tangent-core line.
+# arguments, the `{f}` of the first tangent-core line, after a `+` so that
+# a resolution with no feature at all still says it found the crate.
+# Nothing at all when the tree holds no tangent-core; fails only when cargo
+# does.
 core_features() {
   local out
   out="$("$CARGO" tree "$@" --target all --prefix none --format '{p}|{f}')" || return 1
-  printf '%s\n' "$out" | awk -F'|' '$1 ~ /^tangent-core / && !n++ { print $2 } END { exit !n }'
+  printf '%s\n' "$out" | awk -F'|' '$1 ~ /^tangent-core / && !n++ { print "+" $2 }'
 }
 
 features() {
-  local shipped plugin tested fail=0
+  local shipped plugin got member fail=0 tested=0
   shipped="$(core_features -p tangent --all-features -e normal,build)" \
     || { echo "check-home: cargo tree could not resolve the binary as it ships" >&2; exit 1; }
   plugin="$(core_features --manifest-path plugin/Cargo.toml --all-features -e normal,build)" \
     || { echo "check-home: cargo tree could not resolve the plugin as it ships" >&2; exit 1; }
-  tested="$(core_features -p tangent -e normal,build,dev)" \
-    || { echo "check-home: cargo tree could not resolve the binary's test build" >&2; exit 1; }
-  printf '  %-34s %s\n' "the binary as it ships:" "tangent-core [${shipped}]" \
-    "the plugin as it ships:" "tangent-core [${plugin}]" \
-    "the binary's test build:" "tangent-core [${tested}]"
-  case ",$shipped," in *,test-home,*)
+  printf '  %-34s %s\n' "the binary as it ships:" "tangent-core [${shipped#+}]" \
+    "the plugin as it ships:" "tangent-core [${plugin#+}]"
+  case ",${shipped#+}," in *,test-home,*)
     echo "check-home: a build of the binary that ships carries test-home: it would keep every" >&2
     echo "  setting and project in a temp folder" >&2
     fail=1 ;;
   esac
-  case ",$plugin," in *,test-home,*)
+  case ",${plugin#+}," in *,test-home,*)
     echo "check-home: the plugin carries test-home" >&2
     fail=1 ;;
   esac
-  case ",$tested," in *,test-home,*) ;; *)
-    echo "check-home: the binary's test build does not carry test-home: its tests resolve the real" >&2
-    echo "  home (and this check cannot see the feature where it must be)" >&2
-    fail=1 ;;
-  esac
+  # **Every test build that links tangent-core carries it**, each member
+  # read alone, the way check.sh's `cargo test -p` legs build it: a
+  # workspace run unifies any one member's dev-dependency line into all of
+  # them, which is how tangent-core's own integration tests went without it
+  # unseen. A member that gains tangent-core later is read the day it does.
+  for member in $(sed -n 's/^members *= *\[\(.*\)\]/\1/p' Cargo.toml | tr -d '" ' | tr ',' ' '); do
+    got="$(core_features -p "$member" -e normal,build,dev)" \
+      || { echo "check-home: cargo tree could not resolve $member's test build" >&2; exit 1; }
+    [ -n "$got" ] || continue
+    tested=$((tested + 1))
+    printf '  %-34s %s\n' "$member's test build:" "tangent-core [${got#+}]"
+    case ",${got#+}," in *,test-home,*) ;; *)
+      echo "check-home: $member's test build does not carry test-home: its tests resolve the real home" >&2
+      fail=1 ;;
+    esac
+  done
+  # The binary, tangent-ui and tangent-core itself, or this read nothing.
+  if [ "$tested" -lt 3 ]; then
+    echo "check-home: only $tested test builds link tangent-core: the members were not read" >&2
+    fail=1
+  fi
   # **And the artifacts are what the scripts build.** A cargo build that
   # also compiles a test, bench or example target is building the
   # dev-dependencies, so it resolves `test-home` into everything it builds,

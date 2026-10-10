@@ -38,16 +38,20 @@
 //! home is a scratch folder of its own (see [`home`]), so a test that saves
 //! settings, presses New or relocks the Konami marker does it to a folder
 //! nobody owns, and a test that reads the taught chords reads none. It is
-//! decided here, in the build, because `#[cfg(test)]` is per crate: it is
-//! true while THIS crate's tests compile and false in the ordinary copy of
-//! this crate that `tangent-ui`'s tests and the binary's tests link, which
-//! is how those tests came to resolve the owner's real `~/.config/tangent`,
-//! `Documents/Tangent Media` and `Movies/Tangent` once the internal builds'
-//! staging folder was gone, and to read his taught chords into every app
-//! they built. Those crates turn on the `test-home` feature from their
-//! `[dev-dependencies]`, which resolver 2 gives to a test build alone;
-//! `scripts/check-home.sh features` proves that no build that ships carries
-//! it, and `scripts/check-home.sh run` runs the suite in a home it watches.
+//! decided here, in the build, because `#[cfg(test)]` is narrower than "a
+//! test build": it is true only while this library itself compiles as its
+//! own unit tests, and false in the ordinary copy of it that everything
+//! else links: `tangent-ui`'s tests, the binary's, and this crate's own
+//! integration tests under `tests/`. That is how the first two came to
+//! resolve the owner's real `~/.config/tangent`, `Documents/Tangent Media`
+//! and `Movies/Tangent` once the internal builds' staging folder was gone,
+//! and to read his taught chords into every app they built; the third
+//! resolved the real config whenever this crate was tested alone. All three
+//! turn on the `test-home` feature from their `[dev-dependencies]` (this
+//! crate by naming itself), which resolver 2 gives to a test build alone;
+//! `scripts/check-home.sh features` proves that every one of those test
+//! builds carries it and no build that ships does, and
+//! `scripts/check-home.sh run` runs the suite in a home it watches.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -63,10 +67,11 @@ const OVERRIDE: &str = "TANGENT_CONFIG_DIR";
 const PRE_5_0: &str = "ivory";
 
 /// **Whether this build keeps every home path in a scratch folder**: this
-/// crate's own tests, and any build with the `test-home` feature, which only
-/// a `[dev-dependencies]` line turns on (the binary's and `tangent-ui`'s), so
-/// only a test build. Public so a test in another crate can say which kind of
-/// build it is in, rather than infer it from where a path happens to land.
+/// crate's unit tests, and any build with the `test-home` feature, which only
+/// a `[dev-dependencies]` line turns on (the binary's, `tangent-ui`'s, and
+/// this crate's own for its integration tests), so only a test build. Public
+/// so a test in another crate can say which kind of build it is in, rather
+/// than infer it from where a path happens to land.
 pub const TEST_HOME: bool = cfg!(any(test, feature = "test-home"));
 
 /// What a test build's scratch home is called in the temp folder, before
@@ -304,11 +309,12 @@ mod tests {
 
     /// **A test build's home is a scratch folder, and every path built on it
     /// is in there**: the config directory and its files, the documents and
-    /// the video folders. This crate's tests are a test build by
-    /// `cfg(test)`; the binary's and `tangent-ui`'s are by the `test-home`
-    /// feature their `[dev-dependencies]` turn on, and each pins the same
-    /// fact from its own side (`home_tests` in the binary, `settings` in
-    /// `tangent-ui`). Revert check: `home()` answering `dirs::home_dir()`
+    /// the video folders. This crate's unit tests are a test build by
+    /// `cfg(test)`; its integration tests, the binary's and `tangent-ui`'s
+    /// are by the `test-home` feature their `[dev-dependencies]` turn on,
+    /// and each pins the same fact from its own side (`tests/test_home.rs`
+    /// here, `home_tests` in the binary, `settings` in `tangent-ui`).
+    /// Revert check: `home()` answering `dirs::home_dir()`
     /// in every build fails the scratch-folder assertion on any machine
     /// whose home is not in the temp folder.
     #[test]
