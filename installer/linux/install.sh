@@ -2,7 +2,8 @@
 # Install Tangent.
 #
 #   ./install.sh                 into your home directory (no root)
-#   ./install.sh --system        into /usr/local/bin, for every user (needs root)
+#   ./install.sh --system        for every user, under /usr/local and
+#                                /usr/share (needs root)
 #   ./install.sh --prefix DIR    somewhere else entirely
 #   ./install.sh --desktop       menu entry + icon, without being asked
 #   ./install.sh --deps          install missing video-acceleration packages
@@ -33,7 +34,8 @@ usage() {
 Install Tangent.
 
   ./install.sh                 into your home directory (no root)
-  ./install.sh --system        into /usr/local/bin, for every user (needs root)
+  ./install.sh --system        for every user, under /usr/local and
+                               /usr/share (needs root)
   ./install.sh --prefix DIR    somewhere else entirely
   ./install.sh --desktop       menu entry + icon, without being asked
   ./install.sh --no-desktop    the binary only, no menu entry
@@ -81,9 +83,9 @@ RT_GROUP=audio
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        # Asks for what the default does now. Still taken, so that a command
-        # line copied from an older page keeps working.
-        --app)       ;;
+        # Still taken, so that a command line copied from an older page keeps
+        # working. Each installs what the default installs.
+        --app|--both) ;;
         --desktop)    WANT_DESKTOP=1 ;;
         --no-desktop) WANT_DESKTOP=0 ;;
         --deps)       WANT_DEPS=1 ;;
