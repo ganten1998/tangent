@@ -1310,6 +1310,12 @@ pub struct TangentApp {
     /// forgets what you were doing is worse than one that never asked. See
     /// `ask_before` and `resume_after_save`.
     pending_after_save: Option<AfterSave>,
+    /// **The save prompt's Save went to the host**, and what it interrupted
+    /// carries on when the host says its Save has landed (`host_saved`):
+    /// see `DialogAction::SaveChangesSave`. Only that answer sets it, so a
+    /// Ctrl+S after a Save As panel was cancelled does not quit out from
+    /// under the hand that cancelled it.
+    resume_after_host_save: bool,
     /// **"Don't Save" was the answer**, and the New or Open it let through
     /// must not write the session after all. The host's save-back on the
     /// way out (`switch_project`, the New arm) asks the exact dirt question
@@ -4540,6 +4546,7 @@ impl TangentApp {
             history: Vec::new(),
             saved_state: None,
             pending_after_save: None,
+            resume_after_host_save: false,
             outgoing_discarded: false,
             quit_now: false,
             quit_allowed: false,
@@ -7090,19 +7097,29 @@ impl TangentApp {
         self.auto_clipboard_from = aim(self.auto_clipboard_from);
         self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| *o != gone_node);
         self.arr_auto_hot = self.arr_auto_hot.filter(|(o, _, _)| *o != gone_node);
-        // And its drum KIT: a drum track made here later played the old
-        // one's samples at the old one's settings. It leaves the map with
-        // its track; the moment before this one keeps it for the undo.
-        // A drum panel open on it stands on no row from here (`drumpad_row`):
-        // it shows no kit and takes no edit until the undo brings the track
-        // back.
+        // And its drum KIT, which leaves the desk with its track and not the
+        // disk with it. A drum track made here later gets a new id and no
+        // kit (`mint_emptied_row_id`), so it never plays the old one's
+        // samples; the removed track's kit stays in the map under the
+        // removed id, inert like every entry keyed by a removed id (design
+        // 4), until an undo brings its track back or a session switch
+        // purges it. A drum panel open on it stands on no row from here
+        // (`drumpad_row`): it shows no kit and takes no edit until the undo.
+        //
+        // **Nothing is written.** The removal used to take the kit out of the
+        // map and save the sidecar at once (`drumpad_edited`), so Don't Save
+        // after removing a drum track reopened the project with its kit gone
+        // while its document still held the track. The sidecar's own writes
+        // file kits by the rows of the document on disk (`drumpad_save`),
+        // which name the removed track until a save writes both without it;
+        // the kit kept here is what they file for it. The engine's lane is
+        // told it lost its kit (`drumpad_dirty`).
         if self
             .drumpad_kits
-            .remove(&gone)
-            .is_some_and(|k| k != crate::drumpad::DrumpadDoc::default())
+            .get(&gone)
+            .is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default())
         {
             self.drumpad_dirty = true;
-            self.drumpad_edited();
         }
         // And the sidechain key edges, at BOTH ends: an edge keyed BY this
         // track would go on ducking to a track that is not there, and an
@@ -13078,9 +13095,11 @@ impl TangentApp {
         if let Some(kit) = copy.kit.clone() {
             self.drumpad_kits.insert(self.track_id_at(into), kit);
             // The samples have to be decoded for the new lane and the kit
-            // pushed to the audio thread, which is what this asks for.
+            // pushed to the audio thread, which is what this asks for. The
+            // sidecar saves itself here whatever the panel stands on: this
+            // kit is the pasted track's (the paste's hold commits the moment).
             self.drumpad_dirty = true;
-            self.drumpad_edited();
+            self.drumpad_save();
         }
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
@@ -14076,9 +14095,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The samples alone left a real project whose kit lived only in
         // memory: reopened, it came up with every pad empty. A folder made
         // real by a take or an import never wrote the sidecar.
-        if !dir.join(crate::drumpad::FILE_NAME).exists()
-            && self.drumpad_kits.values().any(|k| !k.is_empty())
-        {
+        if !dir.join(crate::drumpad::FILE_NAME).exists() && self.desk_kits_hold_samples() {
             self.save_kits_beside(&self.project_doc);
         }
     }
@@ -14771,7 +14788,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A Save As is a name somebody CHOSE: the copy is a kept project,
         // never a scratch a new session may reclaim.
         self.arrangement.named = true;
-        self.arrangement.save_to(&doc);
+        // With the desk as it stands now, through the one writer: see
+        // `write_session_doc` for the track a stale copy left out.
+        self.write_session_doc(&doc);
         self.project_doc = doc.clone();
         self.note_doc_rows();
         self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -17844,8 +17863,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if next != AfterSave::Quit && self.session_held() {
             return true;
         }
-        // A fresh question; an earlier "Don't Save" answered a different one.
+        // A fresh question; an earlier "Don't Save" answered a different one,
+        // and an earlier Save carries nothing on past it.
         self.outgoing_discarded = false;
+        self.resume_after_host_save = false;
         // **The EXACT comparison, and it stays exact.** This is the one
         // thing standing between an afternoon's work and a keystroke, and it
         // runs once per New/Open/Quit — there is nothing to buy here by
@@ -17963,6 +17984,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The host's cue that the answer was "go", taken once.
     pub fn take_quit_now(&mut self) -> bool {
         std::mem::take(&mut self.quit_now)
+    }
+
+    /// **The host's Save has landed** (`ProjectRequest::Save`: the document,
+    /// then the plugins' states beside it). When the save prompt's Save
+    /// raised it (`DialogAction::SaveChangesSave`), the New, Open, Quit or
+    /// Reset Template it interrupted carries on now, as it does after the
+    /// panel of a first save; any other Save carries nothing on.
+    pub fn host_saved(&mut self) {
+        if std::mem::take(&mut self.resume_after_host_save) {
+            self.resume_after_save();
+        }
     }
 
     /// Whether the question has been asked and answered "go". Sticky, and
@@ -18532,26 +18564,78 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn save_project_doc(&mut self) {
         // The folder is born the moment something real is kept.
         self.materialize_project_dir();
-        self.arrangement.desk = Some(self.desk_snapshot());
         self.mark_project_saved();
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
-            // **And the kit sidecar with it, by the rows just written.**
-            // Today's bytes file each kit under its LANE, and a save is what
-            // moves the document's rows on disk: the save never wrote the
-            // sidecar, so a project saved after a drag reopened with the kit
-            // on the row the drum track had left and the drum track silent.
-            // Between saves the sidecar files kits by the rows this wrote
-            // (`drumpad_save`), never by rows the document has not saved.
-            // An absent sidecar and an empty one read alike, so a desk with
-            // no kit and no sidecar writes none.
-            if crate::drumpad::DrumpadDoc::sidecar(&doc).exists()
-                || self.drumpad_kits.values().any(|k| !k.is_empty())
-            {
-                self.save_kits_beside(&doc);
-            }
-            self.note_doc_rows();
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            // Nothing on disk to write to (no project yet): the document in
+            // memory still carries the desk on screen, as a save leaves it.
+            self.arrangement.desk = Some(self.desk_snapshot());
+            return;
+        };
+        self.write_session_doc(&doc);
+        // **And the kit sidecar with it, by the rows just written.**
+        // Today's bytes file each kit under its LANE, and a save is what
+        // moves the document's rows on disk: the save never wrote the
+        // sidecar, so a project saved after a drag reopened with the kit on
+        // the row the drum track had left and the drum track silent. Between
+        // saves the sidecar files kits by the rows this wrote
+        // (`drumpad_save`), never by rows the document has not saved. An
+        // absent sidecar and an empty one read alike, so a desk with no kit
+        // and no sidecar writes none.
+        if crate::drumpad::DrumpadDoc::sidecar(&doc).exists() || self.desk_kits_hold_samples() {
+            self.save_kits_beside(&doc);
         }
+        self.note_doc_rows();
+    }
+
+    /// **The one writer of the session's document**: the desk as the
+    /// session shows it, taken off the live settings at the moment of the
+    /// write, then the document at `doc`. Every save road that writes the
+    /// session comes through here (Save, the first save, the save-backs,
+    /// Save As).
+    ///
+    /// The document carries a copy of the desk, refreshed by the edits that
+    /// go through `arr_save_edits` and by a save, but not by every edit:
+    /// adding a track (`add_bare_track`) or giving a row its kind
+    /// (`set_channel_kind`) writes the settings and leaves the copy as it
+    /// was. Save As wrote that copy as it stood, so a track added and then
+    /// Saved As was missing from the copy's document while the copy's kit
+    /// sidecar, written from the live rows, held its kit: the two files of
+    /// one project described two desks. Refreshed here, no road can write a
+    /// desk older than the one on screen (`a_save_writes_the_desk_the_session_shows`
+    /// keeps the roads to this one writer).
+    fn write_session_doc(&mut self, doc: &std::path::Path) {
+        self.arrangement.desk = Some(self.desk_snapshot());
+        self.arrangement.save_to(doc);
+    }
+
+    /// **The document `save_project_doc` writes, as the bytes it writes**,
+    /// asked before it writes them: the one serialisation
+    /// `write_session_doc` makes (the live desk, this build's format),
+    /// without the write.
+    ///
+    /// For the host's plugin states (design 6.6). The host writes down the
+    /// mirror a save road owes the project's `state/` before the document
+    /// lands, and a launch after a kill pays it when the document on disk
+    /// is the road's. Going by the document the road found, that launch
+    /// could tell a road that wrote from one that never got there only when
+    /// the write changed the file, and a save of knobs alone (a knob turned
+    /// in a plugin's own window never dirties the document) rewrites the
+    /// very bytes it found: its debt was let go, and the knobs with it.
+    /// `the_document_a_save_writes_is_known_before_it_is_written` holds the
+    /// two to one text.
+    pub fn session_doc_text(&self) -> String {
+        self.arrangement.to_json_with_desk(Some(&self.desk_snapshot()))
+    }
+
+    /// **The document Save As and the first save write into the home
+    /// [`Self::save_choice_dir`] names**, as the bytes they write: the
+    /// session's ([`Self::session_doc_text`]), NAMED, both roads' word that
+    /// a person chose the place. Asked before the save runs, for the same
+    /// debt.
+    pub fn save_choice_doc_text(&self) -> String {
+        let mut named = self.arrangement.clone_without_desk();
+        named.named = true;
+        named.to_json_with_desk(Some(&self.desk_snapshot()))
     }
 
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
@@ -23522,8 +23606,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// to call the plain save: loading a kit, clearing a pad, renaming one,
     /// turning a knob. None of it was undoable, and an undo taken after any
     /// of it put the clips back and left the pads alone.
+    ///
+    /// **The panel of a removed track writes nothing**: it takes no edit
+    /// (`drumpad_mut`), and every road out of it still ends here. Its write
+    /// was harmless while a removal rewrote the sidecar itself, so that the
+    /// next write found nothing to change; a removal changes only the session
+    /// now (`remove_channel_inner`), and a refused knob or pad would have
+    /// been the first write after it, filing the kits again for an edit that
+    /// never happened. The paste, whose kit is not the panel's, writes
+    /// through `drumpad_save` itself.
     fn drumpad_edited(&mut self) {
-        self.drumpad_save();
+        if self.drumpad_row().is_some() {
+            self.drumpad_save();
+        }
         self.undo_commit();
     }
 
@@ -23590,6 +23685,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.drumpad_row().unwrap_or(0),
             doc,
         );
+    }
+
+    /// **Whether a track on the desk holds a kit with a sample in it**: what
+    /// a sidecar written beside the live rows (`save_kits_beside`) would
+    /// have in it. A removed track's kit is kept in the map for its undo
+    /// (`remove_channel_inner`) and is no row's, so it neither asks for a
+    /// sidecar nor puts one into a folder that has none.
+    fn desk_kits_hold_samples(&self) -> bool {
+        self.settings
+            .track_ids
+            .iter()
+            .any(|id| self.drumpad_kits.get(id).is_some_and(|k| !k.is_empty()))
     }
 
     /// One knob's current value, in its own units.
@@ -38099,8 +38206,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.ask_where_to_keep("");
                     return;
                 }
-                self.save_project_doc();
-                self.resume_after_save();
+                // **The host keeps it, as the Project window's Save has it
+                // kept, and the app carries on once the host says it landed**
+                // (`host_saved`). This wrote the document here, and the
+                // plugins' knobs reached the project's `state/` only in the
+                // host's road that came after (the quit's `on_exit`, New's or
+                // Open's save-back): a kill in the frames between left a
+                // plugin seated since the last save at its defaults, with no
+                // record that a mirror was owed. The host's Save writes that
+                // record before the document (design 6.6) and settles it once
+                // it has mirrored, so a relaunch finishes what a kill cut short.
+                self.resume_after_host_save = true;
+                self.project_request = Some(crate::ports::ProjectRequest::Save);
             }
             DialogAction::SaveChangesSaveAs => {
                 // The panel is asynchronous, so the pending action WAITS —
@@ -38126,6 +38243,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SaveChangesCancel => {
                 // The whole point of the answer: nothing happens.
                 self.pending_after_save = None;
+                self.resume_after_host_save = false;
             }
             // The browser asks; the host reads the disk and hands the rows
             // back through `set_browser`.
@@ -85184,3 +85302,8 @@ mod lane_refs_tests {
         }
     }
 }
+
+/// **The save roads' own tests** (W5-save-gaps), in their own file.
+#[cfg(test)]
+#[path = "app_save_tests.rs"]
+mod save_tests;
