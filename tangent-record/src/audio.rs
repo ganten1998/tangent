@@ -1535,38 +1535,11 @@ impl ChannelPick {
     }
 }
 
-/// How many inputs of one interface can be open at once.
+/// The inputs to keep, in the order they appear in the stream.
 ///
 /// **One interface, several inputs.** A second DEVICE is a second clock and is
 /// declined on purpose; anyone with that rig makes an aggregate device, which
 /// presents as one device with one clock and arrives here as the ordinary case.
-///
-/// **One per CHANNEL of the desk, which is thirty-two.** It was four, and the
-/// four was a leftover: the reason written on `Picks::from_slice` was "a desk
-/// with a fixed number of input strips cannot show them", and that desk was
-/// the old band with four input strips. Every one of the desk's channels has
-/// its own input chip now, so a cap below the channel count means a track
-/// that can be bound, armed and metered and can never receive a sample — the
-/// owner, having hit it on his fifth audio track: "I do not think the input
-/// cap is a good thing at all and it at least needs to be the size of the
-/// tracks." No other DAW has one; REAPER, Pro Tools and Logic expose whatever
-/// the interface reports.
-///
-/// **It costs almost nothing, and that is a fact about the RING rather than
-/// an optimism.** The capture rings carry whole DEVICE frames — see the note
-/// on `Recorder::monitor`, "the monitor ring's width is the DEVICE's, not the
-/// take's ... so that choosing an input costs nothing" — so the picks are a
-/// MAP from the stream's columns to strips, not a thing that sizes a buffer.
-/// What grows with this number is a handful of fixed arrays indexed by it
-/// (`pick_strip`, `monitor_gain`, `monitor_widths`, the sink widths, the UI's
-/// `inputs`) and the per-input loop in `mix_monitor`, which does frame work
-/// only for an input that is bound AND heard.
-///
-/// `tangent_ui::recorder::INPUTS` must equal this; the host asserts it, since
-/// neither crate can see the other's constant.
-pub const MAX_PICKS: usize = 32;
-
-/// The inputs to keep, in the order they appear in the stream.
 ///
 /// **One stream, one ring, channels laid end to end.** Picking input 6 and
 /// inputs 1/2 out of an eighteen-channel interface produces a three-channel
@@ -1575,45 +1548,60 @@ pub const MAX_PICKS: usize = 32;
 /// there is exactly one callback, one clock and one set of timing marks, which
 /// is what keeps several inputs sample-aligned with each other for free.
 ///
-/// Fixed size rather than a `Vec` so it stays `Copy` and allocates nothing:
-/// this is read on the audio callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Picks([Option<ChannelPick>; MAX_PICKS]);
+/// **As many as the desk binds, and no number of its own.** There was one,
+/// `MAX_PICKS`: four, then thirty-two, each time a leftover of a desk with a
+/// fixed number of input strips. A cap below the desk means a track that can
+/// be bound, armed and metered and can never receive a sample - the owner,
+/// having hit it on his fifth audio track: "I do not think the input cap is a
+/// good thing at all and it at least needs to be the size of the tracks." The
+/// desk has no width now (design `unlimited-tracks.md` section 2), so the
+/// picks are a list as long as the bound tracks. No other DAW has a cap
+/// either; REAPER, Pro Tools and Logic expose whatever the interface reports.
+///
+/// **On the heap, and that costs the callback nothing.** It was a fixed array
+/// so it could stay `Copy` while being "read on the audio callback". It is
+/// not read there: the device's callback copies whole DEVICE frames and never
+/// looks at a pick (see `capture_channel_monitored`), the writer thread maps
+/// columns through a table it builds once per change (`CaptureSink`), and the
+/// engine's monitor is handed each pick's device columns already worked out,
+/// moved in whole and never cloned on its thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Picks(Vec<ChannelPick>);
 
 impl Picks {
     /// Everything the device has, in its own order.
-    pub const EVERYTHING: Self = Self([None; MAX_PICKS]);
+    pub const EVERYTHING: Self = Self(Vec::new());
 
     /// One input, which is what every caller wanted before there could be more.
     pub fn one(pick: ChannelPick) -> Self {
-        let mut out = Self::EVERYTHING;
-        out.0[0] = Some(pick);
-        out
+        Self(vec![pick])
     }
 
-    /// As many as fit, in the order given. Extras beyond [`MAX_PICKS`] are
-    /// dropped — a desk with a fixed number of input strips cannot show them.
+    /// Every one of them, in the order given: two strips on input 1 are two
+    /// picks of the same microphone, which is a real desk, and the ninth
+    /// binding on an eight-input interface is as real as the first.
     pub fn from_slice(picks: &[ChannelPick]) -> Self {
-        let mut out = Self::EVERYTHING;
-        for (slot, pick) in out.0.iter_mut().zip(picks) {
-            *slot = Some(*pick);
-        }
-        out
+        Self(picks.to_vec())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = ChannelPick> + '_ {
-        self.0.iter().flatten().copied()
+        self.0.iter().copied()
+    }
+
+    /// The `i`th pick, if there are that many.
+    pub fn get(&self, i: usize) -> Option<ChannelPick> {
+        self.0.get(i).copied()
     }
 
     /// How many inputs, not how many channels.
     pub fn len(&self) -> usize {
-        self.iter().count()
+        self.0.len()
     }
 
     /// No picks at all means the whole device, which is a real and common
     /// answer rather than a missing one.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
     }
 
     /// How many channels come OUT, summed over every pick.
@@ -1643,21 +1631,34 @@ impl Picks {
     }
 
     /// How many channels each pick contributes, in order — the layout the
-    /// monitor's other end shares out between input strips.
+    /// monitor's other end shares out between input strips. One entry per
+    /// pick, and one entry as wide as the device when there are none.
     ///
     /// On `Picks` rather than only on the sink, because the UI thread has to
     /// compute it when picks change LIVE, without the sink (which lives on
     /// the writer's thread).
-    pub fn widths<const N: usize>(&self, device_channels: usize) -> [u8; N] {
+    pub fn widths(&self, device_channels: usize) -> Vec<u8> {
         if self.is_empty() {
-            let mut out = [0u8; N];
-            if let Some(first) = out.first_mut() {
-                *first = device_channels.min(u8::MAX as usize) as u8;
-            }
-            return out;
+            return vec![device_channels.min(u8::MAX as usize) as u8];
         }
-        let mut it = self.iter();
-        std::array::from_fn(|_| it.next().map_or(0, |p| p.channels() as u8))
+        self.iter().map(|p| p.channels() as u8).collect()
+    }
+
+    /// **The device column each output channel is copied from**, worked out
+    /// once: what [`Self::source`] answers channel by channel, as a table.
+    ///
+    /// `source` walks every pick before the one it answers, which was free
+    /// at four picks and is the square of the desk at two hundred: the
+    /// writer thread asked it once per sample per channel. A column that no
+    /// pick can honour reads column 0, the writer's own fallback.
+    pub fn columns(&self, device_channels: usize) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.channels());
+        for pick in self.iter() {
+            for c in 0..pick.channels() {
+                out.push(pick.source(c, device_channels).unwrap_or(0));
+            }
+        }
+        out
     }
 
     /// Drop the picks this device cannot honour, keeping the rest.
@@ -1668,13 +1669,14 @@ impl Picks {
     /// [`ChannelPick::fits`] — and if nothing is left the stream falls back to
     /// the whole device, which is what "no picks" already means.
     pub fn fitted(self, device_channels: usize) -> Self {
-        let kept: Vec<ChannelPick> = self.iter().filter(|p| p.fits(device_channels)).collect();
-        Self::from_slice(&kept)
+        Self(self.0.into_iter().filter(|p| p.fits(device_channels)).collect())
     }
 }
 
 /// What the caller would like, all of it optional.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Not `Copy`: the picks are a list as long as the desk binds (`Picks`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigWish {
     /// `None` means the device's own default rate. Resampling is out of scope
     /// (RECORDER-PLAN §3: correct the timestamps, never resample), so this is
@@ -2140,6 +2142,7 @@ pub fn capture_channel_monitored(
         stats,
         channels,
         device_channels,
+        map: picks.columns(device_channels),
         picks,
         lift: Vec::new(),
     };
@@ -2344,6 +2347,10 @@ pub struct CaptureSink {
     /// downstream that shares the block out between input strips would then be
     /// reading the wrong columns — silently, and with plausible audio in them.
     picks: Picks,
+    /// **The device column each picked channel is copied from**, worked out
+    /// when the picks change (`Picks::columns`) rather than walked per sample:
+    /// at two hundred picks the walk was the square of the desk, per frame.
+    map: Vec<usize>,
     /// The device's own width, which is what the ring carries.
     device_channels: usize,
     /// Scratch for lifting device frames out of the ring before the picked
@@ -2361,8 +2368,8 @@ impl CaptureSink {
     }
 
     /// The picks in force, for the monitor's other end to map with.
-    pub fn picks(&self) -> Picks {
-        self.picks
+    pub fn picks(&self) -> &Picks {
+        &self.picks
     }
 
     /// Choose different inputs, without touching the device.
@@ -2384,6 +2391,7 @@ impl CaptureSink {
         } else {
             picks.channels()
         };
+        self.map = picks.columns(self.device_channels);
         self.picks = picks;
     }
     pub fn channels(&self) -> usize {
@@ -2392,16 +2400,8 @@ impl CaptureSink {
 
     /// How the block's channels are shared out between the inputs, as a width
     /// each. No picks at all is one input as wide as the device.
-    pub fn widths<const N: usize>(&self) -> [u8; N] {
-        if self.picks.is_empty() {
-            let mut out = [0u8; N];
-            if let Some(first) = out.first_mut() {
-                *first = self.channels.min(u8::MAX as usize) as u8;
-            }
-            return out;
-        }
-        let mut it = self.picks.iter();
-        std::array::from_fn(|_| it.next().map_or(0, |p| p.channels() as u8))
+    pub fn widths(&self) -> Vec<u8> {
+        self.picks.widths(self.channels)
     }
 
     pub fn stats(&self) -> &Arc<CaptureStats> {
@@ -2451,7 +2451,7 @@ impl CaptureSink {
                 for c in 0..ch {
                     // `unwrap_or(0)` rather than an index: a pick that
                     // slipped through must not panic the writer thread.
-                    let src = self.picks.source(c, dev).unwrap_or(0);
+                    let src = self.map.get(c).copied().unwrap_or(0);
                     out[start + f * ch + c] = self.lift[f * dev + src];
                 }
             }
@@ -3460,7 +3460,7 @@ pub fn open_input(
     let monitor_frames = (rate as usize / 8).max(1024);
     let ((source, sink), monitor) = capture_channel_monitored(
         channels,
-        wish.picks,
+        wish.picks.clone(),
         ring_frames,
         mark_slots,
         Arc::clone(&stats),
@@ -4222,6 +4222,87 @@ C   77      0      0    ---     ---   ---   ---     0                  alsa_play
         }
     }
 
+    /// **Two hundred picks on an eight-input interface, every one read from
+    /// its own column** (design `unlimited-tracks.md`, W5: picks are as many
+    /// as the bound tracks).
+    ///
+    /// The cap this replaces dropped every pick past the thirty-second, so a
+    /// track bound past it was armed and metered and never received a
+    /// sample. Two hundred is far past it, on a box with eight inputs, so
+    /// most of them share an input with another track: duplicates are a
+    /// real desk (two strips of one microphone), not a mistake to fold
+    /// away. Each device column carries its own number, so a pick reading a
+    /// neighbour's column is a wrong number and not a plausible signal.
+    #[test]
+    fn two_hundred_picks_each_read_their_own_column() {
+        use ChannelPick::{Mono, Stereo};
+        let dev = 8usize;
+        let list: Vec<ChannelPick> = (0..200u16)
+            .map(|i| {
+                if i % 7 == 3 {
+                    Stereo(i % 8, (i + 3) % 8)
+                } else {
+                    Mono(i % 8)
+                }
+            })
+            .collect();
+        let picks = Picks::from_slice(&list);
+        assert_eq!(picks.len(), 200, "every binding is a pick: nothing is cut");
+        let want_cols: Vec<usize> = list
+            .iter()
+            .flat_map(|p| match *p {
+                Mono(a) => vec![usize::from(a)],
+                Stereo(a, b) => vec![usize::from(a), usize::from(b)],
+            })
+            .collect();
+        assert_eq!(picks.columns(dev), want_cols, "the table is each pick's own columns, in order");
+        let widths = picks.widths(dev);
+        assert_eq!(widths.len(), 200, "one width per pick");
+        let (mut src, mut sink) = capture_channel_from(dev, picks, 64, 64, stats());
+        assert_eq!(sink.channels(), want_cols.len(), "the take is as wide as every pick together");
+        // Device column v of frame f carries f * 100 + v: unique per column.
+        let block: Vec<f32> = (0..4usize)
+            .flat_map(|f| (0..dev).map(move |v| (f * 100 + v) as f32))
+            .collect();
+        src.accept(&block, Some(0), 0);
+        let mut out = Vec::new();
+        assert_eq!(sink.drain_samples(&mut out), 4);
+        let ch = want_cols.len();
+        for f in 0..4usize {
+            for (c, col) in want_cols.iter().enumerate() {
+                assert_eq!(
+                    out[f * ch + c],
+                    (f * 100 + col) as f32,
+                    "frame {f}, channel {c}: read the wrong device column"
+                );
+            }
+        }
+    }
+
+    /// **The column table answers what `source` answers**, for every channel
+    /// of every list, including picks the device cannot honour (the
+    /// writer's fallback, column 0).
+    #[test]
+    fn the_column_table_is_what_source_answers() {
+        use ChannelPick::{Mono, Stereo};
+        let lists: [&[ChannelPick]; 4] = [
+            &[],
+            &[Mono(3)],
+            &[Stereo(6, 1), Mono(0), Stereo(2, 2), Mono(5)],
+            &[Mono(40), Stereo(63, 9), Mono(70), Stereo(1, 99)],
+        ];
+        for list in lists {
+            let picks = Picks::from_slice(list);
+            for dev in [1usize, 2, 8, 64] {
+                let table = picks.columns(dev);
+                assert_eq!(table.len(), picks.channels());
+                for (c, col) in table.iter().enumerate() {
+                    assert_eq!(Some(*col), Some(picks.source(c, dev).unwrap_or(0)), "{list:?} on {dev}: channel {c}");
+                }
+            }
+        }
+    }
+
     /// **Choosing a different input on an OPEN stream changes what the take
     /// keeps, and changes nothing else.**
     ///
@@ -4270,13 +4351,16 @@ C   77      0      0    ---     ---   ---   ---     0                  alsa_play
         use ChannelPick::{Mono, Stereo};
         let (_src, mut sink) = capture_channel_from(8, Picks::one(Mono(0)), 64, 64, stats());
         assert_eq!(sink.channels(), 1);
-        assert_eq!(sink.widths::<4>(), [1, 0, 0, 0]);
+        // One width per pick: the fixed array this was read from padded the
+        // rest with zeros, and there is no rest now.
+        assert_eq!(sink.widths(), vec![1]);
         sink.set_picks(Picks::from_slice(&[Mono(5), Stereo(3, 4)]));
         assert_eq!(sink.channels(), 3, "one plus two");
-        assert_eq!(sink.widths::<4>(), [1, 2, 0, 0], "the strips' shares moved");
+        assert_eq!(sink.widths(), vec![1, 2], "the strips' shares moved");
         // A pick the device cannot honour is still dropped whole.
         sink.set_picks(Picks::one(Stereo(6, 99)));
         assert_eq!(sink.channels(), 8, "no picks left means the whole device");
+        assert_eq!(sink.widths(), vec![8], "and the whole device is one input");
     }
 
     /// **One input going missing costs that input and not the others.**
