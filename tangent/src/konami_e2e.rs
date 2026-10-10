@@ -440,3 +440,41 @@ fn undo_and_redo_cross_the_free_cap_through_the_key_feed() {
         let _ = std::fs::remove_dir_all(tiers::dir(tag));
     }
 }
+
+/// **The engine and the shelf are tier-blind** (design 11.2 item 11, 5.6):
+/// a desk past the cap plays, exports, freezes and keeps its plugin states
+/// whole on every tier because nothing that builds, drives or furnishes the
+/// engine, or files a state, asks about the licence. Production code only:
+/// each file's tests build apps on every tier, by name. The persistence and
+/// drawing half is `tangent-ui`'s `width_tests`.
+#[test]
+fn the_engine_and_the_shelf_never_read_the_licence() {
+    let files: [(&str, &str); 7] = [
+        ("instrument.rs", include_str!("instrument.rs")),
+        ("engine_bridge.rs", include_str!("engine_bridge.rs")),
+        ("desk_plan.rs", include_str!("desk_plan.rs")),
+        ("lane_bank.rs", include_str!("lane_bank.rs")),
+        ("laneset.rs", include_str!("laneset.rs")),
+        ("rtwork.rs", include_str!("rtwork.rs")),
+        ("shelf.rs", include_str!("shelf.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        // Everything from the first test module down is the file's tests.
+        let code = src.find("\n#[cfg(test)]\nmod tests").map_or(src, |at| &src[..at]);
+        for (n, line) in code.lines().enumerate() {
+            let line = line.split("//").next().unwrap_or("");
+            for word in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                let lower = word.to_ascii_lowercase();
+                let licence = lower.contains("license")
+                    || lower.contains("licence")
+                    || ["is_supporter", "track_cap", "cheated", "licensed", "FREE_TRACKS", "may_add_tracks", "counted_tracks"]
+                        .contains(&word);
+                if licence {
+                    bad.push(format!("{name}:{} reads `{word}`", n + 1));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "the engine or the shelf reads the licence:\n  {}", bad.join("\n  "));
+}
