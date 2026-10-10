@@ -46,7 +46,7 @@ work:
 2. **An MIT application may host VST3 plugins.** That is what makes the Recorder
    view's plugin-hosting workstream legally possible; see `docs/RECORDER-PLAN.md`
    §8. The only surviving obligation is trademark, and it is now optional under
-   MIT — see the trademark section below, which still applies.
+   MIT (see the trademark section below, which still applies).
 
 Copyleft attaches to the **binary that does the linking**, not to source that
 happens to be compiled into it. MIT is GPL-compatible, so the same MIT sources

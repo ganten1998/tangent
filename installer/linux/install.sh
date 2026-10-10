@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install Tangent — the application, the VST3 plugin, or both.
+# Install Tangent: the application, the VST3 plugin, or both.
 #
 #   ./install.sh                 both, into your home directory (no root)
 #   ./install.sh --app           the application only
@@ -16,7 +16,7 @@
 # WHY A SHELL SCRIPT AND NOT A .deb
 #
 # A .deb reaches Debian and Ubuntu. The same argument then repeats for rpm, for
-# Arch, and for Void — which is the machine this build is made on. This runs on
+# Arch, and for Void, which is the machine this build is made on. This runs on
 # all of them, needs no root for the default, and can be read before it is run,
 # which is what a Linux user is going to do anyway.
 #
@@ -28,11 +28,11 @@ SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME="Tangent"
 
 # Written out rather than sed'd out of the header comment above. That trick
-# needs a line range, the range was 2..26, and the comment grew — so --help
+# needs a line range, the range was 2..26, and the comment grew, so --help
 # printed the usage AND the first half of an essay about .deb packages.
 usage() {
     cat <<'USAGE'
-Install Tangent — the application, the VST3 plugin, or both.
+Install Tangent: the application, the VST3 plugin, or both.
 
   ./install.sh                 both, into your home directory (no root)
   ./install.sh --app           the application only
@@ -57,7 +57,7 @@ You are asked about it unless --desktop or --no-desktop says so; with no
 terminal to ask in, it is installed.
 
 Video acceleration is checked at the end. Tangent records correctly without it;
-what it costs is processor — a take encoded on the CPU can use two and a half
+what it costs is processor: a take encoded on the CPU can use two and a half
 cores where the GPU uses a twentieth of one. If something is missing you are
 shown the exact command for your distribution and asked whether to run it.
 --deps runs it without asking, --no-deps never touches the package manager.
@@ -71,11 +71,11 @@ WANT_VST3=1
 # is "both". The two artifacts are not the same shape: the full release carries
 # `Tangent.vst3` beside this script, and the plain cross-built tarball is the
 # application on its own. Treating "no plugin in this archive" as a failure
-# made the default invocation exit 1 on the app-only tarball — which is the
+# made the default invocation exit 1 on the app-only tarball, which is the
 # tarball most people have.
 VST3_EXPLICIT=0
 # Desktop integration: the .desktop entry and the icon, which is what puts
-# Tangent in an application menu and in rofi/wofi/dmenu. Empty means "ask" —
+# Tangent in an application menu and in rofi/wofi/dmenu. Empty means "ask";
 # see the prompt below. Not a plain 1, because "install it" and "the user has
 # not said" are different states and the flags have to be able to say both.
 WANT_DESKTOP=""
@@ -166,8 +166,8 @@ run() {
 # what `pam_limits` turns into an actual `RLIMIT_RTPRIO`. That is why this
 # writes the file rather than only running `usermod`.
 #
-# `memlock` is deliberately NOT granted. Tangent never calls `mlock` — the
-# source has no `mlock`, `MCL_CURRENT` or `memlock` anywhere — so asking for
+# `memlock` is deliberately NOT granted. Tangent never calls `mlock` (the
+# source has no `mlock`, `MCL_CURRENT` or `memlock` anywhere), so asking for
 # it would be taking a privilege the program does not use.
 #
 # 95 rather than 99: a real-time thread that outranks the kernel's own
@@ -238,7 +238,7 @@ grant_realtime() {
         } > "$RT_LIMITS"
         chmod 0644 "$RT_LIMITS"
     fi
-    echo "  Log out and back in for this to take effect — a process keeps the"
+    echo "  Log out and back in for this to take effect: a process keeps the"
     echo "  groups and limits it started with."
 }
 
@@ -278,7 +278,7 @@ ungrant_realtime() {
 # **ID_LIKE is the part that matters**, because it is what makes this work on
 # the derivatives people actually run rather than only on the five names
 # someone thought of. Zorin is `ID=zorin` with `ID_LIKE="ubuntu debian"`, Mint
-# is `ID=linuxmint`, Pop is `ID=pop` — an enumerated list of names misses all
+# is `ID=linuxmint`, Pop is `ID=pop`: an enumerated list of names misses all
 # of them silently, which is worse than not checking at all.
 distro_family() {
     (
@@ -319,7 +319,7 @@ have_lilv() {
     # musl has no ldconfig cache and a minimal container may have no ldconfig
     # at all, so fall back to looking where the loader looks. `LILV_SEARCH`
     # overrides the list so this can be exercised on a machine that is not the
-    # one it is written for — the same trick `OS_RELEASE` plays above.
+    # one it is written for, the same trick `OS_RELEASE` plays above.
     for _d in ${LILV_SEARCH:-/usr/lib /usr/lib64 /lib /lib64 /usr/local/lib \
               /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu}; do
         [ -e "$_d/liblilv-0.so.0" ] && return 0
@@ -368,7 +368,7 @@ have_va_driver() {
 # **Probe the ffmpeg the app will actually run, not the one on PATH.**
 #
 # `encode::ffmpeg::program()` resolves `$TANGENT_FFMPEG`, then the `tangent-ffmpeg`
-# sitting beside the installed binary, and only then the bare name — so the
+# sitting beside the installed binary, and only then the bare name, so the
 # BUNDLED copy wins over PATH. Checking `command -v ffmpeg` therefore answers a
 # question nobody asked: a machine with a perfect system ffmpeg and a bundled
 # copy built without VA-API would be told it was ready while every take encoded
@@ -392,7 +392,7 @@ have_vaapi_ffmpeg() {
     "$FFMPEG_TESTED" -hide_banner -hwaccels </dev/null 2>/dev/null | grep -q "^vaapi$"
 }
 
-# Is the encoder we probed the one we ship? If so, no package fixes it — the
+# Is the encoder we probed the one we ship? If so, no package fixes it: the
 # bundled copy takes precedence over anything the package manager installs.
 tested_is_bundled() {
     case "$FFMPEG_TESTED" in
@@ -535,7 +535,7 @@ media_prereqs() {
         echo "          TANGENT_FFMPEG=/usr/bin/ffmpeg tangent"
     fi
 
-    # Nothing a package manager can supply — everything outstanding has been
+    # Nothing a package manager can supply: everything outstanding has been
     # explained above.
     [ -n "$_pkgs" ] || return 0
 
@@ -588,7 +588,7 @@ media_prereqs() {
 #
 # `--prefix /tmp/somewhere-new` is a directory that is SUPPOSED not to exist
 # yet, so testing its parent for writability tested a directory that was also
-# absent — `-w` said no and the script refused to install anywhere it had been
+# absent: `-w` said no and the script refused to install anywhere it had been
 # asked to create. Walking up to something real is the question actually
 # worth asking: may I create this?
 nearest_existing() {
@@ -602,7 +602,7 @@ nearest_existing() {
 # Refuse early and clearly, rather than failing on the first copy.
 if [ "$DRY" = "0" ] && [ "$MODE" != "user" ]; then
     if [ ! -w "$(nearest_existing "$BIN_DIR")" ] && [ "$(id -u)" != "0" ]; then
-        echo "cannot write to $BIN_DIR — the nearest existing directory" >&2
+        echo "cannot write to $BIN_DIR: the nearest existing directory" >&2
         echo "($(nearest_existing "$BIN_DIR")) is not writable by you." >&2
         if [ "$MODE" = "system" ]; then
             echo "Re-run with sudo, or drop --system to install into your home" >&2
@@ -623,7 +623,7 @@ if [ "$UNINSTALL" = "1" ]; then
     run rm -f  "$DESKTOP_DIR/tangent.desktop"
     run rm -f  "$ICON_DIR/tangent.png"
     # And tell the desktop, or the menu keeps an entry for a binary that is
-    # gone — which reads as a broken install rather than as a finished
+    # gone, which reads as a broken install rather than as a finished
     # uninstall. Best-effort, exactly as on the way in.
     if [ "$DRY" = "0" ]; then
         command -v update-desktop-database >/dev/null 2>&1 &&
@@ -633,13 +633,13 @@ if [ "$UNINSTALL" = "1" ]; then
                 >/dev/null 2>&1 || true
     fi
     echo
-    echo "Removed. Your settings are still in ~/.config/tangent — taught chord"
+    echo "Removed. Your settings are still in ~/.config/tangent: taught chord"
     echo "names and a supporter key live there, so uninstalling does not throw"
     echo "them away. Delete that directory yourself if you want them gone."
     exit 0
 fi
 
-[ "$DRY" = "1" ] && echo "(dry run — nothing will be written)"
+[ "$DRY" = "1" ] && echo "(dry run: nothing will be written)"
 echo "Installing $NAME"
 
 if [ "$WANT_APP" = "1" ]; then
@@ -675,7 +675,7 @@ if [ "$WANT_APP" = "1" ]; then
     #
     # The .desktop entry and the icon. Between them they are what makes Tangent
     # appear in an application menu and, more to the point, in the launchers
-    # people actually use on a tiling desktop — rofi, wofi, dmenu — all of
+    # people actually use on a tiling desktop (rofi, wofi, dmenu), all of
     # which read $XDG_DATA_HOME/applications and nothing else.
     #
     # ASKED FOR rather than assumed. It writes three files outside the one
@@ -712,7 +712,7 @@ if [ "$WANT_APP" = "1" ]; then
         echo "  menu entry  -> $DESKTOP_DIR/tangent.desktop"
         run mkdir -p "$DESKTOP_DIR"
         # **The absolute path, not the bare name.** The shipped entry says
-        # `Exec=tangent`, which needs $BIN_DIR to be on PATH — and a launcher
+        # `Exec=tangent`, which needs $BIN_DIR to be on PATH, and a launcher
         # does not run your shell's PATH anyway: rofi and wofi exec through a
         # session environment that may never have sourced your profile. An
         # entry that cannot start the program is worse than no entry, because
@@ -736,8 +736,8 @@ if [ "$WANT_APP" = "1" ]; then
         fi
 
         # Tell the desktop it changed. Both are best-effort and both are
-        # genuinely absent on minimal systems — a tiling-WM install often has
-        # neither — so a missing one is not a failure. rofi reads the .desktop
+        # genuinely absent on minimal systems (a tiling-WM install often has
+        # neither), so a missing one is not a failure. rofi reads the .desktop
         # files directly and will find Tangent either way; these are what make
         # a full desktop environment and the icon cache notice inside a second
         # rather than at the next login.
@@ -840,7 +840,7 @@ if [ "$WANT_APP" = "1" ]; then
         echo "Run it with:  $BIN_DIR/tangent"
     fi
     # Said out loud, because the whole point of answering yes to that question
-    # is being able to start it without a terminal — and a launcher that has
+    # is being able to start it without a terminal, and a launcher that has
     # not rescanned yet looks exactly like an entry that was never written.
     if [ "${WANT_DESKTOP:-0}" = "1" ]; then
         echo "Or from your application menu, rofi, wofi or dmenu, as \"Tangent\"."

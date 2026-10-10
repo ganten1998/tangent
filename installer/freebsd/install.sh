@@ -15,7 +15,7 @@
 # to explain what happened. That is the opposite of the Linux script beside it,
 # which IS the installer because Linux has no one package manager to defer to.
 # FreeBSD has exactly one, every derivative uses it, and a package the system
-# tracks beats a script the user has to keep — `pkg delete tangent` is then a
+# tracks beats a script the user has to keep: `pkg delete tangent` is then a
 # complete and honest uninstall, and `pkg info tangent` answers "what did this
 # put on my disk".
 #
@@ -156,7 +156,7 @@ EOF
 #   JACK at its best stable setting       --  ->  10.9 ms
 #
 # It also lowers the driver's minimum block from 192 frames to 48, which is
-# what makes the small JACK periods legal at all — so it is not merely a
+# what makes the small JACK periods legal at all, so it is not merely a
 # saving, it is what unlocks the low-latency configurations entirely.
 #
 # Applied by default because it is free: a 45-second stress test with four CPU
@@ -229,27 +229,27 @@ target_user() {
 # Tangent renders lanes onto a worker pool, and the pool is gated on readiness:
 # `rtwork` counts the workers that actually took the real-time policy, and the
 # fork takes the serial walk whenever that count is short of the pool's width.
-# That gate is not defensive programming, it is a measurement — an ordinary
+# That gate is not defensive programming, it is a measurement: an ordinary
 # timeshare thread misses whole deadlines, and a fork-join is defined by its
 # slowest worker, so a pool that cannot be scheduled is SLOWER than not
 # forking at all.
 #
 # On FreeBSD the policy is SCHED_FIFO through pthread_setschedparam(3), which
 # needs PRIV_SCHED_RTPRIO. Unprivileged, that call returns EPERM, the pool
-# reports zero ready, and every track renders on the callback thread — on one
+# reports zero ready, and every track renders on the callback thread: on one
 # core, silently, with no error the user ever sees. That silence is the whole
 # reason this step exists: nothing in the UI can tell you it happened.
 #
 # mac_priority(4) is FreeBSD's answer and the direct counterpart of the Linux
 # audio group: it grants PRIV_SCHED_RTPRIO and PRIV_SCHED_SETPOLICY to any
 # process running with gid 47, the 'realtime' group. On a stock system that
-# group ALREADY EXISTS in /etc/group and the module is already on disk — the
+# group ALREADY EXISTS in /etc/group and the module is already on disk; the
 # two things missing are the load and the membership, which is all this does.
 #
 # The module is loaded now AND written to loader.conf, for the same reason the
 # sysctl above is applied now and written to sysctl.conf: one for this boot,
 # one for the next. The granted user is recorded inside the marked block so
-# that --uninstall gives back precisely what this granted and nothing more — a
+# that --uninstall gives back precisely what this granted and nothing more: a
 # user who was already in 'realtime' before Tangent existed keeps it.
 grant_realtime() {
     [ "$RT" = 1 ] || { say "Skipping the real-time scheduling grant (--no-rt)."; return 0; }
@@ -347,7 +347,7 @@ case "$MODE" in
 
 install)
     APP_PKG="$(find_app_pkg)" || {
-        echo "no ${PKGNAME}-*.pkg beside this script — is the folder complete?" >&2
+        echo "no ${PKGNAME}-*.pkg beside this script; is the folder complete?" >&2
         exit 1
     }
     command -v pkg >/dev/null 2>&1 || {
@@ -382,7 +382,7 @@ install)
     if [ "$TUNE" = 1 ]; then
         say ""
         say "If a USB audio interface is plugged in right now, unplug and replug"
-        say "it once — the lower-latency buffering applies when a device attaches."
+        say "it once: the lower-latency buffering applies when a device attaches."
     fi
     # Said last and said plainly, because it is the one step the installer
     # cannot take for the user and the one whose absence is invisible: a
@@ -398,7 +398,7 @@ install)
 
 home)
     APP_PKG="$(find_app_pkg)" || {
-        echo "no ${PKGNAME}-*.pkg beside this script — is the folder complete?" >&2
+        echo "no ${PKGNAME}-*.pkg beside this script; is the folder complete?" >&2
         exit 1
     }
     BIN="$HOME/.local/bin"
@@ -415,7 +415,7 @@ home)
         # Everything, rather than naming members. A .pkg stores its paths
         # ABSOLUTE (`/usr/local/bin/tangent`), so asking tar for `usr/local`
         # or `./usr/local` matches nothing and the extraction silently yields
-        # an empty directory. tar strips the leading slash itself — the
+        # an empty directory. tar strips the leading slash itself; the
         # "Removing leading '/'" note on stderr is that working, not failing.
         tar -xf "$APP_PKG" -C "$TMP" 2>/dev/null \
             || { echo "could not read $APP_PKG" >&2; exit 1; }
@@ -447,7 +447,7 @@ home)
             ;;
     esac
     say ""
-    say "A home install cannot pull in dependencies — pkg is what does that, and"
+    say "A home install cannot pull in dependencies: pkg is what does that, and"
     say "it needs root. If Tangent will not start, these are the two it cannot"
     say "do without: ALSA for sound, lilv for the plugin format FreeBSD has."
     say "    pkg install alsa-lib alsa-plugins lilv"
@@ -473,7 +473,7 @@ uninstall)
         ensure_root "$@"
         step "Removing the $PKGNAME package"
         # Dependencies are left alone deliberately. pkg knows which of them
-        # nothing else wants — `pkg autoremove` is the user's call to make, and
+        # nothing else wants; `pkg autoremove` is the user's call to make, and
         # taking mesa off a machine because they uninstalled one app would be a
         # remarkable thing for an uninstaller to do unasked.
         run pkg delete -y "$PKGNAME"
