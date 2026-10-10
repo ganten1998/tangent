@@ -1100,7 +1100,8 @@ pub struct TangentApp {
     /// Not a second copy of anything: the kits live in `drumpad_kits` and
     /// this only says which one has the panel's attention. By identity, so
     /// the panel stays on its track through a reorder, an insert above it
-    /// and their undo, and an aim at a removed track comes back with it.
+    /// and their undo, and an aim at a removed track is inert - no kit
+    /// shown, no edit taken - and comes back with it.
     drumpad_lane: Option<crate::desk_id::TrackId>,
     /// The pad the inspector describes.
     drumpad_sel: usize,
@@ -7022,6 +7023,9 @@ impl TangentApp {
         // And its drum KIT: a drum track made here later played the old
         // one's samples at the old one's settings. It leaves the map with
         // its track; the moment before this one keeps it for the undo.
+        // A drum panel open on it stands on no row from here (`drumpad_row`):
+        // it shows no kit and takes no edit until the undo brings the track
+        // back.
         if self
             .drumpad_kits
             .remove(&gone)
@@ -7404,20 +7408,22 @@ impl TangentApp {
             ("media/Ride Bell.wav", 0.85, 0.5, 0.0, 0),
         ];
         for (i, (path, gain, pan, tune, choke)) in kit.into_iter().enumerate() {
-            self.drumpad_mut().pads[i] = crate::drumpad::PadSlot {
-                path: path.to_owned(),
-                name: String::new(),
-                params: recorder::DrumPadParams {
-                    obey: false,
-                    trim_start: 0.0,
-                    trim_end: 1.0,
-                    gain,
-                    pan,
-                    tune,
-                    choke,
-                },
-                extra: Default::default(),
-            };
+            if let Some(kit) = self.drumpad_mut() {
+                kit.pads[i] = crate::drumpad::PadSlot {
+                    path: path.to_owned(),
+                    name: String::new(),
+                    params: recorder::DrumPadParams {
+                        obey: false,
+                        trim_start: 0.0,
+                        trim_end: 1.0,
+                        gain,
+                        pan,
+                        tune,
+                        choke,
+                    },
+                    extra: Default::default(),
+                };
+            }
             let wave: Vec<f32> = (0..48)
                 .map(|b| {
                     let t = b as f32 / 48.0;
@@ -7434,12 +7440,14 @@ impl TangentApp {
             };
         }
         // The pad whose file a tidy-up moved: the red dress.
-        self.drumpad_mut().pads[11] = crate::drumpad::PadSlot {
-            path: "media/Cowbell.wav".to_owned(),
-            name: String::new(),
-            params: recorder::DrumPadParams::default(),
-            extra: Default::default(),
-        };
+        if let Some(kit) = self.drumpad_mut() {
+            kit.pads[11] = crate::drumpad::PadSlot {
+                path: "media/Cowbell.wav".to_owned(),
+                name: String::new(),
+                params: recorder::DrumPadParams::default(),
+                extra: Default::default(),
+            };
+        }
         self.drumpad_status[11] = crate::ports::PadStatus {
             loaded: false,
             missing: true,
@@ -13285,6 +13293,15 @@ impl TangentApp {
         self.a11y_on = None;
         self.meter_hold = [[0.0; 2]; recorder::STRIPS];
         self.refresh_route_labels();
+        // **A drum panel left on no row** - its track removed, by the edit
+        // or by an undo or redo - shows no kit (`drumpad_row`), so the last
+        // kit's load status goes too: its missing-file marks and the pad
+        // menu's wave would stand on the empty panel, and the host pushes
+        // no status to a panel on no lane (`drumpad_lane`). The track's own
+        // comes back with the reload its undo asks for.
+        if self.drumpad_row().is_none() {
+            self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
+        }
     }
 
     /// **Which legacy shape the open document's `state/` folder is in**,
@@ -23149,6 +23166,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_dirty = true;
     }
 
+    /// **What a pad edit says when the panel's track is gone**: the panel
+    /// of a removed drum track shows no kit and takes no edit until the
+    /// undo that brings the track back (`drumpad_mut`), and a drop or a
+    /// loaded kit that changed nothing must say why.
+    const PADS_TRACK_GONE: &'static str = "the drum track these pads belong to was removed";
+
     /// Put `file` on pad `pad`: copy it into `media/`, point the slot at
     /// it, save the sidecar, and ask the host to decode. The copy is the
     /// same one every import pays — it is what keeps a project folder
@@ -23156,6 +23179,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn drumpad_load(&mut self, pad: usize, file: &std::path::Path) -> Result<(), String> {
         if pad >= recorder::DRUM_PADS {
             return Err("no such pad".to_owned());
+        }
+        // Before the copy, which would be for no kit at all.
+        if self.drumpad_row().is_none() {
+            return Err(Self::PADS_TRACK_GONE.to_owned());
         }
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
@@ -23171,8 +23198,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .unwrap_or_default()
             ));
         };
-        self.drumpad_mut().pads[pad].path = rel;
-        self.drumpad_mut().pads[pad].name.clear();
+        let Some(kit) = self.drumpad_mut() else {
+            return Err(Self::PADS_TRACK_GONE.to_owned());
+        };
+        kit.pads[pad].path = rel;
+        kit.pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
@@ -23198,6 +23228,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if bytes.is_empty() {
             return Err("that pad's sample is empty".to_owned());
         }
+        if self.drumpad_row().is_none() {
+            return Err(Self::PADS_TRACK_GONE.to_owned());
+        }
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
         };
@@ -23206,8 +23239,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(rel) = write_into_media(&doc, file_name, bytes) else {
             return Err(format!("could not write {file_name} into the project"));
         };
-        self.drumpad_mut().pads[pad].path = rel;
-        self.drumpad_mut().pads[pad].name.clear();
+        let Some(kit) = self.drumpad_mut() else {
+            return Err(Self::PADS_TRACK_GONE.to_owned());
+        };
+        kit.pads[pad].path = rel;
+        kit.pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.materialize_project_dir();
@@ -23223,7 +23259,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.drumpad().pads[pad].path.is_empty() {
             return;
         }
-        self.drumpad_mut().pads[pad] = crate::drumpad::PadSlot::default();
+        let Some(kit) = self.drumpad_mut() else { return };
+        kit.pads[pad] = crate::drumpad::PadSlot::default();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_edited();
         self.drumpad_dirty = true;
@@ -23233,8 +23270,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// pad on another. `from` and `to` are KEYS.
     fn swap_pads(&mut self, from: usize, to: usize) {
         // The whole slot rides: path AND knobs, and the
-        // two pads trade places — nothing is lost either way.
-        self.drumpad_mut().pads.swap(from, to);
+        // two pads trade places — nothing is lost either way. Not on the
+        // panel of a removed track, which has no kit to trade in, nor its
+        // pads' FX bays with it (`drumpad_mut`).
+        let Some(kit) = self.drumpad_mut() else { return };
+        kit.pads.swap(from, to);
         self.drumpad_status.swap(from, to);
         self.drumpad_peaks.swap(from, to);
         self.drumpad_sel = to;
@@ -23323,7 +23363,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::drumpad::DrumpadDoc::save_track_kits(
             &self.drumpad_kits,
             &self.settings.track_ids,
-            self.drumpad_row(),
+            self.drumpad_row().unwrap_or(0),
             doc,
         );
     }
@@ -23378,10 +23418,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (lo, hi) = p.range();
         let v = if v.is_finite() { v.clamp(lo, hi) } else { p.default_value() };
         let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        let Some(kit) = self.drumpad_mut() else { return };
+        let params = &mut kit.pads[sel].params;
         match p {
-            P::Gain => self.drumpad_mut().pads[sel].params.gain = v,
-            P::Pan => self.drumpad_mut().pads[sel].params.pan = v,
-            P::Tune => self.drumpad_mut().pads[sel].params.tune = v,
+            P::Gain => params.gain = v,
+            P::Pan => params.pan = v,
+            P::Tune => params.tune = v,
         }
     }
 
@@ -23661,7 +23703,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 if commit || cancel {
                     if commit {
-                        self.drumpad_mut().pads[pad].name = buf.trim().to_owned();
+                        if let Some(kit) = self.drumpad_mut() {
+                            kit.pads[pad].name = buf.trim().to_owned();
+                        }
                         self.drumpad_edited();
                     }
                     self.pad_name_typing = None;
@@ -23678,11 +23722,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if let Some(p) = pointer {
                         let f = ((p.x - wave.left()) / wave.width().max(1.0))
                             .clamp(0.0, 1.0);
-                        let params = &mut self.drumpad_mut().pads[pad].params;
-                        if end {
-                            params.trim_end = f.max(params.trim_start + 0.02);
-                        } else {
-                            params.trim_start = f.min(params.trim_end - 0.02);
+                        if let Some(kit) = self.drumpad_mut() {
+                            let params = &mut kit.pads[pad].params;
+                            if end {
+                                params.trim_end = f.max(params.trim_start + 0.02);
+                            } else {
+                                params.trim_start = f.min(params.trim_end - 0.02);
+                            }
                         }
                     }
                 } else {
@@ -23713,8 +23759,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     return;
                 }
                 if pad_menu_obey(menu).contains(p) {
-                    let params = &mut self.drumpad_mut().pads[pad].params;
-                    params.obey = !params.obey;
+                    if let Some(kit) = self.drumpad_mut() {
+                        let params = &mut kit.pads[pad].params;
+                        params.obey = !params.obey;
+                    }
                     self.drumpad_edited();
                     return;
                 }
@@ -23994,8 +24042,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             Some(H::Choke) => {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-                let g = &mut self.drumpad_mut().pads[sel].params.choke;
-                *g = (*g + 1) % (crate::drumpad_panel::CHOKE_GROUPS + 1);
+                if let Some(kit) = self.drumpad_mut() {
+                    let g = &mut kit.pads[sel].params.choke;
+                    *g = (*g + 1) % (crate::drumpad_panel::CHOKE_GROUPS + 1);
+                }
                 self.drumpad_edited();
             }
             Some(H::Clear) => self.drumpad_clear_selected(),
@@ -24014,31 +24064,48 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **The kit the panel is editing.** Every reader goes through here, so
-    /// there is one place that decides which track that is.
+    /// there is one place that decides which track that is: the empty kit
+    /// while that track is on no row (`drumpad_row`).
     fn drumpad(&self) -> &crate::drumpad::DrumpadDoc {
-        self.drumpad_kits.get(&self.drumpad_track()).unwrap_or_else(|| empty_kit())
+        self.drumpad_row()
+            .and_then(|row| self.drumpad_kits.get(&self.track_id_at(row)))
+            .unwrap_or_else(|| empty_kit())
     }
 
-    fn drumpad_mut(&mut self) -> &mut crate::drumpad::DrumpadDoc {
+    /// **The kit the panel edits**, or `None` while the panel names a track
+    /// this desk does not hold: such an edit has no track to land on, and is
+    /// refused rather than handed to another one. Row 0's track used to
+    /// take it, so a sample dropped on a pad of a removed drum track's panel
+    /// rewrote another drum track's kit, as an undo moment and on disk, with
+    /// nothing on screen to say whose.
+    fn drumpad_mut(&mut self) -> Option<&mut crate::drumpad::DrumpadDoc> {
+        let row = self.drumpad_row()?;
         // A kit on a lane is a fact the desk index reads (residue).
         self.desk_index_dirty();
-        let id = self.drumpad_track();
-        self.drumpad_kits.entry(id).or_default()
+        let id = self.track_id_at(row);
+        Some(self.drumpad_kits.entry(id).or_default())
     }
 
-    /// **The row whose kit the panel shows**: its track's row, or row 0 when
-    /// the panel names no track this desk holds - nothing chosen yet, or a
-    /// track removed since, whose aim comes back with its undo. Row 0 is
-    /// where the panel stood before it was ever pointed anywhere, and where
-    /// an aim past the kits always fell back to.
-    fn drumpad_row(&self) -> usize {
-        self.drumpad_lane.and_then(|id| self.row_of(id)).unwrap_or(0)
+    /// **The row whose kit the panel shows**: its track's row; row 0 while
+    /// the panel has never been pointed at a track, where it always stood;
+    /// `None` while it names a track this desk does not hold - one removed
+    /// since, whose aim is inert until the undo that brings the track back.
+    /// Row 0 is not that track: falling back to it there put the panel, its
+    /// edits and the host's pushes on another track's kit, where the base
+    /// stayed on the emptied row and showed an empty kit.
+    fn drumpad_row(&self) -> Option<usize> {
+        match self.drumpad_lane {
+            Some(id) => self.row_of(id),
+            None => Some(0),
+        }
     }
 
-    /// **The track whose kit the panel shows and edits** (`drumpad_row`'s),
-    /// by identity: the id form of `drumpad_lane()` (C11).
+    /// **The track whose kit the panel shows and edits**, by identity: the
+    /// id form of `drumpad_lane()` (C11). Once this desk no longer holds that
+    /// track (removed) it still names it, where `drumpad_lane` names no row:
+    /// what the panel is aimed at, not where it stands.
     pub fn drumpad_track(&self) -> crate::desk_id::TrackId {
-        self.track_id_at(self.drumpad_row())
+        self.drumpad_lane.unwrap_or_else(|| self.track_id_at(0))
     }
 
     /// **What the OS keeps of the display's height**, 0.5..=1.0, told by the
@@ -24065,9 +24132,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The row whose kit the drumpad window shows, for the host that speaks
-    /// lanes. See `drumpad_row`.
+    /// lanes (see `drumpad_row`): a lane past every row (`usize::MAX`) while
+    /// the panel's track is one this desk does not hold, so a host matching
+    /// lanes against it matches none. Answering row 0 there sent row 0's
+    /// pad status (its missing-file marks) to the panel of a removed track.
     pub fn drumpad_lane(&self) -> usize {
-        self.drumpad_row()
+        self.drumpad_row().unwrap_or(usize::MAX)
     }
 
     /// Every lane's kit, for the host's push. Empty kits included, because
@@ -29476,13 +29546,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .to_owned();
             return;
         }
-        let lane = self.drumpad_row();
+        // The panel of a removed track has no track to be named for.
         let suggested = {
-            let at = recorder::Strip::Channel(lane).index();
             let name = self
-                .settings
-                .strip_names
-                .get(at)
+                .drumpad_row()
+                .and_then(|lane| self.settings.strip_names.get(recorder::Strip::Channel(lane).index()))
                 .map(String::as_str)
                 .unwrap_or_default()
                 .trim()
@@ -29851,10 +29919,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.track.error = "that kit has no pads in it".to_owned();
             return;
         }
-        for pad in self.drumpad_mut().pads.iter_mut() {
+        // The panel of a removed track has no kit to lay it on: said, and
+        // nothing cleared (`drumpad_mut`).
+        let Some(kit) = self.drumpad_mut() else {
+            self.track.error = Self::PADS_TRACK_GONE.to_owned();
+            return;
+        };
+        for pad in kit.pads.iter_mut() {
             *pad = crate::drumpad::PadSlot::default();
         }
-        self.drumpad_mut().master = preset.master;
+        kit.master = preset.master;
         let mut missing = 0usize;
         for pad in &preset.pads {
             // **The kit's own audio first.** A kit made on someone else's
@@ -29869,7 +29943,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 missing += 1;
                 continue;
             }
-            if let Some(slot) = self.drumpad_mut().pads.get_mut(pad.key) {
+            if let Some(slot) = self.drumpad_mut().and_then(|kit| kit.pads.get_mut(pad.key)) {
                 slot.name = pad.name.clone();
                 slot.params = pad.params;
             }
@@ -45704,7 +45778,7 @@ mod tests {
         let at = app.drumpad_rect.expect("the drum pads did not lay out").center();
         // A pad with a sample in it: an empty pad's knobs are not saved.
         let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
-        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.drumpad_mut().expect("the panel stands on a row").pads[sel].path = "media/kick.wav".to_owned();
         app.undo_commit();
         let before = app.hist_at;
         let param = crate::drumpad_panel::Param::Gain;
@@ -45822,7 +45896,7 @@ mod tests {
         let rect = app.drumpad_rect.expect("the drum pads did not lay out");
         // A pad with a sample in it: an empty pad has no knobs to turn.
         let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
-        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.drumpad_mut().expect("the panel stands on a row").pads[sel].path = "media/kick.wav".to_owned();
         app.undo_commit();
         let _ = run_frame(&ctx, &mut app);
         let before = app.hist_at;
@@ -45851,7 +45925,7 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         let rect = app.drumpad_rect.expect("the drum pads did not lay out");
         let sel = app.drumpad_sel.min(recorder::DRUM_PADS - 1);
-        app.drumpad_mut().pads[sel].path = "media/kick.wav".to_owned();
+        app.drumpad_mut().expect("the panel stands on a row").pads[sel].path = "media/kick.wav".to_owned();
         app.pad_menu = Some(sel);
         app.undo_commit();
         let _ = run_frame(&ctx, &mut app);
@@ -54554,7 +54628,7 @@ mod tests {
         let doc = crate::arrangement::doc_in(&made_in);
         crate::arrangement::Arrangement::default().save_to(&doc);
         app.open_project(&doc);
-        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[38] = crate::drumpad::PadSlot {
             path: "media/clap.wav".to_owned(),
             name: "Clap".to_owned(),
             params: recorder::DrumPadParams {
@@ -54632,7 +54706,7 @@ mod tests {
         let doc = crate::arrangement::doc_in(&made_in);
         crate::arrangement::Arrangement::default().save_to(&doc);
         app.open_project(&doc);
-        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[36] = crate::drumpad::PadSlot {
             path: "media/Kick.wav".to_owned(),
             name: "Kick".to_owned(),
             ..Default::default()
@@ -54694,13 +54768,13 @@ mod tests {
         let doc = crate::arrangement::doc_in(&dir);
         crate::arrangement::Arrangement::default().save_to(&doc);
         app.open_project(&doc);
-        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
             ..Default::default()
         };
         // A pad naming a file that is not there — a moved folder, an
         // unmounted drive, a sample deleted since it was loaded.
-        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[38] = crate::drumpad::PadSlot {
             path: "media/gone.wav".to_owned(),
             ..Default::default()
         };
@@ -54727,7 +54801,7 @@ mod tests {
 
         // A kit with nothing missing stays SILENT. A status strip that
         // speaks after every save is one nobody reads.
-        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot::default();
+        app.drumpad_mut().expect("the panel stands on a row").pads[38] = crate::drumpad::PadSlot::default();
         app.write_kit_preset(&root.join("Whole.kit"));
         assert!(
             app.track.error.is_empty(),
@@ -54810,7 +54884,7 @@ mod tests {
         let doc = crate::arrangement::doc_in(&made_in);
         crate::arrangement::Arrangement::default().save_to(&doc);
         app.open_project(&doc);
-        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[38] = crate::drumpad::PadSlot {
             path: "media/clap.wav".to_owned(),
             name: "Clap".to_owned(),
             ..Default::default()
@@ -55635,7 +55709,7 @@ mod tests {
         let root = project_scratch("padswapundo");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+        app.drumpad_mut().expect("the panel stands on a row").pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
             ..Default::default()
         };
@@ -83270,7 +83344,8 @@ mod lane_refs_tests {
     /// follow the row to the new one (`retarget_row`) rather than being
     /// orphaned - the kit silently, and for good at the next save. A
     /// removal mints too and carries nothing: the removed track's kit and
-    /// the panel's aim at it come back with its undo.
+    /// the panel's aim at it come back with its undo, and until then the
+    /// panel stands on no row - not on row 0, whose track is another one.
     #[test]
     fn a_row_given_its_first_kind_keeps_what_was_aimed_at_it() {
         let (_, mut app) = headless(Caps::DESKTOP);
@@ -83295,7 +83370,7 @@ mod lane_refs_tests {
         app.remove_selected_channels(row);
         assert_ne!(app.track_id_at(row), made, "fixture: the emptied row kept the removed track's id");
         assert!(app.kit_at(row).is_empty(), "the removed track's kit stayed on its row");
-        assert_eq!(app.drumpad_lane(), 0, "the panel stayed on a row its track has left");
+        assert_eq!(app.drumpad_lane(), usize::MAX, "the panel stayed on a row its track has left");
         app.undo();
         assert_eq!(app.track_id_at(row), made, "fixture: the undo did not bring the track back");
         assert_eq!(app.kit_at(row).pads[36].path, "media/kick.wav", "the undo did not bring the kit back");
@@ -83403,6 +83478,81 @@ mod lane_refs_tests {
                 run();
             }
         }
+    }
+
+    /// **The drum panel of a removed track shows no kit and edits none**,
+    /// and comes back with the undo. With kits on rows 0 and 5 and the panel
+    /// open on row 5, removing track 5 left the panel on row 0's kit: a knob
+    /// let go, a sample dropped, two pads traded or a kit file loaded there
+    /// rewrote track 0's kit, as an undo moment and on disk, and the host
+    /// pushed row 0's pad status to it. Base stayed on the emptied row and
+    /// showed an empty kit.
+    #[test]
+    fn a_removed_tracks_drum_panel_shows_no_kit_and_edits_none() {
+        use crate::drumpad_panel::Param;
+        let root = project_scratch("lane-refs-panel-gone");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.bootstrap_project(&root.join("Projects"));
+        let doc = app.project_doc().expect("a project").to_path_buf();
+        for n in 2..=5 {
+            assert!(app.add_bare_track(n), "fixture: row {n} took no track");
+        }
+        app.kit_at_mut(0).pads[36].path = "media/kick.wav".into();
+        app.kit_at_mut(5).pads[38].path = "media/snare.wav".into();
+        app.set_drumpad_lane(5);
+        app.open_drumpad();
+        app.drumpad_edited();
+        let kit_file = root.join("Snare.kit");
+        app.write_kit_preset(&kit_file);
+        assert!(kit_file.is_file(), "fixture: no kit file: {}", app.track.error);
+        let sample = root.join("clap.wav");
+        std::fs::write(&sample, b"RIFFxxxxWAVE").expect("a sample to drop");
+        let first = app.kit_at(0).clone();
+        let gone = app.track_id_at(5);
+        // What the host pushed for the kit on show: a sample it could not read.
+        let mut status: [crate::ports::PadStatus; recorder::DRUM_PADS] =
+            std::array::from_fn(|_| crate::ports::PadStatus::default());
+        status[38].missing = true;
+        app.set_drumpad_status(status);
+
+        app.remove_channel(5);
+        assert_eq!(app.row_of(gone), None, "fixture: the track was not removed");
+        assert_eq!(app.drumpad_lane(), usize::MAX, "the panel's lane form names a row its track has left");
+        assert_eq!(app.drumpad_track(), gone, "the panel let go of its track");
+        assert!(app.drumpad().is_empty(), "the panel of a removed track shows a kit");
+        assert!(
+            app.drumpad_status.iter().all(|s| *s == crate::ports::PadStatus::default()),
+            "the removed kit's missing-file mark stayed on the empty panel"
+        );
+        let moments = app.history.len();
+        let sidecar = crate::drumpad::DrumpadDoc::sidecar(&doc);
+        let on_disk = std::fs::read(&sidecar).expect("the sidecar");
+
+        // Every road into the panel's kit.
+        app.drumpad_sel = 36;
+        app.drumpad_set(Param::Gain, 0.25);
+        app.drumpad_edited();
+        assert_eq!(app.drumpad_load(40, &sample), Err(TangentApp::PADS_TRACK_GONE.to_owned()), "a drop on a pad");
+        app.swap_pads(36, 40);
+        app.drumpad_clear_selected();
+        app.track.error.clear();
+        app.apply_kit_preset(&kit_file);
+        assert_eq!(app.track.error, TangentApp::PADS_TRACK_GONE, "a kit loaded into the panel said nothing");
+
+        assert!(*app.kit_at(0) == first, "an edit in the removed track's panel rewrote track 0's kit");
+        assert!(app.drumpad().is_empty(), "an edit landed in the removed track's panel");
+        assert_eq!(app.history.len(), moments, "a refused edit left an undo moment");
+        assert_eq!(std::fs::read(&sidecar).expect("the sidecar"), on_disk, "a refused edit rewrote the kits on disk");
+        assert!(!doc.with_file_name("media").join("clap.wav").exists(), "a refused drop copied its sample in");
+
+        app.undo();
+        assert_eq!(app.row_of(gone), Some(5), "fixture: the undo did not bring the track back");
+        assert_eq!(app.drumpad_lane(), 5, "the panel did not come back with its track");
+        assert_eq!(app.drumpad().pads[38].path, "media/snare.wav", "the panel did not show its track's kit again");
+        app.drumpad_set(Param::Gain, 0.25);
+        assert!((app.kit_at(5).pads[36].params.gain - 0.25).abs() < 1e-6, "the panel's edits did not land on its track again");
+        assert!(*app.kit_at(0) == first, "the panel's edit landed on track 0's kit");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A track copied in one project pastes into another asking the host
