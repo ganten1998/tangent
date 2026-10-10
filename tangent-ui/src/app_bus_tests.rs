@@ -487,6 +487,14 @@ fn a_send_curve_moves_its_send_and_names_its_bus_wherever_it_stands() {
     app.auto_set_control(AutoLane::Row(1), p, 0.8);
     assert_eq!(app.strip_send_to(StripRef::Row(1), Node::Track(to), false), None, "a dial made a send");
     assert_eq!(app.auto_resting(AutoLane::Row(1), p), 0.0);
+    // Nor does a level aimed at a send that is not there: only `add_send`
+    // makes one, so nothing can bring back a send somebody took away. (The
+    // dial's moves above end at a release, as the row's drag does.)
+    app.undo_commit();
+    let at = app.hist_at;
+    app.set_send_level(StripRef::Row(1), Node::Track(to), false, 0.5, true);
+    assert_eq!(app.strip_send_to(StripRef::Row(1), Node::Track(to), false), None, "a level made a send");
+    assert_eq!(app.hist_at, at, "a level that moved nothing was a moment");
     // The mixer's row drags the same send, and its curve follows a lone base.
     app.arrangement.automation.entry(0, p).put(Point { at_s: 0.0, value: 0.25, shape: Shape::Linear });
     app.apply_mixer_hit(Hit::SendLevel(Column::Track(0), 0), 0.75);
@@ -535,4 +543,43 @@ fn a_tracks_post_fader_sends_are_offered_for_automation_by_their_buses_names() {
         panic!("not the automation menu");
     };
     assert!(groups.iter().all(|g| g.name != "Sends"), "a track that sends nowhere offered sends");
+}
+
+/// **The undo sentinel catches a road that leaves a bus holding a clip**:
+/// every gesture that could has its own refusal, and this is what a road
+/// added later without one would meet, in every test that walks it.
+#[test]
+#[should_panic(expected = "a gesture left a bus with a clip")]
+fn the_sentinel_catches_a_road_that_leaves_a_clip_on_a_bus() {
+    let (_ctx, mut app) = app_on(desk(1), tiers::free("bus-sentinel"));
+    let bus = app.new_bus(BusRole::Bus).expect("a bus");
+    // A road with no refusal of its own: the clip straight onto the bus.
+    app.arrangement.add_clip(crate::arrangement::ArrClip { lane: bus, len_s: 1.0, ..Default::default() });
+    app.undo_commit();
+}
+
+/// **A row that takes a new identity keeps what is sent to it**
+/// (`retarget_row`): the sends into it from a row and from a special, and a
+/// curve drawing one of them, follow the row to its new id, as its routes,
+/// keys and bays always have. A row can be a send's destination before it is
+/// a track, in a desk read from a file.
+#[test]
+fn a_row_that_takes_a_new_identity_keeps_what_is_sent_to_it() {
+    use crate::automation::{AutoParam, Point, Shape};
+    use crate::desk_model::Send;
+    let mut s = desk(2);
+    let old = TrackId(700);
+    s.rows.push(TrackRow::vacant(old));
+    s.next_track_id = 701;
+    s.rows[0].sends.push(Send { to: Node::Track(old), level: 0.5, pre: false });
+    s.specials.drums.sends.push(Send { to: Node::Track(old), level: 0.25, pre: false });
+    let (_ctx, mut app) = app_on(s, tiers::free("bus-retarget"));
+    app.arrangement.automation.entry(0, AutoParam::SendTo { to: old }).put(Point { at_s: 1.0, value: 0.5, shape: Shape::Linear });
+    app.mint_row_id(2);
+    let now = app.track_id_at(2);
+    assert_ne!(now, old, "fixture: no new id");
+    assert_eq!(app.settings.rows[0].sends[0].to, Node::Track(now), "a row's send stayed on the old id");
+    assert_eq!(app.settings.specials.drums.sends[0].to, Node::Track(now), "a special's send stayed on the old id");
+    assert!(app.arrangement.automation.get(AutoLane::Row(0), AutoParam::SendTo { to: now }).is_some(), "the curve lost its send");
+    assert!(app.arrangement.automation.get(AutoLane::Row(0), AutoParam::SendTo { to: old }).is_none());
 }

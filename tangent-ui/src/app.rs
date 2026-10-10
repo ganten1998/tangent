@@ -539,6 +539,25 @@ fn counted_in(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arr
         .count()
 }
 
+/// **How far a desk is from every bus being a bus** (design 9), for the
+/// undo sentinel: the clips standing on bus rows, the bus rows with an input
+/// or an arm, and the sends aimed at a track that is no bus.
+#[cfg(test)]
+fn bus_faults(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arrangement) -> usize {
+    let bus = |r: &crate::desk_model::TrackRow| r.kind == Some(crate::desk_model::RowKind::Bus);
+    let buses: std::collections::BTreeSet<crate::desk_id::TrackId> =
+        desk.rows.iter().filter(|r| bus(r)).map(|r| r.id).collect();
+    let clips = arr.clips.iter().filter(|c| desk.rows.get(c.lane).is_some_and(|r| bus(r))).count();
+    let switched = desk.rows.iter().filter(|r| bus(r) && (!r.input.is_empty() || r.arm)).count();
+    let stray = desk
+        .rows
+        .iter()
+        .flat_map(|r| &r.sends)
+        .filter(|x| x.to.track().is_some_and(|t| !buses.contains(&t)))
+        .count();
+    clips + switched + stray
+}
+
 /// **What a gesture changes about the desk's shape**, for the line
 /// `TangentApp::desk_shape_held_for` says when a running arrangement record
 /// or realtime export makes it wait.
@@ -18315,6 +18334,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     #[cfg(test)]
     fn cap_sentinel(&self, state: &Moment) {
         self.desk_sentinel();
+        // **And a bus stays a bus** (design 9), on every tier: no gesture
+        // ends with more clips, inputs or arms on buses, or more sends
+        // aimed at rows that are no bus, than the moment it stood on. Every
+        // road that could has its own refusal; this catches the road added
+        // later without one. Against the standing moment rather than zero,
+        // as the cap is: a desk read from a hand-edited file may hold such a
+        // thing, and the reader keeps what it is given.
+        if let Some(top) = self.history.get(self.hist_at) {
+            let (was, now) = (bus_faults(&top.desk, &top.arr), bus_faults(&state.desk, &state.arr));
+            assert!(now <= was, "a gesture left a bus with a clip, an input or an arm, or a send aimed at no bus: {was} -> {now}");
+        }
         let Some(cap) = self.track_cap() else {
             return;
         };
@@ -18345,28 +18375,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // and no two rows wearing one id.
         let dangling = self.settings.model_view().check();
         assert!(dangling.is_empty(), "a gesture left the desk with dangling entries: {dangling:?}");
-        // **And a bus stays a bus** (design 9): no gesture leaves a clip on
-        // one, an input or an arm on one, or a send aimed at a row that is
-        // not one. Every road that could has its own refusal; this is what
-        // catches the road somebody adds later without one.
-        let buses: std::collections::BTreeSet<crate::desk_id::TrackId> = self
-            .settings
-            .rows
-            .iter()
-            .filter(|r| r.kind == Some(crate::desk_model::RowKind::Bus))
-            .map(|r| r.id)
-            .collect();
-        for (n, row) in self.settings.rows.iter().enumerate() {
-            if buses.contains(&row.id) {
-                assert!(!self.lane_has_clips(n), "a gesture left a clip on the bus on row {n}");
-                assert!(row.input.is_empty() && !row.arm, "a gesture gave the bus on row {n} an input or an arm");
-            }
-            for x in &row.sends {
-                if let Some(to) = x.to.track() {
-                    assert!(buses.contains(&to), "a gesture left row {n} sending to {to}, which is no bus");
-                }
-            }
-        }
     }
 
     /// **The commit at a click's release on a row that jumps to the
