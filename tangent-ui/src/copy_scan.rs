@@ -30,6 +30,9 @@
 //! * "stays free" in a sentence that does not name the track limit;
 //! * "Thirty-two channels", "Thirty-two tracks", "-channel mixer" and
 //!   "{}-channel": the desk described by a width, for everybody;
+//! * an em dash, anywhere: the owner's rule for published text, because
+//!   the mark has come to read as machine-written and a reader once said so
+//!   of his. A comma, a colon, parentheses or a full stop say the same.
 //! * on a surface that says buses have no limit, a sentence calling folders
 //!   buses that does not say they count. The README and the store page call a
 //!   folder a real bus (it sums its children and runs a rack over the sum),
@@ -60,6 +63,9 @@ const WIDTH_CLAIMS: [&str; 4] = [
     "{}-channel",
 ];
 
+/// The em dash, refused on every surface (see the module doc).
+const EM_DASH: char = '\u{2014}';
+
 /// What is wrong with `text`, one entry per hit, or nothing.
 ///
 /// `text` is one surface's copy: a whole prose file, or one string literal.
@@ -77,6 +83,9 @@ fn stale(text: &str) -> Vec<String> {
         if flat.contains(phrase) {
             hits.push(format!("describes the desk by a width: {phrase:?}"));
         }
+    }
+    for sentence in sentences(text).into_iter().filter(|s| s.contains(EM_DASH)) {
+        hits.push(format!("has an em dash: {sentence:?}"));
     }
     for sentence in sentences(text) {
         let low = sentence.to_lowercase();
@@ -322,6 +331,17 @@ pub(crate) fn lex(src: &str) -> Lexed {
                 if s[j] == '\\' && j + 1 < n {
                     match s[j + 1] {
                         'n' | 't' | 'r' => lit.push('\n'),
+                        // `\u{2014}` is the character it names: a dash
+                        // spelled as an escape is still a dash on screen.
+                        'u' if s.get(j + 2) == Some(&'{') => {
+                            let close = (j + 3..n).find(|&k| s[k] == '}').unwrap_or(n);
+                            let hex: String = s[j + 3..close].iter().collect();
+                            if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                                lit.push(ch);
+                            }
+                            j = close + 1;
+                            continue;
+                        }
                         // A line continuation: the newline and the next
                         // line's indent vanish.
                         '\n' => {
@@ -525,6 +545,9 @@ fn every_refused_phrase_fails_the_scan_when_planted() {
         "Folders are buses and buses are never counted.",
         "Buses are unlimited. A folder acts as a bus over its children.",
         "Buses have no limit. Folders are buses and do not count.",
+        // The em dash, wherever it stands in a sentence.
+        "A key lifts the limit \u{2014} for every version.",
+        "Thirty-three tracks\u{2014}and more.",
     ];
     for plant in plants {
         let page = format!("# Tangent\n\nPlay a chord.\n\n{plant}\n\n- A bullet.\n");
@@ -559,6 +582,8 @@ fn the_new_copy_passes_the_scan() {
         // Folders and buses named in one sentence, neither called the other.
         "Buses have no limit. Load it onto any channel, folder, bus or the master.",
         "Buses have no limit. A track in a folder is heard through the folder's send to the effects bus.",
+        // A hyphen and an en dash are not the mark the rule is about.
+        "Routing - Channel 3, the 2026\u{2013}2027 season.",
     ] {
         assert!(stale(good).is_empty(), "{good:?} was refused: {:?}", stale(good));
     }
@@ -584,11 +609,24 @@ mod tests {
 #[cfg(test)]
 const TEST_ONLY: &str = "also not shipped";
 const AFTER: &str = "six";
+const ESCAPED: &str = "seven \u{2014} eight";
+#[cfg(all(test, feature = "x"))]
+const GATED: &str = "not shipped either";
+const LAST: &str = "nine";
 "##;
     assert_eq!(
         literals(src),
-        vec!["one", "two \"quoted\"", "three four\nfive", "six"],
+        vec!["one", "two \"quoted\"", "three four\nfive", "six", "seven \u{2014} eight", "nine"],
     );
+    // And the CODE the ban scan reads: the same skips, every line kept.
+    let code = lex(src).code;
+    assert_eq!(code.lines().count(), src.lines().count(), "the code lost or gained a line");
+    for kept in ["const SHIPPED", "const AFTER", "const ESCAPED", "const LAST", "fn a<'x>(q: &'x str)"] {
+        assert!(code.contains(kept), "the code lost `{kept}`:\n{code}");
+    }
+    for gone in ["nothing more", "nested", "not an unlock", "TEST_ONLY", "GATED", "mod tests", "quoted", "eight"] {
+        assert!(!code.contains(gone), "the code kept `{gone}`:\n{code}");
+    }
 }
 
 #[test]

@@ -690,7 +690,7 @@ fn main() {
             "key": key,
         });
         if let Err(e) = ledger_append(&ledger, &entry) {
-            eprintln!("LEDGER WRITE FAILED for {sale_id}: {e} — refusing to send unrecorded key");
+            eprintln!("LEDGER WRITE FAILED for {sale_id}: {e}; refusing to send unrecorded key");
             let _ = req.respond(tiny_http::Response::from_string("ledger failed").with_status_code(500));
             continue;
         }

@@ -1853,7 +1853,7 @@ impl KitPreset {
         if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
             if len > max_file {
                 return Err(format!(
-                    "that file is {} MB — too big to be a kit, and reading it \
+                    "that file is {} MB, too big to be a kit, and reading it \
                      would take twice that in memory",
                     len / (1024 * 1024)
                 ));

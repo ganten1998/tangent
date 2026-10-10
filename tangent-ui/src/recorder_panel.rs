@@ -2735,9 +2735,9 @@ impl Hit {
     pub fn label(self) -> &'static str {
         match self {
             Hit::Record => "Record armed channels into the arrangement",
-            Hit::Capture => "Capture the session — video, audio, MIDI — apart from the arrangement",
-            Hit::ProjectMenu => "Project — new, open, save, save as, template",
-            Hit::Pause => "Pause — hold the playhead here; Stop goes home",
+            Hit::Capture => "Capture the session (video, audio, MIDI) apart from the arrangement",
+            Hit::ProjectMenu => "Project: new, open, save, save as, template",
+            Hit::Pause => "Pause: hold the playhead here; Stop goes home",
             Hit::OpenSetup => "Settings - audio and media",
             Hit::CloseSetup => "Done",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
