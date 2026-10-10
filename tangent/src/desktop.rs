@@ -6264,6 +6264,7 @@ impl DesktopApp {
                 &self.app,
                 &self.bridge,
                 self.recorder.engine.as_ref(),
+                &self.displaced_states,
                 &relabels,
                 &shelf,
             );

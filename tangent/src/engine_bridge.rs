@@ -421,7 +421,8 @@ pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
 
 /// **Carry a gesture's bay relabels on the host** (C11's
 /// `take_bay_relabels`): each plugin that moved from one bay to another (a
-/// drum pad swap, its undo, its redo) takes its settings with it.
+/// drum pad swap, an FX drag or swap, their undo and redo) takes its
+/// settings with it.
 ///
 /// The app has already moved the NAMES: what stood at `from` is wanted at
 /// `to`. The engine still holds the old instances, and the reconcile that
@@ -429,18 +430,30 @@ pub fn app_seat_of(ids: &[TrackId], sb: SeatBay) -> Option<(usize, usize)> {
 /// owes is that every destination's file is the moved plugin's own state
 /// before that rebuild reads it. **Read every source first, then write
 /// every destination**, because a swap's two files are each the other's
-/// source. A source is the instance PLAYING in the engine when it is that
-/// plugin (a unit somebody has been turning has not written its file since
-/// it loaded), else its file on `shelf` (owner-checked).
+/// source.
+///
+/// **A source is the moved plugin's NEWEST word**, in the order
+/// `shelf::incoming_state` ranks them, with the playing instance above
+/// both: the instance at `from` when it is that plugin (a unit somebody has
+/// been turning has not written its file since it loaded), else what the
+/// displaced shelf kept of that plugin at `from` (what it was playing when
+/// the reconcile last took it out of that bay, newer than the file by
+/// construction), else the file on `shelf` (owner-checked). The shelf is
+/// what a step back across more than one moment needs: a plugin swapped
+/// into a bay, dialled there and then replaced has left the bay, so it is
+/// not playing, and its file still holds the swap's settings, while the
+/// dial is on the shelf. Read from the file, an undo across the swap and the
+/// replace in one go brought it home without the dial.
 ///
 /// Answers each destination written and the bundle written there: the
 /// caller lets go of any displaced copy for it (`incoming_state` must not
 /// prefer an older one) and marks the bay to rebuild even when its NAME did
-/// not change (two pads holding the same unit trade settings, not names).
-pub fn carry_relabels(
+/// not change (two bays holding the same unit trade settings, not names).
+pub(crate) fn carry_relabels(
     app: &TangentApp,
     bridge: &Bridge,
     engine: Option<&Engine>,
+    displaced: &crate::shelf::DisplacedShelf,
     relabels: &[tangent_ui::desk_id::BayRelabel],
     shelf: &std::path::Path,
 ) -> Vec<(SeatBay, String)> {
@@ -452,7 +465,11 @@ pub fn carry_relabels(
                 let playing = e.insert_at(at.0, at.1).and_then(|l| l.bundle.to_str()) == Some(bundle.as_str());
                 playing.then(|| e.save_insert_state_at(at.0, at.1)).flatten()
             });
-            let state = live.or_else(|| crate::shelf::read_state(shelf, r.from, &bundle))?;
+            let state = live.or_else(|| {
+                crate::shelf::incoming_state(displaced, &(r.from, bundle.clone()), || {
+                    crate::shelf::read_state(shelf, r.from, &bundle)
+                })
+            })?;
             Some((r.to, bundle, state))
         })
         .collect();
@@ -2450,7 +2467,8 @@ mod tests {
         swapped.plugins.insert(snare, COMP_PATH.to_owned());
         let after = app_with(swapped);
         let swap = [BayRelabel { from: kick, to: snare }, BayRelabel { from: snare, to: kick }];
-        let mut written = carry_relabels(&after, &p, Some(&e), &swap, &shelf);
+        let none = crate::shelf::DisplacedShelf::new();
+        let mut written = carry_relabels(&after, &p, Some(&e), &none, &swap, &shelf);
         written.sort();
         assert_eq!(
             written,
@@ -2471,11 +2489,139 @@ mod tests {
         // The undo, with nothing playing: the inverse relabels, read off the
         // files the swap wrote, and every byte goes home.
         let back = swap.map(BayRelabel::inverse);
-        let mut written = carry_relabels(&before, &p, None, &back, &shelf);
+        let mut written = carry_relabels(&before, &p, None, &none, &back, &shelf);
         written.sort();
         assert_eq!(written, vec![(kick, COMP_PATH.to_owned()), (snare, EQ_PATH.to_owned())]);
         assert_eq!(crate::shelf::read_state(&shelf, kick, COMP_PATH), Some(comp_live), "the undo lost the comp");
         assert_eq!(crate::shelf::read_state(&shelf, snare, EQ_PATH), Some(eq_live), "the undo lost the EQ");
+        let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
+    }
+
+    /// **The host's reconcile over `bays`, without its overlay**: what
+    /// `DesktopApp`'s does to a bay whose wanted tenant the engine is not
+    /// playing, or that a carry marked to rebuild (`rebuild`). The outgoing
+    /// tenant's PLAYING settings are shelved under its bay and bundle when a
+    /// different one is coming in (`shelve_displaced`), the incoming one is
+    /// seated from the shelf first and its file second (`incoming_state`),
+    /// and a shelved state is spent once it is seated.
+    fn reconcile(
+        e: &mut Engine,
+        p: &Bridge,
+        app: &TangentApp,
+        displaced: &mut crate::shelf::DisplacedShelf,
+        shelf: &Path,
+        bays: &[SeatBay],
+        rebuild: &[SeatBay],
+    ) {
+        for &sb in bays {
+            let at = p.engine_bay(sb).expect("a bay with a lane");
+            let want = app.plugin(sb).map(str::to_owned);
+            let gone = e.insert_at(at.0, at.1).and_then(|l| l.bundle.to_str()).map(str::to_owned);
+            if gone == want && !rebuild.contains(&sb) {
+                continue;
+            }
+            if let Some(gone) = gone.filter(|g| want.as_deref() != Some(g.as_str())) {
+                if let Some(blob) = e.save_insert_state_at(at.0, at.1) {
+                    crate::shelf::shelve_displaced(displaced, (sb, gone), blob);
+                }
+            }
+            let state = want.as_deref().and_then(|w| {
+                crate::shelf::incoming_state(displaced, &(sb, w.to_owned()), || crate::shelf::read_state(shelf, sb, w))
+            });
+            e.load_insert_at(at.0, at.1, want.as_deref().map(Path::new), state.as_deref()).expect("a bay loads");
+            if let Some(w) = want {
+                displaced.remove(&(sb, w));
+            }
+        }
+        take_handoffs(e);
+    }
+
+    /// One block rendered, so the callback takes every instance handed to a
+    /// bay's ring and retires the one it replaced: a bay's ring is two deep,
+    /// and a test that seats one bay three times without a callback between
+    /// finds it full, as a stalled callback would.
+    fn take_handoffs(e: &mut Engine) {
+        e.settle_offline();
+        let mut out = vec![0.0f32; 256];
+        e.render_offline(&mut out);
+        e.settle_offline();
+    }
+
+    /// **A carry takes a moved plugin's newest settings, the displaced
+    /// shelf's before its file** (W5-identity-maps, after review). A comp
+    /// and an EQ trade bays; the comp is dialled in its new bay and then
+    /// replaced there by a plate; one step back crosses both moments. The
+    /// swap's inverse relabels are all there is to carry (a replace has
+    /// none), and they are carried while the plate still plays where the
+    /// comp went: the comp is playing nowhere, its new bay's FILE still holds
+    /// what the swap wrote, and the dial lives only on the displaced shelf,
+    /// where the replace put it. Read from the file, the comp came home
+    /// without the dial; read from the shelf (`incoming_state`'s own order),
+    /// it comes home dialled, and the rebuild seats it so.
+    #[test]
+    fn a_carry_takes_the_displaced_shelfs_dial_before_the_file() {
+        use tangent_ui::desk_id::BayRelabel;
+        let shelf = scratch("relabel-shelf").join("state");
+        let mut s = blank();
+        kind(&mut s, &[0, 1], ChannelKind::Audio);
+        let track = row(&s, 1);
+        let (a, b) = (SeatBay::new(track, Rack::Chain(0), 0), SeatBay::new(track, Rack::Chain(0), 1));
+        s.plugins.insert(a, COMP_PATH.to_owned());
+        s.plugins.insert(b, EQ_PATH.to_owned());
+        let before = app_with(s.clone());
+        let mut swapped = s.clone();
+        swapped.plugins.insert(a, EQ_PATH.to_owned());
+        swapped.plugins.insert(b, COMP_PATH.to_owned());
+        let after = app_with(swapped.clone());
+        let mut replaced = swapped;
+        replaced.plugins.insert(b, PLATE_PATH.to_owned());
+        let last = app_with(replaced);
+
+        let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+        let mut p = Bridge::new();
+        p.sync(&before, &mut e);
+        let (at_a, at_b) = (p.engine_bay(a).expect("bay a"), p.engine_bay(b).expect("bay b"));
+        let mut displaced = crate::shelf::DisplacedShelf::new();
+        e.load_insert_at(at_a.0, at_a.1, Some(Path::new(COMP_PATH)), Some(dialled(COMP_PATH, &[(0, 0.2)]).as_slice()))
+            .expect("the comp loads");
+        e.load_insert_at(at_b.0, at_b.1, Some(Path::new(EQ_PATH)), Some(dialled(EQ_PATH, &[(0, 0.8)]).as_slice()))
+            .expect("the EQ loads");
+        take_handoffs(&mut e);
+        // The host's half of a carry: what it wrote outranks the shelf, and
+        // what it wrote is rebuilt.
+        let land = |written: Vec<(SeatBay, String)>, displaced: &mut crate::shelf::DisplacedShelf| -> Vec<SeatBay> {
+            for (sb, bundle) in &written {
+                displaced.remove(&(*sb, bundle.clone()));
+            }
+            written.into_iter().map(|(sb, _)| sb).collect()
+        };
+
+        // The swap, carried and rebuilt.
+        let swap = [BayRelabel { from: a, to: b }, BayRelabel { from: b, to: a }];
+        let rebuild = land(carry_relabels(&after, &p, Some(&e), &displaced, &swap, &shelf), &mut displaced);
+        reconcile(&mut e, &p, &after, &mut displaced, &shelf, &[a, b], &rebuild);
+        let swap_file = crate::shelf::read_state(&shelf, b, COMP_PATH).expect("the swap wrote the comp's file");
+        // The comp dialled where it landed; nothing writes its file.
+        e.load_insert_at(at_b.0, at_b.1, Some(Path::new(COMP_PATH)), Some(dialled(COMP_PATH, &[(0, 0.9), (1, 0.1)]).as_slice()))
+            .expect("the dial");
+        take_handoffs(&mut e);
+        let dial = e.save_insert_state_at(at_b.0, at_b.1).expect("the comp's dial");
+        assert_ne!(dial, swap_file, "fixture: the dial is what the swap wrote");
+        // Replaced there by a plate: the reconcile shelves the dial.
+        reconcile(&mut e, &p, &last, &mut displaced, &shelf, &[a, b], &[]);
+
+        // One step back across both moments, the plate still playing.
+        let back = swap.map(BayRelabel::inverse);
+        let written = carry_relabels(&before, &p, Some(&e), &displaced, &back, &shelf);
+        assert!(written.contains(&(a, COMP_PATH.to_owned())), "the step back did not carry the comp home");
+        assert_eq!(
+            crate::shelf::read_state(&shelf, a, COMP_PATH),
+            Some(dial.clone()),
+            "the comp came home without its dial: the carry read its file and not the displaced shelf"
+        );
+        let rebuild = land(written, &mut displaced);
+        reconcile(&mut e, &p, &before, &mut displaced, &shelf, &[a, b], &rebuild);
+        assert_eq!(e.save_insert_state_at(at_a.0, at_a.1), Some(dial), "the comp plays in its own bay without its dial");
         let _ = std::fs::remove_dir_all(shelf.parent().expect("the scratch"));
     }
 
