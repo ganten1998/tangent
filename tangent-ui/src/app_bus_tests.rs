@@ -472,7 +472,9 @@ fn every_road_to_a_new_bus_is_one_moment_at_the_end_of_the_desk() {
 /// **A send's curve moves its send and names its bus wherever the bus
 /// stands** (`AutoParam::SendTo`): its dial reads and writes the send's
 /// level, moves nothing on a strip with no such send, and the curve is
-/// saved by its key and follows its bus through a reorder.
+/// saved by its key and follows its bus through a reorder. A lone base
+/// follows the send's row only once a send's curve is played
+/// (`SEND_CURVES_PLAY`).
 #[test]
 fn a_send_curve_moves_its_send_and_names_its_bus_wherever_it_stands() {
     use crate::automation::{AutoParam, Point, Shape};
@@ -495,12 +497,15 @@ fn a_send_curve_moves_its_send_and_names_its_bus_wherever_it_stands() {
     app.set_send_level(StripRef::Row(1), Node::Track(to), false, 0.5, true);
     assert_eq!(app.strip_send_to(StripRef::Row(1), Node::Track(to), false), None, "a level made a send");
     assert_eq!(app.hist_at, at, "a level that moved nothing was a moment");
-    // The mixer's row drags the same send, and its curve follows a lone base.
+    // The mixer's row drags the same send. A lone base follows it only on a
+    // curve that is played: until a send's is, the send's own level is what
+    // is heard, and the base stays where it was drawn.
     app.arrangement.automation.entry(0, p).put(Point { at_s: 0.0, value: 0.25, shape: Shape::Linear });
     app.apply_mixer_hit(Hit::SendLevel(Column::Track(0), 0), 0.75);
     assert_eq!(app.strip_send_to(StripRef::Row(0), Node::Track(to), false), Some(0.75));
     let base = app.arrangement.automation.get(AutoLane::Row(0), p).and_then(|c| c.points().first()).map(|q| q.value);
-    assert_eq!(base, Some(0.75), "a lone base did not follow its send");
+    let follows = if crate::automation::SEND_CURVES_PLAY { 0.75 } else { 0.25 };
+    assert_eq!(base, Some(follows), "a lone base followed a send curve nothing plays, or did not follow a played one");
     // Saved by its key, read back by it.
     let doc = app.arrangement.to_json();
     assert!(doc.contains(&format!("\"send:t{}\"", to.0)), "the send curve is not saved by its key");
@@ -513,12 +518,15 @@ fn a_send_curve_moves_its_send_and_names_its_bus_wherever_it_stands() {
     assert_eq!(app.strip_send_to(StripRef::Row(1), Node::Track(to), false), Some(0.5), "the curve lost its bus");
 }
 
-/// **A track's post-fader sends are offered for automation, by their
-/// buses' names** (`AutoParam::SendTo`): one row each in a Sends group of
-/// the A menu, keyed `send:t<id>`, after the desk's own four; a pre-fader
-/// send has no curve, and a track that sends nowhere has no group.
+/// **A track's post-fader sends are offered for automation by their
+/// buses' names, and only once their curves are played**
+/// (`AutoParam::SendTo`, `SEND_CURVES_PLAY`). Played: one row each in a
+/// Sends group of the A menu, keyed `send:t<id>`, after the desk's own
+/// four; a pre-fader send has no curve, and a track that sends nowhere has
+/// no group. Not played, as today: no Sends group on any track, whatever it
+/// sends, since a row drawn on would be a curve that moves nothing.
 #[test]
-fn a_tracks_post_fader_sends_are_offered_for_automation_by_their_buses_names() {
+fn a_tracks_post_fader_sends_are_offered_for_automation_only_once_their_curves_play() {
     let (_ctx, mut app) = app_on(desk(2), tiers::free("bus-auto-menu"));
     let a = app.new_bus(BusRole::Return).expect("a return");
     let b = app.new_bus(BusRole::Return).expect("a second return");
@@ -532,17 +540,62 @@ fn a_tracks_post_fader_sends_are_offered_for_automation_by_their_buses_names() {
     };
     let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
     assert_eq!(names.first(), Some(&"Desk"));
-    let sends = groups.iter().find(|g| g.name == "Sends").expect("no Sends group");
-    assert_eq!(
-        sends.rows.iter().map(|r| (r.key.clone(), r.label.clone())).collect::<Vec<_>>(),
-        vec![(format!("send:t{}", id.0), "send to Return 1".to_owned())],
-        "the menu does not offer exactly the post-fader send"
-    );
+    let sends = groups.iter().find(|g| g.name == "Sends");
+    if crate::automation::SEND_CURVES_PLAY {
+        assert_eq!(
+            sends.expect("no Sends group").rows.iter().map(|r| (r.key.clone(), r.label.clone())).collect::<Vec<_>>(),
+            vec![(format!("send:t{}", id.0), "send to Return 1".to_owned())],
+            "the menu does not offer exactly the post-fader send"
+        );
+    } else {
+        assert!(sends.is_none(), "the menu offers a send curve nothing plays");
+    }
     app.arr_open_automation_menu(AutoLane::Row(1));
     let Some(Dialog::Automation { groups, .. }) = &app.dialog else {
         panic!("not the automation menu");
     };
     assert!(groups.iter().all(|g| g.name != "Sends"), "a track that sends nowhere offered sends");
+}
+
+/// **No gesture makes a send curve while nothing plays one**
+/// (`AutoParam::plays`, `SEND_CURVES_PLAY`). A send row moved while its
+/// lane writes and the transport rolls lays no point down (the fader
+/// beside it, moved the same way, does: the lane is writing). The row does
+/// not open by its key, from the menu's tick or from anywhere else. And a
+/// lone base a file holds does not set the send on open, since the send's
+/// own level is what is heard. Once a send's curve is played, each of the
+/// three does what a fader's curve does.
+#[test]
+fn no_gesture_makes_a_send_curve_while_nothing_plays_one() {
+    use crate::automation::{AutoMode, AutoParam, Point, Shape, SEND_CURVES_PLAY};
+    let (_ctx, mut app) = app_on(desk(2), tiers::free("bus-curve-unplayed"));
+    let bus = app.new_bus(BusRole::Return).expect("a return");
+    assert!(app.add_send(StripRef::Row(0), bus));
+    let to = app.track_id_at(bus);
+    let p = AutoParam::SendTo { to };
+    let level = |app: &TangentApp| app.strip_send_to(StripRef::Row(0), Node::Track(to), false);
+    // A pass written on row 0's lane: its send row moved, then its fader.
+    app.arr_auto_modes.insert(app.owner_at(0), AutoMode::Write);
+    app.recorder.playing = true;
+    app.recorder.position_s = 2.0;
+    app.apply_mixer_hit(Hit::SendLevel(Column::Track(0), 0), 0.5);
+    assert_eq!(level(&app), Some(0.5), "the row did not move its send");
+    assert_eq!(
+        app.arrangement.automation.get(AutoLane::Row(0), p).is_some(),
+        SEND_CURVES_PLAY,
+        "a send row's move wrote a curve nothing plays, or wrote no played one"
+    );
+    app.apply_mixer_hit(Hit::Fader(Column::Track(0)), 0.5);
+    assert!(app.arrangement.automation.get(AutoLane::Row(0), AutoParam::Gain).is_some(), "fixture: the lane is not writing");
+    app.recorder.playing = false;
+    // The row, by its key, as the A menu's tick sends it.
+    app.apply_dialog_action(DialogAction::AutomationToggle(AutoLane::Row(0), p.key()));
+    assert_eq!(app.arr_auto_is_open(AutoLane::Row(0), p), SEND_CURVES_PLAY, "a row opened for a send curve nothing plays");
+    // A lone base read from a file, below where the send stands, then an open.
+    app.arrangement.automation.entry(0, p).set_points(vec![Point { at_s: 0.0, value: 0.25, shape: Shape::Linear }]);
+    app.reconcile_auto_bases();
+    let heard = if SEND_CURVES_PLAY { 0.25 } else { 0.5 };
+    assert_eq!(level(&app), Some(heard), "an open set the send from a curve nothing plays, or not from a played one");
 }
 
 /// **The undo sentinel catches a road that leaves a bus holding a clip**:

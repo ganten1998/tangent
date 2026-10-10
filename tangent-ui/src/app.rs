@@ -6530,7 +6530,8 @@ impl TangentApp {
             // **A send row's level**, by its place in this strip's list of
             // sends to buses, written through the send's one writer. Its
             // moment is the drag's release, as a fader's is; a curve on it
-            // with nothing but its base follows (`auto_sync_base`, below).
+            // with nothing but its base follows (`auto_sync_base`, below)
+            // once a send's curve is played (`AutoParam::plays`).
             H::SendLevel(i, k) => {
                 if let Some((sr, x)) = self.strip_bus_send_at(i, k) {
                     self.write_strip_send(sr, x.to, x.pre, f64::from(v));
@@ -6902,7 +6903,11 @@ impl TangentApp {
             }
             _ => return None,
         };
-        Some(row)
+        // **A control whose curve nothing plays stands on no row**
+        // (`AutoParam::plays`): moving it writes no point
+        // (`record_automation_move`) and drags no base (`auto_sync_base`),
+        // since a curve made either way would move nothing anybody hears.
+        Some(row).filter(|(_, p)| p.plays())
     }
 
     /// **Moving a control moves the base node of a lane that has only one.**
@@ -14604,7 +14609,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for curve in self.arrangement.automation.curves() {
             // Only a lone base, and only the controls this desk owns. A
             // plugin's parameter lives in the plugin and is not ours to set.
-            if curve.points().len() != 1 || matches!(curve.param, AutoParam::Plugin { .. }) {
+            // And only a curve that is played (`AutoParam::plays`): the node
+            // wins because the node is what is heard, and where nothing
+            // plays the curve it is the control that is heard.
+            if curve.points().len() != 1 || matches!(curve.param, AutoParam::Plugin { .. }) || !curve.param.plays() {
                 continue;
             }
             let Some(v) = curve.points().first().map(|p| p.value) else {
@@ -15815,6 +15823,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return;
         };
         if !self.arr_auto_open.remove(&row) {
+            // **No row opens for a curve nothing plays** (`AutoParam::plays`).
+            // The A menu offers none; this is the belt to its brace, so a key
+            // from anywhere else cannot open a row to draw, arm or dial a
+            // curve that moves nothing.
+            if !param.plays() {
+                return;
+            }
             self.arr_auto_open.insert(row);
             self.arr_seed_first_node(lane, param);
         }
@@ -16629,16 +16644,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **A track's sends to buses, each with a curve of its own**
         // (`AutoParam::SendTo`), named by the bus: the post-fader ones, in
         // the order the strip lists them. A pre-fader send is a cue feed set
-        // once, and has none.
+        // once, and has none. **Only curves the engine plays**
+        // (`AutoParam::plays`): until a send's is played the group is not
+        // offered, since a row drawn on would be a curve that moves nothing.
         if let AutoLane::Row(row) = lane {
             let rows: Vec<dialogs::AutoRow> = self
                 .strip_bus_sends(recorder::StripRef::Row(row))
                 .into_iter()
                 .filter(|x| !x.pre)
-                .filter_map(|x| {
-                    let p = AutoParam::SendTo { to: x.to.track()? };
-                    Some(dialogs::AutoRow { key: p.key(), label: self.auto_param_label(lane, p), on: self.arr_auto_is_open(lane, p) })
-                })
+                .filter_map(|x| Some(AutoParam::SendTo { to: x.to.track()? }))
+                .filter(|p| p.plays())
+                .map(|p| dialogs::AutoRow { key: p.key(), label: self.auto_param_label(lane, p), on: self.arr_auto_is_open(lane, p) })
                 .collect();
             if !rows.is_empty() {
                 groups.push(dialogs::AutoGroup { name: "Sends".to_owned(), rows });
@@ -17530,7 +17546,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 _ => return,
             },
             // A send row's level writes its send's curve, the post-fader
-            // ones that have one (`auto_row_of_hit`).
+            // ones that have one, once that curve is played
+            // (`auto_row_of_hit`).
             H::SendLevel(..) => match self.auto_row_of_hit(hit) {
                 Some((lane, param)) => (lane, param, f64::from(v)),
                 None => return,
@@ -35466,8 +35483,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **Take a send away.** One moment, and one undo brings it back at the
     /// level it had. A curve that drew its level stays in the document, as
     /// a plugin's does when its plugin leaves: it is somebody's work, it
-    /// moves nothing while there is no send (`auto_set_control`), and it
-    /// plays again if the send is made again.
+    /// moves nothing while there is no send (`auto_set_control`), and it is
+    /// the send's again if the send is made again.
     pub fn remove_send(&mut self, s: recorder::StripRef, to: crate::desk_id::Node, pre: bool) -> bool {
         if self.strip_send_to(s, to, pre).is_none() {
             return false;
