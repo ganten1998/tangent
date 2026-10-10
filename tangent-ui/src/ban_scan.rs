@@ -22,12 +22,16 @@
 //!   A clamp that is not a lane says what bounds it ([`NOT_LANES`]).
 //! * **The internal builds' switch** (`config::STAGING`), deleted with this
 //!   wave; nothing may route a build to the staging twins again.
-//! * **A home found off the one road** (W8-safe-tests): the `dirs` crate,
-//!   or a read of `HOME` or `USERPROFILE`, anywhere but
+//! * **A home found off the one road** (W8-safe-tests): a home-finding
+//!   crate by path (`dirs` and its cousins), a function that answers where
+//!   a home is (`std::env::home_dir`, the password database, the platforms'
+//!   folder calls), or the name of a variable a home is read from (`HOME`,
+//!   `USERPROFILE`, the XDG folders) in a shipped string, anywhere but
 //!   `tangent_core::config`, whose `home` a test build sends to a scratch
 //!   folder. A second road would put a test back among a person's files.
 //!   The two roads that are somebody else's are named by their function
-//!   ([`OTHER_HOMES`]).
+//!   ([`OTHER_HOMES`]), and a string that only says the word by what it is
+//!   ([`NOT_HOME_READS`]).
 //!
 //! **Live code is what ships**: comments, string and char literals, items
 //! under a test cfg (one no build outside a test satisfies, [`is_test_cfg`])
@@ -553,8 +557,80 @@ fn has_word(text: &str, word: &str) -> bool {
 /// `videos` beside it), which a test build turns into a scratch folder.
 const HOME_ROAD: &str = "tangent-core/src/config.rs";
 
-/// The environment variables a home is read from.
-const HOME_VARS: [&str; 4] = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"];
+/// **The environment variables a home is read from**, and the ones that
+/// name a folder inside it (the XDG base and user folders, Windows's
+/// application data): each is a person's files reached past the one road.
+const HOME_VARS: [&str; 13] = [
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DOCUMENTS_DIR",
+    "XDG_VIDEOS_DIR",
+    "XDG_MUSIC_DIR",
+];
+
+/// **The crates whose every answer is a home or a folder in one**, refused
+/// by path (`dirs::`, `home::`): the one road's own (`dirs`, which only
+/// [`HOME_ROAD`] may name) and its cousins, any of which a manifest could
+/// gain in one line.
+const HOME_CRATES: [&str; 13] = [
+    "dirs",
+    "dirs_next",
+    "dirs_sys",
+    "dirs_sys_next",
+    "directories",
+    "directories_next",
+    "home",
+    "etcetera",
+    "xdg",
+    "platform_dirs",
+    "known_folders",
+    "app_dirs2",
+    "homedir",
+];
+
+/// **What answers where a home is without a crate**, refused as a whole
+/// word: `home_dir`, which std still has (deprecated, and on the pinned
+/// toolchain it compiles without a warning, so removing `dirs` made no
+/// second road a compile error by itself) and which every home-finding
+/// crate names its answer, a method included; the password database, which
+/// ignores HOME; and each platform's own folder calls, with the user domain
+/// Foundation's are asked about. A variable may not take the name
+/// `home_dir` either: call it for what it holds.
+const HOME_CALLS: [&str; 15] = [
+    "home_dir",
+    "getpwuid",
+    "getpwuid_r",
+    "getpwnam",
+    "getpwnam_r",
+    "NSHomeDirectory",
+    "NSHomeDirectoryForUser",
+    "homeDirectoryForCurrentUser",
+    "NSSearchPathForDirectoriesInDomains",
+    "URLsForDirectory_inDomains",
+    "NSUserDomainMask",
+    "SHGetKnownFolderPath",
+    "SHGetFolderPathW",
+    "GetUserProfileDirectoryW",
+    "GetUserProfileDirectoryA",
+];
+
+/// **Strings that spell a home variable's name and read nothing**: the
+/// file, a word on the string's own line that says what it is, and why. An
+/// exemption that stops matching fails the scan
+/// (`every_exemption_names_what_is_still_there`).
+const NOT_HOME_READS: [(&str, &str, &str); 1] = [(
+    "tangent-ui/src/app.rs",
+    "media_home",
+    "the sampler browser's label for the media home, beside the folder it labels",
+)];
 
 /// **A road to a home that is not ours to send to the scratch folder**, by
 /// its file and the function it stands in: outside that function the file
@@ -586,32 +662,85 @@ const OTHER_HOMES: [Kept; 2] = [
 ];
 
 /// **Where live code finds a home without the one road**, one entry per
-/// hit: the `dirs` crate by path (every answer it has is a home or a folder
-/// under one) and a read of [`HOME_VARS`]. `code` is `src` as the lexer
-/// leaves it; the variable's name is a literal, so it is looked for on the
-/// source line of a live `var`/`var_os` call.
-fn home_roads_in(rel: &str, src: &str, code: &str) -> Vec<String> {
+/// line, naming everything on it: a [`HOME_CRATES`] crate by path, a
+/// [`HOME_CALLS`] word, and a shipped string that is a [`HOME_VARS`] name
+/// (a C string's trailing `\0` aside).
+///
+/// **The name is refused wherever it stands, not beside a read.** This
+/// looked for it on the line of a live `var`/`var_os` call, so a read
+/// split over lines (as rustfmt lays out a long call) or a name held in a
+/// `const` and read on another line passed; and `env!`, `getenv` and
+/// `vars().find(..)` read one with no `var` in sight. A string that only
+/// says the word without reading it says so in [`NOT_HOME_READS`].
+///
+/// `code` and `live` are `src` as the lexer leaves it ([`crate::copy_scan::Lexed`]):
+/// the words are read in `code`, where no string or comment can hold one,
+/// and the names in `live`, which keeps the shipped strings as written.
+fn home_roads_in(rel: &str, src: &str, code: &str, live: &str) -> Vec<String> {
     if rel == HOME_ROAD {
         return Vec::new();
     }
     let kept: Vec<std::ops::Range<usize>> =
         OTHER_HOMES.iter().filter(|k| k.file == rel).filter_map(|k| fn_lines(code, k.func)).collect();
-    let mut hits = Vec::new();
-    for (n, (live, line)) in code.lines().zip(src.lines()).enumerate() {
-        if kept.iter().any(|r| r.contains(&n)) {
-            continue;
-        }
-        let at = |what: &str| format!("{rel}:{}: {what}: {}", n + 1, line.trim());
-        if word_at(live, "dirs").iter().any(|(i, _)| live[i + "dirs".len()..].trim_start().starts_with("::")) {
-            hits.push(at("the `dirs` crate"));
-        }
-        if has_word(live, "var") || has_word(live, "var_os") {
-            for v in HOME_VARS.iter().filter(|v| line.contains(&format!("\"{v}\""))) {
-                hits.push(at(v));
+    let not_reads: Vec<&str> = NOT_HOME_READS.iter().filter(|(f, _, _)| *f == rel).map(|(_, w, _)| *w).collect();
+    let live_lines: Vec<&str> = live.lines().collect();
+    let mut found: std::collections::BTreeMap<usize, Vec<String>> = std::collections::BTreeMap::new();
+    for (n, line) in code.lines().enumerate() {
+        for krate in HOME_CRATES {
+            if word_at(line, krate).iter().any(|(i, _)| line[i + krate.len()..].trim_start().starts_with("::")) {
+                found.entry(n).or_default().push(format!("the `{krate}` crate"));
             }
         }
+        for call in HOME_CALLS.iter().filter(|c| has_word(line, c)) {
+            found.entry(n).or_default().push(format!("`{call}`"));
+        }
     }
-    hits
+    for (n, text) in string_literals(live) {
+        let name = text.strip_suffix("\\0").unwrap_or(&text);
+        if !HOME_VARS.contains(&name) {
+            continue;
+        }
+        if not_reads.iter().any(|w| live_lines.get(n).is_some_and(|l| has_word(l, w))) {
+            continue;
+        }
+        found.entry(n).or_default().push(format!("the home variable `{name}`"));
+    }
+    let src_lines: Vec<&str> = src.lines().collect();
+    found
+        .into_iter()
+        .filter(|(n, _)| !kept.iter().any(|r| r.contains(n)))
+        .map(|(n, what)| {
+            let line = src_lines.get(n).copied().unwrap_or_default().trim();
+            format!("{rel}:{}: {}: {line}", n + 1, what.join(", "))
+        })
+        .collect()
+}
+
+/// **Every string literal in `text`**, with the line it opens on (0-based)
+/// and what stands between its quotes as written (escapes unresolved):
+/// normal, byte and C strings, and raw ones with any number of hashes.
+/// `text` is a lexer view in which only strings hold a `"` (the `live`
+/// one: comments and char literals blanked).
+fn string_literals(text: &str) -> Vec<(usize, String)> {
+    let s: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let (mut i, mut line) = (0, 0);
+    while i < s.len() {
+        if let Some(end) = past_string(&s, i) {
+            let lit: String = s[i..end].iter().collect();
+            let open = lit.find('"').map_or(0, |k| k + 1);
+            let close = lit.rfind('"').unwrap_or(lit.len()).max(open);
+            out.push((line, lit[open..close].to_owned()));
+            line += lit.matches('\n').count();
+            i = end;
+            continue;
+        }
+        if s[i] == '\n' {
+            line += 1;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The lines (0-based, end exclusive) of the function whose signature in
@@ -677,9 +806,10 @@ fn no_live_code_names_the_fixed_desk() {
 /// tangent-ui another crate's tests link; that keeps a test away from a
 /// person's files only while every path to them is built on that road. So
 /// shipped code in every crate asks for a home there and nowhere else: not
-/// through the `dirs` crate, and not by reading `HOME` or `USERPROFILE`.
-/// [`OTHER_HOMES`] names the two roads that are somebody else's, each by
-/// its function.
+/// through a home-finding crate or a platform's own call, and not by
+/// reading `HOME`, `USERPROFILE` or a folder variable however the name
+/// reaches the read ([`home_roads_in`]). [`OTHER_HOMES`] names the two
+/// roads that are somebody else's, each by its function.
 #[test]
 fn no_live_code_finds_a_home_but_the_one_road() {
     let root = root();
@@ -698,9 +828,9 @@ fn no_live_code_finds_a_home_but_the_one_road() {
         }
         read += 1;
         let src = std::fs::read_to_string(f).expect("a source file");
-        let code = crate::copy_scan::lex(&src).code;
-        road |= rel == HOME_ROAD && code.contains("dirs::home_dir()");
-        hits.extend(home_roads_in(&rel, &src, &code));
+        let lexed = crate::copy_scan::lex(&src);
+        road |= rel == HOME_ROAD && lexed.code.contains("dirs::home_dir()");
+        hits.extend(home_roads_in(&rel, &src, &lexed.code, &lexed.live));
     }
     assert!(read > 150, "the scan read only {read} files");
     assert!(road, "{HOME_ROAD} no longer asks `dirs` for the home: the one road moved, so move HOME_ROAD");
@@ -720,8 +850,9 @@ fn every_exemption_names_what_is_still_there() {
     let root = root();
     for k in OTHER_HOMES {
         let src = std::fs::read_to_string(root.join(k.file)).expect("a kept road's file");
-        let code = crate::copy_scan::lex(&src).code;
-        let lines = fn_lines(&code, k.func).unwrap_or_else(|| panic!("{} no longer has `{}`", k.file, k.func));
+        let lexed = crate::copy_scan::lex(&src);
+        let code = &lexed.code;
+        let lines = fn_lines(code, k.func).unwrap_or_else(|| panic!("{} no longer has `{}`", k.file, k.func));
         // The function as the scan would read it with no exemption: its
         // lines alone, everything else blanked, so a hit is one of its own.
         let only = |text: &str| -> String {
@@ -731,7 +862,7 @@ fn every_exemption_names_what_is_still_there() {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let unkept = home_roads_in("tangent/src/x.rs", &only(&src), &only(&code));
+        let unkept = home_roads_in("tangent/src/x.rs", &only(&src), &only(code), &only(&lexed.live));
         assert!(!unkept.is_empty(), "{}'s `{}` no longer finds a home ({}): drop the exemption", k.file, k.func, k.why);
         if !k.called {
             let name = k.func.trim_start_matches("fn ").trim_end_matches('(');
@@ -750,6 +881,18 @@ fn every_exemption_names_what_is_still_there() {
                 );
             }
         }
+    }
+    for (file, word, why) in NOT_HOME_READS {
+        let live = crate::copy_scan::lex(&std::fs::read_to_string(root.join(file)).expect("a string's file")).live;
+        let names: Vec<usize> = string_literals(&live)
+            .into_iter()
+            .filter(|(_, text)| HOME_VARS.contains(&text.as_str()))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            live.lines().enumerate().any(|(n, l)| names.contains(&n) && has_word(l, word)),
+            "{file} no longer has a home variable's name beside `{word}` ({why}): drop the exemption"
+        );
     }
     for (file, name) in LOCAL {
         let src = std::fs::read_to_string(root.join(file)).expect("a local constant's file");
@@ -952,15 +1095,25 @@ fn a_cfg_that_only_spells_test_or_says_not_test_is_read_as_shipping() {
 }
 
 /// **A home found off the one road fails the scan** (design
-/// W8-safe-tests): the `dirs` crate by path, in a call, a function handed
-/// over or a `use`, and a read of each home variable. The road itself may;
-/// a kept road may only inside the function it names; a comment, a
-/// literal, a test item, a crate whose name only ends in the word and a
-/// literal that only says "HOME" are not hits.
+/// W8-safe-tests): every home-finding crate by path (in a call, a function
+/// handed over, a `use`), every platform's own call and `home_dir`, std's
+/// and any crate's, and every home variable's name however it reaches its
+/// read: in the call, on a line of its own inside it, held in a `const`,
+/// through `env!` or a C string. The road itself may; a kept road may only
+/// inside the function it names, and a kept string only on its line; a
+/// comment, a string that only holds the word, a test item and names that
+/// only contain one are not hits. Revert checks: the per-line `var` rule
+/// this replaced misses the split read and six plants (the `const`, the
+/// label-shaped tuple, `env!`, `vars().find` and both `getenv`s), and with
+/// the crate and call lists cut back to `dirs` as well it misses 37 of the
+/// 61, std's `home_dir` and every crate but `dirs` among them.
 #[test]
 fn a_home_found_off_the_one_road_fails_the_scan_when_planted() {
-    let scan = |rel: &str, src: &str| home_roads_in(rel, src, &crate::copy_scan::lex(src).code);
-    for plant in [
+    let scan = |rel: &str, src: &str| {
+        let lexed = crate::copy_scan::lex(src);
+        home_roads_in(rel, src, &lexed.code, &lexed.live)
+    };
+    let mut plants: Vec<String> = [
         "let h = dirs::home_dir();",
         "let d = dirs::document_dir().or_else(dirs::home_dir).unwrap();",
         "use dirs::video_dir;",
@@ -969,21 +1122,51 @@ fn a_home_found_off_the_one_road_fails_the_scan_when_planted() {
         "let h = std::env::var(\"USERPROFILE\").ok();",
         "let d = env::var_os(\"HOMEDRIVE\");",
         "let p = env::var_os(\"HOMEPATH\");",
-    ] {
+        // std's own, which the pinned toolchain compiles without a warning.
+        "let m = std::env::home_dir().unwrap().join(\"Documents/Tangent Media\");",
+        "let h = env::home_dir();",
+        "use std::env::home_dir;",
+        "let h = BaseDirs::new().map(|b| b.home_dir().to_owned());",
+        "let h = subdirs::home_dir();",
+        // The name apart from its read.
+        "const H: &str = \"HOME\";\nfn f() -> Option<OsString> {\n    std::env::var_os(H)\n}",
+        "let root = (\"HOME\".to_owned(), path);",
+        "let h = env!(\"HOME\");",
+        "let h = std::env::vars().find(|(k, _)| k == \"USERPROFILE\");",
+        "let p = unsafe { libc::getenv(c\"HOME\".as_ptr()) };",
+        "let p = unsafe { libc::getenv(b\"HOME\\0\".as_ptr().cast()) };",
+        "let r = std::env::var_os(r\"HOME\");",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    plants.extend(HOME_CRATES.iter().map(|c| format!("let x = {c}::BaseDirs::new();")));
+    plants.extend(HOME_CALLS.iter().map(|c| format!("let x = unsafe {{ {c}(0) }};")));
+    plants.extend(HOME_VARS.iter().map(|v| format!("let x = std::env::var_os(\"{v}\");")));
+    for plant in &plants {
         assert_eq!(scan("tangent/src/x.rs", plant).len(), 1, "missed: {plant}");
     }
+    // A read rustfmt split over lines is found at the name's own line.
+    let split = scan("tangent/src/x.rs", "let h = std::env::var_os(\n    \"HOME\",\n);");
+    assert_eq!(split.len(), 1, "missed the split read");
+    assert!(split[0].starts_with("tangent/src/x.rs:2:"), "found at the wrong line: {split:?}");
     assert!(scan(HOME_ROAD, "let h = dirs::home_dir().or_else(|| std::env::var_os(\"HOME\"));").is_empty());
     let kept = "pub fn search_paths() -> Vec<PathBuf> {\n    let h = std::env::var_os(\"HOME\");\n    Vec::new()\n}\n";
     assert!(scan("tangent-host/src/scan.rs", kept).is_empty(), "the kept road was flagged");
     let beside = format!("{kept}fn beside() {{\n    let h = dirs::home_dir();\n}}\n");
     assert_eq!(scan("tangent-host/src/scan.rs", &beside).len(), 1, "an exemption reached past its function");
     assert_eq!(scan("tangent/src/x.rs", kept).len(), 1, "an exemption reached past its file");
+    // The sampler's label, on its line; the same word anywhere else is not.
+    let label = "(\"HOME\".to_owned(), self.media_home().to_string_lossy().into_owned()),";
+    assert!(scan("tangent-ui/src/app.rs", label).is_empty(), "the sampler's label was flagged");
+    assert_eq!(scan("tangent-ui/src/app.rs", "(\"HOME\".to_owned(), path),").len(), 1, "a kept string reached past its line");
+    assert_eq!(scan("tangent/src/x.rs", label).len(), 1, "a kept string reached past its file");
     for fine in [
         "// dirs::home_dir() was the road, and var_os(\"HOME\") beside it",
-        "let s = \"dirs::home_dir()\";",
+        "/* std::env::home_dir() */ let s = \"dirs::home_dir() and HOME\";",
         "#[cfg(test)]\nfn t() { let _ = dirs::home_dir(); let _ = std::env::var_os(\"HOME\"); }",
-        "let h = subdirs::home_dir(); let d = my_dirs::x();",
-        "let root = (\"HOME\".to_owned(), path);",
+        "let d = my_dirs::x(); let e = subdirs::listing(); let f = homes::x(); let g = home_directory();",
+        "let home = tangent_core::config::home(); let k = egui::Key::Home; let n = \"Home\";",
+        "let p = value.strip_prefix(\"$HOME/\"); let q = \"HOME \"; let c = '\"';",
     ] {
         assert!(scan("tangent/src/x.rs", fine).is_empty(), "flagged: {fine}: {:?}", scan("tangent/src/x.rs", fine));
     }
