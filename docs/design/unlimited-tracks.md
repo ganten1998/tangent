@@ -1696,6 +1696,14 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 - **Holds:** during an arrangement record and a realtime export, insert, remove, reorder, kind and input-binding changes wait with the line, and Add appends without moving any row.
 - **Undo:** the `undo_commit` sentinel is silent. Undo and redo across add, insert, paste and delete restore rows with their ids and every state, one gesture per moment.
 
+
+**Carried in from wave 5 (2026-10-10, binding for this lane):**
+- The strip-space relay W5-identity-maps left: `Bridge::desk()` still hands the host's take facts a strip-space desk, and `TangentApp::desk()`, `recorder::Desk` (V32Desk) and the meters' legacy order remain. Retire them by moving `desktop.rs` `push_monitor_settings`, `muted_out_of_the_take`, `armed_racks_pending` and the meter fill off strip space.
+- The C11 seat-form adapters on TangentApp (`insert`, `set_insert`, `insert_bypassed`, `toggle_insert_bypass`, `set_insert_bypass`, `trade_inserts`, `open_insert_face`, `open_face_seats`, `set_insert_gr`, `set_builtin_face`, the seat `take_sampler_load` returns) go once the host stops calling them.
+- `desk_shape_held` is still a stub (W5-engine-memory-inputs): input-binding changes on non-recording tracks take effect mid-record. Implement it.
+- The capture tee skips a pick that reads nothing (`Renderer::mix_monitor`), so a capturing pick that loses its width mid-record (a device reopened narrower) stops its take silently. Make that loud.
+- Owner default kept unless overturned: a recording track whose input is cleared keeps monitoring its take's input until the record ends.
+- Design deviations to honour (recorded in the lane reports, not yet in sections 0-12): copy and paste are not relabels; a pad or FX swap is carried as SeatBay relabels (C11), not a seat permutation; `convert_global_shelf(launch)` takes the launch's shuffle set; `full_build` is a free function.
 ### W6-engine-buses-sends
 
 **Goal.** The engine half of unlimited buses, returns and sends, plus parallel post-fork work:
