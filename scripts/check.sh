@@ -92,7 +92,11 @@ echo "==> cargo test --workspace  (in a scratch home it watches: no test reaches
 # was gone). `scripts/check-home.sh run` is the proof and the net: HOME is a
 # fresh folder seeded with decoys where Tangent keeps a person's files, the
 # real folders are watched read-only, and a run that creates, changes or
-# deletes anything in either fails here, naming it.
+# deletes anything in either fails here, naming it, Tangent open or not
+# (close it first: its own writes cannot be told from a test's). The
+# selftest holds `run` to that with stub commands before anything relies on
+# it.
+scripts/check-home.sh selftest
 scripts/check-home.sh run cargo test --workspace --exclude linuxvideo --no-fail-fast
 
 echo "==> no build that ships carries test-home  (resolver 2 keeps it in test builds)"
