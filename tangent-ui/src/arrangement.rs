@@ -2,15 +2,17 @@
 //!
 //! # Why this is not in `settings.json`, and the decision is deliberate
 //!
-//! Settings are PREFERENCES: fixed-size arrays keyed by the desk's shape,
-//! migrated by `settings_version`, one set per user for ever. An arrangement
-//! is a DOCUMENT: an unbounded list of clips whose positions change with the
-//! work, one per song, and eventually a thing you hand to somebody. Folding
-//! the second into the first would mean exactly one arrangement for ever
-//! (starting a second song destroys the first), every schema change running a
-//! migration across everyone's colours and window geometry, and the
-//! `LEGACY_MAX_STRIPS` caps losing their meaning the moment an unbounded
-//! document shares the file. The owner weighed this and chose the split.
+//! Settings are PREFERENCES: one set per user for ever, migrated by
+//! `settings_version`, holding the desk a session starts from. An
+//! arrangement is a DOCUMENT: an unbounded list of clips whose positions
+//! change with the work, one per song, and eventually a thing you hand to
+//! somebody. Folding the second into the first would mean exactly one
+//! arrangement for ever (starting a second song destroys the first), and
+//! every schema change running a migration across everyone's colours and
+//! window geometry. The owner weighed this and chose the split. (The desk
+//! was once a set of fixed-size arrays keyed by its width, which was a
+//! third reason; it is the list of rows that exist now, in both files, read
+//! and written by one serializer, `desk_format`.)
 //!
 //! Deliberately NOT a "project" feature: no New/Open/Save-As, no dirty flag,
 //! no recent-files list. One file at a well-known path, auto-loaded and

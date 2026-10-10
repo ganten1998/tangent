@@ -369,10 +369,13 @@ pub struct LicenseStore {
     raw: Option<String>,
     license: Option<License>,
     /// **The Konami road.** True when the cheat marker sits beside the key
-    /// file: the install is supporter in every right - the heart, the wide
-    /// desk, the folded mixer - and the thanked name is "Cheater" until a
-    /// legitimate key replaces it. The owner's spec, verbatim spirit: the
-    /// code is a real unlock, not a demo mode.
+    /// file: the install is a supporter in every right (no limit on the
+    /// tracks it may create, and the heart) and the thanked name is
+    /// "Cheater" until a legitimate key replaces it. The owner's spec,
+    /// verbatim spirit: the code is a real unlock, not a demo mode. It used
+    /// to buy "the wide desk, the folded mixer"; a desk has no width now,
+    /// and the one thing standing decides about it is how many tracks may be
+    /// MADE (`recorder::track_cap`), never which exist.
     cheat: bool,
 }
 

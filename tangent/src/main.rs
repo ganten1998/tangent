@@ -106,19 +106,16 @@ mod instrument;
 #[cfg(all(test, feature = "recorder"))]
 mod rt_bench;
 /// The real-time building blocks of the slot engine (docs/design/
-/// unlimited-tracks.md section 7), landed unwired and proven against frozen
-/// copies of today's walks before W3 wires them in: a lane set with no width
-/// in its type, the per-shape desk plan, and the op/spine protocol. Told
-/// about the dead-code lint here, once, for the reason `units` is: their
-/// consumers are the next waves.
+/// unlimited-tracks.md section 7): a lane set with no width in its type, the
+/// per-shape desk plan, and the op/spine protocol the renderer runs on. They
+/// landed unwired in the first wave, under a module-wide dead-code allow
+/// until their consumers arrived; every one of them is read by the engine
+/// now, and what only the tests use is `#[cfg(test)]` where it stands.
 #[cfg(feature = "recorder")]
-#[allow(dead_code)]
 mod laneset;
 #[cfg(feature = "recorder")]
-#[allow(dead_code)]
 mod desk_plan;
 #[cfg(feature = "recorder")]
-#[allow(dead_code)]
 mod lane_bank;
 /// A counting allocator for this test binary and the alias harness: what the
 /// callback allocates today, measured before the engine is rebuilt.
