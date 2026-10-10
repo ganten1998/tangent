@@ -28322,7 +28322,8 @@ mod tests {
     #[test]
     fn an_armed_input_waiting_on_its_chain_holds_the_room_shut() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS, INSERTS};
+        use tangent_ui::recorder::{AMP_PEDALS, INSERTS};
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let armed_on = |ch: usize| 1u32 << ch;
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
@@ -28392,7 +28393,7 @@ mod tests {
     #[test]
     fn the_mics_wait_for_their_folders_denoiser_and_never_for_the_piano() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::folder_extra_seat;
+        use tangent_ui::desk_legacy::folder_extra_seat;
         let armed = 1u32 << 2 | 1 << 4 | 1 << 6;
         let audio = |ch: usize| matches!(ch, 0 | 4 | 6 | 7);
         let mut parents = [-1i32; CHANNELS];
@@ -28452,7 +28453,8 @@ mod tests {
     #[test]
     fn an_armed_inputs_chain_is_the_racks_its_audio_meets() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, Strip};
+        use tangent_ui::recorder::Strip;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let flat = [-1i32; CHANNELS];
         let audio = |_: usize| true;
         let no_routes = |_: usize| 0u32;
@@ -29220,7 +29222,7 @@ mod tests {
     #[test]
     fn a_shelved_state_is_its_bays_wherever_the_row_goes() {
         use tangent_ui::desk_legacy::V32_CHANNELS as CHANNELS;
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat};
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let master = tangent_ui::desk_lift::V32_MASTER;
         let ids = tangent_ui::desk_legacy::identity_ids(CHANNELS);
         let at = |ids: &[tangent_ui::desk_id::TrackId], seat: usize| {

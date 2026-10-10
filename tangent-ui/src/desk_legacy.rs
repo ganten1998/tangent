@@ -355,12 +355,6 @@ pub const BUS_EXTRA_SEATS: usize = BUS_EXTRA;
 /// The buses: every strip past the channels (drums, click, fx).
 pub const BUSES: usize = V32_STRIPS - V32_CHANNELS;
 
-/// Every legacy rack seat ([`V32_TOTAL_SEATS`]).
-pub const TOTAL_SEATS: usize = V32_TOTAL_SEATS;
-
-/// The legacy flat bay space ([`V32_INSERT_SPACE`]).
-pub const INSERT_SPACE: usize = V32_INSERT_SPACE;
-
 /// **Which seat and bay a strip's Nth DISPLAYED slot was**, by the strip's
 /// legacy index: the master's first three slots are its extra rack, a
 /// channel's and a bus's 3..5 their second seats.
@@ -520,11 +514,10 @@ impl Strip {
 /// bus, and what is heard. It was the live `recorder::Desk` the app built
 /// for the bridge every frame; the bridge and the host's take facts read
 /// the desk by identity now (`TangentApp::strip_send`, `strip_heard_muted`,
-/// W6), and this shape is kept, re-exported as `recorder::Desk`, for the
-/// one reader left that speaks strip space: the engine's cfg(test)
-/// `set_desk` shim and the goldens and benches that drive it, until that
-/// lane moves them (C11: the old form is deleted by the lane that stops
-/// using it).
+/// W6), and this shape is kept, under this name only since W8 retired the
+/// `recorder::Desk` re-export, for the one reader left that speaks strip
+/// space: the engine's cfg(test) `set_desk` shim and the goldens and
+/// benches that drive it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct V32Desk {
     /// How much of each strip goes to the effects bus, 0..=1, at its legacy
@@ -743,22 +736,20 @@ mod tests {
         assert!(hit.iter().all(|h| *h));
     }
 
+    /// **The counts the frozen map is built from are still the live
+    /// desk's**: bays per rack, pads per kit and pedals per board, which the
+    /// identity grammar and the app both read. The widths have no live twin
+    /// to agree with (the specials left strip space in W5 and the desk is
+    /// the list of rows that exist since W6), and the block bases' old names
+    /// are aliases of the literals above, held by the tiling proof at the
+    /// top of the file; W1 compared them with `recorder`'s live seat
+    /// arithmetic while that existed, and W8 dropped those comparisons with
+    /// it.
     #[test]
-    fn the_frozen_numbers_are_still_the_live_desks() {
-        // `V32_CHANNELS` and `V32_STRIPS` have no live twin to agree with:
-        // the specials left strip space (W5) and the desk is the list of
-        // rows that exist (W6), so the widths live here alone.
-        assert_eq!(V32_TOTAL_SEATS, TOTAL_SEATS);
-        assert_eq!(V32_INSERT_SPACE, INSERT_SPACE);
+    fn the_frozen_counts_are_still_the_live_desks() {
         assert_eq!(BAYS, recorder::INSERTS);
         assert_eq!(PADS, recorder::DRUM_PADS);
         assert_eq!(AMP_PEDALS, recorder::AMP_PEDALS);
-        assert_eq!(MASTER, MASTER_SEAT);
-        assert_eq!(MASTER_EXTRA, MASTER_EXTRA_SEAT);
-        assert_eq!(EXTRA_PADS, EXTRA_PAD_SEATS);
-        assert_eq!(FOLDER_EXTRA, FOLDER_EXTRA_SEATS);
-        assert_eq!(PEDALS, AMP_PEDAL_SEATS);
-        assert_eq!(BUS_EXTRA, BUS_EXTRA_SEATS);
     }
 
     /// The strip a legacy owner's slots are drawn on, in `Strip::index` space.

@@ -51623,7 +51623,7 @@ mod tests {
         app.set_insert(at, 0, Some("/x/Piano.vst3"));
         // And one in the LOWER rack, which is a seat of its own: a copy that
         // took only the first three would drop it silently.
-        let lower_src = recorder::folder_extra_seat(at);
+        let lower_src = crate::desk_legacy::folder_extra_seat(at);
         app.set_insert(lower_src, 1, Some("/x/Saturn 2.vst3"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -51673,7 +51673,7 @@ mod tests {
         assert!((app.settings.strip_send(recorder::StripRef::Row(to_at)) - 0.75).abs() < 1e-9, "the send");
         assert_eq!(app.insert(to_at, 0), Some("/x/Piano.vst3"), "the bay");
         assert_eq!(
-            app.insert(recorder::folder_extra_seat(to_at), 1),
+            app.insert(crate::desk_legacy::folder_extra_seat(to_at), 1),
             Some("/x/Saturn 2.vst3"),
             "the lower rack did not travel"
         );
@@ -57322,7 +57322,7 @@ mod tests {
     #[test]
     fn pad_fx_follow_their_track_through_a_reorder_and_its_undo() {
         use crate::desk_id::{Rack, SeatBay};
-        use crate::recorder::pad_rack_index;
+        use crate::desk_legacy::pad_rack_index;
         let root = project_scratch("padfx-reorder");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
@@ -63310,7 +63310,7 @@ mod tests {
     #[test]
     fn shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders() {
         let track_seat = recorder::Strip::Channel(3).index();
-        let folder_seat = recorder::folder_extra_seat(1);
+        let folder_seat = crate::desk_legacy::folder_extra_seat(1);
         for arrangement in [false, true] {
             let where_ = if arrangement { "arrangement" } else { "mixer" };
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -63408,11 +63408,11 @@ mod tests {
             app.add_bare_track(n);
         }
         app.toggle_folder(1);
-        let folder_seat = recorder::folder_extra_seat(1);
+        let folder_seat = crate::desk_legacy::folder_extra_seat(1);
         app.set_insert(folder_seat, 0, Some("/x/Verb.vst3"));
-        app.set_insert(recorder::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
+        app.set_insert(crate::desk_legacy::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
         app.toggle_insert_bypass(folder_seat, 0);
-        app.toggle_insert_bypass(recorder::MASTER_EXTRA_SEAT, 1);
+        app.toggle_insert_bypass(crate::desk_legacy::MASTER_EXTRA_SEAT, 1);
 
         let v = app.mixer_view();
         assert!(v.strips[recorder::Column::Track(1)].bypassed[3], "the mixer's folder rack lost the flag");
@@ -65564,7 +65564,7 @@ mod tests {
 
         // Into the SAME track's lower rack, which is another seat — the case
         // the drag no longer covers, because inside one strip a carry moves.
-        let lower = recorder::folder_extra_seat(0);
+        let lower = crate::desk_legacy::folder_extra_seat(0);
         app.paste_fx(bay(&app, lower, 0));
         let req = app.take_recorder_request();
         assert!(
@@ -65710,9 +65710,9 @@ mod tests {
         // **And the same channel's OTHER RACK is still the same channel** —
         // the owner's "make it such that fx inserts 1-3 can drag between
         // themselves AND between 4-6". Slots 3..5 of a channel live in an
-        // appended seat (`recorder::seat_bay`), so a carry across the middle
+        // appended seat (`desk_legacy::seat_bay`), so a carry across the middle
         // of the rack used to read as a drop on another strip and COPY.
-        let lower = recorder::folder_extra_seat(0);
+        let lower = crate::desk_legacy::folder_extra_seat(0);
         assert!(app.insert(lower, 0).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(lower, 0));
@@ -65729,7 +65729,7 @@ mod tests {
         // ...and ANOTHER track's lower rack is still another track, which
         // copies. "FX dragged BETWEEN different TRACKS should still auto
         // copy."
-        let elsewhere = recorder::folder_extra_seat(4);
+        let elsewhere = crate::desk_legacy::folder_extra_seat(4);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(elsewhere, 1));
         let req = app.take_recorder_request();
@@ -71362,9 +71362,9 @@ mod tests {").expect("the tests module")];
         // fixture is about WHICH channel's board the face reads, so the
         // seeded board comes off again, and one recognisable pedal per
         // channel goes on below.
-        if let Some(ch) = recorder::pedal_owner(seat) {
+        if let Some(ch) = crate::desk_legacy::pedal_owner(seat) {
             for p in 0..recorder::AMP_PEDALS {
-                app.set_insert(recorder::amp_pedal_seat(ch, p), 0, None);
+                app.set_insert(crate::desk_legacy::amp_pedal_seat(ch, p), 0, None);
             }
         }
         app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
@@ -71376,8 +71376,8 @@ mod tests {").expect("the tests module")];
         // One recognisable tenant on channel 1's board, and another on
         // channel 2's, so a face that read the WRONG channel's board would
         // draw a name rather than an empty chip and be caught saying so.
-        app.set_insert(recorder::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
-        app.set_insert(recorder::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
         app.mixer_open = true;
         pointer_frame(&ctx, &mut app, Vec::new());
         app.open_bay_face(app.legacy_bay(seat, bay).expect("a bay"));
@@ -71432,7 +71432,7 @@ mod tests {").expect("the tests module")];
 
         // The group's SECOND rack — slot 4, which is bay 1 of
         // `folder_extra_seat(1)`. Same board, because a channel owns one.
-        let (_ctx, app) = app_with_an_amp_face(recorder::folder_extra_seat(1), 1);
+        let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::folder_extra_seat(1), 1);
         let board = board_on_the_face(&app)
             .expect("an amp in a group's bays 3..5 still drew no board");
         assert_eq!(
@@ -71447,14 +71447,14 @@ mod tests {").expect("the tests module")];
         // And everything with no board of its own still says so: the master
         // wears none, in either of ITS two racks.
         for bay in [0usize, 1] {
-            let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_SEAT, bay);
+            let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::MASTER_SEAT, bay);
             assert_eq!(
                 board_on_the_face(&app),
                 None,
                 "the master's bay {bay} grew a pedalboard"
             );
         }
-        let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_EXTRA_SEAT, 0);
+        let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::MASTER_EXTRA_SEAT, 0);
         assert_eq!(
             board_on_the_face(&app),
             None,
@@ -71529,9 +71529,10 @@ mod tests {").expect("the tests module")];
     /// an amp ends in.)
     #[test]
     fn the_seeded_pedalboard_arrives_switched_off() {
-        use recorder::{amp_pedal_seat, folder_extra_seat, AMP_DEFAULT_BOARD, AMP_PEDALS};
+        use recorder::{AMP_DEFAULT_BOARD, AMP_PEDALS};
+        use crate::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         for amp_seat in [3usize, folder_extra_seat(5)] {
-            let ch = recorder::pedal_owner(amp_seat).expect("the seat owns a board");
+            let ch = crate::desk_legacy::pedal_owner(amp_seat).expect("the seat owns a board");
             let (_ctx, mut app) = headless(Caps::DESKTOP);
             for pedal in 0..AMP_PEDALS {
                 assert_eq!(app.insert(amp_pedal_seat(ch, pedal), 0), None, "the board was dressed before the amp landed");
@@ -71577,7 +71578,8 @@ mod tests {").expect("the tests module")];
     /// undo or an open never passes through the writer that seeds.
     #[test]
     fn an_amp_and_its_board_are_one_moment_and_undo_never_seeds_again() {
-        use recorder::{amp_pedal_seat, AMP_PEDALS};
+        use recorder::AMP_PEDALS;
+        use crate::desk_legacy::amp_pedal_seat;
         let root = project_scratch("ampboard");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
@@ -71641,7 +71643,7 @@ mod tests {").expect("the tests module")];
         // desk wants EMPTY chips beside the one dressed below, so the seeded
         // board comes off again.
         for p in 0..recorder::AMP_PEDALS {
-            app.set_insert(recorder::amp_pedal_seat(0, p), 0, None);
+            app.set_insert(crate::desk_legacy::amp_pedal_seat(0, p), 0, None);
         }
         app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: crate::faces_amp::AMP_PATH.to_owned(),
@@ -71652,7 +71654,7 @@ mod tests {").expect("the tests module")];
         // Pedal 2 dressed, so its chip wears a word a test can find. A suite
         // unit rather than a bundle: a bundle's editor is the host's own
         // window and opens no slot of ours at all.
-        app.set_insert(recorder::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
         app.mixer_open = true;
         app.open_bay_face(app.legacy_bay(0, 0).expect("a bay"));
         for _ in 0..3 {
@@ -71784,7 +71786,7 @@ mod tests {").expect("the tests module")];
         // And the pedal's own face is standing over it, on its own seat.
         assert_eq!(
             stacked_face(&app),
-            Some(bay_at(&app, recorder::amp_pedal_seat(0, 2), 0)),
+            Some(bay_at(&app, crate::desk_legacy::amp_pedal_seat(0, 2), 0)),
             "the chip opened the wrong window, or none"
         );
 
@@ -71952,7 +71954,7 @@ mod tests {").expect("the tests module")];
     #[test]
     fn the_insert_tap_goes_to_the_pedal_and_comes_back_to_the_amp() {
         let (ctx, mut app) = a_desk_with_an_amp_face();
-        let seat = recorder::amp_pedal_seat(0, 2);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 2);
         while app.take_recorder_request().is_some() {}
         click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
         let mut armed_pedal = false;
@@ -72082,7 +72084,7 @@ mod tests {").expect("the tests module")];
     fn a_pedal_picked_from_the_stack_opens_in_the_stack() {
         let (ctx, mut app) = a_desk_with_an_amp_face();
         // Pedal 5 is empty in the fixture, so its chip wears a plus.
-        let seat = recorder::amp_pedal_seat(0, 5);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 5);
         assert_eq!(app.insert(seat, 0), None, "the fixture dressed pedal 5");
         app.apply_dialog_action(DialogAction::OpenPedalFace {
             bay: bay_at(&app, 0, 0),
@@ -72146,7 +72148,7 @@ mod tests {").expect("the tests module")];
     /// to end.
     #[test]
     fn alt_and_shift_on_a_pedal_chip_do_what_they_do_on_a_bay() {
-        let seat = recorder::amp_pedal_seat(0, 2);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 2);
         // Alt empties the seat, exactly as it empties a bay.
         let (_ctx, mut app) = a_desk_with_an_amp_face();
         assert!(!app.alt_down && !app.shift_down, "the desk was holding a key");
@@ -77451,7 +77453,8 @@ mod folder_tests {
     /// settings file was handed.
     #[test]
     fn a_seat_past_the_map_cannot_size_the_desk() {
-        use crate::recorder::{INSERTS, INSERT_SPACE};
+        use crate::recorder::INSERTS;
+        use crate::desk_legacy::V32_INSERT_SPACE as INSERT_SPACE;
         let (root, doc) = a_project_with_a_desk("seat-past-map");
         // Two instruments this session's own settings do NOT seat, so
         // finding them proves the document's desk landed.
@@ -84331,7 +84334,7 @@ mod views_windowed_tests {
             }],
         ));
         a.set_insert(18, 0, Some("/Library/Audio/Plug-Ins/VST3/x.vst3"));
-        a.set_insert(recorder::amp_pedal_seat(19, 2), 0, Some("/Library/Audio/Plug-Ins/VST3/p.vst3"));
+        a.set_insert(crate::desk_legacy::amp_pedal_seat(19, 2), 0, Some("/Library/Audio/Plug-Ins/VST3/p.vst3"));
         // The raw writes above reach no app road; a gesture would end in
         // its commit, which marks.
         a.undo_commit();

@@ -31,8 +31,8 @@ pub struct StripView<'a> {
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
     /// **Six, because the master has two racks.** A channel fills the first
-    /// three and leaves the rest empty. See `recorder::seat_bay`, which is
-    /// the one place that knows a slot's real seat.
+    /// three and leaves the rest empty. See `desk_id::slot_key`, which is
+    /// the one place that knows a slot's real bay.
     pub inserts: [&'a str; INSERTS * 2],
     /// How many routes leave this channel, for the strips under the button.
     /// The routes THEMSELVES live on the view, not the strip: one borrow for
@@ -88,7 +88,7 @@ pub struct StripView<'a> {
     /// This channel's MIDI goes to the theory view — the **T** switch.
     pub to_theory: bool,
     /// This channel IS a folder — a group head, wearing six bays like the
-    /// master. See `recorder::folder_extra_seat`.
+    /// master: slots 3..5 are its second rack (`desk_id::slot_key`).
     pub is_folder: bool,
     /// This channel lives inside a folder above it. Drawn a step LOWER —
     /// the mixer's vertical answer to the arrangement's indent.
@@ -101,7 +101,7 @@ pub struct StripView<'a> {
     /// **Which bays are BYPASSED** — kept, loaded, editable, and not
     /// applied. Same indexing as `inserts` and `keyed`: the strip's visible
     /// slots, which for the master and a folder span two racks. The caller
-    /// resolves that through `recorder::seat_bay` before asking, exactly as
+    /// resolves that through `desk_id::slot_key` before asking, exactly as
     /// it does for the names.
     ///
     /// Appended after `keyed` and not woven in beside it, for the reason
@@ -1677,7 +1677,8 @@ pub struct StripStrip {
     /// A user effect plugin across this strip. Only the bus has one today.
     /// **Six, because the master has two racks.** A channel uses the first
     /// three and leaves the rest `NOTHING`; `recorder::bays_on` says how
-    /// many a strip actually draws. See `recorder::MASTER_EXTRA_SEAT`.
+    /// many a strip actually draws, and `desk_id::slot_key` which rack each
+    /// slot is (the master's show extra-first).
     pub inserts: [Rect; INSERTS * 2],
     /// The Routing button, under the insert bays — the owner's placement.
     pub routing: Rect,
@@ -5543,7 +5544,7 @@ mod tests {
     /// view to be the same as the current tracks'".
     ///
     /// The CLICK is in the sweep because it grew a second rack to be here
-    /// with: six slots seated in `recorder::BUS_EXTRA_SEATS`, and the engine
+    /// with: six slots on its two racks (`Node::Click`, chains 0 and 1), and the engine
     /// runs them.
     #[test]
     fn every_rack_on_the_desk_is_at_one_height() {

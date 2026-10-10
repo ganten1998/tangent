@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use tangent_record::audio::Timebase;
 use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
-use tangent_ui::recorder::Desk;
+use tangent_ui::desk_legacy::V32Desk as Desk;
 // The engine's shim speaks the legacy LANE table: routes by row number.
 use tangent_ui::routing::{LaneRoute as Route, LaneRoutes as Routes, LaneTarget as Target};
 
@@ -40,7 +40,7 @@ use crate::builtin_fx::{
     CHORUS_PATH, COMP_PATH, DENOISE_PATH, EQ_PATH, PLATE_PATH, SAMPLER_PATH, TRIM_PATH,
 };
 use crate::instrument::{
-    ClipNote, Engine, PadKit, Placed, PlacedMidi, SamplerSample, CHANNELS, MASTER_AUTO_LANE,
+    ClipNote, Engine, PadKit, Placed, PlacedMidi, SamplerSample, LEGACY_LANES, MASTER_AUTO_LANE,
     SAMPLER_ROOT_KEY,
 };
 
@@ -160,8 +160,8 @@ fn routes(list: &[(usize, Target, f32)]) -> Routes {
     )
 }
 
-fn folders(pairs: &[(usize, i32)]) -> [i32; CHANNELS] {
-    let mut p = [-1i32; CHANNELS];
+fn folders(pairs: &[(usize, i32)]) -> [i32; LEGACY_LANES] {
+    let mut p = [-1i32; LEGACY_LANES];
     for &(child, parent) in pairs {
         p[child] = parent;
     }
@@ -311,7 +311,7 @@ fn drums_pad_fx(on: bool) -> Engine {
     if on {
         seat(
             &mut e,
-            tangent_ui::recorder::pad_rack_index(6, 0),
+            tangent_ui::desk_legacy::pad_rack_index(6, 0),
             0,
             COMP_PATH,
             Some(&state(COMP_PATH, &[(0, 0.5), (1, 1.0)])),

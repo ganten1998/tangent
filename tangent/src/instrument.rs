@@ -355,13 +355,15 @@ fn retire_deadline(offline: bool) -> Instant {
 /// Peak-hold fall rate, matching `tangent-record`'s meter so the two read the same.
 const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 
-/// **The width of the legacy desk, as the engine's own number.** Every
-/// engine is built with this many lanes installed, row r at slot r (design 3),
-/// and the engine's frozen seat map and its arm word reach exactly this far:
-/// a lane past it has no pad racks until the wave that gives it them. (Its
-/// plugin racks, through their `HostRack`s, its instruments and its curves
-/// are reached at any slot.) The bridge gives a new track a slot below it
-/// whenever one is free or on its way home (`Bridge::install`).
+/// **The width of the legacy desk, as the engine's own number**: the
+/// thirty-two rows the frozen V32 files hold, and no width of anybody's
+/// desk. Every engine is built with this many lanes installed, row r at
+/// slot r (design 3), and the engine's legacy seat space ([`LEGACY_SEATS`],
+/// the frozen map) and the strip-space words its test shims write reach
+/// exactly this far. A lane past it keeps its racks, pad racks included, in
+/// the range after that map (`RackAddr::seat`), and its instruments and
+/// curves are reached at any slot. The bridge gives a new track a slot below
+/// it whenever one is free or on its way home (`Bridge::install`).
 pub(crate) const LEGACY_LANES: usize = 32;
 
 /// How many pads the drumpad has: the identity grammar's (`desk_id::PADS`),
@@ -369,14 +371,16 @@ pub(crate) const LEGACY_LANES: usize = 32;
 /// moves.
 pub const PADS: usize = tangent_ui::desk_id::PADS;
 
-/// Every rack seat one engine owns: the strips, the master, and one per PAD —
-/// the pads' bays ride the same index space as everything else, seats
-/// `STRIPS + 1 ..`, so loading, editors and state files need no second
-/// machinery. See `pad_rack_index`. **The frozen V32 seat map**
-/// (`desk_legacy::V32_TOTAL_SEATS`, design Appendix A): an engine's seats ARE
-/// that map for every lane below [`LEGACY_LANES`], row r's at slot r, so the
-/// number is the map's and never the UI's live desk.
-pub const RACK_SEATS: usize = tangent_ui::desk_legacy::V32_TOTAL_SEATS;
+/// Every rack seat one engine's legacy seat space holds: the strips, the
+/// master, and one per PAD — the pads' bays ride the same index space as
+/// everything else, seats `LEGACY_STRIPS + 1 ..`, so loading, editors and
+/// state files need no second machinery. See `pad_rack_index`. **The frozen
+/// V32 seat map** (`desk_legacy::V32_TOTAL_SEATS`, design Appendix A): an
+/// engine's seats ARE that map for every lane below [`LEGACY_LANES`], row
+/// r's at slot r, and a lane past them has its racks in the range after it,
+/// so the number is the map's and never a width of anybody's desk. It was
+/// `RACK_SEATS`, from when it was every seat there was.
+pub(crate) const LEGACY_SEATS: usize = tangent_ui::desk_legacy::V32_TOTAL_SEATS;
 
 /// **The lane the MASTER's automation curves are filed under, for the shims
 /// and the tests.** One past the legacy lanes, as `tangent_ui`'s
@@ -390,7 +394,7 @@ pub const MASTER_AUTO_LANE: usize = LEGACY_LANES;
 /// Where channel `ch`'s pad `i` keeps its bays. Declared in the UI beside
 /// the rest of the seat map; re-exported here so the engine names it the
 /// way it always has.
-pub use tangent_ui::recorder::pad_rack_index;
+pub use tangent_ui::desk_legacy::pad_rack_index;
 
 /// Pad 0's MIDI note; pad `n` answers `PAD_BASE + n`. See the UI's
 /// `DRUM_PAD_BASE` — one constant, declared there, read here.
@@ -718,31 +722,29 @@ pub enum Strip {
     Fx,
 }
 
-/// How many general channels one engine's legacy strip space holds: its
-/// [`LEGACY_LANES`], the engine's own number and never the UI's live desk
-/// width (design (C) of W4-integrate). The `From` impl below is what keeps
-/// the two strip enums provably the same shape while the UI's desk is the
-/// same thirty-two.
-pub const CHANNELS: usize = LEGACY_LANES;
-
-/// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 3;
+/// **The legacy strip space, master aside**: the [`LEGACY_LANES`] rows, then
+/// the drum bus, the click and the effects return (`Strip::index`), as the
+/// frozen V32 files wrote them (`desk_legacy::V32_STRIPS`). The master is
+/// the one past it. A width of the strip arrays the engine still reads in
+/// that shape, never of anybody's desk: it was `STRIPS`, and before it
+/// `CHANNELS` the desk's width, both gone with the fixed desk (design W8).
+pub(crate) const LEGACY_STRIPS: usize = LEGACY_LANES + 3;
 
 /// The master's own rack seat in the engine's seat space, after the
 /// channels and the three buses (Appendix A: 35).
-pub(crate) const MASTER_SEAT: usize = STRIPS;
+pub(crate) const MASTER_SEAT: usize = LEGACY_STRIPS;
 
 /// The master's second rack, after the legacy pad block (Appendix A: 164).
-pub(crate) const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + PADS;
+pub(crate) const MASTER_EXTRA_SEAT: usize = LEGACY_STRIPS + 1 + PADS;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
     pub const fn index(self) -> usize {
         match self {
             Strip::Channel(i) => i,
-            Strip::Drums => CHANNELS,
-            Strip::Click => CHANNELS + 1,
-            Strip::Fx => CHANNELS + 2,
+            Strip::Drums => LEGACY_LANES,
+            Strip::Click => LEGACY_LANES + 1,
+            Strip::Fx => LEGACY_LANES + 2,
         }
     }
 
@@ -764,7 +766,7 @@ impl Strip {
 /// The strip at a strip-space index (`Strip::index`'s inverse over the
 /// legacy strips), for the readouts that hand the host a strip-wide array.
 fn strip_of_index(i: usize) -> Strip {
-    match i.checked_sub(CHANNELS) {
+    match i.checked_sub(LEGACY_LANES) {
         Some(0) => Strip::Drums,
         Some(1) => Strip::Click,
         Some(2) => Strip::Fx,
@@ -849,7 +851,7 @@ fn strip_is_heard(strip: Strip, muted: u64, soloed: u64) -> bool {
 ///
 /// `parents` is the renderer's copy of `Shared::folder_of`, read once a
 /// block. The walk terminates because a parent index is always lower than
-/// its child's; `CHANNELS` is the belt-and-braces bound.
+/// its child's; [`LEGACY_LANES`] is the belt-and-braces bound.
 fn channel_is_heard(ch: usize, parents: &[i32], muted: u64, soloed: u64) -> bool {
     let bit = word_bit;
     // Muted anywhere up the chain: silent, whatever anything else says.
@@ -858,7 +860,7 @@ fn channel_is_heard(ch: usize, parents: &[i32], muted: u64, soloed: u64) -> bool
     let mut up = Some(ch);
     let mut hops = 0;
     while let Some(n) = up {
-        if hops > CHANNELS {
+        if hops > LEGACY_LANES {
             break;
         }
         if muted & bit(n) != 0 && n != ch {
@@ -879,7 +881,7 @@ fn channel_is_heard(ch: usize, parents: &[i32], muted: u64, soloed: u64) -> bool
     let mut up = Some(ch);
     let mut hops = 0;
     while let Some(n) = up {
-        if hops > CHANNELS {
+        if hops > LEGACY_LANES {
             break;
         }
         if soloed & bit(n) != 0 {
@@ -908,14 +910,14 @@ fn channel_is_heard(ch: usize, parents: &[i32], muted: u64, soloed: u64) -> bool
     // Its own mute still wins, for the reason stated at the top of this
     // function: nothing overrides a group being switched off, and soloing a
     // track inside a muted group is not a request to un-switch the group.
-    for kid in 0..CHANNELS {
+    for kid in 0..LEGACY_LANES {
         if kid == ch || soloed & bit(kid) == 0 {
             continue;
         }
         let mut up = parents.get(kid).copied().filter(|p| *p >= 0).map(|p| p as usize);
         let mut hops = 0;
         while let Some(n) = up {
-            if hops > CHANNELS {
+            if hops > LEGACY_LANES {
                 break;
             }
             if n == ch {
@@ -1013,8 +1015,8 @@ impl Shared {
     /// For the shims that rewrite a whole table at once, and the bypass and
     /// key tables, which do.
     fn seat_cells(&self, kind: SeatKind) -> impl Iterator<Item = (usize, &AtomicU32)> + '_ {
-        let legacy = (0..RACK_SEATS * INSERTS).filter_map(move |f| self.seat_cell(kind, f).map(|c| (f, c)));
-        let past = self.lanes.rows().filter(|(slot, _)| *slot >= CHANNELS).flat_map(move |(slot, _)| {
+        let legacy = (0..LEGACY_SEATS * INSERTS).filter_map(move |f| self.seat_cell(kind, f).map(|c| (f, c)));
+        let past = self.lanes.rows().filter(|(slot, _)| *slot >= LEGACY_LANES).flat_map(move |(slot, _)| {
             (0..LANE_RACKS).flat_map(move |rack| {
                 let seat = lane_seat(slot, rack);
                 (0..INSERTS).filter_map(move |b| {
@@ -1023,7 +1025,7 @@ impl Shared {
                 })
             })
         });
-        let pads = self.lanes.rows().filter(|(slot, _)| *slot >= CHANNELS).flat_map(move |(slot, l)| {
+        let pads = self.lanes.rows().filter(|(slot, _)| *slot >= LEGACY_LANES).flat_map(move |(slot, l)| {
             l.pad_racks.get().into_iter().flat_map(move |rows| {
                 rows.iter().enumerate().flat_map(move |(pad, r)| {
                     let seat = pad_seat(slot, pad);
@@ -1435,7 +1437,7 @@ fn lane_gain_of(auto: &AutoNow, shared: &Shared, phase: Option<&LaneSet>, lane: 
     // property of the strip that the level passes through.
     let flipped = match phase {
         Some(set) => set.contains(lane),
-        None => lane < CHANNELS && shared.strip_phase.load(Ordering::Relaxed) & word_bit(lane) != 0,
+        None => lane < LEGACY_LANES && shared.strip_phase.load(Ordering::Relaxed) & word_bit(lane) != 0,
     };
     if flipped {
         -g
@@ -2895,7 +2897,7 @@ struct Shared {
     /// Every instrument slot defaults to 1.0 and everything else to 0.0, which
     /// is exactly the routing this app had when the effects were an insert on
     /// the instrument bus — so an upgrade sounds identical.
-    send: [AtomicU32; STRIPS],
+    send: [AtomicU32; LEGACY_STRIPS],
     /// **Routing, packed for the audio thread.** A `Vec<Route>` cannot cross
     /// into a callback that must not allocate, lock or drop, so the table is
     /// a fixed array of packed words plus a count: the UI writes, the render
@@ -2912,7 +2914,7 @@ struct Shared {
     /// f32 bits. Read and RESET, like the limiter's gain reduction beside it:
     /// a peak is a transient and an average would read as almost nothing on
     /// exactly the material a meter is there for.
-    strip_peak: [[AtomicU32; 2]; STRIPS],
+    strip_peak: [[AtomicU32; 2]; LEGACY_STRIPS],
     pad_master: AtomicU32,
     /// One bit per strip. See [`Strip`].
     ///
@@ -3743,8 +3745,8 @@ impl Shared {
             pad_master: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicU64::new(0),
             auto_suspend: AtomicU64::new(0),
-            seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
-            seat_gr: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            seat_latency: (0..LEGACY_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            seat_gr: (0..LEGACY_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             learn_thr: (0..crate::units::denoise::DENOISE_BANDS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
@@ -3811,9 +3813,9 @@ impl Shared {
             insert_tap_route: AtomicU64::new(0),
             insert_tap_aim: AtomicU64::new(0),
             insert_tap: Mutex::new(None),
-            insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            insert_key: (0..LEGACY_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             insert_key_n: AtomicUsize::new(0),
-            insert_bypass: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            insert_bypass: (0..LEGACY_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             frozen: AtomicU32::new(0),
             pending_ir: Mutex::new(None),
             finished_ir: Mutex::new(None),
@@ -4949,7 +4951,7 @@ struct SeatParam {
 /// onto a different plugin. `TangentApp::master_bay` is the same rule on the way
 /// in, and this must not drift from it.
 ///
-/// **Not to be confused with `recorder::seat_bay`, which orders the master's
+/// **Not to be confused with `desk_legacy::seat_bay`, which orders the master's
 /// six slots the OTHER way round.** Both are correct and they are answering
 /// different questions. `seat_bay` is the panel's DISPLAY order: the extra
 /// rack was added above the original on the strip, a rack runs top to bottom,
@@ -4977,14 +4979,14 @@ pub(crate) fn param_slot(lane: usize, bay: usize, master: usize) -> Option<(usiz
             None
         };
     }
-    if lane < CHANNELS && bay >= INSERTS && bay < INSERTS * 2 {
+    if lane < LEGACY_LANES && bay >= INSERTS && bay < INSERTS * 2 {
         // A FOLDER's bays 3..5. Plain order - bay numbering and display
         // order agree, see `FOLDER_EXTRA_SEATS` - so no `master_bay` twin.
         // Unconditional on folder-hood on purpose: a curve outlives the
         // fold, exactly as the plugin state does.
-        return Some((tangent_ui::recorder::folder_extra_seat(lane), bay - INSERTS));
+        return Some((tangent_ui::desk_legacy::folder_extra_seat(lane), bay - INSERTS));
     }
-    if lane < CHANNELS {
+    if lane < LEGACY_LANES {
         return (bay < INSERTS).then_some((lane, bay));
     }
     // **A lane past the frozen map** (W6-rows-unlimited): its two chains'
@@ -4999,7 +5001,7 @@ pub(crate) fn param_slot(lane: usize, bay: usize, master: usize) -> Option<(usiz
         1 => CHAIN_EXTRA,
         _ => return None,
     };
-    let seat = (lane - CHANNELS).checked_mul(LANE_RACKS)?.checked_add(RACK_SEATS + rack)?;
+    let seat = (lane - LEGACY_LANES).checked_mul(LANE_RACKS)?.checked_add(LEGACY_SEATS + rack)?;
     Some((seat, bay % INSERTS))
 }
 
@@ -5116,27 +5118,27 @@ mod engine_parts {
             mk(0, 700, 3, 400, 16, 16, 1.0, 0.125),
             mk(1, 0, 0, 650, 0, 0, 1.0, -0.75),
             mk(2, 900_000, 0, 1_000, 0, 0, 1.0, 0.3),
-            mk(CHANNELS - 1, 640, 11, 500, 32, 0, 0.5, 0.9),
+            mk(LEGACY_LANES - 1, 640, 11, 500, 32, 0, 0.5, 0.9),
             // A gain the sanitiser has to catch, and one past the clamp.
             mk(4, 600, 0, 500, 0, 0, f32::NAN, 0.2),
             mk(5, 600, 0, 500, 0, 0, 1_000.0, 0.15),
         ];
         // A punch that cuts one lane part way through the span, which the
         // inversion turned from a per-frame test into a span bound.
-        let mut punch = [u64::MAX; CHANNELS];
+        let mut punch = [u64::MAX; LEGACY_LANES];
         punch[3] = 800;
         punch[1] = 0;
 
         let at = 640u64;
         let frames = 512usize;
-        let stride = CHANNELS * 2;
+        let stride = LEGACY_LANES * 2;
         // The desk, rebuilt the way it is built now: one pull per lane into
         // that lane's own planar buffer, scattered back into the whole-desk
         // layout the oracle below writes. Each lane is written exactly once,
         // because the pull zeroes and accumulates inside itself.
         let fill_desk = |dst: &mut [f32]| {
             let mut planar = vec![vec![0.0f32; frames]; TAP_CHANNELS];
-            for lane in 0..CHANNELS {
+            for lane in 0..LEGACY_LANES {
                 pull_lane_clips(&clips, lane, at, frames, punch[lane], &mut planar);
                 for f in 0..frames {
                     dst[f * stride + lane * 2] = planar[0][f];
@@ -5153,7 +5155,7 @@ mod engine_parts {
             let now = at + f as u64;
             for placed in &clips {
                 let lane = placed.strip;
-                if lane >= CHANNELS {
+                if lane >= LEGACY_LANES {
                     continue;
                 }
                 let Some(k) = now.checked_sub(placed.start) else {
@@ -5364,8 +5366,8 @@ mod engine_parts {
         let at = test_bounds(&sorted).expect("a sorted list has bounds");
         assert_eq!(at[0], 0);
         assert_eq!((at[1] - at[0], at[3] - at[2], at[8] - at[7]), (1, 2, 2));
-        assert_eq!(at[CHANNELS], sorted.len() as u32);
-        for ch in 0..CHANNELS {
+        assert_eq!(at[LEGACY_LANES], sorted.len() as u32);
+        for ch in 0..LEGACY_LANES {
             for placed in lane_run(&sorted, Some(&at), ch) {
                 assert_eq!(
                     placed.strip,
@@ -5385,7 +5387,7 @@ mod engine_parts {
         let pull = |clips: &[Placed], table: Option<&[u32]>| {
             let mut out = vec![vec![0.0f32; frames]; TAP_CHANNELS];
             let mut all = Vec::new();
-            for ch in 0..CHANNELS {
+            for ch in 0..LEGACY_LANES {
                 pull_lane_clips(lane_run(clips, table, ch), ch, 150, frames, u64::MAX, &mut out);
                 all.extend(out[0].iter().copied());
                 all.extend(out[1].iter().copied());
@@ -5466,10 +5468,10 @@ mod engine_parts {
         assert!(held.pan[5].is_some(), "suspending one lane silenced another");
 
         // And the plugin parameters, the same way.
-        let seats = RACK_SEATS * INSERTS;
+        let seats = LEGACY_SEATS * INSERTS;
         let mut out: Vec<Vec<tangent_host::ParamPoint>> =
             (0..seats).map(|_| Vec::with_capacity(8)).collect();
-        let mut touched = LaneSet::with_capacity(CHANNELS);
+        let mut touched = LaneSet::with_capacity(LEGACY_LANES);
         fill_automation_params(&doc, &none, false, &CurveOwners::EVERY, 7.5, &mut out, &mut touched);
         assert!(!touched.is_empty(), "no lane was reported awake, so nothing was written");
         let wrote: Vec<f32> = out.iter().flatten().map(|p| p.value as f32).collect();
@@ -5695,18 +5697,19 @@ mod engine_parts {
     /// seats beyond it are real ones the engine renders.
     #[test]
     fn the_editor_poll_reaches_the_seats_past_the_channel_strips() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        use tangent_ui::recorder::AMP_PEDALS;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         // The old window was seats `0..=STRIPS`, which is `(STRIPS + 1)`
         // seats of `INSERTS` bays each.
-        let old_last = STRIPS;
-        for ch in 0..CHANNELS {
+        let old_last = LEGACY_STRIPS;
+        for ch in 0..LEGACY_LANES {
             let extra = folder_extra_seat(ch);
             assert!(extra > old_last, "lane {ch}'s extra rack was inside the old window");
-            assert!(extra < RACK_SEATS, "lane {ch}'s extra rack is past every seat");
+            assert!(extra < LEGACY_SEATS, "lane {ch}'s extra rack is past every seat");
             for pedal in 0..AMP_PEDALS {
                 let seat = amp_pedal_seat(ch, pedal);
                 assert!(seat > old_last, "lane {ch} pedal {pedal} was inside the old window");
-                assert!(seat < RACK_SEATS, "lane {ch} pedal {pedal} is past every seat");
+                assert!(seat < LEGACY_SEATS, "lane {ch} pedal {pedal} is past every seat");
             }
         }
     }
@@ -5742,9 +5745,10 @@ mod engine_parts {
     /// this silently.
     #[test]
     fn the_seats_a_lane_owns_never_meet_another_lanes() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        use tangent_ui::recorder::AMP_PEDALS;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let mut seen = std::collections::HashMap::new();
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             let mut mine = vec![ch, folder_extra_seat(ch)];
             mine.extend((0..AMP_PEDALS).map(|p| amp_pedal_seat(ch, p)));
             // The order the frozen map lays them out in: own seat, then the
@@ -5755,7 +5759,7 @@ mod engine_parts {
                 "lane {ch}: the board is not past the extra seat"
             );
             assert!(
-                amp_pedal_seat(ch, AMP_PEDALS - 1) < RACK_SEATS,
+                amp_pedal_seat(ch, AMP_PEDALS - 1) < LEGACY_SEATS,
                 "lane {ch}: the board runs off the end of the bank"
             );
             for seat in mine {
@@ -5784,7 +5788,8 @@ mod engine_parts {
     /// else by exactly their lookahead.
     #[test]
     fn a_frozen_lane_stands_down_every_seat_it_owns() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        use tangent_ui::recorder::AMP_PEDALS;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let r = e.offline.as_ref().expect("a renderer");
         const CH: usize = 3;
@@ -5827,7 +5832,7 @@ mod engine_parts {
             CH + 1
         );
         // A bus seat belongs to no channel and must never be read as one.
-        let bus = tangent_ui::recorder::bus_extra_seat(Strip::Click.index());
+        let bus = tangent_ui::desk_legacy::bus_extra_seat(Strip::Click.index());
         assert_eq!(lane_of_seat(bus), None, "a bus seat was attributed to a channel");
     }
 
@@ -5901,7 +5906,7 @@ mod engine_parts {
     /// here rather than as a set.
     #[test]
     fn a_lane_that_is_live_in_any_way_is_never_rendered_ahead() {
-        use tangent_ui::recorder::folder_extra_seat;
+        use tangent_ui::desk_legacy::folder_extra_seat;
         // The rule answers in a set now, decoded from the words it is handed;
         // read back as the lane word every assertion below was written
         // against, so not one of them had to change to follow it.
@@ -5911,12 +5916,12 @@ mod engine_parts {
                             room: u32,
                             keys_live: bool|
          -> u32 {
-            let mut out = LaneSet::with_capacity(CHANNELS);
+            let mut out = LaneSet::with_capacity(LEGACY_LANES);
             pinned_lanes(
                 shared,
                 &DeskLanes::read(shared),
                 folders,
-                &(0..CHANNELS)
+                &(0..LEGACY_LANES)
                     .map(|c| shared.lanes.get(c).punch.load(Ordering::Relaxed))
                     .collect::<Vec<_>>(),
                 &LaneSet::from_u32(receives),
@@ -5924,11 +5929,11 @@ mod engine_parts {
                 keys_live,
                 &mut out,
             );
-            assert!(out.iter().all(|ch| ch < CHANNELS), "a lane past the desk was pinned");
+            assert!(out.iter().all(|ch| ch < LEGACY_LANES), "a lane past the desk was pinned");
             out.iter().fold(0u32, |m, ch| m | 1 << ch)
         };
         let shared = Shared::new();
-        let none = [false; CHANNELS];
+        let none = [false; LEGACY_LANES];
         // `Shared::new` arms everything and leaves every lane's MIDI on, so
         // start from the quiet desk a session actually has.
         shared.armed.store(0, Ordering::Relaxed);
@@ -5985,7 +5990,7 @@ mod engine_parts {
         assert!(!one(&shared));
 
         // A folder's rack runs at the fold, over the summed children.
-        let mut folders = [false; CHANNELS];
+        let mut folders = [false; LEGACY_LANES];
         folders[CH] = true;
         assert!(
             pinned_lanes(&shared, &folders, 0, 0, false) & bit != 0,
@@ -6023,7 +6028,7 @@ mod engine_parts {
 
         // The seven pedal seats are handed `None` and must NOT be scanned,
         // or the count goes the other way and under-reports.
-        shared.seat_cell(SeatKind::Key, tangent_ui::recorder::amp_pedal_seat(CH, 3) * INSERTS).expect("a seat")
+        shared.seat_cell(SeatKind::Key, tangent_ui::desk_legacy::amp_pedal_seat(CH, 3) * INSERTS).expect("a seat")
             .store(pack_key(2), Ordering::Relaxed);
         assert!(
             pinned_lanes(&shared, &none, 0, 0, true) & bit == 0,
@@ -6097,10 +6102,11 @@ mod engine_parts {
     /// the last lane is no lane's rather than lane 0's.
     #[test]
     fn every_lane_seat_is_found_in_its_own_lane() {
-        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        use tangent_ui::recorder::AMP_PEDALS;
+        use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let r = e.offline.as_mut().expect("an offline engine keeps its renderer");
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             let mut seats = vec![(ch, CHAIN_OWN), (folder_extra_seat(ch), CHAIN_EXTRA)];
             seats.extend((0..AMP_PEDALS).map(|p| (amp_pedal_seat(ch, p), 2 + p)));
             for (seat, rack) in seats {
@@ -6153,7 +6159,7 @@ fn seat_is_frozen(frozen: &LaneSet, seat: usize) -> bool {
 /// the master strip's, so both ask its bit; every other seat here is a strip
 /// already.
 fn chain_strip(at: usize) -> usize {
-    if at == MASTER_EXTRA_SEAT { STRIPS } else { at }
+    if at == MASTER_EXTRA_SEAT { LEGACY_STRIPS } else { at }
 }
 
 /// **How many lanes a desk word can name**: the width of the widest one, the
@@ -6284,7 +6290,7 @@ impl DeskLanes {
         load_word(&mut self.suspend, suspend & !master_bit);
         self.suspend_master = suspend & master_bit != 0;
         let off = shared.midi_off.load(Ordering::Relaxed);
-        self.strip_midi = std::array::from_fn(|i| off & (1u64 << (CHANNELS + i)) == 0);
+        self.strip_midi = std::array::from_fn(|i| off & (1u64 << (LEGACY_LANES + i)) == 0);
     }
 
     /// **Reload every set from a plan** (design 7.6): the lanes by their
@@ -6362,7 +6368,7 @@ impl DeskLanes {
     /// **Whether a strip-space index listens to MIDI**: a lane by its own
     /// bit, the drum bus, click, return and master by theirs.
     fn strip_listens(&self, strip: usize) -> bool {
-        match strip.checked_sub(CHANNELS) {
+        match strip.checked_sub(LEGACY_LANES) {
             Some(i) if i < self.strip_midi.len() => self.strip_midi[i],
             _ => self.midi_on.contains(strip),
         }
@@ -7504,7 +7510,7 @@ impl RackAddr {
     /// The engine-private seat this rack answers to. `None` for a rack the
     /// owner does not have.
     fn seat(self) -> Option<usize> {
-        use tangent_ui::recorder::bus_extra_seat;
+        use tangent_ui::desk_legacy::bus_extra_seat;
         let r = usize::from(self.rack);
         match self.owner {
             // `[own, extra, pedal 0..7]`, then pad `p` as `LANE_RACKS + p`:
@@ -7595,7 +7601,7 @@ impl Renderer {
 /// The engine still speaks seats at its edges (the host's handoff rings,
 /// the per-seat cells, the automation rows, the editors), so this is the one
 /// place a seat is turned into a lane's own rack. **Two ranges**: the frozen
-/// V32 map below `RACK_SEATS`, where lane `ch < 32` keeps the seats it has
+/// V32 map below [`LEGACY_SEATS`], where lane `ch < 32` keeps the seats it has
 /// always had, and the seats PAST it, which name the racks of lanes from
 /// slot 32 on, nine to a lane ([`lane_seat`]). A seat number is the engine's
 /// private name for a rack; nothing persists it.
@@ -7606,17 +7612,17 @@ fn lane_rack_of_seat(seat: usize) -> Option<(usize, usize)> {
     if seat >= PAD_SEAT_BASE {
         return None;
     }
-    if let Some(past) = seat.checked_sub(RACK_SEATS) {
-        return Some((CHANNELS + past / LANE_RACKS, past % LANE_RACKS));
+    if let Some(past) = seat.checked_sub(LEGACY_SEATS) {
+        return Some((LEGACY_LANES + past / LANE_RACKS, past % LANE_RACKS));
     }
-    if seat < CHANNELS {
+    if seat < LEGACY_LANES {
         return Some((seat, CHAIN_OWN));
     }
-    if let Some(ch) = tangent_ui::recorder::folder_extra_of(seat) {
-        return (ch < CHANNELS).then_some((ch, CHAIN_EXTRA));
+    if let Some(ch) = tangent_ui::desk_legacy::folder_extra_of(seat) {
+        return (ch < LEGACY_LANES).then_some((ch, CHAIN_EXTRA));
     }
-    tangent_ui::recorder::amp_pedal_of(seat)
-        .filter(|(ch, _)| *ch < CHANNELS)
+    tangent_ui::desk_legacy::amp_pedal_of(seat)
+        .filter(|(ch, _)| *ch < LEGACY_LANES)
         .map(|(ch, p)| (ch, 2 + p))
 }
 
@@ -7624,9 +7630,9 @@ fn lane_rack_of_seat(seat: usize) -> Option<(usize, usize)> {
 /// [`lane_rack_of_seat`]. The frozen map's own seats for the first
 /// thirty-two lanes, the range past it for every lane after them.
 fn lane_seat(slot: usize, rack: usize) -> usize {
-    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat};
-    if slot >= CHANNELS {
-        return RACK_SEATS + (slot - CHANNELS) * LANE_RACKS + rack;
+    use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
+    if slot >= LEGACY_LANES {
+        return LEGACY_SEATS + (slot - LEGACY_LANES) * LANE_RACKS + rack;
     }
     match rack {
         CHAIN_OWN => slot,
@@ -7653,20 +7659,20 @@ fn pad_seat(slot: usize, pad: usize) -> Option<usize> {
     if pad >= PADS {
         return None;
     }
-    if slot < CHANNELS {
+    if slot < LEGACY_LANES {
         return Some(pad_rack_index(slot, pad));
     }
     if slot >= tangent_ui::desk_id::MAX_ROWS {
         return None;
     }
-    (slot - CHANNELS).checked_mul(PADS)?.checked_add(PAD_SEAT_BASE + pad)
+    (slot - LEGACY_LANES).checked_mul(PADS)?.checked_add(PAD_SEAT_BASE + pad)
 }
 
 /// [`pad_seat`]'s inverse over the sparse range: the lane past slot 31 and
 /// its pad. `None` for every other seat, the frozen map's pads included.
 fn sparse_pad_of_seat(seat: usize) -> Option<(usize, usize)> {
     let past = seat.checked_sub(PAD_SEAT_BASE)?;
-    let slot = CHANNELS + past / PADS;
+    let slot = LEGACY_LANES + past / PADS;
     (slot < tangent_ui::desk_id::MAX_ROWS).then_some((slot, past % PADS))
 }
 
@@ -7675,7 +7681,7 @@ fn sparse_pad_of_seat(seat: usize) -> Option<(usize, usize)> {
 /// a rack by its seat and must now name it by identity. `None` for a seat no
 /// rack answers to.
 fn seat_addr(seat: usize) -> Option<RackAddr> {
-    use tangent_ui::recorder::bus_extra_of;
+    use tangent_ui::desk_legacy::bus_extra_of;
     let at = |owner: RackOwner, rack: usize| Some(RackAddr { owner, rack: u16::try_from(rack).ok()? });
     // A pad of a lane past slot 31 (`pad_seat`'s sparse range).
     if let Some((slot, pad)) = sparse_pad_of_seat(seat) {
@@ -7684,7 +7690,7 @@ fn seat_addr(seat: usize) -> Option<RackAddr> {
     if let Some((slot, rack)) = lane_rack_of_seat(seat) {
         return at(RackOwner::Lane(Slot(u32::try_from(slot).ok()?)), rack);
     }
-    let special = |strip: usize| match strip.checked_sub(CHANNELS) {
+    let special = |strip: usize| match strip.checked_sub(LEGACY_LANES) {
         Some(0) => Some(RackOwner::Drums),
         Some(1) => Some(RackOwner::Click),
         Some(2) => Some(RackOwner::Fx),
@@ -7710,7 +7716,7 @@ fn seat_addr(seat: usize) -> Option<RackAddr> {
         let rest = seat.checked_sub(pad_rack_index(1, 0))?;
         (1 + rest / PADS, rest % PADS)
     };
-    if ch >= CHANNELS {
+    if ch >= LEGACY_LANES {
         return None;
     }
     at(RackOwner::Lane(Slot(ch as u32)), LANE_RACKS + pad)
@@ -7892,7 +7898,7 @@ struct Wide {
     /// atomics inline, and read by both pull sites.
     punch_now: Box<[u64]>,
     /// **Where each lane's clips begin in `clips`**, one past the end at
-    /// `CHANNELS`. `None` when the list is not lane-monotonic, which a host
+    /// the spine's width. `None` when the list is not lane-monotonic, which a host
     /// that forgot to sort would produce and which must not be a wrong mix.
     ///
     /// Correctness never depends on it: `pull_lane_clips` skips clips whose
@@ -8119,7 +8125,7 @@ struct Wide {
 /// **How many rack seats a spine of `lanes` slots has**: the frozen map's,
 /// then nine for every lane past slot 31 (`lane_seat`).
 const fn seat_space(lanes: usize) -> usize {
-    RACK_SEATS + lanes.saturating_sub(CHANNELS) * LANE_RACKS
+    LEGACY_SEATS + lanes.saturating_sub(LEGACY_LANES) * LANE_RACKS
 }
 
 /// **A per-lane schedule's bounds**: `at[ch]..at[ch + 1]` is lane `ch`'s run
@@ -8220,7 +8226,7 @@ impl Wide {
             // walks it; a plan carries its route order already sorted
             // (`DeskPlan::routes`).
             #[cfg(test)]
-            route_deps: (0..CHANNELS).map(|_| LaneSet::with_capacity(CHANNELS)).collect(),
+            route_deps: (0..LEGACY_LANES).map(|_| LaneSet::with_capacity(LEGACY_LANES)).collect(),
             auto: AutoNow::with_capacity(lanes),
         }
     }
@@ -8321,10 +8327,11 @@ impl crate::lane_bank::SpineExt for Wide {
 /// with generation `gen`: a desk built today is a legacy desk, row r at
 /// slot r (design section 3).
 fn spine_from_bank(bank: Vec<Rack>, gen: u32) -> (Vec<Option<Rack>>, Spine<Lane, Wide>) {
-    use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+    use tangent_ui::recorder::AMP_PEDALS;
+    use tangent_ui::desk_legacy::{amp_pedal_seat, folder_extra_seat};
     let mut bank: Vec<Option<Rack>> = bank.into_iter().map(Some).collect();
-    let mut spine = Spine::with_ext(CHANNELS, FIRST_PICKS, Wide::new(CHANNELS));
-    for ch in 0..CHANNELS {
+    let mut spine = Spine::with_ext(LEGACY_LANES, FIRST_PICKS, Wide::new(LEGACY_LANES));
+    for ch in 0..LEGACY_LANES {
         let mut take = |seat: usize| bank.get_mut(seat).and_then(Option::take);
         let (Some(own), Some(extra)) = (take(ch), take(folder_extra_seat(ch))) else {
             continue;
@@ -8883,7 +8890,7 @@ fn fill_bounds<T: LaneOf>(clips: &[T], at: &mut [u32]) -> Option<()> {
 /// that read one.
 #[cfg(test)]
 fn test_bounds<T: LaneOf>(clips: &[T]) -> Option<Box<[u32]>> {
-    let mut b = LaneBounds::with_capacity(CHANNELS);
+    let mut b = LaneBounds::with_capacity(LEGACY_LANES);
     lane_bounds(clips, &mut b);
     b.valid.then_some(b.at)
 }
@@ -10604,7 +10611,7 @@ struct Renderer {
     /// desk does and what the plugin expects, and per-channel inserts would be
     /// nine instances of the same reverb running at once for a machine this
     /// app is careful about.
-    /// One rack per channel, master last — `Strip::index` and then `STRIPS`.
+    /// One rack per channel, master last — `Strip::index` and then `LEGACY_STRIPS`.
     ///
     /// **The effects bus is one of them.** It used to be a field of its own
     /// with its own hand-off and its own function; a bus is a channel with a
@@ -11246,7 +11253,7 @@ impl Renderer {
             // silence every strip that is. Masked off here, once: a mute on
             // the master is a real control (see `Shared::master_mute`) and a
             // solo on it is a light.
-            let soloed = self.shared.soloed.load(Ordering::Relaxed) & !(1u64 << STRIPS);
+            let soloed = self.shared.soloed.load(Ordering::Relaxed) & !(1u64 << LEGACY_STRIPS);
             return (muted, soloed);
         }
         use crate::desk_plan::LaneFlags as F;
@@ -11254,7 +11261,7 @@ impl Renderer {
         for lane in self.plan.lanes.iter() {
             let at = lane.slot.0 as usize;
             let solo = lane.flags.contains(F::SOLOED);
-            if at < CHANNELS {
+            if at < LEGACY_LANES {
                 if lane.flags.contains(F::MUTED) {
                     muted |= word_bit(at);
                 }
@@ -11286,7 +11293,7 @@ impl Renderer {
         if self.plan.gen == 0 {
             for i in 0..ext.order.len() {
                 let ch = ext.order[i] as usize;
-                let (h, flat) = if ch < CHANNELS {
+                let (h, flat) = if ch < LEGACY_LANES {
                     (
                         channel_is_heard(ch, &ext.folders, muted, soloed),
                         strip_is_heard(Strip::Channel(ch), muted, soloed),
@@ -11312,7 +11319,7 @@ impl Renderer {
             // `muted_now` has already folded the curve into, and the lane's
             // own row past them (W6-rows-unlimited), where `None` leaves the
             // plan's MUTED flag in charge as the button is.
-            ext.mute_rank[r] = if at < CHANNELS {
+            ext.mute_rank[r] = if at < LEGACY_LANES {
                 Some(muted & word_bit(at) != 0)
             } else {
                 ext.auto.mute.get(at).copied().flatten()
@@ -11591,7 +11598,7 @@ impl Renderer {
             // The frozen map's pads, in the bank, and every lane's own past
             // it (`PadRack`): a kit on lane 40 with a pad effect is as live
             // as one on lane 1.
-            self.pad_racks_live = (0..CHANNELS).any(|ch| {
+            self.pad_racks_live = (0..LEGACY_LANES).any(|ch| {
                 (0..PADS).any(|i| seat_rack(&self.racks, &self.spine.lanes, pad_rack_index(ch, i)).is_some_and(|r| !r.is_empty()))
             }) || self.spine.lanes.iter().flatten().any(|l| {
                 l.peek().pads.as_deref().is_some_and(|bank| bank.racks.iter().flatten().any(|p| !p.rack.is_empty()))
@@ -12556,7 +12563,7 @@ impl Renderer {
                 || seat_rack(
                     &self.racks,
                     &self.spine.lanes,
-                    tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
+                    tangent_ui::desk_legacy::bus_extra_seat(Strip::Click.index()),
                 )
                 .is_some_and(|r| !r.is_empty())
             {
@@ -12616,7 +12623,7 @@ impl Renderer {
                     // over what bays 0..2 just left. The click wears six now
                     // (`recorder::bays_on`), seated past everything in
                     // `BUS_EXTRA_SEATS`, and six bays are one chain.
-                    if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, tangent_ui::recorder::bus_extra_seat(Strip::Click.index())) {
+                    if let Some(rack) = seat_rack_mut(&mut self.racks, &mut self.spine.lanes, tangent_ui::desk_legacy::bus_extra_seat(Strip::Click.index())) {
                         run_extra_rack(
                             rack,
                             false,
@@ -12625,7 +12632,7 @@ impl Renderer {
                             &mut self.fx_out,
                             &self.shared,
                             &self.spine.ext.desk.frozen,
-                            tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
+                            tangent_ui::desk_legacy::bus_extra_seat(Strip::Click.index()),
                             n,
                             notes,
                             controls,
@@ -12807,7 +12814,7 @@ impl Renderer {
             // chain, with three empty bays added in front of them (and an
             // empty rack returns immediately).
             self.run_insert_chain(MASTER_EXTRA_SEAT, false, n);
-            self.run_insert_chain(STRIPS, false, n);
+            self.run_insert_chain(LEGACY_STRIPS, false, n);
             // **A curve on the master overrides its fader**, exactly as a
             // channel's does — see `lane_gain_of`. The stored position is
             // what the hand left; the curve is what the song says.
@@ -13721,7 +13728,7 @@ impl Renderer {
         // and only if one is open - see `route_transfer`. A plan's come from
         // its own transfer (`plan_routed_held`).
         #[cfg(test)]
-        let mut transfer: Option<[[f32; 2]; CHANNELS]> = None;
+        let mut transfer: Option<[[f32; 2]; LEGACY_LANES]> = None;
         for input in 0..self.monitor_picks.len().min(self.monitor_fades.len()) {
             let pick = self.monitor_picks[input];
             let width = usize::from(pick.width);
@@ -14578,7 +14585,7 @@ impl Renderer {
     /// themselves this block, so a plugin swapped in or out is reflected the
     /// next time anybody looks, and a stale number cannot survive a load.
     ///
-    /// The maximum is over the CHANNELS and the master's own chain — the
+    /// The maximum is over the channels and the master's own chain — the
     /// paths whose output reaches the same mix and therefore have to agree
     /// about when "now" is. The drum pads are deliberately not in it: there
     /// are a hundred and twenty-eight of them, they are struck rather than
@@ -14687,7 +14694,7 @@ impl Renderer {
             if !on_desk {
                 continue;
             }
-            // `lane`, emphatically not `STRIPS`. Asking every channel for
+            // `lane`, emphatically not `LEGACY_STRIPS`. Asking every channel for
             // the MASTER's figure reads plausibly and is wrong twice over:
             // the readout says each of the sixteen costs what the master
             // costs, and a limiter on the master alone drags every channel
@@ -14750,7 +14757,7 @@ impl Renderer {
         self.shared.max_latency.store(max, Ordering::Relaxed);
         // ...and the READOUT is the whole of it, because a figure that hides
         // latency somebody is paying is worth nothing.
-        let master = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, STRIPS);
+        let master = Rack::latency(&self.shared, &self.spine.ext.desk.frozen, LEGACY_STRIPS);
         self.shared
             .total_latency
             .store(max.saturating_add(master), Ordering::Relaxed);
@@ -14765,7 +14772,7 @@ impl Renderer {
     /// for is left alone rather than wrapped onto lane 0.
     fn muted_now(&self, muted: u64) -> u64 {
         let mut out = muted;
-        for lane in 0..CHANNELS {
+        for lane in 0..LEGACY_LANES {
             match self.spine.ext.auto.mute.get(lane).copied().flatten() {
                 Some(true) => out |= word_bit(lane),
                 Some(false) => out &= !word_bit(lane),
@@ -15493,7 +15500,7 @@ impl Renderer {
         // seat in the sparse range, `pad_seat`), made the first time a
         // plugin is seated on that pad. A kit past slot 31 summed its voices
         // dry here, its pad effects seated nowhere.
-        let sparse = lane_ix >= CHANNELS;
+        let sparse = lane_ix >= LEGACY_LANES;
         for i in 0..PADS {
             let rack_at = pad_seat(lane_ix, i).unwrap_or(usize::MAX);
             let rack_live = if sparse {
@@ -18348,7 +18355,7 @@ impl Renderer {
     /// **Whether channel `ch`'s pedalboard is armed this chunk**, asked of
     /// the racks that can hold the amp for that channel — its own, and, for
     /// a FOLDER, the extra rack its bays 3..5 live in
-    /// (`recorder::folder_extra_seat`).
+    /// (`desk_legacy::folder_extra_seat`).
     ///
     /// One function because four places have to agree and used to be three
     /// spellings of `rack_holds_amp(&self.racks[ch])`: the lane pass, the
@@ -18364,7 +18371,7 @@ impl Renderer {
     /// than removing it, which is precisely why it is one function.
     ///
     /// A channel owns ONE board and a folder has two racks; both racks
-    /// therefore share it. See `recorder::pedal_owner`, where that decision
+    /// therefore share it. See `desk_legacy::pedal_owner`, where that decision
     /// is written down, and `run_pedalboard`, which runs it once.
     /// **Every lane a live route lands on**, into [`Self::receives`]: a
     /// channel destination with a gain above zero. One spelling for the two
@@ -18373,7 +18380,7 @@ impl Renderer {
     fn fill_receives(&mut self) {
         self.spine.ext.receives.clear();
         for &(_, target, hardware, _, gain) in self.route_cache.iter().take(self.route_n) {
-            if !hardware && gain > 0.0 && target < CHANNELS {
+            if !hardware && gain > 0.0 && target < LEGACY_LANES {
                 self.spine.ext.receives.insert(target);
             }
         }
@@ -19214,7 +19221,7 @@ impl Renderer {
     /// routes make of it (`route_transfer`), on top of `base`. `None` for a
     /// strip with no route out. Test builds only, as the shim's table is.
     #[cfg(test)]
-    fn shim_routed_held(&self, lane: usize, base: [f32; 2], transfer: &mut Option<[[f32; 2]; CHANNELS]>) -> Option<[f32; 2]> {
+    fn shim_routed_held(&self, lane: usize, base: [f32; 2], transfer: &mut Option<[[f32; 2]; LEGACY_LANES]>) -> Option<[f32; 2]> {
         let routed = (0..self.route_n).any(|i| {
             let (from, _, hardware, _, _) = self.route_cache[i];
             from == lane && !hardware
@@ -19226,7 +19233,7 @@ impl Renderer {
         let mut held = base;
         for i in 0..self.route_n {
             let (from, target, hardware, _, gain) = self.route_cache[i];
-            if from == lane && !hardware && gain > 0.0 && target < CHANNELS {
+            if from == lane && !hardware && gain > 0.0 && target < LEGACY_LANES {
                 held[0] += gain * t[target][0];
                 held[1] += gain * t[target][1];
             }
@@ -19287,7 +19294,7 @@ impl Renderer {
         }
         for i in 0..self.route_n {
             let (from, target, hardware, _, gain) = self.route_cache[i];
-            if hardware || gain <= 0.0 || target >= CHANNELS || from >= CHANNELS {
+            if hardware || gain <= 0.0 || target >= LEGACY_LANES || from >= LEGACY_LANES {
                 continue;
             }
             if self.spine.ext.receives.contains(from) {
@@ -19299,12 +19306,12 @@ impl Renderer {
         // Kahn's, over bitmasks: at most CHANNELS passes, each a
         // handful of bit tests. No allocation, and nothing runs at
         // all on a desk with no routes.
-        let mut order = [0usize; CHANNELS];
+        let mut order = [0usize; LEGACY_LANES];
         let mut n_order = 0usize;
         self.spine.ext.route_placed.clear();
-        for _ in 0..CHANNELS {
+        for _ in 0..LEGACY_LANES {
             let mut moved = false;
-            for dest in 0..CHANNELS {
+            for dest in 0..LEGACY_LANES {
                 if !self.spine.ext.receives.contains(dest) || self.spine.ext.route_placed.contains(dest) {
                     continue;
                 }
@@ -19322,7 +19329,7 @@ impl Renderer {
         }
         // Whatever is left is in a cycle (a self-route counts): it
         // runs last, one hop, exactly as before.
-        for dest in 0..CHANNELS {
+        for dest in 0..LEGACY_LANES {
             if self.spine.ext.receives.contains(dest) && !self.spine.ext.route_placed.contains(dest) {
                 order[n_order] = dest;
                 n_order += 1;
@@ -19499,7 +19506,7 @@ impl Renderer {
             // A route naming a channel this build does not have is
             // dropped here rather than indexed with: the desk can shrink
             // between the write and the read.
-            if from >= CHANNELS || (!hardware && target >= CHANNELS) {
+            if from >= LEGACY_LANES || (!hardware && target >= LEGACY_LANES) {
                 continue;
             }
             let gain = f32::from_bits(self.shared.route_gain[i].load(Ordering::Relaxed));
@@ -19533,7 +19540,7 @@ impl Renderer {
         }
         // Sends are accumulated per destination and must start empty.
         if self.route_n > 0 {
-            if let Some(sa) = self.send_accum.get_mut(..CHANNELS * n * TAP_CHANNELS) {
+            if let Some(sa) = self.send_accum.get_mut(..LEGACY_LANES * n * TAP_CHANNELS) {
                 sa.fill(0.0);
             }
         }
@@ -20653,13 +20660,13 @@ impl Renderer {
     /// change nothing; the clear is there so the flag means what it says.)
     /// The arithmetic and its order are unchanged.
     #[cfg(test)]
-    fn route_transfer(&self) -> [[f32; 2]; CHANNELS] {
+    fn route_transfer(&self) -> [[f32; 2]; LEGACY_LANES] {
         fn walk(
             r: &Renderer,
             d: usize,
-            path: &mut [bool; CHANNELS],
-            t: &mut [[f32; 2]; CHANNELS],
-            done: &mut [bool; CHANNELS],
+            path: &mut [bool; LEGACY_LANES],
+            t: &mut [[f32; 2]; LEGACY_LANES],
+            done: &mut [bool; LEGACY_LANES],
         ) -> [f32; 2] {
             if done[d] {
                 return t[d];
@@ -20671,7 +20678,7 @@ impl Renderer {
             let mut on = [0.0f32; 2];
             for i in 0..r.route_n {
                 let (from, target, hardware, _, gain) = r.route_cache[i];
-                if from != d || hardware || gain <= 0.0 || target >= CHANNELS {
+                if from != d || hardware || gain <= 0.0 || target >= LEGACY_LANES {
                     continue;
                 }
                 let next = walk(r, target, path, t, done);
@@ -20686,10 +20693,10 @@ impl Renderer {
             done[d] = true;
             t[d]
         }
-        let mut t = [[0.0f32; 2]; CHANNELS];
-        let mut path = [false; CHANNELS];
-        let mut done = [false; CHANNELS];
-        for d in 0..CHANNELS {
+        let mut t = [[0.0f32; 2]; LEGACY_LANES];
+        let mut path = [false; LEGACY_LANES];
+        let mut done = [false; LEGACY_LANES];
+        for d in 0..LEGACY_LANES {
             walk(self, d, &mut path, &mut t, &mut done);
         }
         t
@@ -22778,12 +22785,12 @@ impl Engine {
         // most one handoff per bay is ever in flight — `hand_off_insert`
         // waits for the return before it starts another — and the spare
         // element is what lets `Rack::swap` check for room before it commits.
-        let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(RACK_SEATS);
+        let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(LEGACY_SEATS);
         // Collected into the `Vec` rather than an array: an array of a
         // rack per pad of every channel is BUILT ON THE STACK before it
         // moves into the struct, which is the overflow the field moved to
         // the heap to avoid. `collect` never forms the array at all.
-        let racks: Vec<Rack> = (0..RACK_SEATS).map(|_| {
+        let racks: Vec<Rack> = (0..LEGACY_SEATS).map(|_| {
             let mut ends: Vec<Handoff> = Vec::with_capacity(INSERTS);
             let mut incoming = Vec::with_capacity(INSERTS);
             let mut retiring = Vec::with_capacity(INSERTS);
@@ -22811,7 +22818,7 @@ impl Engine {
         }).collect();
         let mut rack_ends = rack_ends.into_iter();
         let host_racks = HostRacks {
-            dense: (0..RACK_SEATS)
+            dense: (0..LEGACY_SEATS)
                 .map(|_| HostRack::new(rack_ends.next().expect("one set per channel")))
                 .collect(),
             pads: std::collections::BTreeMap::new(),
@@ -22855,26 +22862,26 @@ impl Engine {
         // kit was refused and silently discarded, so a project with three
         // or more kits exported with the third onward SILENT - in the file,
         // not in the room, which is the worst place to find out.
-        let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(CHANNELS + 2);
-        let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(CHANNELS + 2);
+        let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(LEGACY_LANES + 2);
+        let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(LEGACY_LANES + 2);
         // The sampler's pair. Deeper than the kit's two: a project opening
         // with a sampler on several lanes delivers them in one frame, and a
         // ring of two would park all but the first two until the next.
         let (sampler_to_audio, sampler_incoming) =
-            RingBuffer::<(usize, Option<SamplerSample>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<SamplerSample>)>::new(LEGACY_LANES + 2);
         let (sampler_retiring, sampler_from_audio) =
-            RingBuffer::<(usize, Option<SamplerSample>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<SamplerSample>)>::new(LEGACY_LANES + 2);
         // The per-lane instruments' pairs. Deeper than the kit's two, because
         // a loading session can legitimately raise every lane at once and the
         // host's diff should land in one frame, not thirty-two.
         let (dx7_to_audio, dx7_incoming) =
-            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(LEGACY_LANES + 2);
         let (dx7_retiring, dx7_from_audio) =
-            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(LEGACY_LANES + 2);
         let (keys_to_audio, keys_incoming) =
-            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(LEGACY_LANES + 2);
         let (keys_retiring, keys_from_audio) =
-            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(CHANNELS + 2);
+            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(LEGACY_LANES + 2);
         let (preview_to_audio, preview_incoming) =
             RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2);
         let (preview_retiring, preview_from_audio) =
@@ -22969,7 +22976,7 @@ impl Engine {
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
+            lane_pedal_out: Vec::with_capacity(LEGACY_LANES * 3),
             pos: 0,
             seen_req: 0,
             was_rolling: false,
@@ -23102,7 +23109,7 @@ impl Engine {
             #[cfg(test)]
             routes_hw: false,
             #[cfg(test)]
-            send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
+            send_accum: vec![0.0; LEGACY_LANES * MAX_BLOCK as usize * TAP_CHANNELS],
             #[cfg(test)]
             send_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
@@ -23175,10 +23182,10 @@ impl Engine {
                     lined: false,
                     banked: true,
                 };
-                CHANNELS
+                LEGACY_LANES
             ],
             next_gen: LEGACY_GEN,
-            slot_capacity: CHANNELS,
+            slot_capacity: LEGACY_LANES,
             plan_shadows: Vec::new(),
             lines_owed: Vec::new(),
             monitor_pending: RefCell::new(None),
@@ -24312,7 +24319,7 @@ impl Engine {
     /// nearest folder ABOVE — so a violation here is a bug on the way in,
     /// and taking none of it beats taking half.
     #[cfg(test)]
-    pub fn set_folders(&self, parents: [i32; CHANNELS]) -> bool {
+    pub fn set_folders(&self, parents: [i32; LEGACY_LANES]) -> bool {
         for (ch, p) in parents.iter().enumerate() {
             if *p >= 0 && (*p as usize) >= ch {
                 return false;
@@ -24333,7 +24340,7 @@ impl Engine {
         // The renderer's own decode, of the words as they stand now: the
         // same `DeskLanes` and the same walk `Renderer::first_drum_lane`
         // takes over it.
-        DeskLanes::read(&self.shared).drums.iter().next().filter(|ch| *ch < CHANNELS)
+        DeskLanes::read(&self.shared).drums.iter().next().filter(|ch| *ch < LEGACY_LANES)
     }
 
     /// Every channel the built-in instrument is on.
@@ -24392,7 +24399,7 @@ impl Engine {
     /// Which channel each capture pick feeds: desk indices, `None` unbound.
     /// The live punch: `Some(frame)` while lane records over its clips.
     #[cfg(test)]
-    pub fn set_punches(&self, punches: [Option<u64>; CHANNELS]) {
+    pub fn set_punches(&self, punches: [Option<u64>; LEGACY_LANES]) {
         for (ch, p) in punches.into_iter().enumerate() {
             if let Some(l) = self.shared.lanes.cells(ch) {
                 l.punch.store(p.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -24485,7 +24492,7 @@ impl Engine {
     /// why this is separate from `set_midi_off`, and `MidiEvent::src` for how
     /// the device identity gets here at all.
     #[cfg(test)]
-    pub fn set_midi_routes(&self, routes: &[tangent_ui::recorder::MidiRoute; CHANNELS]) {
+    pub fn set_midi_routes(&self, routes: &[tangent_ui::recorder::MidiRoute; LEGACY_LANES]) {
         for (ch, r) in routes.iter().enumerate() {
             if let Some(c) = self.shared.lanes.cells(ch) {
                 c.midi_src.store(r.src, Ordering::Relaxed);
@@ -24967,7 +24974,7 @@ impl Engine {
     ///
     /// Each tuple is `(seat, bay, source_channel)` in ENGINE terms — the seat
     /// space `load_insert` speaks, the bay 0..[`INSERTS`], the source a desk
-    /// channel 0..[`CHANNELS`]. Out-of-range entries are dropped here, not
+    /// channel 0..[`LEGACY_LANES`]. Out-of-range entries are dropped here, not
     /// stored: the desk can shrink between the write and the read.
     ///
     /// **The count is stored LAST and cleared FIRST**, the routes' protocol.
@@ -24991,7 +24998,7 @@ impl Engine {
     // the publish path holds the engine by shared reference.
     #[cfg(test)]
     pub fn set_insert_keys(&self, keys: &[(usize, usize, usize)]) {
-        self.write_insert_keys(keys, CHANNELS);
+        self.write_insert_keys(keys, LEGACY_LANES);
     }
 
     /// The key table's one writer: clear, fill, count. A source at or past
@@ -25189,7 +25196,7 @@ impl Engine {
     /// Which pitches each lane's CLIPS are sounding right now.
     ///
     /// Playback only — see `Shared::lane_sounding`.
-    pub fn lane_sounding(&self) -> [u128; CHANNELS] {
+    pub fn lane_sounding(&self) -> [u128; LEGACY_LANES] {
         std::array::from_fn(|lane| {
             let lo = self
                 .shared
@@ -26462,7 +26469,7 @@ impl Engine {
     /// which is what makes the UI's strip order and this one provably the same
     /// rather than the same by inspection.
     #[cfg(test)]
-    pub fn set_desk(&self, desk: &tangent_ui::recorder::Desk) {
+    pub fn set_desk(&self, desk: &tangent_ui::desk_legacy::V32Desk) {
         let mut muted = 0u64;
         let mut soloed = 0u64;
         let sh = &self.shared;
@@ -26498,7 +26505,7 @@ impl Engine {
 
     /// The loudest thing each strip has made since this was last called, and
     /// it CLEARS as it reads. Zero for a strip that has been silent.
-    pub fn strip_peaks(&self) -> [[f32; 2]; STRIPS] {
+    pub fn strip_peaks(&self) -> [[f32; 2]; LEGACY_STRIPS] {
         std::array::from_fn(|i| {
             std::array::from_fn(|c| {
                 self.shared
@@ -26605,7 +26612,7 @@ impl Engine {
     /// accessor the desk happens not to ask for reads as dead however
     /// thoroughly it is exercised.
     #[allow(dead_code)]
-    pub fn latency_frames(&self) -> ([u32; CHANNELS], u32) {
+    pub fn latency_frames(&self) -> ([u32; LEGACY_LANES], u32) {
         (
             std::array::from_fn(|i| self.shared.lanes.get(i).latency.load(Ordering::Relaxed)),
             self.shared.total_latency.load(Ordering::Relaxed),
@@ -26642,7 +26649,7 @@ impl Engine {
         // generation, `CurveOwners::plays` answered no, and it was silent on
         // a lane the bridge had already installed (W6-rows-unlimited).
         let wide = auto.gens.iter().map(|(s, _)| s.0 as usize + 1).max().unwrap_or(0);
-        let mut gens = vec![0u32; wide.max(CHANNELS)];
+        let mut gens = vec![0u32; wide.max(LEGACY_LANES)];
         for (slot, gen) in auto.gens {
             if let Some(g) = gens.get_mut(slot.0 as usize) {
                 *g = gen;
@@ -29044,7 +29051,7 @@ mod tests {
         assert_eq!(Rack::latency(&shared, &DeskLanes::read(&shared).frozen, 1), 32);
         // A seat past the end of the table is a seat with nothing in it, and
         // says so instead of panicking: this is reached from the load path.
-        assert!(!seat(&shared, RACK_SEATS, 0, 99));
+        assert!(!seat(&shared, LEGACY_SEATS, 0, 99));
     }
 
     /// **Two figures, because one number cannot answer both questions.**
@@ -29060,7 +29067,7 @@ mod tests {
     fn the_alignment_target_and_the_readout_are_different_numbers() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
 
         // Nothing loaded: both are zero and there is nothing to tell apart.
         r.publish_latency();
@@ -29086,7 +29093,7 @@ mod tests {
         seat(&shared, 3, 1, 128);
         r.publish_latency();
         let (lanes, shown) = (
-            std::array::from_fn::<u32, CHANNELS, _>(|i| {
+            std::array::from_fn::<u32, LEGACY_LANES, _>(|i| {
                 shared.lanes.get(i).latency.load(Ordering::Relaxed)
             }),
             shared.total_latency.load(Ordering::Relaxed),
@@ -29554,7 +29561,7 @@ mod tests {
         // the number has to reach `take.json`.
         let shared = Arc::new(Shared::new());
         let (tx, rx) = RingBuffer::<f32>::new(8 * TAP_CHANNELS);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tx, 2);
         for (i, s) in r.tap_scratch.iter_mut().enumerate() {
             *s = i as f32;
         }
@@ -29603,7 +29610,7 @@ mod tests {
             "before the first callback nobody has measured anything"
         );
 
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tx, 2);
         let mut out = vec![0.0f32; 128 * 2];
         let now = 1_000_000_000;
         // 128 frames at 48 kHz, which is the shape a healthy backend reports.
@@ -29655,7 +29662,7 @@ mod tests {
         // What `Engine::start` stores for a Linux stream: 256 a callback out of
         // a 1024-frame ring.
         shared.out_ring_asked.store(1024, Ordering::Relaxed);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tx, 2);
         // `render`, not `render_program`: the block is counted from the buffer
         // the DEVICE handed over, which is the outer function's business.
         // `render_program` takes a frame count it has already been told.
@@ -29817,7 +29824,7 @@ mod tests {
         // rack per pad of every channel is BUILT ON THE STACK before it
         // moves into the struct, which is the overflow the field moved to
         // the heap to avoid. `collect` never forms the array at all.
-        let racks: Vec<Rack> = (0..RACK_SEATS).map(|_| {
+        let racks: Vec<Rack> = (0..LEGACY_SEATS).map(|_| {
             let mut inc = Vec::new();
             let mut ret = Vec::new();
             for _ in 0..INSERTS {
@@ -29868,7 +29875,7 @@ mod tests {
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
             route_n: 0,
             routes_hw: false,
-            send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
+            send_accum: vec![0.0; LEGACY_LANES * MAX_BLOCK as usize * TAP_CHANNELS],
             send_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -29935,7 +29942,7 @@ mod tests {
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
+            lane_pedal_out: Vec::with_capacity(LEGACY_LANES * 3),
             pos: 0,
             seen_req: 0,
             was_rolling: false,
@@ -30019,7 +30026,7 @@ mod tests {
         shared.builtin_strips.store(1, Ordering::Relaxed);
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, dev_ch);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, dev_ch);
         r.lane_body_mut(0).dx7 = Some(Box::new(crate::dx7::Dx7::new(RATE as f32)));
         r.midi = midi_rx;
         (r, midi_tx, shared)
@@ -30260,8 +30267,8 @@ mod tests {
         // A seat past the general channels: the pads' rows are exactly what the
         // widened ledger added, and an off-by-one here would show as a silent
         // drop rather than a panic.
-        let pad = RACK_SEATS - 1;
-        assert!(pad >= CHANNELS, "the test wants a seat past the channels");
+        let pad = LEGACY_SEATS - 1;
+        assert!(pad >= LEGACY_LANES, "the test wants a seat past the channels");
         tx.push(UiParam::at_seat(pad, 1, 7, 0.25)).expect("the ring is empty");
         // No automation at all — the shortcut path, which is the common song.
         assert!(r.automation.is_empty());
@@ -30485,10 +30492,10 @@ mod tests {
         };
         let mut engine = Engine::start(None).expect("an audio output");
         engine
-            .load_insert(STRIPS, 0, Some(&bundle), None)
+            .load_insert(LEGACY_STRIPS, 0, Some(&bundle), None)
             .expect("an instrument must load in a bay - the refusal is gone");
         assert!(
-            engine.insert(STRIPS, 0).is_some(),
+            engine.insert(LEGACY_STRIPS, 0).is_some(),
             "the bay does not report its instrument"
         );
 
@@ -30519,7 +30526,7 @@ mod tests {
 
         // Let the tails die, then gate the channel and play again.
         std::thread::sleep(Duration::from_millis(2500));
-        engine.set_midi_off(1 << STRIPS);
+        engine.set_midi_off(1 << LEGACY_STRIPS);
         let t = engine.timebase().now();
         for n in [48u8, 60, 64, 67] {
             engine.send_midi(t, &[0x90, n, 100]);
@@ -30820,7 +30827,7 @@ mod tests {
         // on. The helper already put a DX7 on lane 0, mask and instance.
         shared.builtin_strips.store(1, Ordering::Relaxed);
         let mut mask = 0;
-        for i in 0..CHANNELS {
+        for i in 0..LEGACY_LANES {
             mask |= Strip::Channel(i).bit();
         }
         shared.muted.store(mask, Ordering::Relaxed);
@@ -31096,7 +31103,7 @@ mod tests {
             }
             e.set_drum_strips((1 << 5) | (1 << 6));
             if folder {
-                let mut parents = [-1i32; CHANNELS];
+                let mut parents = [-1i32; LEGACY_LANES];
                 parents[5] = 2;
                 parents[6] = 2;
                 assert!(e.set_folders(parents), "the tree was refused");
@@ -31176,15 +31183,15 @@ mod tests {
                 e.set_channel_gain(l, 1.0);
             }
             e.set_drum_strips((1 << KID) | (1 << OTHER));
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[KID] = GROUP as i32;
             assert!(e.set_folders(parents), "the tree was refused");
             e.set_channel_gain(GROUP, 1.0);
             // The desk is pushed WHOLE, the way the host pushes it — the
             // masks are built inside `set_desk` so "is anything soloed"
             // cannot disagree with itself. See its own note.
-            let mut desk = tangent_ui::recorder::Desk::default();
-            for n in 0..CHANNELS {
+            let mut desk = tangent_ui::desk_legacy::V32Desk::default();
+            for n in 0..LEGACY_LANES {
                 let at = tangent_ui::recorder::Strip::Channel(n).index();
                 desk.muted[at] = muted & (1u64 << n) != 0;
                 desk.soloed[at] = soloed & (1u64 << n) != 0;
@@ -31265,7 +31272,7 @@ mod tests {
             e.set_channel_gain(l, 1.0);
         }
         e.set_drum_strips((1 << 5) | (1 << 6));
-        let mut parents = [-1i32; CHANNELS];
+        let mut parents = [-1i32; LEGACY_LANES];
         parents[5] = 2;
         parents[6] = 2;
         assert!(e.set_folders(parents));
@@ -31673,7 +31680,7 @@ mod tests {
             .expect("the bay reports it");
         if trim_in_pedal {
             e.load_insert(
-                tangent_ui::recorder::amp_pedal_seat(CH, 0),
+                tangent_ui::desk_legacy::amp_pedal_seat(CH, 0),
                 0,
                 Some(Path::new(crate::builtin_fx::TRIM_PATH)),
                 Some(&loud),
@@ -31729,7 +31736,7 @@ mod tests {
         if let Some(slot) = slot {
             // Through the seat map, like every other caller: it is what
             // answers 3..5 out of the channel's own folder-extra seat.
-            let (seat, bay) = tangent_ui::recorder::seat_bay(CH, slot);
+            let (seat, bay) = tangent_ui::desk_legacy::seat_bay(CH, slot);
             e.load_insert(seat, bay, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&loud))
                 .expect("the seat admits a built-in")
                 .expect("the bay reports it");
@@ -31860,7 +31867,7 @@ mod tests {
         let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
         let loud = crate::builtin_fx::state_text(spec, &[1.0], &[]).into_bytes();
         let amp_seat = if extra_rack {
-            tangent_ui::recorder::folder_extra_seat(GROUP)
+            tangent_ui::desk_legacy::folder_extra_seat(GROUP)
         } else {
             GROUP
         };
@@ -31869,7 +31876,7 @@ mod tests {
             .expect("the bay reports it");
         if trim_in_pedal {
             e.load_insert(
-                tangent_ui::recorder::amp_pedal_seat(GROUP, 2),
+                tangent_ui::desk_legacy::amp_pedal_seat(GROUP, 2),
                 0,
                 Some(Path::new(crate::builtin_fx::TRIM_PATH)),
                 Some(&loud),
@@ -31877,7 +31884,7 @@ mod tests {
             .expect("a pedal seat admits a built-in")
             .expect("the pedal bay reports it");
         }
-        let mut parents = [-1i32; CHANNELS];
+        let mut parents = [-1i32; LEGACY_LANES];
         parents[KID] = GROUP as i32;
         assert!(e.set_folders(parents), "the tree was refused");
         // Low on the GROUP for `dx7_through_amp`'s reason: the claim is
@@ -32050,7 +32057,7 @@ mod tests {
         // with routing, and would pass "no other track heard it" perfectly.
         // So first, with every lane admitting everything (the desk as it was
         // before any of this existed), one note has to reach BOTH.
-        e.set_midi_routes(&[tangent_ui::recorder::MidiRoute::EVERYTHING; CHANNELS]);
+        e.set_midi_routes(&[tangent_ui::recorder::MidiRoute::EVERYTHING; LEGACY_LANES]);
         hw.push(MidiEvent {
             stamp: 0,
             src: 0,
@@ -32337,7 +32344,7 @@ mod tests {
     /// **An amp in a group's SECOND rack still wears the board.**
     ///
     /// A folder's bays 3..5 are seated past every pad block
-    /// (`recorder::folder_extra_seat`), so every question anyone asked about
+    /// (`desk_legacy::folder_extra_seat`), so every question anyone asked about
     /// the board — does the face draw it, does the host seed it, does the
     /// engine run it — was asked as `seat < CHANNELS` and answered "no" for
     /// exactly those three bays. One amp, moved one bay down, lost its
@@ -32436,7 +32443,7 @@ mod tests {
         e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
             .expect("the amp loads")
             .expect("the bay reports it");
-        let seat = tangent_ui::recorder::amp_pedal_seat(CH, 0);
+        let seat = tangent_ui::desk_legacy::amp_pedal_seat(CH, 0);
         if pedal != Pedal::None {
             e.load_insert(seat, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&loud))
                 .expect("a pedal seat admits a built-in")
@@ -32743,7 +32750,7 @@ mod tests {
                 .expect("seated");
             if pedal_then_unload {
                 e.load_insert(
-                    tangent_ui::recorder::amp_pedal_seat(CH, 4),
+                    tangent_ui::desk_legacy::amp_pedal_seat(CH, 4),
                     0,
                     Some(Path::new(crate::builtin_fx::TRIM_PATH)),
                     None,
@@ -32757,7 +32764,7 @@ mod tests {
             let mut out = vec![0.0f32; 512 * 2];
             e.render_offline(&mut out);
             if pedal_then_unload {
-                e.load_insert(tangent_ui::recorder::amp_pedal_seat(CH, 4), 0, None, None)
+                e.load_insert(tangent_ui::desk_legacy::amp_pedal_seat(CH, 4), 0, None, None)
                     .expect("unload");
             }
             e.render_offline(&mut out);
@@ -32856,7 +32863,7 @@ mod tests {
             e.render_offline(&mut out);
             e.published_max_latency_for_test()
         };
-        let pedal_seat = tangent_ui::recorder::amp_pedal_seat(6, 3);
+        let pedal_seat = tangent_ui::desk_legacy::amp_pedal_seat(6, 3);
         // A lookahead pedal behind a seated amp: the lane pays it.
         let with_amp = render(&|e| {
             e.load_insert(6, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
@@ -32878,7 +32885,7 @@ mod tests {
         let grouped = |wire: &dyn Fn(&mut Engine)| -> u32 {
             render(&|e: &mut Engine| {
                 wire(e);
-                let mut parents = [-1i32; CHANNELS];
+                let mut parents = [-1i32; LEGACY_LANES];
                 parents[9] = 6;
                 assert!(e.set_folders(parents), "the tree was refused");
             })
@@ -32896,7 +32903,7 @@ mod tests {
         // pad block — arms the same board and costs the same.
         let group_extra = grouped(&|e| {
             e.load_insert(
-                tangent_ui::recorder::folder_extra_seat(6),
+                tangent_ui::desk_legacy::folder_extra_seat(6),
                 0,
                 Some(Path::new(crate::builtin_fx::AMP_PATH)),
                 None,
@@ -33902,15 +33909,15 @@ mod tests {
     fn every_renderer_constructor_buys_the_key_scratches_up_front() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let r = e.offline.as_ref().expect("an offline engine holds its renderer");
-        assert_eq!(r.spine.desk.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        assert_eq!(r.spine.desk.key_prev.len(), MAX_BLOCK as usize * LEGACY_LANES * 2);
         assert_eq!(r.spine.desk.key_prev_frames, 0, "a fresh snapshot claims frames it never wrote");
         assert_eq!(r.key_io.len(), TAP_CHANNELS);
         assert!(r.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
-        assert_eq!(r.shared.seat_cells(SeatKind::Key).count(), RACK_SEATS * INSERTS);
+        assert_eq!(r.shared.seat_cells(SeatKind::Key).count(), LEGACY_SEATS * INSERTS);
 
         let (tx, _rx) = RingBuffer::<f32>::new(64);
-        let t = Renderer::for_tests(CHANNELS, Arc::new(Shared::new()), tx, 2);
-        assert_eq!(t.spine.desk.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        let t = Renderer::for_tests(LEGACY_LANES, Arc::new(Shared::new()), tx, 2);
+        assert_eq!(t.spine.desk.key_prev.len(), MAX_BLOCK as usize * LEGACY_LANES * 2);
         assert_eq!(t.key_io.len(), TAP_CHANNELS);
         assert!(t.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
     }
@@ -33923,7 +33930,7 @@ mod tests {
     fn the_device_send_gets_the_master_pair_only_while_on_and_drops_when_full() {
         let (tx, _rx) = RingBuffer::<f32>::new(1 << 16);
         let shared = Arc::new(Shared::new());
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tx, 2);
         let (dtx, mut drx) = RingBuffer::<f32>::new(1024);
         r.devsend_tx = dtx;
         for (i, s) in r.reastream_scratch[..256].iter_mut().enumerate() {
@@ -34258,7 +34265,7 @@ mod tests {
     #[test]
     fn a_grouped_clip_and_a_loose_one_each_wait_only_for_what_they_have_not_paid() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let mut parents = [-1i32; CHANNELS];
+        let mut parents = [-1i32; LEGACY_LANES];
         parents[6] = 5;
         assert!(e.set_folders(parents), "the tree was refused");
         e.load_insert(5, 0, Some(Path::new(crate::builtin_fx::DENOISE_PATH)), None)
@@ -34289,7 +34296,7 @@ mod tests {
             e.render_offline(&mut out);
             e.drain_stems(&mut drained);
         }
-        let wide = CHANNELS * 2;
+        let wide = LEGACY_LANES * 2;
         let frames = drained.len() / wide;
         assert!(frames > pdc + 512, "too little drained to see the wait: {frames}");
         let first = |lane: usize| -> Option<usize> {
@@ -34364,7 +34371,7 @@ mod tests {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut drained);
             }
-            let wide = CHANNELS * 2;
+            let wide = LEGACY_LANES * 2;
             (0..drained.len() / wide)
                 .map(|f| drained[f * wide + CH * 2].abs())
                 .fold(0.0f32, f32::max)
@@ -34394,7 +34401,7 @@ mod tests {
         let run = |dry: bool| -> f32 {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
             e.load_insert(
-                tangent_ui::recorder::folder_extra_seat(CH),
+                tangent_ui::desk_legacy::folder_extra_seat(CH),
                 0,
                 Some(Path::new(crate::builtin_fx::ANALOG_PATH)),
                 None,
@@ -34421,7 +34428,7 @@ mod tests {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut drained);
             }
-            let wide = CHANNELS * 2;
+            let wide = LEGACY_LANES * 2;
             (0..drained.len() / wide)
                 .map(|f| drained[f * wide + CH * 2].abs())
                 .fold(0.0f32, f32::max)
@@ -34475,7 +34482,7 @@ mod tests {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut drained);
             }
-            let wide = CHANNELS * 2;
+            let wide = LEGACY_LANES * 2;
             (0..drained.len() / wide).map(|f| drained[f * wide + CH * 2]).collect()
         };
         let (dry, wet) = (run(true), run(false));
@@ -34530,7 +34537,7 @@ mod tests {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut drained);
             }
-            let wide = CHANNELS * 2;
+            let wide = LEGACY_LANES * 2;
             (0..drained.len() / wide)
                 .map(|f| drained[f * wide + 2 * 2].abs())
                 .fold(0.0f32, f32::max)
@@ -34584,7 +34591,7 @@ mod tests {
         let state = fast_deep_comp_state();
         let run = |dry: bool| -> Vec<f32> {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[6] = 5;
             assert!(e.set_folders(parents), "the tree was refused");
             e.load_insert(
@@ -34643,7 +34650,7 @@ mod tests {
         let state = fast_deep_comp_state();
         let run = |dry: bool| -> f32 {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[6] = 5;
             assert!(e.set_folders(parents), "the tree was refused");
             e.load_insert(
@@ -34678,7 +34685,7 @@ mod tests {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut drained);
             }
-            let wide = CHANNELS * 2;
+            let wide = LEGACY_LANES * 2;
             // Lane 5 is the FOLDER's slot, which the fold replaces with the
             // group's own output — that is the group's stem.
             (0..drained.len() / wide)
@@ -34744,7 +34751,7 @@ mod tests {
             e.render_offline(&mut out);
             e.drain_stems(&mut drained);
         }
-        let wide = CHANNELS * 2;
+        let wide = LEGACY_LANES * 2;
         let frames = drained.len() / wide;
         assert!(frames > pdc + 512, "too little drained to see the wait: {frames}");
         let first = (0..frames).find(|f| drained[f * wide + 2 * 2].abs() > 0.01);
@@ -34832,7 +34839,7 @@ mod tests {
     #[test]
     fn the_bypass_table_is_republished_without_ever_letting_go() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        e.set_insert_bypass(&[(3, 1), (RACK_SEATS + 9, 0), (4, INSERTS + 2)]);
+        e.set_insert_bypass(&[(3, 1), (LEGACY_SEATS + 9, 0), (4, INSERTS + 2)]);
         assert!(e.insert_bypassed(3, 1));
         assert!(!e.insert_bypassed(3, 0), "a neighbour was switched off too");
         assert!(!e.insert_bypassed(4, 0), "an out-of-range bay landed somewhere real");
@@ -34881,7 +34888,7 @@ mod tests {
             e.set_master_gain(1.0);
             e.set_channel_gain(3, gain);
             if folded {
-                let mut parents = [-1i32; CHANNELS];
+                let mut parents = [-1i32; LEGACY_LANES];
                 parents[5] = 3;
                 assert!(e.set_folders(parents), "the tree was refused");
                 e.set_channel_gain(5, 1.0);
@@ -34936,7 +34943,7 @@ mod tests {
             // Somebody's chain is 64 frames late, so every lane waits for it.
             e.set_seat_latency_for_test(0, 0, 64);
             if folded {
-                let mut parents = [-1i32; CHANNELS];
+                let mut parents = [-1i32; LEGACY_LANES];
                 parents[5] = 3;
                 assert!(e.set_folders(parents), "the tree was refused");
                 e.set_channel_gain(3, 1.0);
@@ -34995,7 +35002,7 @@ mod tests {
         assert_eq!(param_slot(7, 2, MASTER_AUTO_LANE), Some((7, 2)));
         assert_eq!(
             param_slot(7, INSERTS, MASTER_AUTO_LANE),
-            Some((tangent_ui::recorder::folder_extra_seat(7), 0)),
+            Some((tangent_ui::desk_legacy::folder_extra_seat(7), 0)),
             "a channel's fourth bay is its folder seat's first"
         );
         assert_eq!(
@@ -35009,7 +35016,7 @@ mod tests {
         // lanes there now and files their curves under the slot): bays 0..2
         // on its own rack's seat, 3..5 on its extra rack's, the seats its
         // racks read their queues from (`lane_seat`), and no seventh.
-        let past = CHANNELS + 5;
+        let past = LEGACY_LANES + 5;
         assert_eq!(param_slot(past, 1, MASTER_AUTO_LANE), Some((lane_seat(past, CHAIN_OWN), 1)));
         assert_eq!(param_slot(past, INSERTS + 2, MASTER_AUTO_LANE), Some((lane_seat(past, CHAIN_EXTRA), 2)));
         assert_eq!(param_slot(past, INSERTS * 2, MASTER_AUTO_LANE), None, "a lane past 31 grew a seventh bay");
@@ -35059,7 +35066,7 @@ mod tests {
                 "master bay {bay} is filed on the CLICK's seat"
             );
             assert!(
-                seat >= CHANNELS,
+                seat >= LEGACY_LANES,
                 "master bay {bay} is filed on channel {seat}'s seat"
             );
         }
@@ -35119,7 +35126,7 @@ mod tests {
         // is 64 and not zero.
         let grouped = render(&|e| {
             e.set_seat_latency_for_test(3, 0, 64);
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[5] = 3;
             assert!(e.set_folders(parents), "the tree was refused");
         });
@@ -35133,7 +35140,7 @@ mod tests {
         let both = render(&|e| {
             e.set_seat_latency_for_test(3, 0, 64);
             e.set_seat_latency_for_test(5, 0, 32);
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[5] = 3;
             assert!(e.set_folders(parents), "the tree was refused");
         });
@@ -35144,7 +35151,7 @@ mod tests {
             e.set_seat_latency_for_test(1, 0, 16);
             e.set_seat_latency_for_test(3, 0, 64);
             e.set_seat_latency_for_test(7, 0, 32);
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[3] = 1;
             parents[7] = 3;
             assert!(e.set_folders(parents), "the nested tree was refused");
@@ -35156,7 +35163,7 @@ mod tests {
         let freed = render(&|e| {
             e.set_seat_latency_for_test(3, 0, 64);
             e.set_seat_latency_for_test(5, 0, 32);
-            assert!(e.set_folders([-1i32; CHANNELS]), "the empty tree was refused");
+            assert!(e.set_folders([-1i32; LEGACY_LANES]), "the empty tree was refused");
         });
         assert_eq!(freed, 64, "a freed lane still paid its old group");
     }
@@ -35222,7 +35229,7 @@ mod tests {
         // LESS, because it is about to pay that rack on the way through.
         let grouped = head(&|e| {
             e.set_seat_latency_for_test(3, 0, 256);
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[5] = 3;
             assert!(e.set_folders(parents), "the tree was refused");
         });
@@ -35352,7 +35359,7 @@ mod tests {
             e.set_channel_gain(7, 1.0);
             e.set_drum_strips(1 << 7);
             // 1 contains 3, 3 contains 7.
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             parents[3] = 1;
             parents[7] = 3;
             assert!(e.set_folders(parents), "the nested tree was refused");
@@ -35466,7 +35473,7 @@ mod tests {
         // And a curve on a channel's number must NOT be mistaken for it —
         // the master is one PAST the channels, not the last of them.
         let elsewhere = Automation::from_curves(vec![Curve::sanitised(
-            CHANNELS - 1,
+            LEGACY_LANES - 1,
             AutoParam::Gain,
             vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Linear }],
         )]);
@@ -35609,13 +35616,13 @@ mod tests {
     #[test]
     fn a_parent_that_is_not_above_its_child_is_refused() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let mut bad = [-1i32; CHANNELS];
+        let mut bad = [-1i32; LEGACY_LANES];
         bad[2] = 5;
         assert!(!e.set_folders(bad), "a child above its parent was accepted");
-        let mut itself = [-1i32; CHANNELS];
+        let mut itself = [-1i32; LEGACY_LANES];
         itself[4] = 4;
         assert!(!e.set_folders(itself), "a folder inside itself was accepted");
-        let mut good = [-1i32; CHANNELS];
+        let mut good = [-1i32; LEGACY_LANES];
         good[5] = 2;
         assert!(e.set_folders(good), "a proper tree was refused");
     }
@@ -36277,7 +36284,7 @@ mod tests {
         let run = |limiter: f32, level: f32| -> (i64, f32) {
             let shared = Arc::new(Shared::new());
             let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -36368,7 +36375,7 @@ mod tests {
         let feed = |route: bool| {
             let shared = Arc::new(Shared::new());
             let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -36441,7 +36448,7 @@ mod tests {
         }
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
@@ -37370,18 +37377,18 @@ mod tests {
 
     /// **Every pad seat is inside the rack space `load_insert` admits.** The
     /// guard capped at `STRIPS`, so pad FX (seats `STRIPS+1..`) were refused
-    /// and did nothing; this pins that the whole seat map fits `RACK_SEATS`.
+    /// and did nothing; this pins that the whole seat map fits `LEGACY_SEATS`.
     #[test]
     fn pad_seats_are_loadable_rack_indices() {
         // Every CHANNEL's pads now, not just one block: a drum instrument
         // loads a full instance per channel and each of them needs seats
         // inside the loadable range.
-        for ch in [0usize, 1, CHANNELS / 2, CHANNELS - 1] {
+        for ch in [0usize, 1, LEGACY_LANES / 2, LEGACY_LANES - 1] {
             for pad in [0, 1, PADS / 2, PADS - 1] {
                 let seat = pad_rack_index(ch, pad);
                 assert!(
-                    seat > STRIPS && seat < RACK_SEATS,
-                    "channel {ch} pad {pad} seat {seat} is outside 0..{RACK_SEATS}"
+                    seat > LEGACY_STRIPS && seat < LEGACY_SEATS,
+                    "channel {ch} pad {pad} seat {seat} is outside 0..{LEGACY_SEATS}"
                 );
             }
         }
@@ -37402,13 +37409,13 @@ mod tests {
              again, and a pad plugin's window can never open"
         );
         assert!(
-            e.open_insert_editor(pad_rack_index(CHANNELS - 1, PADS - 1), INSERTS - 1)
+            e.open_insert_editor(pad_rack_index(LEGACY_LANES - 1, PADS - 1), INSERTS - 1)
                 .is_err(),
             "the last pad's last bay is inside the seat map too"
         );
         // Past the whole map is still a no-op, never a panic and never an
         // error a menu would have to word.
-        assert!(e.open_insert_editor(RACK_SEATS, 0).is_ok());
+        assert!(e.open_insert_editor(LEGACY_SEATS, 0).is_ok());
     }
 
     /// **A refused hand-off comes back instead of dying silently.** The
@@ -37427,7 +37434,7 @@ mod tests {
              was dropped on the spot and the caller cannot know"
         );
         // A seat that does not exist cannot take anything either.
-        assert!(e.hand_off_insert(RACK_SEATS, 0, PluginBox(None)).is_some());
+        assert!(e.hand_off_insert(LEGACY_SEATS, 0, PluginBox(None)).is_some());
     }
 
     /// **A looped MIDI clip keeps sounding past the first wrap.** The note
@@ -37504,7 +37511,7 @@ mod tests {
     fn one_lanes_chord_storm_does_not_withhold_another_lanes_note() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         // Every pitch there is, on two lanes, all striking at frame 0: this
         // is exactly what used to fill the desk pool before lane 2 was
         // reached.
@@ -37565,7 +37572,7 @@ mod tests {
     fn a_loop_wrap_brings_every_lane_back() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         // A loop over [4096, 8192). One note per lane, right at the head,
         // half the region long — so each is over before the wrap and each
         // must be re-struck after it.
@@ -37633,7 +37640,7 @@ mod tests {
     fn a_note_on_the_loop_point_survives_the_wrap() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         // Two lanes: one whose downbeat is EXACTLY on the loop point, one
         // whose first note is a little later. The second is the control —
         // it always sounded, which is why only two of the owner's four
@@ -37715,7 +37722,7 @@ mod tests {
     fn a_chord_landing_on_the_last_ones_end_is_not_choked() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let rate = 48_000.0f64;
         let f = |s: f64| (s * rate).round() as u64;
         // The real numbers, and the real overlap: chord two's length rounds a
@@ -37932,7 +37939,7 @@ mod tests {
             e.drain_stems(&mut drained);
         }
         assert!(!drained.is_empty(), "the stem tap delivered nothing");
-        let wide = CHANNELS * 2;
+        let wide = LEGACY_LANES * 2;
         let frames = drained.len() / wide;
         let lane2_peak = (0..frames)
             .map(|f| drained[f * wide + 2 * 2].abs())
@@ -38167,7 +38174,7 @@ mod tests {
         use crate::dx7::Dx7;
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut to_audio, _from) = r.hijack_dx7_rings();
         const HELD: usize = 4;
         const FREE: usize = 5;
@@ -38978,7 +38985,7 @@ mod tests {
         let mut out = vec![0.0f32; 128 * 2];
         r.render(&mut out, 0, 0);
         assert_eq!(r.controls.len(), 2, "both should travel as controls");
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             let pedals = r.lane_body(ch).live_pedal;
             assert_eq!(
                 pedals, [0_u8; 3],
@@ -39068,7 +39075,7 @@ mod tests {
         // a flag somebody might read in the wrong place.
         let shared = Arc::new(Shared::new());
         let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         shared.metro_on.store(true, Ordering::Relaxed);
         shared.metro_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
         // The click only speaks while the transport does — the owner's
@@ -39117,14 +39124,14 @@ mod tests {
             CAPTURE_WORDS * 64 >= tangent_ui::desk_id::MAX_ROWS,
             "a pick a desk can bind has no capture flag"
         );
-        assert_eq!(STRIPS, tangent_ui::desk_legacy::V32_STRIPS, "the strip space left the frozen map");
+        assert_eq!(LEGACY_STRIPS, tangent_ui::desk_legacy::V32_STRIPS, "the strip space left the frozen map");
         assert_eq!(MASTER_SEAT, tangent_ui::desk_lift::V32_MASTER, "the master's seat left the frozen map");
         assert_eq!(
             MASTER_EXTRA_SEAT,
             tangent_ui::desk_lift::V32_EXTRA_PADS - 1,
             "the master's second rack left the frozen map"
         );
-        assert_eq!(RACK_SEATS, tangent_ui::desk_legacy::V32_TOTAL_SEATS);
+        assert_eq!(LEGACY_SEATS, tangent_ui::desk_legacy::V32_TOTAL_SEATS);
         // And every UI strip maps onto a host strip at the same index, which
         // is what makes the mute masks and the send array the same arrays.
         for ui in tangent_ui::recorder::Strip::all() {
@@ -39151,7 +39158,7 @@ mod tests {
         const BLOCK: usize = 128;
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
         // A second of mono input nobody drained: the old audio is 0.25 and the
         // NEWEST block — the part that should be heard — is 0.75.
@@ -39219,7 +39226,7 @@ mod tests {
     fn a_scratch_clamped_monitor_read_keeps_whole_frames() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         // A hundred frames of a three-wide input: one mono pick and one
         // stereo pair, laid end to end the way `Picks` lays them.
@@ -39261,7 +39268,7 @@ mod tests {
         for monitored in [false, true] {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             // The live input, one mono channel of a steady half.
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             for _ in 0..4096 {
@@ -39344,7 +39351,7 @@ mod tests {
         for (armed, muted, solo_other, monitoring, take_wants, room_wants) in cases {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -39420,7 +39427,7 @@ mod tests {
         ] {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -39501,7 +39508,7 @@ mod tests {
         ] {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut to_audio, _back) = r.hijack_track_rings();
             if rolling {
                 to_audio
@@ -39596,7 +39603,7 @@ mod tests {
         let render = |tree: &[(usize, i32)], sender: usize, monitoring: bool, folder_send: f32| -> (Vec<f32>, f32) {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -39696,7 +39703,7 @@ mod tests {
         ] {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-            let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+            let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
@@ -39796,7 +39803,7 @@ mod tests {
         }
         assert_eq!(e.offline_stem_lead(0), 300);
         assert_eq!(e.offline_stem_lead(2), 200);
-        assert_eq!(e.offline_stem_lead(CHANNELS + 5), 300, "an out-of-range lane reads the bare lead");
+        assert_eq!(e.offline_stem_lead(LEGACY_LANES + 5), 300, "an out-of-range lane reads the bare lead");
     }
 
     /// **The lamp answers for the peak INTO the limiter.** A limiter in
@@ -39808,7 +39815,7 @@ mod tests {
     fn the_lamp_lights_for_a_peak_into_the_limiter() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 14);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
@@ -39845,7 +39852,7 @@ mod tests {
     fn metronome_in_take_puts_the_click_into_the_tap_as_well() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         shared.metro_on.store(true, Ordering::Relaxed);
         shared.metro_in_take.store(true, Ordering::Relaxed);
         shared.metro_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -39883,9 +39890,9 @@ mod tests {
         // and jump to the one it has now.
         let shared = Arc::new(Shared::new());
         let (tap_tx, _rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         r.gain_coeff = gain_coefficient(RATE);
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             r.lane_body_mut(ch).channel_gain = 1.0;
         }
         shared.set_channel_gain(0, 0.0);
@@ -39919,17 +39926,17 @@ mod tests {
         // dialog and `exit(1)`. A menu that got its arithmetic wrong should
         // misbehave, not end the session.
         let shared = Shared::new();
-        shared.set_channel_gain(CHANNELS, 0.25);
+        shared.set_channel_gain(LEGACY_LANES, 0.25);
         shared.set_channel_gain(usize::MAX, 0.25);
-        for cell in (0..CHANNELS).map(|c| &shared.lanes.get(c).gain) {
+        for cell in (0..LEGACY_LANES).map(|c| &shared.lanes.get(c).gain) {
             assert_eq!(
                 Shared::f32_of(cell),
                 1.0,
                 "a real channel was written instead"
             );
         }
-        shared.set_channel_gain(CHANNELS - 1, 0.25);
-        assert_eq!(Shared::f32_of(&shared.lanes.get(CHANNELS - 1).gain), 0.25);
+        shared.set_channel_gain(LEGACY_LANES - 1, 0.25);
+        assert_eq!(Shared::f32_of(&shared.lanes.get(LEGACY_LANES - 1).gain), 0.25);
     }
 
     #[test]
@@ -39952,7 +39959,7 @@ mod tests {
     fn a_count_in_publishes_its_beat_and_its_downbeat_from_the_audio_thread() {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _rx) = RingBuffer::<f32>::new(1 << 16);
-        let mut r = Renderer::for_tests(CHANNELS, Arc::clone(&shared), tap_tx, 2);
+        let mut r = Renderer::for_tests(LEGACY_LANES, Arc::clone(&shared), tap_tx, 2);
         // Two beats at 240 bpm: 12000 frames apart at 48 kHz.
         shared.bpm.store(240.0f64.to_bits(), Ordering::Relaxed);
         shared.count_in_beats.store(2, Ordering::Relaxed);
@@ -40232,7 +40239,7 @@ mod tests {
         let mut engine = Engine::start(None).expect("an audio output");
         assert!(engine.is_running());
         assert!(
-            (0..=STRIPS).all(|st| (0..INSERTS).all(|b| engine.insert(st, b).is_none())),
+            (0..=LEGACY_STRIPS).all(|st| (0..INSERTS).all(|b| engine.insert(st, b).is_none())),
             "a fresh engine has something loaded"
         );
         engine.set_metronome_enabled(true);
@@ -40327,7 +40334,7 @@ mod tests {
         // exist. Both are `None` rather than an error, because the caller's
         // only move either way is to write nothing.
         assert!(engine.save_insert_state(0, 1).is_none());
-        assert!(engine.save_insert_state(STRIPS + 1, 0).is_none());
+        assert!(engine.save_insert_state(LEGACY_STRIPS + 1, 0).is_none());
 
         engine
             .load_insert(0, 0, Some(&bundle), Some(&bytes))
@@ -40415,7 +40422,7 @@ mod tests {
         engine
             .load_insert(0, 0, Some(&bundle), None)
             .expect("channel 1");
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             engine.set_channel_gain(ch, 0.4);
         }
         let one = chord_peak(&engine);
@@ -40456,7 +40463,7 @@ mod tests {
         engine
             .load_insert(1, 0, Some(&bundle), None)
             .expect("channel 2");
-        for ch in 0..CHANNELS {
+        for ch in 0..LEGACY_LANES {
             engine.set_channel_gain(ch, 0.4);
         }
         assert!(chord_peak(&engine) > 0.001);
@@ -40480,26 +40487,26 @@ mod tests {
         // Every one of these is reachable from a menu, and a panic here goes
         // through the app's hook to a dialog and `exit(1)`.
         //
-        // `RACK_SEATS`, not `STRIPS + 1`: that seat is pad 0's FX bay now,
+        // `LEGACY_SEATS`, not `LEGACY_STRIPS + 1`: that seat is pad 0's FX bay now,
         // a bay that very much exists — the first seat that does not is the
         // one past the whole map.
         let bundle = piano();
         let mut engine = Engine::start(None).expect("an audio output");
         assert!(matches!(
-            engine.load_insert(RACK_SEATS, 0, Some(&bundle), None),
+            engine.load_insert(LEGACY_SEATS, 0, Some(&bundle), None),
             Ok(None)
         ));
         assert!(matches!(
             engine.load_insert(0, INSERTS, Some(&bundle), None),
             Ok(None)
         ));
-        assert!(engine.open_insert_editor(RACK_SEATS, 0).is_ok());
-        let _ = engine.load_insert(RACK_SEATS, 0, None, None);
-        engine.close_insert_editor(RACK_SEATS, 0);
-        engine.set_channel_gain(CHANNELS, 0.5);
-        assert!(!engine.insert_has_editor(RACK_SEATS, 0));
-        assert!(!engine.insert_editor_open(RACK_SEATS, 0));
-        assert!(engine.insert(RACK_SEATS, 0).is_none());
+        assert!(engine.open_insert_editor(LEGACY_SEATS, 0).is_ok());
+        let _ = engine.load_insert(LEGACY_SEATS, 0, None, None);
+        engine.close_insert_editor(LEGACY_SEATS, 0);
+        engine.set_channel_gain(LEGACY_LANES, 0.5);
+        assert!(!engine.insert_has_editor(LEGACY_SEATS, 0));
+        assert!(!engine.insert_editor_open(LEGACY_SEATS, 0));
+        assert!(engine.insert(LEGACY_SEATS, 0).is_none());
         assert!(engine.is_running(), "a bad bay number stopped the stream");
     }
 
@@ -40655,7 +40662,7 @@ mod slot_engine {
     /// defaults, and nothing published yet.
     fn wide(lanes: usize) -> Engine {
         let mut e = offline();
-        let cap = lanes.max(CHANNELS);
+        let cap = lanes.max(LEGACY_LANES);
         if cap > e.lane_capacity() {
             let sized = Engine::offline_sized(48_000, Timebase::new(), cap).expect("an offline engine");
             sized.set_armed(0);
@@ -40664,7 +40671,7 @@ mod slot_engine {
             sized.set_master_gain(1.0);
             e = sized;
         }
-        let fresh: Vec<(Slot, LaneSpec)> = (CHANNELS..lanes).map(|s| (Slot(s as u32), audio())).collect();
+        let fresh: Vec<(Slot, LaneSpec)> = (LEGACY_LANES..lanes).map(|s| (Slot(s as u32), audio())).collect();
         if !fresh.is_empty() {
             e.install_lanes(fresh).expect("the lanes install");
         }
@@ -40903,9 +40910,9 @@ mod slot_engine {
         // below it is silent and every lane past it is itself, and the other
         // way round. A clip whose slot wrapped would sound on a partner.
         for high in [true, false] {
-            let got = alias_desk(lanes, &subjects, &|s| (s >= CHANNELS) == high, None, &[]);
+            let got = alias_desk(lanes, &subjects, &|s| (s >= LEGACY_LANES) == high, None, &[]);
             for (j, &s) in subjects.iter().enumerate() {
-                if (s >= CHANNELS) == high {
+                if (s >= LEGACY_LANES) == high {
                     assert_eq!(bits(&got[j]), bits(&reference[j]), "lane {s}'s own clip moved ({lanes} lanes)");
                 } else {
                     assert!(got[j].iter().all(|v| *v == 0.0), "lane {s} sounded another slot's clip ({lanes} lanes)");
@@ -41360,8 +41367,8 @@ mod slot_engine {
             e.set_clips_slotted(clips);
             roll(&mut e, 8).0
         };
-        let small = render(CHANNELS);
-        let large = render(CHANNELS + 200);
+        let small = render(LEGACY_LANES);
+        let large = render(LEGACY_LANES + 200);
         assert!(small.iter().any(|v| *v != 0.0));
         assert_eq!(bits(&small), bits(&large), "silent lanes moved the master");
     }
@@ -41432,7 +41439,7 @@ mod slot_engine {
     /// audible within two blocks of landing. The list was never dropped.
     #[test]
     fn a_clip_sent_before_its_lane_plays_once_the_lane_lands() {
-        let mut e = wide(CHANNELS);
+        let mut e = wide(LEGACY_LANES);
         // Slot 33's generation, reserved: the next one minted.
         let gen = e.next_gen.wrapping_add(1).max(LEGACY_GEN + 1);
         let mut clip = clip_at(&e, 0, 0x3333);
@@ -41443,7 +41450,7 @@ mod slot_engine {
         assert!(stems.iter().all(|v| *v == 0.0), "a clip played on no lane");
         let gens = e.install_lanes(vec![(Slot(33), audio())]).expect("the lane goes");
         assert_eq!(gens, vec![gen], "the generation the clip was built for");
-        let mut inputs = plan(&e, CHANNELS, &|_| LaneFlags::default());
+        let mut inputs = plan(&e, LEGACY_LANES, &|_| LaneFlags::default());
         inputs.lanes.push(InLane {
             slot: Slot(33),
             gen,
@@ -41490,7 +41497,7 @@ mod slot_engine {
             }
         }
         assert!(heard_at.is_some(), "the lane was not audible within two blocks of landing");
-        assert_eq!(e.stem_frame_width(), CHANNELS * 2, "the stem stream changed width mid-pass");
+        assert_eq!(e.stem_frame_width(), LEGACY_LANES * 2, "the stem stream changed width mid-pass");
         assert_eq!(e.shared.plan_refused.load(Ordering::Relaxed), 0);
     }
 
@@ -41571,14 +41578,14 @@ mod slot_engine {
     #[test]
     fn every_op_lands_without_the_callback_allocating() {
         for lanes in [33usize, 65, 200, 1000] {
-            let mut e = wide(CHANNELS);
+            let mut e = wide(LEGACY_LANES);
             let mut out = vec![0.0f32; BLOCK * 2];
             for _ in 0..4 {
                 e.render_offline(&mut out);
             }
             // Grow + Install in one: the host built the shell.
             let fresh: Vec<(Slot, LaneSpec)> =
-                (CHANNELS..lanes).map(|s| (Slot(s as u32), audio())).collect();
+                (LEGACY_LANES..lanes).map(|s| (Slot(s as u32), audio())).collect();
             e.install_lanes(fresh).expect("the lanes go");
             let c = counted_block(&mut e);
             assert_eq!(c, 0, "Grow and Install allocated at {lanes}");
@@ -41757,7 +41764,7 @@ mod slot_engine {
     /// lanes and the strips, and its own past it** (contract C8).
     #[test]
     fn a_rack_address_names_one_seat() {
-        use tangent_ui::recorder::{amp_pedal_seat, bus_extra_seat, folder_extra_seat};
+        use tangent_ui::desk_legacy::{amp_pedal_seat, bus_extra_seat, folder_extra_seat};
         let lane = |s: u32, r: u16| RackAddr { owner: RackOwner::Lane(Slot(s)), rack: r }.seat();
         assert_eq!(lane(3, 0), Some(3));
         assert_eq!(lane(3, 1), Some(folder_extra_seat(3)));
@@ -41799,7 +41806,7 @@ mod slot_engine {
         for s in [32u32, 33, 255, 256, 257, 65_535] {
             for r in 0..LANE_RACKS as u16 {
                 let seat = lane(s, r).expect("a seat");
-                assert!(seat >= RACK_SEATS, "lane {s} rack {r} landed in the frozen map");
+                assert!(seat >= LEGACY_SEATS, "lane {s} rack {r} landed in the frozen map");
                 assert!(seen.insert(seat), "seat {seat} named twice");
                 assert_eq!(lane_rack_of_seat(seat), Some((s as usize, usize::from(r))));
             }
@@ -41891,7 +41898,7 @@ mod slot_engine {
         // would pass the ceiling below for ever.
         let (_, seen) = crate::rt_alloc::count_bytes(|| drop(std::hint::black_box(vec![0u8; 4096])));
         assert!(seen >= 4096, "the byte counter saw {seen} of 4096");
-        let mut e = wide(CHANNELS);
+        let mut e = wide(LEGACY_LANES);
         e.ensure_seats(lane_seat(40, LANE_RACKS - 1) + 1);
         let (lane, bytes) = crate::rt_alloc::count_bytes(|| e.build_lane(40, 77, audio()));
         assert!(bytes <= 256 * 1024, "an idle lane asked for {bytes} bytes at build");
@@ -41951,7 +41958,7 @@ mod slot_engine {
                 // plugin: the load builds nothing and says so, where it used
                 // to answer "seated" for a rack that went home with the
                 // plugin in it (W7-slot-gaps).
-                let room = attach || slot < CHANNELS;
+                let room = attach || slot < LEGACY_LANES;
                 assert_eq!(seated, room, "slot {slot}'s pad rack, with the bank {attach}: seated {seated}");
                 let inputs = plan(&e, 40, &|x| if x == slot { LaneFlags::DRUM } else { LaneFlags::MIDI_OFF });
                 e.publish_plan(&inputs).expect("the plan goes");
@@ -41979,7 +41986,7 @@ mod slot_engine {
     /// it used to send that ring home unused and leave the input silent.
     #[test]
     fn a_ring_and_its_layout_pushed_before_one_block_both_arrive() {
-        let mut e = wide(CHANNELS);
+        let mut e = wide(LEGACY_LANES);
         warm(&mut e);
         let (_tx, ring) = RingBuffer::<f32>::new(4096);
         let picks = tangent_record::audio::Picks::EVERYTHING;
@@ -42015,9 +42022,9 @@ mod slot_engine {
     fn a_grow_while_a_route_plays_moves_no_bit() {
         use crate::desk_plan::{InRoute, RouteEnd};
         let render = |grow: bool| {
-            let mut e = wide(CHANNELS);
+            let mut e = wide(LEGACY_LANES);
             let before = e.lane_capacity();
-            let mut inputs = plan(&e, CHANNELS, &|_| LaneFlags::default());
+            let mut inputs = plan(&e, LEGACY_LANES, &|_| LaneFlags::default());
             inputs.routes.push(InRoute { from: Slot(1), to: RouteEnd::Lane(Slot(2)), gain: 1.0 });
             e.publish_plan(&inputs).expect("the plan goes");
             trim(&mut e, 2);
@@ -42148,7 +42155,7 @@ mod slot_engine {
     #[test]
     fn the_stem_stream_keeps_its_width_through_a_grow() {
         let render = |grow: bool| {
-            let mut e = wide(CHANNELS);
+            let mut e = wide(LEGACY_LANES);
             e.set_clips_slotted(vec![clip_at(&e, 3, 0x303)]);
             e.set_stems(true);
             e.set_transport(1, 0);
@@ -42162,9 +42169,9 @@ mod slot_engine {
                 e.render_offline(&mut out);
                 e.drain_stems(&mut stems);
             }
-            assert_eq!(e.stem_frame_width(), CHANNELS * 2, "the stream changed width");
-            assert_eq!(stems.len(), 5 * BLOCK * CHANNELS * 2, "a frame was cut");
-            bits(&column(&stems, CHANNELS, 3))
+            assert_eq!(e.stem_frame_width(), LEGACY_LANES * 2, "the stream changed width");
+            assert_eq!(stems.len(), 5 * BLOCK * LEGACY_LANES * 2, "a frame was cut");
+            bits(&column(&stems, LEGACY_LANES, 3))
         };
         let plain = render(false);
         assert!(plain.iter().any(|b| *b != 0));
@@ -42190,10 +42197,10 @@ mod slot_engine {
             let mut by_plan = DeskLanes::new();
             by_plan.decode_plan(&plan);
             let shared = Shared::new();
-            shared.midi_off.store(1u64 << (CHANNELS + i), Ordering::Relaxed);
+            shared.midi_off.store(1u64 << (LEGACY_LANES + i), Ordering::Relaxed);
             let by_word = DeskLanes::read(&shared);
             for j in 0..4 {
-                let strip = CHANNELS + j;
+                let strip = LEGACY_LANES + j;
                 assert_eq!(by_plan.strip_listens(strip), j != i, "special {j} with special {i} shut");
                 assert_eq!(by_plan.strip_listens(strip), by_word.strip_listens(strip), "special {j}: the plan and the word disagree");
             }
@@ -42209,14 +42216,14 @@ mod slot_engine {
     /// holds.
     #[test]
     fn the_host_record_of_a_slot_follows_the_callback() {
-        let mut e = wide(CHANNELS);
+        let mut e = wide(LEGACY_LANES);
         let mut out = vec![0.0f32; BLOCK * 2];
         assert_eq!(
             e.install_lanes(vec![(Slot(40), audio()), (Slot(40), audio())]),
             Err(EngineBusy::Twice(Slot(40)))
         );
         assert_eq!(e.lane_gen(Slot(40)), None);
-        assert_eq!(e.lane_capacity(), CHANNELS, "a refused batch sent a Grow");
+        assert_eq!(e.lane_capacity(), LEGACY_LANES, "a refused batch sent a Grow");
         e.remove_lanes(&[Slot(7)]).expect("remove");
         assert_eq!(e.install_lanes(vec![(Slot(7), audio())]), Err(EngineBusy::Busy), "a leaving slot is not Busy");
         e.render_offline(&mut out);
@@ -42353,7 +42360,7 @@ mod slot_engine {
     /// began, leaving the take's ring where it is.
     #[test]
     fn a_capture_ring_swaps_on_the_op_ring_and_never_under_a_take() {
-        let mut e = wide(CHANNELS);
+        let mut e = wide(LEGACY_LANES);
         warm(&mut e);
         let (tx, mut rx) = RingBuffer::<f32>::new(64);
         e.set_capture_ring(PickId(1), Some(tx)).expect("the ring goes");
@@ -42432,13 +42439,13 @@ mod slot_engine {
     #[test]
     fn every_seat_names_one_rack_and_back() {
         let mut owned = 0;
-        for seat in 0..RACK_SEATS {
+        for seat in 0..LEGACY_SEATS {
             if let Some(addr) = seat_addr(seat) {
                 assert_eq!(addr.seat(), Some(seat), "seat {seat} -> {addr:?}");
                 owned += 1;
             }
         }
-        assert_eq!(owned, RACK_SEATS, "a seat of the frozen map names no rack");
+        assert_eq!(owned, LEGACY_SEATS, "a seat of the frozen map names no rack");
         for slot in [32u32, 40, 255, 256, 65_535] {
             for rack in 0..LANE_RACKS as u16 {
                 let addr = RackAddr { owner: RackOwner::Lane(Slot(slot)), rack };
@@ -42466,7 +42473,7 @@ mod slot_engine {
             let sh = &e.shared;
             let w32 = |w: &AtomicU32, i: usize| i < 32 && w.load(Ordering::Relaxed) & (1u32 << i) != 0;
             let w64 = |w: &AtomicU64, i: usize| i < 64 && w.load(Ordering::Relaxed) & (1u64 << i) != 0;
-            let lanes = (0..CHANNELS)
+            let lanes = (0..LEGACY_LANES)
                 .map(|ch| {
                     let l = sh.lanes.get(ch);
                     let parent = l.folder_of.load(Ordering::Relaxed);
@@ -42503,11 +42510,11 @@ mod slot_engine {
                     .with(F::PHASE, w64(&sh.strip_phase, i))
             };
             let specials = SpecialFlags {
-                drums: special(CHANNELS),
-                click: special(CHANNELS + 1),
-                fx: special(CHANNELS + 2),
+                drums: special(LEGACY_LANES),
+                click: special(LEGACY_LANES + 1),
+                fx: special(LEGACY_LANES + 2),
                 master: F::default()
-                    .with(F::MIDI_OFF, w64(&sh.midi_off, CHANNELS + 3))
+                    .with(F::MIDI_OFF, w64(&sh.midi_off, LEGACY_LANES + 3))
                     .with(F::SUSPEND, w64(&sh.auto_suspend, LEGACY_LANES)),
             };
             let n = sh.route_count.load(Ordering::Acquire).min(MAX_ROUTES);
@@ -42655,7 +42662,7 @@ mod slot_engine {
             use crate::builtin_fx::{CHORUS_PATH, COMP_PATH, EQ_PATH, PLATE_PATH, TRIM_PATH};
             let mut e = offline();
             let n = 6 + rng.below(20);
-            let mut parents = [-1i32; CHANNELS];
+            let mut parents = [-1i32; LEGACY_LANES];
             for c in 1..n {
                 if rng.chance(0.45) {
                     parents[c] = rng.below(c) as i32;
@@ -42690,7 +42697,7 @@ mod slot_engine {
             for lane in 0..n {
                 if rng.chance(0.4) {
                     let unit = units[rng.below(units.len())];
-                    let seat = if rng.chance(0.3) { tangent_ui::recorder::folder_extra_seat(lane) } else { lane };
+                    let seat = if rng.chance(0.3) { tangent_ui::desk_legacy::folder_extra_seat(lane) } else { lane };
                     e.load_insert(seat, rng.below(INSERTS), Some(Path::new(unit)), None).expect("a built-in loads");
                 }
             }
@@ -44516,7 +44523,7 @@ mod slot_engine {
             for &slot in &SLOTS {
                 let s = Slot(slot as u32);
                 let gen = e.lane_gen(s).expect("a lane");
-                if slot >= CHANNELS {
+                if slot >= LEGACY_LANES {
                     e.attach(s, gen, LanePart::Pads(Box::new(PadBank::new()))).expect("the bank goes");
                 }
                 e.attach(s, gen, LanePart::Kit(Box::new(kit36()))).expect("the kit goes");
@@ -44591,7 +44598,7 @@ mod slot_engine {
             let plain = pad_desk(None);
             let reference = rms(&pad_desk(Some(SLOTS[0]))[0]) / rms(&plain[0]);
             assert!((reference - 0.063).abs() < 0.01, "lane 1's pad effect cut its kit to {reference} of itself");
-            for (i, &a) in SLOTS.iter().enumerate().filter(|(_, s)| **s >= CHANNELS) {
+            for (i, &a) in SLOTS.iter().enumerate().filter(|(_, s)| **s >= LEGACY_LANES) {
                 let cut = pad_desk_at(Some(a), true);
                 let ratio = rms(&cut[i]) / rms(&plain[i]);
                 assert!((ratio - reference).abs() <= 1e-3 * reference, "lane {a}'s pad effect, loaded before its bank, cut its kit to {ratio} of itself, lane 1's to {reference}");
@@ -45569,14 +45576,14 @@ mod sampler_road {
         let (retiring, mut from) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
         r.sampler_incoming = incoming;
         r.sampler_retiring = retiring;
-        to.push((CHANNELS + 7, Some(a_sample("nowhere.wav", 0.5))))
+        to.push((LEGACY_LANES + 7, Some(a_sample("nowhere.wav", 0.5))))
             .expect("room for the sample");
 
         let mut out = vec![0.0f32; 2 * 512];
         r.render(&mut out, 0, 0);
 
         let (lane, back) = from.pop().expect("the stray sample came back");
-        assert_eq!(lane, CHANNELS + 7);
+        assert_eq!(lane, LEGACY_LANES + 7);
         assert_eq!(back.expect("it came back whole").name, "nowhere.wav");
     }
 
@@ -45744,7 +45751,7 @@ mod sampler_road {
             e.render_offline(&mut out);
             e.drain_stems(&mut drained);
         }
-        let wide = CHANNELS * 2;
+        let wide = LEGACY_LANES * 2;
         let lane: Vec<f32> = (0..drained.len() / wide)
             .map(|f| drained[f * wide + CH * 2].abs().max(drained[f * wide + CH * 2 + 1].abs()))
             .collect();
@@ -46111,19 +46118,19 @@ mod lanesets {
     fn route_transfer_answers_what_its_masks_did() {
         fn oracle(
             routes: &[(usize, usize, bool, bool, f32)],
-            gain: &[f32; CHANNELS],
-            direct: &[f32; CHANNELS],
-            pan: &[f32; CHANNELS],
-        ) -> [[f32; 2]; CHANNELS] {
+            gain: &[f32; LEGACY_LANES],
+            direct: &[f32; LEGACY_LANES],
+            pan: &[f32; LEGACY_LANES],
+        ) -> [[f32; 2]; LEGACY_LANES] {
             #[allow(clippy::too_many_arguments)]
             fn walk(
                 routes: &[(usize, usize, bool, bool, f32)],
-                gain: &[f32; CHANNELS],
-                direct: &[f32; CHANNELS],
-                pan: &[f32; CHANNELS],
+                gain: &[f32; LEGACY_LANES],
+                direct: &[f32; LEGACY_LANES],
+                pan: &[f32; LEGACY_LANES],
                 d: usize,
                 path: u32,
-                t: &mut [[f32; 2]; CHANNELS],
+                t: &mut [[f32; 2]; LEGACY_LANES],
                 done: &mut u32,
             ) -> [f32; 2] {
                 let bit = 1u32.checked_shl(d as u32).expect("the oracle is a 32-lane word");
@@ -46135,7 +46142,7 @@ mod lanesets {
                 }
                 let mut on = [0.0f32; 2];
                 for &(from, target, hardware, _, g) in routes {
-                    if from != d || hardware || g <= 0.0 || target >= CHANNELS {
+                    if from != d || hardware || g <= 0.0 || target >= LEGACY_LANES {
                         continue;
                     }
                     let next = walk(routes, gain, direct, pan, target, path | bit, t, done);
@@ -46147,9 +46154,9 @@ mod lanesets {
                 *done |= bit;
                 t[d]
             }
-            let mut t = [[0.0f32; 2]; CHANNELS];
+            let mut t = [[0.0f32; 2]; LEGACY_LANES];
             let mut done = 0u32;
-            for d in 0..CHANNELS {
+            for d in 0..LEGACY_LANES {
                 walk(routes, gain, direct, pan, d, 0, &mut t, &mut done);
             }
             t
@@ -46169,12 +46176,12 @@ mod lanesets {
             let n = (next(MAX_ROUTES as u64 + 1) as usize).min(MAX_ROUTES);
             let mut routes = Vec::with_capacity(n);
             for _ in 0..n {
-                let from = next(CHANNELS as u64) as usize;
+                let from = next(LEGACY_LANES as u64) as usize;
                 // Dense in the low lanes so cycles are common, and now and
                 // then the top lane or a target past the desk.
                 let target = match next(16) {
-                    0 => CHANNELS - 1,
-                    1 => CHANNELS + next(4) as usize,
+                    0 => LEGACY_LANES - 1,
+                    1 => LEGACY_LANES + next(4) as usize,
                     _ => next(6) as usize,
                 };
                 let hardware = next(10) == 0;
@@ -46184,10 +46191,10 @@ mod lanesets {
                 };
                 routes.push((from, target, hardware, false, g));
             }
-            let mut gain = [1.0f32; CHANNELS];
-            let mut direct = [1.0f32; CHANNELS];
-            let mut pan = [0.0f32; CHANNELS];
-            for d in 0..CHANNELS {
+            let mut gain = [1.0f32; LEGACY_LANES];
+            let mut direct = [1.0f32; LEGACY_LANES];
+            let mut pan = [0.0f32; LEGACY_LANES];
+            for d in 0..LEGACY_LANES {
                 gain[d] = next(1500) as f32 / 1000.0;
                 direct[d] = if next(3) == 0 { 0.0 } else { 1.0 };
                 pan[d] = next(2001) as f32 / 1000.0 - 1.0;
@@ -46206,7 +46213,7 @@ mod lanesets {
             }));
             let want = oracle(&routes, &gain, &direct, &pan);
             let got = r.route_transfer();
-            for d in 0..CHANNELS {
+            for d in 0..LEGACY_LANES {
                 for side in 0..2 {
                     assert_eq!(
                         got[d][side].to_bits(),
@@ -46236,7 +46243,7 @@ mod lanesets {
     fn auto_key_files_every_bay_where_param_slot_does() {
         use tangent_ui::desk_id::{auto_key, Node, TrackId};
         use tangent_ui::desk_legacy::{encode_v32, identity_ids, unbind, V32_CHANNELS};
-        assert_eq!(CHANNELS, V32_CHANNELS, "the engine's lanes are the V32 rows until W3");
+        assert_eq!(LEGACY_LANES, V32_CHANNELS, "the engine's lanes are the V32 rows until W3");
         let ids = identity_ids(V32_CHANNELS);
         let mut filed = 0;
         for lane in 0..64usize {
@@ -46338,7 +46345,7 @@ mod lanesets {
         };
         let render = |strays: &[usize]| -> (Vec<f32>, Vec<f32>) {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("an offline engine");
-            let mut clips = vec![flat_clip(CHANNELS - 1, 0.25)];
+            let mut clips = vec![flat_clip(LEGACY_LANES - 1, 0.25)];
             clips.extend(strays.iter().map(|&s| flat_clip(s, 0.5)));
             e.set_clips(clips);
             e.set_stems(true);
@@ -46353,8 +46360,8 @@ mod lanesets {
             (master, stems)
         };
         let (alone_master, alone_stems) = render(&[]);
-        assert!(alone_master.iter().any(|v| *v != 0.0), "lane {} made no sound", CHANNELS - 1);
-        for strays in [&[CHANNELS][..], &[40], &[63, 64, 200]] {
+        assert!(alone_master.iter().any(|v| *v != 0.0), "lane {} made no sound", LEGACY_LANES - 1);
+        for strays in [&[LEGACY_LANES][..], &[40], &[63, 64, 200]] {
             let (master, stems) = render(strays);
             let same = |a: &[f32], b: &[f32]| {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
@@ -46374,14 +46381,14 @@ mod lanesets {
     /// heard every note whatever the master's own bit said.
     #[test]
     fn the_master_racks_ask_the_masters_own_midi_bit() {
-        assert_eq!(chain_strip(MASTER_EXTRA_SEAT), STRIPS);
-        assert_eq!(chain_strip(MASTER_SEAT), STRIPS);
+        assert_eq!(chain_strip(MASTER_EXTRA_SEAT), LEGACY_STRIPS);
+        assert_eq!(chain_strip(MASTER_SEAT), LEGACY_STRIPS);
         assert_eq!(chain_strip(Strip::Fx.index()), Strip::Fx.index());
         assert!(MASTER_EXTRA_SEAT >= DESK_WORD_LANES, "the extra seat has a bit of its own now");
         let shared = Shared::new();
         // The master's bit set (deaf), bit 63 clear: the case the clamp
         // answered wrongly.
-        shared.midi_off.store(1u64 << STRIPS, Ordering::Relaxed);
+        shared.midi_off.store(1u64 << LEGACY_STRIPS, Ordering::Relaxed);
         let desk = DeskLanes::read(&shared);
         assert!(!desk.midi_on.contains(chain_strip(MASTER_EXTRA_SEAT)));
         assert!(desk.midi_on.contains(chain_strip(Strip::Fx.index())));
@@ -46434,11 +46441,11 @@ impl Engine {
             "strip_phase": sh.strip_phase.load(Ordering::Relaxed),
             "muted": sh.muted.load(Ordering::Relaxed),
             "soloed": sh.soloed.load(Ordering::Relaxed),
-            "send": (0..STRIPS).map(|i| sh.send_cell(strip_of_index(i)).map_or(0, ld32)).collect::<Vec<_>>(),
-            "folder_of": (0..CHANNELS).map(|c| sh.lanes.get(c).folder_of.load(Ordering::Relaxed)).collect::<Vec<_>>(),
-            "punch": (0..CHANNELS).map(|c| sh.lanes.get(c).punch.load(Ordering::Relaxed)).collect::<Vec<_>>(),
-            "midi_src": (0..CHANNELS).map(|c| ld32(&sh.lanes.get(c).midi_src)).collect::<Vec<_>>(),
-            "midi_chan": (0..CHANNELS).map(|c| ld32(&sh.lanes.get(c).midi_chan)).collect::<Vec<_>>(),
+            "send": (0..LEGACY_STRIPS).map(|i| sh.send_cell(strip_of_index(i)).map_or(0, ld32)).collect::<Vec<_>>(),
+            "folder_of": (0..LEGACY_LANES).map(|c| sh.lanes.get(c).folder_of.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "punch": (0..LEGACY_LANES).map(|c| sh.lanes.get(c).punch.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "midi_src": (0..LEGACY_LANES).map(|c| ld32(&sh.lanes.get(c).midi_src)).collect::<Vec<_>>(),
+            "midi_chan": (0..LEGACY_LANES).map(|c| ld32(&sh.lanes.get(c).midi_chan)).collect::<Vec<_>>(),
             "routes": sh.routes[..n].iter().map(ld32).collect::<Vec<_>>(),
             "route_gain": sh.route_gain[..n].iter().map(ld32).collect::<Vec<_>>(),
             "insert_key_n": sh.insert_key_n.load(Ordering::Relaxed),
@@ -46481,12 +46488,12 @@ fn plan_words(plan: &DeskPlan) -> Vec<(&'static str, serde_json::Value)> {
             }
         }
         if master && sp.master.contains(f) {
-            w |= 1u64 << STRIPS;
+            w |= 1u64 << LEGACY_STRIPS;
         }
         w
     };
     let per_slot = |f: &dyn Fn(&crate::desk_plan::PlanLane) -> serde_json::Value, idle: serde_json::Value| {
-        (0..CHANNELS)
+        (0..LEGACY_LANES)
             .map(|c| {
                 plan.rank_of(Slot(c as u32))
                     .and_then(|r| plan.lanes.get(r as usize))
@@ -46596,8 +46603,8 @@ mod memory_inputs {
     /// legacy thirty-two, then `spec` past them) and a plan naming them all
     /// with `flags`, landed.
     fn engine_with(lanes: usize, spec: LaneSpec, flags: LaneFlags) -> Engine {
-        let mut e = Engine::offline_sized(RATE, Timebase::new(), lanes.max(CHANNELS)).expect("an offline engine");
-        let fresh: Vec<(Slot, LaneSpec)> = (CHANNELS..lanes).map(|s| (Slot(s as u32), spec)).collect();
+        let mut e = Engine::offline_sized(RATE, Timebase::new(), lanes.max(LEGACY_LANES)).expect("an offline engine");
+        let fresh: Vec<(Slot, LaneSpec)> = (LEGACY_LANES..lanes).map(|s| (Slot(s as u32), spec)).collect();
         if !fresh.is_empty() {
             e.install_lanes(fresh).expect("the lanes install");
         }
@@ -46730,11 +46737,11 @@ mod memory_inputs {
         const DEV: usize = 64;
         const COL: usize = 39;
         const TRACK: usize = 5;
-        let mut e = engine_with(CHANNELS, audio(), LaneFlags::MIDI_OFF);
-        let mut flags = every_lane(&e, CHANNELS, LaneFlags::MIDI_OFF);
+        let mut e = engine_with(LEGACY_LANES, audio(), LaneFlags::MIDI_OFF);
+        let mut flags = every_lane(&e, LEGACY_LANES, LaneFlags::MIDI_OFF);
         flags.lanes[TRACK].flags = LaneFlags::ARMED | LaneFlags::MIDI_OFF;
         e.publish_plan(&flags).expect("the plan goes");
-        let rows: Vec<InputRow> = (0..CHANNELS)
+        let rows: Vec<InputRow> = (0..LEGACY_LANES)
             .map(|i| InputRow {
                 id: TrackId(i as u32),
                 audio: i == TRACK,
@@ -46818,12 +46825,12 @@ mod memory_inputs {
         let mut e = Engine::offline(RATE, Timebase::new()).expect("an engine");
         assert_eq!((e.capture_ring_bytes(), e.stem_ring_bytes()), (0, 0), "an idle engine holds a ring");
         const MORE: usize = 256;
-        let fresh: Vec<(Slot, LaneSpec)> = (CHANNELS..CHANNELS + MORE).map(|s| (Slot(s as u32), audio())).collect();
+        let fresh: Vec<(Slot, LaneSpec)> = (LEGACY_LANES..LEGACY_LANES + MORE).map(|s| (Slot(s as u32), audio())).collect();
         let (_, bytes) = crate::rt_alloc::count_bytes(|| e.install_lanes(fresh).expect("the lanes install"));
         e.settle_offline();
         assert!(bytes / MORE < RING / 2, "a lane asked for {} bytes, a stem ring's column of them", bytes / MORE);
         assert_eq!((e.capture_ring_bytes(), e.stem_ring_bytes()), (0, 0), "idle memory moved with the lanes");
-        let wide = CHANNELS + MORE - 1;
+        let wide = LEGACY_LANES + MORE - 1;
         e.sync_capture_rings(&[PickId(wide as u32)]).expect("a ring");
         e.arm_stems(&[Slot(3), Slot(wide as u32)]);
         let mut narrow = Engine::offline(RATE, Timebase::new()).expect("an engine");

@@ -7410,7 +7410,8 @@ mod tests {
     /// onto the new empty channels.
     #[test]
     fn an_eight_channel_desk_grows_to_sixteen() {
-        use crate::recorder::{pad_insert_index, Strip, INSERTS};
+        use crate::recorder::{Strip, INSERTS};
+        use crate::desk_legacy::pad_insert_index;
         use crate::desk_legacy::{V32_CHANNELS as CHANNELS, V32_STRIPS as STRIPS};
         assert!(CHANNELS >= 16, "this test is about the 8 -> 16 widening");
         // v18 8-channel shape: STRIPS = 11 (0..7 channels, 8 drums, 9 click,
@@ -7482,7 +7483,8 @@ mod tests {
     /// eight-to-sixteen test above extracts from its own era.
     #[test]
     fn a_sixteen_channel_desk_grows_to_twenty_four() {
-        use crate::recorder::{pad_insert_index, Strip, INSERTS};
+        use crate::recorder::{Strip, INSERTS};
+        use crate::desk_legacy::pad_insert_index;
         use crate::desk_legacy::{V32_CHANNELS as CHANNELS, V32_STRIPS as STRIPS};
         assert!(CHANNELS >= 24, "this test is about the 16 -> 24 widening");
         // 16-era shape: STRIPS = 19 (0..15 channels, 16 drums, 17 click,
@@ -8284,7 +8286,8 @@ mod tests {
 
     #[test]
     fn a_pre_lanes_projects_pad_plugins_follow_their_drumpad() {
-        use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS};
+        use crate::recorder::{DRUM_PADS, INSERTS};
+        use crate::desk_legacy::pad_rack_index;
         use crate::desk_legacy::V32_STRIPS as STRIPS;
         // A session as an older build wrote it: the drumpad on channel 7,
         // and a plugin on pad 36 sitting in the ONE pad block that existed.
@@ -8294,7 +8297,7 @@ mod tests {
         // channel 7.
         // The migration works on the file's dense legacy table, before
         // anything is bound to identity, so that is what it is handed here.
-        let bare = || vec![String::new(); crate::recorder::INSERT_SPACE];
+        let bare = || vec![String::new(); crate::desk_legacy::V32_INSERT_SPACE];
         let mut s = bare();
         s[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
         let legacy = (STRIPS + 1 + 36) * INSERTS;
@@ -9028,7 +9031,7 @@ mod tests {
 
         let mut s = Settings::default();
         // Out of order and out of seat order, so the sorting is doing work.
-        assert!(s.bypass.insert(bay(crate::recorder::MASTER_EXTRA_SEAT, 1)));
+        assert!(s.bypass.insert(bay(crate::desk_legacy::MASTER_EXTRA_SEAT, 1)));
         assert!(s.bypass.insert(bay(3, 2)));
         assert!(s.bypass.insert(bay(3, 0)));
         // Setting a bay that is already set changes nothing and says so.
@@ -9043,7 +9046,7 @@ mod tests {
         // were flagged in.
         assert_eq!(
             BypassBays::from_json(out.get("insert_bypass").expect("written")).0,
-            vec![(3, 0), (3, 2), (crate::recorder::MASTER_EXTRA_SEAT, 1)],
+            vec![(3, 0), (3, 2), (crate::desk_legacy::MASTER_EXTRA_SEAT, 1)],
             "the list was not written sorted"
         );
         let back = Settings::from_map(out);
@@ -9349,7 +9352,7 @@ mod tests {
         // the clamp is wider than the strips — what matters is the FRONT
         // never slid.
         assert!(
-            s.legacy_inserts().len() <= crate::recorder::INSERT_SPACE
+            s.legacy_inserts().len() <= crate::desk_legacy::V32_INSERT_SPACE
         );
         for i in 0..((STRIPS + 1) * INSERTS).min(s.legacy_inserts().len()) {
             assert_eq!(s.legacy_inserts()[i], format!("/x/p{i}.vst3"), "bay {i} moved");
@@ -9581,7 +9584,7 @@ mod tests {
         let back = Settings::from_json(&text);
         assert_eq!(back.legacy_inserts(), s.legacy_inserts(), "the desk moved through the file");
         assert!(!back.extra.contains_key("strip_inserts_tail"), "the tail became a stranger");
-        assert_eq!(back.legacy_inserts().len(), crate::recorder::INSERT_SPACE);
+        assert_eq!(back.legacy_inserts().len(), crate::desk_legacy::V32_INSERT_SPACE);
 
         let legacy = serde_json::to_string(&Value::Object(map)).expect("json");
         assert_eq!(Settings::from_json(&legacy).legacy_inserts(), s.legacy_inserts(), "the legacy shape read differently");
@@ -9621,7 +9624,7 @@ mod tests {
         assert_eq!(s.legacy_inserts()[200], "/x/PadComp.vst3", "a pad-rack seat did not land");
         assert_eq!(s.legacy_inserts()[4149 * INSERTS], "/x/Brusfri.vst3", "the far seat did not land");
         assert!(s.legacy_inserts()[9000].is_empty(), "an empty path made a seat");
-        assert_eq!(s.legacy_inserts().len(), crate::recorder::INSERT_SPACE, "a seat past the map grew it");
+        assert_eq!(s.legacy_inserts().len(), crate::desk_legacy::V32_INSERT_SPACE, "a seat past the map grew it");
         assert!(!s.extra.contains_key("strip_inserts_tail"));
     }
 
