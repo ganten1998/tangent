@@ -104,12 +104,23 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     if std::fs::write(&tmp, bytes).is_ok() && {
         #[cfg(test)]
         kill_point();
-        std::fs::rename(&tmp, path).is_ok()
+        !write_refused() && std::fs::rename(&tmp, path).is_ok()
     } {
         return true;
     }
     let _ = std::fs::remove_file(&tmp);
     false
+}
+
+/// **A legacy sidecar's bytes, for the copy**: `None` when the file cannot
+/// be read (a refused permission, a volume gone), which the conversion
+/// counts as a copy still owed and never as one done.
+fn read_legacy(path: &Path) -> Option<Vec<u8>> {
+    fs_call();
+    if read_refused() {
+        return None;
+    }
+    std::fs::read(path).ok()
 }
 
 /// **Which bays a shelf holds a pstate file for**: ONE directory read. A
@@ -334,6 +345,15 @@ pub struct ShelfConversion {
     /// Legacy files whose pstate name was already there (a copy an earlier,
     /// interrupted run made, or a state written since): left alone.
     pub kept: usize,
+    /// Legacy files that name a bay and whose copy did not land: the read
+    /// failed, or the write or its rename did.
+    pub failed: usize,
+    /// **It could not finish, and the next launch runs it again**: a copy
+    /// failed, or `.shelf-v23` itself did not land. The pending marker
+    /// stands (written here when this run's set came from the launch), so
+    /// that run copies through the same set, and copy-if-absent makes it
+    /// redo only what is missing.
+    pub owed: bool,
 }
 
 /// **The global shelf's one conversion** (design 6.6), before any project
@@ -359,6 +379,17 @@ pub fn convert_global_shelf(launch: ShelfShuffles) -> ShelfConversion {
 /// missing and keeps what is there), and it never runs again once
 /// `.shelf-v23` stands: a pstate file deleted after that never comes back.
 /// No legacy file is renamed or deleted.
+///
+/// **And `.shelf-v23` is written only over a WHOLE copy.** A legacy file
+/// that names a bay and could not be read, or whose copy did not land (a
+/// refused permission, a full disk, a rename that failed), leaves the
+/// conversion owed: no `.shelf-v23`, and the pending marker standing,
+/// written here from this run's set when the launch supplied it. Marked
+/// done over a failed copy, the conversion never ran again and that bay's
+/// knobs stayed in a file this build never reads (the global shelf is read
+/// by identity names alone), so its plugin opened at its defaults for
+/// good. Owed, the next launch copies through the same set, and
+/// copy-if-absent makes that run redo only the copies still missing.
 pub fn convert_shelf_in(dir: &Path, launch: ShelfShuffles) -> ShelfConversion {
     let pending = dir.join(SHELF_PENDING_NAME);
     if dir.join(SHELF_DONE_NAME).exists() {
@@ -366,7 +397,7 @@ pub fn convert_shelf_in(dir: &Path, launch: ShelfShuffles) -> ShelfConversion {
         let _ = std::fs::remove_file(&pending);
         return ShelfConversion::default();
     }
-    let set = std::fs::read_to_string(&pending)
+    let marked = std::fs::read_to_string(&pending)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|v| {
@@ -377,8 +408,8 @@ pub fn convert_shelf_in(dir: &Path, launch: ShelfShuffles) -> ShelfConversion {
                 .filter_map(|n| n.as_str().map(str::to_owned))
                 .collect();
             ShelfShuffles::from_names(names.iter().map(String::as_str))
-        })
-        .unwrap_or(launch);
+        });
+    let set = marked.unwrap_or(launch);
     let mut done = ShelfConversion { ran: true, ..ShelfConversion::default() };
     for (legacy, bay) in legacy_states(dir) {
         // Where the old builds' renames would have put it: `None` where they
@@ -393,19 +424,36 @@ pub fn convert_shelf_in(dir: &Path, launch: ShelfShuffles) -> ShelfConversion {
             done.kept += 1;
             continue;
         }
-        fs_call();
-        let Ok(bytes) = std::fs::read(dir.join(legacy_name(legacy, bay))) else {
-            continue;
-        };
-        if write_atomic(&to, &bytes) {
+        let landed = read_legacy(&dir.join(legacy_name(legacy, bay))).is_some_and(|bytes| write_atomic(&to, &bytes));
+        if landed {
             done.copied += 1;
+        } else {
+            done.failed += 1;
         }
     }
-    // LAST: from here on the conversion never runs again.
-    if write_atomic(&dir.join(SHELF_DONE_NAME), b"") {
+    // LAST, and only over a whole copy: from here on the conversion never
+    // runs again.
+    if done.failed == 0 && write_atomic(&dir.join(SHELF_DONE_NAME), b"") {
         let _ = std::fs::remove_file(&pending);
+        return done;
+    }
+    // **Owed.** The marker is what names the set to the next launch, whose
+    // format-2 settings raise none: one this run read stands as it is, and
+    // one it did not (the set was the launch's, or the marker would not
+    // parse) is written now.
+    done.owed = true;
+    if marked.is_none() {
+        write_pending(dir, set);
     }
     done
+}
+
+/// **The pending marker, naming `set`**, temp and rename: the shape
+/// `Settings::save_to` writes before the first format-2 settings write, read
+/// by [`convert_shelf_in`] for `shuffles` alone.
+fn write_pending(dir: &Path, set: ShelfShuffles) -> bool {
+    let marker = serde_json::json!({ "shuffles": set.names() });
+    serde_json::to_string_pretty(&marker).is_ok_and(|text| write_atomic(&dir.join(SHELF_PENDING_NAME), text.as_bytes()))
 }
 
 /// **The plugins a document ON DISK names**, by bay: its format-2 desk's
@@ -509,6 +557,52 @@ fn kill_point() {
         Some(n) => k.set(Some(n - 1)),
         None => {}
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// **A write that fails and a read that fails, for the failure tests**:
+    /// when set, the write (or the legacy read) that finds its count at zero
+    /// fails the way a full disk, a refused permission or a refused rename
+    /// fails it, and the process goes on; every earlier one counts it down.
+    /// The kill above ends the run; these let it carry on past the failure,
+    /// which is what decides whether it may still call itself done.
+    static FAIL_WRITE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_READ: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the countdown in `cell` has reached this call.
+#[cfg(test)]
+fn counted_out(cell: &std::cell::Cell<Option<usize>>) -> bool {
+    match cell.get() {
+        Some(0) => {
+            cell.set(None);
+            true
+        }
+        Some(n) => {
+            cell.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether this write's rename is refused (tests only; never in a build).
+#[inline]
+fn write_refused() -> bool {
+    #[cfg(test)]
+    return FAIL_WRITE.with(counted_out);
+    #[cfg(not(test))]
+    false
+}
+
+/// Whether this legacy read fails (tests only; never in a build).
+#[inline]
+fn read_refused() -> bool {
+    #[cfg(test)]
+    return FAIL_READ.with(counted_out);
+    #[cfg(not(test))]
+    false
 }
 
 #[cfg(test)]
@@ -937,6 +1031,98 @@ mod tests {
             writes += 1;
         }
         assert!(writes > 4, "fixture: the conversion made only {writes} writes");
+    }
+
+    /// **A copy that FAILS leaves the conversion owed, and the next launch
+    /// finishes it** (design 6.6: every state reaches its V32 seat, and
+    /// `.shelf-v23` is the word that none is left to copy). A kill ends the
+    /// run; a failure lets it carry on, which is exactly when it could
+    /// still have called itself done. So each failure is injected at each
+    /// point it can strike, and the run goes on past it: every write in
+    /// turn (a temp that will not rename, the copies and `.shelf-v23`
+    /// alike), then every read of a legacy file, with the set coming from a
+    /// standing marker and from the launch alone.
+    ///
+    /// The failed run leaves no `.shelf-v23`, a marker naming the set it
+    /// copied through (the one that stood, untouched, or one it wrote from
+    /// the launch's set, because the relaunch's format-2 settings raise
+    /// none), no temp file and every legacy file as it was. The relaunch
+    /// copies what is missing and marks the conversion done, and every
+    /// plugin finds its own knobs.
+    #[test]
+    fn a_failed_copy_leaves_the_conversion_owed_and_the_next_launch_finishes_it() {
+        let (_, bays, plugins) = v12();
+        let set = ShelfShuffles::from_names(["v13", "v14", "v18", "v19", "v20"]).expect("the names");
+        let marker = r#"{"settings_version": 12, "shuffles": ["v13", "v14", "v18", "v19", "v20"]}"#;
+        let names = |dir: &Path| -> Option<Vec<String>> {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SHELF_PENDING_NAME)).ok()?).ok()?;
+            Some(v["shuffles"].as_array()?.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect())
+        };
+        let mut struck_any = (0, 0);
+        for from_marker in [true, false] {
+            for (what, key) in [("write", &FAIL_WRITE), ("read", &FAIL_READ)] {
+                let mut at = 0;
+                loop {
+                    let tag = format!("{what} {at}, the set from {}", if from_marker { "the marker" } else { "the launch" });
+                    let dir = scratch("fail-copy");
+                    seed(&dir, &bays);
+                    let before = legacy_files(&dir);
+                    if from_marker {
+                        std::fs::write(dir.join(SHELF_PENDING_NAME), marker).expect("the marker");
+                    }
+                    key.with(|k| k.set(Some(at)));
+                    let done = convert_shelf_in(&dir, if from_marker { ShelfShuffles::NONE } else { set });
+                    let struck = key.with(std::cell::Cell::take).is_none();
+                    if struck {
+                        if what == "write" {
+                            struck_any.0 += 1;
+                        } else {
+                            struck_any.1 += 1;
+                        }
+                        assert!(done.ran && done.owed, "{tag}: a failed run called itself finished: {done:?}");
+                        // A read that fails, or a copy whose write does, is
+                        // one copy owed; the one write that is not a copy is
+                        // `.shelf-v23` itself.
+                        assert!(done.failed == 1 || (what == "write" && done.failed == 0), "{tag}: {done:?}");
+                        assert!(!dir.join(SHELF_DONE_NAME).exists(), "{tag}: the conversion was marked done over a failure");
+                        assert_eq!(
+                            names(&dir).as_deref(),
+                            Some(&set.names().into_iter().map(str::to_owned).collect::<Vec<_>>()[..]),
+                            "{tag}: no marker names the set the relaunch must copy through"
+                        );
+                        if from_marker {
+                            assert_eq!(
+                                std::fs::read_to_string(dir.join(SHELF_PENDING_NAME)).expect("the marker"),
+                                marker,
+                                "{tag}: the standing marker was rewritten"
+                            );
+                        }
+                        let torn: Vec<String> = files(&dir).into_keys().filter(|n| n.ends_with(".tmp")).collect();
+                        assert!(torn.is_empty(), "{tag}: {torn:?} left behind");
+                        assert_eq!(legacy_files(&dir), before, "{tag}: a legacy sidecar was touched");
+                        // The relaunch: its format-2 settings raise nothing.
+                        // It copies exactly the copy that was owed (the
+                        // failed bay had no file, or copy-if-absent would
+                        // have kept it) and nothing else.
+                        let again = convert_shelf_in(&dir, ShelfShuffles::NONE);
+                        assert!(again.ran && !again.owed && again.failed == 0, "{tag}: the relaunch did not finish: {again:?}");
+                        assert_eq!(again.copied, done.failed, "{tag}: the relaunch did not copy exactly what was owed");
+                    }
+                    every_state_found(&tag, &dir, &plugins, &bays);
+                    assert!(dir.join(SHELF_DONE_NAME).is_file(), "{tag}: not marked done");
+                    assert!(!dir.join(SHELF_PENDING_NAME).exists(), "{tag}: the marker outlived the conversion");
+                    let torn: Vec<String> = files(&dir).into_keys().filter(|n| n.ends_with(".tmp")).collect();
+                    assert!(torn.is_empty(), "{tag}: {torn:?} left half-written");
+                    assert_eq!(legacy_files(&dir), before, "{tag}: a legacy sidecar was touched");
+                    let _ = std::fs::remove_dir_all(&dir);
+                    if !struck {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+        }
+        assert!(struck_any.0 > 8 && struck_any.1 > 4, "fixture: too few failures struck: {struck_any:?}");
     }
 
     /// **No new-build path renames or deletes a legacy sidecar** (design

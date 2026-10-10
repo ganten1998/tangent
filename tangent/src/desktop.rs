@@ -20005,13 +20005,27 @@ impl DesktopApp {
                     converted.kept
                 );
             }
-            let _ = (
-                me.app.take_desk_state_shift(),
-                me.app.take_desk_state_shift_v14(),
-                me.app.take_pad_state_shift_v18(),
-                me.app.take_desk_state_shift_v19(),
-                me.app.take_desk_state_shift_v20(),
-            );
+            // **A conversion that could not finish is owed, and so is its
+            // set.** It left the pending marker naming the set; the flags
+            // stay up as well, so that if the marker could not be written
+            // either, the first format-2 settings write (which writes one
+            // when none stands) names the load's set rather than the empty
+            // set a taken flag would leave it.
+            if converted.owed {
+                log::warn!(
+                    "plugin states: {} legacy file(s) could not be copied to their identity names; \
+                     the copy runs again at the next launch",
+                    converted.failed
+                );
+            } else {
+                let _ = (
+                    me.app.take_desk_state_shift(),
+                    me.app.take_desk_state_shift_v14(),
+                    me.app.take_pad_state_shift_v18(),
+                    me.app.take_desk_state_shift_v19(),
+                    me.app.take_desk_state_shift_v20(),
+                );
+            }
         }
         #[cfg(feature = "recorder")]
         me.open_project_at_launch();
@@ -36165,6 +36179,16 @@ mod sidecar_walk_probe {
         assert!(set < app, "the shuffle set is read after the app has taken the settings");
         assert!(convert < open, "the shelf is converted after the launch's project has opened");
         assert_eq!(src.matches(call).count(), 1, "the global shelf is converted on more than one road");
+        // An owed conversion keeps the flags up: taken, the first format-2
+        // settings write would name the empty set to the launch that has to
+        // finish the copy.
+        let owed = new.find("if converted.owed {").expect("the launch asks whether the conversion is owed");
+        let taken = new.find("me.app.take_desk_state_shift(),").expect("the flags are taken");
+        let otherwise = new[owed..taken].rfind("} else {").map(|n| owed + n);
+        assert!(
+            convert < owed && otherwise.is_some_and(|e| e < taken),
+            "the shuffle flags are taken whether or not the conversion finished"
+        );
     }
 
     /// **A shelf written before the seat space grew converts to its bays.**
