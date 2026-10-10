@@ -1018,3 +1018,29 @@ fn persistence_and_drawing_never_read_the_licence() {
     let code = production_code(planted);
     assert!(code.contains("track_cap") && !code.contains("cheated"), "the scan's own reading is wrong:\n{code}");
 }
+
+/// **The timeline's frame is its layout's** (`arr_frame` reads the numbers
+/// `arrange_view` hands the layout), whatever hidden rows the desk holds:
+/// the lanes the clip pictures are cut for are the lanes drawn, and the
+/// lane bar's gutter is reserved exactly when the bar is drawn. It read the
+/// desk's length, hidden rows and all, so a fresh desk of two tracks
+/// reserved a gutter for a bar its layout never drew.
+#[test]
+fn the_timelines_frame_is_its_layouts_whatever_rows_are_hidden() {
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 700.0));
+    let shipped = Settings {
+        show_welcome: false,
+        ..Settings::default()
+    };
+    for (what, settings, bar) in [("the shipped desk", shipped, false), ("one track", desk(1), false), ("forty", desk(40), true)] {
+        let (_ctx, mut app) = app_on(settings, tiers::supporter("frame"));
+        app.settings.arr_visible = 8;
+        let frame = app.arr_frame(rect);
+        let clips = app.arr_clip_views();
+        let v = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &v);
+        assert_eq!(l.lane_bar.track.is_positive(), bar, "{what}: fixture: the bar is not what eight lanes of this desk draw");
+        assert_eq!(frame.lanes_area, l.lanes_area, "{what}: the frame's lanes are not the layout's");
+    }
+    let _ = std::fs::remove_dir_all(tiers::dir("frame"));
+}

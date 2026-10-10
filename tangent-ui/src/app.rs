@@ -12954,9 +12954,10 @@ impl TangentApp {
     /// **The rows the two TRACKS stand on now**, asked as the note is taken,
     /// so a reorder between the copy and the paste (or the paste and the
     /// take) cannot hand the host another track's files. A source removed
-    /// since - a cut - stands on no row; its files are on the row its
-    /// removal emptied (`TrackCopy::files_at`), wherever that row is now,
-    /// and nothing when a new track has been made there.
+    /// since - a cut - stands on no row, and since Remove deletes its row
+    /// (W6) neither does anything it left, so this form answers nothing for
+    /// it; the identity form (`take_insert_state_copy_ids`) still names the
+    /// track, whose states the shelf keeps under its own bays.
     pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
         let (from, to, files_at) = self.insert_state_copy.take()?;
         let from = self.row_of(from).or_else(|| self.row_of(files_at))?;
@@ -14705,10 +14706,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the same two numbers `arrange_view` hands the layout, so the lanes'
     /// width here is the one the clips are drawn against.
     fn arr_frame(&self, rect: Rect) -> crate::arrangement_panel::Frame {
+        // The view's own `active` (`arrange_view`): the drawn lanes and the
+        // add under them. The desk's length counts the hidden rows too, and
+        // a fresh desk of two tracks among thirty hidden ones reserved a
+        // gutter for a bar its layout never drew.
+        let active = self.desk_index().shown_len() + 1;
         crate::arrangement_panel::Layout::frame(
             rect,
             self.arr_header_w_pt(),
-            crate::arrangement_panel::lane_bar_shown(self.arr_visible(), self.desk_extent()),
+            crate::arrangement_panel::lane_bar_shown(self.arr_visible(), active),
         )
     }
 
