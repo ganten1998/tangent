@@ -8,7 +8,8 @@
 //! hundred buses; loops greyed in the pickers) are `tangent-ui`'s
 //! `bus_tests`. What this file adds is that the plan the engine plays
 //! carries a bus as a bus and every send to one, in an order no reorder
-//! moves; that a send is heard, through its bus and nowhere else; that a
+//! moves; that a send is heard, through its bus and nowhere else; that the
+//! switch the app's send curves wait on says what an export plays; that a
 //! free desk's hundred buses and thousand sends reach one plan; and that a
 //! route loop a legacy file saved plays exactly as the legacy shim played
 //! it, which is the road the render goldens pin.
@@ -249,6 +250,69 @@ fn a_send_is_heard_through_its_bus_and_nowhere_else() {
     assert!(energy(&sent) > energy(&none) * 1.5, "the send did not reach the master through its bus");
     assert_eq!(bus_zero, 0.0, "a send at nothing reached the bus");
     assert!(zero.iter().zip(&none).all(|(a, b)| a.to_bits() == b.to_bits()), "a send at nothing changed the mix");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **The send curve switch says what an export plays**
+/// (`tangent_ui::automation::SEND_CURVES_PLAY`, which the A menu's Sends
+/// group, a send row's writes and a lone base all wait on): a curve on a
+/// track's send to a return changes the export exactly when the switch says
+/// a send's curve is played. The curve holds the send at nothing for the
+/// whole song, written where a save writes curves and opened as a song is.
+/// Played, the return hears nothing; not played (today), the export is the
+/// export of the same song with no curve, bit for bit. The commit that
+/// maps `AutoParam::SendTo` onto the engine's send curves (W7-slot-gaps
+/// item 5) fails this until it sets the switch, and a switch set with
+/// nothing behind it fails it too.
+#[test]
+fn the_send_curve_switch_says_what_an_export_plays() {
+    use tangent_ui::automation::{AutoParam, Shape, SEND_CURVES_PLAY};
+    let root = scratch("send-curve");
+    let wav = root.join("noise.wav");
+    noise_wav(&wav, 0x5e4d);
+    let (_ctx, mut app) = app_on(desk(0), tiers::free("buses-send-curve"));
+    app.bootstrap_project(&root.join("Projects"));
+    app.import_audio_at(&wav, 0, 0.0).expect("a track with a sound");
+    let bus = app.new_bus(BusRole::Return).expect("a return");
+    assert!(app.add_send(StripRef::Row(0), bus));
+    let to = app.track_at(bus).expect("the return's track");
+    assert!(app.save_project_first(&root.join("Send.tan")), "the save did not land");
+    let doc = app.project_doc().expect("the saved project").to_path_buf();
+    // The saved song, opened again with `curves` for its automation: what
+    // its export makes, and what its return's lane meters.
+    let reopen = |app: &mut TangentApp, curves: serde_json::Value| {
+        let text = std::fs::read_to_string(&doc).expect("the document");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("the document parses");
+        json.as_object_mut().expect("a document").insert("automation".to_owned(), curves);
+        std::fs::write(&doc, serde_json::to_string_pretty(&json).expect("json")).expect("the document written");
+        app.open_project(&doc);
+        let (master, lanes) = heard(app);
+        (master, lanes[app.row_of(to).expect("the return's row")])
+    };
+    let (plain, return_plain) = reopen(&mut app, serde_json::json!([]));
+    let curve = serde_json::json!([{
+        "lane": 0,
+        "param": AutoParam::SendTo { to }.key(),
+        "points": [
+            { "at": 0.0, "v": 0.0, "shape": Shape::Hold.key() },
+            { "at": 30.0, "v": 0.0, "shape": Shape::Hold.key() },
+        ],
+    }]);
+    let (curved, return_curved) = reopen(&mut app, curve);
+    assert!(return_plain > 0.0, "fixture: the return hears nothing with no curve");
+    assert!(
+        app.automation().curves().iter().any(|c| c.param == AutoParam::SendTo { to }),
+        "fixture: the song lost its send's curve"
+    );
+    assert_eq!(app.strip_send_to(StripRef::Row(0), Node::Track(to), false), Some(1.0), "fixture: the open moved the send");
+    let same = return_curved.to_bits() == return_plain.to_bits()
+        && curved.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits());
+    if SEND_CURVES_PLAY {
+        assert_eq!(return_curved, 0.0, "the switch says a send's curve plays, and the return heard one held at nothing");
+        assert!(!same, "the switch says a send's curve plays, and the export did not change");
+    } else {
+        assert!(same, "a send's curve changed the export while the switch says none is played");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
