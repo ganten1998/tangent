@@ -31,8 +31,8 @@ pub struct StripView<'a> {
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
     /// **Six, because the master has two racks.** A channel fills the first
-    /// three and leaves the rest empty. See `recorder::seat_bay`, which is
-    /// the one place that knows a slot's real seat.
+    /// three and leaves the rest empty. See `desk_id::slot_key`, which is
+    /// the one place that knows a slot's real bay.
     pub inserts: [&'a str; INSERTS * 2],
     /// How many routes leave this channel, for the strips under the button.
     /// The routes THEMSELVES live on the view, not the strip: one borrow for
@@ -88,7 +88,7 @@ pub struct StripView<'a> {
     /// This channel's MIDI goes to the theory view — the **T** switch.
     pub to_theory: bool,
     /// This channel IS a folder — a group head, wearing six bays like the
-    /// master. See `recorder::folder_extra_seat`.
+    /// master: slots 3..5 are its second rack (`desk_id::slot_key`).
     pub is_folder: bool,
     /// This channel lives inside a folder above it. Drawn a step LOWER —
     /// the mixer's vertical answer to the arrangement's indent.
@@ -101,7 +101,7 @@ pub struct StripView<'a> {
     /// **Which bays are BYPASSED** — kept, loaded, editable, and not
     /// applied. Same indexing as `inserts` and `keyed`: the strip's visible
     /// slots, which for the master and a folder span two racks. The caller
-    /// resolves that through `recorder::seat_bay` before asking, exactly as
+    /// resolves that through `desk_id::slot_key` before asking, exactly as
     /// it does for the names.
     ///
     /// Appended after `keyed` and not woven in beside it, for the reason
@@ -118,6 +118,11 @@ pub struct StripView<'a> {
     /// return and is not here). Empty on a strip that sends nowhere.
     /// Appended.
     pub sends: Vec<SendRow>,
+    /// **The track's identity**, `None` for the click and the master: what
+    /// its controls' accessibility ids are keyed by ([`a11y_key`]), so a
+    /// reorder or an insert above never hands a reader's focus to the track
+    /// that moved into this one's row. Appended.
+    pub id: Option<crate::desk_id::TrackId>,
 }
 
 /// **One send as a strip's row draws it**: the bus's name, the level, and
@@ -195,9 +200,9 @@ impl StripView<'_> {
 ///
 /// It was `[StripView; COLUMNS]`, every column of the desk built every frame
 /// whether it was on screen or forty strips off it, and the array's last
-/// two entries were the click and the master by position. The desk stops
-/// being a fixed width (docs/design/unlimited-tracks.md, section 10), so a
-/// view now carries the tracks the layout will place, in RANK order (the
+/// two entries were the click and the master by position. The desk has no
+/// fixed width (docs/design/unlimited-tracks.md, sections 2 and 10), so a
+/// view carries the tracks the layout will place, in RANK order (the
 /// drawn order, which a shut folder's children have left), plus the click
 /// and the master by NAME, plus the totals the scroll range needs.
 ///
@@ -1677,7 +1682,8 @@ pub struct StripStrip {
     /// A user effect plugin across this strip. Only the bus has one today.
     /// **Six, because the master has two racks.** A channel uses the first
     /// three and leaves the rest `NOTHING`; `recorder::bays_on` says how
-    /// many a strip actually draws. See `recorder::MASTER_EXTRA_SEAT`.
+    /// many a strip actually draws, and `desk_id::slot_key` which rack each
+    /// slot is (the master's show extra-first).
     pub inserts: [Rect; INSERTS * 2],
     /// The Routing button, under the insert bays — the owner's placement.
     pub routing: Rect,
@@ -2625,10 +2631,9 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
         // **The id is the strip's IDENTITY and the control**, never the
         // column's place on screen: a scroll or a zoom moves every strip and
         // must not hand a reader's focus to whatever slid under it. A track
-        // is its TrackId (by the identity rule, row r is TrackId(r) until
-        // W3 gives the app ids of its own: MERGE-ME there), and the two
-        // pinned strips are themselves.
-        let id = egui::Id::new(("desk", a11y_key(col), format!("{hit:?}")));
+        // is its TrackId (`StripView::id`, the row's own since W3), and the
+        // two pinned strips are themselves.
+        let id = egui::Id::new(("desk", a11y_key(col, s.id), format!("{hit:?}")));
         let travel = |norm: f32, axis: DragAxis| Travel {
             norm: norm.clamp(0.0, 1.0),
             up: matches!(axis, DragAxis::Vertical),
@@ -2774,10 +2779,14 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
 }
 
 /// The identity an accessibility id is keyed by: a track's `TrackId`, or
-/// the pinned strip itself. See `a11y_nodes_from`.
-fn a11y_key(col: Column) -> (u8, u32) {
+/// the pinned strip itself. See `a11y_nodes_from`. It read `TrackId(row)`,
+/// the identity rule's answer for a legacy desk, which is the ROW again
+/// under another name: a track dragged above this one left its controls'
+/// ids to whichever track landed on its row. A track strip with no id
+/// (none is built without one) keeps a key no identity can share.
+fn a11y_key(col: Column, id: Option<crate::desk_id::TrackId>) -> (u8, u32) {
     match col {
-        Column::Track(row) => (0, crate::desk_id::TrackId(row as u32).0),
+        Column::Track(row) => id.map_or((3, row as u32), |t| (0, t.0)),
         Column::Click => (1, 0),
         Column::Master => (2, 0),
     }
@@ -4742,6 +4751,11 @@ mod tests {
             frozen: false,
             plus: Plus::Row,
             sends: Vec::new(),
+            // The identity rule's ids, row r is track r, as a legacy desk's.
+            id: match strip {
+                Some(Strip::Channel(r)) => Some(crate::desk_id::TrackId(r as u32)),
+                _ => None,
+            },
         }
     }
 
@@ -5083,6 +5097,50 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len(), "two desk controls share an id");
+    }
+
+    /// **A control's accessibility id is its track's, not its row's.** The
+    /// same desk twice, the second with the first two rows' tracks swapped
+    /// (a drag of track 1 below track 2): every control on a row whose track
+    /// stayed keeps its id, so a reader's focus survives, and every control
+    /// on the two rows whose tracks changed gets a new one, so focus is
+    /// never handed to the track that moved into a row. The id used to be
+    /// keyed by `TrackId(row)`, the row under another name, and both rows
+    /// kept their ids across the swap.
+    #[test]
+    fn a_controls_accessibility_id_belongs_to_its_track_not_its_row() {
+        use crate::desk_id::TrackId;
+        let r = rect();
+        let mut first = a_view();
+        let mut swapped = a_view();
+        for (row, (a, b)) in [(0usize, (40u32, 41u32)), (1, (41, 40))] {
+            first.strips.tracks[row].id = Some(TrackId(a));
+            swapped.strips.tracks[row].id = Some(TrackId(b));
+        }
+        let (before, after) = (a11y_nodes(r, &first), a11y_nodes(r, &swapped));
+        assert_eq!(before.len(), after.len(), "the swap changed the controls");
+        let targets = Layout::new(r, &first).targets();
+        let row_of = |rect: Rect| {
+            targets.iter().find(|(rr, _)| *rr == rect).and_then(|&(_, hit)| match hit_column(hit) {
+                Some(Column::Track(row)) => Some(row),
+                _ => None,
+            })
+        };
+        let (mut kept, mut renewed) = (0, 0);
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(b.rect, a.rect, "the two desks laid out differently");
+            match row_of(b.rect) {
+                Some(0 | 1) => {
+                    assert_ne!(b.id, a.id, "{}: a swapped row's control kept its id", b.label);
+                    renewed += 1;
+                }
+                _ => {
+                    assert_eq!(b.id, a.id, "{}: a control whose track stayed lost its id", b.label);
+                    kept += 1;
+                }
+            }
+        }
+        assert!(renewed >= 10 && kept >= 40, "too few controls compared: {renewed} renewed, {kept} kept");
     }
 
     /// A fader reads in decibels and a pan in sides, never in 0..1.
@@ -5543,7 +5601,7 @@ mod tests {
     /// view to be the same as the current tracks'".
     ///
     /// The CLICK is in the sweep because it grew a second rack to be here
-    /// with: six slots seated in `recorder::BUS_EXTRA_SEATS`, and the engine
+    /// with: six slots on its two racks (`Node::Click`, chains 0 and 1), and the engine
     /// runs them.
     #[test]
     fn every_rack_on_the_desk_is_at_one_height() {

@@ -6348,12 +6348,12 @@ impl Settings {
     /// nobody finds again and one that fails outright inside a signed
     /// `.app`.
     ///
-    /// **An internal build keeps its own: `Documents/Tangent Media
-    /// Staging`.** See `tangent_core::config::STAGING`: the projects, takes
-    /// and templates such a build writes are in a format no release can
-    /// read, and the folder beside the real one is what keeps them from
-    /// landing in it. `TANGENT_MEDIA_ROOT` points either kind of build at
-    /// any folder, real files included, on purpose.
+    /// **`TANGENT_MEDIA_ROOT` points a build at any folder**, a developer's
+    /// switch beside `TANGENT_CONFIG_DIR`. The unlimited-tracks branch kept
+    /// its internal builds in `Documents/Tangent Media Staging` until its
+    /// last wave, so nothing it wrote landed among the release's projects;
+    /// the first build after it opens the real folder, and a legacy document
+    /// is kept as `<doc>.pre-v8` beside itself before its first format-2 save.
     pub fn media_root(&self) -> PathBuf {
         // **Never the owner's own folder under test**, for the reason
         // `Settings::path` gives: a test that built an app on
@@ -6370,19 +6370,19 @@ impl Settings {
         }
         #[cfg(not(test))]
         {
-            Self::default_media_root(tangent_core::config::STAGING)
+            Self::default_media_root()
         }
     }
 
-    /// `Documents/Tangent Media`, or its staging twin. Apart from
-    /// [`Self::media_root`] so that the choice is testable without the
-    /// environment and without the per-thread test root in the way; it
-    /// only names a path and creates nothing.
-    fn default_media_root(staging: bool) -> PathBuf {
+    /// `Documents/Tangent Media`. Apart from [`Self::media_root`] so that
+    /// the choice is testable without the environment and without the
+    /// per-thread test root in the way; it only names a path and creates
+    /// nothing.
+    fn default_media_root() -> PathBuf {
         dirs::document_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(if staging { "Tangent Media Staging" } else { "Tangent Media" })
+            .join("Tangent Media")
     }
 
     /// A folder the user actually chose, or nothing. An empty string is not
@@ -6399,10 +6399,25 @@ impl Settings {
     /// Kept so [`Self::pin_legacy_media_root`] can find an install that
     /// already has work in it.
     fn legacy_record_root() -> PathBuf {
-        dirs::video_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Tangent")
+        // **Never the owner's own take folder under test**, for the reason
+        // `media_root` gives: `Settings::load` runs the pin, so a test that
+        // loads settings would look in the real `Movies/Tangent` and, finding
+        // work there, aim that test's takes at it. The unlimited-tracks
+        // branch's internal builds kept the pin inert (`STAGING`), which hid
+        // this from every test; the pin runs again since its last wave, so a
+        // test looks in a per-thread folder that holds nothing. The rule
+        // itself is pinned on a temp folder through `pin_legacy_media_root_at`.
+        #[cfg(test)]
+        {
+            return test_path().with_file_name("Legacy Takes");
+        }
+        #[cfg(not(test))]
+        {
+            dirs::video_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Tangent")
+        }
     }
 
     /// **Throw away a `screen_reader_mode` that the app guessed at.**
@@ -6453,21 +6468,13 @@ impl Settings {
     /// purpose, knowing what is where.
     ///
     /// Runs once; `media_root_v20` is the marker.
-    ///
-    /// **Pins nothing in an internal build** (`tangent_core::config::STAGING`)
-    /// and leaves the marker alone: the old place is the release install's
-    /// work, and pinning to it is exactly the road by which a staging build
-    /// would write into it.
     pub fn pin_legacy_media_root(&mut self) -> bool {
-        if tangent_core::config::STAGING {
-            return false;
-        }
         self.pin_legacy_media_root_at(&Self::legacy_record_root())
     }
 
     /// [`Self::pin_legacy_media_root`]'s rule against a given old take
-    /// folder, staging or not: the test's road, on a temp folder rather
-    /// than the real `Movies/Tangent`.
+    /// folder: the test's road, on a temp folder rather than the real
+    /// `Movies/Tangent`.
     fn pin_legacy_media_root_at(&mut self, old: &std::path::Path) -> bool {
         if self.media_root_v20 {
             return false;
@@ -7075,23 +7082,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&old);
     }
 
-    /// **An internal build keeps its own media and pins nothing.** With no
-    /// override the root is `Documents/Tangent Media Staging`; the release
-    /// name is the other answer of the same chooser; and the legacy pin is
-    /// inert, marker included, so a staging build never adopts the release
-    /// install's take folder.
+    /// **With no override the media root is `Documents/Tangent Media`**,
+    /// the release's, in every build: the unlimited-tracks branch's staging
+    /// twin (`Tangent Media Staging`) went with its last wave. Through the
+    /// chooser, which names a path and touches nothing; the legacy pin's
+    /// rule is pinned above on a temp folder, never on the real
+    /// `Movies/Tangent`.
     #[test]
-    fn an_internal_build_pins_nothing_and_keeps_its_own_media() {
-        assert!(tangent_core::config::STAGING, "this branch's builds are internal");
-        let staged = Settings::default_media_root(true);
-        assert!(staged.ends_with("Tangent Media Staging"), "{}", staged.display());
-        let release = Settings::default_media_root(false);
-        assert!(release.ends_with("Tangent Media"), "{}", release.display());
-        assert_eq!(staged.parent(), release.parent(), "the twin is not beside the real one");
-        let mut s = Settings::default();
-        assert!(!s.pin_legacy_media_root(), "a staging build pinned the release's takes");
-        assert!(!s.media_root_v20, "a staging build spent the release's one-shot");
-        assert!(s.record_dir.is_none() && s.project_dir.is_none());
+    fn the_media_root_is_documents_tangent_media() {
+        let root = Settings::default_media_root();
+        assert!(root.ends_with("Tangent Media"), "{}", root.display());
+        assert!(!root.to_string_lossy().contains("Staging"), "{}", root.display());
     }
 
     /// A first launch shows the whole app; a corrupt file does not get
@@ -7409,7 +7410,8 @@ mod tests {
     /// onto the new empty channels.
     #[test]
     fn an_eight_channel_desk_grows_to_sixteen() {
-        use crate::recorder::{pad_insert_index, Strip, INSERTS};
+        use crate::recorder::{Strip, INSERTS};
+        use crate::desk_legacy::pad_insert_index;
         use crate::desk_legacy::{V32_CHANNELS as CHANNELS, V32_STRIPS as STRIPS};
         assert!(CHANNELS >= 16, "this test is about the 8 -> 16 widening");
         // v18 8-channel shape: STRIPS = 11 (0..7 channels, 8 drums, 9 click,
@@ -7481,7 +7483,8 @@ mod tests {
     /// eight-to-sixteen test above extracts from its own era.
     #[test]
     fn a_sixteen_channel_desk_grows_to_twenty_four() {
-        use crate::recorder::{pad_insert_index, Strip, INSERTS};
+        use crate::recorder::{Strip, INSERTS};
+        use crate::desk_legacy::pad_insert_index;
         use crate::desk_legacy::{V32_CHANNELS as CHANNELS, V32_STRIPS as STRIPS};
         assert!(CHANNELS >= 24, "this test is about the 16 -> 24 widening");
         // 16-era shape: STRIPS = 19 (0..15 channels, 16 drums, 17 click,
@@ -8283,7 +8286,8 @@ mod tests {
 
     #[test]
     fn a_pre_lanes_projects_pad_plugins_follow_their_drumpad() {
-        use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS};
+        use crate::recorder::{DRUM_PADS, INSERTS};
+        use crate::desk_legacy::pad_rack_index;
         use crate::desk_legacy::V32_STRIPS as STRIPS;
         // A session as an older build wrote it: the drumpad on channel 7,
         // and a plugin on pad 36 sitting in the ONE pad block that existed.
@@ -8293,7 +8297,7 @@ mod tests {
         // channel 7.
         // The migration works on the file's dense legacy table, before
         // anything is bound to identity, so that is what it is handed here.
-        let bare = || vec![String::new(); crate::recorder::INSERT_SPACE];
+        let bare = || vec![String::new(); crate::desk_legacy::V32_INSERT_SPACE];
         let mut s = bare();
         s[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
         let legacy = (STRIPS + 1 + 36) * INSERTS;
@@ -9027,7 +9031,7 @@ mod tests {
 
         let mut s = Settings::default();
         // Out of order and out of seat order, so the sorting is doing work.
-        assert!(s.bypass.insert(bay(crate::recorder::MASTER_EXTRA_SEAT, 1)));
+        assert!(s.bypass.insert(bay(crate::desk_legacy::MASTER_EXTRA_SEAT, 1)));
         assert!(s.bypass.insert(bay(3, 2)));
         assert!(s.bypass.insert(bay(3, 0)));
         // Setting a bay that is already set changes nothing and says so.
@@ -9042,7 +9046,7 @@ mod tests {
         // were flagged in.
         assert_eq!(
             BypassBays::from_json(out.get("insert_bypass").expect("written")).0,
-            vec![(3, 0), (3, 2), (crate::recorder::MASTER_EXTRA_SEAT, 1)],
+            vec![(3, 0), (3, 2), (crate::desk_legacy::MASTER_EXTRA_SEAT, 1)],
             "the list was not written sorted"
         );
         let back = Settings::from_map(out);
@@ -9348,7 +9352,7 @@ mod tests {
         // the clamp is wider than the strips — what matters is the FRONT
         // never slid.
         assert!(
-            s.legacy_inserts().len() <= crate::recorder::INSERT_SPACE
+            s.legacy_inserts().len() <= crate::desk_legacy::V32_INSERT_SPACE
         );
         for i in 0..((STRIPS + 1) * INSERTS).min(s.legacy_inserts().len()) {
             assert_eq!(s.legacy_inserts()[i], format!("/x/p{i}.vst3"), "bay {i} moved");
@@ -9580,7 +9584,7 @@ mod tests {
         let back = Settings::from_json(&text);
         assert_eq!(back.legacy_inserts(), s.legacy_inserts(), "the desk moved through the file");
         assert!(!back.extra.contains_key("strip_inserts_tail"), "the tail became a stranger");
-        assert_eq!(back.legacy_inserts().len(), crate::recorder::INSERT_SPACE);
+        assert_eq!(back.legacy_inserts().len(), crate::desk_legacy::V32_INSERT_SPACE);
 
         let legacy = serde_json::to_string(&Value::Object(map)).expect("json");
         assert_eq!(Settings::from_json(&legacy).legacy_inserts(), s.legacy_inserts(), "the legacy shape read differently");
@@ -9620,7 +9624,7 @@ mod tests {
         assert_eq!(s.legacy_inserts()[200], "/x/PadComp.vst3", "a pad-rack seat did not land");
         assert_eq!(s.legacy_inserts()[4149 * INSERTS], "/x/Brusfri.vst3", "the far seat did not land");
         assert!(s.legacy_inserts()[9000].is_empty(), "an empty path made a seat");
-        assert_eq!(s.legacy_inserts().len(), crate::recorder::INSERT_SPACE, "a seat past the map grew it");
+        assert_eq!(s.legacy_inserts().len(), crate::desk_legacy::V32_INSERT_SPACE, "a seat past the map grew it");
         assert!(!s.extra.contains_key("strip_inserts_tail"));
     }
 

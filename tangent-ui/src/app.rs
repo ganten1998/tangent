@@ -3700,19 +3700,19 @@ fn kit_shortfall(report: &crate::drumpad::KitEmbedReport) -> String {
     // never fire with a zero in them and no arm has to say "0 samples".
     match (report.unreadable, report.over_ceiling) {
         (n, 0) => format!(
-            "kit saved, but {n} {} could not be read — this kit will only play \
+            "kit saved, but {n} {} could not be read, so this kit will only play \
              on this machine",
             plural(n)
         ),
         (0, n) => format!(
-            "kit saved, but it is past {} MB, so {n} {} stayed out — this kit \
+            "kit saved, but it is past {} MB, so {n} {} stayed out and this kit \
              will only play on this machine",
             crate::drumpad::MAX_KIT_BYTES / (1024 * 1024),
             plural(n)
         ),
         (u, c) => format!(
             "kit saved, but {u} {} could not be read and {c} more were past \
-             {} MB — this kit will only play on this machine",
+             {} MB, so this kit will only play on this machine",
             plural(u),
             crate::drumpad::MAX_KIT_BYTES / (1024 * 1024)
         ),
@@ -7702,6 +7702,12 @@ impl TangentApp {
                         .collect(),
                     _ => Vec::new(),
                 },
+                // The row's own identity, which its controls' accessibility
+                // ids are keyed by (`mixer_panel::a11y_key`).
+                id: match s {
+                    Strip::Channel(n) => self.row(n).map(|r| r.id),
+                    _ => None,
+                },
             }
         };
         let master = StripRef::Master;
@@ -7805,6 +7811,7 @@ impl TangentApp {
                     plus: crate::mixer_panel::Plus::Row,
                     // Nothing past the master to send to.
                     sends: Vec::new(),
+                    id: None,
                 },
             },
             any_solo: self.any_solo(),
@@ -11701,7 +11708,7 @@ impl TangentApp {
                     (Some((a, None)), true) => format!("IN {}", a + 1),
                     (Some((a, Some(b))), true) => format!("IN {}/{}", a + 1, b + 1),
                     (Some((a, _)), false) => format!("IN {} \u{b7} NO ROOM", a + 1),
-                    (None, true) => "IN: \u{2014}".to_owned(),
+                    (None, true) => "IN: none".to_owned(),
                     (None, false) => "NO ROOM".to_owned(),
                 }
             }
@@ -11731,7 +11738,7 @@ impl TangentApp {
                     (Some((a, None)), true) => format!("IN {}", a + 1),
                     (Some((a, Some(b))), true) => format!("{}/{}", a + 1, b + 1),
                     (Some((a, _)), false) => format!("IN {a}!", a = a + 1),
-                    (None, true) => "IN \u{2014}".to_owned(),
+                    (None, true) => "IN -".to_owned(),
                     (None, false) => "IN !".to_owned(),
                 }
             }
@@ -14720,7 +14727,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.notify(
                 crate::notify::Kind::Error,
                 "That is the template shelf. Use Save as a Template to put a \
-                 stencil there — saving a project into it makes every new \
+                 stencil there: saving a project into it makes every new \
                  session a copy of this one.",
             );
             return None;
@@ -30052,7 +30059,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn save_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error =
-                "there is no file panel in a plugin — save this kit from the \
+                "there is no file panel in a plugin; save this kit from the \
                  Tangent app"
                     .to_owned();
             return;
@@ -30386,7 +30393,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn load_kit_preset(&mut self) {
         if !self.caps.native_file_dialogs {
             self.track.error =
-                "there is no file panel in a plugin — load this kit from the \
+                "there is no file panel in a plugin; load this kit from the \
                  Tangent app"
                     .to_owned();
             return;
@@ -33909,17 +33916,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.time_sel.filter(|(a, b)| b > a)
     }
 
-    /// How many mixer channels / arrange lanes / MIDI keys show at once —
-    /// Shift+wheel zooms each, clamped to a legible band. Read from settings
-    /// so the choice survives a relaunch.
-    ///
-    /// **A big window shows more.** Full or tiled, the desk shows every
-    /// channel and the timeline ten tracks — the stored counts are what a
-    /// WINDOW shows, and a screen is not a window. It is a floor rather than
-    /// an override: somebody who has zoomed PAST these keeps what they chose,
-    /// because the setting is the thing they asked for and this is only the
-    /// room the screen happens to have.
-
     /// **How far the desk reaches**: how many rows the views lay out, the
     /// pickers search and the scroll rails run to. Never reads the licence.
     ///
@@ -34062,6 +34058,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// How many mixer strips show at once: Shift+wheel zooms it, up to
+    /// `recorder::VISIBLE_MAX`, and it is read from settings so the choice
+    /// survives a relaunch. ([`Self::arr_visible`] is the same for the
+    /// arrangement's lanes.)
     fn mixer_visible(&self) -> usize {
         // **Zero is the auto sentinel** — the shipped, un-chosen state, the
         // same idiom `arr_header_w` uses. There it means derive the strip
@@ -39668,7 +39668,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // takes a press in silence is worse than one that is missing.
                 if !self.caps.native_file_dialogs {
                     self.set_bank_note(
-                        "there is no file panel in a plugin — save this bank from \
+                        "there is no file panel in a plugin; save this bank from \
                          the Tangent app"
                             .to_owned(),
                     );
@@ -51623,7 +51623,7 @@ mod tests {
         app.set_insert(at, 0, Some("/x/Piano.vst3"));
         // And one in the LOWER rack, which is a seat of its own: a copy that
         // took only the first three would drop it silently.
-        let lower_src = recorder::folder_extra_seat(at);
+        let lower_src = crate::desk_legacy::folder_extra_seat(at);
         app.set_insert(lower_src, 1, Some("/x/Saturn 2.vst3"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -51673,7 +51673,7 @@ mod tests {
         assert!((app.settings.strip_send(recorder::StripRef::Row(to_at)) - 0.75).abs() < 1e-9, "the send");
         assert_eq!(app.insert(to_at, 0), Some("/x/Piano.vst3"), "the bay");
         assert_eq!(
-            app.insert(recorder::folder_extra_seat(to_at), 1),
+            app.insert(crate::desk_legacy::folder_extra_seat(to_at), 1),
             Some("/x/Saturn 2.vst3"),
             "the lower rack did not travel"
         );
@@ -51773,14 +51773,11 @@ mod tests {
     /// rows beneath shift down rather than being written over.
     ///
     /// The owner: "Need a rightclick option for channels to insert track."
-    /// The desk is thirty-two fixed lanes, so this is a PERMUTATION and not
-    /// a growth — a lane nobody is using is spent to make the gap — and the
-    /// two things worth pinning are which lane gets spent and what happens
-    /// to a folder the gap opens inside.
-    ///
-    /// Revert check performed: take the spare lane from anywhere free rather
-    /// than from below the click, and the track above the insertion moves —
-    /// the wrong direction, and rows the gesture never mentioned.
+    /// The desk grows by the row (`DeskModel::insert_rows`), so what is worth
+    /// pinning is that nothing above the click moves and what happens to a
+    /// folder the gap opens inside. (While the desk was thirty-two fixed
+    /// lanes this was a permutation that spent a lane nobody was using, and
+    /// a spare taken from above the click moved the track above it.)
     #[test]
     fn insert_track_opens_a_row_below_and_pushes_the_rest_down() {
         let root = project_scratch("trackinsert");
@@ -51809,8 +51806,7 @@ mod tests {
 
         // ── and a folder keeps its children ──────────────────────────
         //
-        // The lane that is spent comes from outside every group, so it
-        // arrives carrying "not in a folder". Dropped into the middle of a
+        // A new row arrives carrying "not in a folder". Dropped into the middle of a
         // group that way it is a stranger between two children, and
         // `folder_of`'s walk stops at it — the rows under it fall out of
         // the group they were in. So the new row takes the membership of
@@ -57322,7 +57318,7 @@ mod tests {
     #[test]
     fn pad_fx_follow_their_track_through_a_reorder_and_its_undo() {
         use crate::desk_id::{Rack, SeatBay};
-        use crate::recorder::pad_rack_index;
+        use crate::desk_legacy::pad_rack_index;
         let root = project_scratch("padfx-reorder");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
@@ -57983,21 +57979,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Every channel can hold an input**, because the capture cap is the
-    /// channel count.
+    /// **Every channel can hold an input**, because there is no capture cap.
     ///
-    /// It was FOUR, and four was a leftover from a desk with four input
-    /// strips (`tangent_record::audio::MAX_PICKS`, where the history is
-    /// written). The desk has thirty-two channels each with its own input
-    /// chip, so a lower cap meant a track that could be bound, armed and
-    /// metered and could never receive a sample — the owner's fifth audio
-    /// track, which is how it was found. No other DAW has one.
+    /// It was FOUR, a leftover from a desk with four input strips, then the
+    /// channel count (`tangent_record::audio::Picks`, where the history is
+    /// written). Every channel has its own input chip, so a cap below the
+    /// desk meant a track that could be bound, armed and metered and could
+    /// never receive a sample — the owner's fifth audio track, which is how
+    /// it was found. No other DAW has one.
     ///
     /// `audio_ordinal` is still positional, and that is still right: the
     /// k-th audio channel takes the k-th column of the capture stream. What
     /// changed is that it cannot run out.
     #[test]
-    fn every_channel_can_take_an_input_because_the_cap_is_the_channel_count() {
+    fn every_channel_can_take_an_input_because_there_is_no_cap() {
         // There is no capture cap left to compare with the desk: the picks
         // are one per bound track (W5-engine-memory-inputs), and `INPUTS`
         // went with the fixed desk (W6). What stands is the walk below.
@@ -63310,7 +63305,7 @@ mod tests {
     #[test]
     fn shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders() {
         let track_seat = recorder::Strip::Channel(3).index();
-        let folder_seat = recorder::folder_extra_seat(1);
+        let folder_seat = crate::desk_legacy::folder_extra_seat(1);
         for arrangement in [false, true] {
             let where_ = if arrangement { "arrangement" } else { "mixer" };
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -63408,11 +63403,11 @@ mod tests {
             app.add_bare_track(n);
         }
         app.toggle_folder(1);
-        let folder_seat = recorder::folder_extra_seat(1);
+        let folder_seat = crate::desk_legacy::folder_extra_seat(1);
         app.set_insert(folder_seat, 0, Some("/x/Verb.vst3"));
-        app.set_insert(recorder::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
+        app.set_insert(crate::desk_legacy::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
         app.toggle_insert_bypass(folder_seat, 0);
-        app.toggle_insert_bypass(recorder::MASTER_EXTRA_SEAT, 1);
+        app.toggle_insert_bypass(crate::desk_legacy::MASTER_EXTRA_SEAT, 1);
 
         let v = app.mixer_view();
         assert!(v.strips[recorder::Column::Track(1)].bypassed[3], "the mixer's folder rack lost the flag");
@@ -65564,7 +65559,7 @@ mod tests {
 
         // Into the SAME track's lower rack, which is another seat — the case
         // the drag no longer covers, because inside one strip a carry moves.
-        let lower = recorder::folder_extra_seat(0);
+        let lower = crate::desk_legacy::folder_extra_seat(0);
         app.paste_fx(bay(&app, lower, 0));
         let req = app.take_recorder_request();
         assert!(
@@ -65710,9 +65705,9 @@ mod tests {
         // **And the same channel's OTHER RACK is still the same channel** —
         // the owner's "make it such that fx inserts 1-3 can drag between
         // themselves AND between 4-6". Slots 3..5 of a channel live in an
-        // appended seat (`recorder::seat_bay`), so a carry across the middle
+        // appended seat (`desk_legacy::seat_bay`), so a carry across the middle
         // of the rack used to read as a drop on another strip and COPY.
-        let lower = recorder::folder_extra_seat(0);
+        let lower = crate::desk_legacy::folder_extra_seat(0);
         assert!(app.insert(lower, 0).is_none());
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(0)), app.legacy_bay(lower, 0));
@@ -65729,7 +65724,7 @@ mod tests {
         // ...and ANOTHER track's lower rack is still another track, which
         // copies. "FX dragged BETWEEN different TRACKS should still auto
         // copy."
-        let elsewhere = recorder::folder_extra_seat(4);
+        let elsewhere = crate::desk_legacy::folder_extra_seat(4);
         app.bay_carry = Some((app.legacy_bay(0, 1).expect("a bay"), Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(recorder::StripRef::Row(4)), app.legacy_bay(elsewhere, 1));
         let req = app.take_recorder_request();
@@ -71362,9 +71357,9 @@ mod tests {").expect("the tests module")];
         // fixture is about WHICH channel's board the face reads, so the
         // seeded board comes off again, and one recognisable pedal per
         // channel goes on below.
-        if let Some(ch) = recorder::pedal_owner(seat) {
+        if let Some(ch) = crate::desk_legacy::pedal_owner(seat) {
             for p in 0..recorder::AMP_PEDALS {
-                app.set_insert(recorder::amp_pedal_seat(ch, p), 0, None);
+                app.set_insert(crate::desk_legacy::amp_pedal_seat(ch, p), 0, None);
             }
         }
         app.set_builtin_face_at(seat, bay, crate::ports::BuiltinFace {
@@ -71376,8 +71371,8 @@ mod tests {").expect("the tests module")];
         // One recognisable tenant on channel 1's board, and another on
         // channel 2's, so a face that read the WRONG channel's board would
         // draw a name rather than an empty chip and be caught saying so.
-        app.set_insert(recorder::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
-        app.set_insert(recorder::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
         app.mixer_open = true;
         pointer_frame(&ctx, &mut app, Vec::new());
         app.open_bay_face(app.legacy_bay(seat, bay).expect("a bay"));
@@ -71432,7 +71427,7 @@ mod tests {").expect("the tests module")];
 
         // The group's SECOND rack — slot 4, which is bay 1 of
         // `folder_extra_seat(1)`. Same board, because a channel owns one.
-        let (_ctx, app) = app_with_an_amp_face(recorder::folder_extra_seat(1), 1);
+        let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::folder_extra_seat(1), 1);
         let board = board_on_the_face(&app)
             .expect("an amp in a group's bays 3..5 still drew no board");
         assert_eq!(
@@ -71447,14 +71442,14 @@ mod tests {").expect("the tests module")];
         // And everything with no board of its own still says so: the master
         // wears none, in either of ITS two racks.
         for bay in [0usize, 1] {
-            let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_SEAT, bay);
+            let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::MASTER_SEAT, bay);
             assert_eq!(
                 board_on_the_face(&app),
                 None,
                 "the master's bay {bay} grew a pedalboard"
             );
         }
-        let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_EXTRA_SEAT, 0);
+        let (_ctx, app) = app_with_an_amp_face(crate::desk_legacy::MASTER_EXTRA_SEAT, 0);
         assert_eq!(
             board_on_the_face(&app),
             None,
@@ -71529,9 +71524,10 @@ mod tests {").expect("the tests module")];
     /// an amp ends in.)
     #[test]
     fn the_seeded_pedalboard_arrives_switched_off() {
-        use recorder::{amp_pedal_seat, folder_extra_seat, AMP_DEFAULT_BOARD, AMP_PEDALS};
+        use recorder::{AMP_DEFAULT_BOARD, AMP_PEDALS};
+        use crate::desk_legacy::{amp_pedal_seat, folder_extra_seat};
         for amp_seat in [3usize, folder_extra_seat(5)] {
-            let ch = recorder::pedal_owner(amp_seat).expect("the seat owns a board");
+            let ch = crate::desk_legacy::pedal_owner(amp_seat).expect("the seat owns a board");
             let (_ctx, mut app) = headless(Caps::DESKTOP);
             for pedal in 0..AMP_PEDALS {
                 assert_eq!(app.insert(amp_pedal_seat(ch, pedal), 0), None, "the board was dressed before the amp landed");
@@ -71577,7 +71573,8 @@ mod tests {").expect("the tests module")];
     /// undo or an open never passes through the writer that seeds.
     #[test]
     fn an_amp_and_its_board_are_one_moment_and_undo_never_seeds_again() {
-        use recorder::{amp_pedal_seat, AMP_PEDALS};
+        use recorder::AMP_PEDALS;
+        use crate::desk_legacy::amp_pedal_seat;
         let root = project_scratch("ampboard");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
@@ -71641,7 +71638,7 @@ mod tests {").expect("the tests module")];
         // desk wants EMPTY chips beside the one dressed below, so the seeded
         // board comes off again.
         for p in 0..recorder::AMP_PEDALS {
-            app.set_insert(recorder::amp_pedal_seat(0, p), 0, None);
+            app.set_insert(crate::desk_legacy::amp_pedal_seat(0, p), 0, None);
         }
         app.set_builtin_face_at(0, 0, crate::ports::BuiltinFace {
             path: crate::faces_amp::AMP_PATH.to_owned(),
@@ -71652,7 +71649,7 @@ mod tests {").expect("the tests module")];
         // Pedal 2 dressed, so its chip wears a word a test can find. A suite
         // unit rather than a bundle: a bundle's editor is the host's own
         // window and opens no slot of ours at all.
-        app.set_insert(recorder::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
+        app.set_insert(crate::desk_legacy::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
         app.mixer_open = true;
         app.open_bay_face(app.legacy_bay(0, 0).expect("a bay"));
         for _ in 0..3 {
@@ -71784,7 +71781,7 @@ mod tests {").expect("the tests module")];
         // And the pedal's own face is standing over it, on its own seat.
         assert_eq!(
             stacked_face(&app),
-            Some(bay_at(&app, recorder::amp_pedal_seat(0, 2), 0)),
+            Some(bay_at(&app, crate::desk_legacy::amp_pedal_seat(0, 2), 0)),
             "the chip opened the wrong window, or none"
         );
 
@@ -71952,7 +71949,7 @@ mod tests {").expect("the tests module")];
     #[test]
     fn the_insert_tap_goes_to_the_pedal_and_comes_back_to_the_amp() {
         let (ctx, mut app) = a_desk_with_an_amp_face();
-        let seat = recorder::amp_pedal_seat(0, 2);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 2);
         while app.take_recorder_request().is_some() {}
         click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
         let mut armed_pedal = false;
@@ -72082,7 +72079,7 @@ mod tests {").expect("the tests module")];
     fn a_pedal_picked_from_the_stack_opens_in_the_stack() {
         let (ctx, mut app) = a_desk_with_an_amp_face();
         // Pedal 5 is empty in the fixture, so its chip wears a plus.
-        let seat = recorder::amp_pedal_seat(0, 5);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 5);
         assert_eq!(app.insert(seat, 0), None, "the fixture dressed pedal 5");
         app.apply_dialog_action(DialogAction::OpenPedalFace {
             bay: bay_at(&app, 0, 0),
@@ -72146,7 +72143,7 @@ mod tests {").expect("the tests module")];
     /// to end.
     #[test]
     fn alt_and_shift_on_a_pedal_chip_do_what_they_do_on_a_bay() {
-        let seat = recorder::amp_pedal_seat(0, 2);
+        let seat = crate::desk_legacy::amp_pedal_seat(0, 2);
         // Alt empties the seat, exactly as it empties a bay.
         let (_ctx, mut app) = a_desk_with_an_amp_face();
         assert!(!app.alt_down && !app.shift_down, "the desk was holding a key");
@@ -77451,7 +77448,8 @@ mod folder_tests {
     /// settings file was handed.
     #[test]
     fn a_seat_past_the_map_cannot_size_the_desk() {
-        use crate::recorder::{INSERTS, INSERT_SPACE};
+        use crate::recorder::INSERTS;
+        use crate::desk_legacy::V32_INSERT_SPACE as INSERT_SPACE;
         let (root, doc) = a_project_with_a_desk("seat-past-map");
         // Two instruments this session's own settings do NOT seat, so
         // finding them proves the document's desk landed.
@@ -82124,12 +82122,12 @@ mod aspect_snap_tests {
     /// collapses: the smallest window in the table still opens four lanes and
     /// four strips, and the 5K still opens sixteen.
     ///
-    /// **What is ASSERTED below is what is PAINTED, which is not always that
-    /// number.** Once the desk has thirty-two channels and a panel tall enough
-    /// for two rows it folds, and a folded desk paints all thirty-two whatever
-    /// the count says — that is why the 4K's and the 5K's windows assert 32
-    /// strips against a derived 16 and 24. The fold is `mixer_panel`'s
-    /// decision and this change does not touch it.
+    /// **What is ASSERTED below is what is PAINTED**, which for a while was
+    /// not that number: a desk of thirty-two channels with a panel tall
+    /// enough for two rows folded, and a folded desk painted all thirty-two
+    /// whatever the count said, so the 4K's and the 5K's windows asserted 32
+    /// strips against a derived 16 and 24. The fold is gone (the owner's one
+    /// row), so what is painted is the count again.
     ///
     /// The claims that have to hold everywhere are the ones after the table:
     /// every answer is a real rung, a bigger window is never given fewer of
@@ -84331,7 +84329,7 @@ mod views_windowed_tests {
             }],
         ));
         a.set_insert(18, 0, Some("/Library/Audio/Plug-Ins/VST3/x.vst3"));
-        a.set_insert(recorder::amp_pedal_seat(19, 2), 0, Some("/Library/Audio/Plug-Ins/VST3/p.vst3"));
+        a.set_insert(crate::desk_legacy::amp_pedal_seat(19, 2), 0, Some("/Library/Audio/Plug-Ins/VST3/p.vst3"));
         // The raw writes above reach no app road; a gesture would end in
         // its commit, which marks.
         a.undo_commit();
