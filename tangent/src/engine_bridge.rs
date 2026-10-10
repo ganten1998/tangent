@@ -1141,6 +1141,7 @@ impl Bridge {
             let kind = match app.channel_kind(row) {
                 Some(ChannelKind::Midi) => LaneKind::Midi,
                 Some(ChannelKind::Audio) => LaneKind::Audio,
+                Some(ChannelKind::Bus) => LaneKind::Bus,
                 None if app.desk_index().is_folder(row) => LaneKind::Folder,
                 None => LaneKind::Empty,
             };

@@ -1817,13 +1817,22 @@ impl Layout {
             header_rows.push((
                 i,
                 if row.header.is_positive() {
-                    Self::header_row(
+                    let mut h = Self::header_row(
                         row.header,
                         lane.used,
                         if lane.in_folder { FOLDER_INDENT } else { 0.0 },
                         lane.is_folder,
                         lane.plus,
-                    )
+                    );
+                    // **A bus has no input to bind, nothing to arm and no
+                    // MIDI for the theory view** (design 9): the three seats
+                    // stand empty, as a folder's arm and note do.
+                    if lane.kind == Some(ChannelKind::Bus) {
+                        h.input = Rect::NOTHING;
+                        h.arm = Rect::NOTHING;
+                        h.theory = Rect::NOTHING;
+                    }
+                    h
                 } else {
                     HeaderRow::NONE
                 },
