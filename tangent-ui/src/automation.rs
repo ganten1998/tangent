@@ -140,10 +140,12 @@ pub enum AutoParam {
     ///
     /// Only a post-fader send has a curve. A pre-fader send is a cue mix,
     /// set once and listened to on headphones; the desk the curves are
-    /// drawn on is the one that goes through the fader.
-    ///
-    /// Read from a file, saved and carried like any other curve, but not
-    /// played yet, so no gesture makes one: see [`SEND_CURVES_PLAY`].
+    /// drawn on is the one that goes through the fader. Played live and in
+    /// an export on that send alone: the host hands it to the engine as the
+    /// post-fader send between the strip's lane and the bus's
+    /// (`engine_bridge::send_bus_of`, `instrument::SendCurve`), so a file's
+    /// strip that also sends to the bus before its fader keeps that cue
+    /// where it was set.
     ///
     /// [`Send`]: AutoParam::Send
     SendTo { to: crate::desk_id::TrackId },
@@ -235,46 +237,7 @@ impl AutoParam {
             _ => None,
         }
     }
-
-    /// **Whether a curve on this control is played**, live and in an
-    /// export. Every control's is but a send to a bus's, which waits on
-    /// [`SEND_CURVES_PLAY`]. The app offers, writes and follows only the
-    /// curves this answers yes for: a door that makes a curve nothing plays
-    /// is a control that moves and does nothing.
-    pub fn plays(self) -> bool {
-        match self {
-            Self::SendTo { .. } => SEND_CURVES_PLAY,
-            _ => true,
-        }
-    }
 }
-
-/// **Whether the engine plays a curve on a send to a bus**
-/// ([`AutoParam::SendTo`]). Not yet.
-///
-/// The engine reads the desk's four controls and the plugins' parameters
-/// off a lane's curves. A send to a bus has curves of its own in the
-/// engine (`instrument::SendCurve`), and nothing hands it any: the bridge
-/// carries each send at its fixed level. A curve drawn on a send would sit
-/// on screen and move nothing, live or in an export. So until one is played,
-/// no gesture makes one. The A menu offers no Sends group, the row cannot be
-/// opened, a send row moved while its lane writes lays no point down, and a
-/// lone base neither follows the send nor sets it on open
-/// ([`AutoParam::plays`]). A curve a file holds is kept whole, the way a
-/// curve waiting for its plugin is.
-///
-/// MERGE-ME(W7-slot-gaps item 5): set this true in the commit that maps
-/// `SendTo` onto the engine's `SendCurve`s through the bridge, live and in
-/// an export. The menu, the row, the writes and the base come back with
-/// it. `bus_e2e`'s `the_send_curve_switch_says_what_an_export_plays` fails
-/// until the switch and the engine agree, and `bus_tests` hold the app half
-/// to whichever state the switch is in. Two things to carry across. The
-/// engine names a send by its two ends, so one of its curves drives a
-/// strip's pre-fader AND post-fader send to one bus, while this curve is
-/// the post-fader send's alone. And the curve names its bus by `TrackId`,
-/// so the bridge resolves both ends to slots each frame, as
-/// `Bridge::read_sends` does.
-pub const SEND_CURVES_PLAY: bool = false;
 
 /// What a lane's automation does while the transport rolls.
 ///

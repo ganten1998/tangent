@@ -26,10 +26,12 @@
 //! map's seats, which is what made the faces' roads stop at the
 //! thirty-second row. The parts that need a BUS on the desk (a key to a
 //! bus, a curve on a send to one, and the mixing leftovers of item 6, which
-//! each cross one) have no road from the desk until W7-buses-ui gives the
-//! bridge buses: the engine holds all three at these widths
-//! (`slot_engine::gaps`, `slot_engine::buses`), and the desk's half of the
-//! first two waits here as MERGE-ME tests.
+//! each cross one) had no road from the desk until W7-buses-ui gave the
+//! bridge buses; the engine held them at these widths
+//! (`slot_engine::gaps`, `slot_engine::buses`), and since W7-join the
+//! desk's half of each runs here too. So does a kit owed the frame its
+//! track takes the drumpad, which the frame's own rule decides
+//! (`Synced::owes_kits`).
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
 //! directory of the test's own (`composite::tiers`), every project and every
@@ -196,10 +198,11 @@ fn open_saved(tag: &str, settings: Settings, path: &Path) -> TangentApp {
 /// **What the host keeps between frames**, for its own roads to keep here:
 /// the reconcile's ledger and displaced shelf, the live shelf it seats bays
 /// from (this test's own, `<scratch>/state`), the engine's sentence, the
-/// samplers' record and cache, the kits' cache and the knobs each kit was
-/// last told. [`Host::frame`] runs a frame over them through `DesktopApp`'s
-/// own functions, so a road of the host's that stops at the thirty-second
-/// row stops here too.
+/// samplers' record and cache, the kits' cache, the knobs each kit was last
+/// told and whether a kit delivery is owed a retry, and the curves the
+/// engine was last handed. [`Host::frame`] runs a frame over them through
+/// `DesktopApp`'s own functions, so a road of the host's that stops at the
+/// thirty-second row stops here too.
 #[derive(Default)]
 struct Host {
     shelf: PathBuf,
@@ -210,6 +213,8 @@ struct Host {
     sampler_cache: HashMap<PathBuf, Decoded>,
     pad_cache: HashMap<PathBuf, Decoded>,
     pushed_pads: BTreeMap<usize, DrumKitParams>,
+    kits_retry: bool,
+    pushed_auto: Option<tangent_ui::automation::Automation>,
 }
 
 impl Host {
@@ -233,15 +238,22 @@ impl Host {
     /// - `push_monitor_settings`'s: the bridge's sync, a lane leaving
     ///   written down and forgotten (`forget_lane`) and one taken back
     ///   reclaimed (`reclaim_lanes`), what the host keeps per slot forgotten
-    ///   for a lane that came or went (`forget_moved_slots`), and the kits'
-    ///   knobs (`push_pad_knobs`);
+    ///   for a lane that came or went (`forget_moved_slots`, and the curves
+    ///   it last handed over), the kits the sync owes, and the kits' knobs
+    ///   (`push_pad_knobs`);
+    /// - `push_automation`'s: the curves, the sends' own among them
+    ///   (`push_curves`), when they changed;
     /// - `after_frame`'s reconcile: the bays the desk wants
     ///   (`bays_wanted`), the next one owed a load (`next_owed_bay`) and its
     ///   load (`load_bay`), one a frame, the frames run back to back until
     ///   none is owed;
-    /// - `run_warm`'s: the kits (`deliver_kits`) and the samplers' files
-    ///   (`deliver_samples`). The host runs these when they are owed; every
-    ///   frame here is one whose desk moved, so every frame owes them.
+    /// - `after_frame`'s kits owed by a retry or an edit
+    ///   (`take_drumpad_dirty`), and `run_warm`'s: the kits (`deliver_kits`)
+    ///   when owed, a delivery that did not all land owed again, and the
+    ///   samplers' files (`deliver_samples`). The host runs the samplers'
+    ///   when they are owed; every frame here is one whose desk moved, so
+    ///   every frame owes them. The kits keep the host's own rule, which is
+    ///   what decides whether a track that takes the drumpad hears its kit.
     fn frame(&mut self, app: &mut TangentApp, e: &mut Engine, p: &mut Bridge) {
         let synced = {
             let (ledger, shelf) = (&mut self.ledger, &self.shelf);
@@ -249,10 +261,15 @@ impl Host {
         };
         DesktopApp::reclaim_lanes(&mut self.ledger, &synced);
         DesktopApp::forget_moved_slots(&synced.moved, &mut self.sampler_have, &mut self.pushed_pads);
+        if !synced.moved.is_empty() {
+            self.pushed_auto = None;
+        }
+        let mut kits_owed = synced.owes_kits();
         if synced.primed {
             self.pushed_pads.clear();
         }
         DesktopApp::push_pad_knobs(e, p, app, &mut self.pushed_pads);
+        DesktopApp::push_curves(Some(&mut *e), p, app, &mut self.pushed_auto);
         let mut settled = false;
         for _ in 0..10_000 {
             let wanted = DesktopApp::bays_wanted(app, p);
@@ -275,7 +292,10 @@ impl Host {
         }
         assert!(settled, "the reconcile never ran out of bays to load");
         assert!(self.error.is_none(), "a bay would not load: {:?}", self.error);
-        DesktopApp::deliver_kits(Some(&mut *e), p, app, &mut self.pad_cache);
+        kits_owed |= std::mem::take(&mut self.kits_retry) || app.take_drumpad_dirty();
+        if kits_owed {
+            self.kits_retry = !DesktopApp::deliver_kits(Some(&mut *e), p, app, &mut self.pad_cache);
+        }
         DesktopApp::deliver_samples(Some(&mut *e), p, app, &mut self.sampler_have, &mut self.sampler_cache);
         e.settle_offline();
     }
@@ -548,6 +568,60 @@ fn a_pad_effect_waits_for_its_tracks_kit_and_is_heard_past_slot_31_as_on_row_1()
     }
     cleanup(&dry_dir, &tags[..1]);
     cleanup(&dir, &tags[1..]);
+}
+
+/// **A track that takes the drumpad hears its kit from the next frame, past
+/// slot 31 as on row 1, live and in the export** (W7-join item 4). Row 2 is
+/// a drum track from the start, and its kit has landed, so no delivery is
+/// owed a retry; every subject is a MIDI track with the keyboard in its
+/// first bay and a kit of its own in the sidecar (a project reopened, or an
+/// engine rebuilt, after the drumpad was swapped out). The drumpad is picked
+/// into each subject's first bay and the host runs one frame by its own rule
+/// for when kits are owed: every subject's kit plays its clip at row 2's
+/// level, live as in the export. The pick marked no kit owed: no lane came
+/// or went, no kit was edited, and the last delivery had landed whole, so
+/// `reload_pads` never ran and each subject's pads stayed silent live until
+/// another kit edit or a reopen, while the export, which attaches every
+/// drum lane's kit itself, played them.
+#[test]
+fn a_track_that_takes_the_drumpad_hears_its_kit_from_the_next_frame_past_slot_31_as_on_row_1() {
+    const TAG: &str = "gaps-drum-pick";
+    let dir = scratch("drum-pick");
+    wav(&dir.join("media").join("pad.wav"), 0.25, false);
+    let mut s = wide_desk();
+    let mut doc = Arrangement::default();
+    let rows: Vec<usize> = SUBJECTS.into_iter().chain([CONTROL]).collect();
+    for &row in &rows {
+        s.rows[row].kind = Some(RowKind::Midi);
+        let first = if row == CONTROL { DRUMPAD_PATH } else { KEYS_PATH };
+        s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), first.to_owned());
+        doc.add_clip(notes(row, DRUM_PAD_BASE + 36));
+    }
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    save_kits(&s, &rows, &path);
+    let firsts: Vec<SeatBay> = SUBJECTS.iter().map(|r| bay_of(&s, *r, Rack::Chain(0), 0)).collect();
+    let mut host = Host::at(&dir);
+    let mut app = open_saved(TAG, s, &path);
+    let (mut e, mut p) = live(&mut app, &mut host);
+    assert!(!host.kits_retry, "fixture: row 2's kit did not land, so a retry would deliver every kit anyway");
+    // The drumpad picked into every subject's first bay, and one frame.
+    for sb in firsts {
+        app.set_plugin(sb, Some(DRUMPAD_PATH));
+    }
+    host.frame(&mut app, &mut e, &mut p);
+    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+    for (road, got) in [("live", levels(&mut e, &p, &rows)), ("export", levels(&mut x, &xb, &rows))] {
+        let control = got[rows.len() - 1];
+        assert!(control > 0.02, "{road}: row 2's kit is silent ({control})");
+        for (row, level) in SUBJECTS.iter().zip(&got) {
+            assert!(
+                (level - control).abs() <= 0.02 * control,
+                "{road}: row {row}'s kit plays at {level} the frame after its track took the drumpad, row 2's at {control}"
+            );
+        }
+    }
+    cleanup(&dir, &[TAG]);
 }
 
 // ── a sampler bay's file ────────────────────────────────────────────────────
@@ -868,7 +942,7 @@ fn hold_keys(prefix: &str, comps: &[usize], path: &Path, dir: &Path, desk: &dyn 
 /// needed no fix: this proves them through the bridge, both ways. The key
 /// to a BUS is held at the engine
 /// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`) and from
-/// the desk by the MERGE-ME test below, which waits for the bridge's buses.
+/// the desk by the bus test below.
 #[test]
 fn a_key_reaches_a_comp_past_slot_31_as_on_row_1_live_and_in_the_export() {
     let dir = scratch("keys");
@@ -906,20 +980,16 @@ fn feeder(i: usize) -> usize {
 
 /// **A key reaches a comp on a BUS past slot 31 as it reaches row 1's, live
 /// and in the export, and no other comp** (W7-slot-gaps item 4, its bus
-/// half). Every subject and row 2 a bus with a hard comp in its first bay,
-/// each fed at unity by a quiet track of its own (rows 101 to 107), and the
-/// desk's key drawn from row 150 to one subject's comp at a time while a
-/// loud clip plays there.
-///
-/// MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send
-/// to one until that lane lands (`RowKind::Bus` reaches no plan flag and
-/// `TrackRow::sends` no `InSend`), so here every bus is an empty lane with
-/// nothing arriving and its comp squeezes nothing. The engine holds a key
-/// to a bus at these widths already
-/// (`gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`); this
-/// holds the road from the desk to it. Enable it at that merge.
+/// half, run since W7-join). Every subject and row 2 a bus with a hard comp
+/// in its first bay, each fed at unity by a quiet track of its own (rows 101
+/// to 107), and the desk's key drawn from row 150 to one subject's comp at a
+/// time while a loud clip plays there. The bridge makes each bus row a BUS
+/// lane and carries each feeder's send to it (`Bridge::read_sends`), so
+/// every comp has its feeder's tone to squeeze and the control's to be
+/// measured against; the engine's own door is
+/// `gaps::a_key_from_lane_40_reaches_a_comp_on_33_and_on_a_bus`, and this is
+/// the road from the desk to it.
 #[test]
-#[ignore = "MERGE-ME(W7-buses-ui): the bridge makes no row a bus and carries no send to one until that lane lands"]
 fn a_key_reaches_a_comp_on_a_bus_past_slot_31_as_on_row_1_live_and_in_the_export() {
     use tangent_ui::desk_model::Send as DeskSend;
     let dir = scratch("bus-keys");
@@ -1056,30 +1126,21 @@ fn a_send_knob_past_slot_31_is_its_return_entry_as_on_row_1_live_and_in_the_expo
 }
 
 /// **The control a curve on a strip's send to `bus` is drawn on**:
-/// `AutoParam::SendTo { to: bus }`, the variant W7-buses-ui appends.
-/// MERGE-ME(W7-buses-ui): answer `Some(AutoParam::SendTo { to: bus })`.
-fn send_to(bus: TrackId) -> Option<tangent_ui::automation::AutoParam> {
-    let _ = bus;
-    None
+/// `AutoParam::SendTo { to: bus }`, the post-fader send's.
+fn send_to(bus: TrackId) -> tangent_ui::automation::AutoParam {
+    tangent_ui::automation::AutoParam::SendTo { to: bus }
 }
 
 /// **A curve on a strip's send to a bus plays on a track past slot 31 as on
-/// row 1, live and in the export** (W7-slot-gaps item 5, its curves). Every
-/// subject an audio track playing a steady tone into a bus of its own (rows
-/// 101 to 106) by a send at unity, and a curve on that send holding it at a
-/// quarter: each bus hears a quarter of its track, as row 1's does, on both
-/// engines (`Bridge::send_curves`, which the live push and `full_build_with`
-/// both hand the engine). Without the curve a bus hears its track whole.
-///
-/// MERGE-ME(W7-buses-ui): that lane appends `AutoParam::SendTo { to }` (the
-/// control the curve is drawn on: [`send_to`] answers it then, and
-/// `engine_bridge::send_bus_of` reads it, its body spelled out where it
-/// stands) and gives the bridge buses and their sends. The engine half is
-/// held already: the knob as a plan entry above, and
-/// `engine_bridge::tests::a_send_curve_runs_between_its_two_lanes_at_any_row`
-/// with a decoder standing in for the variant. Enable it at that merge.
+/// row 1, live and in the export** (W7-slot-gaps item 5, its curves, run
+/// since W7-join). Every subject an audio track playing a steady tone into a
+/// bus of its own (rows 101 to 106) by a send at unity, and a curve on that
+/// send holding it at a quarter: each bus hears a quarter of its track, as
+/// row 1's does, on both engines (`Bridge::send_curves`, which the live
+/// push and `full_build_with` both hand the engine). Without the curve a
+/// bus hears its track whole. The control the curve is drawn on is
+/// [`send_to`]'s, which `engine_bridge::send_bus_of` reads.
 #[test]
-#[ignore = "MERGE-ME(W7-buses-ui): AutoParam::SendTo and the bridge's sends to a bus land with that lane"]
 fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export() {
     use tangent_ui::automation::{Curve, Point, Shape};
     use tangent_ui::desk_model::Send as DeskSend;
@@ -1107,7 +1168,7 @@ fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export()
     };
     let mut saved = Arrangement::load_from(&path);
     for (row, (_, bus)) in SUBJECTS.into_iter().zip(&buses) {
-        let param = send_to(*bus).expect("MERGE-ME(W7-buses-ui): no control is a send to a bus on this base");
+        let param = send_to(*bus);
         let hold = |at_s| Point { at_s, value: 0.25, shape: Shape::Hold };
         saved.automation.set(Curve::sanitised(row, param, vec![hold(0.0), hold(30.0)]));
     }
@@ -1127,6 +1188,366 @@ fn a_send_curve_to_a_bus_past_slot_31_plays_as_on_row_1_live_and_in_the_export()
         }
     }
     cleanup(&dir, &TAGS);
+}
+
+// ── the mixing leftovers, through the bridge (W7-slot-gaps item 6) ──────────
+//
+// The engine holds each of these at the width slots
+// (`slot_engine::buses::*_at_every_width`); what this adds is the road from
+// the desk to them, live and in an export, now that the bridge makes a bus
+// row a BUS lane and carries every send to one (W7-join item 2).
+
+/// The bus that looks ahead, which every leftover below crosses.
+const AHEAD: usize = 120;
+
+/// The source row a bus node is fed from, by a route.
+const SOURCE: usize = 150;
+
+/// **The denoise with its bank and its lookahead, nothing learned**: an
+/// honest 3 ms delay and nothing else, the engine leftovers' own unit.
+fn lookahead() -> Vec<u8> {
+    state(
+        crate::builtin_fx::DENOISE_PATH,
+        &[(0, 0.0), (5, 1.0), (6, crate::units::denoise::DenoiseKernel::Bank.dial())],
+        &[],
+    )
+}
+
+/// A second of silence with one frame at `level` at frame `at`, as a float
+/// WAV: an impulse whose frame says where a path delivered it.
+fn impulse_wav(path: &Path, at: usize, level: f32) {
+    use tangent_record::wav::{Bext, SampleFormat, WavSpec, WavWriter, Wallclock};
+    let spec = WavSpec {
+        sample_rate: RATE,
+        channels: 2,
+        format: SampleFormat::Float32,
+    };
+    let bext = Bext::new(Wallclock::from_unix(0, 0), spec);
+    let mut w = WavWriter::create(path, spec, &bext).expect("a file");
+    let mut samples = vec![0.0f32; RATE as usize * 2];
+    samples[at * 2] = level;
+    samples[at * 2 + 1] = level;
+    w.write_interleaved(&samples).expect("its audio");
+    w.finish().expect("closed");
+}
+
+/// **[`wide_desk`] a row wider** (row 201, for row 200's member), with row
+/// `ahead`, when given, a bus whose first bay looks ahead, its state on
+/// `host`'s shelf for the reconcile to seat it from.
+fn desk_ahead_at(host: &Host, ahead: Option<usize>) -> Settings {
+    let mut s = wide_desk();
+    let next = s.next_track_id;
+    s.rows.push(TrackRow::vacant(TrackId(next as u32)));
+    s.next_track_id = next + 1;
+    if let Some(at) = ahead {
+        s.rows[at].kind = Some(RowKind::Bus);
+        let sb = bay_of(&s, at, Rack::Chain(0), 0);
+        s.plugins.insert(sb, crate::builtin_fx::DENOISE_PATH.to_owned());
+        host.shelve(sb, crate::builtin_fx::DENOISE_PATH, &lookahead());
+    }
+    s
+}
+
+/// Row `from`'s post-fader send at unity to the bus on row `to`.
+fn send_unity(s: &mut Settings, from: usize, to: usize) {
+    let to = Node::Track(s.rows[to].id);
+    s.rows[from].sends.push(tangent_ui::desk_model::Send { to, level: 1.0, pre: false });
+}
+
+/// **What a roll from zero makes**: the master, and each of `rows`' stem
+/// columns (wet, or dry), over `secs` seconds. The tap is armed for those
+/// rows' lanes and no others through the host's own door (`arm_stem_tap`,
+/// as a pass arms it), and each column is read as a pass writes it.
+fn roll_stems(e: &mut Engine, p: &Bridge, rows: &[usize], dry: bool, secs: f64) -> (Vec<f32>, Vec<Vec<f32>>) {
+    let slots: Vec<Slot> = rows.iter().map(|r| p.lane(*r).expect("a row's lane").slot).collect();
+    crate::desktop::arm_stem_tap(e, true, &slots, dry);
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    let mut out = vec![0.0f32; 512 * 2];
+    let mut master = Vec::new();
+    let mut cols = vec![Vec::new(); rows.len()];
+    let mut scratch = Vec::new();
+    for _ in 0..((secs * f64::from(RATE)) as usize).div_ceil(512) {
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        master.extend_from_slice(&out);
+        scratch.clear();
+        e.drain_stems(&mut scratch);
+        let wide = e.stem_frame_width().max(2);
+        for (col, slot) in cols.iter_mut().zip(&slots) {
+            let c = e.stem_column(*slot).expect("the tap was armed for the row's lane");
+            for f in 0..scratch.len() / wide {
+                col.extend_from_slice(&scratch[f * wide + c * 2..f * wide + c * 2 + 2]);
+            }
+        }
+    }
+    (master, cols)
+}
+
+/// The frame of a column's loudest sample.
+fn peak_at(col: &[f32]) -> usize {
+    let mut best = (0usize, 0.0f32);
+    for (i, v) in col.chunks_exact(2).enumerate() {
+        if v[0].abs() > best.1 {
+            best = (i, v[0].abs());
+        }
+    }
+    best.0
+}
+
+/// The frame a column first carries anything.
+fn onset(col: &[f32]) -> Option<usize> {
+    col.chunks_exact(2).position(|f| f[0].abs() > 1e-4 || f[1].abs() > 1e-4)
+}
+
+fn rms(xs: &[f32]) -> f64 {
+    (xs.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / xs.len().max(1) as f64).sqrt()
+}
+
+/// **A lined node's dry stem lands with its wet stem past slot 31 as on row
+/// 1, live and in the export** (W7-slot-gaps item 6, through the bridge). A
+/// node at each subject in turn sends at unity into bus 120, whose first bay
+/// looks ahead: a folder over the row after it, which plays an impulse, and
+/// a bus fed by a route from row 150, which plays it. Its way out waits on
+/// its line so it lands with the path through bus 120; its racks are empty,
+/// so its dry stem is its wet stem, and each must peak on the frame the
+/// other does and the frame row 1's node's do, on the live engine the bridge
+/// drives and on the export's. The dry stem was left early by that wait.
+#[test]
+fn a_lined_nodes_dry_stem_lands_with_its_wet_stem_past_slot_31_as_on_row_1_live_and_in_the_export() {
+    let dir = scratch("dry-stems");
+    impulse_wav(&dir.join("media").join("impulse.wav"), 4_000, 0.5);
+    let mut tags = Vec::new();
+    for folder in [true, false] {
+        let mut reference = None;
+        for node in SUBJECTS {
+            let tag = format!("gaps-dry-{}-{node}", if folder { "folder" } else { "bus" });
+            let host = Host::at(&dir);
+            let mut s = desk_ahead_at(&host, Some(AHEAD));
+            let mut doc = Arrangement::default();
+            let source = if folder {
+                s.rows[node].kind = Some(RowKind::Audio);
+                s.rows[node].folder = true;
+                s.rows[node + 1].kind = Some(RowKind::Audio);
+                s.rows[node + 1].in_folder = true;
+                node + 1
+            } else {
+                s.rows[node].kind = Some(RowKind::Bus);
+                s.rows[SOURCE].kind = Some(RowKind::Audio);
+                let (from, to) = (Node::Track(s.rows[SOURCE].id), Node::Track(s.rows[node].id));
+                s.routes.add(tangent_ui::routing::Route::new(from, tangent_ui::routing::Target::Node(to)));
+                SOURCE
+            };
+            send_unity(&mut s, node, AHEAD);
+            doc.add_clip(audio(source, "impulse.wav"));
+            let path = tangent_ui::arrangement::doc_in(&dir);
+            doc.save_to(&path);
+            let mut app = open_saved(&tag, s, &path);
+            let (mut wet_e, wet_p) = live(&mut app, &mut Host::at(&dir));
+            let (mut dry_e, dry_p) = live(&mut app, &mut Host::at(&dir));
+            let Built { engine: mut wet_x, bridge: wet_xb } = export(&app, (&wet_e, &wet_p));
+            let Built { engine: mut dry_x, bridge: dry_xb } = export(&app, (&wet_e, &wet_p));
+            let roads = [
+                ("live", (&mut wet_e, &wet_p), (&mut dry_e, &dry_p)),
+                ("export", (&mut wet_x, &wet_xb), (&mut dry_x, &dry_xb)),
+            ];
+            for (road, (we, wp), (de, dp)) in roads {
+                let (_, wet) = roll_stems(we, wp, &[node], false, 0.3);
+                let (_, dry) = roll_stems(de, dp, &[node], true, 0.3);
+                assert!(
+                    we.published_max_latency_for_test() > 100,
+                    "{road}: bus 120's lookahead is not in the alignment (node {node}, folder {folder})"
+                );
+                let (wet, dry) = (&wet[0], &dry[0]);
+                assert!(wet.iter().any(|v| *v != 0.0) && dry.iter().any(|v| *v != 0.0), "{road}: node {node}'s stem is silent (folder {folder})");
+                assert_eq!(peak_at(dry), peak_at(wet), "{road}: node {node}'s dry stem is off its wet stem's frame (folder {folder})");
+                let row_1 = *reference.get_or_insert(peak_at(wet));
+                assert_eq!(peak_at(wet), row_1, "{road}: node {node} lands on another frame than row 1's (folder {folder})");
+            }
+            tags.push(tag);
+        }
+    }
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    cleanup(&dir, &tags);
+}
+
+/// **A bare kit sent into a bus that looks ahead lands with its own way out
+/// past slot 31 as on row 1, live; and the export carries the send as the
+/// live plan does** (W7-slot-gaps item 6, through the bridge). The bus at
+/// each subject in turn looks ahead, and the drum bus sends to it at unity,
+/// or at nothing, from the desk's file (no gesture makes a drum bus send).
+/// No track holds the drumpad, so a strike on channel 10 plays the bare kit
+/// (given here by the engine's test door, as the drumpad window played bare
+/// gives it). Live, the desk's alignment covers the kit's path through the
+/// bus, and the bus's share of the master peaks on the frame the kit's own
+/// way out does, which is the frame it does through row 1's bus. The drum
+/// bus had no rank in the compensation graph, so the share came out the
+/// bus's lookahead late. An export hears no live MIDI, so no bare kit is
+/// struck in one; its plan carries the drum bus's send to the bus's lane
+/// all the same, which is what keeps the two engines one desk.
+#[test]
+fn a_bare_kit_sent_into_a_bus_that_looks_ahead_lands_with_its_own_way_out_past_slot_31_as_on_row_1() {
+    use crate::desk_plan::InSend;
+    let dir = scratch("bare-kit");
+    let kit = || {
+        let mut kit = crate::instrument::PadKit::default();
+        let mut hit = vec![0.0f32; 4_800 * 2];
+        hit[0] = 0.25;
+        hit[1] = 0.25;
+        kit.pads[0] = Some(std::sync::Arc::new(tangent_record::decode::Clip { samples: hit, rate: RATE, source: PathBuf::new() }));
+        kit
+    };
+    let mut tags = Vec::new();
+    let mut reference = None;
+    for bus in SUBJECTS {
+        let mut heard = Vec::new();
+        for level in [0.0, 1.0] {
+            let tag = format!("gaps-bare-kit-{bus}-{level}");
+            let host = Host::at(&dir);
+            let mut s = desk_ahead_at(&host, Some(bus));
+            let to = Node::Track(s.rows[bus].id);
+            s.specials.drums.sends.push(tangent_ui::desk_model::Send { to, level, pre: false });
+            let doc = Arrangement::default();
+            let mut app = open(&tag, s, &doc, &dir);
+            let (mut e, p) = live(&mut app, &mut Host::at(&dir));
+            if level > 0.0 {
+                let Built { bridge: xb, .. } = export(&app, (&e, &p));
+                let sent = InSend { from: SendFrom::Drums, to: SendTo::Lane(xb.lane(bus).expect("the bus's lane").slot), level: 1.0, pre: false };
+                let plan = xb.published_for_test().expect("the export's plan");
+                assert!(plan.sends.contains(&sent), "the export's plan lost the drum bus's send to bus {bus}");
+                let live_sent = InSend { to: SendTo::Lane(p.lane(bus).expect("the bus's lane").slot), ..sent };
+                assert!(p.published_for_test().expect("a plan").sends.contains(&live_sent), "fixture: the live plan's send");
+            }
+            assert!(e.set_pad_kit(0, kit()), "the bare kit went nowhere");
+            let mut out = vec![0.0f32; 512 * 2];
+            for _ in 0..4 {
+                e.render_offline(&mut out);
+            }
+            e.send_midi(0, &[0x99, DRUM_PAD_BASE, 127]);
+            let (master, _) = roll_stems(&mut e, &p, &[], false, 0.1);
+            assert!(
+                e.published_max_latency_for_test() > 100,
+                "the bare kit's path through bus {bus} is not in the desk's alignment"
+            );
+            heard.push(master);
+            tags.push(tag);
+        }
+        let (alone, both) = (&heard[0], &heard[1]);
+        assert!(alone.iter().any(|v| *v != 0.0), "the bare kit is silent (bus {bus})");
+        let share: Vec<f32> = both.iter().zip(alone).map(|(b, a)| b - a).collect();
+        assert!(share.iter().any(|v| v.abs() > 1e-4), "nothing of the kit came out of bus {bus}");
+        assert_eq!(peak_at(&share), peak_at(alone), "the bare kit's send into bus {bus} landed off its own way out's frame");
+        let row_1 = *reference.get_or_insert(peak_at(alone));
+        assert_eq!(peak_at(alone), row_1, "the kit through bus {bus} lands on another frame than through row 1's");
+    }
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    cleanup(&dir, &tags);
+}
+
+/// **The click pays a bus that looks ahead uncompensated past slot 31 as on
+/// row 1, live; and stays out of the export, holding it back by nothing**
+/// (W7-slot-gaps item 6, through the bridge, the pin kept). The click sends
+/// at unity, from the desk's file, into the bus at each subject in turn,
+/// which looks ahead or does not. Live, the click is a cue, summed at once
+/// so the beat is heard when it falls: what it sends reaches the bus at
+/// once, the bus's lookahead delays it by exactly what the bus looks ahead,
+/// and the desk's alignment stays at nothing, on row 1's frames at every
+/// width. The export leaves the click out of the file: the bus hears
+/// nothing, and the click's send holds the file back by nothing.
+#[test]
+fn the_click_pays_a_bus_that_looks_ahead_uncompensated_past_slot_31_and_stays_out_of_the_export() {
+    let dir = scratch("click");
+    let mut tags = Vec::new();
+    let mut reference = None;
+    for bus in SUBJECTS {
+        let mut onsets = Vec::new();
+        for ahead in [false, true] {
+            let tag = format!("gaps-click-{bus}-{ahead}");
+            let host = Host::at(&dir);
+            let mut s = desk_ahead_at(&host, ahead.then_some(bus));
+            s.rows[bus].kind = Some(RowKind::Bus);
+            let to = Node::Track(s.rows[bus].id);
+            s.specials.click.sends.push(tangent_ui::desk_model::Send { to, level: 1.0, pre: false });
+            let doc = Arrangement::default();
+            let mut app = open(&tag, s, &doc, &dir);
+            let (mut e, p) = live(&mut app, &mut Host::at(&dir));
+            if ahead {
+                let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+                let (_, cols) = roll_stems(&mut x, &xb, &[bus], false, 0.25);
+                assert!(cols[0].iter().all(|v| *v == 0.0), "the click reached bus {bus} in the export");
+                assert_eq!(x.published_max_latency_for_test(), 0, "the click's send into bus {bus} held the export back");
+            }
+            e.set_metronome_enabled(true);
+            e.set_metronome_gain(1.0);
+            let (_, cols) = roll_stems(&mut e, &p, &[bus], false, 0.25);
+            assert_eq!(e.published_max_latency_for_test(), 0, "the click's send into bus {bus} held the desk back");
+            onsets.push(onset(&cols[0]).unwrap_or_else(|| panic!("the click never reached bus {bus} (ahead {ahead})")));
+            tags.push(tag);
+        }
+        let (at, late) = (onsets[0], onsets[1]);
+        assert!(late > at + 100, "the click through bus {bus} is not late by the bus's lookahead ({at} then {late})");
+        let row_1 = *reference.get_or_insert((at, late));
+        assert_eq!((at, late), row_1, "the click through bus {bus} lands on other frames than through row 1's");
+    }
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    cleanup(&dir, &tags);
+}
+
+/// **A track in a folder that is also routed into a bus is summed by both,
+/// past slot 31 as on row 1, live and in the export** (W7-slot-gaps item 6,
+/// through the bridge: the old fold rule, kept on purpose and pinned so a
+/// change is deliberate). The folder at each subject in turn holds the row
+/// after it, which plays a tone and is routed into bus 120. The folder's
+/// stem and the bus's each carry the track whole, and the master hears it
+/// twice over, in step, as loud as with the folder on row 1. Changing either
+/// rule changes saved projects' sound.
+#[test]
+fn a_folded_track_routed_into_a_bus_is_summed_by_both_past_slot_31_as_on_row_1_live_and_in_the_export() {
+    let dir = scratch("fold-pin");
+    wav(&dir.join("media").join("tone.wav"), 0.3, false);
+    let near = |a: f64, b: f64| (a - b).abs() <= 1e-3 * b;
+    let tail = |v: &[f32]| v[v.len() - 512 * 2 * 4..].to_vec();
+    let mut tags = Vec::new();
+    let mut reference = None;
+    for folder in SUBJECTS {
+        let track = folder + 1;
+        let mut heard: Vec<Vec<(Vec<f32>, Vec<Vec<f32>>)>> = Vec::new();
+        for routed in [false, true] {
+            let tag = format!("gaps-fold-{folder}-{routed}");
+            let mut s = desk_ahead_at(&Host::at(&dir), None);
+            s.rows[AHEAD].kind = Some(RowKind::Bus);
+            s.rows[folder].kind = Some(RowKind::Audio);
+            s.rows[folder].folder = true;
+            s.rows[track].kind = Some(RowKind::Audio);
+            s.rows[track].in_folder = true;
+            if routed {
+                let (from, to) = (Node::Track(s.rows[track].id), Node::Track(s.rows[AHEAD].id));
+                s.routes.add(tangent_ui::routing::Route::new(from, tangent_ui::routing::Target::Node(to)));
+            }
+            let mut doc = Arrangement::default();
+            doc.add_clip(audio(track, "tone.wav"));
+            let mut app = open(&tag, s, &doc, &dir);
+            let (mut e, p) = live(&mut app, &mut Host::at(&dir));
+            let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+            let rows = [folder, AHEAD, track];
+            heard.push(vec![roll_stems(&mut e, &p, &rows, false, 0.25), roll_stems(&mut x, &xb, &rows, false, 0.25)]);
+            tags.push(tag);
+        }
+        for (i, road) in ["live", "export"].into_iter().enumerate() {
+            let (alone, _) = &heard[0][i];
+            let (twice, cols) = &heard[1][i];
+            let (held, bus, own) = (rms(&tail(&cols[0])), rms(&tail(&cols[1])), rms(&tail(&cols[2])));
+            assert!(rms(&tail(alone)) > 1e-2, "{road}: the track in folder {folder} is silent");
+            assert!(near(held, own), "{road}: folder {folder} no longer carries its child whole ({held} against {own})");
+            assert!(near(bus, own), "{road}: the bus no longer carries the track in folder {folder} whole ({bus} against {own})");
+            let (both, one) = (rms(&tail(twice)), rms(&tail(alone)));
+            assert!(near(both, 2.0 * one), "{road}: the master does not hear the track in folder {folder} twice, in step ({both} against {one})");
+            let row_1 = *reference.get_or_insert(both);
+            assert!(near(both, row_1), "{road}: the master hears folder {folder}'s track at {both}, row 1's at {row_1}");
+        }
+    }
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    cleanup(&dir, &tags);
 }
 
 // ── the host is off the frozen map's seats ──────────────────────────────────
@@ -1227,9 +1648,13 @@ fn no_host_road_names_a_bay_by_the_frozen_maps_seat() {
 /// the frame's reconcile loads its bay through `load_bay` and walks through
 /// `next_owed_bay`, the sampler reload is `deliver_samples`, the kits'
 /// reload `deliver_kits`, their knobs `push_pad_knobs`, a lane that came or
-/// went is forgotten by `forget_moved_slots`, and a face's knob is set by
-/// `set_insert_param`. A road the frame took by other lines would leave
-/// this suite proving a function nothing calls.
+/// went is forgotten by `forget_moved_slots` (and the curves last handed
+/// over with it), the curves go by `push_curves`, a face's knob is set by
+/// `set_insert_param`, and the kits are owed by the sync's own answer
+/// (`Synced::owes_kits`), a retry or an edit. A road the frame took by other
+/// lines would leave this suite proving a function nothing calls, and a
+/// rule for when the kits are owed that the frame did not keep would leave
+/// it proving a rule nothing keeps.
 #[test]
 fn the_frame_runs_the_roads_this_suite_drives() {
     let whole = include_str!("desktop.rs");
@@ -1240,13 +1665,24 @@ fn the_frame_runs_the_roads_this_suite_drives() {
         &src[at..at + src[at..].find("\n    }\n").expect("its end")]
     };
     let frame = body_of("fn after_frame(&mut self");
-    for road in ["Self::bays_wanted(&self.app, &self.bridge)", "Self::next_owed_bay(&wanted,", "Self::load_bay(", "Self::set_insert_param("] {
+    for road in [
+        "Self::bays_wanted(&self.app, &self.bridge)",
+        "Self::next_owed_bay(&wanted,",
+        "Self::load_bay(",
+        "Self::set_insert_param(",
+        "self.push_automation();",
+        "if std::mem::take(&mut self.recorder.pads_retry) || self.app.take_drumpad_dirty() {",
+    ] {
         assert!(frame.contains(road), "the frame no longer takes `{road}`");
     }
     let push = body_of("fn push_monitor_settings(&mut self)");
-    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs("] {
+    for road in ["Self::forget_moved_slots(", "Self::push_pad_knobs(", "self.pushed_auto = None;", "if synced.owes_kits() {"] {
         assert!(push.contains(road), "the frame's push no longer takes `{road}`");
     }
+    assert!(
+        body_of("fn push_automation(&mut self)").contains("Self::push_curves(self.recorder.engine.as_mut(), &self.bridge, &self.app, &mut self.pushed_auto)"),
+        "the curves go another road"
+    );
     assert!(body_of("fn reload_sampler(&mut self)").contains("Self::deliver_samples("), "the sampler reload goes another road");
     assert!(body_of("fn reload_pads(&mut self)").contains("Self::deliver_kits("), "the kits' reload goes another road");
 }
