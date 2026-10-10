@@ -18385,7 +18385,8 @@ pub struct Engine {
     capturing: RefCell<std::collections::BTreeSet<u32>>,
     /// The stem tap's rings to the callback (see `Renderer::stem`), and the
     /// read end and slots of the one last armed. The read end outlives a
-    /// disarm, so the pass that disarmed it can still drain what is in it.
+    /// disarm, so the pass that disarmed it can still drain what is in it,
+    /// and goes when the pass lets it go ([`Engine::release_stems`]).
     stems_to_audio: RefCell<Producer<Option<StemTap>>>,
     stems_from_audio: RefCell<Consumer<Option<StemTap>>>,
     stem_rx: RefCell<Option<Consumer<f32>>>,
@@ -22193,6 +22194,10 @@ impl Engine {
         // after it gave up is freed on this thread on the next frame,
         // which is the whole point of the ring.
         while self.sampler_from_audio.pop().is_ok() {}
+        // **A stem tap the callback sent home**, a disarmed export's: it
+        // held its ring's write end, and a tap that waited here for the next
+        // arm held that ring with it (see `release_stems`).
+        while self.stems_from_audio.get_mut().pop().is_ok() {}
         while self.track_from_audio.pop().is_ok() {}
         if let Some(clips) = self.track_pending.take() {
             if let Err(rtrb::PushError::Full(clips)) = self.track_to_audio.push(clips) {
@@ -22530,7 +22535,8 @@ impl Engine {
     /// frame was the whole desk buffer, kept for the roads and the goldens
     /// that read a column by its slot. An export that knows its stems arms
     /// only those ([`Engine::arm_stems`]). Off disarms; what the ring still
-    /// holds stays drainable until the next arm.
+    /// holds stays drainable until the pass lets it go
+    /// ([`Engine::release_stems`]) or the next arm replaces it.
     pub fn set_stems(&self, on: bool) {
         if on {
             let every: Vec<Slot> = (0..self.slot_capacity as u32).map(Slot).collect();
@@ -22551,6 +22557,27 @@ impl Engine {
         *self.stem_rx.borrow_mut() = Some(rx);
         *self.stem_slots.borrow_mut() = slots.to_vec();
         self.send_stem_tap(Some(StemTap::new(tx, slots)));
+    }
+
+    /// **The stem ring let go: a pass is over and has drained its last.**
+    /// The read end and the slots are dropped here, and so is a disarmed
+    /// tap the callback has already sent home; one it sends home later goes
+    /// at the next [`Engine::retire_tick`], whose drop frees the ring (its
+    /// storage is the two ends' to share, so it goes with the later of
+    /// them). Disarm first (`set_stems(false)`): an armed tap keeps writing
+    /// the ring, and keeps it.
+    ///
+    /// Nothing let it go before: the read end stayed for "the pass that
+    /// disarmed it can still drain", and the next arm was the only thing
+    /// that replaced it. An export runs on the LIVE engine, which lives for
+    /// the session, so the four seconds of every stem it wrote stayed held
+    /// until the next export: about 1.5 MB a stem at 48 kHz, 184 MB after a
+    /// hundred and twenty stems, where an idle engine holds none (design
+    /// 7.12, memory sized by use).
+    pub fn release_stems(&self) {
+        *self.stem_rx.borrow_mut() = None;
+        self.stem_slots.borrow_mut().clear();
+        while self.stems_from_audio.borrow_mut().pop().is_ok() {}
     }
 
     /// The tap onto its ring, the one it displaced dropped HERE first. A
@@ -22581,8 +22608,9 @@ impl Engine {
     }
 
     /// **How many bytes of stem ring the engine holds**: none until a pass
-    /// arms the tap, and then four seconds of the slots it armed, never of
-    /// the whole desk (design 7.12).
+    /// arms the tap, then four seconds of the slots it armed, never of the
+    /// whole desk, and none again once the pass lets it go
+    /// ([`Engine::release_stems`]; design 7.12).
     #[cfg_attr(not(test), allow(dead_code, reason = "the memory measurement's own reading"))]
     pub fn stem_ring_bytes(&self) -> usize {
         self.stem_rx
@@ -40876,6 +40904,14 @@ mod memory_inputs {
     /// held from the first block, and what building an engine asks for is
     /// under the thirty-two capture rings and the thirty-two-lane stem ring
     /// it used to hold before anything was armed.
+    ///
+    /// **And idle again once the use is over**: after an export, by the
+    /// realtime road's own steps (`tick_bounce`: the tap disarmed, its last
+    /// drained, the ring let go), and after the armed pick is disarmed, the
+    /// wide engine holds what a fresh one does, and the export's ring is
+    /// measured as given back to the allocator. The ring was kept for the
+    /// next export on an engine that lives for the session: four seconds of
+    /// every stem the last export wrote, held while the desk sat idle.
     #[test]
     fn idle_stem_and_capture_memory_stays_flat_as_lanes_are_added() {
         let (_, built) = crate::rt_alloc::count_bytes(|| Engine::offline(RATE, Timebase::new()).expect("an engine"));
@@ -40901,6 +40937,37 @@ mod memory_inputs {
         );
         assert_eq!(e.capture_ring_bytes(), capture_ring_frames(RATE) * TAP_CHANNELS * 4);
         assert_eq!(e.stem_ring_bytes(), 2 * capture_ring_frames(RATE) * TAP_CHANNELS * 4);
+        // The export runs (the callback takes the tap and fills it), then
+        // ends as the realtime road ends it: disarmed, the last drained, the
+        // ring let go, all before the callback has sent the tap home.
+        let held = e.stem_ring_bytes();
+        let mut out = vec![0.0f32; BLOCK * 2];
+        e.render_offline(&mut out);
+        // What that block sent home (the pick table's old shell, which the
+        // armed pick's Grow replaced) goes first, so the tick measured below
+        // gives back the stem tap's and nothing else's.
+        e.retire_tick();
+        e.set_stems(false);
+        let mut last = Vec::new();
+        e.drain_stems(&mut last);
+        assert!(!last.is_empty(), "the tap wrote nothing while it was armed");
+        e.release_stems();
+        assert_eq!(e.stem_ring_bytes(), 0, "an idle engine still holds the last export's stem ring");
+        // The next block sends the disarmed tap home, and the next frame's
+        // tick drops it: the ring's write end was the last thing holding it.
+        e.render_offline(&mut out);
+        let ((), freed) = crate::rt_alloc::count_freed(|| e.retire_tick());
+        assert!(freed >= held, "the export's ring was not given back: {freed} of its {held} bytes");
+        // And the record's pick disarmed: its ring goes home the same way.
+        e.sync_capture_rings(&[]).expect("the ring goes home");
+        e.render_offline(&mut out);
+        e.retire_tick();
+        e.sync_capture_rings(&[]).expect("home");
+        assert_eq!(
+            (e.capture_ring_bytes(), e.stem_ring_bytes()),
+            (0, 0),
+            "idle memory after an export and a record is not an idle engine's"
+        );
     }
 
     /// **A capture ring is never smaller than the graph's quantum** (W5,
