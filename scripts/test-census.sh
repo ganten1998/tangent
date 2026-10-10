@@ -13,6 +13,18 @@
 # (`→` is accepted for `->`.) Commits that keep or raise every count need
 # nothing.
 #
+# **A ledger can be written late**, in `scripts/test-census.ledger`, for a
+# commit already in history whose body carries none (or carries one in a
+# shape this script does not read): history is never rewritten to fix a
+# message, and a red census on every later commit is not a fix either. Each
+# line there is a ledger line prefixed with the FULL hash of the commit it
+# answers for, so it can excuse no other commit:
+#
+#     <40-hex commit> census(<crate>): <removed test> -> <its replacement>
+#
+# It is read from the working tree, which is where a late ledger has to
+# live: the commit it speaks for cannot contain it.
+#
 # **Where the census starts.** At the commit that added this script, found
 # from history rather than written down, so the census can never be pointed
 # at a range that predates it (973 commits of history before it carry no
@@ -61,6 +73,15 @@ ledger_lines() {
   printf '%s\n' "$1" | grep -c -E "^census\\($2\\): .+ (->|→) .+" || true
 }
 
+LATE_LEDGER="scripts/test-census.ledger"
+
+# `late_lines <commit> <crate>`: how many late ledger lines (see the header)
+# answer for that commit and crate.
+late_lines() {
+  [ -f "$LATE_LEDGER" ] || { echo 0; return; }
+  grep -c -E "^$1 census\\($2\\): .+ (->|→) .+" "$LATE_LEDGER" || true
+}
+
 if [ -n "${CENSUS_BASE:-}" ]; then
   start="$CENSUS_BASE"
 else
@@ -90,7 +111,7 @@ for c in $(git rev-list --no-merges --reverse "$range"); do
     now="$(count "$c" "$crate")"
     if [ "$now" -lt "$was" ]; then
       drop=$((was - now))
-      have="$(ledger_lines "$body" "$crate")"
+      have=$(( $(ledger_lines "$body" "$crate") + $(late_lines "$c" "$crate") ))
       if [ "$have" -lt "$drop" ]; then
         printf '  %s %s: %s -> %s tests, %s ledger line(s) for %s removed\n' \
           "$(git log -1 --format=%h "$c")" "$crate" "$was" "$now" "$have" "$drop" >&2
