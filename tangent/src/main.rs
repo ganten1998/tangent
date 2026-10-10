@@ -137,6 +137,11 @@ mod engine_bridge;
 /// bridge: docs/design/unlimited-tracks.md, 11.2 and W6-rows-unlimited.
 #[cfg(all(test, feature = "recorder"))]
 mod konami_e2e;
+/// Buses, returns and sends heard through the bridge: the plan carries
+/// them, a send is heard through its bus, a saved route loop plays as it
+/// did. docs/design/unlimited-tracks.md, section 9 and W7-buses-ui.
+#[cfg(all(test, feature = "recorder"))]
+mod bus_e2e;
 /// The plugin-state shelves, named by identity, and the one copy of the
 /// legacy global shelf into those names. docs/design/unlimited-tracks.md,
 /// section 6.6 and C10.
