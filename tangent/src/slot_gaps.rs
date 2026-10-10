@@ -19,11 +19,12 @@
 //! knob (`set_insert_param`). A copy of those here stayed green while the
 //! road it copied could stop at the thirty-second row.
 //!
-//! The parts: a drum lane's pad effect, a sampler bay's file, a built-in
-//! face (its push, its knobs and the automation's overlay on it), a
-//! sidechain key, and a strip's send knob as its Return 0 entry. And the
-//! scans that keep the host off the frozen map's seats, which is what made
-//! the faces' roads stop at the thirty-second row.
+//! The parts: a drum lane's pad effect (and one seated before its track's
+//! kit is), a sampler bay's file, a built-in face (its push, its knobs and
+//! the automation's overlay on it), a sidechain key, and a strip's send knob
+//! as its Return 0 entry. And the scans that keep the host off the frozen
+//! map's seats, which is what made the faces' roads stop at the
+//! thirty-second row.
 //!
 //! **Nothing here touches the real home**: every licence store is a temp
 //! directory of the test's own (`composite::tiers`), every project and every
@@ -40,7 +41,7 @@ use tangent_ui::app::TangentApp;
 use tangent_ui::arrangement::{ArrClip, ArrNote, Arrangement, ClipKind};
 use tangent_ui::desk_id::{Node, Rack, SeatBay, TrackId};
 use tangent_ui::desk_model::{RowKind, TrackRow};
-use tangent_ui::dialogs::{DialogAction, DRUMPAD_PATH};
+use tangent_ui::dialogs::{DialogAction, DRUMPAD_PATH, KEYS_PATH};
 use tangent_ui::drumpad::DrumpadDoc;
 use tangent_ui::host::Caps;
 use tangent_ui::recorder::{DrumKitParams, RecorderRequest, StripRef, DRUM_PAD_BASE};
@@ -50,7 +51,7 @@ use crate::builtin_fx::{COMP_PATH, EQ_PATH, SAMPLER_PATH, TRIM_PATH};
 use crate::composite::tiers;
 use crate::desk_plan::{SendFrom, SendTo, Slot};
 use crate::desktop::{BayRoad, Decoded, DesktopApp, InsertLedger};
-use crate::engine_bridge::{full_build_with, BuildFor, Bridge, Built, Furnish};
+use crate::engine_bridge::{full_build_with, lane_bay, BuildFor, Bridge, Built, Furnish};
 use crate::instrument::Engine;
 use crate::shelf::DisplacedShelf;
 
@@ -453,6 +454,95 @@ fn a_pad_effect_on_a_track_past_slot_31_is_heard_as_on_row_1_live_and_in_the_exp
     }
     cleanup(&dry_dir, &tags[..1]);
     cleanup(&cut_dir, &tags[1..]);
+}
+
+/// **A pad effect seated before its track is a drum track waits for the
+/// track's kit, and is then heard past slot 31 as on row 1, live and in the
+/// export** (W7-slot-gaps, after review). Every subject a MIDI track whose
+/// first bay holds the keyboard, with a Trim at -24 dB still on its pad 36
+/// (nothing clears a pad's bays when the instrument changes) and its kit in
+/// the sidecar: a project reopened, or an engine rebuilt, after the drumpad
+/// was swapped out. Then the drumpad goes back in every subject's first bay.
+///
+/// A lane past the frozen map is installed with no pad bank for such a
+/// track, and a pad's rack lives in that bank. The reconcile loaded the Trim
+/// all the same: its rack went home with the plugin in it, the ledger still
+/// said it was seated, and once the drumpad was back the bank came with
+/// nothing on pad 36, so the kit played that pad dry, live, for good, while
+/// the export built the lane with its bank and played it trimmed. Now no
+/// pad's bay is wanted before its lane has a bank (`Bridge::engine_bay`):
+/// past the frozen map nothing is seated or written down before the
+/// drumpad, a lane of the frozen map seats the Trim in its frozen rack at
+/// once, and after the drumpad every subject's kit is cut by the 24 dB row
+/// 1's is, against kits that were drum tracks from the start.
+#[test]
+fn a_pad_effect_waits_for_its_tracks_kit_and_is_heard_past_slot_31_as_on_row_1() {
+    let tags = ["gaps-late-dry", "gaps-late"];
+    let (dry_dir, dir) = (scratch("late-dry"), scratch("late"));
+    let (dry_app, mut dry_e, dry_p) = kit_desk(tags[0], &dry_dir, false);
+    wav(&dir.join("media").join("pad.wav"), 0.25, false);
+    let mut s = wide_desk();
+    let mut doc = Arrangement::default();
+    for row in SUBJECTS {
+        s.rows[row].kind = Some(RowKind::Midi);
+        s.plugins.insert(bay_of(&s, row, Rack::Chain(0), 0), KEYS_PATH.to_owned());
+        s.plugins.insert(bay_of(&s, row, Rack::Pad(36), 0), TRIM_PATH.to_owned());
+        doc.add_clip(notes(row, DRUM_PAD_BASE + 36));
+    }
+    let path = tangent_ui::arrangement::doc_in(&dir);
+    doc.save_to(&path);
+    save_kits(&s, &SUBJECTS, &path);
+    let mut host = Host::at(&dir);
+    let floor = state(TRIM_PATH, &[(0, 0.0)], &[]);
+    let firsts: Vec<SeatBay> = SUBJECTS.iter().map(|r| bay_of(&s, *r, Rack::Chain(0), 0)).collect();
+    for row in SUBJECTS {
+        host.shelve(bay_of(&s, row, Rack::Pad(36), 0), TRIM_PATH, &floor);
+    }
+    let mut app = open_saved(tags[1], s, &path);
+    let (mut e, mut p) = live(&mut app, &mut host);
+
+    // Before the drumpad: a lane of the frozen map seats the Trim in its
+    // frozen rack; past it the lane has no bank, and the reconcile neither
+    // loads the Trim nor writes it down as loaded.
+    for row in SUBJECTS {
+        let lane = p.lane(row).expect("a lane");
+        let at = lane_bay(lane.slot, Rack::Pad(36), 0).expect("a pad's bay");
+        let seated = e.insert_at(at.0, at.1).is_some();
+        let noted = host.ledger.contains_key(&at);
+        let frozen = row < 32;
+        assert_eq!(
+            (seated, noted),
+            (frozen, frozen),
+            "row {row}'s pad 36 before its track's kit: seated {seated}, in the ledger {noted}"
+        );
+    }
+
+    // The drumpad back in every subject's first bay, and a frame: each lane
+    // past the frozen map is sent its bank, and the reconcile seats the pad.
+    for sb in firsts {
+        app.set_plugin(sb, Some(DRUMPAD_PATH));
+    }
+    host.frame(&mut app, &mut e, &mut p);
+    let Built { engine: mut x, bridge: xb } = export(&app, (&e, &p));
+    let Built { engine: mut dx, bridge: dxb } = export(&dry_app, (&dry_e, &dry_p));
+    let roads = [
+        ("live", levels(&mut dry_e, &dry_p, &SUBJECTS), levels(&mut e, &p, &SUBJECTS)),
+        ("export", levels(&mut dx, &dxb, &SUBJECTS), levels(&mut x, &xb, &SUBJECTS)),
+    ];
+    for (road, dry, cut) in &roads {
+        let ratio = |i: usize| cut[i] / dry[i];
+        let reference = ratio(0);
+        assert!((reference - 0.063).abs() < 0.01, "{road}: row 1's pad effect left its kit at {reference} of itself, not -24 dB");
+        for (i, row) in SUBJECTS.iter().enumerate() {
+            let r = ratio(i);
+            assert!(
+                (r - reference).abs() <= 0.02 * reference,
+                "{road}: row {row}'s pad effect, seated before its kit, left the kit at {r} of itself, row 1's at {reference}"
+            );
+        }
+    }
+    cleanup(&dry_dir, &tags[..1]);
+    cleanup(&dir, &tags[1..]);
 }
 
 // ── a sampler bay's file ────────────────────────────────────────────────────

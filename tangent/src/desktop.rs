@@ -7827,7 +7827,8 @@ impl DesktopApp {
     /// **What the desk wants in every bay, at the engine's address for it**:
     /// the app's bays by identity (`engine_bridge::desk_bays`), each at its
     /// track's lane. A bay whose track has no lane yet (one waiting for a
-    /// slot) is not wanted anywhere until it has one.
+    /// slot), or a pad's whose lane has no pad bank yet, is not wanted
+    /// anywhere until it has one (`Bridge::engine_bay`).
     pub(crate) fn bays_wanted(app: &TangentApp, bridge: &crate::engine_bridge::Bridge) -> InsertLedger {
         crate::engine_bridge::desk_bays(app)
             .into_iter()
