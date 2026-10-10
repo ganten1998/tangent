@@ -8473,9 +8473,9 @@ const GRAIN_AUTO: u32 = u32::MAX;
 ///
 /// **Measured again at scale and kept** (W7-scale-and-budgets,
 /// `docs/PERF-UNLIMITED.md`): 256 lanes of built-in [EQ, comp, plate],
-/// forked. At a 32-frame callback the p99 was 215.8 us off and 205.5,
-/// 201.3 and 202.1 us at 4, 8 and 16 blocks; at 64 frames 333.1 off
-/// and 324.0, 330.4 and 352.2 us at 2, 4 and 8. Built-ins pay little per
+/// forked. At a 32-frame callback the p99 was 211.5 us off and 200.0,
+/// 197.6 and 201.6 us at 4, 8 and 16 blocks; at 64 frames 350.3 off
+/// and 329.0, 318.3 and 329.1 us at 2, 4 and 8. Built-ins pay little per
 /// block, so a grain moves them a few percent either way and one run of
 /// three readings does not separate the settings; the table above, on
 /// hosted reverbs whose per-instance block cost is the whole story, is

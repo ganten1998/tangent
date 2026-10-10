@@ -610,9 +610,9 @@ struct Gate {
 ///   on) and a bounce's is every core less one (fourteen); the tester boxes
 ///   the fan-out was swept on are four threads.
 /// * **A bounce would use more on a bigger machine.** 1,024 lanes, each a
-///   plate, export pool of plain threads, 128-frame blocks: serial 6,922
-///   us a block, then 3,759 / 2,710 / 1,948 / 1,587 / 1,285 us at 1, 2, 4,
-///   8 and 14 peers, still 1.23x from eight to fourteen with the last six
+///   plate, export pool of plain threads, 128-frame blocks: serial 6,730
+///   us a block, then 3,761 / 2,706 / 1,925 / 1,499 / 1,286 us at 1, 2, 4,
+///   8 and 14 peers, still 1.17x from eight to fourteen with the last six
 ///   on efficiency cores (`docs/PERF-UNLIMITED.md`). A 32-core machine is
 ///   capped at half its cores for a bounce, unmeasured.
 /// * **A wider LIVE pool is a bet that can turn the fork off.** The fork
