@@ -82663,6 +82663,9 @@ mod arrange_peaks_tests {
         assert!(clips.iter().any(|c| c.id == a && c.peaks.is_some()));
         // A second audio clip pictured the OLD way reopens the host's road.
         app.arrangement.add_clip(an_audio_clip(1, 1.0));
+        // A fixture write past every app road: the mark a gesture or a frame
+        // would have made (the timeline's frame reads the drawn lanes).
+        app.desk_index_dirty();
         let b = app.arrangement.clips[1].id;
         app.clip_infos.insert(
             b,
