@@ -963,6 +963,10 @@ struct ArrRecAudio {
     lane: Option<crate::engine_bridge::LaneAt>,
     pick: crate::desk_plan::PickId,
     frames: Vec<f32>,
+    /// **Its input is gone from the device**, and the line saying so stands
+    /// (`say_deaf_takes`): kept so the line is raised once, taken down when
+    /// the input comes back, and taken down with the record.
+    deaf: bool,
 }
 
 /// One armed MIDI lane's take, and the rule that says which messages are its.
@@ -1032,6 +1036,7 @@ impl ArrRec {
                         lane: bridge.lane_of(*id),
                         pick,
                         frames: Vec::new(),
+                        deaf: false,
                     }),
                     // NO INPUT on an explicit desk: R is lit but there is no
                     // input behind it, and a press that does nothing
@@ -10174,6 +10179,11 @@ impl DesktopApp {
         let Some(mut rec) = self.recorder.arr_rec.take() else {
             return;
         };
+        // A take that lost its input has its line taken down with the
+        // record: there is nothing left that is not recording.
+        for a in rec.audio.iter().filter(|a| a.deaf) {
+            self.app.notify_lower(&deaf_take_key(a.id));
+        }
         let rate = self
             .recorder
             .engine
@@ -15928,6 +15938,10 @@ impl DesktopApp {
         };
         let explicit = self.bridge.sync_inputs(&self.app, e, &stream);
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
+        // **And a take whose input left the device says so** (see
+        // `say_deaf_takes`), read off the picks just bound.
+        let gone = self.bridge.held_reading_nothing();
+        say_deaf_takes(self.recorder.arr_rec.as_mut(), &gone, &mut self.app);
         // Never read from a settings file — see `TangentApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -17758,6 +17772,67 @@ pub(crate) fn mirror_sampler_samples(
             }),
         );
     }
+}
+
+/// **The line a take that lost its input stands under**, one per track, so
+/// two takes that lose theirs are two lines.
+#[cfg(feature = "recorder")]
+fn deaf_take_key(id: tangent_ui::desk_id::TrackId) -> String {
+    format!("take-input-gone-{}", id.0)
+}
+
+/// **A take whose input the device no longer has says so** (W6, carried in
+/// from W5): raised once when its pick stops reading, taken down when the
+/// input is back, and with the record (`finish_arr_record`).
+///
+/// The tee writes a held pick's ring only while that pick reads device
+/// columns (`Renderer::mix_monitor` skips one that reads nothing), so an
+/// interface reopened with fewer inputs under an arrangement record stopped
+/// the takes on the inputs it lost, and nothing said so: the record went on,
+/// the meters of the others moved, and the take came back short. `gone` is
+/// the bridge's answer this frame (`Bridge::held_reading_nothing`), read off
+/// the picks as they were just bound.
+#[cfg(feature = "recorder")]
+fn say_deaf_takes(rec: Option<&mut ArrRec>, gone: &[crate::desk_plan::PickId], app: &mut TangentApp) {
+    let Some(rec) = rec else {
+        return;
+    };
+    for (id, deaf) in deaf_take_edges(rec, gone) {
+        let key = deaf_take_key(id);
+        if deaf {
+            let line = deaf_take_line(app, id);
+            app.notify_raise(&key, Kind::Error, line);
+        } else {
+            app.notify_lower(&key);
+        }
+    }
+}
+
+/// **Which takes' lines go up (`true`) or come down (`false`) this frame**:
+/// each take whose pick started or stopped reading nothing, its flag moved
+/// with it, so a line is raised once and a frame that changes nothing says
+/// nothing.
+#[cfg(feature = "recorder")]
+fn deaf_take_edges(rec: &mut ArrRec, gone: &[crate::desk_plan::PickId]) -> Vec<(tangent_ui::desk_id::TrackId, bool)> {
+    let mut edges = Vec::new();
+    for a in &mut rec.audio {
+        let deaf = gone.contains(&a.pick);
+        if deaf != a.deaf {
+            a.deaf = deaf;
+            edges.push((a.id, deaf));
+        }
+    }
+    edges
+}
+
+/// The line itself: the track by its number and name where it stands now.
+#[cfg(feature = "recorder")]
+fn deaf_take_line(app: &TangentApp, id: tangent_ui::desk_id::TrackId) -> String {
+    let who = app.row_of(id).map_or_else(
+        || "A removed track".to_owned(),
+        |row| format!("Track {} ({})", row + 1, app.channel_display_name(row)),
+    );
+    format!("{who} is not recording: its input is gone from the audio device.")
 }
 
 /// **Where the arrangement record is replacing each lane's schedule**, in
@@ -37971,3 +38046,62 @@ mod arr_identity {
         assert!(rec.audio[0].frames == want, "the take is not input 3, sample for sample");
     }
 }
+
+/// **A take whose input left the device says so** (W6-rows-unlimited, the
+/// capture tee made loud), driven through the bridge the host binds its
+/// picks with.
+#[cfg(all(test, feature = "recorder"))]
+mod deaf_takes {
+    use super::*;
+    use crate::desk_plan::PickId;
+    use crate::engine_bridge::{Bridge, InputRow, InputStream};
+    use tangent_record::audio::{ChannelPick, Picks};
+    use tangent_ui::desk_id::TrackId;
+
+    fn take(id: u32, pick: PickId) -> ArrRecAudio {
+        ArrRecAudio { id: TrackId(id), lane: None, pick, frames: Vec::new(), deaf: false }
+    }
+
+    /// **Each take's line goes up once when its input leaves the device and
+    /// comes down when it is back**: an interface reopened with two inputs
+    /// under a record taking inputs 3+4 and input 1, through the bridge's own
+    /// pick table on an offline engine. The take on 3+4 is named once (a
+    /// frame that changes nothing says nothing), the other never; the
+    /// inputs back, the line comes down.
+    #[test]
+    fn a_take_whose_input_left_the_device_is_named_once_and_unnamed_when_it_is_back() {
+        let mut e = crate::instrument::Engine::offline(48_000, tangent_record::audio::Timebase::new()).expect("an offline engine");
+        let mut bridge = Bridge::new();
+        let rows = vec![
+            InputRow { id: TrackId(7), audio: true, spec: Some(ChannelPick::Stereo(2, 3)), armed: true },
+            InputRow { id: TrackId(8), audio: true, spec: Some(ChannelPick::Mono(0)), armed: true },
+        ];
+        let stream = |dev: usize| InputStream { device_channels: Some(dev), picks: Picks::EVERYTHING };
+        let _ = bridge.sync_input_rows(&rows, &mut e, &stream(4));
+        let (a, b) = (bridge.pick_of(TrackId(7)).expect("a pick"), bridge.pick_of(TrackId(8)).expect("a pick"));
+        bridge.hold_picks(&[a, b]);
+        let mut rec = ArrRec { start_s: 0.0, start_ns: 0, midi: Vec::new(), audio: vec![take(7, a), take(8, b)] };
+        let mut frame = |dev: usize, rec: &mut ArrRec| {
+            let _ = bridge.sync_input_rows(&rows, &mut e, &stream(dev));
+            deaf_take_edges(rec, &bridge.held_reading_nothing())
+        };
+        assert!(frame(4, &mut rec).is_empty(), "a take reading its input was named");
+        assert_eq!(frame(2, &mut rec), vec![(TrackId(7), true)], "the take on the lost inputs was not named, or another was");
+        assert!(frame(2, &mut rec).is_empty(), "the same loss was said twice");
+        assert_eq!(frame(4, &mut rec), vec![(TrackId(7), false)], "the line stayed up with the input back");
+    }
+
+    /// **The line names the track where it stands, and says what is
+    /// wrong**, in plain words (no em dash: it is shown to people).
+    #[test]
+    fn the_line_names_the_track_and_says_it_is_not_recording() {
+        let ctx = egui::Context::default();
+        let app = TangentApp::with_license(&ctx, Settings::default(), Caps::PLUGIN, crate::composite::tiers::free("deaf-line"));
+        let id = app.track_at(1).expect("the shipped desk's second row");
+        let line = deaf_take_line(&app, id);
+        assert!(line.starts_with("Track 2 (") && line.contains("is not recording"), "{line}");
+        assert!(!line.contains('\u{2014}'), "an em dash in a line people read: {line}");
+        assert!(deaf_take_line(&app, TrackId(9_999)).starts_with("A removed track"));
+    }
+}
+
