@@ -24,6 +24,7 @@
 use crate::chord_strip;
 use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
 use crate::fretboard_panel;
+use crate::automation::AutoLane;
 use crate::host::Caps;
 use crate::keys;
 use crate::menu::{self, ColorTarget, MenuAction, MenuState, MenuView};
@@ -524,14 +525,38 @@ impl NoteState {
 /// sentinel can compare two moments by the same measure.
 #[cfg(test)]
 fn counted_in(desk: &crate::arrangement::DeskSnap, arr: &crate::arrangement::Arrangement) -> usize {
-    (0..recorder::CHANNELS)
-        .filter(|n| {
-            desk.kinds.get(*n).is_some_and(|k| recorder::ChannelKind::from_u8(*k).is_some())
-                || (u64::from(desk.tracks_added) >> n) & 1 == 1
-                || desk.is_folder.get(*n).copied().unwrap_or(false)
+    desk.rows
+        .iter()
+        .enumerate()
+        .filter(|(n, r)| {
+            matches!(r.kind, Some(crate::desk_model::RowKind::Midi | crate::desk_model::RowKind::Audio))
+                || r.added
+                || r.folder
                 || arr.clips.iter().any(|c| c.lane == *n)
         })
         .count()
+}
+
+/// **What a gesture changes about the desk's shape**, for the line
+/// `TangentApp::desk_shape_held_for` says when a running arrangement record
+/// or realtime export makes it wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeChange {
+    /// Rows reordered: a drag, a snap into a folder, a group made.
+    Order,
+    /// A track taken off the desk.
+    Remove,
+    /// A row put between others: Insert or Paste Track below. (A new track
+    /// at the END is no shape change: Add appends under a hold.)
+    Insert,
+    /// A track's kind changed.
+    Kind,
+    /// A track's input bound, cleared or narrowed.
+    Input,
+    /// A folder made or dissolved without moving a row.
+    Folder,
+    /// A route or a sidechain key added or taken away.
+    Route,
 }
 
 /// **Why a gesture that would make a new track was refused**, before it
@@ -547,13 +572,14 @@ pub enum TrackRefusal {
     /// cap of `cap`. `have` can exceed `cap` (a supporter's project opened
     /// on a free machine), and deleting below the cap makes room again.
     FreeCap { have: usize, cap: usize },
-    /// The build's own ceiling: a supporter with every row of this build's
-    /// fixed-width desk in use. Exists only until the desk is a list.
+    /// The desk's sanity bound (`desk_id::MAX_ROWS` rows, a hostile file's
+    /// limit and no tier's): nothing a hand can reach, but a batch that
+    /// would pass it is refused rather than half-made.
     Ceiling { max: usize },
     /// The desk's shape is held by a running arrangement record or realtime
-    /// export. MERGE-ME(W6-rows-unlimited): raised by `desk_shape_held`;
-    /// until then the existing holds (`lane_order_held`, `tracks_held`,
-    /// `folders_held`) keep their own lines and this is never returned.
+    /// export: a track that would land between others waits
+    /// (`desk_shape_held_for`, which says the line), and Add appends at the
+    /// end instead, so no road that only adds is ever refused this way.
     Held,
 }
 
@@ -574,7 +600,7 @@ impl TrackRefusal {
                  removes the limit. Buses, returns and sends are unlimited either way.{room}"
             ),
             TrackRefusal::Ceiling { max } => {
-                format!("This build's desk holds {max} tracks.{room}")
+                format!("A desk holds at most {max} rows.{room}")
             }
             TrackRefusal::Held => {
                 "The tracks cannot change shape while a recording or an export runs.".to_owned()
@@ -868,7 +894,8 @@ pub struct TangentApp {
     /// The same for the arrangement's lane scrollbar.
     arr_bar_grab: Option<f32>,
     /// The first lane the arrangement shows — the vertical twin of the
-    /// mixer's scroll, moved by the wheel over the track headers. Still a
+    /// mixer's scroll, moved by the wheel over the track headers — as its
+    /// RANK among the drawn lanes (`ArrangeView::lane_scroll`). Still a
     /// whole-lane index: the lane stack distributes exact heights (bus
     /// half-rows, automation shrinkage) and has no notion of a partial
     /// lane, so the smoothness lives in `arr_scroll_acc` instead.
@@ -1177,19 +1204,6 @@ pub struct TangentApp {
     /// active once the hand has really moved, so a rename's double-click
     /// never turns into a shuffle.
     mixer_reorder: Option<(usize, Pos2, bool)>,
-    /// A track reorder's permutation, waiting for the HOST to move the
-    /// plugin-state sidecars and reload the racks: `order[new] = old`,
-    /// channel space. Taken once. Undo and redo of a reorder send one too,
-    /// its inverse and the order again (see `undo_apply`), and all three go
-    /// through `send_desk_perm`, which composes onto one the host has not
-    /// taken yet rather than overwriting it.
-    desk_state_perm: Option<Vec<usize>>,
-    /// **The reorders since the standing moment**, composed into one
-    /// `order[new] = old`, waiting for the commit that keeps them in
-    /// `Moment::perm`. Survives a `begin_one_moment` batch, so Insert
-    /// Track's shift and the track that lands in the gap are one moment
-    /// carrying one permutation.
-    perm_since_moment: Option<Vec<usize>>,
     /// **Bay relabels waiting for the HOST** (C11's `take_bay_relabels`):
     /// plugins a gesture carried from one bay to another, composed into one
     /// set the host applies together. Undo and redo of such a gesture send
@@ -1204,7 +1218,7 @@ pub struct TangentApp {
     /// of. See `undo_commit_double_click`.
     click_moment: Option<(ClickRow, std::sync::Arc<Vec<u64>>)>,
     /// **The automation rows closed since the standing moment**, waiting,
-    /// like `perm_since_moment`, for the commit that keeps them in
+    /// like `relabels_since_moment`, for the commit that keeps them in
     /// `Moment::rows_closed`. Filled by `close_auto_rows`.
     rows_closed_since_moment: ClosedRows,
     /// The marquee'd SET of clips, beside the single selection — the
@@ -1274,11 +1288,14 @@ pub struct TangentApp {
     /// A drag along the panel's tempo track, once one has begun.
     met_drag: bool,
     /// The meters' held picture: rise instant, fall exponential — the
-    /// engine hands raw per-frame maxima, and raw maxima flicker. In the
-    /// host's legacy strip order, as `RecorderState::strip_peaks` arrives
-    /// (`desk_legacy::v32_strip`), and read by what a strip is through
-    /// `strip_meter`, never by index.
-    meter_hold: [[f32; 2]; crate::desk_legacy::V32_STRIPS],
+    /// engine hands raw per-frame maxima, and raw maxima flicker. One per
+    /// row, as `RecorderState::row_peaks` arrives, as many as the desk has;
+    /// read by what a strip is through `strip_meter`.
+    meter_hold: Vec<[f32; 2]>,
+    /// The same for the three specials that meter, in
+    /// `recorder::SPECIAL_METERS` order, as `RecorderState::special_peaks`
+    /// arrives.
+    meter_hold_specials: [[f32; 2]; 3],
     /// **The desk's shape, worked out once** (`desk_index::DeskIndex`):
     /// drawn order, ranks, classes, folders and clip counts, which every
     /// view reads so building one is O(visible). Rebuilt by `desk_index`
@@ -2300,17 +2317,17 @@ struct AutoDragFrom {
     /// The node under the hand, `(lane, param, index)` into the anchor, and
     /// the point it was: the hand sets its time and value, and every other
     /// moving node follows by the same step.
-    lead: (usize, crate::automation::AutoParam, usize),
+    lead: (AutoLane, crate::automation::AutoParam, usize),
     lead_at: crate::automation::Point,
     /// **Where the lead node sits NOW**, `(lane, param, index)`: the address
     /// the next frame's call must name for this anchor to still be its own.
     /// A call naming any other node is a new drag, and re-anchors — an
     /// anchor carried over from a drag that never saw its release would
     /// rebuild a curve from points it no longer has.
-    lead_now: (usize, crate::automation::AutoParam, usize),
+    lead_now: (AutoLane, crate::automation::AutoParam, usize),
     /// `(lane, param, the curve's points at the press, the moving indices)`.
     curves: Vec<(
-        usize,
+        AutoLane,
         crate::automation::AutoParam,
         Vec<crate::automation::Point>,
         Vec<usize>,
@@ -2341,7 +2358,7 @@ enum ArrDrag {
     /// point's index is re-derived after every move, because moving a point
     /// past its neighbour re-sorts the curve and the old index would then
     /// name somebody else's point.
-    AutoPoint(usize, usize, usize),
+    AutoPoint(AutoLane, usize, usize),
     /// **A box drawn over an automation row's empty room**, choosing every
     /// node inside it. `from` and `to` are `(song seconds, normalised
     /// value)` at the press and under the hand now; `press` is where the
@@ -2351,7 +2368,7 @@ enum ArrDrag {
     /// release arrive together, because the press arm goes on to the
     /// release block rather than returning.
     AutoMarquee {
-        lane: usize,
+        lane: AutoLane,
         slot: usize,
         from: (f64, f64),
         to: (f64, f64),
@@ -2362,7 +2379,7 @@ enum ArrDrag {
     /// the slot: opening or closing another row mid-drag renumbers the slots
     /// and the drag would then be turning somebody else's control.
     AutoDial {
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         from_y: f32,
         from: f64,
@@ -2602,19 +2619,6 @@ struct Moment {
     /// The same walk as one `u64` — `project_dirty`'s number, from the
     /// SAME pass as the words so the two cannot describe different moments.
     mark: u64,
-    /// **The lane permutation that carried the desk INTO this moment** from
-    /// the one before it - `order[new] = old`, channel space - when the
-    /// gesture that made it reordered tracks, composed when it reordered
-    /// more than once. A drum pad swap keeps its SEAT order here, which
-    /// `compose_orders` and the host's `seat_order` both read as such.
-    ///
-    /// The words cannot say it. They name each bay's BUNDLE, and the plugin
-    /// playing in it, settings and all, is the host's: undoing a reorder put
-    /// every name back and handed the host nothing to carry, so each moved
-    /// bay was rebuilt from a sidecar written for another row. `undo_apply`
-    /// sends the host this order's inverse on the way back and the order
-    /// itself on the way forward, through the door a reorder uses.
-    perm: Option<std::sync::Arc<Vec<usize>>>,
     /// **The bay relabels that carried plugins INTO this moment** from the
     /// one before it (a drum pad swap), composed. The words name each bay's
     /// bundle and nothing of the plugin's settings, which are the host's:
@@ -2683,18 +2687,6 @@ impl ClosedRows {
     }
 }
 
-/// **`first`, then `then`, as ONE permutation**, every order in the
-/// `order[new] = old` form.
-///
-/// The rows `then` reads are the rows `first` left, so new row `n` holds what
-/// `first` put at `then[n]`: old row `first[then[n]]`. Channel orders only:
-/// a pad swap is a relabel of bays by identity (`swap_pads`), not an order.
-fn compose_orders(first: &[usize], then: &[usize]) -> Vec<usize> {
-    then.iter()
-        .map(|&mid| first.get(mid).copied().unwrap_or(mid))
-        .collect()
-}
-
 /// **Whose pedalboard an amp seated in bay `sb` wears**: a track's, from
 /// either of its two chains (a folder's racks share its one board); nothing
 /// else has a board. The one question every part of the board asks — the
@@ -2723,16 +2715,6 @@ fn shown_on(sb: crate::desk_id::SeatBay) -> Option<crate::desk_id::Node> {
     crate::desk_id::display_slot(sb).map(|_| sb.seat.node)
 }
 
-/// **The order that puts `order` back**: row `order[new]` returns from `new`.
-fn invert_order(order: &[usize]) -> Vec<usize> {
-    let mut back: Vec<usize> = (0..order.len()).collect();
-    for (new, &old) in order.iter().enumerate() {
-        if let Some(slot) = back.get_mut(old) {
-            *slot = new;
-        }
-    }
-    back
-}
 
 /// **What "saved" means**: the words of the moment that was written, and
 /// its fingerprint.
@@ -3369,7 +3351,7 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
     let legacy = template_kit.parent().and_then(|t| {
         match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(t)) {
             crate::arrangement::LoadOutcome::Loaded(a) => a.desk.as_ref().and_then(|d| {
-                (0..recorder::CHANNELS).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..d.rows.len()).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
             }),
             _ => None,
         }
@@ -3396,18 +3378,21 @@ fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool 
     }
 }
 
-/// **The rows' ids of the document at `doc`**, lane by lane, as wide as
-/// the live desk: what its kit sidecar's `track_kits` keys name. The
-/// identity desk when the document has no desk this build reads (missing,
-/// damaged, refused) or one of another width, which is every legacy
-/// document's answer anyway (legacy row r is `TrackId(r)`).
+/// **The id no row holds**: what a row past the desk reads as
+/// (`TangentApp::track_id_at`). The counter never mints it (`mint_id`).
+const NO_TRACK: crate::desk_id::TrackId = crate::desk_id::TrackId(u32::MAX);
+
+/// **The rows' ids of the document at `doc`**, lane by lane, as many as it
+/// has: what its kit sidecar's `track_kits` keys name. The identity desk
+/// when the document has no desk this build reads (missing, damaged,
+/// refused), which is every legacy document's answer anyway (legacy row r
+/// is `TrackId(r)`).
 fn template_row_ids(doc: &std::path::Path) -> Vec<crate::desk_id::TrackId> {
     let read = match crate::arrangement::Arrangement::read_from(doc) {
-        crate::arrangement::LoadOutcome::Loaded(a) => a.desk.map(|d| d.ids.rows().into_owned()),
+        crate::arrangement::LoadOutcome::Loaded(a) => a.desk.map(|d| d.row_ids()),
         _ => None,
     };
-    read.filter(|ids| ids.len() == recorder::CHANNELS)
-        .unwrap_or_else(|| crate::desk_legacy::identity_ids(recorder::CHANNELS))
+    read.unwrap_or_else(|| crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS))
 }
 
 /// **The document a session's relative MEDIA resolves against** - a pad's
@@ -3768,10 +3753,9 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 ///
 /// The rule itself lives in `arrangement::armed_by_default`, because a launch
 /// and an open that disagree about what a silent desk means is two rules.
-fn default_armed(settings: &Settings) -> u32 {
-    crate::arrangement::armed_by_default(&settings.channel_kinds, |n| {
-        settings.row_plugin(n, 0) == Some(dialogs::BUILTIN_PATH)
-    })
+fn default_armed(settings: &Settings) -> Option<usize> {
+    let kinds: Vec<u8> = settings.rows.iter().map(|r| crate::desk_model::RowKind::byte(r.kind)).collect();
+    crate::arrangement::armed_by_default(&kinds, |n| settings.row_plugin(n, 0) == Some(dialogs::BUILTIN_PATH))
 }
 
 #[cfg(test)]
@@ -3784,11 +3768,11 @@ mod default_arm_tests {
     /// one it forgot about. That cost a red run here.
     fn desk(kinds: &[u8], bay0: &[&str]) -> Settings {
         let mut s = Settings::default();
-        s.channel_kinds.iter_mut().for_each(|k| *k = 0);
+        s.rows.iter_mut().for_each(|r| r.kind = None);
         s.plugins.clear();
         for (n, k) in kinds.iter().enumerate() {
-            if let Some(slot) = s.channel_kinds.get_mut(n) {
-                *slot = *k;
+            if let Some(row) = s.rows.get_mut(n) {
+                row.kind = crate::desk_model::RowKind::from_byte(*k);
             }
         }
         for (n, p) in bay0.iter().enumerate() {
@@ -3818,7 +3802,7 @@ mod default_arm_tests {
         let s = desk(&[1, 1, 0], &[dialogs::DRUMPAD_PATH, crate::faces_analog::ANALOG_PATH, ""]);
         assert_eq!(
             default_armed(&s),
-            0,
+            None,
             "a drum pad and an analog are not the piano; nothing should be live"
         );
     }
@@ -3829,14 +3813,14 @@ mod default_arm_tests {
     #[test]
     fn the_built_in_piano_is_still_the_one_channel_that_opens_live() {
         let s = desk(&[1, 1], &[dialogs::DRUMPAD_PATH, dialogs::BUILTIN_PATH]);
-        assert_eq!(default_armed(&s), 1 << 1, "the DX7's channel, and only it");
+        assert_eq!(default_armed(&s), Some(1), "the DX7's channel, and only it");
         // An AUDIO channel holding one changes nothing: the rule is about a
         // channel that plays notes.
         let audio = desk(&[0], &[dialogs::BUILTIN_PATH]);
-        assert_eq!(default_armed(&audio), 0);
+        assert_eq!(default_armed(&audio), None);
         // An empty desk is silent, which is the honest reading of a desk with
         // nothing to play.
-        assert_eq!(default_armed(&desk(&[], &[])), 0);
+        assert_eq!(default_armed(&desk(&[], &[])), None);
     }
 }
 
@@ -4377,13 +4361,17 @@ impl TangentApp {
 
         // **Resolved BEFORE the literal takes `settings`, and only when the
         // file does not say.** Arming is remembered now — it rides the desk
-        // like the mute and the solo masks — so this is the answer for a
+        // like the mute and the solo switches — so this is the answer for a
         // settings file written before it was, and for the very first launch.
-        // A stored `Some(0)` is a desk somebody disarmed and is left alone;
-        // that difference is why the field is an `Option`. See
-        // `default_armed` and `Settings::channel_armed`.
-        if settings.channel_armed.is_none() {
-            settings.channel_armed = Some(default_armed(&settings));
+        // A desk that says nothing is armed is a desk somebody disarmed and
+        // is left alone; that difference is why `arm_unsaid` exists. See
+        // `default_armed`.
+        if settings.arm_unsaid {
+            let arm = default_armed(&settings);
+            for (n, row) in settings.rows.iter_mut().enumerate() {
+                row.arm = Some(n) == arm;
+            }
+            settings.arm_unsaid = false;
         }
         let mut me = Self {
             settings,
@@ -4518,8 +4506,6 @@ impl TangentApp {
             drumpad_num: None,
             media_sel: None,
             mixer_reorder: None,
-            desk_state_perm: None,
-            perm_since_moment: None,
             bay_relabels: Vec::new(),
             relabels_since_moment: Vec::new(),
             click_moment: None,
@@ -4538,7 +4524,8 @@ impl TangentApp {
             met_menu: None,
             met_at: None,
             met_drag: false,
-            meter_hold: [[0.0; 2]; crate::desk_legacy::V32_STRIPS],
+            meter_hold: Vec::new(),
+            meter_hold_specials: [[0.0; 2]; 3],
             desk_index: std::cell::RefCell::new(None),
             desk_index_gen: std::cell::Cell::new(0),
             desk_index_stale: std::cell::Cell::new(true),
@@ -4802,7 +4789,7 @@ impl TangentApp {
         if let Some(one) = self.midi_port_override.as_ref() {
             return vec![one.clone()];
         }
-        let kinds: Vec<_> = (0..recorder::CHANNELS)
+        let kinds: Vec<_> = (0..self.desk_extent())
             .map(|ch| self.channel_kind(ch))
             .collect();
         if !kinds.iter().any(|k| *k == Some(recorder::ChannelKind::Midi)) {
@@ -4815,7 +4802,7 @@ impl TangentApp {
         self.midi_ports_seen
             .iter()
             .filter(|port| {
-                (0..recorder::CHANNELS).any(|ch| {
+                (0..kinds.len()).any(|ch| {
                     kinds[ch] == Some(recorder::ChannelKind::Midi)
                         && self.channel_midi_sel(ch).wants_device(port)
                 })
@@ -4917,8 +4904,8 @@ impl TangentApp {
     /// A device this desk names and which is not open contributes no bit and
     /// is simply not heard — it is never forgotten. See
     /// `recorder::live_midi_routes`.
-    pub fn midi_routes(&self) -> [recorder::MidiRoute; recorder::CHANNELS] {
-        let kinds: Vec<_> = (0..recorder::CHANNELS)
+    pub fn midi_routes(&self) -> Vec<recorder::MidiRoute> {
+        let kinds: Vec<_> = (0..self.desk_extent())
             .map(|ch| self.channel_kind(ch))
             .collect();
         let slots = self
@@ -4926,7 +4913,8 @@ impl TangentApp {
             .as_ref()
             .map(|p| p.source_slots())
             .unwrap_or_default();
-        recorder::live_midi_routes(&self.settings.channel_midi_inputs, &kinds, &slots)
+        let sels: Vec<recorder::MidiInputSel> = self.settings.rows.iter().map(|r| r.midi.clone()).collect();
+        recorder::live_midi_routes(&sels, &kinds, &slots)
     }
 
     /// The ports the app has just seen, for the chip and the dialog. Kept
@@ -5369,7 +5357,7 @@ impl TangentApp {
     /// Whether a channel's MIDI reaches the theory view.
     /// Whether this channel is a folder.
     pub fn is_folder(&self, ch: usize) -> bool {
-        self.settings.strip_is_folder.get(ch).copied().unwrap_or(false)
+        self.row(ch).is_some_and(|r| r.folder)
     }
 
     /// Whether this channel sits inside the folder above it.
@@ -5378,7 +5366,7 @@ impl TangentApp {
     /// folder above — a flag left behind by a reorder draws a flat track
     /// rather than an orphan indent. See `Settings::strip_in_folder`.
     pub fn in_folder(&self, ch: usize) -> bool {
-        self.settings.strip_in_folder.get(ch).copied().unwrap_or(false)
+        self.row(ch).is_some_and(|r| r.in_folder)
             && self.folder_of(ch).is_some()
     }
 
@@ -5390,14 +5378,14 @@ impl TangentApp {
     /// flag, and treating it as a member would let one reorder swallow every
     /// track below a folder.
     pub fn folder_of(&self, ch: usize) -> Option<usize> {
-        if ch == 0 || !self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
+        if ch == 0 || !self.row(ch).is_some_and(|r| r.in_folder) {
             return None;
         }
         for n in (0..ch).rev() {
-            if self.settings.strip_is_folder.get(n).copied().unwrap_or(false) {
+            if self.row(n).is_some_and(|r| r.folder) {
                 return Some(n);
             }
-            if !self.settings.strip_in_folder.get(n).copied().unwrap_or(false) {
+            if !self.row(n).is_some_and(|r| r.in_folder) {
                 return None;
             }
         }
@@ -5410,8 +5398,8 @@ impl TangentApp {
             return Vec::new();
         }
         let mut out = Vec::new();
-        for n in ch + 1..recorder::CHANNELS {
-            if !self.settings.strip_in_folder.get(n).copied().unwrap_or(false) {
+        for n in ch + 1..self.desk_extent() {
+            if !self.row(n).is_some_and(|r| r.in_folder) {
                 break;
             }
             // A folder closes the run: one level, so a folder is never a
@@ -5434,11 +5422,7 @@ impl TangentApp {
         if !self.is_folder(ch) {
             return Vec::new();
         }
-        (ch + 1..recorder::CHANNELS)
-            .take_while(|n| {
-                self.settings.strip_in_folder.get(*n).copied().unwrap_or(false)
-            })
-            .collect()
+        (ch + 1..self.desk_extent()).take_while(|n| self.row(*n).is_some_and(|r| r.in_folder)).collect()
     }
 
     /// **What a drag CARRIES** — the leaders, plus everything inside any
@@ -5493,7 +5477,7 @@ impl TangentApp {
         let mut group: Vec<usize> = self
             .selected_rows()
             .into_iter()
-            .filter(|n| *n < recorder::CHANNELS)
+            .filter(|n| *n < self.desk_extent())
             .collect();
         group.sort_unstable();
         if group.len() < 2 || !group.contains(&from) {
@@ -5506,7 +5490,7 @@ impl TangentApp {
     /// is not a folder — so a stale flag cannot hide anything.
     pub fn folder_shut(&self, ch: usize) -> bool {
         self.is_folder(ch)
-            && self.settings.strip_folder_shut.get(ch).copied().unwrap_or(false)
+            && self.row(ch).is_some_and(|r| r.shut)
     }
 
     /// Whether this lane is hidden inside a shut folder.
@@ -5525,12 +5509,9 @@ impl TangentApp {
         if !self.is_folder(ch) {
             return;
         }
-        while self.settings.strip_folder_shut.len() < recorder::CHANNELS {
-            self.settings.strip_folder_shut.push(false);
-        }
         let was = self.folder_shut(ch);
-        if let Some(slot) = self.settings.strip_folder_shut.get_mut(ch) {
-            *slot = !was;
+        if let Some(row) = self.row_mut(ch) {
+            row.shut = !was;
         }
         self.save_settings();
         // Hashed like the folder flag it belongs to, so it needs a moment
@@ -5541,11 +5522,8 @@ impl TangentApp {
     fn set_is_folder(&mut self, ch: usize, on: bool) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        while self.settings.strip_is_folder.len() < recorder::CHANNELS {
-            self.settings.strip_is_folder.push(false);
-        }
-        if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
-            *slot = on;
+        if let Some(row) = self.row_mut(ch) {
+            row.folder = on;
         }
         // **A group is not a send destination**, and this is the only place
         // that has to enforce it, because it is the only place a channel
@@ -5571,8 +5549,7 @@ impl TangentApp {
     /// `reorder_channels` carries them along with the tracks — the same
     /// mechanism that keeps gains and colours attached.
     fn snap_into_folder(&mut self, from: usize, folder: usize) {
-        use crate::recorder::CHANNELS;
-        if folder >= CHANNELS || !self.is_folder(folder) {
+        if folder >= self.desk_extent() || !self.is_folder(folder) {
             return;
         }
         // The same rule as `move_channel`, and for the same reason - said out
@@ -5595,7 +5572,7 @@ impl TangentApp {
             self.set_in_folder(n, true);
         }
         let anchor = self.folder_children(folder).last().copied().unwrap_or(folder);
-        let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        let rest: Vec<usize> = (0..self.desk_extent()).filter(|n| !group.contains(n)).collect();
         let at = rest.iter().take_while(|n| **n <= anchor).count();
         let mut order = rest;
         for (k, g) in group.iter().enumerate() {
@@ -5607,11 +5584,8 @@ impl TangentApp {
     fn set_in_folder(&mut self, ch: usize, on: bool) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        while self.settings.strip_in_folder.len() < recorder::CHANNELS {
-            self.settings.strip_in_folder.push(false);
-        }
-        if let Some(slot) = self.settings.strip_in_folder.get_mut(ch) {
-            *slot = on;
+        if let Some(row) = self.row_mut(ch) {
+            row.in_folder = on;
         }
     }
 
@@ -5629,11 +5603,8 @@ impl TangentApp {
     fn toggle_folder(&mut self, ch: usize) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if ch >= recorder::CHANNELS {
+        if ch >= self.desk_extent() {
             return;
-        }
-        while self.settings.strip_is_folder.len() < recorder::CHANNELS {
-            self.settings.strip_is_folder.push(false);
         }
         let was = self.is_folder(ch);
         if was {
@@ -5652,16 +5623,13 @@ impl TangentApp {
     }
 
     pub fn to_theory(&self, ch: usize) -> bool {
-        self.settings.strip_to_theory.get(ch).copied().unwrap_or(false)
+        self.row(ch).is_some_and(|r| r.theory)
     }
 
     /// Turn one channel's theory send on or off.
     pub fn set_to_theory(&mut self, ch: usize, on: bool) {
-        while self.settings.strip_to_theory.len() < recorder::CHANNELS {
-            self.settings.strip_to_theory.push(false);
-        }
-        if let Some(slot) = self.settings.strip_to_theory.get_mut(ch) {
-            *slot = on;
+        if let Some(row) = self.row_mut(ch) {
+            row.theory = on;
         }
         self.save_settings();
     }
@@ -5674,7 +5642,7 @@ impl TangentApp {
     /// whether any MIDI channel with the switch on is listening — which, on
     /// the shipped desk, is exactly "is track one's switch on".
     fn live_reaches_theory(&self) -> bool {
-        (0..recorder::CHANNELS).any(|n| {
+        (0..self.desk_extent()).any(|n| {
             self.to_theory(n)
                 && self.channel_kind(n) == Some(recorder::ChannelKind::Midi)
         })
@@ -6181,7 +6149,7 @@ impl TangentApp {
         match hit {
             H::Fader(i) => {
                 let to = match i.strip() {
-                    Some(Strip::Channel(n)) => d.channel_gains.get(n).copied().unwrap_or(1.0),
+                    Some(Strip::Channel(n)) => d.rows.get(n).map_or(1.0, |r| r.gain),
                     Some(Strip::Drums) => d.drums_gain,
                     Some(Strip::Click) => d.metronome_gain,
                     Some(Strip::Fx) => d.fx_return_gain,
@@ -6216,7 +6184,7 @@ impl TangentApp {
             H::Pan(i) => {
                 match i.strip() {
                     Some(Strip::Channel(n)) => {
-                        if let Some(slot) = self.settings.channel_pans.get_mut(n) {
+                        if let Some(slot) = self.row_mut(n).map(|r| &mut r.pan) {
                             *slot = 0.0;
                         }
                     }
@@ -6245,7 +6213,7 @@ impl TangentApp {
             return Vec::new();
         }
         rows.into_iter()
-            .filter(|x| *x != n && *x < recorder::CHANNELS)
+            .filter(|x| *x != n && *x < self.desk_extent())
             .collect()
     }
 
@@ -6416,7 +6384,7 @@ impl TangentApp {
     /// each read and written by what it is (`Settings::strip_switch`), so
     /// alt on a track stands the click and the master down as it always did.
     fn press_switch(&mut self, s: recorder::StripRef, w: crate::settings::StripSwitch) {
-        let every: Vec<recorder::StripRef> = (0..recorder::CHANNELS)
+        let every: Vec<recorder::StripRef> = (0..self.desk_extent())
             .map(recorder::StripRef::Row)
             .chain(recorder::StripRef::SPECIALS)
             .collect();
@@ -6436,7 +6404,7 @@ impl TangentApp {
         match hit {
             H::Mute(_) => self.settings.strip_switch(row, StripSwitch::Mute),
             H::Solo(_) => self.settings.strip_switch(row, StripSwitch::Solo),
-            H::Arm(_) => self.armed_mask() & (1 << n) != 0,
+            H::Arm(_) => self.is_armed(n),
             H::ToTheory(_) => self.to_theory(n),
             _ => false,
         }
@@ -6525,7 +6493,7 @@ impl TangentApp {
             // moved another one instead.
             H::Fader(i) => match i.strip() {
                 Some(Strip::Channel(n)) => {
-                    if let Some(g) = self.settings.channel_gains.get_mut(n) {
+                    if let Some(g) = self.row_mut(n).map(|r| &mut r.gain) {
                         *g = gain;
                     }
                 }
@@ -6542,7 +6510,7 @@ impl TangentApp {
                 let p = f64::from(v).mul_add(2.0, -1.0).clamp(-1.0, 1.0);
                 match i.strip() {
                     Some(Strip::Channel(n)) => {
-                        if let Some(slot) = self.settings.channel_pans.get_mut(n) {
+                        if let Some(slot) = self.row_mut(n).map(|r| &mut r.pan) {
                             *slot = p;
                         }
                     }
@@ -6603,6 +6571,8 @@ impl TangentApp {
                     // slot's circled plus makes a bare track on the spot —
                     // no menu, no icon, a NO INPUT chip; a used channel's
                     // icon opens the input menu that answers what feeds it.
+                    // The trailing add, past the last row: Add.
+                    Some(Strip::Channel(n)) if n >= self.desk_extent() => self.press_trailing_add(),
                     Some(Strip::Channel(n)) => {
                         if self.channel_used(n) {
                             self.open_input_menu(n);
@@ -6758,14 +6728,12 @@ impl TangentApp {
                     // for the mute and the solo: a copy kept beside it is
                     // where the next change to the gesture lands in one
                     // place only. The arm word's lanes are its members.
-                    let live = self.armed_mask();
-                    let lanes = u32::BITS as usize;
-                    let on: Vec<usize> = (0..lanes).filter(|r| live >> r & 1 == 1).collect();
-                    let next = Self::switch_next(&on, n, self.alt_down)
+                    let on = self.armed_rows();
+                    let next: Vec<usize> = Self::switch_next(&on, n, self.alt_down)
                         .into_iter()
-                        .filter(|r| *r < lanes)
-                        .fold(0u32, |m, r| m | 1 << r);
-                    self.set_armed_mask(next);
+                        .filter(|r| *r < self.desk_extent())
+                        .collect();
+                    self.set_armed_rows(&next);
                 }
                 return;
             }
@@ -6839,17 +6807,17 @@ impl TangentApp {
     /// COLUMN, and its row is one past the channels.
     fn auto_row_of_hit(
         hit: crate::mixer_panel::Hit,
-    ) -> Option<(usize, crate::automation::AutoParam)> {
+    ) -> Option<(AutoLane, crate::automation::AutoParam)> {
         use crate::automation::AutoParam;
         use crate::mixer_panel::Hit as H;
         use crate::recorder::Strip;
         let channel_of = |i: recorder::Column| match i.strip() {
-            Some(Strip::Channel(n)) => Some(n),
+            Some(Strip::Channel(n)) => Some(AutoLane::Row(n)),
             _ => None,
         };
         let row = match hit {
             H::Fader(i) => match i.strip() {
-                Some(Strip::Channel(n)) => (n, AutoParam::Gain),
+                Some(Strip::Channel(n)) => (AutoLane::Row(n), AutoParam::Gain),
                 None => (master_lane(), AutoParam::Gain),
                 _ => return None,
             },
@@ -6898,12 +6866,9 @@ impl TangentApp {
         self.auto_set_base(lane, param, v);
     }
 
-    /// Remove `n`, and every other selected track with it.
-    ///
-    /// **Highest index first.** It was needed when removing a channel
-    /// shuffled the ones below it up; `remove_channel_inner` now empties the
-    /// slot in place, so no index moves under the loop. The selection is
-    /// emptied afterwards: the tracks it named are gone.
+    /// Remove `n`, and every other selected track with it, in ONE removal:
+    /// the rows go together, so no index moves under a loop, and the
+    /// selection is emptied afterwards because the tracks it named are gone.
     fn remove_selected_channels(&mut self, n: usize) {
         // Not under an export or an arrangement record - see `tracks_held`.
         // Every road comes through here: the Track menu, the strip's ×,
@@ -6913,244 +6878,111 @@ impl TangentApp {
         }
         let mut all = self.selection_partners(n);
         all.push(n);
-        all.sort_unstable_by(|a, b| b.cmp(a));
-        // **Removing four selected tracks is ONE thing somebody did.**
-        // `remove_channel` holds its own removal; this nests one deeper so
-        // a marquee over four lanes is one Ctrl+Z rather than four, each
-        // putting a different track back on its own.
-        self.begin_one_moment();
-        for m in all {
-            self.remove_channel(m);
-        }
-        self.commit_undo_moment();
+        all.sort_unstable();
+        all.dedup();
+        // **Removing four selected tracks is ONE thing somebody did**: one
+        // removal, one Ctrl+Z, rather than four, each putting a different
+        // track back on its own.
+        self.remove_channels(&all);
         self.selected_tracks.clear();
         self.selected_channel = None;
         self.sel_anchor = None;
     }
 
-    /// Put one general channel back to an empty slot.
-    ///
-    /// **What the channel accumulated goes with it**: kind and input, name,
-    /// colour, mute, solo and arm, its fader and send back to shipped, its
-    /// clips, its sidechain key edges and routes, and every bay the track
-    /// has (both chains, its pedalboard and its pads) with their bypass
-    /// flags. Leaving any of it behind would make the next thing added here
-    /// inherit a stranger's settings, which is worse than either keeping the
-    /// channel or losing it. Its pan, polarity and icon, its drum kit, and
-    /// its automation go too: the curves, and the open, armed and bypassed
-    /// rows. See the note at the end for why the pedalboard is no longer
-    /// the exception it was.
+    /// **Take one track off the desk**: Remove Track (owner call 3, design
+    /// section 4), for the tests that walk one removal. Every gesture
+    /// removes through [`Self::remove_channels`].
+    #[cfg(test)]
     fn remove_channel(&mut self, n: usize) {
+        self.remove_channels(&[n]);
+    }
+
+    /// **Take tracks off the desk: their rows are deleted**, the rows below
+    /// moving up (owner call 3: Remove Track deletes the row, it does not
+    /// leave a hole).
+    ///
+    /// **Everything a track is goes with its row, because it IS the row or
+    /// names its identity**: kind and input, name, colour, switches, fader
+    /// and send, its clips and its curves, every route, key and send into or
+    /// out of it, and every bay it has (both chains, its pedalboard and its
+    /// pads) with their bypass flags. The host's bridge sees the track go
+    /// and writes each bay's state to the global shelf before its lane
+    /// drops (design 7.13), so the undo that brings the track back reloads
+    /// every plugin as it was. A folder's members stay, handed up to the
+    /// folder above it or out to the top level (`DeskModel::remove_rows`).
+    ///
+    /// **The pedalboard leaves with its row.** The old in-place removal had
+    /// to leave a removed track's pedals on the row (the next track made
+    /// there inherited a stranger's board); there is no row left to inherit
+    /// anything now. Rows that still carry such residue from older desks
+    /// stay Vacant and are never reused (design section 4).
+    ///
+    /// **ONE moment for the whole removal.** A track is clips, six bays, a
+    /// sidechain table and a bypass table, and `arr_save_edits` and
+    /// `set_insert` each commit their own - so deleting a track with three
+    /// plugins in it took four Ctrl+Z, each one putting a different quarter
+    /// of it back. See `begin_one_moment`.
+    fn remove_channels(&mut self, lanes: &[usize]) {
         // The backstop only: every gesture asks `tracks_held`, through
         // `remove_selected_channels`, before it changes anything.
         if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
-        // **ONE moment for the whole removal.** A track is clips, six bays,
-        // a sidechain table and a bypass table, and `arr_save_edits` and
-        // `set_insert` each commit their own - so deleting a track with
-        // three plugins in it took four Ctrl+Z, each one putting a
-        // different quarter of it back. See `begin_one_moment`.
+        let lanes: Vec<usize> = lanes.iter().copied().filter(|n| *n < self.desk_extent()).collect();
+        if lanes.is_empty() {
+            return;
+        }
         self.begin_one_moment();
-        self.remove_channel_inner(n);
-        self.commit_undo_moment();
-    }
-
-    fn remove_channel_inner(&mut self, n: usize) {
-        // Moves a fact the desk index reads; see `desk_index_dirty`.
-        self.desk_index_dirty();
-        // **The track going**, by its identity, before the row is minted a
-        // new one: everything below that names the removed TRACK (its rows,
-        // its aims, its kit) is found by this, wherever the row stands.
-        let gone = self.track_id_at(n);
-        let gone_node = crate::desk_id::Node::Track(gone);
-        // **A folder takes its membership with it.**
-        //
-        // Membership is positional — "the nearest folder above me" — so
-        // deleting a folder does not free its children: the flag stays on
-        // them and they either attach to whatever folder is further up or,
-        // with none, draw indented under an empty row belonging to nothing.
-        // The owner: "when deleted, a track with children leaves them in
-        // 'foldered' state, indented below an empty channel."
-        //
-        // Done BEFORE the row is cleared, while it is still knowable that
-        // this was a folder and which rows were in it. The run ends at the
-        // next folder or at the first row that is not a member, which is the
-        // same rule that decides the group everywhere else.
-        if self.settings.strip_is_folder.get(n).copied().unwrap_or(false) {
-            // Where this folder itself sat, so its children are handed UP
-            // rather than simply cut loose: deleting an inner group should
-            // leave its tracks in the outer one, not at the top level.
-            let up = self.folder_of(n).is_some();
-            for ch in n + 1..recorder::CHANNELS {
-                if !self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
-                    break;
-                }
-                let nested = self.settings.strip_is_folder.get(ch).copied().unwrap_or(false);
-                self.set_in_folder(ch, up);
-                if nested {
-                    // A folder inside the one being deleted keeps being a
-                    // folder; only its membership changes. Its own children
-                    // are below it and belong to it, so the walk stops here.
-                    break;
-                }
-            }
-            self.set_is_folder(n, false);
-        }
-        // **The emptied row keeps its indent.** Membership is a CONTIGUOUS
-        // run, so clearing the vacated row's flag severed everything below
-        // it from the group — the handed-up children of a deleted inner
-        // folder, and the rest of the run when a middle member left. The
-        // old engine scan ignored the gap, which is exactly the UI/engine
-        // disagreement `folder_parents` no longer permits; the owner's own
-        // ruling already named the right picture: "indented below an empty
-        // channel". An empty row inside a group is an indented plus.
-        let keeps_indent = self.folder_of(n).is_some();
-        self.set_in_folder(n, keeps_indent);
-        self.settings.tracks_added &= !(1 << n);
-        // **The emptied row is not the removed track any more**, so it
-        // stops wearing its id: whatever still names that id (a selection,
-        // a host's note) is inert from here, and the undo that brings the
-        // track back brings the id back with it. Nothing follows the row to
-        // its new id, which is the whole difference from a mint that makes a
-        // track (`mint_emptied_row_id`).
-        self.mint_emptied_row_id(n);
-        // A copy of the track being removed (a cut) finds its plugin states
-        // on this row's files until the host keeps them by track: the row
-        // keeps them, under its new id. See `TrackCopy::files_at`.
-        let emptied = self.track_id_at(n);
-        if let Some(copy) = self.track_clipboard.as_mut().filter(|c| c.files_at == Some(gone)) {
-            copy.files_at = Some(emptied);
-        }
-        let d = Settings::default();
-        // The row's own strip facts: a track's are its row's (the specials
-        // keep theirs apart, W5).
-        let at = n;
-        if let Some(k) = self.settings.channel_kinds.get_mut(n) {
-            *k = recorder::ChannelKind::as_u8(None);
-        }
-        // **And the INPUT goes with the kind**, because they are one fact:
-        // "the input IS the kind" (`set_channel_input_spec`). This line was
-        // missing, and what it left behind was a slot with no kind still
-        // holding the interface channel the deleted track listened to — a
-        // state the model says cannot exist and nothing could repair from
-        // the desk. Pressing the empty slot's plus then produced a track
-        // wearing switches whose R toggled and which could never monitor or
-        // record, because `audio_ordinal` asks for `ChannelKind::Audio` and
-        // the kind was still none. See `Settings::heal_orphan_inputs`, which
-        // is the same rule applied to desks that already carry one.
-        if let Some(slot) = self.settings.channel_inputs.get_mut(n) {
-            slot.clear();
-        }
-        recorder::reconcile_midi_inputs(
-            &mut self.settings.channel_midi_inputs,
-            &self.settings.channel_inputs,
-        );
-        if let Some(g) = self.settings.channel_gains.get_mut(n) {
-            *g = d.channel_gains.get(n).copied().unwrap_or(1.0);
-        }
-        if let Some(s) = self.settings.strip_sends.get_mut(at) {
-            *s = d.strip_sends.get(at).copied().unwrap_or(0.0);
-        }
-        if let Some(c) = self.settings.strip_colors.get_mut(at) {
-            *c = 0;
-        }
-        if let Some(name) = self.settings.strip_names.get_mut(at) {
-            name.clear();
-        }
-        self.settings.strip_muted &= !(1 << at);
-        self.settings.strip_soloed &= !(1 << at);
-        self.set_armed_mask(self.armed_mask() & !(1 << n));
-        // Its pan, polarity and icon, which the next track made here took
-        // over: hard left and phase-inverted from the first frame.
-        if let Some(p) = self.settings.channel_pans.get_mut(n) {
-            *p = d.channel_pans.get(n).copied().unwrap_or(0.0);
-        }
-        self.settings.strip_phase &= !(1 << at);
-        if let Some(i) = self.settings.channel_icons.get_mut(n) {
-            *i = d.channel_icons.get(n).copied().unwrap_or(0);
-        }
-        // And the lane's CLIPS: a removed channel that kept invisible clips
-        // would keep playing them. The media copies stay in the project.
-        let had = self.arrangement.clips.iter().any(|c| c.lane == n);
+        let gone: Vec<crate::desk_id::TrackId> = lanes.iter().map(|n| self.track_id_at(*n)).collect();
+        let nodes: Vec<crate::desk_id::Node> = gone.iter().map(|id| crate::desk_id::Node::Track(*id)).collect();
+        // The lanes' CLIPS: a removed track that kept invisible clips would
+        // keep playing them. The media copies stay in the project.
+        let had = self.arrangement.clips.iter().any(|c| lanes.contains(&c.lane));
         if had {
-            self.arrangement.clips.retain(|c| c.lane != n);
-            self.arr_save_edits();
+            self.arrangement.clips.retain(|c| !lanes.contains(&c.lane));
         }
-        // **And its AUTOMATION.** The curves are keyed by lane, so a removed
-        // track's ride went on driving the next track made in its slot, and
-        // its rows stood open, armed and bypassed under the empty slot - an
-        // armed one writing into the stranger's curve on the next pass. The
-        // hand's aims at those rows go too; they name rows that are gone.
-        let curves = self.arrangement.automation.curves();
-        if curves.iter().any(|c| c.lane == n) {
-            let kept = curves.iter().filter(|c| c.lane != n).cloned().collect();
-            self.arrangement.automation = crate::automation::Automation::from_curves(kept);
-            self.arr_save_edits();
-        }
-        // Its rows close INTO the moment, by the track they are, so the undo
-        // that brings the track back reopens them on it wherever it lands.
-        self.close_auto_rows(&[gone_node], &[]);
-        self.arr_auto_nodes.retain(|(o, _, _)| *o != gone_node);
-        let aim = |a: Option<AutoRow>| a.filter(|(o, _)| *o != gone_node);
+        // **And their AUTOMATION.** A removed track's rows close INTO the
+        // moment, by the track they are, so the undo that brings the track
+        // back reopens them on it wherever it lands; the hand's aims at
+        // those rows go too, they name rows that are gone.
+        self.close_auto_rows(&nodes, &[]);
+        self.arr_auto_nodes.retain(|(o, _, _)| !nodes.contains(o));
+        let aim = |a: Option<AutoRow>| a.filter(|(o, _)| !nodes.contains(o));
         self.arr_auto_focus = aim(self.arr_auto_focus);
         self.auto_clipboard_from = aim(self.auto_clipboard_from);
-        self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| *o != gone_node);
-        self.arr_auto_hot = self.arr_auto_hot.filter(|(o, _, _)| *o != gone_node);
-        // And its drum KIT, which leaves the desk with its track and not the
-        // disk with it. A drum track made here later gets a new id and no
-        // kit (`mint_emptied_row_id`), so it never plays the old one's
-        // samples; the removed track's kit stays in the map under the
-        // removed id, inert like every entry keyed by a removed id (design
-        // 4), until an undo brings its track back or a session switch
-        // purges it. A drum panel open on it stands on no row from here
+        self.arr_auto_sel = self.arr_auto_sel.filter(|(o, _)| !nodes.contains(o));
+        self.arr_auto_hot = self.arr_auto_hot.filter(|(o, _, _)| !nodes.contains(o));
+        // And their drum KITS, which leave the desk with their tracks and
+        // not the disk with them: a removed track's kit stays in the map
+        // under its id, inert like every entry keyed by a removed id (design
+        // 4), until an undo brings its track back or a session switch purges
+        // it. A drum panel open on it stands on no row from here
         // (`drumpad_row`): it shows no kit and takes no edit until the undo.
         //
-        // **Nothing is written.** The removal used to take the kit out of the
-        // map and save the sidecar at once (`drumpad_edited`), so Don't Save
-        // after removing a drum track reopened the project with its kit gone
-        // while its document still held the track. The sidecar's own writes
-        // file kits by the rows of the document on disk (`drumpad_save`),
-        // which name the removed track until a save writes both without it;
-        // the kit kept here is what they file for it. The engine's lane is
-        // told it lost its kit (`drumpad_dirty`).
-        if self
-            .drumpad_kits
-            .get(&gone)
-            .is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default())
+        // **Nothing is written.** The removal used to take the kit out of
+        // the map and save the sidecar at once (`drumpad_edited`), so Don't
+        // Save after removing a drum track reopened the project with its kit
+        // gone while its document still held the track. The sidecar's own
+        // writes file kits by the rows of the document on disk
+        // (`drumpad_save`), which name the removed track until a save writes
+        // both without it. The engine's lane is told it lost its kit.
+        if gone
+            .iter()
+            .any(|id| self.drumpad_kits.get(id).is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default()))
         {
             self.drumpad_dirty = true;
         }
-        // And the sidechain key edges, at BOTH ends: an edge keyed BY this
-        // track would go on ducking to a track that is not there, and an
-        // edge ON this track's bays names effects that just unloaded.
-        let _ = self.settings.insert_keys.drop_node(gone_node);
-        // **And its ROUTES, both ends**, by the same discipline: a route out
-        // of the removed track waits for nobody, and one into it would fold
-        // its source into a strip that is not there, off the master and out
-        // of earshot.
-        let _ = self.settings.routes.drop_node(gone_node);
-        // **Every bay the track had, and every flag on them**: both chains,
-        // its pedalboard and its pads. They are keyed by the track's
-        // identity, which the emptied row no longer wears, so they leave
-        // with the track (the moment before this one keeps them for the
-        // undo, which brings the id back) and nothing is left on the row
-        // for the next track made there to adopt. The old seat-keyed desk
-        // could only leave the pedalboard on the ROW, where a new track
-        // inherited a stranger's board; by identity there is no such
-        // residue to leave. The host's bridge sees the track go and writes
-        // each bay's state to the shelf before its lane drops (design 7.13).
-        let bays: Vec<crate::desk_id::SeatBay> =
-            self.settings.plugins.keys().filter(|sb| sb.seat.node == gone_node).copied().collect();
-        for sb in bays {
-            self.set_plugin(sb, None);
+        // **The rows themselves**, and with them every bay, flag, route, key
+        // and send naming them, through the model's own removal, which also
+        // carries every clip and curve below them up a lane. The bays are
+        // dropped without `set_plugin`'s per-bay bookkeeping: the curves
+        // they drew are the track's own and went above.
+        let _ = self.desk_remove(&lanes);
+        if had {
+            self.arr_save_edits();
         }
-        self.settings.bypass.retain(|sb| sb.seat.node != gone_node);
-        // The row is another row now: the aims that named it let go.
-        self.on_desk_shape_change();
         self.save_settings();
-        // No commit here, for the reason `paste_track_inner` states: the
-        // hold in `remove_channel` is what ends the gesture.
+        self.commit_undo_moment();
     }
 
     /// What the neck's interval column should say, or nothing when it is off.
@@ -7575,7 +7407,8 @@ impl TangentApp {
     /// [`Self::mixer_view_in`] with the rect it will draw into.
     fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
         let index = self.desk_index();
-        let rows = index.shown().iter().map(|r| *r as usize).collect();
+        // Every drawn track, and the trailing add after them.
+        let rows = index.shown().iter().map(|r| *r as usize).chain([self.desk_extent()]).collect();
         self.mixer_view_rows(0, rows)
     }
 
@@ -7589,7 +7422,9 @@ impl TangentApp {
     fn mixer_view_of(&self, col: recorder::Column) -> crate::mixer_panel::MixerView<'_> {
         match col.row() {
             Some(row) => {
-                let first = self.desk_index().rank_of(row).unwrap_or(0);
+                let index = self.desk_index();
+                // The trailing add ranks after every drawn track.
+                let first = if row >= self.desk_extent() { index.shown_len() } else { index.rank_of(row).unwrap_or(0) };
                 self.mixer_view_rows(first, vec![row])
             }
             None => self.mixer_view_rows(0, Vec::new()),
@@ -7602,18 +7437,19 @@ impl TangentApp {
     /// each is O(visible) however long the desk is.
     pub(crate) fn mixer_view_in(&self, rect: Rect) -> crate::mixer_panel::MixerView<'_> {
         let index = self.desk_index();
-        let ranks = crate::mixer_panel::track_window(
-            rect,
-            self.mixer_visible(),
-            index.shown_len(),
-            self.mixer_scroll_px,
-        );
-        let rows = index.window(ranks.start, ranks.len()).iter().map(|r| *r as usize).collect();
+        // The drawn tracks and the trailing add, which ranks last.
+        let drawn = index.shown_len() + 1;
+        let ranks = crate::mixer_panel::track_window(rect, self.mixer_visible(), drawn, self.mixer_scroll_px);
+        let mut rows: Vec<usize> = index.window(ranks.start, ranks.len()).iter().map(|r| *r as usize).collect();
+        if ranks.end > index.shown_len() {
+            rows.push(self.desk_extent());
+        }
         self.mixer_view_rows(ranks.start, rows)
     }
 
     /// The one builder behind all three: the strips of these track `rows`
-    /// (in row order), the first of which ranks `first` among the drawn.
+    /// (in row order), the first of which ranks `first` among the drawn. A
+    /// row at the desk's extent is the trailing add (`trailing_plus`).
     fn mixer_view_rows(&self, first: usize, rows: Vec<usize>) -> crate::mixer_panel::MixerView<'_> {
         use crate::recorder::{Strip, StripRef};
         use crate::settings::StripSwitch;
@@ -7636,7 +7472,7 @@ impl TangentApp {
             };
             let icon = match s {
                 Strip::Channel(n) => {
-                    self.settings.channel_icons.get(n).copied().unwrap_or(0)
+                    self.row(n).map_or(0, |r| r.icon)
                 }
                 _ => 0,
             };
@@ -7659,7 +7495,7 @@ impl TangentApp {
                         .get(n)
                         .map(String::as_str)
                         .unwrap_or(""),
-                    g.channels.get(n).copied().unwrap_or(1.0),
+                    self.channel_gain(n),
                     !self.channel_used(n),
                 ),
                 Strip::Drums => ("DRUM BUS", "", self.settings.drums_gain as f32, false),
@@ -7742,18 +7578,15 @@ impl TangentApp {
                     self.strip_slot_bay(sr, n).is_some_and(|sb| self.bay_bypassed(sb))
                 }),
                 frozen: matches!(s, Strip::Channel(n) if self.lane_frozen(n).is_some()),
+                // A row's own empty slot; the trailing add is set below.
+                plus: crate::mixer_panel::Plus::Row,
                 kind,
                 icon,
                 empty,
                 gain,
                 send: self.settings.strip_send(sr) as f32,
                 pan: match s {
-                    Strip::Channel(n) => self
-                        .settings
-                        .channel_pans
-                        .get(n)
-                        .map(|p| *p as f32)
-                        .unwrap_or(0.0),
+                    Strip::Channel(n) => self.channel_pan(n),
                     Strip::Drums => self.settings.drums_pan as f32,
                     _ => 0.0,
                 },
@@ -7770,14 +7603,30 @@ impl TangentApp {
                     && (kind.is_some()
                         || matches!(s, Strip::Channel(n) if index.clip_count(n) > 0)),
                 armed: match s {
-                    Strip::Channel(n) => self.armed_mask() & (1 << n) != 0,
+                    Strip::Channel(n) => self.is_armed(n),
                     _ => false,
                 },
             }
         };
         let master = StripRef::Master;
-        let shown = index.shown_len();
-        let tracks: Vec<_> = rows.into_iter().map(|row| strip(Strip::Channel(row))).collect();
+        // The drawn tracks and the trailing add: the scroll range.
+        let shown = index.shown_len() + 1;
+        let extent = self.desk_extent();
+        let trailing = self.trailing_plus();
+        let tracks: Vec<_> = rows
+            .into_iter()
+            .map(|row| {
+                let mut v = strip(Strip::Channel(row));
+                // **The trailing add**: no row, so nothing on it but its plus
+                // (design section 10). Every field it was built with read as
+                // a row's defaults past the desk; only these two are drawn.
+                if row >= extent {
+                    v.empty = true;
+                    v.plus = trailing;
+                }
+                v
+            })
+            .collect();
         crate::mixer_panel::MixerView {
             // **What the click is playing**, for its own button. The chosen
             // file's name; the bundled click has no path, so it says what it
@@ -7857,6 +7706,7 @@ impl TangentApp {
                     bypassed: std::array::from_fn(|n| {
                         self.strip_slot_bay(master, n).is_some_and(|sb| self.bay_bypassed(sb))
                     }),
+                    plus: crate::mixer_panel::Plus::Row,
                 },
             },
             any_solo: self.any_solo(),
@@ -8242,8 +8092,9 @@ impl TangentApp {
     }
 
     /// How long the supporter heart's wave takes to walk the whole palette:
-    /// one colour per channel, `recorder::CHANNELS` of them (thirty-two since
-    /// the desk grew), so one twelve-second lap is thirty-two bands.
+    /// one colour per palette slot, `recorder::PALETTE_SLOTS` of them
+    /// (thirty-two, the width the fixed desk once had), so one
+    /// twelve-second lap is thirty-two bands.
     ///
     /// **Fast enough to read as a wave.** The first pass took twenty-four
     /// seconds on the reasoning that a thing in the corner of a window
@@ -9882,36 +9733,42 @@ impl TangentApp {
         std::mem::take(&mut self.settings.desk_state_shift_v20)
     }
 
-    /// Which channels are armed — record-ready and LIVE — for the host to
-    /// push at the engine every frame.
+    /// **Whether row `n` is armed** — record-ready and LIVE — for the host to
+    /// push at the engine every frame. A row past the desk is not.
     ///
-    /// **The desk's own state now, not the session's.** It was a field on the
+    /// **The desk's own state, not the session's.** It was a field on the
     /// app, recomputed at every launch and written down nowhere, so a project
     /// opened with the DX7's channel live whatever it had been left holding —
     /// the owner: "record arming and other related states like mute and solo
-    /// are also remembered and respected by loading projects." It lives in
-    /// the settings beside the mute and the solo masks, rides `DeskSnap` the
-    /// way they do, and so travels in the document, in the template a New
-    /// project is made from, and in every undo moment.
-    ///
-    /// `unwrap_or(0)` is not a default: the constructor resolves `None`
-    /// through `default_armed` before anything can ask, so by here it is
-    /// always `Some`. See `Settings::channel_armed`.
-    pub fn armed_mask(&self) -> u32 {
-        self.settings.channel_armed.unwrap_or(0)
+    /// are also remembered and respected by loading projects." It lives on
+    /// the row beside the mute and the solo, rides `DeskSnap` the way they
+    /// do, and so travels in the document, in the template a New project is
+    /// made from, and in every undo moment. One flag per row: it was a u32
+    /// word, which had no bit for a thirty-third track.
+    pub fn is_armed(&self, n: usize) -> bool {
+        self.row(n).is_some_and(|r| r.arm)
     }
 
-    /// Put the arm mask back, and mark the desk changed.
+    /// Every armed row, in lane order.
+    pub fn armed_rows(&self) -> Vec<usize> {
+        (0..self.desk_extent()).filter(|n| self.is_armed(*n)).collect()
+    }
+
+    /// **Arm exactly `rows`**, and mark the desk changed.
     ///
-    /// Every write goes through here rather than at the field, because the
-    /// arm is a saved fact now: a toggle that skipped this would move a
-    /// switch the title bar could not see and the next save would not carry.
-    fn set_armed_mask(&mut self, mask: u32) {
-        if self.settings.channel_armed == Some(mask) {
-            return;
+    /// Every write goes through here rather than at the rows, because the
+    /// arm is a saved fact: a toggle that skipped this would move a switch
+    /// the title bar could not see and the next save would not carry.
+    fn set_armed_rows(&mut self, rows: &[usize]) {
+        let mut moved = false;
+        for (n, row) in self.settings.rows.iter_mut().enumerate() {
+            let on = rows.contains(&n);
+            moved |= row.arm != on;
+            row.arm = on;
         }
-        self.settings.channel_armed = Some(mask);
-        self.save_settings_soon();
+        if moved {
+            self.save_settings_soon();
+        }
     }
 
     // ── the project ────────────────────────────────────────────────────────
@@ -10063,7 +9920,9 @@ impl TangentApp {
                     // On a lane that can hold audio — never the DX7's. The
                     // first unused lane on the shipped desk, which is where
                     // the BACKING column used to stand.
-                    let lane = self.lane_for_audio().unwrap_or(recorder::CHANNELS - 1);
+                    // A desk of nothing but MIDI tracks takes it on the
+                    // row past its last (`lane_for_audio`'s own answer).
+                    let lane = self.lane_for_audio().unwrap_or(self.desk_extent());
                     arr.add_clip(clip_at(&rel, lane, 0.0));
                 }
             }
@@ -10200,21 +10059,47 @@ impl TangentApp {
     /// the drop-on-a-lane in the view's phase — and the copy is what keeps
     /// the directory self-contained.
     pub fn import_audio_file(&mut self, file: &std::path::Path) -> Result<(), String> {
-        let Some(lane) = self.lane_for_audio() else {
-            return Err("every lane is MIDI; make room for audio first".to_owned());
-        };
+        // A desk of nothing but MIDI tracks grows a row for it: the desk has
+        // room for one more, wherever the import lands.
+        let lane = self.lane_for_audio().unwrap_or(self.desk_extent());
         self.import_audio_at(file, lane, 0.0)
     }
 
     /// Where un-aimed audio lands: the first unused lane, else the first
-    /// AUDIO lane. `None` on a desk that is wall-to-wall MIDI.
+    /// AUDIO lane. `None` on a desk that is wall-to-wall MIDI, whose answer
+    /// is a new row past the last.
     fn lane_for_audio(&self) -> Option<usize> {
         (0..self.desk_extent())
             .find(|n| self.channel_kind(*n).is_none())
             .or_else(|| {
-                (0..recorder::CHANNELS)
+                (0..self.desk_extent())
                     .find(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Audio))
             })
+    }
+
+    /// **The row a drop or an import aimed at `lane` lands on**: that row,
+    /// or, at or past the end of the desk, a new row appended for it (design
+    /// section 10: dropping media below the last lane makes a track; a fixed
+    /// desk clamped it onto its last row, which was somebody else's track).
+    /// A new last row moves no row, so no hold refuses it; `None` only when
+    /// the id counter is spent.
+    fn lane_or_new(&mut self, lane: usize) -> Option<usize> {
+        if lane < self.desk_extent() {
+            return Some(lane);
+        }
+        self.open_trailing_row()
+    }
+
+    /// **Whether a new track may stand on row `n` as it is**: not a track
+    /// and not a folder already, and either drawn (an empty row the desk
+    /// shows, the indented plus included) or hidden and holding nothing at
+    /// all. A hidden row with a pedalboard left on it is somebody's residue
+    /// and never taken over (design section 4); see [`Self::row_reusable`].
+    fn row_takes_new_track(&self, n: usize) -> bool {
+        if self.channel_used(n) || self.is_folder(n) {
+            return false;
+        }
+        self.desk_index().class(n) != crate::desk_index::RowClass::Vacant || self.row_reusable(n)
     }
 
     /// The same import, aimed: the lane it was dropped on, at the second it
@@ -10230,10 +10115,13 @@ impl TangentApp {
         if self.channel_kind(lane) == Some(recorder::ChannelKind::Midi) {
             return Err("a MIDI lane cannot take an audio file".to_owned());
         }
-        // **A clip on an empty row makes a track**, so the gate is asked
-        // before the copy into `media/` or anything else is touched.
-        let into = lane.min(recorder::CHANNELS - 1);
-        if let Some(line) = self.track_refusal_text(usize::from(!self.row_counted(into))) {
+        // **A clip on an empty row makes a track**, and so does a drop
+        // below the last row (design section 10: the desk grows for it,
+        // where a fixed desk clamped it onto its last row, somebody else's
+        // track). The gate is asked before the copy into `media/` or
+        // anything else is touched.
+        let grows = lane >= self.desk_extent();
+        if let Some(line) = self.track_refusal_text(usize::from(grows || !self.row_counted(lane))) {
             return Err(line);
         }
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
@@ -10249,8 +10137,20 @@ impl TangentApp {
                 file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             ));
         };
-        self.arrangement
-            .add_clip(clip_at(&rel, lane.min(recorder::CHANNELS - 1), start_s.max(0.0)));
+        let rows_before = self.desk_extent();
+        let Some(lane) = self.lane_or_new(lane) else {
+            return Err("the desk is holding its shape; the file stays in media/".to_owned());
+        };
+        // **A new track is a new identity** (design section 3: add, insert,
+        // paste and import mint, and a reused row takes a fresh id). A clip
+        // landing on a row that was no track makes one, so the row is
+        // minted first, as a kind or an input on it is, and whatever its old
+        // id named follows it (`mint_row_id`). A row appended for the drop
+        // was minted as it was made.
+        if lane < rows_before && !self.row_counted(lane) {
+            self.mint_row_id(lane);
+        }
+        self.arrangement.add_clip(clip_at(&rel, lane, start_s.max(0.0)));
         // Through the one save that also makes this a MOMENT undo can
         // reach; the desk rides along as everywhere else.
         let _ = doc;
@@ -10269,11 +10169,17 @@ impl TangentApp {
     ) -> Result<(), String> {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        // The same gate as the audio import, first: a .mid on a bare lane
-        // makes it a MIDI track.
-        let into = lane.min(recorder::CHANNELS - 1);
-        if let Some(line) = self.track_refusal_text(usize::from(!self.row_counted(into))) {
+        // The same gate as the audio import, first: a .mid on a bare lane,
+        // or below the last row, makes a MIDI track.
+        let grows = lane >= self.desk_extent();
+        if let Some(line) = self.track_refusal_text(usize::from(grows || !self.row_counted(lane))) {
             return Err(line);
+        }
+        // Then the binding's hold (`midi_bind_hold_line`), before a row is
+        // made or a moment held: under a running record or export the lane
+        // stays as it is and the file is not taken in.
+        if let Some(line) = self.midi_bind_hold_line(lane) {
+            return Err(line.to_owned());
         }
         let name = file
             .file_stem()
@@ -10289,20 +10195,29 @@ impl TangentApp {
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
         };
+        // **ONE moment for the drop**: the row it lands on, the binding
+        // that makes that row a MIDI track (which commits a moment of its
+        // own) and the clip. Two, and the first Ctrl+Z took the clip back
+        // and left the track it had made: one gesture, one moment.
+        self.begin_one_moment();
+        // Below the last row, a row is made for it.
+        let Some(lane) = self.lane_or_new(lane) else {
+            self.commit_undo_moment();
+            return Err("the desk is holding its shape".to_owned());
+        };
         // A .mid landing on a BARE lane makes it a MIDI track — the
         // lane-draw's own ritual, so the lane arms and records like one.
-        // A lane that already IS something keeps its kind.
-        if self.channel_kind(lane.min(recorder::CHANNELS - 1)).is_none() {
-            self.set_channel_input_spec(
-                lane.min(recorder::CHANNELS - 1),
-                "midi:all",
-            );
+        // A lane that already IS something keeps its kind. A binding that
+        // does not take lands no clip on a row it never made a track.
+        if self.channel_kind(lane).is_none() && !self.set_channel_input_spec(lane, "midi:all") {
+            self.commit_undo_moment();
+            return Err(format!("{name} was not taken in: the lane could not become a MIDI track"));
         }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: import.pedal,
             kind: crate::arrangement::ClipKind::Midi,
             notes: import.notes,
-            lane: lane.min(recorder::CHANNELS - 1),
+            lane,
             path: String::new(),
             start_s: start_s.max(0.0),
             offset_s: 0.0,
@@ -10324,6 +10239,7 @@ impl TangentApp {
         });
         let _ = doc;
         self.arr_save_edits();
+        self.commit_undo_moment();
         Ok(())
     }
 
@@ -10430,15 +10346,18 @@ impl TangentApp {
             } else {
                 crate::arrangement::ClipKind::Midi
             };
+            // **The take's own row**: the host resolves each take's track to
+            // the row it stands on at the finish, and a row past the desk
+            // (nothing holds the desk's shape against it any more) grows a
+            // new last row rather than landing on somebody else's.
+            let Some(lane) = self.lane_or_new(r.lane) else {
+                continue;
+            };
             // **The punch FIRST, whatever was played.** Recording over
             // material is destructive — a take of silence is an erase, and
             // skipping the carve because no notes landed left the old clip
             // standing, the owner's bug.
-            self.arr_carve(
-                r.lane.min(recorder::CHANNELS - 1),
-                r.start_s.max(0.0),
-                r.start_s.max(0.0) + r.len_s,
-            );
+            self.arr_carve(lane, r.start_s.max(0.0), r.start_s.max(0.0) + r.len_s);
             carved = true;
             if kind == crate::arrangement::ClipKind::Midi && r.notes.is_empty() {
                 continue;
@@ -10454,7 +10373,7 @@ impl TangentApp {
                 pedal: r.pedal,
                 kind,
                 notes: r.notes,
-                lane: r.lane.min(recorder::CHANNELS - 1),
+                lane,
                 path: r.path.unwrap_or_default(),
                 start_s: r.start_s.max(0.0),
                 offset_s: 0.0,
@@ -10753,18 +10672,14 @@ impl TangentApp {
     fn desk_view(s: &Settings) -> crate::arrangement::DeskRef<'_> {
         let sig = s.time_signature();
         crate::arrangement::DeskRef {
-            kinds: &s.channel_kinds,
-            icons: &s.channel_icons,
-            names: &s.strip_names,
-            colors: &s.strip_colors,
+            // **The rows, whole**: every fact of every track and its
+            // identity, as long as the desk is. The arm is desk state, like
+            // the mute and the solo, and the live desk says every late row
+            // fact: a save always writes them and the document wins from
+            // then on. See the block on `DeskSnap`.
+            rows: &s.rows,
+            row_says: crate::arrangement::Says::ROWS,
             plugins: &s.plugins,
-            sends: &s.strip_sends,
-            muted: s.strip_muted,
-            soloed: s.strip_soloed,
-            gains: &s.channel_gains,
-            pans: &s.channel_pans,
-            inputs: &s.channel_inputs,
-            midi_inputs: &s.channel_midi_inputs,
             drums_gain: s.drums_gain,
             drums_pan: s.drums_pan,
             metronome_gain: s.metronome_gain,
@@ -10774,31 +10689,14 @@ impl TangentApp {
             sig_beats: sig.beats,
             sig_unit: sig.unit,
             metronome_on: s.metronome_on,
-            tracks_added: s.tracks_added as u32,
-            is_folder: &s.strip_is_folder,
-            in_folder: &s.strip_in_folder,
-            folder_shut: &s.strip_folder_shut,
-            // **The arm is desk state**, like the mute and the solo two
-            // lines up. `None` is a settings file written before it was,
-            // and the constructor resolves that once (see `default_armed`)
-            // — so by the time anything asks this it is always `Some`.
-            armed: s.channel_armed.unwrap_or(0),
-            // **The LIVE desk always says.** These six are `Option` on the
+            // **The LIVE desk always says.** These are `Option` on the
             // snapshot because a DOCUMENT may predate them; the settings
             // never do, so every one of them is `Some` here — which is what
             // makes a save always write them and the document win from then
             // on. See the block on `DeskSnap`.
-            phase: Some(s.strip_phase),
-            to_theory: Some(&s.strip_to_theory),
             routes: Some(&s.routes),
             insert_keys: Some(&s.insert_keys),
             bypass: Some(&s.bypass),
-            instruments: Some(crate::arrangement::InstrumentsRef {
-                dx7_cartridge: &s.strip_dx7_cartridge,
-                dx7_patch: &s.strip_dx7_patch,
-                keys_patch: &s.strip_keys_patch,
-                keys_params: &s.strip_keys_params,
-            }),
             // **And the second late wave**, `Some` for the same reason the
             // six above are: the settings never predate a key, so the live
             // desk always says, every save writes all eleven, and the
@@ -10878,10 +10776,6 @@ impl TangentApp {
                 capo_style: &s.capo_style,
                 tuning: &s.fretboard_tuning,
             }),
-            frozen: Some(&s.frozen_lanes),
-            // The rows' identities (W3): a moment holds them, so an undo
-            // puts every track back on its own id.
-            ids: &s.track_ids,
             next_id: s.next_track_id,
             // The specials' names, paint, sends and switches (W5): the rows'
             // arrays above hold rows and nothing else.
@@ -10889,15 +10783,12 @@ impl TangentApp {
         }
     }
 
-    /// **The rows a desk snapshot stands the desk on**: its own ids when
-    /// they are one distinct id per channel, else the identity desk by the
-    /// identity rule (every legacy document). One rule for the apply and
-    /// for `doc_rows`, which names the rows an open of the file stands on.
+    /// **The rows a desk snapshot stands the desk on**, by identity: its
+    /// own rows' ids (a legacy document's are the identity ids, read so).
+    /// One rule for the apply and for `doc_rows`, which names the rows an
+    /// open of the file stands on.
     fn snapshot_rows(d: &crate::arrangement::DeskSnap) -> Vec<crate::desk_id::TrackId> {
-        let n = recorder::CHANNELS;
-        let said = d.ids.len() == n
-            && d.ids.iter().collect::<std::collections::BTreeSet<_>>().len() == n;
-        if said { d.ids.0.clone() } else { crate::desk_legacy::identity_ids(n) }
+        d.row_ids()
     }
 
     /// **The document at `project_doc` lies on disk as `arrangement`
@@ -10923,55 +10814,65 @@ impl TangentApp {
         // Every open, undo and redo lands here: a new index generation.
         self.touch_desk_index();
         // A desk from an earlier era of the desk's shape arrives already
-        // lifted: `DeskSnap::from_value` runs the length-keyed era lifts on
-        // the dense array as the file holds it. They ran here once, on a
-        // clone of every desk applied — every open and every undo step —
-        // although a moment can never hold an old-era desk.
+        // lifted, and already rows: `DeskSnap::from_value` runs the
+        // length-keyed era lifts on the dense arrays as the file holds them
+        // and reads them onto rows once.
         //
-        // **The rows' ids, first**: a moment's ids are what undo puts back,
-        // a format-2 document's are its own, and a desk that does not say
-        // (every legacy document) is the identity desk by the identity rule.
-        // The counter never falls below what the ids need; past that it is
-        // the snapshot's, so an open lands on the document's own counter.
-        // Undo keeps the higher of the two (`undo_apply`), so an id handed
-        // out and undone is not handed out again.
-        // The rows the live desk had, for what a document that does not
-        // SAY leaves standing: the live routes, keys and bypass stand on
-        // the same ROWS they stood on, now worn by these ids.
-        let was_ids = std::mem::replace(&mut self.settings.track_ids, Self::snapshot_rows(d));
-        let stands = crate::settings::rekey_rows(&was_ids, &self.settings.track_ids);
-        self.settings.next_track_id = self
-            .settings
-            .track_ids
+        // The rows the live desk had, for what a document that does not SAY
+        // leaves standing: the live routes, keys and bypass stand on the
+        // same ROWS they stood on, now worn by the snapshot's ids.
+        let live = std::mem::take(&mut self.settings.rows);
+        let was_ids: Vec<crate::desk_id::TrackId> = live.iter().map(|r| r.id).collect();
+        // **The rows, as the snapshot says them**, every one, as long as it
+        // is; clamped the way every settings read is, because the file is
+        // content and may say anything. A late row fact the snapshot does
+        // not SAY (a document written before its key) takes the live row's
+        // on the same lane: what "the live value stands" has always meant,
+        // when the live value was kept by row. Polarity, the T switch and
+        // the instruments are those facts; a freeze is the document's own,
+        // and a document that says none has nothing frozen.
+        use crate::arrangement::Says;
+        let mut rows = d.rows.clone();
+        for (n, row) in rows.iter_mut().enumerate() {
+            let was = live.get(n);
+            if !d.row_says.contains(Says::PHASE) {
+                row.phase = was.is_some_and(|r| r.phase);
+            }
+            if !d.row_says.contains(Says::TO_THEORY) {
+                row.theory = was.is_some_and(|r| r.theory);
+            }
+            if !d.row_says.contains(Says::INSTRUMENTS) {
+                if let Some(w) = was {
+                    row.dx7 = w.dx7.clone();
+                    row.keys = w.keys.clone();
+                }
+            }
+            row.icon = row.icon.min(recorder_panel::ICON_MAX);
+            row.gain = if row.gain.is_finite() { row.gain.clamp(0.0, 8.0) } else { 1.0 };
+            row.pan = if row.pan.is_finite() { row.pan.clamp(-1.0, 1.0) } else { 0.0 };
+            let send = crate::desk_model::fx_send_level(&row.sends);
+            crate::desk_model::set_fx_send_level(&mut row.sends, if send.is_finite() { send.clamp(0.0, 1.0) } else { 0.0 });
+            // **The device sets travel with the inputs**, because they ARE
+            // the input for a MIDI track: restored through the reconcile
+            // the file loaders use, so an undo of a desk captured by a build
+            // without them lands on what its strings say.
+            recorder::reconcile_midi_input(&mut row.midi, &row.input);
+        }
+        self.settings.rows = rows;
+        // **The rows' ids**: a moment's are what undo puts back, a document's
+        // are its own. The counter never falls below what the ids need;
+        // past that it is the snapshot's, so an open lands on the
+        // document's own counter. Undo keeps the higher of the two
+        // (`undo_apply`), so an id handed out and undone is not handed out
+        // again.
+        let ids = self.settings.desk_ids();
+        let stands = crate::settings::rekey_rows(&was_ids, &ids);
+        self.settings.next_track_id = ids
             .iter()
             .map(|id| u64::from(id.0) + 1)
             .max()
             .unwrap_or(0)
             .max(d.next_id.0);
-        if d.icons.is_empty() {
-            // A document from before the badges: derive them — the drum
-            // where the drumpad stands, auto everywhere else — instead of
-            // leaving the LAST project's badges on this one's tracks.
-            for i in 0..recorder::CHANNELS {
-                let bay0 = self.row_bay(i, 0).and_then(|sb| d.plugins.get(&sb)).map(String::as_str);
-                self.settings.channel_icons[i] =
-                    u8::from(bay0 == Some(dialogs::DRUMPAD_PATH));
-            }
-        } else {
-            for (i, ic) in d.icons.iter().take(recorder::CHANNELS).enumerate() {
-                self.settings.channel_icons[i] =
-                    (*ic).min(recorder_panel::ICON_MAX);
-            }
-        }
-        for (i, k) in d.kinds.iter().take(recorder::CHANNELS).enumerate() {
-            self.settings.channel_kinds[i] = (*k).min(2);
-        }
-        // The rows' strip facts by row; the specials' are their own (W5),
-        // below with the masks.
-        self.settings.strip_names = d.names.clone();
-        for (i, c) in d.colors.iter().take(self.settings.strip_colors.len()).enumerate() {
-            self.settings.strip_colors[i] = *c;
-        }
         // **The snapshot's bays, as they are: by identity.** Nothing is
         // spread over a seat space and nothing is allocated by a value in
         // the file: a bay is a key, and a key a file cannot place on a row
@@ -10979,14 +10880,9 @@ impl TangentApp {
         // error policy) never reaches a snapshot. An empty path is no bay.
         self.settings.plugins =
             d.plugins.iter().filter(|(_, p)| !p.is_empty()).map(|(sb, p)| (*sb, p.clone())).collect();
-        for (i, v) in d.sends.iter().take(self.settings.strip_sends.len()).enumerate() {
-            self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
-        }
-        self.settings.strip_muted = d.muted;
-        self.settings.strip_soloed = d.soloed;
         // **The specials whole**, as the snapshot says them (it always
         // does), each send clamped as a row's is. Their polarity is applied
-        // with the rows' below, and only when the snapshot says it.
+        // only when the snapshot says the rows' (they were one mask).
         {
             use crate::settings::StripSwitch;
             let phase = recorder::StripRef::SPECIALS.map(|sr| self.settings.strip_switch(sr, StripSwitch::Phase));
@@ -10995,29 +10891,15 @@ impl TangentApp {
                 let send = self.settings.strip_send(sr);
                 self.settings.set_strip_send(sr, send.clamp(0.0, 1.0));
             }
-            for (sr, on) in recorder::StripRef::SPECIALS.into_iter().zip(phase) {
-                self.settings.set_strip_switch(sr, StripSwitch::Phase, on);
+            if !d.row_says.contains(Says::PHASE) {
+                for (sr, on) in recorder::StripRef::SPECIALS.into_iter().zip(phase) {
+                    self.settings.set_strip_switch(sr, StripSwitch::Phase, on);
+                }
             }
         }
-        for (i, v) in d.gains.iter().take(recorder::CHANNELS).enumerate() {
-            self.settings.channel_gains[i] = v.clamp(0.0, 8.0);
-        }
-        for (i, v) in d.pans.iter().take(recorder::CHANNELS).enumerate() {
-            self.settings.channel_pans[i] = v.clamp(-1.0, 1.0);
-        }
-        self.settings.channel_inputs = d.inputs.clone();
-        // **The device sets travel with the inputs**, because they ARE the
-        // input for a MIDI track. Restored through the same reconcile the
-        // file loaders use, so an undo of a desk captured by a build without
-        // them lands on what its strings say rather than on nothing.
-        self.settings.channel_midi_inputs = d.midi_inputs.to_vec();
-        recorder::reconcile_midi_inputs(
-            &mut self.settings.channel_midi_inputs,
-            &self.settings.channel_inputs,
-        );
-        // **A document can carry the orphan too**, and this is where one
-        // arrives. Every project saved while the fault was live holds the
-        // deleted track's input on a channel with no kind — see
+        // **A document can carry an orphan input too**, and this is where
+        // one arrives. Every project saved while the fault was live holds the
+        // deleted track's input on a row with no kind — see
         // `Settings::heal_orphan_inputs` — so the desk is made consistent as
         // it lands rather than only when the settings file is read.
         self.settings.heal_orphan_inputs();
@@ -11032,67 +10914,17 @@ impl TangentApp {
         self.settings.record_time_signature =
             format!("{}/{}", d.sig_beats.clamp(1, 32), d.sig_unit.clamp(1, 32));
         self.settings.metronome_on = d.metronome_on;
-        // **Which channels EXIST comes from the document too.**
+        // **Which rows exist, their folders, what is armed: the rows'
+        // own**, above. Opening a project (or making a New one from the
+        // template) used to apply its levels, names and bays over whatever
+        // rows happened to be on screen and leave the rows themselves
+        // behind: the owner's "click new track → no channels are deleted".
+        // A snapshot's rows ARE the desk now, so every session stands on
+        // exactly its own rows.
         //
-        // Without this, opening a project — or making a New one from the
-        // template — applied its levels, names and bays over whatever rows
-        // were already on screen and left the rows themselves behind. Every
-        // session inherited the last one's track count, and New could not
-        // give you the template's desk however faithfully it copied the
-        // folder. The owner: "no channels are deleted ... the default must
-        // be loaded and if something is silently overwriting it, that's a
-        // huge problem."
-        self.settings.tracks_added = i64::from(d.tracks_added);
-        // **The folder skeleton comes from the document too.** The three
-        // vectors used to live ONLY in the shared settings file, so every
-        // project opened wearing the previous session's folders — the
-        // mixer indented slots this document never grouped — and undo
-        // restored the whole desk around flags it could not see. A row
-        // the document says nothing about reads FLAT, not "whatever the
-        // last session left": that silence-means-keep was the bleed.
-        for (dst, src) in [
-            (&mut self.settings.strip_is_folder, &d.is_folder),
-            (&mut self.settings.strip_in_folder, &d.in_folder),
-            (&mut self.settings.strip_folder_shut, &d.folder_shut),
-        ] {
-            for (i, slot) in dst.iter_mut().enumerate() {
-                *slot = src.get(i).copied().unwrap_or(false);
-            }
-        }
-        // **And what is ARMED comes from the document too.**
-        //
-        // It came from the launch and nowhere else: every open, every New
-        // from the template and every undo left the session's own arms
-        // standing over a desk that had been saved with others. The owner
-        // wants the project's back — "load my default ... and arm a few
-        // extra tracks, then new track and have the original record states
-        // back". A document written before the key carries the shipped rule
-        // instead, resolved from its OWN desk by `DeskSnap::from_value`, so
-        // an old project opens exactly as it always did.
-        self.settings.channel_armed = Some(d.armed);
-        // **And the six that used to live in the settings alone.**
-        //
-        // Applied only when the document SAYS — `None` is a file written
-        // before the key, and the live value stands for it, so no project
-        // changes what it sounds like because a field was added. See the
-        // block on `DeskSnap`. A document that says anything wins outright:
-        // that is the whole point of carrying them.
-        if let Some(v) = d.phase {
-            self.settings.strip_phase = v;
-            for (node, sp) in d.specials.iter() {
-                if let Some(sr) = recorder::StripRef::of_special(node) {
-                    self.settings.set_strip_switch(sr, crate::settings::StripSwitch::Phase, sp.phase);
-                }
-            }
-        }
-        if let Some(v) = d.to_theory.as_ref() {
-            for (i, slot) in self.settings.strip_to_theory.iter_mut().enumerate() {
-                *slot = v.get(i).copied().unwrap_or(false);
-            }
-        }
-        // A field the document does not say stands as it was, on the same
-        // rows (`stands`): what "the live value stands" has always meant,
-        // when the live value was kept by row.
+        // A wiring field the document does not say stands as it was, on the
+        // same rows (`stands`): what "the live value stands" has always
+        // meant, when the live value was kept by row.
         match d.routes.as_ref() {
             Some(v) => self.settings.routes = v.clone(),
             None => {
@@ -11117,24 +10949,6 @@ impl TangentApp {
             Some(v) => v.clone(),
             None => self.settings.bypass.iter().map(|sb| stands.bay(*sb)).collect(),
         };
-        if let Some(i) = d.instruments.as_ref() {
-            // Length-clamped like every other vector read out of a
-            // document: the file is content and may say anything, and the
-            // settings' own vectors are sized by the desk.
-            let put = |dst: &mut Vec<usize>, src: &[usize]| {
-                for (n, slot) in dst.iter_mut().enumerate() {
-                    *slot = src.get(n).copied().unwrap_or(0);
-                }
-            };
-            for (n, slot) in self.settings.strip_dx7_cartridge.iter_mut().enumerate() {
-                *slot = i.dx7_cartridge.get(n).cloned().unwrap_or_default();
-            }
-            put(&mut self.settings.strip_dx7_patch, &i.dx7_patch);
-            put(&mut self.settings.strip_keys_patch, &i.keys_patch);
-            for (n, slot) in self.settings.strip_keys_params.iter_mut().enumerate() {
-                *slot = i.keys_params.get(n).copied().unwrap_or(*slot);
-            }
-        }
         // **And the second late wave** — the rack, the levels and the rest
         // of what a song is. Same rule as the six above: applied only when
         // the document SAYS, clamped the way the settings' own reader
@@ -11337,28 +11151,25 @@ impl TangentApp {
                 self.settings.fretboard_tuning = n.tuning.to_owned();
             }
         }
-        // **A freeze does not outlive its document.** `None` here is "this
-        // document has nothing frozen", not "the live value stands" — see
-        // `DeskSnap::frozen` — because the file a freeze points at lives in
-        // that document's media folder and no other. One entry per lane,
-        // the last one said wins, and a lane the desk does not have is
-        // dropped rather than carried.
-        let mut frozen: Vec<crate::arrangement::FrozenLane> = Vec::new();
-        for z in d.frozen.iter().flatten() {
-            if z.lane >= recorder::CHANNELS || z.path.is_empty() || !z.len_s.is_finite() {
-                continue;
+        // **A freeze does not outlive its document**: each row's freeze is
+        // the snapshot's own (a document that says none has nothing frozen,
+        // not "the live value stands"), because the file a freeze points at
+        // lives in that document's media folder and no other. One with no
+        // file, or no length, is no freeze.
+        for row in &mut self.settings.rows {
+            if row.frozen.as_ref().is_some_and(|z| z.path.is_empty() || !z.len_s.is_finite()) {
+                row.frozen = None;
             }
-            frozen.retain(|f| f.lane != z.lane);
-            frozen.push(z.clone());
+            if let Some(z) = row.frozen.as_mut() {
+                z.len_s = z.len_s.max(0.0);
+            }
         }
-        frozen.sort_by_key(|f| f.lane);
-        self.settings.frozen_lanes = frozen;
         // A group is not a send destination — `set_is_folder` enforces
         // that at the gesture, but a document's folder arrives here, and
         // the routes it must displace live in settings, not in the
         // document. Same invariant, second doorway.
-        for ch in 0..recorder::CHANNELS {
-            if self.settings.strip_is_folder.get(ch).copied().unwrap_or(false) {
+        for ch in 0..self.desk_extent() {
+            if self.row(ch).is_some_and(|r| r.folder) {
                 let into = self.row_node(ch);
                 let _ = self.settings.routes.drop_into(into);
             }
@@ -11547,14 +11358,17 @@ impl TangentApp {
                     }
                 }
             }
+            // **A binding waits for a running record or export**
+            // (`desk_shape_held_for`, which says why): the record reads each
+            // track from the input it had at the press.
             0 => {
-                if i < width {
+                if i < width && !self.desk_shape_held_for(ShapeChange::Input) {
                     self.set_channel_input_spec(ch, &format!("{i}"));
                 }
                 self.input_menu = None;
             }
             1 => {
-                if width >= 2 && i < width - 1 {
+                if width >= 2 && i < width - 1 && !self.desk_shape_held_for(ShapeChange::Input) {
                     self.set_channel_input_spec(ch, &format!("{i}+{}", i + 1));
                 }
                 self.input_menu = None;
@@ -11659,7 +11473,9 @@ impl TangentApp {
                 if let Some(i) = tops.iter().position(|r| r.contains(pos)) {
                     if i == 3 {
                         let ch = m.ch;
-                        self.set_channel_input_spec(ch, "");
+                        if !self.desk_shape_held_for(ShapeChange::Input) {
+                            self.set_channel_input_spec(ch, "");
+                        }
                         self.input_menu = None;
                     } else if i == 2 {
                         self.open_midi_row(m.ch);
@@ -11759,9 +11575,9 @@ impl TangentApp {
             Some(recorder::ChannelKind::Midi) => {
                 self.channel_midi_sel(ch).chip_text(&self.midi_ports_seen)
             }
-            // **And a channel PAST THE CAP says so.** The desk carries four
-            // audio inputs (`recorder::INPUTS`, which must equal
-            // `tangent_record::audio::MAX_PICKS`) and `audio_ordinal` is
+            // **And a channel PAST THE CAP says so.** The desk carried four
+            // audio inputs (a constant that had to equal the capture's own
+            // pick count, both gone now) and `audio_ordinal` was
             // positional: the fifth audio channel answers `None` and can
             // never reach a capture channel, whatever its spec says. The
             // chip printed the spec anyway — so a fifth audio track read
@@ -11818,11 +11634,7 @@ impl TangentApp {
     /// never been narrowed, which is every channel until somebody opens the
     /// MIDI Inputs dialog. See `recorder::MidiInputSel`.
     pub fn channel_midi_sel(&self, ch: usize) -> recorder::MidiInputSel {
-        self.settings
-            .channel_midi_inputs
-            .get(ch)
-            .cloned()
-            .unwrap_or(recorder::MidiInputSel::EVERYTHING)
+        self.row(ch).map_or(recorder::MidiInputSel::EVERYTHING, |r| r.midi.clone())
     }
 
     /// **Narrow (or widen) what channel `ch` listens to.** The dialog's one
@@ -11836,12 +11648,15 @@ impl TangentApp {
     /// second path that wrote the string directly would be a second set of
     /// those rules.
     pub fn set_channel_midi_sel(&mut self, ch: usize, sel: recorder::MidiInputSel) {
-        while self.settings.channel_midi_inputs.len() <= ch {
-            self.settings
-                .channel_midi_inputs
-                .push(recorder::MidiInputSel::EVERYTHING);
+        // An input binding: it waits out a record or an export with the
+        // line (`desk_shape_held_for`), before anything is written.
+        if self.row(ch).is_some_and(|r| r.midi != sel) && self.desk_shape_held_for(ShapeChange::Input) {
+            return;
         }
-        self.settings.channel_midi_inputs[ch] = sel.clone();
+        let Some(row) = self.row_mut(ch) else {
+            return;
+        };
+        row.midi = sel.clone();
         // **Written BEFORE the spec, and trimmed after it.**
         // `set_channel_input_spec` resets the set from the string it is given
         // (that is how the shipped "midi:all" call sites and the old menu keep
@@ -11851,13 +11666,9 @@ impl TangentApp {
         self.set_channel_input_spec(ch, &sel.legacy_spec());
     }
 
-    /// One channel's INPUT spec — see `Settings::channel_inputs`.
+    /// One channel's INPUT spec — see `TrackRow::input`.
     pub fn channel_input_spec(&self, ch: usize) -> &str {
-        self.settings
-            .channel_inputs
-            .get(ch)
-            .map(String::as_str)
-            .unwrap_or("")
+        self.row(ch).map_or("", |r| r.input.as_str())
     }
 
     /// Bind one channel's INPUT spec, which is also its kind.
@@ -11869,7 +11680,17 @@ impl TangentApp {
     fn set_channel_input_spec(&mut self, ch: usize, spec: &str) -> bool {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        let fresh = !spec.is_empty() && ch < recorder::CHANNELS && !self.row_counted(ch);
+        if ch >= self.desk_extent() {
+            return false;
+        }
+        // **An input binding, which is also the kind**: under a record or an
+        // export it waits with the line (design 7.13), asked here at the one
+        // writer so no road binds around it. The same spec again changes
+        // nothing and is not refused.
+        if self.channel_input_spec(ch) != spec && self.desk_shape_held_for(ShapeChange::Input) {
+            return false;
+        }
+        let fresh = !spec.is_empty() && !self.row_counted(ch);
         if fresh && !self.admit_tracks(1) {
             return false;
         }
@@ -11878,10 +11699,7 @@ impl TangentApp {
         if fresh {
             self.mint_row_id(ch);
         }
-        while self.settings.channel_inputs.len() < recorder::CHANNELS {
-            self.settings.channel_inputs.push(String::new());
-        }
-        if let Some(slot) = self.settings.channel_inputs.get_mut(ch) {
+        if let Some(slot) = self.row_mut(ch).map(|r| &mut r.input) {
             *slot = spec.to_owned();
         }
         // **And the device set follows the string.**
@@ -11895,10 +11713,9 @@ impl TangentApp {
         // the set — and its channel — exactly as written. A spec that is not
         // MIDI at all resets the row, because a set on an audio channel is
         // meaningless.
-        recorder::reconcile_midi_inputs(
-            &mut self.settings.channel_midi_inputs,
-            &self.settings.channel_inputs,
-        );
+        if let Some(row) = self.row_mut(ch) {
+            recorder::reconcile_midi_input(&mut row.midi, &row.input);
+        }
         // **The input IS the kind** — the REAPER model, the owner's ruling.
         // The icon follows what is actually bound, and binding the first
         // input is what ADDS the track: it opens armed with its send up,
@@ -11919,11 +11736,11 @@ impl TangentApp {
         // leave a track behind rather than take one away: the desk's
         // added-track bit is what says "this exists because somebody said
         // so", and it is set here.
-        if kind.is_none() && was.is_some() && ch < 32 {
-            self.settings.tracks_added |= 1 << ch;
-        }
-        if let Some(slot) = self.settings.channel_kinds.get_mut(ch) {
-            *slot = recorder::ChannelKind::as_u8(kind);
+        if let Some(row) = self.row_mut(ch) {
+            if kind.is_none() && was.is_some() {
+                row.added = true;
+            }
+            row.kind = kind.map(recorder::ChannelKind::row_kind);
         }
         if was.is_none() && kind.is_some() {
             // **A fresh binding's send rests at ZERO** — the owner's ruling:
@@ -11959,22 +11776,30 @@ impl TangentApp {
     /// it, or added bare by the + circle / Ctrl+T.
     // ── track freezing ──────────────────────────────────────────────────
 
-    /// The frozen file standing in for this lane, if the lane is frozen.
-    /// See `arrangement::FrozenLane`.
-    pub fn lane_frozen(&self, lane: usize) -> Option<&crate::arrangement::FrozenLane> {
-        self.settings.frozen_lanes.iter().find(|z| z.lane == lane)
+    /// The frozen file standing in for this lane, if the lane is frozen:
+    /// its row's own (`TrackRow::frozen`), so it moves with the row.
+    pub fn lane_frozen(&self, lane: usize) -> Option<&crate::desk_model::Frozen> {
+        self.row(lane).and_then(|r| r.frozen.as_ref())
     }
 
-    /// Every frozen lane, in lane order.
-    pub fn frozen_lanes(&self) -> &[crate::arrangement::FrozenLane] {
-        &self.settings.frozen_lanes
+    /// Every frozen lane, in lane order, as the host reads them.
+    pub fn frozen_lanes(&self) -> Vec<crate::arrangement::FrozenLane> {
+        self.settings
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, r)| {
+                let z = r.frozen.as_ref()?;
+                Some(crate::arrangement::FrozenLane { lane, path: z.path.clone(), len_s: z.len_s })
+            })
+            .collect()
     }
 
     /// Whether a freeze would render anything: a used channel that is not a
     /// folder, not already frozen, and carries a clip or a loaded bay.
     /// A folder is its children's fold and freezes with them, not alone.
     pub fn can_freeze(&self, lane: usize) -> bool {
-        lane < recorder::CHANNELS
+        lane < self.desk_extent()
             && self.channel_used(lane)
             && !self.is_folder(lane)
             && self.lane_frozen(lane).is_none()
@@ -11985,7 +11810,7 @@ impl TangentApp {
     /// **Cmd/Ctrl+Shift+F on the selected track.** Frozen thaws, live freezes,
     /// and a lane with nothing to render says so rather than doing nothing.
     fn freeze_selected(&mut self) {
-        let Some(lane) = self.selected_row().filter(|n| *n < recorder::CHANNELS) else {
+        let Some(lane) = self.selected_row().filter(|n| *n < self.desk_extent()) else {
             self.notify(crate::notify::Kind::Info, "Select a track to freeze it.");
             return;
         };
@@ -12034,11 +11859,10 @@ impl TangentApp {
         if self.lane_frozen(lane).is_some() && self.freezes_held() {
             return;
         }
-        let before = self.settings.frozen_lanes.len();
-        self.settings.frozen_lanes.retain(|z| z.lane != lane);
-        if self.settings.frozen_lanes.len() == before {
+        let Some(row) = self.row_mut(lane).filter(|r| r.frozen.is_some()) else {
             return;
-        }
+        };
+        row.frozen = None;
         self.arr_save_edits();
         let name = self.channel_display_name(lane);
         self.notify(crate::notify::Kind::Success, format!("Thawed {name}"));
@@ -12051,19 +11875,14 @@ impl TangentApp {
     pub fn note_frozen(&mut self, lane: usize, path: String, len_s: f64) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if lane >= recorder::CHANNELS || path.is_empty() || !len_s.is_finite() {
+        if path.is_empty() || !len_s.is_finite() {
             return;
         }
-        self.settings.frozen_lanes.retain(|z| z.lane != lane);
-        self.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
-            lane,
-            path,
-            len_s: len_s.max(0.0),
-        });
-        self.settings.frozen_lanes.sort_by_key(|z| z.lane);
-        if let Some(mask) = self.settings.channel_armed.as_mut() {
-            *mask &= !(1u32 << lane.min(31));
-        }
+        let Some(row) = self.row_mut(lane) else {
+            return;
+        };
+        row.frozen = Some(crate::desk_model::Frozen { path, len_s: len_s.max(0.0) });
+        row.arm = false;
         self.arr_save_edits();
         let name = self.channel_display_name(lane);
         self.notify(crate::notify::Kind::Success, format!("Froze {name}"));
@@ -12104,15 +11923,7 @@ impl TangentApp {
     pub fn channel_used(&self, n: usize) -> bool {
         self.channel_kind(n).is_some()
             || self.lane_has_clips(n)
-            || (self.settings.tracks_added >> n) & 1 == 1
-    }
-
-    /// The host's cue that the channels moved - a reorder, or the undo or
-    /// redo of one: `order[new] = old`. The host saves live plugin states,
-    /// carries the plugins and renames the sidecars to follow, and reloads
-    /// only what it could not carry.
-    pub fn take_desk_state_perm(&mut self) -> Option<Vec<usize>> {
-        self.desk_state_perm.take()
+            || self.row(n).is_some_and(|r| r.added)
     }
 
     /// **The plugins a gesture carried between bays**, for the host to carry
@@ -12124,111 +11935,166 @@ impl TangentApp {
     }
 
     /// **Hand the host a set of relabels, composed onto one it has not
-    /// taken yet** (the `send_desk_perm` rule: two swaps in one slow frame
-    /// must both be carried).
+    /// taken yet**: two swaps in one slow frame must both be carried.
     fn send_relabels(&mut self, set: &[crate::desk_id::BayRelabel]) {
         self.bay_relabels = crate::desk_id::compose_relabels(&self.bay_relabels, set);
     }
 
-    /// **Hand the host a permutation, composed onto one it has not taken
-    /// yet.** The host takes one a frame; a reorder and an undo in the same
-    /// frame, or two Ctrl+Z in one slow frame, each move the desk, and the
-    /// plugins have to be carried by both. A plain assignment kept the
-    /// second and the host carried by half of what happened.
-    fn send_desk_perm(&mut self, order: &[usize]) {
-        self.desk_state_perm = Some(match self.desk_state_perm.take() {
-            Some(first) => compose_orders(&first, order),
-            None => order.to_vec(),
-        });
-    }
-
-    /// **Whether the lane ORDER is held, saying so when it is.** An export's
-    /// stems and an arrangement record's lanes and punches are bound to lane
-    /// INDICES at their press, so a permutation under either would write, or
-    /// carve, the wrong lane: the lane drags refuse for exactly that reason.
-    /// An ordinary take holds no lane and is not asked about.
+    /// **Whether the desk's shape is held, saying so when it is** (design
+    /// 7.13): the one hold every road that would change the rows' shape, a
+    /// track's kind or an input binding asks BEFORE it changes anything, so
+    /// a refusal half-applies nothing.
     ///
-    /// Asked by every other gesture that reaches `reorder_channels` -
-    /// Insert and Paste Track Below, Cmd/Ctrl+F grouping, a drag that comes
-    /// home or lands - BEFORE it changes anything. None of them asked, and a
-    /// refusal inside the reorder alone would leave them half-applied: a
-    /// folder flag set on the row at the top, a member's flag cleared, a
-    /// bare track added onto the live row below.
-    fn lane_order_held(&mut self) -> bool {
-        let held = self.recorder.exporting || self.recorder.arr_recording;
-        if held {
-            let why = if self.recorder.exporting {
+    /// **An arrangement record and a realtime export each bind the desk at
+    /// their press.** The record captures each armed track by its row, its
+    /// lane and its input pick, and an export writes each track's stem by
+    /// its lane, so a row moved, inserted above or taken away under either
+    /// would carve, or write, the wrong lane, and a kind or input changed
+    /// under a record would hand the take another track's input. So those
+    /// wait, with a line that says why. A new track is NOT refused: Add
+    /// appends at the end (`add_track`), where no row and no pick moves. An
+    /// ordinary take holds no lane and is not asked about.
+    ///
+    /// The folders and the routes hold only under an export, which writes
+    /// each folder's bus and plays through every route; a record binds
+    /// neither. These were four holds (`lane_order_held`, `tracks_held`,
+    /// `folders_held`, `routes_held`) with their own lines; they keep the
+    /// lines and are one decision now.
+    fn desk_shape_held_for(&mut self, what: ShapeChange) -> bool {
+        match self.desk_shape_hold_line(what) {
+            Some(why) => {
+                self.notify(crate::notify::Kind::Info, why);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **The line [`Self::desk_shape_held_for`] says, without saying it**:
+    /// `None` when nothing holds `what`. For the roads that answer a
+    /// `Result` and hand their refusal to a caller that already reports
+    /// errors (`import_midi_at`), as `track_refusal_text` is the gate's.
+    fn desk_shape_hold_line(&self, what: ShapeChange) -> Option<&'static str> {
+        let (export, record) = (self.recorder.exporting, self.recorder.arr_recording);
+        let held = match what {
+            ShapeChange::Folder | ShapeChange::Route => export,
+            _ => export || record,
+        };
+        if !held {
+            return None;
+        }
+        let why = match (what, export) {
+            (ShapeChange::Order, true) => {
                 "Tracks keep their order while an export runs - it writes each track by its row."
-            } else {
+            }
+            (ShapeChange::Order, false) => {
                 "Tracks keep their order while the arrangement records - it records each track by its row."
-            };
-            self.notify(crate::notify::Kind::Info, why);
-        }
-        held
-    }
-
-    /// **Whether the folders hold their shape, saying so when they do.** A
-    /// realtime export chose its stems by the folders at its press - a
-    /// folder that collects children writes a stem of its bus - and the
-    /// engine folds by the same table (`folder_parents`), so a folder made
-    /// or dissolved under one moves its children onto another bus
-    /// mid-render, and the undo that could put it back waits for the export
-    /// to end. Asked by Cmd/Ctrl+F's two single-row branches, which move no
-    /// lane and so are not `lane_order_held`'s. An arrangement record binds
-    /// no bus and is not asked about.
-    fn folders_held(&mut self) -> bool {
-        if self.recorder.exporting {
-            self.notify(
-                crate::notify::Kind::Info,
-                "Folders keep their shape while an export runs - it writes each folder's bus.",
-            );
-        }
-        self.recorder.exporting
-    }
-
-    /// **Whether where each lane's signal goes holds still, saying so when it
-    /// does.** A route takes a lane's signal to another channel or a jack,
-    /// and a sidechain key feeds a bay from another lane, so one added,
-    /// removed or re-keyed under a realtime export moved a lane's signal
-    /// onto another destination partway through the file, with the undo
-    /// that could put it back refused until the export ends - the shape of
-    /// `folders_held`. A route's gain is a fader and rides as ever. Asked
-    /// by `AddRoute`, `RemoveRoute` and `SetInsertKeySource`, the only
-    /// roads that change either table; an arrangement record binds neither
-    /// and is not asked about.
-    fn routes_held(&mut self) -> bool {
-        if self.recorder.exporting {
-            self.notify(
-                crate::notify::Kind::Info,
-                "Routes and sidechains stay as they are while an export runs - it is playing through them.",
-            );
-        }
-        self.recorder.exporting
-    }
-
-    /// **Whether the tracks stay on the desk, saying so when they do.**
-    /// Remove Track empties a row in place - clips, kind, bays and routes,
-    /// and a folder track hands its children up - so under a realtime export
-    /// it takes a lane's sound and a folder's bus out of the render halfway
-    /// through, with the undo that could put them back refused until the
-    /// export ends. Under an arrangement record it would delete a lane the
-    /// record is writing, whose take then lands on the emptied row at Stop;
-    /// and the record captures its audio by input PICK, numbered in desk
-    /// order over the bound audio tracks at its press, so removing even an
-    /// unrelated bound track above a recorded one hands the record the next
-    /// track's input. Asked by `remove_selected_channels`, the one door
-    /// every road to a removal goes through.
-    fn tracks_held(&mut self) -> bool {
-        let held = self.recorder.exporting || self.recorder.arr_recording;
-        if held {
-            let why = if self.recorder.exporting {
-                "No track is removed while an export runs - it is writing every one."
-            } else {
+            }
+            (ShapeChange::Remove, true) => "No track is removed while an export runs - it is writing every one.",
+            (ShapeChange::Remove, false) => {
                 "No track is removed while the arrangement records - it records each track by its row and input."
-            };
-            self.notify(crate::notify::Kind::Info, why);
+            }
+            (ShapeChange::Insert, true) => {
+                "No track is inserted between others while an export runs - it writes each track by its row. \
+                 A new track joins at the end."
+            }
+            (ShapeChange::Insert, false) => {
+                "No track is inserted between others while the arrangement records - it records each track by \
+                 its row. A new track joins at the end."
+            }
+            (ShapeChange::Kind, true) => "Tracks keep their kind while an export runs - it is playing every one.",
+            (ShapeChange::Kind, false) => {
+                "Tracks keep their kind while the arrangement records - it records each track by what it is."
+            }
+            (ShapeChange::Input, true) => {
+                "Inputs stay as they are while an export runs - it is playing through them."
+            }
+            (ShapeChange::Input, false) => {
+                "Inputs stay as they are while the arrangement records - it records each track from its input."
+            }
+            (ShapeChange::Folder, _) => "Folders keep their shape while an export runs - it writes each folder's bus.",
+            (ShapeChange::Route, _) => {
+                "Routes and sidechains stay as they are while an export runs - it is playing through them."
+            }
+        };
+        Some(why)
+    }
+
+    /// **The line a gesture that makes row `lane` a MIDI track waits with**,
+    /// or `None` when it may go ahead: a MIDI item drawn on a lane, or a
+    /// `.mid` dropped on one, binds a row with no kind to every MIDI device,
+    /// and that binding is its input and its kind at once, which a running
+    /// record or export holds (design 7.13). Past the desk is the row a drop
+    /// below the last lane would append, which is bound the same way. A lane
+    /// that is already a track keeps its kind and binds nothing, so nothing
+    /// holds it. Asked BEFORE the gesture's moment, so a held one lands
+    /// nothing: it used to land its clip on a row whose binding the hold
+    /// had just refused.
+    fn midi_bind_hold_line(&self, lane: usize) -> Option<&'static str> {
+        let binds = lane >= self.desk_extent()
+            || (self.channel_kind(lane).is_none() && self.channel_input_spec(lane) != "midi:all");
+        if binds {
+            self.desk_shape_hold_line(ShapeChange::Input)
+        } else {
+            None
         }
-        held
+    }
+
+    /// **Whether a pasted track landing on row `at` waits**, saying the line
+    /// when it does: the paste gives the empty row the copy's kind and input
+    /// (`paste_track_inner`), which a running record or export holds (design
+    /// 7.13). Past the desk is the row a paste below the last one appends,
+    /// as empty as a vacant row. Asked by both paste roads before their
+    /// moment and before any row is opened or minted, so a held paste
+    /// changes nothing: the kind hold used to refuse inside the paste, which
+    /// then went on to write the name, the input, the bays and the clips
+    /// onto a counted track with no kind.
+    fn paste_held(&mut self, at: usize) -> bool {
+        let Some(copy) = self.track_clipboard.as_ref() else {
+            return false;
+        };
+        let (kind, input) = if at < self.desk_extent() {
+            (self.channel_kind(at), self.channel_input_spec(at))
+        } else {
+            (None, "")
+        };
+        let what = if copy.kind != kind {
+            ShapeChange::Kind
+        } else if copy.input != input {
+            ShapeChange::Input
+        } else {
+            return false;
+        };
+        self.desk_shape_held_for(what)
+    }
+
+    /// [`Self::desk_shape_held_for`] for a reorder: the hold the drags ask.
+    fn desk_shape_held(&mut self) -> bool {
+        self.desk_shape_held_for(ShapeChange::Order)
+    }
+
+    /// The order hold, by its old name: every gesture that reaches
+    /// `reorder_channels` asks it (Cmd/Ctrl+F grouping, a drag that comes
+    /// home or lands).
+    fn lane_order_held(&mut self) -> bool {
+        self.desk_shape_held_for(ShapeChange::Order)
+    }
+
+    /// The folders' hold: Cmd/Ctrl+F's two single-row branches, which move
+    /// no lane.
+    fn folders_held(&mut self) -> bool {
+        self.desk_shape_held_for(ShapeChange::Folder)
+    }
+
+    /// The routes' hold: `AddRoute`, `RemoveRoute` and `SetInsertKeySource`.
+    fn routes_held(&mut self) -> bool {
+        self.desk_shape_held_for(ShapeChange::Route)
+    }
+
+    /// The removal hold: `remove_selected_channels`, the one door every road
+    /// to a removal goes through.
+    fn tracks_held(&mut self) -> bool {
+        self.desk_shape_held_for(ShapeChange::Remove)
     }
 
     /// **Whether the frozen tracks stay frozen, saying so when they do.** A
@@ -12254,31 +12120,23 @@ impl TangentApp {
     }
 
     /// MOVE channel `from` to position `to` — the drag-reorder, both views.
-    /// Everything a channel is follows it: kind, input, icon, colour, name,
-    /// fader, pan, send, mute, solo, polarity, arm, bays (the host moves
-    /// their saved states), and every clip on its lane. The rows between
-    /// shift by one.
+    /// Everything a channel is follows it, because everything a channel is
+    /// is its row (`TrackRow`) or names its identity: kind, input, icon,
+    /// colour, name, fader, pan, send, switches, arm, bays and their saved
+    /// states, and every clip and curve on its lane. The rows between shift
+    /// by one.
     pub fn move_channel(&mut self, from: usize, to: usize) {
-        // Moves a fact the desk index reads; see `desk_index_dirty`.
-        self.desk_index_dirty();
-        use crate::recorder::CHANNELS;
-        if from >= CHANNELS || to >= CHANNELS || from == to {
+        let width = self.desk_extent();
+        if from >= width || to >= width || from == to {
             return;
         }
-        // Not under an arrangement record or a realtime export: the host's
-        // recording lanes and an export's stems are bound to lane INDICES,
-        // and a reorder under either would carve, or write, the wrong lane.
-        // **An ordinary take is not refused**: it films the window and the
-        // desk and holds no lane of its own, and a reorder is exactly the
-        // kind of thing a breakdown video shows. It was refused here on
-        // `state.is_active`, the take machine, which is also what an export
-        // runs on - so `exporting` is the half of that test that meant
-        // something.
-        if self.recorder.exporting || self.recorder.arr_recording {
+        // Not under an arrangement record or a realtime export
+        // (`desk_shape_held`, which says why).
+        if self.desk_shape_held() {
             return;
         }
         // `order[new] = old` — a rotation of the span between.
-        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        let mut order: Vec<usize> = (0..width).collect();
         let ch = order.remove(from);
         order.insert(to, ch);
         self.reorder_channels(&order);
@@ -12293,7 +12151,6 @@ impl TangentApp {
     /// one at a time with `move_channel` walks the target out from under
     /// itself after the first one lands.
     pub fn move_selection(&mut self, from: usize, to: usize) {
-        use crate::recorder::CHANNELS;
         // **The BLOCK, not the selection.** A folder brings its rows with it;
         // one row on its own is still one row. See `drag_block`.
         let group = self.drag_block(from);
@@ -12301,10 +12158,10 @@ impl TangentApp {
             self.move_channel(from, to);
             return;
         }
-        if self.recorder.exporting || self.recorder.arr_recording {
+        if self.desk_shape_held() {
             return;
         }
-        let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        let rest: Vec<usize> = (0..self.desk_extent()).filter(|n| !group.contains(n)).collect();
         // **Where a single track would have landed — which is simply `to`.**
         //
         // `move_channel` removes the lane and inserts at `to` in what is left,
@@ -12326,7 +12183,6 @@ impl TangentApp {
         // to fill the space it left. The owner's rule, in his words: the
         // folder lands where it was dropped.
         let at = to.min(rest.len());
-        let _ = from;
         let mut order = rest;
         for (k, g) in group.iter().enumerate() {
             order.insert(at + k, *g);
@@ -12334,191 +12190,60 @@ impl TangentApp {
         self.reorder_channels(&order);
     }
 
-    /// Put the channels in `order`, where `order[new] = old`.
+    /// Put the channels in `order`, where `order[new] = old`: ONE
+    /// permutation of the rows, through the model's own edit
+    /// ([`Self::desk_permute`]), which carries the clips and the curves.
     ///
-    /// Split out of [`Self::move_channel`] so a multiple selection can hand it
-    /// an order it worked out for itself. Everything that names a lane —
-    /// clips, routes, automation, the selection itself — follows.
+    /// **Nothing else moves, because nothing else names a row.** Every fact
+    /// of a track is its row's, and everything that names a track (the
+    /// selection, the drum panel and its kit, every automation row's state,
+    /// a pending load, a face, a copied effect, the routes, the keys, the
+    /// bypassed bays, every plugin and its saved state) names its identity,
+    /// which a reorder does not change. This used to permute some twenty
+    /// arrays and masks in step and remap a dozen session fields by hand,
+    /// and every one somebody forgot (the T switches, the routes, a lane's
+    /// pad racks) was a moved track wearing another track's state. It also
+    /// handed the host a permutation to carry plugins and faces with; a
+    /// reorder now moves no plugin and renames no file (design 7.13: one
+    /// plan, no round trips), so there is nothing to hand.
     fn reorder_channels(&mut self, order: &[usize]) {
-        // Moves a fact the desk index reads; see `desk_index_dirty`.
-        self.desk_index_dirty();
-        use crate::recorder::CHANNELS;
-        if order.len() != CHANNELS {
+        if order.len() != self.desk_extent() {
             return;
         }
-        // The backstop only: every gesture asks `lane_order_held` before it
+        // The backstop only: every gesture asks `desk_shape_held` before it
         // changes anything, and refusing here alone half-applies them.
         if self.recorder.exporting || self.recorder.arr_recording {
             return;
         }
-        // And the inverse, for everything that NAMES a lane.
-        let mut inv = [0usize; CHANNELS];
+        // **A member the order leaves with no folder above it leaves the
+        // folder** (W6). The model refuses to strand one (`permute`), where
+        // the positional desk let its flag go stale and drew it flat, which
+        // is what this makes true: the row is out of the folder it was
+        // dragged away from. Only a member that HAD a folder: a flag that
+        // was already stale is not this gesture's to clear.
+        let rows = &self.settings.rows;
+        let mut filed = vec![false; order.len()];
         for (new, old) in order.iter().enumerate() {
-            inv[*old] = new;
+            let above = new.checked_sub(1).map(|p| (&rows[order[p]], filed[p]));
+            filed[new] = rows[*old].in_folder && above.is_some_and(|(r, f)| r.folder || f);
         }
-
-        // ── channel space ────────────────────────────────────────────────
-        // **The ids move with their rows**: a reorder renumbers lanes and
-        // nothing else, so every track keeps the id it had.
-        let ids = self.settings.desk_ids();
-        self.settings.track_ids = (0..CHANNELS).map(|n| ids[order[n]]).collect();
-        self.settings.channel_gains =
-            std::array::from_fn(|n| self.settings.channel_gains[order[n]]);
-        self.settings.channel_pans =
-            std::array::from_fn(|n| self.settings.channel_pans[order[n]]);
-        self.settings.channel_kinds =
-            std::array::from_fn(|n| self.settings.channel_kinds[order[n]]);
-        self.settings.channel_icons =
-            std::array::from_fn(|n| self.settings.channel_icons[order[n]]);
-        while self.settings.channel_inputs.len() < CHANNELS {
-            self.settings.channel_inputs.push(String::new());
+        let leaving: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter(|(new, old)| rows[**old].in_folder && !filed[*new] && self.folder_of(**old).is_some())
+            .map(|(_, old)| *old)
+            .collect();
+        for old in leaving {
+            self.set_in_folder(old, false);
         }
-        let inputs = self.settings.channel_inputs.clone();
-        for n in 0..CHANNELS {
-            self.settings.channel_inputs[n] = inputs[order[n]].clone();
+        if self.desk_permute(order).is_err() {
+            return;
         }
-        // The channel block exactly fills a u32 at thirty-two, so the
-        // "everything above the channels" complement has to dodge the
-        // 1<<32 overflow; the rows' strip masks are u64 and get their own
-        // mover (the specials' switches are theirs and do not move).
-        let chan_bits_u32: u32 = if CHANNELS >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << CHANNELS) - 1
-        };
-        let move_bits_u32 = |mask: u32| -> u32 {
-            let mut out = mask & !chan_bits_u32;
-            for n in 0..CHANNELS {
-                if mask & (1 << order[n]) != 0 {
-                    out |= 1 << n;
-                }
-            }
-            out
-        };
-        let move_bits_u64 = |mask: u64| -> u64 {
-            let mut out = mask & !((1u64 << CHANNELS) - 1);
-            for n in 0..CHANNELS {
-                if mask & (1 << order[n]) != 0 {
-                    out |= 1 << n;
-                }
-            }
-            out
-        };
-        self.settings.channel_armed = Some(move_bits_u32(self.armed_mask()));
-        self.settings.strip_muted = move_bits_u64(self.settings.strip_muted);
-        self.settings.strip_soloed = move_bits_u64(self.settings.strip_soloed);
-        self.settings.strip_phase = move_bits_u64(self.settings.strip_phase);
-        {
-            let mask = self.settings.tracks_added;
-            let mut out = mask & !((1i64 << CHANNELS) - 1);
-            for n in 0..CHANNELS {
-                if mask & (1 << order[n]) != 0 {
-                    out |= 1 << n;
-                }
-            }
-            self.settings.tracks_added = out;
-        }
-
-        // ── the rows' strip facts; the specials keep theirs (W5) ─────────
-        let colors = self.settings.strip_colors;
-        for n in 0..CHANNELS {
-            self.settings.strip_colors[n] = colors[order[n]];
-        }
-        while self.settings.strip_names.len() < CHANNELS {
-            self.settings.strip_names.push(String::new());
-        }
-        let names = self.settings.strip_names.clone();
-        for n in 0..CHANNELS {
-            self.settings.strip_names[n] = names[order[n]].clone();
-        }
-        let sends = self.settings.strip_sends;
-        for n in 0..CHANNELS {
-            self.settings.strip_sends[n] = sends[order[n]];
-        }
-        // **The per-channel `Vec<bool>` flags, which were being left behind.**
-        //
-        // `strip_to_theory` was not in this function at all: reordering
-        // tracks moved the gains, the colours, the names, the inserts and
-        // every mask — and left the T switches on whichever rows those
-        // channels used to occupy. Silent, because the switch went on drawing
-        // a correct-looking state; it was simply a different track's.
-        //
-        // The two folder flags have the same requirement, and this is where
-        // that requirement is met for all three at once rather than in three
-        // places somebody can forget one of.
-        for v in [
-            &mut self.settings.strip_to_theory,
-            &mut self.settings.strip_is_folder,
-            &mut self.settings.strip_in_folder,
-            &mut self.settings.strip_folder_shut,
-        ] {
-            while v.len() < CHANNELS {
-                v.push(false);
-            }
-            let was = v.clone();
-            for n in 0..CHANNELS {
-                v[n] = was[order[n]];
-            }
-        }
-        // **Every plugin bay stays exactly where it is**: a bay is keyed by
-        // its track's identity (`Settings::plugins`), so the track's two
-        // chains, its pedalboard and its pads are wherever the track is,
-        // with nothing to carry. This block used to copy the seat map
-        // through the permutation, and the seats it did not list (a lane's
-        // pad racks) were left on the row for the next track to inherit.
-
-        // ── the document: every clip follows its lane ────────────────────
-        for c in &mut self.arrangement.clips {
-            if c.lane < CHANNELS {
-                c.lane = inv[c.lane];
-            }
-        }
-
-        // ── session state ────────────────────────────────────────────────
-        //
-        // **What names a TRACK is keyed by its identity, so nothing here
-        // carries it**: the selection, the drum panel and its kit, every
-        // automation row's open, armed and bypassed state, its mode, latch
-        // and last written point, the paste's aims and the copied track all
-        // stayed on their tracks because their tracks did not change. This
-        // block used to remap each of them by hand, and each one added
-        // without its remap (the kits, the curves' rows, the T switches)
-        // was a moved track wearing another track's state until somebody
-        // noticed. What names a ROW for one gesture lets go instead, at the
-        // end, once the route table it relabels has moved too - see
-        // `on_desk_shape_change`, which also puts the pedal window down.
-        //
-        // The bay aims (a pick under way, the face it opens on load, an
-        // open face, a copied effect, a sampler load) are keyed by the
-        // bay's identity too, and so stay aimed at their bay with no remap.
         // **The kits stay with their tracks and the host hears of it.** A
         // drum lane's kit is keyed by its track, so it moved with the row by
         // not moving at all; what the engine holds is per LANE, and every
         // moved drum lane's samples have to be pushed again.
         self.drumpad_dirty = true;
-        // **The CURVES.** They are document state keyed by lane (until W6
-        // gives them an `AutoLane`), so without this a track's volume
-        // automation stays on the seat and starts driving whichever track
-        // moved into it.
-        {
-            let moved: Vec<crate::automation::Curve> = self
-                .arrangement
-                .automation
-                .curves()
-                .iter()
-                .map(|c| {
-                    // The curve itself, re-laned: a plugin curve waiting
-                    // for its plugin keeps the mark of whose it is.
-                    let mut c = c.clone();
-                    if c.lane < CHANNELS {
-                        c.lane = inv[c.lane];
-                    }
-                    c
-                })
-                .collect();
-            self.arrangement.automation =
-                crate::automation::Automation::from_curves(moved);
-        }
         // The chosen nodes and the chosen row let go. Not because they would
         // land on another track - they name their owner - but because they
         // are a hand's choice, and a reorder is the hand doing something
@@ -12526,27 +12251,101 @@ impl TangentApp {
         // eye has just watched move.
         self.arr_auto_nodes.clear();
         self.arr_auto_sel = None;
-
-        // **The sidechain keys, the routes and the bypassed bays carry
-        // nothing either.** Each names its ends by identity (a bay, a
-        // track), so a reorder cannot leave one behind on a row: the
-        // compressor keeps ducking to its own source, a route keeps moving
-        // its own track, a flag stays on its own plugin.
-        // The desk has its new shape: the aims that named rows let go. The
-        // kit sidecar is not written: it files kits by the rows of the
-        // document on disk, which only a save moves (`drumpad_save`).
-        self.on_desk_shape_change();
-
-        // **And the moment this gesture leaves keeps the order**, so undo
-        // can hand the host the way back - see `Moment::perm`. Composed, for
-        // a batch that reorders twice before it commits.
-        self.send_desk_perm(order);
-        self.perm_since_moment = Some(match self.perm_since_moment.take() {
-            Some(first) => compose_orders(&first, order),
-            None => order.to_vec(),
-        });
         self.save_settings();
         self.arr_save_edits();
+    }
+
+    // ── the four structural edits (design section 4) ─────────────────────
+    //
+    // The ONLY roads by which the desk's rows change shape: `append`,
+    // `insert_rows`, `remove_rows` and `permute`, each run on the live desk
+    // as one model (`Settings::with_model`), each refusing before it
+    // changes anything. Each carries what the model cannot reach - the clips
+    // and the curves, positional by lane - through its `Reshape`, lets go of
+    // every aim that named a row (`on_desk_shape_change`), and under
+    // cfg(test) proves the desk names nothing that is not on it
+    // (`DeskModel::check`).
+
+    /// **Insert `rows` at lane `at`**, every row from `at` down moving by
+    /// their count. See [`crate::desk_model::DeskModel::insert_rows`].
+    fn desk_insert(
+        &mut self,
+        at: usize,
+        rows: Vec<crate::desk_model::TrackRow>,
+    ) -> Result<crate::desk_model::Reshape, crate::desk_model::EditRefused> {
+        let reshape = self.settings.with_model(|m| m.insert_rows(at, rows))?;
+        self.carry_lanes(&reshape);
+        Ok(reshape)
+    }
+
+    /// **Take the rows at `lanes` off the desk**, and everything that names
+    /// them: their bays and bypass (the pedalboard leaves with its row),
+    /// every route, key and send touching them. See
+    /// [`crate::desk_model::DeskModel::remove_rows`].
+    fn desk_remove(
+        &mut self,
+        lanes: &[usize],
+    ) -> Result<crate::desk_model::Removed, crate::desk_model::EditRefused> {
+        let removed = self.settings.with_model(|m| m.remove_rows(lanes))?;
+        self.carry_lanes(&removed.reshape);
+        Ok(removed)
+    }
+
+    /// **Reorder the rows**, `order[new] = old`. See
+    /// [`crate::desk_model::DeskModel::permute`].
+    fn desk_permute(
+        &mut self,
+        order: &[usize],
+    ) -> Result<crate::desk_model::Reshape, crate::desk_model::EditRefused> {
+        let reshape = self.settings.with_model(|m| m.permute(order))?;
+        self.carry_lanes(&reshape);
+        Ok(reshape)
+    }
+
+    /// **What the model cannot reach, carried through a reshape**: every
+    /// clip and every row's curve to its row's new lane, the master's
+    /// curves untouched (they name the master). A clip or curve on a lane
+    /// the edit took away is gone with it (the removal took it first; this
+    /// is the backstop), and one on a lane past the desk names no row and is
+    /// left as it was. Then the aims that named rows let go, and the index
+    /// is marked.
+    fn carry_lanes(&mut self, reshape: &crate::desk_model::Reshape) {
+        let width = reshape.old_to_new.len();
+        self.arrangement.clips.retain_mut(|c| {
+            if c.lane >= width {
+                return true;
+            }
+            match reshape.lane(c.lane) {
+                Some(n) => {
+                    c.lane = n;
+                    true
+                }
+                None => false,
+            }
+        });
+        let curves: Vec<crate::automation::Curve> = self
+            .arrangement
+            .automation
+            .curves()
+            .iter()
+            .filter_map(|c| {
+                let mut c = c.clone();
+                if let AutoLane::Row(r) = c.lane {
+                    if r < width {
+                        c.lane = AutoLane::Row(reshape.lane(r)?);
+                    }
+                }
+                Some(c)
+            })
+            .collect();
+        self.arrangement.automation = crate::automation::Automation::from_curves(curves);
+        self.desk_index_dirty();
+        self.on_desk_shape_change();
+        #[cfg(test)]
+        {
+            let dangling = self.settings.model_view().check();
+            assert!(dangling.is_empty(), "a structural edit left the desk naming what is not on it: {dangling:?}");
+        }
     }
 
     /// **Close the automation rows these owners have and the rows `curves`
@@ -12624,10 +12423,24 @@ impl TangentApp {
         if !self.row_counted(lane) && !self.admit_tracks(1) {
             return;
         }
-        if self.channel_kind(lane).is_none() {
-            // Drawing a MIDI item on a bare lane makes it a
-            // track — through the spec, the one authority.
-            let _ = self.set_channel_input_spec(lane, "midi:all");
+        // **The binding's hold, before the moment** (`midi_bind_hold_line`):
+        // under a running record or export a bare lane stays bare and the
+        // item is not drawn, rather than landing on a row with no kind.
+        if let Some(line) = self.midi_bind_hold_line(lane) {
+            self.notify(crate::notify::Kind::Info, line);
+            return;
+        }
+        // **ONE moment for the draw**: the lane made a MIDI track (its
+        // binding commits a moment of its own) and the item drawn on it.
+        // It was two, and the first Ctrl+Z took the item back and left a
+        // track nobody had asked for: one gesture, one moment.
+        self.begin_one_moment();
+        // Drawing a MIDI item on a bare lane makes it a track, through the
+        // spec, the one authority; a binding that does not take (a lane
+        // past the desk) draws nothing on a row it never made a track.
+        if self.channel_kind(lane).is_none() && !self.set_channel_input_spec(lane, "midi:all") {
+            self.commit_undo_moment();
+            return;
         }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -12659,78 +12472,188 @@ impl TangentApp {
             warp_rate: 0,
         });
         self.arr_save_edits();
+        self.commit_undo_moment();
     }
 
-    /// **Open an empty lane directly below `n`**, the rows under it shifting
-    /// down a place, and answer where the hole landed.
+    /// **Open a row for a new track at lane `at`**, and answer where it is
+    /// (design section 4).
     ///
-    /// The desk is thirty-two fixed channels, so "insert" is not a growth —
-    /// it is a PERMUTATION. A lane nobody is using is spent to make the gap,
-    /// and [`Self::reorder_channels`] carries everything that names a lane
-    /// (clips, routes, automation, the bays' saved plugin states, the
-    /// selection) along with it, which is the whole reason this is one call
-    /// to that and not thirty assignments here.
+    /// **The desk grows**: a new empty row is inserted at `at`, every row
+    /// from there down moving a place, through the model's own insert
+    /// (`desk_insert`), which carries their clips and curves; `member` says
+    /// whether it joins the folder run it lands in, which the insert holds
+    /// it to (a row that would cut a run in two is refused). It was a
+    /// PERMUTATION while the desk was thirty-two fixed rows: a lane nobody
+    /// was using was spent to make the gap, and a desk with none free below
+    /// could not insert at all.
     ///
-    /// **The spare lane is taken from BELOW the insertion point**, always.
-    /// Any free lane would make a hole in the right place, but one taken from
-    /// above would shift every track between it and `n` UP a row — tracks the
-    /// gesture never mentioned, moving in the opposite direction to the one
-    /// the user asked for. Taken from below, the only rows that move are the
-    /// ones under the click, which is what "insert below" looks like. A desk
-    /// with nothing free under `n` answers `None`, and the caller says so -
-    /// and so does a lane order an export or an arrangement record holds
-    /// (`lane_order_held`, which says why).
-    fn open_lane_below(&mut self, n: usize) -> Option<usize> {
-        // Moves a fact the desk index reads; see `desk_index_dirty`.
-        self.desk_index_dirty();
-        use recorder::CHANNELS;
-        if n >= CHANNELS {
+    /// **A fully empty vacant row standing exactly at `at` is used instead**
+    /// (wearing a fresh id once something is made on it, `add_bare_track`):
+    /// a legacy desk's thirty-two rows are mostly such rows, and walking past
+    /// them would leave a hole between every track Add makes. Only a row
+    /// that holds nothing at all: a pedalboard left on a row by an older
+    /// build's removal is somebody's, and a new track there would adopt it
+    /// (design section 4: residue is never reused).
+    ///
+    /// `None` when a row would land between others under a running record
+    /// or export (`desk_shape_held_for`, which says the line; a row at the
+    /// end moves nobody and is never held), or the id counter is spent.
+    fn open_row(&mut self, at: usize, member: bool) -> Option<usize> {
+        let width = self.desk_extent();
+        let at = at.min(width);
+        let between = self.opens_between(at, member);
+        if at < width && !between {
+            return Some(at);
+        }
+        if between && self.desk_shape_held_for(ShapeChange::Insert) {
             return None;
         }
-        // Not under an export or an arrangement record, which write by row.
-        if self.lane_order_held() {
-            return None;
-        }
-        let free = (n + 1..CHANNELS).find(|c| !self.channel_used(*c) && !self.is_folder(*c))?;
-        // `free > n`, so removing it leaves every index up to `n` alone and
-        // the gap belongs at `n + 1`.
-        let mut order: Vec<usize> = (0..CHANNELS).filter(|c| *c != free).collect();
-        let at = n + 1;
-        order.insert(at, free);
-        // The clipboard names its source TRACK (`TrackCopy::from_id`), so the
-        // rows moving under it need nothing: the host is sent to that
-        // track's states wherever the move leaves it.
-        self.reorder_channels(&order);
-        // **Folder membership is the one thing the permutation cannot get
-        // right**, because the lane that was spent came from outside every
-        // group and brings that flag with it. A row opened under a folder's
-        // header, or between two of its children, belongs to that folder —
-        // otherwise the group is split in two by a track that is not in it,
-        // and `folder_of`'s walk stops at the stranger.
-        let member = self.is_folder(n) || self.in_folder(n);
-        if self.settings.strip_in_folder.len() > at {
-            self.settings.strip_in_folder[at] = member;
-        }
+        let mut row = crate::desk_model::TrackRow::vacant(self.mint_id()?);
+        row.in_folder = member;
+        self.desk_insert(at, vec![row]).ok()?;
         Some(at)
     }
 
+    /// **Whether [`Self::open_row`] would put a new row BETWEEN others at
+    /// `at`**: short of the end of the desk, with no empty row standing there
+    /// for it to use (one that holds nothing and is in, or out of, the folder
+    /// run as `member` asks). The one spelling of that rule, so a road that
+    /// asks its holds before opening a row asks the ones the opening will.
+    fn opens_between(&self, at: usize, member: bool) -> bool {
+        at < self.desk_extent() && !(self.row_reusable(at) && self.row(at).is_some_and(|r| r.in_folder == member))
+    }
+
+    /// **Whether row `n` holds nothing at all**, so a new track may stand on
+    /// it rather than beside it: the vacant row's own values (no kind, name,
+    /// colour, level, input, flag, send, instrument or freeze), and nothing
+    /// anywhere naming it: no bay of any rack (a pedalboard included), no
+    /// bypass, route, key or send, no clip, no curve and no kit.
+    fn row_reusable(&self, n: usize) -> bool {
+        let Some(row) = self.row(n) else {
+            return false;
+        };
+        if *row != crate::desk_model::TrackRow::vacant(row.id) {
+            return false;
+        }
+        let node = crate::desk_id::Node::Track(row.id);
+        let named = self.settings.plugins.keys().any(|sb| sb.seat.node == node)
+            || self.settings.bypass.iter().any(|sb| sb.seat.node == node)
+            || self.settings.routes.0.iter().any(|r| r.from == node || r.target == crate::routing::Target::Node(node))
+            || self.settings.insert_keys.0.iter().any(|k| k.from == node || k.seat.seat.node == node)
+            || self.settings.rows.iter().any(|r| r.sends.iter().any(|s| s.to == node))
+            || self.settings.specials.iter().any(|(_, sp)| sp.sends.iter().any(|s| s.to == node));
+        let kit = self.drumpad_kits.get(&row.id).is_some_and(|k| *k != crate::drumpad::DrumpadDoc::default());
+        let curve = self.arrangement.automation.curves().iter().any(|c| c.lane == AutoLane::Row(n));
+        !named && !kit && !curve && !self.lane_has_clips(n)
+    }
+
+    /// **The row a new LAST track takes** (design section 4): the first row
+    /// after the last one the desk draws (`DeskIndex`, vacant rows hidden)
+    /// when that row holds nothing at all ([`Self::row_reusable`]), else a
+    /// new row appended at the end. Never an insert: a new last row moves no
+    /// row and no input pick, so it is the one shape change a running record
+    /// or export lets through (design 7.13), and a row holding residue is
+    /// never taken over. `None` only when the id counter is spent.
+    fn open_trailing_row(&mut self) -> Option<usize> {
+        let end = {
+            let index = self.desk_index();
+            (0..index.extent())
+                .rev()
+                .find(|r| index.class(*r) != crate::desk_index::RowClass::Vacant)
+                .map_or(0, |r| r + 1)
+        };
+        if end < self.desk_extent() && self.row_reusable(end) {
+            return Some(end);
+        }
+        self.open_row(self.desk_extent(), false)
+    }
+
+    /// **What the trailing add is right now** (design section 10): locked
+    /// at the free cap, where Add would be refused for the cap, and open
+    /// otherwise. Read off the desk index's count, once a frame per view,
+    /// rather than `counted_tracks`, which walks every clip per row.
+    fn trailing_plus(&self) -> crate::mixer_panel::Plus {
+        let have = self.desk_index().counted();
+        match self.track_cap() {
+            Some(cap) if have >= cap => crate::mixer_panel::Plus::Locked,
+            _ => crate::mixer_panel::Plus::Trailing,
+        }
+    }
+
+    /// **The trailing add, pressed**, on either view: Add
+    /// ([`Self::add_track`]), or at the free cap the Supporter Key dialog
+    /// the padlock on it promises, rather than a refusal line.
+    fn press_trailing_add(&mut self) {
+        if self.trailing_plus() == crate::mixer_panel::Plus::Locked {
+            self.dialog = Some(Dialog::SupporterKey {
+                input: String::new(),
+                message: None,
+                installed_as: self.license.display_name().map(str::to_owned),
+                focus: true,
+            });
+            return;
+        }
+        self.add_track();
+    }
+
+    /// **Add a track**: Ctrl/Cmd+T in both views and the trailing + at the
+    /// end of the desk. Asks the creation gate first and says why when it
+    /// refuses (at the cap they used to do nothing at all), then makes a
+    /// bare track and selects it: directly under the selected row, joining
+    /// its folder run as Insert Track does, or with nothing selected at the
+    /// end ([`Self::open_trailing_row`]), so the trailing + makes the next
+    /// track where the eye already is. Under a running record or export it
+    /// is always the end, which moves nobody. A selected row that is drawn
+    /// but no track yet (the indented plus) is where the hand meant, the
+    /// owner's rule, and becomes the track in place.
+    pub fn add_track(&mut self) {
+        if !self.admit_tracks(1) {
+            return;
+        }
+        if let Some(sel) = self
+            .selected_row()
+            .filter(|n| *n < self.desk_extent() && !self.row_counted(*n) && self.in_folder(*n))
+        {
+            if self.add_bare_track(sel) {
+                self.select_alone(sel);
+            }
+            return;
+        }
+        let held = self.recorder.exporting || self.recorder.arr_recording;
+        // ONE moment: the row opened and the track made on it.
+        self.begin_one_moment();
+        let at = match self.selected_row().filter(|n| *n < self.desk_extent() && !held) {
+            Some(sel) => {
+                let member = self.is_folder(sel) || self.in_folder(sel);
+                self.open_row(sel + 1, member)
+            }
+            None => self.open_trailing_row(),
+        };
+        if let Some(at) = at {
+            if self.add_bare_track(at) {
+                self.select_alone(at);
+            }
+        }
+        self.save_settings();
+        self.commit_undo_moment();
+    }
+
     /// **A new empty track directly under `n`** — the track menu's Insert
-    /// Track. `false` when there is no free lane below to make room with.
+    /// Track. `false` when nothing was made: the cap, or a record or export
+    /// holding the rows in place (`open_row`, which says so).
     pub fn insert_track_below(&mut self, n: usize) -> bool {
-        // **The gate before the hold.** The free desk's leak was here: the
-        // spare lane `open_lane_below` spends was searched across the whole
-        // capacity and `add_bare_track` asked only for a valid index, so a
-        // full free desk spent a lane past its cap. Asked before the hold so
-        // a refusal leaves no moment.
+        if n >= self.desk_extent() {
+            return false;
+        }
+        // **The gate before the hold.** Asked before the hold so a refusal
+        // leaves no moment.
         if !self.admit_tracks(1) {
             return false;
         }
-        // **ONE moment.** `open_lane_below` reorders the lanes and
-        // `reorder_channels` commits; the track that lands in the gap
-        // commits too. So one press left two, and the moment between them
-        // was every track below shifted a row with nothing in the gap.
+        // **ONE moment**: the row opened and the track made on it.
         self.begin_one_moment();
-        let Some(at) = self.open_lane_below(n) else {
+        let member = self.is_folder(n) || self.in_folder(n);
+        let Some(at) = self.open_row(n + 1, member) else {
             self.commit_undo_moment();
             return false;
         };
@@ -12747,18 +12670,28 @@ impl TangentApp {
     /// change it from the overwrite to add below inbetween selected track and
     /// track below it."
     pub fn paste_track_below(&mut self, n: usize) -> bool {
-        if !self.track_on_clipboard() {
+        if !self.track_on_clipboard() || n >= self.desk_extent() {
             return false;
         }
-        // The same gate `insert_track_below` asks, for the same leak.
+        // The same gate `insert_track_below` asks.
         if !self.admit_tracks(1) {
             return false;
         }
-        // The same two-moment gesture `insert_track_below` is: a lane
-        // permutation and then the paste. Held after the clipboard check,
-        // so a paste with nothing on it holds nothing.
+        // **The desk's shape hold, before the moment and before a row is
+        // opened.** A paste between two rows waits as an insert does
+        // (`open_row` says that line); one onto the empty row standing there,
+        // or onto a row appended at the end, gives it the copy's kind and
+        // input, which wait too (`paste_held`). Asked after `open_row`, a
+        // held paste left the row it had appended behind.
+        let member = self.is_folder(n) || self.in_folder(n);
+        if !self.opens_between(n + 1, member) && self.paste_held(n + 1) {
+            return false;
+        }
+        // The same gesture `insert_track_below` is: a row opened and then
+        // the paste. Held after the clipboard check, so a paste with nothing
+        // on it holds nothing.
         self.begin_one_moment();
-        let Some(at) = self.open_lane_below(n) else {
+        let Some(at) = self.open_row(n + 1, member) else {
             self.commit_undo_moment();
             return false;
         };
@@ -12769,27 +12702,28 @@ impl TangentApp {
 
     /// **Where a paste aimed at `n` should land**, so the menu row, the
     /// arrangement's Ctrl+V and the mixer's agree without each deciding for
-    /// itself: an empty slot receives the track, a live one keeps it and the
+    /// itself: an empty row receives the track, a live one keeps it and the
     /// copy goes under it.
     pub fn paste_track_at(&mut self, n: usize) {
-        if n < recorder::CHANNELS && !self.channel_used(n) {
+        if n < self.desk_extent() && !self.channel_used(n) {
             self.paste_track(n);
         } else {
             self.paste_track_below(n);
         }
     }
 
-    /// Add a BARE track on channel `n`: it exists, dry (its send at zero),
-    /// and says NO INPUT until the chip binds one: the owner's flow.
+    /// Add a BARE track on row `n`: it exists, dry (its send at zero), and
+    /// says NO INPUT until the chip binds one: the owner's flow. Where the
+    /// header's circled plus, `HdrAdd` and the mixer's + land on a row that
+    /// is drawn but no track yet, and what [`Self::add_track`] makes on the
+    /// row it opens.
     ///
-    /// **Asks the creation gate first**, and says why when it refuses: this
-    /// is where Ctrl/Cmd+T, the header's circled plus, `HdrAdd` and the
-    /// mixer's + all land, and at the cap they used to do nothing at all.
+    /// **Asks the creation gate first**, and says why when it refuses.
     /// `false` when nothing was added.
     fn add_bare_track(&mut self, n: usize) -> bool {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        if n >= recorder::CHANNELS {
+        if n >= self.desk_extent() {
             return false;
         }
         let fresh = !self.row_counted(n);
@@ -12800,7 +12734,9 @@ impl TangentApp {
         if fresh {
             self.mint_row_id(n);
         }
-        self.settings.tracks_added |= 1 << n;
+        if let Some(row) = self.row_mut(n) {
+            row.added = true;
+        }
         // Dry at birth — see the bind's own comment: only the shipped DX7
         // comes wired to the reverb.
         self.settings.set_strip_send(recorder::StripRef::Row(n), 0.0);
@@ -12825,7 +12761,7 @@ impl TangentApp {
     /// leaves a note in `insert_state_copy` for the host to act on — see
     /// `take_insert_state_copy`.
     pub fn copy_track(&mut self, n: usize) {
-        if n >= recorder::CHANNELS {
+        if n >= self.desk_extent() {
             return;
         }
         // A track's strip facts are its row's (W5).
@@ -12838,17 +12774,12 @@ impl TangentApp {
             from_id: Some(self.track_id_at(n)),
             files_at: Some(self.track_id_at(n)),
             kind: self.channel_kind(n),
-            name: self
-                .settings
-                .strip_names
-                .get(at)
-                .cloned()
-                .unwrap_or_default(),
-            color: self.settings.strip_colors.get(at).copied().unwrap_or(0),
-            icon: self.settings.channel_icons.get(n).copied().unwrap_or(0),
-            gain: self.settings.channel_gains.get(n).copied().unwrap_or(1.0),
-            pan: self.settings.channel_pans.get(n).copied().unwrap_or(0.0),
-            send: self.settings.strip_sends.get(at).copied().unwrap_or(0.0),
+            name: self.row(at).map(|r| r.name.clone()).unwrap_or_default(),
+            color: self.row(at).map_or(0, |r| r.color),
+            icon: self.row(n).map_or(0, |r| r.icon),
+            gain: self.row(n).map_or(1.0, |r| r.gain),
+            pan: self.row(n).map_or(0.0, |r| r.pan),
+            send: self.row(at).map_or(0.0, |r| crate::desk_model::fx_send_level(&r.sends)),
             input: self.channel_input_spec(n).to_owned(),
             // **All SIX slots**, through the seat map, because a track's
             // 3..5 live in an appended seat and a copy that took three of
@@ -12884,7 +12815,7 @@ impl TangentApp {
                 .automation
                 .curves()
                 .iter()
-                .filter(|c| c.lane == n)
+                .filter(|c| c.lane == AutoLane::Row(n))
                 .cloned()
                 .collect(),
         });
@@ -12987,15 +12918,21 @@ impl TangentApp {
     /// two clips sharing an id is a document that cannot say which one an
     /// edit meant.
     pub fn paste_track(&mut self, into: usize) {
-        if into >= recorder::CHANNELS || self.is_folder(into) || self.channel_used(into) {
+        if into >= self.desk_extent() || self.is_folder(into) || self.channel_used(into) {
             return;
         }
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
         // Always a new track (the refusals above leave only empty rows), so
-        // always asked, and before the hold below.
+        // always asked, and before the moment's hold below.
         if !self.admit_tracks(1) {
+            return;
+        }
+        // **The desk's shape hold, before anything is written**: the copy's
+        // kind and input land on this row, and under a running record or
+        // export they wait with the line (`paste_held`).
+        if self.paste_held(into) {
             return;
         }
         // **ONE moment for the paste.** A track is a kind, a name, a colour,
@@ -13019,9 +12956,11 @@ impl TangentApp {
         // A paste is a NEW track, never the source again: its own id. Before
         // `set_channel_kind`, which then finds the row counted.
         self.mint_row_id(into);
-        self.settings.tracks_added |= 1 << into;
+        if let Some(row) = self.row_mut(into) {
+            row.added = true;
+        }
         self.set_channel_kind(into, copy.kind);
-        if let Some(name) = self.settings.strip_names.get_mut(at) {
+        if let Some(name) = self.row_mut(at).map(|r| &mut r.name) {
             // A copy says so. Two tracks with one name is a mixer nobody can
             // read, and the owner can rename it in the same gesture that
             // would have renamed it anyway.
@@ -13031,27 +12970,20 @@ impl TangentApp {
                 format!("{} 2", copy.name)
             };
         }
-        if let Some(c) = self.settings.strip_colors.get_mut(at) {
+        if let Some(c) = self.row_mut(at).map(|r| &mut r.color) {
             *c = copy.color;
         }
-        if let Some(i) = self.settings.channel_icons.get_mut(into) {
+        if let Some(i) = self.row_mut(into).map(|r| &mut r.icon) {
             *i = copy.icon;
         }
-        if let Some(g) = self.settings.channel_gains.get_mut(into) {
+        if let Some(g) = self.row_mut(into).map(|r| &mut r.gain) {
             *g = copy.gain;
         }
-        if let Some(p) = self.settings.channel_pans.get_mut(into) {
+        if let Some(p) = self.row_mut(into).map(|r| &mut r.pan) {
             *p = copy.pan;
         }
-        if let Some(sd) = self.settings.strip_sends.get_mut(at) {
-            *sd = copy.send;
-        }
-        if self.settings.channel_inputs.len() <= into {
-            self.settings
-                .channel_inputs
-                .resize(into + 1, String::new());
-        }
-        if let Some(inp) = self.settings.channel_inputs.get_mut(into) {
+        self.settings.set_strip_send(recorder::StripRef::Row(at), copy.send);
+        if let Some(inp) = self.row_mut(into).map(|r| &mut r.input) {
             *inp = copy.input.clone();
         }
         // Through `set_plugin`, so the host's reconcile loads each bay the
@@ -13076,14 +13008,15 @@ impl TangentApp {
         // **Its automation, re-laned**, and in place of whatever the lane
         // held: a curve left on an empty slot would play under the copy.
         let curves = self.arrangement.automation.curves();
-        if !copy.automation.is_empty() || curves.iter().any(|c| c.lane == into) {
+        let lane = AutoLane::Row(into);
+        if !copy.automation.is_empty() || curves.iter().any(|c| c.lane == lane) {
             let mut kept: Vec<crate::automation::Curve> =
-                curves.iter().filter(|c| c.lane != into).cloned().collect();
+                curves.iter().filter(|c| c.lane != lane).cloned().collect();
             // Each curve itself, re-laned - a waiting curve keeps the mark
             // of whose it is (`Curve::tenant`).
             kept.extend(copy.automation.iter().map(|c| {
                 let mut c = c.clone();
-                c.lane = into;
+                c.lane = lane;
                 c
             }));
             self.arrangement.automation = crate::automation::Automation::from_curves(kept);
@@ -13124,9 +13057,10 @@ impl TangentApp {
     /// **The rows the two TRACKS stand on now**, asked as the note is taken,
     /// so a reorder between the copy and the paste (or the paste and the
     /// take) cannot hand the host another track's files. A source removed
-    /// since - a cut - stands on no row; its files are on the row its
-    /// removal emptied (`TrackCopy::files_at`), wherever that row is now,
-    /// and nothing when a new track has been made there.
+    /// since - a cut - stands on no row, and since Remove deletes its row
+    /// (W6) neither does anything it left, so this form answers nothing for
+    /// it; the identity form (`take_insert_state_copy_ids`) still names the
+    /// track, whose states the shelf keeps under its own bays.
     pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
         let (from, to, files_at) = self.insert_state_copy.take()?;
         let from = self.row_of(from).or_else(|| self.row_of(files_at))?;
@@ -13146,24 +13080,30 @@ impl TangentApp {
     /// **Every row's id, in lane order**: the desk's rows by identity, for
     /// the host to name plugin states and engine lanes by (C11). Row r is
     /// `track_ids()[r]`.
-    pub fn track_ids(&self) -> &[crate::desk_id::TrackId] {
-        &self.settings.track_ids
+    pub fn track_ids(&self) -> Vec<crate::desk_id::TrackId> {
+        self.settings.desk_ids()
+    }
+
+    /// **Row `row`'s track**, `None` past the desk: [`Self::track_ids`] for
+    /// one row, without the list.
+    pub fn track_at(&self, row: usize) -> Option<crate::desk_id::TrackId> {
+        self.row(row).map(|r| r.id)
     }
 
     /// **The row a track sits on**, or `None` for a track this desk does
     /// not hold (removed, or never here): the one way back from an id.
     pub fn row_of(&self, id: crate::desk_id::TrackId) -> Option<usize> {
-        self.settings.track_ids.iter().position(|t| *t == id)
+        self.settings.row_of(id)
     }
 
-    /// Row `n`'s id. A row past the ids reads as its identity id, the rule
-    /// every legacy desk obeys; no row past the live desk is ever asked.
+    /// Row `n`'s id. **A row past the desk names nobody**: it reads as
+    /// [`NO_TRACK`], which no desk mints (the counter stops short of it), so
+    /// a question asked of the trailing add or of a row an edit just took
+    /// away can never land on a real track. It read as its identity id, the
+    /// legacy rule, while the desk was thirty-two rows and every id below
+    /// that was some row's; an Add-minted `t40` is not row forty.
     fn track_id_at(&self, n: usize) -> crate::desk_id::TrackId {
-        self.settings
-            .track_ids
-            .get(n)
-            .copied()
-            .unwrap_or(crate::desk_id::TrackId(u32::try_from(n).unwrap_or(u32::MAX)))
+        self.row(n).map_or(NO_TRACK, |r| r.id)
     }
 
     /// **Row `n` becomes a new track, so it gets a new id** (design 3): add,
@@ -13189,26 +13129,22 @@ impl TangentApp {
         }
     }
 
-    /// **The row a removal empties gets a new id, and nothing follows it**:
-    /// the removed track keeps its own, so whatever still names it - its
-    /// automation rows, the drum panel, a host's note - is inert from here,
-    /// and the undo that brings the track back brings its id back with it.
-    fn mint_emptied_row_id(&mut self, n: usize) {
-        let _ = self.mint_bare(n);
-    }
-
     /// A new id on row `n`, minted from the counter: the id, or `None` for
     /// no such row or a counter past a `u32`.
     fn mint_bare(&mut self, n: usize) -> Option<crate::desk_id::TrackId> {
-        let slot = self.settings.track_ids.get_mut(n)?;
-        let Ok(id) = u32::try_from(self.settings.next_track_id) else {
-            // Four billion tracks minted in one session: keep the id the row
-            // has rather than wrap onto one in use.
-            return None;
-        };
-        *slot = crate::desk_id::TrackId(id);
+        let id = self.mint_id()?;
+        self.row_mut(n)?.id = id;
+        Some(id)
+    }
+
+    /// **A fresh id**, never held by any row this desk has had: the counter
+    /// only rises. `None` once it is past a `u32`, which takes four billion
+    /// tracks minted in one session; the caller then makes nothing rather
+    /// than wrap onto an id in use.
+    fn mint_id(&mut self) -> Option<crate::desk_id::TrackId> {
+        let id = u32::try_from(self.settings.next_track_id).ok().filter(|id| *id != NO_TRACK.0)?;
         self.settings.next_track_id += 1;
-        Some(*slot)
+        Some(crate::desk_id::TrackId(id))
     }
 
     /// **Everything the session keys by track `from`, keyed by `to`
@@ -13321,32 +13257,32 @@ impl TangentApp {
     /// identity, or the master on the master's lane. `None` past both. The
     /// one door from a lane - what the views, the hits and the curves speak
     /// - to the key every automation session field is held by.
-    fn auto_owner(&self, lane: usize) -> Option<crate::desk_id::Node> {
-        if lane == master_lane() {
-            return Some(crate::desk_id::Node::Master);
+    fn auto_owner(&self, lane: AutoLane) -> Option<crate::desk_id::Node> {
+        match lane {
+            AutoLane::Master => Some(crate::desk_id::Node::Master),
+            AutoLane::Row(r) => self.row(r).map(|r| crate::desk_id::Node::Track(r.id)),
         }
-        self.settings.track_ids.get(lane).copied().map(crate::desk_id::Node::Track)
     }
 
     /// **The lane an automation row's owner stands on now**: the master's
     /// own, or its track's row. `None` for a track this desk does not hold
     /// (removed: its rows are inert until an undo brings it back).
-    fn auto_lane_of(&self, owner: crate::desk_id::Node) -> Option<usize> {
+    fn auto_lane_of(&self, owner: crate::desk_id::Node) -> Option<AutoLane> {
         match owner {
             crate::desk_id::Node::Master => Some(master_lane()),
-            crate::desk_id::Node::Track(id) => self.row_of(id),
+            crate::desk_id::Node::Track(id) => self.row_of(id).map(AutoLane::Row),
             _ => None,
         }
     }
 
     /// `(lane, param)` as the row it is, by owner.
-    fn auto_row(&self, lane: usize, param: crate::automation::AutoParam) -> Option<AutoRow> {
+    fn auto_row(&self, lane: AutoLane, param: crate::automation::AutoParam) -> Option<AutoRow> {
         self.auto_owner(lane).map(|o| (o, param))
     }
 
     /// An owner-keyed row back to `(lane, param)`, while its owner stands
     /// on a lane.
-    fn auto_row_lane(&self, row: AutoRow) -> Option<(usize, crate::automation::AutoParam)> {
+    fn auto_row_lane(&self, row: AutoRow) -> Option<(AutoLane, crate::automation::AutoParam)> {
         self.auto_lane_of(row.0).map(|l| (l, row.1))
     }
 
@@ -13458,7 +13394,9 @@ impl TangentApp {
         // the next paint, from the desk as it now stands.
         self.click_moment = None;
         self.a11y_on = None;
-        self.meter_hold = [[0.0; 2]; crate::desk_legacy::V32_STRIPS];
+        // The rows' held meters name rows by place, so they start again;
+        // the specials' stand.
+        self.meter_hold.clear();
         self.refresh_route_labels();
         // **A drum panel left on no row** - its track removed, by the edit
         // or by an undo or redo - shows no kit (`drumpad_row`), so the last
@@ -13513,7 +13451,7 @@ impl TangentApp {
     /// it is about to show you.
     fn open_midi_row(&mut self, ch: usize) {
         if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi)
-            && !self.set_channel_input_spec(ch, "midi:all")
+            && (self.desk_shape_held_for(ShapeChange::Input) || !self.set_channel_input_spec(ch, "midi:all"))
         {
             // Refused at the cap: no track, so no dialog about its devices.
             self.input_menu = None;
@@ -13619,12 +13557,7 @@ impl TangentApp {
                 // The header's own word, so the title and the chip it was
                 // opened from say the same thing — `Dialog::Automation`'s
                 // rule, and the same derivation.
-                let name = self
-                    .settings
-                    .strip_names
-                    .get(lane)
-                    .map(String::as_str)
-                    .unwrap_or("");
+                let name = self.row(lane).map_or("", |r| r.name.as_str());
                 if name.is_empty() {
                     format!("Track {}", lane + 1)
                 } else {
@@ -13639,8 +13572,8 @@ impl TangentApp {
 
     fn open_track_dialog(&mut self, strip: recorder::StripRef, removable: bool) {
         // The row the menu's row-only parts act on; a strip that is no row
-        // (the click) has none, and every such part asks `lane < CHANNELS`.
-        let lane = strip.row().unwrap_or(usize::MAX);
+        // (the click) has none, and every such part asks for a real row.
+        let lane = strip.row().unwrap_or(dialogs::NOT_A_ROW);
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(Dialog::Track {
             palette: self.settings.palette_choice,
@@ -13651,10 +13584,10 @@ impl TangentApp {
             // **Offered on a live track too, where it OVERWRITES** — the
             // owner's ask. It was empty slots only, which is why the flag
             // used to ask `!removable`. Never on a folder: see `paste_track`.
-            can_paste: lane < recorder::CHANNELS
+            can_paste: lane < self.desk_extent()
                 && self.track_on_clipboard()
                 && !self.is_folder(lane),
-            icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
+            icon: self.row(lane).map_or(0, |r| r.icon),
             // Counted here rather than tested in the dialog, because the
             // dialog has no arrangement to look at — and counted at OPEN
             // rather than per frame, which is what makes it a plain number
@@ -13676,37 +13609,6 @@ impl TangentApp {
             },
             strip,
         });
-    }
-
-    /// Ctrl+T's landing place: the first channel that is not a track yet.
-    fn add_track_first_free(&mut self) {
-        // **At the cap, Ctrl/Cmd+T says why.** It used to search, find no
-        // free slot and do nothing, which reads as a broken key. Asked
-        // before the search, so the answer is the same whichever slot would
-        // have been chosen.
-        if !self.admit_tracks(1) {
-            return;
-        }
-        // **The SELECTED slot first, always** - the owner's rule: a hand
-        // that selected an empty slot and pressed the chord meant THERE,
-        // and ignoring it made the keybind land somewhere off-screen. A
-        // used selection falls through to the first free slot AFTER it,
-        // then anywhere.
-        if let Some(sel) = self.selected_row() {
-            if sel < self.desk_extent() && !self.channel_used(sel) {
-                let _ = self.add_bare_track(sel);
-                return;
-            }
-            if let Some(n) =
-                (sel + 1..self.desk_extent()).find(|n| !self.channel_used(*n))
-            {
-                let _ = self.add_bare_track(n);
-                return;
-            }
-        }
-        if let Some(n) = (0..self.desk_extent()).find(|n| !self.channel_used(*n)) {
-            let _ = self.add_bare_track(n);
-        }
     }
 
     pub fn strip_color(&self, s: recorder::StripRef) -> usize {
@@ -13757,7 +13659,7 @@ impl TangentApp {
 
     /// One channel's pan, -1..1, for the host to push at the engine.
     pub fn channel_pan(&self, ch: usize) -> f32 {
-        self.settings.channel_pans.get(ch).map(|p| *p as f32).unwrap_or(0.0)
+        self.row(ch).map_or(0.0, |r| r.pan as f32)
     }
 
     /// The song's span in seconds, for the host's bounce to know where the
@@ -13845,10 +13747,10 @@ const STOCK_DESKS: &[&[(usize, &str)]] = &[
 fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) -> bool {
     let tracks = shipped.iter().map(|(row, _)| row + 1).max().unwrap_or(0);
     let named: Vec<crate::desk_id::SeatBay> = shipped.iter().filter_map(|(row, _)| d.row_bay(*row, 0)).collect();
-    d.kinds
+    d.rows
         .iter()
         .enumerate()
-        .all(|(n, k)| *k == u8::from(n < tracks))
+        .all(|(n, r)| crate::desk_model::RowKind::byte(r.kind) == u8::from(n < tracks))
         && shipped.iter().all(|(row, want)| d.row_plugin(*row, 0) == Some(*want))
         && d.plugins.iter().filter(|(_, p)| !p.is_empty()).all(|(sb, _)| named.contains(sb))
 }
@@ -13906,7 +13808,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let stock = old.clips.is_empty()
                 && old.next_id <= 1
                 && old.desk.as_ref().is_some_and(|d| {
-                    d.names.iter().all(String::is_empty)
+                    d.rows.iter().all(|r| r.name.is_empty())
                         && Self::STOCK_DESKS
                             .iter()
                             .any(|shipped| Self::matches_stock(d, shipped))
@@ -13977,15 +13879,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // `Settings::default()`. It is, now, and the test beside it holds the
         // two together.
         // **And the shipped ARM, resolved here.** `Settings::default()`
-        // carries `None` — nobody has written an arm down — and a snapshot
-        // reads that as zero, which would hand every New project a desk with
-        // the piano loaded and dead. The constructor resolves the same rule
-        // for a settings file that does not say; this is the template's turn
-        // to. See `default_armed`.
-        s.channel_armed = Some(default_armed(&s));
+        // says nobody has written an arm down, and a snapshot reads that as
+        // nothing armed, which would hand every New project a desk with the
+        // piano loaded and dead. The constructor resolves the same rule for
+        // a settings file that does not say; this is the template's turn to.
+        // See `default_armed`.
+        let arm = default_armed(&s);
+        for (n, row) in s.rows.iter_mut().enumerate() {
+            row.arm = Some(n) == arm;
+        }
+        s.arm_unsaid = false;
         let mut d = Self::desk_snapshot_of(&s);
-        // Two rows, and only two.
-        d.tracks_added = 0b11;
+        // Two tracks, and only two.
+        for (n, row) in d.rows.iter_mut().enumerate() {
+            row.added = n < 2;
+        }
         d
     }
 
@@ -14086,7 +13994,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // And what the document's own clips and frozen lanes stand on,
             // out of the same template and for the same reason: `clip_doc`
             // turns to the project with `kit_doc` - see `copy_doc_media`.
-            copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, src, dir);
+            copy_doc_media(&self.arrangement.clips, &self.frozen_lanes(), src, dir);
             // And the samplers' files, which the host named as it adopted
             // the template's plugin states - see `sampler_media`.
             copy_sampler_media(&self.sampler_media, src, dir);
@@ -14135,7 +14043,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // `copy_sampler_media`).
         if let Some(src) = self.kit_doc().as_deref().and_then(std::path::Path::parent) {
             copy_kit_samples(&self.drumpad_kits, src, dir);
-            copy_doc_media(&arr.clips, &self.settings.frozen_lanes, src, dir);
+            copy_doc_media(&arr.clips, &self.frozen_lanes(), src, dir);
             copy_sampler_media(&self.sampler_media, src, dir);
         }
         Ok(())
@@ -14780,7 +14688,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !src_dir.is_dir() {
             if let Some(src) = self.media_source.clone() {
                 copy_kit_samples(&self.drumpad_kits, &src, &dir);
-                copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, &src, &dir);
+                copy_doc_media(&self.arrangement.clips, &self.frozen_lanes(), &src, &dir);
                 copy_sampler_media(&self.sampler_media, &src, &dir);
             }
         }
@@ -14849,17 +14757,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// AUDIO, and plain AUDIO for a clip lane. One function for the mixer
     /// strip and the arrangement header, so the two can never disagree.
     pub fn channel_display_name(&self, n: usize) -> &str {
-        if let Some(name) = self
-            .settings
-            .strip_names
-            .get(n)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(name) = self.row(n).map(|r| r.name.as_str()).filter(|s| !s.is_empty()) {
             return name;
         }
         match self.channel_kind(n) {
             Some(recorder::ChannelKind::Midi) => self
-                .insert(n, 0)
+                .row_plugin(n, 0)
                 .map(plugin_display_name)
                 .filter(|d| !d.is_empty())
                 .unwrap_or("MIDI"),
@@ -14906,10 +14809,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the same two numbers `arrange_view` hands the layout, so the lanes'
     /// width here is the one the clips are drawn against.
     fn arr_frame(&self, rect: Rect) -> crate::arrangement_panel::Frame {
+        // The view's own `active` (`arrange_view`): the drawn lanes and the
+        // add under them. The desk's length counts the hidden rows too, and
+        // a fresh desk of two tracks among thirty hidden ones reserved a
+        // gutter for a bar its layout never drew.
+        let active = self.desk_index().shown_len() + 1;
         crate::arrangement_panel::Layout::frame(
             rect,
             self.arr_header_w_pt(),
-            crate::arrangement_panel::lane_bar_shown(self.arr_visible(), self.desk_extent()),
+            crate::arrangement_panel::lane_bar_shown(self.arr_visible(), active),
         )
     }
 
@@ -15209,7 +15117,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// accumulator's rail-clear was written to fix once already, and sharing
     /// the function is what stops it being re-introduced by the back door.
     fn arr_scroll_lanes_by_px(&mut self, dpx: f32, lane_h: f32) {
-        let max = self.desk_extent().saturating_sub(self.arr_visible());
+        // In ranks: the drawn lanes and the trailing add.
+        let max = (self.desk_index().shown_len() + 1).saturating_sub(self.arr_visible());
         let lane_h = lane_h.max(1.0);
         self.arr_scroll_acc += dpx;
         while self.arr_scroll_acc >= lane_h {
@@ -15370,16 +15279,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self,
     ) -> (std::sync::Arc<crate::desk_index::DeskIndex>, usize, std::ops::Range<usize>) {
         let index = self.desk_index();
-        let lane_scroll = self
-            .arr_lane_scroll
-            .min(self.desk_extent().saturating_sub(self.arr_visible()));
-        let (first_row, can_show) = crate::arrangement_panel::lane_window_start(
-            lane_scroll,
-            self.arr_visible(),
-            self.desk_extent(),
-        );
-        let first = index.rank_at_or_after(first_row);
-        let last = (first + can_show + 1).min(index.shown_len());
+        // **In RANKS among the drawn lanes**, the trailing add's included
+        // (see `ArrangeView::lane_scroll`): a vacant row or a shut folder's
+        // child is not drawn and takes no scroll.
+        let drawn = index.shown_len() + 1;
+        let lane_scroll = self.arr_lane_scroll.min(drawn.saturating_sub(self.arr_visible()));
+        let (first, can_show) =
+            crate::arrangement_panel::lane_window_start(lane_scroll, self.arr_visible(), drawn);
+        let last = (first + can_show + 1).min(drawn);
         (index, lane_scroll, first..last)
     }
 
@@ -15398,7 +15305,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .arrangement
             .clips
             .iter()
-            .filter(|c| in_window(c.lane.min(recorder::CHANNELS - 1)))
+            .filter(|c| in_window(c.lane))
             .map(|c| {
                 let info = self.clip_infos.get(&c.id);
                 let wave = info.map_or(&[][..], |i| i.wave.as_slice());
@@ -15414,7 +15321,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     notes: &c.notes,
                     offset_s: c.offset_s,
                     recording: false,
-                    lane: c.lane.min(recorder::CHANNELS - 1),
+                    lane: c.lane,
                     start_s: c.start_s,
                     len_s: self.clip_len_resolved(c),
                     max_len_s: if file_s > 0.0 {
@@ -15442,12 +15349,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let len = (self.recorder.position_s - rec.start_s).max(0.0);
             if len > 0.0 {
                 for (lane, is_midi) in &rec.lanes {
-                    if !in_window((*lane).min(recorder::CHANNELS - 1)) {
+                    if !in_window(*lane) {
                         continue;
                     }
                     views.push(crate::arrangement_panel::ClipView {
                         id: 0,
-                        lane: (*lane).min(recorder::CHANNELS - 1),
+                        lane: *lane,
                         start_s: rec.start_s,
                         len_s: len,
                         max_len_s: f64::INFINITY,
@@ -15518,9 +15425,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             for &(_, start, _) in &self.arr_move_orig {
                 dt_all = dt_all.max(-start);
             }
-            let lane_d = lane_at.map_or(0, |l| {
-                l.min(recorder::CHANNELS - 1) as i64 - g_lane as i64
-            });
+            // A pointer past the last row moves no clip off its lane: the
+            // drag is a move, and a desk does not grow under a move.
+            let lane_d = lane_at.filter(|l| *l < self.desk_extent()).map_or(0, |l| l as i64 - g_lane as i64);
             let orig = std::mem::take(&mut self.arr_move_orig);
             let mut dirty = false;
             for &(cid, start, lane0) in &orig {
@@ -15561,7 +15468,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The lane rules mirror the imports': MIDI never lands on an AUDIO
         // channel, audio never on a MIDI one, and an unused lane takes
         // either — it becomes a clip lane, as a drop would make it.
-        let retarget = lane_at.filter(|l| *l < recorder::CHANNELS).filter(|l| {
+        let retarget = lane_at.filter(|l| *l < self.desk_extent()).filter(|l| {
             let kind = self.channel_kind(*l);
             match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.kind) {
                 // A MIDI clip goes ANYWHERE — on an audio channel it just
@@ -15678,7 +15585,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// come first in their own declared order, then the plugins' by bay and
     /// then by id — which is the order the menu offers them in, so the rows
     /// and the menu read the same way down.
-    fn arr_auto_rows(&self, lane: usize) -> Vec<crate::automation::AutoParam> {
+    fn arr_auto_rows(&self, lane: AutoLane) -> Vec<crate::automation::AutoParam> {
         use crate::automation::AutoParam;
         let Some(owner) = self.auto_owner(lane) else {
             return Vec::new();
@@ -15704,7 +15611,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Which parameter the row at `slot` on this lane is showing.
     fn arr_auto_param_at(
         &self,
-        lane: usize,
+        lane: AutoLane,
         slot: usize,
     ) -> Option<crate::automation::AutoParam> {
         self.arr_auto_rows(lane).get(slot).copied()
@@ -15713,7 +15620,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Show or hide ONE parameter's row on a lane — the menu's checkbox.
     fn arr_toggle_automation_param(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
     ) {
         let Some(row) = self.auto_row(lane, param) else {
@@ -15752,7 +15659,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Only when the curve is empty. Re-opening a lane somebody has drawn on
     /// must not touch their work, and a project loaded from a file arrives
     /// with its curves already made.
-    fn arr_seed_first_node(&mut self, lane: usize, param: crate::automation::AutoParam) {
+    fn arr_seed_first_node(&mut self, lane: AutoLane, param: crate::automation::AutoParam) {
         if self
             .arrangement
             .automation
@@ -16043,7 +15950,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Aim the keyboard at one automation row. See `arr_auto_sel`.
-    fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
+    fn arr_select_auto_row(&mut self, lane: AutoLane, slot: usize) {
         self.arr_auto_sel = self.auto_owner(lane).map(|o| (o, slot));
         // One subject at a time: a Delete that might mean a clip OR a curve
         // is a Delete nobody presses twice.
@@ -16062,7 +15969,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     // are exclusive and the clearing is easier to keep honest in one place.
 
     /// One node, alone.
-    fn arr_select_auto_node(&mut self, lane: usize, slot: usize, index: usize) {
+    fn arr_select_auto_node(&mut self, lane: AutoLane, slot: usize, index: usize) {
         self.arr_choose_auto_nodes(vec![(lane, slot, index)]);
     }
 
@@ -16072,7 +15979,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the box, the shift-click that adds one, a paste. Only the presses
     /// used to clear the others, and a box or a paste beside a chosen clip
     /// on a frozen track had Delete refuse the nodes for the clip's sake.
-    fn arr_choose_auto_nodes(&mut self, nodes: Vec<(usize, usize, usize)>) {
+    fn arr_choose_auto_nodes(&mut self, nodes: Vec<(AutoLane, usize, usize)>) {
         self.arr_auto_nodes = self.auto_nodes_owned(nodes);
         self.arr_auto_sel = None;
         self.arr_selected = None;
@@ -16080,7 +15987,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Shift-press: in if it was out, out if it was in.
-    fn arr_toggle_auto_node(&mut self, lane: usize, slot: usize, index: usize) {
+    fn arr_toggle_auto_node(&mut self, lane: AutoLane, slot: usize, index: usize) {
         self.arr_auto_sel = None;
         self.arr_selected = None;
         self.arr_multi.clear();
@@ -16103,7 +16010,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `arr_auto_nodes` keeps them. A lane with no owner names no node.
     fn auto_nodes_owned(
         &self,
-        nodes: Vec<(usize, usize, usize)>,
+        nodes: Vec<(AutoLane, usize, usize)>,
     ) -> Vec<(crate::desk_id::Node, usize, usize)> {
         nodes
             .into_iter()
@@ -16112,13 +16019,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Whether the node `(lane, slot, index)` is one of the chosen.
-    fn auto_node_chosen(&self, lane: usize, slot: usize, index: usize) -> bool {
+    fn auto_node_chosen(&self, lane: AutoLane, slot: usize, index: usize) -> bool {
         self.auto_owner(lane)
             .is_some_and(|o| self.arr_auto_nodes.contains(&(o, slot, index)))
     }
 
     /// The node under the hand is `(lane, slot, index)` - see `arr_auto_hot`.
-    fn set_auto_hot(&mut self, lane: usize, slot: usize, index: usize) {
+    fn set_auto_hot(&mut self, lane: AutoLane, slot: usize, index: usize) {
         self.arr_auto_hot = self.auto_owner(lane).map(|o| (o, slot, index));
     }
 
@@ -16129,8 +16036,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the two halves of a step share it. And highest first, because taking
     /// a point out renumbers every one after it — deleting upwards would
     /// take the wrong points from the second one on.
-    fn arr_auto_node_picks(&self) -> Vec<(usize, crate::automation::AutoParam, usize)> {
-        let mut out: Vec<(usize, crate::automation::AutoParam, usize)> = self
+    fn arr_auto_node_picks(&self) -> Vec<(AutoLane, crate::automation::AutoParam, usize)> {
+        let mut out: Vec<(AutoLane, crate::automation::AutoParam, usize)> = self
             .arr_auto_nodes
             .iter()
             .filter_map(|(owner, slot, index)| {
@@ -16144,7 +16051,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// **Which row an `AutoParam` is showing on**, if its lane has it open.
-    fn arr_auto_slot(&self, lane: usize, param: crate::automation::AutoParam) -> Option<usize> {
+    fn arr_auto_slot(&self, lane: AutoLane, param: crate::automation::AutoParam) -> Option<usize> {
         self.arr_auto_rows(lane).iter().position(|p| *p == param)
     }
 
@@ -16168,7 +16075,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `Curve::remove_at`, because that is a mechanism with no gesture in it.
     fn arr_take_auto_node(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         index: usize,
     ) -> bool {
@@ -16304,7 +16211,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Rows by their owners, landed on the lanes those owners stand on
         // NOW: a share copied off a track that has moved since goes to the
         // track, not to the row it left.
-        let targets: Vec<((usize, AutoParam), Vec<Point>)> = if shares.len() > 1 {
+        let targets: Vec<((AutoLane, AutoParam), Vec<Point>)> = if shares.len() > 1 {
             shares
                 .into_iter()
                 .filter_map(|(row, shape)| Some((self.auto_row_lane(row)?, shape)))
@@ -16334,7 +16241,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return false;
         }
         let at = self.arr_snap_t(self.playhead_s());
-        let mut landed: Vec<(usize, usize, usize)> = Vec::new();
+        let mut landed: Vec<(AutoLane, usize, usize)> = Vec::new();
         for ((lane, param), shape) in targets {
             let pasted: Vec<Point> = shape
                 .iter()
@@ -16371,11 +16278,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// value both fall inside the corners, as `(lane, slot, index)`.
     fn arr_auto_boxed(
         &self,
-        lane: usize,
+        lane: AutoLane,
         slot: usize,
         a: (f64, f64),
         b: (f64, f64),
-    ) -> Vec<(usize, usize, usize)> {
+    ) -> Vec<(AutoLane, usize, usize)> {
         let Some(param) = self.arr_auto_param_at(lane, slot) else {
             return Vec::new();
         };
@@ -16401,7 +16308,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// middle of three on one instant) is simply not found.
     fn arr_auto_find(
         &self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         pts: &[crate::automation::Point],
     ) -> Vec<usize> {
@@ -16428,7 +16335,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the hand already is. The CURVE is untouched: closing a row is about
     /// what is on screen, and a lane that deleted its automation because
     /// somebody tidied the view would be unforgivable.
-    fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
+    fn arr_close_auto_row(&mut self, lane: AutoLane, slot: usize) {
         if let Some(row) = self
             .arr_auto_param_at(lane, slot)
             .and_then(|param| self.auto_row(lane, param))
@@ -16441,7 +16348,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Arm this lane to WRITE while the transport rolls.
-    fn arr_toggle_auto_arm(&mut self, lane: usize, slot: usize) {
+    fn arr_toggle_auto_arm(&mut self, lane: AutoLane, slot: usize) {
         if let Some(row) = self
             .arr_auto_param_at(lane, slot)
             .and_then(|param| self.auto_row(lane, param))
@@ -16458,7 +16365,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the automation actually doing", which is a question you ask by taking
     /// it out and putting it back — and which is unanswerable if the only way
     /// to take it out is to lose it.
-    fn arr_toggle_auto_bypass(&mut self, lane: usize, slot: usize) {
+    fn arr_toggle_auto_bypass(&mut self, lane: AutoLane, slot: usize) {
         if let Some(row) = self
             .arr_auto_param_at(lane, slot)
             .and_then(|param| self.auto_row(lane, param))
@@ -16475,7 +16382,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the one added later, so a saved curve stays on the plugin it was
     /// drawn for) - the rule `auto_param_label` and `auto_resting` resolve
     /// by.
-    fn auto_param_sb(&self, lane: usize, param: crate::automation::AutoParam) -> Option<crate::desk_id::SeatBay> {
+    fn auto_param_sb(&self, lane: AutoLane, param: crate::automation::AutoParam) -> Option<crate::desk_id::SeatBay> {
         crate::desk_id::auto_key(self.auto_owner(lane)?, param.bay()?)
     }
 
@@ -16483,7 +16390,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// inverse of [`Self::auto_param_sb`], or `None` for a bay no lane's
     /// curves can drive (a bus's, a drum pad's, a pedal's) or a track no row
     /// holds.
-    fn auto_address(&self, sb: crate::desk_id::SeatBay) -> Option<(usize, u8)> {
+    fn auto_address(&self, sb: crate::desk_id::SeatBay) -> Option<(AutoLane, u8)> {
         let lane = self.auto_lane_of(sb.seat.node)?;
         Some((lane, u8::try_from(crate::desk_id::auto_bay(sb)?).ok()?))
     }
@@ -16494,11 +16401,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Built at OPEN rather than kept: a plugin loaded or unloaded while the
     /// menu is up would leave a list describing a desk that no longer exists,
     /// and rebuilding is a handful of strings.
-    fn arr_open_automation_menu(&mut self, lane: usize) {
+    fn arr_open_automation_menu(&mut self, lane: AutoLane) {
         use crate::automation::AutoParam;
         let master = lane == master_lane();
-        // A track's lane or the master's, and nothing past them.
-        if recorder::StripRef::from_auto_lane(lane).is_none() {
+        // A track's lane or the master's, and no row past the desk.
+        if lane.row().is_some_and(|r| r >= self.desk_extent()) {
             return;
         }
         // **The master offers what the master HAS** - which grew: fader,
@@ -16588,16 +16495,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             who: {
                 // What the header calls it, so the menu's title and the row
                 // it hangs off say the same word.
-                let name = self
-                    .settings
-                    .strip_names
-                    .get(lane)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if name.is_empty() {
-                    format!("Track {}", lane + 1)
-                } else {
-                    name.to_owned()
+                match lane {
+                    AutoLane::Master => "Master".to_owned(),
+                    AutoLane::Row(row) => {
+                        let name = self.row(row).map_or("", |r| r.name.as_str());
+                        if name.is_empty() {
+                            format!("Track {}", row + 1)
+                        } else {
+                            name.to_owned()
+                        }
+                    }
                 }
             },
             groups,
@@ -16607,7 +16514,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Whether a lane is showing a row for this parameter.
-    fn arr_auto_is_open(&self, lane: usize, param: crate::automation::AutoParam) -> bool {
+    fn arr_auto_is_open(&self, lane: AutoLane, param: crate::automation::AutoParam) -> bool {
         self.auto_row(lane, param).is_some_and(|row| self.arr_auto_open.contains(&row))
     }
 
@@ -16619,7 +16526,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// values would be a worse control than the fader it automates.
     fn arr_put_auto_point(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         t: f64,
         v: f64,
@@ -17147,7 +17054,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// **Where an automation row's lane is drawn**, or `None` while it is not
     /// — the band both the press and the drags read values through.
-    fn arr_auto_band(&self, lane: usize, slot: usize) -> Option<Rect> {
+    fn arr_auto_band(&self, lane: AutoLane, slot: usize) -> Option<Rect> {
         let rect = self.arrangement_rect?;
         let clips = self.arr_clip_views();
         let view = self.arrange_view(&clips);
@@ -17170,12 +17077,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `AutoDragFrom`.
     fn arr_auto_anchor(
         &self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         index: usize,
     ) -> Option<AutoDragFrom> {
         let lead_at = *self.arrangement.automation.get(lane, param)?.points().get(index)?;
-        let mut moving: Vec<(usize, crate::automation::AutoParam, usize)> = self
+        let mut moving: Vec<(AutoLane, crate::automation::AutoParam, usize)> = self
             .arr_auto_nodes
             .iter()
             .filter_map(|(o, s, i)| {
@@ -17187,7 +17094,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             moving.push((lane, param, index));
         }
         let mut curves: Vec<(
-            usize,
+            AutoLane,
             crate::automation::AutoParam,
             Vec<crate::automation::Point>,
             Vec<usize>,
@@ -17225,7 +17132,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// timeline point".
     fn arr_drag_auto_point(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         index: usize,
         t: f64,
@@ -17285,7 +17192,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Where the hand is, unless the group stopped it there.
         let at_s = if dt == want_dt { at_s } else { from.lead_at.at_s + dt };
         let value = if dv == want_dv { value } else { from.lead_at.value + dv };
-        let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
+        let mut chosen: Vec<(AutoLane, usize, usize)> = Vec::new();
         let mut lead_now: Option<(usize, usize)> = None;
         let mut produced: Vec<Vec<Point>> = Vec::with_capacity(from.curves.len());
         for (c_lane, c_param, pts, moving) in &from.curves {
@@ -17367,7 +17274,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     #[cfg(test)]
     fn arr_remove_auto_point(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         t: f64,
     ) {
@@ -17405,23 +17312,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let (lane, param, value) = match hit {
             H::Fader(i) => match i.strip() {
-                Some(Strip::Channel(n)) => (n, AutoParam::Gain, f64::from(v)),
+                Some(Strip::Channel(n)) => (AutoLane::Row(n), AutoParam::Gain, f64::from(v)),
                 _ => return,
             },
             H::Pan(i) => match i.strip() {
-                Some(Strip::Channel(n)) => (n, AutoParam::Pan, f64::from(v)),
+                Some(Strip::Channel(n)) => (AutoLane::Row(n), AutoParam::Pan, f64::from(v)),
                 _ => return,
             },
             H::Send(i) => match i.strip() {
-                Some(Strip::Channel(n)) => (n, AutoParam::Send, f64::from(v)),
+                Some(Strip::Channel(n)) => (AutoLane::Row(n), AutoParam::Send, f64::from(v)),
                 _ => return,
             },
             // A mute is a press rather than a value, so it writes the state
             // it is about to BE — which is the opposite of what it reads.
             H::Mute(i) => match i.strip() {
                 Some(Strip::Channel(n)) => {
-                    let now = self.settings.strip_muted & (1 << n) != 0;
-                    (n, AutoParam::Mute, if now { 0.0 } else { 1.0 })
+                    let now = self.row(n).is_some_and(|r| r.mute);
+                    (AutoLane::Row(n), AutoParam::Mute, if now { 0.0 } else { 1.0 })
                 }
                 _ => return,
             },
@@ -17435,35 +17342,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_write_automation(lane, param, value);
     }
 
-    /// Which lanes' curves must not drive their controls, one bit each.
+    /// **Whether a lane's curves must not drive its controls**, asked per
+    /// lane (a row's, or the master's by name).
     ///
-    /// Crosses to the engine as a plain word — see `Engine::set_auto_suspend`.
-    /// A lane is suspended when it is switched Off, and while it is being
+    /// Crosses to the engine as each lane's `SUSPEND` flag in the plan. A
+    /// lane is suspended when it is switched Off, and while it is being
     /// WRITTEN: a curve that fought the hand would make the fader jump back
-    /// under it as each point landed.
-    pub fn auto_suspend_mask(&self) -> u64 {
-        let mut mask = 0u64;
-        // The master's lane rides the same word, one past the channels -
-        // which is why this word is 64 bits wide: at thirty-two channels
-        // the master's bit is bit 32, and in a u32 it ALIASED channel 31's,
-        // so writing channel 31's fader suspended the master's curve.
-        for lane in
-            (0..recorder::CHANNELS).chain([master_lane()])
-        {
-            let mode = self.arr_auto_mode(lane);
-            // `true` for touching: a lane whose mode writes on touch is
-            // suspended while a hand is on it, and asking the question with
-            // the hand assumed present is what makes the fader lead rather
-            // than fight. A Read lane answers false either way.
-            if !mode.reads() || self.arr_auto_writing(lane, true) {
-                mask |= 1 << lane;
-            }
-        }
-        mask
+    /// under it as each point landed. It was one u64 with the master's bit
+    /// one past the channels, which a desk past sixty-three rows could not
+    /// say, and whose bit for the master a thirty-third track would have
+    /// shared.
+    pub fn auto_suspended(&self, lane: AutoLane) -> bool {
+        let mode = self.arr_auto_mode(lane);
+        // `true` for touching: a lane whose mode writes on touch is
+        // suspended while a hand is on it, and asking the question with the
+        // hand assumed present is what makes the fader lead rather than
+        // fight. A Read lane answers false either way.
+        !mode.reads() || self.arr_auto_writing(lane, true)
     }
 
     /// A lane's automation mode.
-    pub fn arr_auto_mode(&self, lane: usize) -> crate::automation::AutoMode {
+    pub fn arr_auto_mode(&self, lane: AutoLane) -> crate::automation::AutoMode {
         self.auto_owner(lane)
             .and_then(|o| self.arr_auto_modes.get(&o).copied())
             .unwrap_or_default()
@@ -17475,19 +17374,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// delete it.** `arr_auto_modes` has no other writer outside the tests,
     /// so every lane answers `AutoMode::Read` for the life of the process:
     /// `writes()` is false, `record_automation_move` returns at its guard,
-    /// and `auto_suspend_mask` is always zero. The rest of the mode machinery
-    /// IS wired — the desktop reads the mask every frame, the transport
-    /// releases latches on every stop, and the tests in this file exercise
-    /// all five modes — but no control anywhere offers the row that
-    /// `AutoMode::ALL` describes itself as "the order the row cycles them".
-    /// Automation is written the OTHER way today, by arming one parameter
+    /// and `auto_suspended` is always false. The rest of the mode machinery
+    /// IS wired — the bridge reads it every frame, the transport releases
+    /// latches on every stop, and the tests in this file exercise all five
+    /// modes — but no control anywhere offers the row that `AutoMode::ALL`
+    /// describes itself as "the order the row cycles them". Automation is
+    /// written the OTHER way today, by arming one parameter
     /// (`auto_write_if_armed`, whose doc argues for arming over a global
     /// write mode), so the shipping feature is whole; it is the modes that
     /// have no door. Whether that door gets built or the modes come out is
     /// the owner's call, and deleting the only setter would take the question
     /// with it.
     #[allow(dead_code)]
-    fn arr_cycle_auto_mode(&mut self, lane: usize) {
+    fn arr_cycle_auto_mode(&mut self, lane: AutoLane) {
         use crate::automation::AutoMode;
         let now = self.arr_auto_mode(lane);
         let i = AutoMode::ALL.iter().position(|m| *m == now).unwrap_or(0);
@@ -17514,7 +17413,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Whether a lane is writing right now, which is also whether its curve
     /// should stop driving the control.
-    fn arr_auto_writing(&self, lane: usize, touching: bool) -> bool {
+    fn arr_auto_writing(&self, lane: AutoLane, touching: bool) -> bool {
         let latched = self.auto_owner(lane).is_some_and(|o| self.arr_auto_latched.contains(&o));
         self.arr_auto_mode(lane).writes(touching, latched)
     }
@@ -17531,12 +17430,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// did.
     fn arr_write_automation(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         value: f64,
     ) {
         use crate::automation::{Point, Shape};
-        if lane >= recorder::CHANNELS {
+        if lane.row().is_some_and(|r| r >= self.desk_extent()) {
             return;
         }
         let Some(key) = self.auto_row(lane, param) else {
@@ -17664,11 +17563,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// owner's rule: no changes, no new folder, and the name never
     /// advances - so a New that would rebuild the very session on the desk
     /// does nothing instead.
-    /// How many channel strips the mixer actually SHOWS - the active desk
-    /// minus every child a shut folder has folded away. What the scroll
-    /// range answers to. Read off the index, which counted it once.
+    /// How many channel strips the mixer actually SHOWS - the drawn rows (a
+    /// shut folder's children and the vacant rows left out) and the
+    /// trailing add after them. What the scroll range answers to. Read off
+    /// the index, which counted it once.
     pub fn mixer_shown_channels(&self) -> usize {
-        self.desk_index().shown_len().max(1)
+        self.desk_index().shown_len() + 1
     }
 
     /// **The desk's shape**, as of now: see `desk_index::DeskIndex`.
@@ -17733,7 +17633,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// how many clips stand on each.
     fn desk_index_inputs(&self) -> (Vec<crate::desk_index::RowFacts>, Vec<u32>) {
         let rows = self.desk_extent();
-        let flag = |v: &[bool], r: usize| v.get(r).copied().unwrap_or(false);
         // **What keeps a row from being vacant without making it a track**
         // (design section 4's Vacant column, and W2-desk-format's `holds`):
         // a curve, a freeze, a kit, a chain plugin, and either end of a
@@ -17749,10 +17648,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         };
         for c in self.arrangement.automation.curves() {
-            mark(c.lane);
-        }
-        for z in &self.settings.frozen_lanes {
-            mark(z.lane);
+            if let AutoLane::Row(r) = c.lane {
+                mark(r);
+            }
         }
         // A route's and a key's ends are tracks by identity (or a special,
         // which is no row), marking the rows those tracks stand on.
@@ -17767,22 +17665,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             row(k.seat.seat.node).map(&mut mark);
             row(k.from).map(&mut mark);
         }
-        // A kit is its track's, so it marks the row its track stands on.
-        for (r, id) in self.settings.track_ids.iter().enumerate() {
-            if self.drumpad_kits.get(id).is_some_and(|k| !k.is_empty()) {
+        // A kit is its track's, so it marks the row its track stands on; a
+        // freeze is the row's own.
+        for (r, row) in self.settings.rows.iter().enumerate() {
+            if row.frozen.is_some() || self.drumpad_kits.get(&row.id).is_some_and(|k| !k.is_empty()) {
                 mark(r);
             }
         }
-        let facts = (0..rows)
-            .map(|r| crate::desk_index::RowFacts {
-                folder: flag(&self.settings.strip_is_folder, r),
-                in_folder: flag(&self.settings.strip_in_folder, r),
-                shut: flag(&self.settings.strip_folder_shut, r),
+        let facts = self
+            .settings
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| crate::desk_index::RowFacts {
+                folder: row.folder,
+                in_folder: row.in_folder,
+                shut: row.shut,
                 kind: self.channel_kind(r),
-                added: u32::try_from(r)
-                    .ok()
-                    .and_then(|b| self.settings.tracks_added.checked_shr(b))
-                    .is_some_and(|w| w & 1 == 1),
+                added: row.added,
                 residue: residue[r]
                     || (0..recorder::INSERTS * 2).any(|n| {
                         crate::desk_id::slot_key(self.row_node(r), n).is_some_and(|sb| self.plugin(sb).is_some())
@@ -18034,7 +17934,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             words: std::sync::Arc::new(words),
             mark,
             // Attached where a moment is KEPT - see `undo_commit_moment`.
-            perm: None,
             relabels: None,
             rows_closed: None,
         }
@@ -18179,17 +18078,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .get(self.hist_at)
             .is_some_and(|top| top.same_text(&state))
         {
-            // Nothing kept, so nothing to carry: a reorder that changed no
-            // word (two empty lanes trading places) must not ride into the
-            // NEXT gesture's moment and be undone with it.
-            self.perm_since_moment = None;
+            // Nothing kept, so nothing to carry: a relabel that changed no
+            // word must not ride into the NEXT gesture's moment and be undone
+            // with it.
             self.relabels_since_moment.clear();
             self.rows_closed_since_moment = ClosedRows::default();
             return;
         }
-        // The reorders this gesture made ride in the moment they made, and
-        // so do its bay relabels and the automation rows it closed.
-        state.perm = self.perm_since_moment.take().map(std::sync::Arc::new);
+        // The bay relabels this gesture made ride in the moment they made,
+        // and so do the automation rows it closed. A reorder needs nothing
+        // here: it moves no plugin and no file, so the words are all of it.
         let relabels = std::mem::take(&mut self.relabels_since_moment);
         state.relabels = (!relabels.is_empty()).then(|| std::sync::Arc::new(relabels));
         let closed = std::mem::take(&mut self.rows_closed_since_moment);
@@ -18249,12 +18147,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// caught here, at the gesture, instead.
     #[cfg(test)]
     fn desk_sentinel(&self) {
-        let ids = &self.settings.track_ids;
-        assert_eq!(ids.len(), recorder::CHANNELS, "the desk lost its row ids");
-        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
-        assert_eq!(distinct.len(), ids.len(), "two rows hold one id: {ids:?}");
-        let dropped = self.settings.desk_model().dropped;
-        assert!(dropped.is_empty(), "a gesture left the desk with dangling entries: {dropped:?}");
+        // `DeskModel::check` (design 6.3, writer side): no plugin, bypass,
+        // route, key or send naming a row or bay that is not on the desk,
+        // and no two rows wearing one id.
+        let dangling = self.settings.model_view().check();
+        assert!(dangling.is_empty(), "a gesture left the desk with dangling entries: {dangling:?}");
     }
 
     /// **The commit at a click's release on a row that jumps to the
@@ -18286,7 +18183,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 && self.hist_at > 0
                 && self.history.get(self.hist_at).is_some_and(|m| {
                     std::sync::Arc::ptr_eq(&m.words, &words)
-                        && m.perm.is_none()
                         && m.relabels.is_none()
                         && m.rows_closed.is_none()
                 });
@@ -18312,7 +18208,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.history.clear();
         self.hist_at = 0;
         // Moment zero has no moment before it to have been carried from.
-        self.perm_since_moment = None;
         self.relabels_since_moment.clear();
         self.rows_closed_since_moment = ClosedRows::default();
         self.undo_commit_moment(state);
@@ -18328,25 +18223,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The id counter before the moment lands: see below, where it is
         // kept from falling.
         let next_before = self.settings.next_track_id;
-        // **The lanes the moments crossed, for the host to carry the plugins
-        // by.** Back across a reorder is its inverse, newest first; forward
-        // is the reorder again. The words put every bundle NAME back on its
-        // row, but the plugins, their settings and their sidecars are the
-        // host's, and with no permutation it rebuilt each moved bay from a
-        // file written for another row - see `Moment::perm`.
-        let perm_of = |k: usize| {
-            self.history.get(k).and_then(|m| m.perm.as_deref()).map(Vec::as_slice)
-        };
-        let steps: Vec<Vec<usize>> = if at < from {
-            (at + 1..=from).rev().filter_map(perm_of).map(invert_order).collect()
-        } else {
-            (from + 1..=at).filter_map(perm_of).map(<[usize]>::to_vec).collect()
-        };
-        let carry = steps.into_iter().reduce(|first, then| compose_orders(&first, &then));
-        if let Some(order) = carry {
-            self.send_desk_perm(&order);
-        }
-        // **And the bays the moments carried plugins between** (a pad swap),
+        // **A reorder the moments crossed hands the host nothing**: every
+        // plugin, its settings and its state file are named by its bay's
+        // identity, and the rows the moment puts back are where the bridge
+        // finds each track's lane, so one plan is all an undo of a reorder
+        // costs (design 7.13).
+        //
+        // **The bays the moments carried plugins between** (a pad swap),
         // the same way: back across one is its inverse, newest first;
         // forward is the set again. The words put each bay's bundle NAME
         // back, and the host needs the move to put each plugin's settings
@@ -18408,7 +18291,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The rows as they stand before the moment lands: an undo or redo
         // that moved them, minted them or put them back changed the desk's
         // shape, and the aims that named rows let go (see below).
-        let rows_before = self.settings.track_ids.clone();
+        let rows_before = self.settings.desk_ids();
         // The struct, not a re-parse: what comes back is bit for bit what
         // was committed, never the reader's sanitised opinion of it — see
         // `Moment`. The document carries the moment's desk afterwards, as
@@ -18432,7 +18315,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.drumpad_save();
             }
         }
-        if self.settings.track_ids != rows_before {
+        if self.settings.desk_ids() != rows_before {
             self.on_desk_shape_change();
         }
         // **An AUTO width and lane count come back too.** The apply skips a
@@ -18487,7 +18370,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .map(std::path::Path::to_path_buf);
             if let Some(dir) = dir {
                 copy_kit_samples(&self.drumpad_kits, &src, &dir);
-                copy_doc_media(&self.arrangement.clips, &self.settings.frozen_lanes, &src, &dir);
+                copy_doc_media(&self.arrangement.clips, &self.frozen_lanes(), &src, &dir);
             }
         }
         // No document write. Undo and redo used to save the doc to disk on
@@ -20543,7 +20426,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// PASTE at the playhead, snapped — and on the SELECTED track when one
     /// is: the earliest copied clip lands on it and the rest keep their
-    /// relative lanes, clamped. Anywhere goes — a MIDI clip on an audio
+    /// relative lanes, the desk growing for any that land past its end. Anywhere goes — a MIDI clip on an audio
     /// channel simply does not sound, which is the neat kind of nothing.
     fn arr_paste(&mut self) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
@@ -20574,44 +20457,50 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .iter()
                     .min_by(|a, b| a.start_s.total_cmp(&b.start_s))
                     .map_or(0, |c| c.lane);
-                target.min(recorder::CHANNELS - 1) as i64 - base as i64
+                target as i64 - base as i64
             }
             None => 0,
         };
-        // **The WHOLE group is shifted, or the shift is shortened** — the
-        // per-clip clamp below is a backstop, not the mechanism. Clamping
-        // each lane separately squashed a cross-track group onto the last
-        // lane when the target sat near the bottom: three stacked clips
-        // pasted as one visible clip.
-        let (lo, hi) = pasted.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
-            (lo.min(c.lane as i64), hi.max(c.lane as i64))
-        });
-        // Bounded by the desk's extent, which no longer reads the licence:
-        // the tier is a creation cap, asked below, not a width.
-        let edge = self.desk_extent() as i64 - 1;
-        let lane_d = if lo <= hi {
-            lane_d.clamp(-lo, (edge - hi).max(-lo))
-        } else {
-            lane_d
-        };
-        let landing = |c: &crate::arrangement::ArrClip| {
-            (c.lane as i64 + lane_d).clamp(0, edge) as usize
-        };
+        // **The WHOLE group is shifted, never squashed.** Clamping each lane
+        // separately squashed a cross-track group onto the last lane when
+        // the target sat near the bottom: three stacked clips pasted as one
+        // visible clip. Above the first row the shift is shortened; below
+        // the last the desk GROWS (design section 4, grow or refuse): the
+        // rows the group needs are appended, and they are new tracks the
+        // gate below admits or refuses whole. A desk that once ended at a
+        // fixed width had nowhere to put them but the last lane.
+        let lo = pasted.iter().map(|c| c.lane as i64).min().unwrap_or(0);
+        let lane_d = lane_d.max(-lo);
+        let landing = |c: &crate::arrangement::ArrClip| (c.lane as i64 + lane_d).max(0) as usize;
+        let width = self.desk_extent();
         // **A clip landing on an empty row MAKES a track there** (a row with
-        // clips counts), so a paste that lands on rows nobody is using asks
-        // the creation gate for each of them, whole, before anything lands.
+        // clips counts), so a paste that lands on rows nobody is using, or on
+        // rows past the end, asks the creation gate for each of them, whole,
+        // before anything lands.
         let mut new_rows: Vec<usize> = pasted
             .iter()
             .map(landing)
-            .filter(|lane| !self.row_counted(*lane))
+            .filter(|lane| *lane >= width || !self.row_counted(*lane))
             .collect();
         new_rows.sort_unstable();
         new_rows.dedup();
         if !self.admit_tracks(new_rows.len()) {
             return;
         }
-        // Each row a clip makes a track of is a new track: a new id.
-        for lane in &new_rows {
+        let grow = pasted.iter().map(landing).max().map_or(0, |m| (m + 1).saturating_sub(width));
+        if grow > 0 {
+            // At the end: no row moves, so a running record or export lets
+            // it through like Add (design 7.13).
+            let rows: Option<Vec<_>> = (0..grow)
+                .map(|_| self.mint_id().map(crate::desk_model::TrackRow::vacant))
+                .collect();
+            if rows.and_then(|rows| self.desk_insert(width, rows).ok()).is_none() {
+                return;
+            }
+        }
+        // Each row a clip makes a track of is a new track: a new id. The
+        // rows just appended were minted fresh.
+        for lane in new_rows.iter().filter(|n| **n < width) {
             self.mint_row_id(*lane);
         }
         let mut fresh = Vec::new();
@@ -22964,7 +22853,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             song_s: self.recorder.position_s,
             dark: self.settings.me_dark,
             pad_names: {
-                let drum_lane = (0..recorder::CHANNELS).find(|n| {
+                let drum_lane = (0..self.desk_extent()).find(|n| {
                     self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH)
                 });
                 (Some(clip.lane) == drum_lane).then(|| {
@@ -22996,7 +22885,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn midi_editor_lane(&self) -> Option<usize> {
         let id = self.midi_edit.as_ref()?.id;
         let clip = self.arrangement.clips.iter().find(|c| c.id == id)?;
-        (clip.lane < recorder::CHANNELS).then_some(clip.lane)
+        (clip.lane < self.desk_extent()).then_some(clip.lane)
     }
 
     fn open_midi_editor(&mut self, id: u64) {
@@ -23392,15 +23281,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .desk
             .as_ref()
             .and_then(|d| {
-                (0..recorder::CHANNELS).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..d.rows.len()).find(|ch| d.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
             })
             .or_else(|| {
-                (0..recorder::CHANNELS).find(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                (0..self.desk_extent()).find(|ch| self.row_plugin(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
             });
         let (kits, saved_track) = match doc {
             Some(doc) => crate::drumpad::DrumpadDoc::load_track_kits(
                 doc,
-                &self.settings.track_ids,
+                &self.settings.desk_ids(),
                 legacy_lane,
             ),
             None => (crate::drumpad::TrackKits::new(), None),
@@ -23424,11 +23313,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_lane = saved_track
             .filter(|id| has_kit(&self.drumpad_kits, id))
             .or_else(|| {
-                self.settings
-                    .track_ids
-                    .iter()
-                    .copied()
-                    .find(|id| has_kit(&self.drumpad_kits, id))
+                self.settings.rows.iter().map(|r| r.id).find(|id| has_kit(&self.drumpad_kits, id))
             });
         self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
         // C2, and the page that shows it — see `drumpad_focus`. Not key 0:
@@ -23663,11 +23548,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The kit saves itself, so the kit is a REAL thing: the folder
             // is born here if it never was.
             self.materialize_project_dir();
-            let live = &self.settings.track_ids;
+            let live = self.settings.desk_ids();
             crate::drumpad::DrumpadDoc::save_track_kits_on(
                 &self.drumpad_kits,
-                live,
-                self.doc_rows.as_deref().unwrap_or(live),
+                &live,
+                self.doc_rows.as_deref().unwrap_or(&live),
                 Some(self.drumpad_track()),
                 &doc,
             );
@@ -23681,7 +23566,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn save_kits_beside(&self, doc: &std::path::Path) {
         crate::drumpad::DrumpadDoc::save_track_kits(
             &self.drumpad_kits,
-            &self.settings.track_ids,
+            &self.settings.desk_ids(),
             self.drumpad_row().unwrap_or(0),
             doc,
         );
@@ -23693,10 +23578,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (`remove_channel_inner`) and is no row's, so it neither asks for a
     /// sidecar nor puts one into a folder that has none.
     fn desk_kits_hold_samples(&self) -> bool {
-        self.settings
-            .track_ids
-            .iter()
-            .any(|id| self.drumpad_kits.get(id).is_some_and(|k| !k.is_empty()))
+        self.settings.rows.iter().any(|r| self.drumpad_kits.get(&r.id).is_some_and(|k| !k.is_empty()))
     }
 
     /// One knob's current value, in its own units.
@@ -24455,7 +24337,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// opened from a lane; a lane past the desk is ignored. It names the
     /// TRACK, so the panel stays with it through every edit that moves it.
     pub fn set_drumpad_lane(&mut self, lane: usize) {
-        if let Some(id) = self.settings.track_ids.get(lane).copied() {
+        if let Some(id) = self.row(lane).map(|r| r.id) {
             self.drumpad_lane = Some(id);
         }
     }
@@ -24473,8 +24355,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// a lane that LOST its drumpad has to be told so. `None` only past the
     /// desk.
     pub fn drumpad_kit_of(&self, lane: usize) -> Option<&crate::drumpad::DrumpadDoc> {
-        let id = self.settings.track_ids.get(lane)?;
-        Some(self.drumpad_kit_of_track(*id))
+        let id = self.row(lane)?.id;
+        Some(self.drumpad_kit_of_track(id))
     }
 
     /// **A track's kit, by identity** (C11's id form): the empty kit for a
@@ -24489,8 +24371,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         &self,
         lane: usize,
     ) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
-        match self.settings.track_ids.get(lane) {
-            Some(id) => self.drumpad_paths_of_track(*id),
+        match self.row(lane) {
+            Some(row) => self.drumpad_paths_of_track(row.id),
             None => std::array::from_fn(|_| None),
         }
     }
@@ -25162,7 +25044,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
-        let drum_lane = (0..recorder::CHANNELS)
+        let drum_lane = (0..self.desk_extent())
             .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
         let lane = self
             .midi_edit
@@ -26809,7 +26691,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .collect();
         for id in ids {
             if let Some(c) = self.arrangement.clips.iter().find(|c| c.id == id) {
-                if c.lane < recorder::CHANNELS && !lanes.contains(&c.lane) {
+                if c.lane < self.desk_extent() && !lanes.contains(&c.lane) {
                     lanes.push(c.lane);
                 }
             }
@@ -26827,6 +26709,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
         self.arr_auto_sel = None;
+        // A row past the desk (the trailing add, a drop below the last
+        // lane) is nobody to select.
+        if n >= self.desk_extent() {
+            return;
+        }
         let id = self.track_id_at(n);
         if mods.shift {
             // **From the ANCHOR, not from the primary.** Shift-clicking around
@@ -26837,7 +26724,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let anchor = self.sel_anchor.filter(|a| self.row_of(*a).is_some()).unwrap_or(id);
             let from = self.row_of(anchor).unwrap_or(n);
             let (lo, hi) = if from <= n { (from, n) } else { (n, from) };
-            self.selected_tracks = (lo..=hi).map(|r| self.track_id_at(r)).collect();
+            // The drawn rows of the range, a shut folder's children with
+            // them, and its two ends: a vacant row between them is not drawn
+            // and is nobody's to select (W6).
+            let index = self.desk_index();
+            self.selected_tracks = (lo..=hi)
+                .filter(|r| *r == lo || *r == hi || index.class(*r) != crate::desk_index::RowClass::Vacant)
+                .map(|r| self.track_id_at(r))
+                .collect();
             self.sel_anchor = Some(anchor);
             self.selected_channel = Some(id);
         } else if mods.command {
@@ -26872,6 +26766,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// mean the user has moved on, so that collapses to the one track, which
     /// is what every desk does.
     fn touch_track(&mut self, n: usize) {
+        // A row past the desk (the trailing add) is nobody to select.
+        if n >= self.desk_extent() {
+            return;
+        }
         let id = self.track_id_at(n);
         self.selected_channel = Some(id);
         if !self.selected_tracks.contains(&id) {
@@ -27463,9 +27361,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         let steps = self.wheel_arr_zoom.steps(d);
                         let cur = self.arr_visible() as i64;
                         // On the zoom's own ceiling, never the desk's width:
-                        // a desk longer than a screen scrolls.
-                        let next = (cur + i64::from(steps))
-                            .clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX) as i64);
+                        // a desk longer than a screen scrolls, and a desk
+                        // shorter than the count is drawn that tall as it
+                        // grows (the layout shows what there is).
+                        let drawn = self.desk_index().shown_len() + 1;
+                        let next = (cur + i64::from(steps)).clamp(1, recorder::VISIBLE_MAX as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
                             // And the height it was chosen at - see `carried_count`.
@@ -27475,10 +27375,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // zooming in while scrolled deep left the
                             // stale value above the new max, and wheel-up
                             // went dead for that many notches.
-                            self.arr_lane_scroll = self.arr_lane_scroll.min(
-                                self.desk_extent()
-                                    .saturating_sub(self.arr_visible()),
-                            );
+                            self.arr_lane_scroll =
+                                self.arr_lane_scroll.min(drawn.saturating_sub(self.arr_visible()));
                             // Per notch: debounced, see `save_settings_soon`.
                             self.save_settings_soon();
                         }
@@ -27687,11 +27585,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             return;
                         }
                         let seed = self
-                            .settings
-                            .strip_names
-                            .get(n)
+                            .row(n)
+                            .map(|r| r.name.clone())
                             .filter(|s| !s.is_empty())
-                            .cloned()
                             .unwrap_or_else(|| self.channel_display_name(n).to_owned());
                         self.mixer_naming = Some((recorder::Column::Track(n), seed));
                         self.arr_drag = None;
@@ -28005,7 +27901,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.menu_anchor = p;
                         self.open_input_menu(n);
                     }
-                    // The circled plus: a bare track, on the spot.
+                    // The circled plus: a bare track, on the spot; under
+                    // the last lane, the trailing add.
+                    Some(A::HdrAdd(n)) if n >= self.desk_extent() => self.press_trailing_add(),
                     Some(A::HdrAdd(n)) => {
                         let _ = self.add_bare_track(n);
                     }
@@ -28978,9 +28876,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .clips
                             .iter()
                             .filter_map(|c| {
-                                let row = l
-                                    .lane_rows
-                                    .get(c.lane.min(recorder::CHANNELS - 1))?;
+                                let row = l.lane_rows.get(c.lane)?;
                                 let x0 = crate::arrangement_panel::x_of(
                                     rect, &view, c.start_s,
                                 );
@@ -29203,7 +29099,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     && i.key_pressed(egui::Key::A)
             }) {
                 if let Some(n) = self.selected_row().filter(|n| self.channel_used(*n)) {
-                    self.arr_open_automation_menu(n);
+                    self.arr_open_automation_menu(AutoLane::Row(n));
                 }
             }
             // **CUT is copy and then delete** — what it is everywhere else,
@@ -29289,15 +29185,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.arr_glue_selection();
         }
-        // **Ctrl/Cmd+T: a new track**, bare, on the first free slot — the
-        // owner's keyboard twin of the + circle.
+        // **Ctrl/Cmd+T: a new track**, bare, under the selection or at the
+        // end of the desk (`add_track`) — the owner's keyboard twin of the
+        // trailing +.
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
                 (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
             })
         {
-            self.add_track_first_free();
+            self.add_track();
         }
         // **Ctrl/Cmd+M: the metronome panel, in the middle of the
         // timeline.** The owner's call: the click's own settings (tempo,
@@ -29357,9 +29254,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let clips = me.arr_clip_views();
             let view = me.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
+            // **Below the last lane drawn, a new track** (design section
+            // 10): the desk grows for it (`lane_or_new`), where a fixed desk
+            // clamped the drop onto somebody's last lane.
+            let bottom = l
+                .lane_rows
+                .iter()
+                .filter(|(_, r)| r.is_positive())
+                .map(|(_, r)| r.bottom())
+                .fold(f32::MIN, f32::max);
             let lane = l
                 .lane_rows
                 .find_row(|r| r.is_positive() && r.contains(p))
+                .or_else(|| (l.lanes_area.contains(p) && p.y >= bottom).then(|| me.desk_extent()))
                 .unwrap_or_else(|| me.selected_row().unwrap_or(0));
             (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
         };
@@ -29485,17 +29392,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if domain <= 0.0 {
             return recorder::ScrubView::default();
         }
+        // **By drawn rank, as the timeline stacks them**: the overview is the
+        // arrangement in miniature, so the rows it does not draw (vacant
+        // ones, a shut folder's children) take no stripe, and a clip inside
+        // a shut folder shows on the folder's row, the way the folder's own
+        // lane carries it.
+        let index = self.desk_index();
+        let rank = |mut lane: usize| loop {
+            if let Some(r) = index.rank_of(lane) {
+                return Some(r);
+            }
+            lane = index.parent(lane)?;
+        };
         let blocks = self
             .arrangement
             .clips
             .iter()
-            .map(|c| {
-                (
-                    c.lane.min(self.desk_extent().saturating_sub(1)),
+            .filter_map(|c| {
+                Some((
+                    rank(c.lane)?,
                     (c.start_s / domain) as f32,
                     (self.clip_len_resolved(c) / domain) as f32,
                     self.strip_color(recorder::StripRef::Row(c.lane)),
-                )
+                ))
             })
             .collect();
         let viewport = self.arrangement_open.then(|| {
@@ -29506,7 +29425,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             blocks,
             viewport,
             domain_s: domain,
-            rows: self.desk_extent(),
+            rows: index.shown_len(),
         }
     }
 
@@ -29544,7 +29463,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The row state is asked of its OWNER (`auto_owner`): which rows are
     /// open, armed, bypassed, chosen and hot belong to the track, not to
     /// the row it happens to be drawn on this frame.
-    fn auto_views(&self, lane: usize) -> Vec<crate::arrangement_panel::AutoView<'_>> {
+    fn auto_views(&self, lane: AutoLane) -> Vec<crate::arrangement_panel::AutoView<'_>> {
         let owner = self.auto_owner(lane);
         self.arr_auto_rows(lane)
             .into_iter()
@@ -29595,13 +29514,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         clips: &'a [crate::arrangement_panel::ClipView<'a>],
     ) -> crate::arrangement_panel::ArrangeView<'a> {
         use crate::recorder::StripRef;
-        let g = self.settings.knobs().gains;
         let (view_start_s, view_len_s) = self.arr_window_now();
         let master = StripRef::Master;
         let (index, lane_scroll, ranks) = self.arr_lane_window();
         let window = index.window(ranks.start, ranks.len());
         crate::arrangement_panel::ArrangeView {
-            active: self.desk_extent(),
+            // The drawn lanes and the trailing add, in ranks (see
+            // `ArrangeView::lane_scroll`).
+            active: index.shown_len() + 1,
             // **The master's row.** Its level and colour come from the same
             // place the desk's own strip reads, so the two views cannot
             // disagree about how loud the master is or what it looks like.
@@ -29666,11 +29586,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // resting value, arm and bypass — so the row that appears under
             // the master is a track's row in every respect but its subject.
             master_automation: self.auto_views(master_lane()),
-            lanes: crate::arrangement_panel::Lanes::new(window.iter().map(|row| {
-                let n = *row as usize;
+            lanes: crate::arrangement_panel::Lanes::new(window.iter().map(|row| *row as usize).chain(
+                // **The trailing add**, a row under the last lane, when the
+                // window reaches it: it ranks after every drawn lane.
+                (ranks.end > index.shown_len()).then(|| self.desk_extent()),
+            ).map(|n| {
                 let kind = self.channel_kind(n);
                 (n, crate::arrangement_panel::LaneView {
-                    automation: self.auto_views(n),
+                    automation: self.auto_views(AutoLane::Row(n)),
                     route_count: self.settings.routes.from(self.row_node(n)).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
@@ -29701,8 +29624,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // rather than a walk over every clip in the song.
                     used: kind.is_some()
                         || index.clip_count(n) > 0
-                        || (self.settings.tracks_added >> n) & 1 == 1,
-                    armed: self.armed_mask() & (1 << n) != 0,
+                        || self.row(n).is_some_and(|r| r.added),
+                    armed: self.is_armed(n),
                     muted: self.strip_heard_muted(StripRef::Row(n)),
                     phase: self.strip_inverted(StripRef::Row(n)),
                     soloed: self.strip_heard_soloed(StripRef::Row(n)),
@@ -29719,18 +29642,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     folder_silent: {
                         let by_parent = index
                             .parent(n)
-                            .is_some_and(|f| self.settings.strip_muted & (1 << f) != 0);
+                            .is_some_and(|f| self.row(f).is_some_and(|r| r.mute));
                         let own_group = self.is_folder(n)
-                            && self.settings.strip_muted & (1 << n) != 0;
+                            && self.row(n).is_some_and(|r| r.mute);
                         by_parent || own_group
                     },
-                    gain: g.channels.get(n).copied().unwrap_or(1.0),
+                    gain: self.channel_gain(n),
                     send: self.settings.strip_send(StripRef::Row(n)) as f32,
                     pan: self.channel_pan(n),
                     peak: self.strip_meter(StripRef::Row(n)),
+                    // Past the desk it is the trailing add, and nothing but
+                    // its plus is drawn (its other fields read a row's
+                    // defaults); a row's own empty lane wears its number.
+                    plus: if n >= self.desk_extent() {
+                        self.trailing_plus()
+                    } else {
+                        crate::mixer_panel::Plus::Row
+                    },
                 })
             })
-            .collect()),
+            .collect())
+            .starting_at(ranks.start),
             lane_scroll,
             visible_lanes: self.arr_visible(),
             clips,
@@ -30336,7 +30268,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         match n {
             Node::Track(id) => match self.row_of(id) {
                 Some(row) => {
-                    let name = self.settings.strip_names.get(row).map_or("", |s| s.trim());
+                    let name = self.row(row).map(|r| &r.name).map_or("", |s| s.trim());
                     if name.is_empty() {
                         format!("Ch {}", row + 1)
                     } else {
@@ -30549,7 +30481,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the live control instead would disagree with the lane it sits on the
     /// moment the curve moved. See `arr_take_auto_node`, which refuses to
     /// delete a first node standing at the very start, for the same reason.
-    fn auto_base(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
+    fn auto_base(&self, lane: AutoLane, param: crate::automation::AutoParam) -> f64 {
         self.arrangement
             .automation
             .get(lane, param)
@@ -30567,7 +30499,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// at the first node's time, and `Curve::put` at an instant holding a
     /// step replaces the step's SECOND point: with the curve's first instant
     /// a step, the dial showed one level and moved the other.
-    fn auto_set_base(&mut self, lane: usize, param: crate::automation::AutoParam, v: f64) {
+    fn auto_set_base(&mut self, lane: AutoLane, param: crate::automation::AutoParam, v: f64) {
         let v = v.clamp(0.0, 1.0);
         let Some(mut pts) = self
             .arrangement
@@ -30595,7 +30527,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// default, which is where the knob rests until somebody moves it; there
     /// is no way to read a live parameter back from here, and guessing a
     /// middle would draw a line the plugin is not on.
-    fn auto_resting(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
+    fn auto_resting(&self, lane: AutoLane, param: crate::automation::AutoParam) -> f64 {
         use crate::automation::AutoParam;
         // **The master reads its own controls**, not `channel_gains[16]`,
         // which does not exist. Its rows are a track's in every other
@@ -30620,21 +30552,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .map_or(0.5, |q| q.default_normalised.clamp(0.0, 1.0)),
             };
         }
+        let at = lane;
+        let AutoLane::Row(lane) = lane else {
+            return 0.0;
+        };
         match param {
             AutoParam::Gain => {
-                let g = self.settings.channel_gains.get(lane).copied().unwrap_or(1.0);
+                let g = self.row(lane).map_or(1.0, |r| r.gain);
                 f64::from(recorder::gain_to_fader(g as f32))
             }
             // Pan is stored −1..1 and laid onto 0..1, centre at a half —
             // `AutoParam::Pan` says so.
             AutoParam::Pan => f64::from(self.channel_pan(lane) + 1.0) * 0.5,
             AutoParam::Send => {
-                f64::from(self.settings.strip_sends.get(lane).copied().unwrap_or(0.0) as f32)
+                f64::from(self.row(lane).map_or(0.0, |r| crate::desk_model::fx_send_level(&r.sends)) as f32)
             }
             // A switch written as a curve: muted above half. It rests where
             // the switch is.
             AutoParam::Mute => {
-                if self.settings.strip_muted & (1 << lane) != 0 {
+                if self.row(lane).is_some_and(|r| r.mute) {
                     1.0
                 } else {
                     0.0
@@ -30643,7 +30579,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             AutoParam::Plugin { id, .. } => {
                 // Bays 3..5 are the track's second rack; `fx_params` is
                 // keyed by rack, so resolve before looking.
-                self.auto_param_sb(lane, param)
+                self.auto_param_sb(at, param)
                     .and_then(|sb| self.bay_fx_params(sb))
                     .and_then(|fx| fx.params.iter().find(|p| p.id == id))
                     .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0))
@@ -30658,7 +30594,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// directly — that function is the one crossing to the engine, and a
     /// second road to a fader is how the desk and the arrangement come to
     /// disagree about where it is standing.
-    fn auto_set_control(&mut self, lane: usize, param: crate::automation::AutoParam, v: f64) {
+    fn auto_set_control(&mut self, lane: AutoLane, param: crate::automation::AutoParam, v: f64) {
         use crate::automation::AutoParam;
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
@@ -30681,6 +30617,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the reason spelled out below.
             return;
         }
+        let at = lane;
+        let AutoLane::Row(lane) = lane else {
+            return;
+        };
         let col = Column::Track(lane);
         match param {
             AutoParam::Gain => self.apply_mixer_hit(M::Fader(col), v as f32),
@@ -30691,7 +30631,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // it every frame of a drag would chatter.
             AutoParam::Mute => {
                 let want = v >= 0.5;
-                let now = self.settings.strip_muted & (1 << lane) != 0;
+                let now = self.row(lane).is_some_and(|r| r.mute);
                 if want != now {
                     self.apply_mixer_hit(M::Mute(col), 0.0);
                 }
@@ -30707,7 +30647,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // up disagreeing about their own state.
             AutoParam::Plugin { .. } => return,
         }
-        self.auto_write_if_armed(lane, param, v);
+        self.auto_write_if_armed(at, param, v);
     }
 
     /// **Writing: a move on an armed lane lays a point down.**
@@ -30723,7 +30663,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// moved rather than where the mouse was.
     fn auto_write_if_armed(
         &mut self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
         v: f64,
     ) {
@@ -30757,7 +30697,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (`Curve::tenant`), or failing that its address.
     pub fn auto_param_label(
         &self,
-        lane: usize,
+        lane: AutoLane,
         param: crate::automation::AutoParam,
     ) -> String {
         let crate::automation::AutoParam::Plugin { id, .. } = param else {
@@ -31663,27 +31603,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The cartridge path and patch strip `strip`'s own DX7 plays. `""` is
     /// the bank that ships, exactly as the session-wide field spells it.
     pub fn dx7_choice_of(&self, strip: usize) -> (&str, usize) {
+        let dx7 = self.row(strip).map(|r| &r.dx7);
         (
-            self.settings
-                .strip_dx7_cartridge
-                .get(strip)
-                .map_or("", String::as_str),
-            self.settings
-                .strip_dx7_patch
-                .get(strip)
-                .copied()
-                .unwrap_or(0)
-                .min(dialogs::CARTRIDGE_VOICES - 1),
+            dx7.map_or("", |d| d.cart.as_str()),
+            dx7.map_or(0, |d| d.patch).min(dialogs::CARTRIDGE_VOICES - 1),
         )
     }
 
     /// Remember which cartridge strip `strip` has loaded.
     pub fn set_dx7_cartridge_of(&mut self, strip: usize, path: String) {
-        if let Some(slot) = self.settings.strip_dx7_cartridge.get_mut(strip) {
+        if let Some(slot) = self.row_mut(strip).map(|r| &mut r.dx7.cart) {
             *slot = path;
         }
         // The patch index belonged to the cartridge that was there before.
-        if let Some(slot) = self.settings.strip_dx7_patch.get_mut(strip) {
+        if let Some(slot) = self.row_mut(strip).map(|r| &mut r.dx7.patch) {
             *slot = 0;
         }
         self.save_settings();
@@ -31693,7 +31626,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Which of its cartridge's patches strip `strip`'s DX7 plays.
     pub fn set_dx7_patch_of(&mut self, strip: usize, index: usize) {
-        if let Some(slot) = self.settings.strip_dx7_patch.get_mut(strip) {
+        if let Some(slot) = self.row_mut(strip).map(|r| &mut r.dx7.patch) {
             *slot = index.min(dialogs::CARTRIDGE_VOICES - 1);
         }
         // **And it is WRITTEN DOWN**, which it was not.
@@ -31718,17 +31651,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// settings file written by a build that shipped more patches than this
     /// one cannot ask for an instrument that is not here.
     pub fn keys_patch_of(&self, strip: usize) -> usize {
-        self.settings
-            .strip_keys_patch
-            .get(strip)
-            .copied()
-            .unwrap_or(0)
-            .min(dialogs::KEYS_PATCHES - 1)
+        self.row(strip).map_or(0, |r| r.keys.patch).min(dialogs::KEYS_PATCHES - 1)
     }
 
     /// Choose one, for one strip. Saves, because every other setting does.
     pub fn set_keys_patch_of(&mut self, strip: usize, index: usize) {
-        if let Some(slot) = self.settings.strip_keys_patch.get_mut(strip) {
+        if let Some(slot) = self.row_mut(strip).map(|r| &mut r.keys.patch) {
             *slot = index.min(dialogs::KEYS_PATCHES - 1);
         }
         self.settings.save();
@@ -31739,9 +31667,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// strip currently holds. Normalised 0..=1, like everything in the rack.
     pub fn keys_param_of(&self, strip: usize, knob: usize) -> f32 {
         let patch = self.keys_patch_of(strip);
-        self.settings
-            .strip_keys_params
-            .get(dialogs::keys_param_index(strip, patch, knob))
+        // A row's knobs are its own patches' only: row zero's span of the
+        // flat index.
+        self.row(strip)
+            .and_then(|r| r.keys.params.get(dialogs::keys_param_index(0, patch, knob)))
             .copied()
             .unwrap_or_else(|| f64::from(Self::keys_param_default(patch, knob)))
             .clamp(0.0, 1.0) as f32
@@ -31763,8 +31692,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     pub fn set_keys_param_of(&mut self, strip: usize, knob: usize, value: f32) {
         let patch = self.keys_patch_of(strip);
-        let at = dialogs::keys_param_index(strip, patch, knob);
-        if let Some(slot) = self.settings.strip_keys_params.get_mut(at) {
+        let at = dialogs::keys_param_index(0, patch, knob);
+        if let Some(slot) = self.row_mut(strip).and_then(|r| r.keys.params.get_mut(at)) {
             *slot = f64::from(value.clamp(0.0, 1.0));
         }
         self.save_settings_soon();
@@ -31776,8 +31705,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn reset_keys_params_of(&mut self, strip: usize) {
         let patch = self.keys_patch_of(strip);
         for knob in 0..dialogs::KEYS_PARAMS {
-            let at = dialogs::keys_param_index(strip, patch, knob);
-            if let Some(slot) = self.settings.strip_keys_params.get_mut(at) {
+            let at = dialogs::keys_param_index(0, patch, knob);
+            if let Some(slot) = self.row_mut(strip).and_then(|r| r.keys.params.get_mut(at)) {
                 *slot = f64::from(Self::keys_param_default(patch, knob));
             }
         }
@@ -31821,8 +31750,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // leaves no moment and no half-import, and the line says how many
         // would have fitted.
         if !files.is_empty() {
-            let first = lane.min(recorder::CHANNELS - 1);
-            let k = files.len() - 1 + usize::from(!self.row_counted(first));
+            // At or past the end of the desk the first file grows a row.
+            let k = files.len() - 1 + usize::from(lane >= self.desk_extent() || !self.row_counted(lane));
             if let Some(line) = self.track_refusal_text(k) {
                 return vec![line];
             }
@@ -31846,19 +31775,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         at: f64,
     ) -> Vec<String> {
         let mut errors = Vec::new();
-        let mut lane = lane.min(recorder::CHANNELS - 1);
+        let mut lane = lane;
         for (i, path) in files.iter().enumerate() {
-            if i > 0 {
-                let Some(free) = (0..self.desk_extent()).find(|n| !self.channel_used(*n))
-                else {
-                    errors.push(format!(
-                        "no empty track left for {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    break;
-                };
-                lane = free;
+            // **A .mid that would make its row a MIDI track waits out a
+            // record or an export**, asked before its row is found, made or
+            // turned into a bare track below (`import_midi_at` asks it too,
+            // too late to take those back). The first file's row is the one
+            // it was aimed at; every later one lands on a new track, which
+            // is a row with no kind like the one past the desk.
+            if Self::is_midi_path(path) {
+                let aimed = if i == 0 { lane } else { self.desk_extent() };
+                if let Some(line) = self.midi_bind_hold_line(aimed) {
+                    errors.push(line.to_owned());
+                    continue;
+                }
             }
+            // The first file on the row it was aimed at (a drop below the
+            // last row grows one); each after it on the first row a new
+            // track may take, and past every one of them a new last row. A
+            // desk that ended at a fixed width ran out here.
+            let free = if i == 0 {
+                self.lane_or_new(lane)
+            } else {
+                match (0..self.desk_extent()).find(|n| self.row_takes_new_track(*n)) {
+                    Some(n) => Some(n),
+                    None => self.open_trailing_row(),
+                }
+            };
+            let Some(free) = free else {
+                errors.push(format!(
+                    "no empty track left for {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                break;
+            };
+            lane = free;
             // A bare lane becomes a track: the media has to land on something
             // that draws, arms and can be turned down.
             if !self.channel_used(lane) {
@@ -32055,8 +32006,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A middle child steps just past the run, flags already cleared so
         // the permutation carries them - snap_into_folder's own manner,
         // inverted.
-        use crate::recorder::CHANNELS;
-        let mut order: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        let mut order: Vec<usize> = (0..self.desk_extent()).filter(|n| !group.contains(n)).collect();
         let at = order.iter().take_while(|n| **n <= run_end).count();
         for (k, n) in group.iter().enumerate() {
             order.insert(at + k, *n);
@@ -32068,11 +32018,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn make_folder(&mut self) -> bool {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        use crate::recorder::CHANNELS;
         let mut sel: Vec<usize> = self
             .selected_rows()
             .into_iter()
-            .filter(|n| *n < CHANNELS && self.channel_used(*n))
+            .filter(|n| *n < self.desk_extent() && self.channel_used(*n))
             .collect();
         sel.sort_unstable();
         sel.dedup();
@@ -32097,7 +32046,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if sel.len() < 2 {
             let Some(n) = self
                 .selected_row()
-                .filter(|n| *n < CHANNELS && !self.channel_used(*n))
+                .filter(|n| *n < self.desk_extent() && !self.channel_used(*n))
             else {
                 return false;
             };
@@ -32118,7 +32067,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.set_is_folder(n, true);
             // A folder is a ROW, so it has to exist as one: without this it
             // is a flag on a slot nothing draws.
-            self.settings.tracks_added |= 1 << n;
+            if let Some(row) = self.row_mut(n) {
+                row.added = true;
+            }
             self.set_in_folder(n, self.folder_of(n).is_some());
             self.select_alone(n);
             self.save_settings();
@@ -32136,76 +32087,42 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let top = sel[0];
         let bottom = *sel.last().unwrap_or(&top);
         let span = bottom - top + 1;
-        // Grouping MOVES a spare row into place above the run, so it is
-        // refused under an export or an arrangement record - before anything
-        // is set, see `lane_order_held`.
+        // Grouping puts a new row above the run, moving every row below
+        // it, so it is refused under an export or an arrangement record -
+        // before anything is set, see `lane_order_held`.
         if self.lane_order_held() {
             return false;
         }
-        // **The folder spends a row**, so it is a new counted track: asked
-        // before the search, the reorder and the hold below.
+        // **The folder is a new row**, so it is a new counted track: asked
+        // before the insert and the hold below.
         if !self.admit_tracks(1) {
             return false;
         }
-        // A spare row to BE the folder, taken from the bottom so the search
-        // never disturbs anything above the group.
-        let Some(free) = (0..self.desk_extent())
-            .rev()
-            .find(|n| !self.channel_used(*n) && !(top..=bottom).contains(n))
-        else {
-            // **Said out loud.** On a busy sixteen-track session there is no
-            // spare row to BE the folder, and a shortcut that silently does
-            // nothing here is worse than one that does nothing visibly —
-            // this fn's own doc said so while the refusal stayed mute.
-            //
-            // The "only if no dialog is open" guard went with the box: a
-            // notification does not displace anything, so a refusal is no
-            // longer silently thrown away for arriving while a picker is up.
-            // Past the gate, so the desk has room for another track; what it
-            // lacks is a free row OUTSIDE the chosen run, every spare one
-            // sitting between the tracks being grouped. The line used to say
-            // "all 16 rows are in use", which stopped being true of any desk.
-            self.notify(
-                crate::notify::Kind::Error,
-                "No free row outside the selection to hold the folder. \
-                 Remove a track to make room.",
-            );
+        // **ONE moment for the grouping**: the row inserted and the run
+        // filed under it. Held from here rather than from the top of the
+        // function because the exits above it commit nothing and must not
+        // have to remember to release.
+        self.begin_one_moment();
+        // **The header is INSERTED directly above the run** (design section
+        // 4: the desk grows for it), a plain row in whatever folder the run
+        // stands in, so the insert re-files nobody, and only then made a
+        // folder. It used to be a spare row lifted out from below the group
+        // by a permutation of the fixed desk, and a desk whose every spare
+        // row sat inside the selection could not group at all ("No free row
+        // outside the selection to hold the folder").
+        let member = self.folder_of(top).is_some();
+        let Some(at) = self.open_row(top, member) else {
+            self.commit_undo_moment();
             return false;
         };
-        // The permutation: everything in order, with the spare lifted out
-        // and put back at `top`. `reorder_channels` reads `order[new] = old`.
-        let mut order: Vec<usize> = (0..CHANNELS).filter(|n| *n != free).collect();
-        let at = order.iter().position(|n| *n == top).unwrap_or(0);
-        order.insert(at, free);
-        // **ONE moment for the grouping.** `reorder_channels` ends in
-        // `arr_save_edits` and so does the tail of this function, so
-        // Cmd/Ctrl+F left two - and the one in between was every track
-        // shifted a row with no folder over them, a layout nobody asked
-        // for. Held from here rather than from the top of the function
-        // because the four exits above it commit nothing and must not have
-        // to remember to release.
-        self.begin_one_moment();
-        self.reorder_channels(&order);
-        // After the move the folder sits at `at` and its run begins directly
-        // below it. The spare row it spent becomes a header row: a new row,
-        // so a new id.
-        self.mint_row_id(at);
         self.set_is_folder(at, true);
-        self.settings.tracks_added |= 1 << at;
-        // The folder itself belongs to whatever folder IT landed in, so
-        // nesting a group inside a group works without a second gesture.
-        self.set_in_folder(at, self.folder_of(at).is_some());
-        for i in 0..span {
-            let ch = at + 1 + i;
-            if ch < CHANNELS {
-                self.set_in_folder(ch, true);
-                // A track cannot be a folder and a member at once here: the
-                // nested case is a folder that is itself in one, and that is
-                // the row above, not these.
-                if self.settings.strip_is_folder.get(ch).copied().unwrap_or(false) {
-                    self.set_in_folder(ch, true);
-                }
-            }
+        if let Some(row) = self.row_mut(at) {
+            row.added = true;
+        }
+        // The run, one row down now, files under it. A nested folder among
+        // them stays a folder over its own members.
+        for ch in at + 1..at + 1 + span {
+            self.set_in_folder(ch, true);
         }
         self.select_alone(at);
         self.save_settings();
@@ -32223,11 +32140,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// group. Two derivations of one fact, and only one of them knew the
     /// contiguity rule that makes the positional model safe. Now the engine
     /// reads `folder_of` per channel, so the two CANNOT disagree; the
-    /// O(n^2) over sixteen lanes is free.
-    pub fn folder_parents(&self) -> [i32; recorder::CHANNELS] {
-        std::array::from_fn(|ch| {
-            self.folder_of(ch).map_or(-1, |p| p as i32)
-        })
+    /// walk is per row, as many as the desk has.
+    pub fn folder_parents(&self) -> Vec<i32> {
+        (0..self.desk_extent()).map(|ch| self.folder_of(ch).map_or(-1, |p| p as i32)).collect()
     }
 
     pub fn playhead_s(&self) -> f64 {
@@ -32837,8 +32752,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             (Vec::new(), None)
         };
         // Lane r's kit onto the track on THIS desk's row r, by its id.
-        self.drumpad_kits = crate::drumpad::DrumpadDoc::keyed(&self.settings.track_ids, kits);
-        if let Some(id) = lane.and_then(|l| self.settings.track_ids.get(l).copied()) {
+        self.drumpad_kits = crate::drumpad::DrumpadDoc::keyed(&self.settings.desk_ids(), kits);
+        if let Some(id) = lane.and_then(|l| self.row(l).map(|r| r.id)) {
             self.drumpad_lane = Some(id);
         }
         // The pads changed under whatever is playing them, and the sidecar
@@ -33038,7 +32953,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn aim_tap(&mut self, sb: crate::desk_id::SeatBay, on: bool) {
         let at = crate::desk_id::display_slot(sb)
             .and_then(|slot| {
-                let strip = crate::desk_legacy::unbind(sb.seat.node, &self.settings.track_ids)
+                let strip = crate::desk_legacy::unbind(sb.seat.node, &self.settings.desk_ids())
                     .and_then(crate::desk_legacy::encode_v32_strip)?;
                 Some((strip, slot))
             })
@@ -33212,7 +33127,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **The amp face's pedal chips, indexed by the OWNING track rather
         // than by the rack the amp happens to sit in.**
         //
-        // This used to read `seat < recorder::CHANNELS`, which is the
+        // This used to read a seat against the fixed desk's width, the
         // same test spelled four times across this app and wrong in the
         // same way each time. A FOLDER wears six bays; the last three
         // are seated past every pad block (`folder_extra_seat`), so an
@@ -33737,10 +33652,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// width with a key, and wider on a free install only once a DOCUMENT
     /// already carried work past sixteen. The tier is a creation cap now
     /// ([`Self::may_add_tracks`]), so the extent is simply the desk: every
-    /// row this build carries, on every tier. When the desk becomes a list
-    /// this is its length.
+    /// row the desk holds, on every tier: the desk is a list of rows
+    /// (`Settings::rows`) and this is its length.
     pub fn desk_extent(&self) -> usize {
-        recorder::CHANNELS
+        self.settings.rows.len()
+    }
+
+    /// **The track on row `n`**, whole, or `None` past the desk: the one
+    /// door every per-track fact is read through (`Settings::rows`).
+    fn row(&self, n: usize) -> Option<&crate::desk_model::TrackRow> {
+        self.settings.rows.get(n)
+    }
+
+    /// [`Self::row`]'s writer. A row past the desk takes no write.
+    fn row_mut(&mut self, n: usize) -> Option<&mut crate::desk_model::TrackRow> {
+        self.settings.rows.get_mut(n)
     }
 
     /// **The creation cap this install stands at**: `None` for a supporter,
@@ -33768,7 +33694,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (owner call 2): a folder row can carry clips of its own, and
     /// `make_folder` spends a row.
     pub fn counted_tracks(&self) -> usize {
-        (0..recorder::CHANNELS).filter(|n| self.row_counted(*n)).count()
+        (0..self.desk_extent()).filter(|n| self.row_counted(*n)).count()
     }
 
     /// **The one creation gate**: may a gesture that makes `k` new counted
@@ -33793,8 +33719,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 return Err(TrackRefusal::FreeCap { have, cap });
             }
         }
-        let max = self.desk_extent();
-        if have + k > max {
+        // **The desk's sanity bound, never a tier**: rows, not counted
+        // tracks, because a bus or a vacant row is a row too. Nothing a hand
+        // reaches; it is what keeps a batch from half-making a desk the
+        // model would refuse.
+        let max = crate::desk_id::MAX_ROWS;
+        if self.desk_extent().saturating_add(k) > max {
             return Err(TrackRefusal::Ceiling { max });
         }
         Ok(())
@@ -33820,7 +33750,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let refusal = self.may_add_tracks(k).err()?;
         let fit = match refusal {
             TrackRefusal::FreeCap { have, cap } => cap.saturating_sub(have),
-            TrackRefusal::Ceiling { max } => max.saturating_sub(self.counted_tracks()),
+            TrackRefusal::Ceiling { max } => max.saturating_sub(self.desk_extent()),
             TrackRefusal::Held => 0,
         };
         Some(refusal.line(k, fit))
@@ -33829,7 +33759,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// **Force the free cap down for a test**, so every road can be walked
     /// to the cap and past it without building thirty-two tracks. A free
     /// install's cap only: a supporter stays uncapped, so the same walk
-    /// proves that a supporter is not refused (until the build's ceiling).
+    /// proves that a supporter is never refused.
     #[cfg(test)]
     pub(crate) fn force_free_cap(&mut self, cap: usize) {
         self.forced_free_cap = Some(cap);
@@ -33881,7 +33811,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 mixer_run_w(pane),
             )
         };
-        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
+        // **On the zoom's own ceiling, never the desk's length** (design
+        // section 10: a strip's size follows the count asked for, never the
+        // track count). This read `desk_extent().min(VISIBLE_MAX)` while the
+        // extent was the fixed thirty-two; once the desk is its rows, a
+        // two-track desk zoomed to eight drew its two strips and the add at a
+        // third of the run each. The layout shows what there is.
+        want.clamp(1, recorder::VISIBLE_MAX)
     }
     fn arr_visible(&self) -> usize {
         // Zero is the auto sentinel; see `mixer_visible` and
@@ -33896,7 +33832,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 arr_timeline_h(&self.settings, pane),
             )
         };
-        want.clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX))
+        // The zoom's ceiling, not the desk's length: see `mixer_visible`.
+        want.clamp(1, recorder::VISIBLE_MAX)
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -34316,6 +34253,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // made the two panels disagree about the same switch.
             A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column::Track(n)), 0.0),
             A::HdrCollapse(n) => self.toggle_folder_shut(n),
+            A::HdrAdd(n) if n >= self.desk_extent() => self.press_trailing_add(),
             A::HdrAdd(n) => {
                 let _ = self.add_bare_track(n);
             }
@@ -35027,12 +34965,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.undo_commit();
     }
 
-    /// **Which ROWS are polarity-inverted**, one bit per row (the host's
-    /// plan reads it). A special's polarity is its own: [`Self::strip_inverted`].
-    pub fn strip_phase(&self) -> u64 {
-        self.settings.strip_phase
-    }
-
     /// **Whether a strip's polarity is inverted**, by what the strip is: a
     /// row's bit or a special's flag (`Settings::strip_switch`).
     pub fn strip_inverted(&self, s: recorder::StripRef) -> bool {
@@ -35066,9 +34998,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.metronome_in_take
     }
 
-    /// The three monitor gains, linear.
+    /// The monitor gains that are not tracks', linear.
     pub fn gains(&self) -> recorder::Gains {
         self.settings.knobs().gains
+    }
+
+    /// **Row `n`'s fader**, linear: unity past the desk.
+    pub fn channel_gain(&self, n: usize) -> f32 {
+        self.row(n).map_or(1.0, |r| r.gain as f32)
     }
 
     /// The stable uid of the audio input the user chose, if any.
@@ -35098,17 +35035,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.settings.record_camera_uid.as_deref()
     }
 
-    /// **The desk in the legacy strip space**, for the host's take facts
-    /// (which strips a take was cut under) and nothing else: the strip-space
-    /// form the bridge was fed every frame before it read the desk by what
-    /// each strip is ([`Self::strip_send`], [`Self::strip_heard_muted`],
-    /// [`Self::strip_heard_soloed`]). Kept beside those until the host's
-    /// take road moves off it (C11), and built through the frozen strip map
-    /// (`desk_legacy::V32Desk::of`), so no index is worked out here.
-    pub fn desk(&self) -> recorder::Desk {
-        recorder::Desk::of(|s| {
-            (self.settings.strip_send(s) as f32, self.strip_heard_muted(s), self.strip_heard_soloed(s))
-        })
+    /// **Whether a strip is heard**, which is also whether it is recorded:
+    /// solo wins, and a soloed strip is heard even if it is also muted; with
+    /// nothing soloed, a strip is heard unless it, or the folder holding it,
+    /// is muted ([`Self::strip_heard_muted`], [`Self::strip_heard_soloed`]).
+    /// By what the strip is, as many rows as the desk has: the strip-space
+    /// desk the host's take road read this from stopped at row thirty-one.
+    pub fn strip_heard(&self, s: recorder::StripRef) -> bool {
+        if self.any_solo() {
+            self.strip_heard_soloed(s)
+        } else {
+            !self.strip_heard_muted(s)
+        }
     }
 
     /// Whether anything the desk can solo is soloed, which is what makes
@@ -35116,17 +35054,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (the master has no solo of its own).
     pub fn any_solo(&self) -> bool {
         use recorder::StripRef;
-        (0..recorder::CHANNELS)
+        (0..self.desk_extent())
             .map(StripRef::Row)
             .chain([StripRef::Drums, StripRef::Click, StripRef::Fx])
             .any(|s| self.settings.strip_switch(s, crate::settings::StripSwitch::Solo))
     }
 
     /// **A strip's meter**, held and falling (`meter_hold`), by what the
-    /// strip is. The host still pushes the peaks in its legacy strip order,
-    /// so the one crossing to that order is here (`desk_legacy::v32_strip`).
+    /// strip is: a row's by its place, a special's by its own. The master's
+    /// is `RecorderState::master`, not one of these.
     pub fn strip_meter(&self, s: recorder::StripRef) -> [f32; 2] {
-        crate::desk_legacy::v32_strip(s).and_then(|i| self.meter_hold.get(i)).copied().unwrap_or([0.0; 2])
+        match s {
+            recorder::StripRef::Row(n) => self.meter_hold.get(n).copied(),
+            other => recorder::SPECIAL_METERS
+                .iter()
+                .position(|m| *m == other)
+                .and_then(|i| self.meter_hold_specials.get(i))
+                .copied(),
+        }
+        .unwrap_or([0.0; 2])
     }
 
     /// **What the ENGINE is told about this strip's mute — folders included.**
@@ -35236,13 +35182,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// rows as they stand. The host's one crossing; nothing in this file
     /// asks it of a bay of its own.
     fn legacy_bay(&self, seat: usize, bay: usize) -> Option<crate::desk_id::SeatBay> {
-        crate::desk_legacy::bay_at(&self.settings.track_ids, seat, bay)
+        crate::desk_legacy::bay_at(&self.settings.desk_ids(), seat, bay)
     }
 
     /// [`Self::legacy_bay`]'s inverse, for what the app hands the host: a
     /// request that still names a bay by seat.
     fn legacy_seat(&self, sb: crate::desk_id::SeatBay) -> Option<(usize, usize)> {
-        crate::desk_legacy::seat_of(&self.settings.track_ids, sb)
+        crate::desk_legacy::seat_of(&self.settings.desk_ids(), sb)
     }
 
     /// Whether one bay's tenant can take a sidechain key, which is what
@@ -35348,10 +35294,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// What feeds general channel `n`, or `None` for a channel not yet added.
     pub fn channel_kind(&self, n: usize) -> Option<recorder::ChannelKind> {
-        self.settings
-            .channel_kinds
-            .get(n)
-            .and_then(|k| recorder::ChannelKind::from_u8(*k))
+        self.row(n).and_then(|r| r.kind).and_then(recorder::ChannelKind::of_row)
     }
 
     /// Set it, saving. The kind lives BESIDE the channel — fader, send,
@@ -35363,7 +35306,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn set_channel_kind(&mut self, n: usize, kind: Option<recorder::ChannelKind>) {
         // Moves a fact the desk index reads; see `desk_index_dirty`.
         self.desk_index_dirty();
-        let fresh = kind.is_some() && n < recorder::CHANNELS && !self.row_counted(n);
+        // A kind changes which input pick every audio track below takes
+        // (`audio_ordinal`): it waits out a record or an export.
+        if n < self.desk_extent() && self.channel_kind(n) != kind && self.desk_shape_held_for(ShapeChange::Kind) {
+            return;
+        }
+        let fresh = kind.is_some() && n < self.desk_extent() && !self.row_counted(n);
         if fresh && !self.admit_tracks(1) {
             return;
         }
@@ -35371,8 +35319,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if fresh {
             self.mint_row_id(n);
         }
-        if let Some(slot) = self.settings.channel_kinds.get_mut(n) {
-            *slot = recorder::ChannelKind::as_u8(kind);
+        if let Some(row) = self.row_mut(n) {
+            row.kind = kind.map(recorder::ChannelKind::row_kind);
             self.save_settings();
         }
     }
@@ -35388,10 +35336,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.channel_kind(n) != Some(recorder::ChannelKind::Audio) {
             return None;
         }
-        let k = (0..n)
-            .filter(|m| self.channel_kind(*m) == Some(recorder::ChannelKind::Audio))
-            .count();
-        (k < recorder::INPUTS).then_some(k)
+        // As many picks as there are audio tracks: the stream takes one per
+        // bound track (design 7.12), so no ordinal is past the end.
+        Some((0..n).filter(|m| self.channel_kind(*m) == Some(recorder::ChannelKind::Audio)).count())
     }
 
     /// **Put an effect in a bay, or take one out**, by identity: the one
@@ -35489,7 +35436,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             return;
         }
-        let mut gone: Vec<(usize, AutoParam)> = Vec::new();
+        let mut gone: Vec<(AutoLane, AutoParam)> = Vec::new();
         let mut curves = self.arrangement.automation.curves().to_vec();
         let ridden: Vec<bool> = curves.iter().map(|c| self.auto_param_sb(c.lane, c.param) == Some(sb)).collect();
         let mut at = 0;
@@ -35552,7 +35499,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Where a curve or a row at `(lane, param)` goes: across, if it rides
         // one of the two bays (nowhere, if that side has no address), and
         // where it was otherwise.
-        let across = |lane: usize, param: AutoParam| -> Option<(usize, AutoParam)> {
+        let across = |lane: AutoLane, param: AutoParam| -> Option<(AutoLane, AutoParam)> {
             let AutoParam::Plugin { bay, id } = param else {
                 return Some((lane, param));
             };
@@ -36842,7 +36789,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .selected_row()
                         .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         .or_else(|| {
-                            (0..recorder::CHANNELS)
+                            (0..self.desk_extent())
                                 .find(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         });
                     match want {
@@ -36924,7 +36871,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let lane = self
                     .selected_row()
                     .unwrap_or_else(|| {
-                        (0..recorder::CHANNELS)
+                        (0..self.desk_extent())
                             .find(|n| self.channel_used(*n))
                             .unwrap_or(0)
                     });
@@ -37049,7 +36996,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .selected_channel()
                     .filter(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Midi))
                     .or_else(|| {
-                        (0..recorder::CHANNELS)
+                        (0..self.desk_extent())
                             .find(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Midi))
                     });
                 let Some(lane) = lane else {
@@ -38433,7 +38380,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // was chosen.
             DialogAction::TrackIcon(lane, icon) => {
                 for n in self.selection_with(lane) {
-                    if let Some(slot) = self.settings.channel_icons.get_mut(n) {
+                    if let Some(slot) = self.row_mut(n).map(|r| &mut r.icon) {
                         // ICON_MAX, not 3 - the clamp that made every NEW badge write
                         // "bass": the table grew to twenty-five and this line
                         // never heard.
@@ -39009,10 +38956,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // so putting the bank back is putting the STRIP's setting
                 // back, and the host then loads exactly what a fresh lane
                 // would.
-                if let Some(p) = self.settings.strip_dx7_cartridge.get_mut(slot) {
+                if let Some(p) = self.row_mut(slot).map(|r| &mut r.dx7.cart) {
                     p.clear();
                 }
-                if let Some(p) = self.settings.strip_dx7_patch.get_mut(slot) {
+                if let Some(p) = self.row_mut(slot).map(|r| &mut r.dx7.patch) {
                     *p = 0;
                 }
                 self.save_settings();
@@ -39174,8 +39121,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             }
                             None => {}
                         }
+                        // No length of its own: the picks are one per bound
+                        // track, as many as the desk binds.
                         list.retain(|u| !u.is_empty());
-                        list.truncate(recorder::INPUTS.saturating_sub(1));
                     }
                 }
                 self.save_settings();
@@ -39295,6 +39243,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // until the window was closed and opened again — the lesson
             // `SetInputChannels` and `AutomationToggle` both carry.
             DialogAction::MidiInputDevice { lane, device, on } => {
+                if self.desk_shape_held_for(ShapeChange::Input) {
+                    return;
+                }
                 let mut sel = self.channel_midi_sel(lane);
                 sel.devices.retain(|d| *d != device);
                 if on {
@@ -39308,6 +39259,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::MidiInputChannel { lane, channel } => {
+                if self.desk_shape_held_for(ShapeChange::Input) {
+                    return;
+                }
                 let mut sel = self.channel_midi_sel(lane);
                 sel.channel = channel;
                 self.set_channel_midi_sel(lane, sel);
@@ -39473,11 +39427,11 @@ const BASE_OF_MONITOR: f64 = 0.5 * 1.25;
 /// across a table of real displays rather than solved off one screen.
 const COUNT_LADDER: [usize; 10] = [4, 6, 8, 10, 12, 16, 24, 32, 48, 64];
 
-/// **The automation lane the master's curves are filed under.** One name for
-/// [`crate::arrangement_panel::LaneId::auto_lane`] on the master, which asks
-/// `StripRef`, so the app no longer spells "one past the channels" itself.
-pub(crate) fn master_lane() -> usize {
-    crate::arrangement_panel::LaneId::Master.auto_lane()
+/// **Whose the master's curves are**: [`AutoLane::Master`],
+/// by name. It was a lane number one past the channels, which a desk that
+/// grows by appending reaches with its next track.
+pub(crate) fn master_lane() -> AutoLane {
+    AutoLane::Master
 }
 
 /// **A comfortable arrangement LANE height, in points.**
@@ -40231,21 +40185,23 @@ impl TangentApp {
         let chip_key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            self.settings.channel_inputs.hash(&mut h);
-            self.settings.channel_kinds.hash(&mut h);
             // **The device sets and the ports that are OPEN.** The chip says
             // which devices a track listens to and marks the ones that are
             // not plugged in; a key that hashed neither would leave a stale
             // label standing for the rest of the session — which is the class
             // of fault this whole change is about.
-            self.settings.channel_midi_inputs.hash(&mut h);
+            for row in &self.settings.rows {
+                row.input.hash(&mut h);
+                crate::desk_model::RowKind::byte(row.kind).hash(&mut h);
+                row.midi.hash(&mut h);
+            }
             self.midi_ports_seen.hash(&mut h);
             h.finish()
         };
-        if self.input_chip_texts.len() != recorder::CHANNELS
+        if self.input_chip_texts.len() != self.desk_extent()
             || self.input_chip_key != Some(chip_key)
         {
-            self.input_chip_texts = (0..recorder::CHANNELS)
+            self.input_chip_texts = (0..self.desk_extent())
                 .map(|ch| self.input_chip_text(ch))
                 .collect();
             self.input_chip_key = Some(chip_key);
@@ -40926,7 +40882,7 @@ impl TangentApp {
             self.dialog = Some(Dialog::Track {
                 lane: 0,
                 removable: true,
-                icon: self.settings.channel_icons.first().copied().unwrap_or(0),
+                icon: self.settings.rows.first().map_or(0, |r| r.icon),
                 palette: self.settings.palette_choice,
                 palette_auto: self.settings.palette_auto,
                 serial: 1,
@@ -42541,11 +42497,12 @@ impl TangentApp {
             let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.25);
             (-3.685 * dt).exp()
         };
-        for (hold, fresh) in self
-            .meter_hold
-            .iter_mut()
-            .zip(self.recorder.strip_peaks.iter())
-        {
+        // As many held meters as the desk has rows: a row the host has not
+        // metered yet holds silence.
+        self.meter_hold.resize(self.desk_extent(), [0.0; 2]);
+        let rows = self.meter_hold.iter_mut().zip(self.recorder.row_peaks.iter());
+        let specials = self.meter_hold_specials.iter_mut().zip(self.recorder.special_peaks.iter());
+        for (hold, fresh) in rows.chain(specials) {
             for c in 0..2 {
                 hold[c] = (hold[c] * fall).max(fresh[c]);
                 if hold[c] < 1.0e-4 {
@@ -42830,9 +42787,10 @@ impl TangentApp {
                         let steps = self.wheel_mixer_zoom.steps(d);
                         let cur = self.mixer_visible() as i64;
                         // On the zoom's own ceiling, never the desk's width:
-                        // a desk longer than a screen scrolls.
-                        let next = (cur + i64::from(steps))
-                            .clamp(1, self.desk_extent().min(recorder::VISIBLE_MAX) as i64);
+                        // a desk longer than a screen scrolls, and a desk
+                        // shorter than the count is drawn that wide as it
+                        // grows (the layout shows what there is).
+                        let next = (cur + i64::from(steps)).clamp(1, recorder::VISIBLE_MAX as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
                             self.settings.mixer_visible_at = mixer_run_w(self.count_pane());
@@ -42859,7 +42817,7 @@ impl TangentApp {
                     (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
                 })
             {
-                self.add_track_first_free();
+                self.add_track();
             }
             // **Ctrl/Cmd+F: group the selection into a folder**, exactly
             // the arrangement's chord — same handler, same refusals — so a
@@ -44305,6 +44263,32 @@ impl TangentApp {
 /// it. A test that sets state through these and then moves the rows is
 /// asking exactly the question the session answers: does it stay with the
 /// track?
+/// **The arm and the curve suspend as the words the tests written before
+/// the desk was rows pinned**: bit r for row r (rows past 31, and the
+/// master's suspend past them, have none). Test-only: the live desk keeps
+/// each row's arm in its row and asks each lane's suspend by lane.
+#[cfg(test)]
+impl TangentApp {
+    pub(crate) fn armed_word(&self) -> u32 {
+        (0..self.desk_extent().min(32)).filter(|n| self.is_armed(*n)).fold(0, |w, n| w | 1 << n)
+    }
+
+    pub(crate) fn set_armed_word(&mut self, word: u32) {
+        let rows: Vec<usize> = (0..self.desk_extent().min(32)).filter(|n| (word >> n) & 1 == 1).collect();
+        self.set_armed_rows(&rows);
+    }
+
+    pub(crate) fn auto_suspend_word(&self) -> u64 {
+        let rows = (0..self.desk_extent().min(32)).filter(|n| self.auto_suspended(AutoLane::Row(*n)));
+        let word = rows.fold(0u64, |w, n| w | 1 << n);
+        if self.auto_suspended(AutoLane::Master) {
+            word | 1 << crate::desk_lift::V32_MASTER_LANE
+        } else {
+            word
+        }
+    }
+}
+
 #[cfg(test)]
 impl TangentApp {
     /// The PRIMARY on row `row`'s track (or nothing).
@@ -44317,9 +44301,9 @@ impl TangentApp {
         self.selected_tracks = rows.iter().map(|r| self.track_id_at(*r)).collect();
     }
 
-    /// Whose automation lane `lane` is.
+    /// Whose automation lane row `lane`'s is.
     fn owner_at(&self, lane: usize) -> crate::desk_id::Node {
-        self.auto_owner(lane).unwrap_or_else(|| panic!("lane {lane} has no owner"))
+        self.auto_owner(AutoLane::Row(lane)).unwrap_or_else(|| panic!("lane {lane} has no owner"))
     }
 
     /// The row `(lane, param)`, by its owner.
@@ -44328,7 +44312,7 @@ impl TangentApp {
     }
 
     /// The chosen nodes as `(lane, slot, index)`, where their owners stand now.
-    fn auto_nodes_at(&self) -> Vec<(usize, usize, usize)> {
+    fn auto_nodes_at(&self) -> Vec<(AutoLane, usize, usize)> {
         self.arr_auto_nodes
             .iter()
             .filter_map(|(o, s, i)| Some((self.auto_lane_of(*o)?, *s, *i)))
@@ -44342,7 +44326,7 @@ impl TangentApp {
 
     /// Row `lane`'s track's kit, to change.
     fn kit_at_mut(&mut self, lane: usize) -> &mut crate::drumpad::DrumpadDoc {
-        let id = self.settings.track_ids[lane];
+        let id = self.settings.rows[lane].id;
         self.drumpad_kits.entry(id).or_default()
     }
 }
@@ -44437,7 +44421,7 @@ mod paywall_tests {
     /// road, lowest empty rows first.
     fn fill_to(app: &mut TangentApp, n: usize) {
         while app.counted_tracks() < n {
-            let free = (0..recorder::CHANNELS)
+            let free = (0..crate::desk_lift::V32_CHANNELS)
                 .find(|r| !app.row_counted(*r))
                 .expect("no empty row to fill");
             assert!(app.add_bare_track(free), "the fill was refused at {}", app.counted_tracks());
@@ -44447,7 +44431,7 @@ mod paywall_tests {
 
     /// An empty row high on the desk, away from everything `fill_to` uses.
     fn vacant(app: &TangentApp) -> usize {
-        (0..recorder::CHANNELS)
+        (0..crate::desk_lift::V32_CHANNELS)
             .rev()
             .find(|r| !app.row_counted(*r))
             .expect("the desk is full")
@@ -44500,7 +44484,7 @@ mod paywall_tests {
                 makes: 1,
                 on_full: true,
                 go: |app, _| {
-                    app.add_track_first_free();
+                    app.add_track();
                     None
                 },
             },
@@ -44715,6 +44699,36 @@ mod paywall_tests {
                     None
                 },
             },
+            // **W6's own roads**: media dropped below the last lane makes a
+            // track there (design section 10), the desk growing for it once
+            // no hidden row past the last track is free.
+            Road {
+                name: "an audio file dropped below the last lane",
+                makes: 1,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.import_audio_at(&fx.wav, below, 0.0).err()
+                },
+            },
+            Road {
+                name: "a MIDI file dropped below the last lane",
+                makes: 1,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.import_midi_at(&fx.mid, below, 0.0).err()
+                },
+            },
+            Road {
+                name: "two files dropped below the last lane",
+                makes: 2,
+                on_full: true,
+                go: |app, fx| {
+                    let below = app.desk_extent();
+                    app.insert_media_files(below, &[fx.wav.clone(), fx.wav2.clone()], 0.0).into_iter().next()
+                },
+            },
         ]
     }
 
@@ -44833,7 +44847,8 @@ mod paywall_tests {
     }
 
     /// **A supporter and a cheater walk the same roads past the free cap**,
-    /// and stop only at the build's ceiling, with that line.
+    /// and past the thirty-two the build's desk once held (W6: unlimited end
+    /// to end), meeting only the desk's sanity bound, with its line.
     #[test]
     fn supporters_and_cheaters_pass_the_walk_and_meet_only_the_ceiling() {
         let root = scratch("paid");
@@ -44854,24 +44869,136 @@ mod paywall_tests {
                     ));
                 }
             }
-            // Full: every road that can still make a track meets the
-            // ceiling, says so, and changes nothing.
+            // At thirty-two tracks, the old ceiling, every road that can
+            // still make a track makes it: the desk grows (W6).
             for road in roads().into_iter().filter(|r| r.on_full) {
-                let (_ctx, mut app) =
-                    walk_app(tier, "walk-full", &root, recorder::CHANNELS);
-                let before = standing(&app);
+                let full = crate::desk_lift::V32_CHANNELS;
+                let (_ctx, mut app) = walk_app(tier, "walk-full", &root, full);
                 let answer = (road.go)(&mut app, &fx);
-                let line = said(&app, answer);
-                if standing(&app) != before {
-                    bad.push(format!("{tier:?} {}: the ceiling changed the desk", road.name));
+                if app.counted_tracks() != full + road.makes {
+                    bad.push(format!(
+                        "{tier:?} {}: {} tracks after, not {} ({:?})",
+                        road.name,
+                        app.counted_tracks(),
+                        full + road.makes,
+                        said(&app, answer)
+                    ));
                 }
-                if !line.contains("This build's desk holds 32 tracks.") {
-                    bad.push(format!("{tier:?} {}: said {line:?} at the ceiling", road.name));
-                }
+            }
+            // **The one bound left is the desk's own**, no tier's: a gesture
+            // that would take the desk past `MAX_ROWS` rows is refused,
+            // whole, with its line.
+            let (_ctx, app) = walk_app(tier, "walk-bound", &root, CAP);
+            let max = crate::desk_id::MAX_ROWS;
+            let refused = app.may_add_tracks(max);
+            if refused != Err(TrackRefusal::Ceiling { max }) {
+                bad.push(format!("{tier:?}: a batch past the desk's bound was {refused:?}"));
+            }
+            let line = app.track_refusal_text(max).unwrap_or_default();
+            if !line.contains(&format!("A desk holds at most {max} rows.")) {
+                bad.push(format!("{tier:?}: said {line:?} at the bound"));
             }
         }
         let _ = std::fs::remove_dir_all(&root);
         assert!(bad.is_empty(), "the paid walk:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Bring the desk to `n` counted tracks, past its hidden rows too**:
+    /// the lowest empty row while one is left, then Add, which appends; and
+    /// from above, the last track removed until it is there.
+    fn grow_to(app: &mut TangentApp, n: usize) {
+        while app.counted_tracks() > n {
+            let last = (0..app.desk_extent()).rev().find(|r| app.row_counted(*r)).expect("a track to remove");
+            app.remove_channel(last);
+        }
+        while app.counted_tracks() < n {
+            match (0..app.desk_extent()).find(|r| !app.row_counted(*r)) {
+                Some(free) => assert!(app.add_bare_track(free), "the fill was refused at {}", app.counted_tracks()),
+                None => app.add_track(),
+            }
+        }
+        assert_eq!(app.counted_tracks(), n, "the fill overshot");
+    }
+
+    /// **Whether row `row` is drawn once both views are carried to it**: the
+    /// timeline scrolled so its rank leads the window, the desk scrolled by
+    /// its rank's pitch, and each view laid out at `rect`.
+    fn drawn_after_scrolling(app: &mut TangentApp, row: usize, rect: Rect) -> (bool, bool) {
+        let rank = app.desk_index().rank_of(row).unwrap_or_else(|| panic!("row {row} is not drawn at all"));
+        app.arr_lane_scroll = rank;
+        let clips = app.arr_clip_views();
+        let v = app.arrange_view(&clips);
+        let lane = crate::arrangement_panel::Layout::new(rect, &v).lane_rows[row].is_positive();
+        app.mixer_scroll_px = rank as f32 * crate::mixer_panel::Layout::metrics(rect, app.mixer_visible()).1;
+        let v = app.mixer_view_in(rect);
+        let strip = crate::mixer_panel::Layout::new(rect, &v)
+            .strips
+            .get(recorder::Column::Track(row))
+            .is_some_and(|s| s.panel.is_positive());
+        (lane, strip)
+    }
+
+    /// **Tracks 33, 64, 65, 100 and 200, made on every road that can still
+    /// make one when no hidden row is left** (design 11.2 item 1; the same
+    /// milestones played offline are `konami_e2e`'s): a cheater and a
+    /// supporter each make the milestone track, one moment (one undo is the
+    /// desk before the gesture), and the track is drawn once either view is
+    /// scrolled to it.
+    #[test]
+    fn a_cheater_and_a_supporter_make_every_milestone_track_on_every_road() {
+        let root = scratch("milestones");
+        let fx = fixtures(&root);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 700.0));
+        let mut bad = Vec::new();
+        for tier in [Tier::Cheater, Tier::Supporter] {
+            let (_ctx, mut app) = app_on(store(tier, "milestones"));
+            app.bootstrap_project(&root.join("Projects"));
+            app.settings.mixer_visible = 8;
+            app.settings.arr_visible = 8;
+            for m in [33usize, 64, 65, 100, 200] {
+                for road in roads().into_iter().filter(|r| r.on_full) {
+                    grow_to(&mut app, m - road.makes);
+                    app.messages.clear();
+                    let before: Vec<crate::desk_id::TrackId> = app.track_ids();
+                    let answer = (road.go)(&mut app, &fx);
+                    if app.counted_tracks() != m {
+                        bad.push(format!(
+                            "{tier:?} {}: {} tracks, not {m} ({:?})",
+                            road.name,
+                            app.counted_tracks(),
+                            said(&app, answer)
+                        ));
+                        continue;
+                    }
+                    let made: Vec<usize> = app
+                        .track_ids()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| !before.contains(id))
+                        .map(|(r, _)| r)
+                        .filter(|r| app.row_counted(*r))
+                        .collect();
+                    for row in made {
+                        let (lane, strip) = drawn_after_scrolling(&mut app, row, rect);
+                        if !(lane && strip) {
+                            bad.push(format!("{tier:?} {} at {m}: row {row} drawn on the timeline {lane}, on the desk {strip}", road.name));
+                        }
+                    }
+                    // One gesture, one moment: one undo is the desk before it.
+                    app.undo();
+                    if app.track_ids() != before {
+                        bad.push(format!(
+                            "{tier:?} {} at {m}: one undo left {} tracks, not the desk before the gesture",
+                            road.name,
+                            app.counted_tracks()
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(tiers::dir("milestones"));
+        assert!(bad.is_empty(), "the milestones:\n  {}", bad.join("\n  "));
     }
 
     /// **The tier's numbers**: no limit for a supporter, thirty-two free,
@@ -44888,14 +45015,14 @@ mod paywall_tests {
         assert_eq!(cheat.track_cap(), None);
         assert_eq!(buyer.track_cap(), None);
         for app in [&free, &cheat, &buyer] {
-            assert_eq!(app.desk_extent(), recorder::CHANNELS, "the extent read the licence");
+            assert_eq!(app.desk_extent(), crate::desk_lift::V32_CHANNELS, "the extent read the licence");
             assert_eq!(app.may_add_tracks(0), Ok(()), "an edit was refused");
         }
         // A desk past the cap (a supporter's project opened free) is not
         // refused an edit, and is refused the next track.
         let (_c, mut over) = app_on(tiers::free("caps-over"));
         over.force_free_cap(CAP);
-        over.settings.tracks_added = 0b11_1111;
+        over.settings.set_word(|r| &mut r.added, 0b11_1111);
         assert_eq!(over.counted_tracks(), 6);
         assert_eq!(over.may_add_tracks(0), Ok(()));
         assert_eq!(over.may_add_tracks(1), Err(TrackRefusal::FreeCap { have: 6, cap: CAP }));
@@ -44911,7 +45038,7 @@ mod paywall_tests {
     fn a_desk_over_the_cap_shrinks_freely_and_grows_once_back_under() {
         let (_c, mut app) = app_on(tiers::free("over"));
         app.force_free_cap(CAP);
-        app.settings.tracks_added = 0b11_1111;
+        app.settings.set_word(|r| &mut r.added, 0b11_1111);
         app.undo_reset();
         assert_eq!(app.counted_tracks(), 6);
         assert!(!app.add_bare_track(10), "a desk past the cap grew");
@@ -44943,7 +45070,7 @@ mod paywall_tests {
         app.force_free_cap(CAP);
         fill_to(&mut app, CAP);
         // A "road" that writes the track straight in, as a new one might.
-        app.settings.tracks_added |= 1 << 20;
+        app.settings.set_word(|r| &mut r.added, app.settings.word(|r| r.added) | (1 << 20));
         app.undo_commit();
     }
 
@@ -45097,14 +45224,14 @@ mod paywall_tests {
         app.settings.routes.add(Route::new(t5, Target::Node(t2)));
         let table = app.settings.routes.clone();
         // Rows 2 and 4 trade places.
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.swap(2, 4);
         app.reorder_channels(&order);
         // By identity the table did not move at all; read by row, every
         // route stands where its tracks went.
         assert_eq!(app.settings.routes, table, "a reorder rewrote the routing table");
         assert_eq!(
-            app.settings.routes.to_lanes(app.track_ids()).0,
+            app.settings.routes.to_lanes(&app.track_ids()).0,
             vec![
                 LaneRoute::new(4, LaneTarget::Channel(2)),
                 LaneRoute::new(2, LaneTarget::Hardware { first: 2, stereo: true }),
@@ -45116,7 +45243,9 @@ mod paywall_tests {
         // the one into it and the one out of it. The stranger's stays.
         app.remove_channel(2);
         assert_eq!(app.settings.routes.0, vec![Route::new(t5, Target::Node(t2))]);
-        assert_eq!(app.settings.routes.to_lanes(app.track_ids()).0, vec![LaneRoute::new(5, LaneTarget::Channel(4))]);
+        // Read by row, the rows below the removed one have moved up one
+        // (W6: Remove deletes the row): t5 stands on row 4, t2 on row 3.
+        assert_eq!(app.settings.routes.to_lanes(&app.track_ids()).0, vec![LaneRoute::new(4, LaneTarget::Channel(3))]);
     }
 
     // ── scans ────────────────────────────────────────────────────────────
@@ -45375,9 +45504,9 @@ mod tests {
         // they really are.
         let column = |s: Strip| s.column_of().expect("that strip has no column");
         app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.25);
-        let quiet = app.settings.knobs().gains.channels[2];
+        let quiet = app.channel_gain(2);
         app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.75);
-        let loud = app.settings.knobs().gains.channels[2];
+        let loud = app.channel_gain(2);
         assert!(loud > quiet, "the mixer's fader moved nothing: {quiet} then {loud}");
         // And the metronome, which has a column right next to the master, is
         // untouched by either of those.
@@ -45394,19 +45523,20 @@ mod tests {
             0.4,
         );
         assert!(
-            (app.desk().send[Strip::Channel(3).index()] - 0.4).abs() < 1.0e-6,
+            (app.strip_send(recorder::StripRef::Row(3)) - 0.4).abs() < 1.0e-6,
             "the channel's send did not stick"
         );
 
         // Mute and solo toggle, and they are separate switches. Pressed by
-        // COLUMN, read back by desk index — which is the whole conversion
-        // under test.
+        // COLUMN, read back by what the strip is — which is the whole
+        // conversion under test.
         let click = Strip::Click.column_of().expect("the click has a column");
+        let at = recorder::StripRef::Click;
         app.apply_mixer_hit(Hit::Mute(click), 0.0);
-        assert!(app.desk().muted[Strip::Click.index()]);
-        assert!(!app.desk().soloed[Strip::Click.index()]);
+        assert!(app.strip_heard_muted(at));
+        assert!(!app.strip_heard_soloed(at));
         app.apply_mixer_hit(Hit::Mute(click), 0.0);
-        assert!(!app.desk().muted[Strip::Click.index()], "mute did not toggle back");
+        assert!(!app.strip_heard_muted(at), "mute did not toggle back");
     }
 
     /// **The way back to the shipped bank exists at all.**
@@ -45419,8 +45549,8 @@ mod tests {
     #[test]
     fn the_shipped_cartridge_can_be_put_back() {
         let mut settings = Settings::default();
-        settings.strip_dx7_cartridge[2] = "/somewhere/ROM1A.syx".to_owned();
-        settings.strip_dx7_patch[2] = 17;
+        settings.rows[2].dx7.cart = "/somewhere/ROM1A.syx".to_owned();
+        settings.rows[2].dx7.patch = 17;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
         assert_eq!(app.dx7_choice_of(2), ("/somewhere/ROM1A.syx", 17));
 
@@ -46689,8 +46819,8 @@ mod tests {
         app.commit_view_change();
         assert!(app.settings.arr_header_w.abs() < 1e-9, "fixture: the width is not on AUTO");
         assert_eq!(app.settings.arr_visible, 0, "fixture: the lane count is not on AUTO");
-        let n = (0..recorder::CHANNELS)
-            .find(|&n| (app.settings.tracks_added >> n) & 1 == 0)
+        let n = (0..crate::desk_lift::V32_CHANNELS)
+            .find(|&n| (app.settings.word(|r| r.added) >> n) & 1 == 0)
             .expect("a free slot");
         app.add_bare_track(n);
         let m1 = app.hist_at;
@@ -46708,7 +46838,7 @@ mod tests {
             app.commit_view_change(); // the end of that frame
         }
         assert_eq!(app.hist_at, m1 - 1, "three Ctrl+Z from the top stopped at moment {} - undo is wedged", app.hist_at);
-        assert_eq!((app.settings.tracks_added >> n) & 1, 0, "the track add was never undone");
+        assert_eq!((app.settings.word(|r| r.added) >> n) & 1, 0, "the track add was never undone");
         assert!(app.settings.arr_header_w.abs() < 1e-9, "undo left the dragged width at {}", app.settings.arr_header_w);
         assert_eq!(app.settings.arr_visible, 0, "undo left the wheeled lane count standing");
         for _ in 0..3 {
@@ -46717,7 +46847,7 @@ mod tests {
         }
         assert!((app.settings.arr_header_w - 220.0).abs() < 1e-9, "redo lost the width");
         assert_eq!(app.settings.arr_visible, 9, "redo lost the lane count");
-        assert_eq!((app.settings.tracks_added >> n) & 1, 1, "redo lost the track");
+        assert_eq!((app.settings.word(|r| r.added) >> n) & 1, 1, "redo lost the track");
         // **Only an undo takes a zero literally.** The shipped template is
         // seeded on AUTO, and the open or adopt that applies it keeps a sized
         // column, or every launch and New would un-size it.
@@ -46756,10 +46886,10 @@ mod tests {
             assert_eq!(app.hist_at, before + 1, "{what} left no moment");
         }
         // And one step back takes the last one off and leaves the others.
-        let muted = app.settings.strip_muted;
+        let muted = app.settings.word(|r| r.mute);
         app.undo();
         assert_eq!(
-            app.settings.strip_muted, muted,
+            app.settings.word(|r| r.mute), muted,
             "one Ctrl+Z on the theory send also unmuted"
         );
 
@@ -46784,10 +46914,10 @@ mod tests {
         app.arr_gesture_dirty = false;
         app.arr_save_edits();
         assert_eq!(app.hist_at, before + 1, "the release left no moment");
-        let loud = app.settings.channel_gains[2];
+        let loud = app.settings.rows[2].gain;
         app.undo();
         assert!(
-            (app.settings.channel_gains[2] - loud).abs() > 1e-9,
+            (app.settings.rows[2].gain - loud).abs() > 1e-9,
             "one step back did not undo the whole drag"
         );
 
@@ -47067,7 +47197,7 @@ mod tests {
         }
 
         // And a second gesture does not take the first one with it.
-        let cart = app.settings.strip_dx7_cartridge[2].clone();
+        let cart = app.settings.rows[2].dx7.cart.clone();
         app.set_click_sample("/x/other.wav");
         app.undo();
         assert_eq!(
@@ -47075,7 +47205,7 @@ mod tests {
             "one step back did not undo the click's sound"
         );
         assert_eq!(
-            app.settings.strip_dx7_cartridge[2], cart,
+            app.settings.rows[2].dx7.cart, cart,
             "one step back also undid the cartridge chosen three gestures ago"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -47315,7 +47445,7 @@ mod tests {
         app.undo();
         assert_eq!(app.insert(5, 0), None, "a bay survived the undo");
         assert_eq!(app.insert(5, 1), None, "the second bay survived the undo");
-        assert_eq!(app.settings.tracks_added & (1 << 5), 0, "the track survived");
+        assert_eq!(app.settings.word(|r| r.added) & (1 << 5), 0, "the track survived");
         assert!(
             !app.arrangement.clips.iter().any(|c| c.lane == 5),
             "the pasted clip survived the undo"
@@ -47367,7 +47497,7 @@ mod tests {
         app.undo();
         assert_eq!(app.insert(3, 0), None, "a bay survived the undo");
         assert_eq!(app.insert(3, 1), None, "the second bay survived the undo");
-        assert_eq!(app.settings.tracks_added & (1 << 3), 0, "the track survived the undo");
+        assert_eq!(app.settings.word(|r| r.added) & (1 << 3), 0, "the track survived the undo");
         app.redo();
         assert_eq!(app.insert(3, 1), Some("/x/b.vst3"), "the redo lost a bay");
 
@@ -49746,7 +49876,7 @@ mod tests {
         // survives the dialog and not the file is one somebody rebuilds every
         // launch.
         let back = Settings::from_json(&app.settings_json());
-        assert_eq!(back.channel_midi_inputs[4], app.channel_midi_sel(4));
+        assert_eq!(back.rows[4].midi, app.channel_midi_sel(4));
 
         // Untick, and ALL comes back — the way out has to exist.
         app.apply_dialog_action(DialogAction::MidiInputDevice {
@@ -49858,7 +49988,7 @@ mod tests {
     #[test]
     fn the_desk_opens_the_devices_its_tracks_ask_for() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             app.set_channel_input_spec(ch, "");
         }
         app.midi_ports_seen = vec![
@@ -49931,7 +50061,7 @@ mod tests {
         assert_eq!(app.input_chip_text(3), "IN 3");
         // Binding a fresh track raises its send and touches NO arms —
         // the self-arm stole the player's standing arms twice over.
-        assert_eq!(app.armed_mask() & (1 << 3), 0, "a new track armed itself");
+        assert_eq!(app.armed_word() & (1 << 3), 0, "a new track armed itself");
         app.set_channel_input_spec(3, "0+1");
         assert_eq!(app.input_chip_text(3), "IN 1/2");
         assert_eq!(TangentApp::parse_input_spec("2"), Some((2, None)));
@@ -50236,7 +50366,7 @@ mod tests {
             "the seed captured the session that was open"
         );
         assert_ne!(
-            desk.kinds[3], app.settings.channel_kinds[3],
+            desk.rows[3].kind_byte(), app.settings.rows[3].kind_byte(),
             "the fixture did not actually differ from the template"
         );
         // Seeding again does not overwrite a template that exists.
@@ -50245,8 +50375,8 @@ mod tests {
         let again =
             crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&shelf));
         assert_eq!(
-            again.desk.unwrap().kinds[3],
-            desk.kinds[3],
+            again.desk.unwrap().rows[3].kind_byte(),
+            desk.rows[3].kind_byte(),
             "the seed clobbered a saved template"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -50288,7 +50418,7 @@ mod tests {
         app.set_channel_kind(2, Some(recorder::ChannelKind::Midi));
         app.commit_mixer_name(recorder::Column::Track(2), "Rhodes".to_owned());
         app.set_insert(2, 0, Some("/x/EP.vst3"));
-        app.settings.channel_gains[2] = 0.42;
+        app.settings.rows[2].gain = 0.42;
         app.settings.record_export.tempo_bpm = 93.0;
         // And the timeline's own grid and window, the half of the desk the
         // arrangement owns: a magnet, a grid, a header width, a lane count
@@ -50314,9 +50444,9 @@ mod tests {
         // The document on disk carries it.
         let read = crate::arrangement::Arrangement::load_from(&doc);
         let desk = read.desk.expect("the save left the desk out");
-        assert_eq!(desk.kinds[2], app.settings.channel_kinds[2]);
+        assert_eq!(desk.rows[2].kind_byte(), app.settings.rows[2].kind_byte());
         assert_eq!(desk.bay(2 * recorder::INSERTS), Some("/x/EP.vst3"));
-        assert!((desk.gains[2] - 0.42).abs() < 1e-9);
+        assert!((desk.rows[2].gain - 0.42).abs() < 1e-9);
         assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
         let view = desk.view.expect("the save left the timeline's view out");
         assert!(!view.snap, "the magnet did not travel");
@@ -50350,9 +50480,9 @@ mod tests {
         // A DIFFERENT app (fresh settings) opens it: the desk arrives.
         let (_ctx2, mut other) = headless_with(Caps::DESKTOP, Settings::default());
         other.open_project(&doc);
-        assert_eq!(other.settings.channel_kinds[2], app.settings.channel_kinds[2]);
+        assert_eq!(other.settings.rows[2].kind_byte(), app.settings.rows[2].kind_byte());
         assert_eq!(other.insert(2, 0), Some("/x/EP.vst3"));
-        assert!((other.settings.channel_gains[2] - 0.42).abs() < 1e-9);
+        assert!((other.settings.rows[2].gain - 0.42).abs() < 1e-9);
         assert!((other.settings.record_export.tempo_bpm - 93.0).abs() < 1e-9);
         assert!(!other.settings.arr_snap, "the magnet did not arrive");
         assert_eq!(other.settings.arr_grid_exp, -5, "the timeline's grid did not arrive");
@@ -50395,10 +50525,10 @@ mod tests {
         let mut s3 = Settings::default();
         s3.project_path = doc.to_string_lossy().into_owned();
         let (_ctx3, mut third) = headless_with(Caps::DESKTOP, s3);
-        third.settings.channel_gains[2] = 0.9; // "newer than the doc"
+        third.settings.rows[2].gain = 0.9; // "newer than the doc"
         third.bootstrap_project(&root.join("Projects"));
         assert!(
-            (third.settings.channel_gains[2] - 0.9).abs() < 1e-9,
+            (third.settings.rows[2].gain - 0.9).abs() < 1e-9,
             "the launch reopen rolled the live desk back"
         );
         assert!(!third.take_desk_reload());
@@ -50796,14 +50926,12 @@ mod tests {
         app.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
         // `strip_names` is a Vec that grows on demand, so a fresh settings
         // has none — the same shape `copy_track` reads through `get`.
-        app.settings
-            .strip_names.resize(recorder::CHANNELS, String::new());
-        app.settings.strip_names[at] = "Rhodes".to_owned();
-        app.settings.strip_colors[at] = 5;
-        app.settings.channel_icons[1] = 2;
-        app.settings.channel_gains[1] = 0.42;
-        app.settings.channel_pans[1] = -0.3;
-        app.settings.strip_sends[at] = 0.75;
+        app.settings.rows[at].name = "Rhodes".to_owned();
+        app.settings.rows[at].color = 5;
+        app.settings.rows[1].icon = 2;
+        app.settings.rows[1].gain = 0.42;
+        app.settings.rows[1].pan = -0.3;
+        app.settings.set_strip_send(recorder::StripRef::Row(at), 0.75);
         app.set_insert(at, 0, Some("/x/Piano.vst3"));
         // And one in the LOWER rack, which is a seat of its own: a copy that
         // took only the first three would drop it silently.
@@ -50850,11 +50978,11 @@ mod tests {
         app.paste_track(to);
         assert!(app.channel_used(to), "the slot is still empty");
         assert_eq!(app.channel_kind(to), Some(recorder::ChannelKind::Midi));
-        assert_eq!(app.settings.strip_colors[to_at], 5);
-        assert_eq!(app.settings.channel_icons[to], 2);
-        assert!((app.settings.channel_gains[to] - 0.42).abs() < 1e-9, "the fader");
-        assert!((app.settings.channel_pans[to] + 0.3).abs() < 1e-9, "the pan");
-        assert!((app.settings.strip_sends[to_at] - 0.75).abs() < 1e-9, "the send");
+        assert_eq!(app.settings.rows[to_at].color, 5);
+        assert_eq!(app.settings.rows[to].icon, 2);
+        assert!((app.settings.rows[to].gain - 0.42).abs() < 1e-9, "the fader");
+        assert!((app.settings.rows[to].pan + 0.3).abs() < 1e-9, "the pan");
+        assert!((app.settings.strip_send(recorder::StripRef::Row(to_at)) - 0.75).abs() < 1e-9, "the send");
         assert_eq!(app.insert(to_at, 0), Some("/x/Piano.vst3"), "the bay");
         assert_eq!(
             app.insert(recorder::folder_extra_seat(to_at), 1),
@@ -50862,7 +50990,7 @@ mod tests {
             "the lower rack did not travel"
         );
         // Named as a copy: two tracks with one name is a mixer nobody reads.
-        assert_eq!(app.settings.strip_names[to_at], "Rhodes 2");
+        assert_eq!(app.settings.rows[to_at].name, "Rhodes 2");
 
         // The clips travel, with FRESH ids — two clips sharing an id is a
         // document that cannot say which one an edit meant.
@@ -50885,7 +51013,7 @@ mod tests {
         let over = 6usize;
         let over_at = recorder::Strip::Channel(over).index();
         app.set_channel_kind(over, Some(recorder::ChannelKind::Audio));
-        app.settings.strip_names[over_at] = "Guitar".to_owned();
+        app.settings.rows[over_at].name = "Guitar".to_owned();
         app.set_insert(over_at, 0, Some("/x/Amp.vst3"));
         app.arrangement.add_clip(crate::arrangement::ArrClip {
             lane: over,
@@ -50898,7 +51026,7 @@ mod tests {
         // half of this that matters would not be exercised at all.
         let below = 7usize;
         app.set_channel_kind(below, Some(recorder::ChannelKind::Midi));
-        app.settings.strip_names[recorder::Strip::Channel(below).index()] =
+        app.settings.rows[below].name =
             "Bass".to_owned();
         assert!(app.channel_used(over));
         assert!(app.paste_track_below(over), "no lane was opened");
@@ -50909,7 +51037,7 @@ mod tests {
             Some(recorder::ChannelKind::Audio),
             "the live lane lost its own kind"
         );
-        assert_eq!(app.settings.strip_names[over_at], "Guitar");
+        assert_eq!(app.settings.rows[over_at].name, "Guitar");
         assert_eq!(app.insert(over_at, 0), Some("/x/Amp.vst3"), "its bay");
         let kept: Vec<_> = app
             .arrangement
@@ -50923,14 +51051,14 @@ mod tests {
         // The copy is on the row directly under it.
         let landed = over + 1;
         let landed_at = recorder::Strip::Channel(landed).index();
-        assert_eq!(app.settings.strip_names[landed_at], "Rhodes 2", "where it landed");
+        assert_eq!(app.settings.rows[landed_at].name, "Rhodes 2", "where it landed");
         assert_eq!(app.insert(landed_at, 0), Some("/x/Piano.vst3"), "the bay");
         assert_eq!(app.channel_kind(landed), Some(recorder::ChannelKind::Midi));
 
         // And the track that WAS under it moved down a row rather than being
         // eaten, which is the whole difference from the overwrite.
         assert_eq!(
-            app.settings.strip_names[recorder::Strip::Channel(below + 1).index()],
+            app.settings.rows[below + 1].name,
             "Bass",
             "the row below was displaced instead of shifted"
         );
@@ -50941,13 +51069,12 @@ mod tests {
         // from a row that says paste.
         let group = 12usize;
         app.set_channel_kind(group, Some(recorder::ChannelKind::Midi));
-        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
-        app.settings.strip_is_folder[group] = true;
-        app.settings.strip_names[recorder::Strip::Channel(group).index()] =
+        app.settings.rows[group].folder = true;
+        app.settings.rows[group].name =
             "GROUP".to_owned();
         app.paste_track(group);
         assert_eq!(
-            app.settings.strip_names[recorder::Strip::Channel(group).index()],
+            app.settings.rows[group].name,
             "GROUP",
             "a folder was overwritten"
         );
@@ -50971,15 +51098,12 @@ mod tests {
         let root = project_scratch("trackinsert");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        app.settings.strip_names.resize(recorder::CHANNELS, String::new());
-        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
-        app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
         let name_of = |app: &TangentApp, ch: usize| {
-            app.settings.strip_names[recorder::Strip::Channel(ch).index()].clone()
+            app.settings.rows[ch].name.clone()
         };
         let name = |app: &mut TangentApp, ch: usize, s: &str| {
             app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
-            app.settings.strip_names[recorder::Strip::Channel(ch).index()] = s.to_owned();
+            app.settings.rows[ch].name = s.to_owned();
         };
         // Three in a row, and one ABOVE the click that must not budge.
         name(&mut app, 1, "TOP");
@@ -51005,11 +51129,11 @@ mod tests {
         // the row it was inserted under.
         let group = 8usize;
         name(&mut app, group, "GROUP");
-        app.settings.strip_is_folder[group] = true;
+        app.settings.rows[group].folder = true;
         name(&mut app, group + 1, "KID A");
-        app.settings.strip_in_folder[group + 1] = true;
+        app.settings.rows[group + 1].in_folder = true;
         name(&mut app, group + 2, "KID B");
-        app.settings.strip_in_folder[group + 2] = true;
+        app.settings.rows[group + 2].in_folder = true;
 
         // Under the HEADER: the new row is the group's first child.
         assert!(app.insert_track_below(group));
@@ -51036,12 +51160,12 @@ mod tests {
         let root = project_scratch("trackinsertfull");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
         }
         assert!(!app.insert_track_below(4), "a full desk opened a lane anyway");
         // The last channel is the one a naive search would have spent.
-        assert!(app.channel_used(recorder::CHANNELS - 1), "a track was eaten");
+        assert!(app.channel_used(crate::desk_lift::V32_CHANNELS - 1), "a track was eaten");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -51059,28 +51183,25 @@ mod tests {
             let root = project_scratch("lanes-held");
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.bootstrap_project(&root.join("Projects"));
-            app.settings.strip_names.resize(recorder::CHANNELS, String::new());
-            app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
-            app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
             // Two tracks to insert under and group, and further down a
             // folder with two children for the drag that comes home.
             for (ch, name) in [(2usize, "CLICKED"), (3, "UNDER"), (8, "GROUP"), (9, "KID A"), (10, "KID B")] {
                 app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
-                app.settings.strip_names[recorder::Strip::Channel(ch).index()] = name.to_owned();
+                app.settings.rows[ch].name = name.to_owned();
             }
-            app.settings.strip_is_folder[8] = true;
-            app.settings.strip_in_folder[9] = true;
-            app.settings.strip_in_folder[10] = true;
+            app.settings.rows[8].folder = true;
+            app.settings.rows[9].in_folder = true;
+            app.settings.rows[10].in_folder = true;
             assert_eq!(app.folder_children(8), vec![9, 10], "the fixture's folder");
             app.copy_track(2);
             let lanes = |app: &TangentApp| -> Vec<(Option<recorder::ChannelKind>, String, bool, bool)> {
-                (0..recorder::CHANNELS)
+                (0..crate::desk_lift::V32_CHANNELS)
                     .map(|ch| {
                         (
                             app.channel_kind(ch),
-                            app.settings.strip_names[recorder::Strip::Channel(ch).index()].clone(),
-                            app.settings.strip_is_folder[ch],
-                            app.settings.strip_in_folder[ch],
+                            app.settings.rows[ch].name.clone(),
+                            app.settings.rows[ch].folder,
+                            app.settings.rows[ch].in_folder,
                         )
                     })
                     .collect()
@@ -51123,16 +51244,14 @@ mod tests {
             let root = project_scratch("folder-held");
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.bootstrap_project(&root.join("Projects"));
-            app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
-            app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
             // A folder over two tracks with an empty row between them, the
             // row a removed member leaves indented.
             for ch in [8usize, 9, 11] {
                 app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
             }
-            app.settings.strip_is_folder[8] = true;
+            app.settings.rows[8].folder = true;
             for ch in [9, 10, 11] {
-                app.settings.strip_in_folder[ch] = true;
+                app.settings.rows[ch].in_folder = true;
             }
             assert!(!app.channel_used(10), "the fixture's empty row is in use");
             assert_eq!(app.folder_of(11), Some(8), "the fixture's folder");
@@ -51197,14 +51316,12 @@ mod tests {
         );
         app.bootstrap_project(&root.join("Projects"));
         app.settings.keytoggle_enabled = false;
-        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
-        app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
         // A folder over one track, and four more tracks for the other roads.
         for ch in 4..=9 {
             app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
         }
-        app.settings.strip_is_folder[4] = true;
-        app.settings.strip_in_folder[5] = true;
+        app.settings.rows[4].folder = true;
+        app.settings.rows[5].in_folder = true;
         assert_eq!(app.folder_of(5), Some(4), "the fixture's folder");
         let _ = run_frame(&ctx, &mut app);
         let frame_with = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
@@ -51248,7 +51365,7 @@ mod tests {
             ("Delete on the mixer", 7),
             ("the mixer's cut", 6),
         ];
-        let used = |app: &TangentApp| (0..recorder::CHANNELS).map(|n| app.channel_used(n)).collect::<Vec<_>>();
+        let used = |app: &TangentApp| (0..crate::desk_lift::V32_CHANNELS).map(|n| app.channel_used(n)).collect::<Vec<_>>();
         for (exporting, arr) in [(true, false), (false, true)] {
             app.recorder.exporting = exporting;
             app.recorder.arr_recording = arr;
@@ -51271,9 +51388,13 @@ mod tests {
         }
         app.recorder.exporting = false;
         app.recorder.arr_recording = false;
-        for (road, lane) in roads {
+        // By identity: each removal takes its row (W6), and the rows below
+        // move up, so each road is aimed at its track wherever it stands.
+        let tracks: Vec<_> = roads.iter().map(|(road, lane)| (*road, app.track_id_at(*lane))).collect();
+        for (road, id) in tracks {
+            let lane = app.row_of(id).expect("a track the roads aim at is gone");
             remove_by(road, &ctx, &mut app, lane);
-            assert!(!app.channel_used(lane), "{road} no longer removes a track");
+            assert_eq!(app.row_of(id), None, "{road} no longer removes a track");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -51290,10 +51411,8 @@ mod tests {
         let root = project_scratch("trackchord");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        app.settings
-            .strip_names.resize(recorder::CHANNELS, String::new());
         app.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
-        app.settings.channel_gains[1] = 0.33;
+        app.settings.rows[1].gain = 0.33;
 
         // A track selected, no clips: the chord takes the track.
         app.set_primary_row(Some(1));
@@ -51303,9 +51422,9 @@ mod tests {
 
         // Aimed at a LIVE track, paste must not touch it — it falls through
         // to the clip path, which has nothing, so nothing happens.
-        let before = app.settings.channel_gains[1];
+        let before = app.settings.rows[1].gain;
         app.arr_paste();
-        assert!((app.settings.channel_gains[1] - before).abs() < 1e-9);
+        assert!((app.settings.rows[1].gain - before).abs() < 1e-9);
 
         // Aimed at an EMPTY slot, the track lands.
         app.set_primary_row(Some(6));
@@ -51313,7 +51432,7 @@ mod tests {
         assert!(!app.channel_used(6));
         app.arr_paste();
         assert!(app.channel_used(6), "the chord did not paste the track");
-        assert!((app.settings.channel_gains[6] - 0.33).abs() < 1e-9, "the fader");
+        assert!((app.settings.rows[6].gain - 0.33).abs() < 1e-9, "the fader");
         assert_eq!(app.channel_kind(6), Some(recorder::ChannelKind::Midi));
 
         // And with a CLIP selected the chord still means clips: the track
@@ -51432,6 +51551,9 @@ mod tests {
     #[test]
     fn a_recording_lane_wears_a_growing_untouchable_ghost() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // The audio lane recorded onto is a track, as one has to be to arm
+        // (W6: a vacant row is not drawn, so it shows no ghost).
+        app.add_bare_track(3);
         app.recorder.position_s = 12.0;
         app.recorder.arr_rec = Some(recorder::ArrRecView {
             start_s: 8.0,
@@ -51482,6 +51604,11 @@ mod tests {
         let cmd = Modifiers::COMMAND;
         let shift = Modifiers::SHIFT;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // Tracks to select: a range takes the rows the desk draws, and a
+        // vacant row is not one of them (W6).
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
 
         // Plain: this one alone.
         app.select_track(3, Modifiers::NONE);
@@ -51535,6 +51662,10 @@ mod tests {
     fn a_control_on_a_selected_track_leaves_the_selection_alone() {
         use egui::Modifiers;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // Tracks, as the views draw them (W6: no vacant row is drawn).
+        for n in 0..12 {
+            app.add_bare_track(n);
+        }
         app.select_track(2, Modifiers::NONE);
         app.select_track(5, Modifiers::SHIFT);
         assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
@@ -51612,10 +51743,14 @@ mod tests {
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // Tracks, as the views draw them (W6: no vacant row is drawn).
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
 
         // Four tracks, deliberately at different levels.
         for (n, g) in [(2usize, 0.9_f64), (3, 0.5), (4, 0.25), (5, 0.7)] {
-            app.settings.channel_gains[n] = g;
+            app.settings.rows[n].gain = g;
         }
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
@@ -51680,16 +51815,20 @@ mod tests {
     #[test]
     fn a_reorder_carries_the_whole_selection_as_one_block() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        // Give the lanes distinct levels so they can be followed across it.
+        // Give the lanes distinct levels so they can be followed across it,
+        // on tracks, as the views draw them (W6: no vacant row is drawn).
+        for n in 0..9 {
+            app.add_bare_track(n);
+        }
         for n in 0..8 {
-            app.settings.channel_gains[n] = 0.1 + n as f64 * 0.1;
+            app.settings.rows[n].gain = 0.1 + n as f64 * 0.1;
         }
         app.select_track(1, egui::Modifiers::NONE);
         app.select_track(3, egui::Modifiers::SHIFT);
         assert_eq!(app.selected_rows(), vec![1, 2, 3]);
 
         app.move_selection(1, 6);
-        let at = |n: usize| ((app.settings.channel_gains[n] - 0.1) * 10.0).round() as usize;
+        let at = |n: usize| ((app.settings.rows[n].gain - 0.1) * 10.0).round() as usize;
         // **The block's HEAD lands on the row it was dropped on**, which is
         // where a single track dragged the same distance lands: `move_channel`
         // inserts at `to` and nothing else. So 1 is at index 6 with 2 and 3
@@ -51996,9 +52135,16 @@ mod tests {
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
         let picked = [2_usize, 3, 4, 5];
+        // Tracks, as the views draw them (W6: a range takes no vacant row).
+        let tracks = |app: &mut TangentApp| {
+            for n in 0..10 {
+                app.add_bare_track(n);
+            }
+        };
 
         // From the TIMELINE header.
         let (_c1, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        tracks(&mut app);
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
         assert_eq!(app.selected_rows(), picked.to_vec());
@@ -52014,6 +52160,7 @@ mod tests {
         // And from the MIXER, which already went this way — the two must land
         // in the same place or the switch means two things.
         let (_c2, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        tracks(&mut app);
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
         app.apply_mixer_hit(M::ToTheory(Column::Track(3)), 0.0);
@@ -52045,16 +52192,16 @@ mod tests {
         // says nothing about arming, and a snapshot reads silence as zero —
         // so without the resolution in `template_desk` every New project
         // would open with the piano loaded and dead.
+        let kinds: Vec<u8> = shipped.rows.iter().map(|r| r.kind_byte()).collect();
+        let armed: Vec<usize> = (0..shipped.rows.len()).filter(|n| shipped.rows[*n].arm).collect();
         assert_eq!(
-            shipped.armed,
-            crate::arrangement::armed_by_default(&shipped.kinds, |n| {
-                shipped
-                    .bay(recorder::Strip::Channel(n).index() * recorder::INSERTS)
-                    == Some(dialogs::BUILTIN_PATH)
-            }),
+            armed,
+            crate::arrangement::armed_by_default(&kinds, |n| shipped.row_plugin(n, 0) == Some(dialogs::BUILTIN_PATH))
+                .into_iter()
+                .collect::<Vec<_>>(),
             "the template's arm is not the shipped rule"
         );
-        assert_ne!(shipped.armed, 0, "a New project opens with nothing live");
+        assert!(!armed.is_empty(), "a New project opens with nothing live");
         let last = TangentApp::STOCK_DESKS
             .last()
             .expect("there has always been at least one shipped desk");
@@ -52105,8 +52252,8 @@ mod tests {
                 .map(|(at, _)| at / INSERTS + 1)
                 .max()
                 .unwrap_or(0);
-            for (n, k) in d.kinds.iter_mut().enumerate() {
-                *k = u8::from(n < tracks);
+            for (n, row) in d.rows.iter_mut().enumerate() {
+                row.kind = crate::desk_model::RowKind::from_byte(u8::from(n < tracks));
             }
             for (at, path) in shipped {
                 d.set_bay(*at, path);
@@ -52591,11 +52738,7 @@ mod tests {
             });
         }
         let mut desk = TangentApp::template_desk();
-        desk.frozen = Some(vec![crate::arrangement::FrozenLane {
-            lane: 2,
-            path: "media/frozen-03-1.wav".to_owned(),
-            len_s: 1.0,
-        }]);
+        desk.rows[2].frozen = Some(crate::desk_model::Frozen { path: "media/frozen-03-1.wav".to_owned(), len_s: 1.0 });
         doc.desk = Some(desk);
         doc.save_to(&crate::arrangement::doc_in(&template));
 
@@ -52975,7 +53118,7 @@ mod tests {
         assert_eq!(carried_count(0, 1112.0, 654.0), 0, "the auto sentinel is not carried");
         assert_eq!(
             carried_count(3, 300.0, 3000.0),
-            recorder::CHANNELS,
+            crate::desk_lift::V32_CHANNELS,
             "carried past the desk is clamped to the desk"
         );
         // The mixer's run carries the same way.
@@ -53800,11 +53943,11 @@ mod tests {
     fn freezing_asks_the_host_and_the_hosts_word_freezes_the_lane() {
         let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
         assert!(app.can_freeze(0), "a lane with a clip should be freezable");
-        let empty = (0..recorder::CHANNELS)
+        let empty = (0..crate::desk_lift::V32_CHANNELS)
             .find(|n| !app.channel_used(*n))
             .expect("an unused lane on the stock desk");
         assert!(!app.can_freeze(empty), "an empty lane is not");
-        app.settings.channel_armed = Some(0b11);
+        app.set_armed_word(0b11);
 
         app.freeze_toggle(0);
         assert!(
@@ -53816,10 +53959,11 @@ mod tests {
         app.note_frozen(0, "media/frozen-01-7.wav".into(), 4.5);
         let z = app.lane_frozen(0).expect("the host's word froze the lane");
         assert_eq!((z.path.as_str(), z.len_s), ("media/frozen-01-7.wav", 4.5));
-        assert_eq!(app.settings.channel_armed, Some(0b10), "the frozen lane was not disarmed");
+        assert_eq!(app.armed_word(), 0b10, "the frozen lane was not disarmed");
         assert!(!app.can_freeze(0), "a frozen lane offered a second freeze");
         assert!(
-            app.desk_snapshot().frozen.as_deref().is_some_and(|f| f.len() == 1 && f[0].lane == 0),
+            app.desk_snapshot().rows.iter().filter(|r| r.frozen.is_some()).count() == 1
+                && app.desk_snapshot().rows[0].frozen.is_some(),
             "the document does not carry the freeze"
         );
 
@@ -54422,14 +54566,14 @@ mod tests {
         // it may move, and no position in a list stands in for it.
         let snapshot = |s: &Settings| {
             let mut v: Vec<(String, f64)> =
-                s.channel_gains.iter().enumerate().map(|(n, g)| (format!("ch{n}"), *g)).collect();
+                s.rows.iter().enumerate().map(|(n, r)| (format!("ch{n}"), r.gain)).collect();
             v.push(("drums".to_owned(), s.drums_gain));
             v.push(("click".to_owned(), s.metronome_gain));
             v.push(("fx".to_owned(), s.fx_return_gain));
             v.push(("master".to_owned(), s.master_gain));
             v
         };
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             let before = snapshot(&app.settings);
             // A position nothing defaults to, so "it changed" is unambiguous.
@@ -54504,22 +54648,22 @@ mod tests {
         // The desk OPENS with the instrument's send up - the half that must
         // survive.
         assert!(
-            (Settings::default().strip_sends[1] - 1.0).abs() < 1e-9,
+            (Settings::default().strip_send(recorder::StripRef::Row(1)) - 1.0).abs() < 1e-9,
             "the shipped desk no longer opens with the instrument sending, \
              which is a change to what a fresh install sounds like"
         );
 
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             app.apply_mixer_hit(Hit::Send(col), 0.61);
         }
         assert!(
-            app.settings.strip_sends.iter().any(|v| *v > 0.5),
+            (0..app.desk_extent()).any(|n| app.settings.strip_send(recorder::StripRef::Row(n)) > 0.5),
             "nothing moved, so resetting proves nothing"
         );
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             app.reset_mixer_hit(Hit::Send(col));
         }
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             // By what the strip is (W5); the master has no send, so it reads
             // dry whatever happened.
             let now = app.settings.strip_send(col.strip_ref());
@@ -54541,21 +54685,21 @@ mod tests {
         use crate::mixer_panel::Hit;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         let fresh = Settings::default();
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             app.apply_mixer_hit(Hit::Fader(col), 0.13);
         }
         assert_ne!(
             app.settings.master_gain, fresh.master_gain,
             "nothing moved, so resetting proves nothing"
         );
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             app.reset_mixer_hit(Hit::Fader(col));
         }
         for (what, got, want) in [
             ("master", app.settings.master_gain, fresh.master_gain),
             ("track", app.settings.track_gain, fresh.track_gain),
-            ("channel 0", app.settings.channel_gains[0], fresh.channel_gains[0]),
-            ("channel 2", app.settings.channel_gains[2], fresh.channel_gains[2]),
+            ("channel 0", app.settings.rows[0].gain, fresh.rows[0].gain),
+            ("channel 2", app.settings.rows[2].gain, fresh.rows[2].gain),
         ] {
             assert!(
                 (got - want).abs() < 1.0e-6,
@@ -54577,10 +54721,10 @@ mod tests {
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
         use recorder::StripRef;
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, format!("{col:?}"));
-            let named: Vec<StripRef> = (0..recorder::CHANNELS)
+            let named: Vec<StripRef> = (0..crate::desk_lift::V32_CHANNELS)
                 .map(StripRef::Row)
                 .chain(StripRef::SPECIALS)
                 .filter(|s| !app.settings.strip_name(*s).is_empty())
@@ -54625,8 +54769,8 @@ mod tests {
         assert_eq!(app.settings.strip_send(StripRef::Drums), 0.4, "the drum bus's send");
         assert_eq!(app.settings.strip_paint(StripRef::Drums), 9, "the drum bus's paint");
         // No row holds any of it: the rows' arrays are rows.
-        assert_eq!((app.settings.strip_muted, app.settings.strip_phase), (0, 0), "a special sat in a row's mask");
-        assert_eq!(app.settings.strip_names.iter().filter(|n| !n.is_empty()).count(), 1, "a special's name sat in a row");
+        assert_eq!((app.settings.word(|r| r.mute), app.settings.word(|r| r.phase)), (0, 0), "a special sat in a row's mask");
+        assert_eq!(app.settings.rows.iter().filter(|r| !r.name.is_empty()).count(), 1, "a special's name sat in a row");
 
         // A drag carries the row's and moves no special's.
         app.move_channel(2, 5);
@@ -54654,8 +54798,13 @@ mod tests {
     /// And what it names is what the desk reads back for that column.
     #[test]
     fn a_typed_name_is_the_one_the_desk_shows() {
-        for col in recorder::Column::every(recorder::CHANNELS) {
+        for col in recorder::Column::every(crate::desk_lift::V32_CHANNELS) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            // A track's column is drawn once it is a track (W6: a vacant
+            // row has no strip).
+            if let Some(row) = col.row() {
+                app.add_bare_track(row);
+            }
             app.commit_mixer_name(col, "Rhodes".to_owned());
             assert_eq!(
                 app.mixer_view().strips[col].name,
@@ -55555,7 +55704,7 @@ mod tests {
         // The stock desk already seats a drumpad on channel 1, which would
         // answer the question before channel 3 was ever asked. Empty every
         // first bay, then seat exactly one.
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             if let Some(sb) = desk_settings.row_bay(ch, 0) {
                 desk_settings.plugins.remove(&sb);
             }
@@ -56121,6 +56270,11 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         app.settings.keytoggle_enabled = false;
         app.arrangement_open = true;
+        // Lanes to drop on, as the timeline draws them (W6: no vacant row
+        // is drawn).
+        for n in 2..5 {
+            app.add_bare_track(n);
+        }
         let _ = run_frame(&ctx, &mut app);
         let _ = run_frame(&ctx, &mut app);
 
@@ -56181,12 +56335,10 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         // Dress channel 1 (the DX7) distinctly.
-        app.settings
-            .strip_names.resize(recorder::CHANNELS, String::new());
-        app.settings.strip_names[1] = "LEAD".to_owned();
-        app.settings.channel_icons[1] = 2; // guitar badge
-        app.settings.strip_colors[1] = 7;
-        app.settings.channel_gains[1] = 0.42;
+        app.settings.rows[1].name = "LEAD".to_owned();
+        app.settings.rows[1].icon = 2; // guitar badge
+        app.settings.rows[1].color = 7;
+        app.settings.rows[1].gain = 0.42;
         // A clip on its lane.
         let mid = root.join("r.mid");
         let mut b: Vec<u8> = Vec::new();
@@ -56206,11 +56358,11 @@ mod tests {
         // everything else on, too.
         app.move_channel(1, 3);
 
-        assert_eq!(app.settings.strip_names[3], "LEAD");
-        assert_eq!(app.settings.channel_icons[3], 2);
-        assert_eq!(app.settings.strip_colors[3], 7);
-        assert!((app.settings.channel_gains[3] - 0.42).abs() < 1e-9);
-        assert_eq!(app.settings.channel_kinds[3], 1);
+        assert_eq!(app.settings.rows[3].name, "LEAD");
+        assert_eq!(app.settings.rows[3].icon, 2);
+        assert_eq!(app.settings.rows[3].color, 7);
+        assert!((app.settings.rows[3].gain - 0.42).abs() < 1e-9);
+        assert_eq!(app.settings.rows[3].kind_byte(), 1);
         assert_eq!(
             app.insert(3, 0),
             Some(dialogs::BUILTIN_PATH),
@@ -56230,30 +56382,29 @@ mod tests {
         );
         // Nothing rode onto row 7 — the drum lives near the top now.
         assert_eq!(app.insert(7, 0), None);
-        // And the host is told exactly what happened: order[new] = old. The
-        // moved span is 1..3; every channel outside it is carried unchanged,
-        // however many the desk has.
-        let perm = app.take_desk_state_perm().expect("no perm for the host");
-        let mut want: Vec<usize> = (0..recorder::CHANNELS).collect();
-        want.splice(1..4, [2, 3, 1]);
-        assert_eq!(perm, want);
-        assert!(app.take_desk_state_perm().is_none(), "taken twice");
+        // **And the host is handed nothing to carry** (W6): every bay is its
+        // track's by identity, so a reorder relabels no bay, and the
+        // permutation the host was once handed to move plugins by seat is
+        // gone with the seats.
+        assert!(app.take_bay_relabels().is_empty(), "a reorder relabelled a bay");
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **Undo and redo of a reorder hand the host the permutation**, so it
-    /// carries the plugins and their sidecars back exactly as the reorder
-    /// carried them forward.
+    /// **Undo and redo of an insert keep every bay on its own track**, so
+    /// the host has nothing to carry either way (W6).
     ///
-    /// A moment names each bay's BUNDLE and nothing about the plugin playing
-    /// in it. Undoing Insert Track put every name back and told the host
-    /// nothing, so each moved bay was rebuilt from a sidecar written for
-    /// another row: every plugin on the shifted tracks came back at factory,
-    /// or with a neighbour's settings where both carried the same plugin.
-    /// The insert shifts three rows - a cycle, not a swap, which is the case
-    /// an adjacent swap's undo only got right by accident.
+    /// A moment names each bay by its TRACK, and the rows the insert shifts
+    /// take their tracks, and so their bays and their state files, with
+    /// them. Undoing Insert Track once put every name back by position and
+    /// told the host nothing, so each moved bay was rebuilt from a sidecar
+    /// written for another row; then the host was handed the permutation to
+    /// carry them by seat. With bays by identity neither is needed: the
+    /// shifted tracks' plugins are where their tracks are at every step, and
+    /// no relabel is handed over. The insert shifts three rows - a cycle,
+    /// not a swap, which is the case an adjacent swap's undo only got right
+    /// by accident.
     #[test]
-    fn undo_and_redo_of_a_reorder_hand_the_host_the_permutation() {
+    fn undo_and_redo_of_an_insert_keep_every_bay_on_its_track() {
         let root = project_scratch("permundo");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
@@ -56262,20 +56413,32 @@ mod tests {
             app.set_insert(n, 0, Some(p));
         }
         app.commit_view_change();
+        let _ = app.take_bay_relabels();
+        // Each track's own first bay, by its identity.
+        let tracks: Vec<crate::desk_id::TrackId> = (2..5).map(|n| app.track_id_at(n)).collect();
+        let bays = |app: &TangentApp| -> Vec<Option<String>> {
+            tracks
+                .iter()
+                .map(|id| {
+                    let sb = crate::desk_id::SeatBay::new(crate::desk_id::Node::Track(*id), crate::desk_id::Rack::Chain(0), 0);
+                    app.plugin(sb).map(str::to_owned)
+                })
+                .collect()
+        };
+        let want = bays(&app);
         // Insert Track under row 1: rows 2..4 shift down a row - a cycle, not a swap.
         assert!(app.insert_track_below(1), "fixture: no free lane below row 1");
-        let forward = app.take_desk_state_perm().expect("the insert told the host nothing");
         assert_eq!(app.insert(3, 0), Some("/x/A.vst3"), "fixture: the rows did not shift");
+        assert_eq!(bays(&app), want, "the insert moved a bay off its track");
+        assert!(app.take_bay_relabels().is_empty(), "the insert relabelled a bay");
         app.undo();
         assert_eq!(app.insert(2, 0), Some("/x/A.vst3"), "fixture: undo did not put the rows back");
-        let back = app.take_desk_state_perm().expect(
-            "undo put the bundle NAMES back and told the host nothing, so every moved bay \
-             reloads from a sidecar written for another row");
-        for (new, &old) in forward.iter().enumerate() {
-            assert_eq!(back[old], new, "undo's permutation is not the insert's inverse");
-        }
+        assert_eq!(bays(&app), want, "undo moved a bay off its track");
+        assert!(app.take_bay_relabels().is_empty(), "undo relabelled a bay");
         app.redo();
-        assert_eq!(app.take_desk_state_perm(), Some(forward), "redo of the insert told the host nothing");
+        assert_eq!(app.insert(3, 0), Some("/x/A.vst3"), "redo did not shift the rows again");
+        assert_eq!(bays(&app), want, "redo moved a bay off its track");
+        assert!(app.take_bay_relabels().is_empty(), "redo relabelled a bay");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -56306,7 +56469,6 @@ mod tests {
         let (kick, snare) = (SeatBay::new(owner, Rack::Pad(36), 0), SeatBay::new(owner, Rack::Pad(38), 0));
         app.set_plugin(kick, Some("/x/A.vst3"));
         app.commit_view_change();
-        let _ = app.take_desk_state_perm();
         let _ = app.take_bay_relabels();
 
         app.swap_pads(36, 38);
@@ -56316,7 +56478,6 @@ mod tests {
             sorted(vec![BayRelabel { from: kick, to: snare }, BayRelabel { from: snare, to: kick }]),
             "the swap told the host nothing"
         );
-        assert_eq!(app.take_desk_state_perm(), None, "a pad swap moved no row and said it did");
         assert_eq!(app.plugin(snare), Some("/x/A.vst3"), "fixture: the FX did not ride with the pad");
         assert_eq!(app.plugin(kick), None, "fixture: the FX stayed behind as well");
         app.undo();
@@ -56437,11 +56598,11 @@ mod tests {
             assert_eq!(app.settings.routes, routes, "{edit} rewrote the routing table");
             assert_eq!(app.settings.insert_keys, keys, "{edit} rewrote the key table");
             assert_eq!(
-                app.settings.routes.to_lanes(app.track_ids()).0,
+                app.settings.routes.to_lanes(&app.track_ids()).0,
                 vec![LaneRoute::new(row(app, src), LaneTarget::Channel(row(app, dst)))],
                 "after {edit} the route does not run between its tracks' rows"
             );
-            let lanes = app.settings.insert_keys.to_lanes(app.track_ids()).0;
+            let lanes = app.settings.insert_keys.to_lanes(&app.track_ids()).0;
             assert_eq!(
                 lanes.iter().map(|k| (k.strip, k.slot, k.from)).collect::<Vec<_>>(),
                 vec![(row(app, keyed), 1, row(app, src))],
@@ -56804,10 +56965,10 @@ mod tests {
             app.clipboard_stamp.as_deref().is_some_and(|s| s.contains('3')),
             "the copy did not stamp the system clipboard"
         );
-        // Pasting onto the LAST channel of the ACTIVE desk (a fresh test
-        // app is a free install, so that is the free edge — the paywall's
-        // whole point): the shift is shortened so the three lanes keep
-        // their spread instead of piling on the bottom.
+        // Pasting onto the LAST row of the desk: the three lanes keep their
+        // spread, and the desk GROWS below its last row for the two that
+        // land past it (W6: grow or refuse), where a fixed desk shortened
+        // the shift instead and the group piled up short of the end.
         let edge = app.desk_extent() - 1;
         app.recorder.position_s = 40.0;
         app.set_primary_row(Some(edge));
@@ -56822,9 +56983,10 @@ mod tests {
         lanes.sort_unstable();
         assert_eq!(
             lanes,
-            vec![edge - 2, edge - 1, edge],
+            vec![edge, edge + 1, edge + 2],
             "the pasted group lost its lane spread"
         );
+        assert_eq!(app.desk_extent(), edge + 3, "the desk did not grow for the group");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -56931,46 +57093,47 @@ mod tests {
         // The shipped desk: the DX7 opens LIVE and nothing else. It sits on
         // channel 1 — the kit is first — and the arm FOLLOWS THE INSTRUMENT
         // rather than the seat, which is what `default_armed` is for.
-        assert_eq!(app.armed_mask(), 2, "a fresh desk should open with the DX7 armed");
+        assert_eq!(app.armed_word(), 2, "a fresh desk should open with the DX7 armed");
 
         app.apply_mixer_hit(Hit::Arm(Column::Track(1)), 0.0);
-        assert_eq!(app.armed_mask(), 0, "R did not disarm");
+        assert_eq!(app.armed_word(), 0, "R did not disarm");
         app.apply_mixer_hit(Hit::Arm(Column::Track(1)), 0.0);
-        assert_eq!(app.armed_mask(), 2, "R did not arm again");
+        assert_eq!(app.armed_word(), 2, "R did not arm again");
 
         // A track somebody just added touches NOBODY's arms — its own
         // included. It armed itself for a while (first additively, then
         // exclusively) and each version stole something from the player.
-        let n = (1..recorder::CHANNELS)
+        let n = (1..crate::desk_lift::V32_CHANNELS)
             .find(|n| app.channel_kind(*n).is_none())
             .expect("an unused channel");
-        assert_eq!(app.armed_mask(), 2, "the DX7 should stand armed here");
+        assert_eq!(app.armed_word(), 2, "the DX7 should stand armed here");
         app.set_channel_input_spec(n, "midi:all");
         assert_eq!(app.channel_kind(n), Some(ChannelKind::Midi));
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             2,
             "adding a track changed the arms (its own or another's)"
         );
         app.apply_mixer_hit(Hit::Arm(Column::Track(n)), 0.0);
-        assert_ne!(app.armed_mask() & (1 << n), 0, "R would not arm the new track");
+        assert_ne!(app.armed_word() & (1 << n), 0, "R would not arm the new track");
 
         // And the × takes the arm with the channel.
         app.apply_mixer_hit(Hit::Remove(Column::Track(n)), 0.0);
-        assert_eq!(app.armed_mask() & (1 << n), 0, "a removed channel stayed armed");
+        assert_eq!(app.armed_word() & (1 << n), 0, "a removed channel stayed armed");
 
         // **And the desk carries it.** The mask is in the settings file and
         // in the snapshot a document is saved from, so the next launch and
         // the next open find the arms this session left.
-        assert_eq!(app.settings.channel_armed, Some(2), "the arm was not kept");
+        assert_eq!(app.settings.word(|r| r.arm), 2, "the arm was not kept");
+        assert!(!app.settings.arm_unsaid, "the arm was kept as unsaid");
         // In the file as each row's `arm`: read back, the file says it.
         assert_eq!(
-            Settings::from_json(&app.settings.to_json()).channel_armed,
-            Some(2),
+            Settings::from_json(&app.settings.to_json()).word(|r| r.arm),
+            2,
             "the arm never reached the settings file"
         );
         assert_eq!(
-            TangentApp::desk_snapshot_of(&app.settings).armed,
+            TangentApp::desk_snapshot_of(&app.settings).word(|r| r.arm),
             2,
             "the arm is not on the desk a save would write"
         );
@@ -56994,8 +57157,8 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
 
         // A desk with an opinion about all six.
-        app.settings.strip_phase = 0b1010;
-        app.settings.strip_to_theory[2] = true;
+        app.settings.set_word(|r| &mut r.phase, 0b1010);
+        app.settings.rows[2].theory = true;
         app.settings.routes = crate::routing::Routes(vec![crate::routing::Route {
             from: app.row_node(1),
             target: crate::routing::Target::Node(app.row_node(4)),
@@ -57006,41 +57169,40 @@ mod tests {
         app.settings.insert_keys.set(keyed, Some(from));
         let bypassed = app.legacy_bay(2, 1).expect("a bay");
         app.settings.bypass.insert(bypassed);
-        app.settings.strip_dx7_patch[1] = 17;
-        app.settings.strip_keys_patch[1] = 4;
-        app.settings.strip_dx7_cartridge[1] = "ROM3A.syx".to_owned();
+        app.settings.rows[1].dx7.patch = 17;
+        app.settings.rows[1].keys.patch = 4;
+        app.settings.rows[1].dx7.cart = "ROM3A.syx".to_owned();
         app.save_project_doc();
         let doc = app.project_doc.clone();
+        let instruments = |s: &Settings| {
+            s.rows.iter().map(|r| (r.dx7.patch, r.keys.patch, r.dx7.cart.clone())).collect::<Vec<_>>()
+        };
         let want = (
-            app.settings.strip_phase,
-            app.settings.strip_to_theory.clone(),
+            app.settings.word(|r| r.phase),
+            app.settings.word(|r| r.theory),
             app.settings.routes.clone(),
             app.settings.insert_keys.clone(),
             app.settings.bypass.clone(),
-            app.settings.strip_dx7_patch.clone(),
-            app.settings.strip_keys_patch.clone(),
-            app.settings.strip_dx7_cartridge.clone(),
+            instruments(&app.settings),
         );
 
         // The session moves on and changes every one of them.
-        app.settings.strip_phase = 0;
-        app.settings.strip_to_theory[2] = false;
+        app.settings.set_word(|r| &mut r.phase, 0);
+        app.settings.rows[2].theory = false;
         app.settings.routes = crate::routing::Routes::default();
         app.settings.insert_keys = crate::routing::KeyEdges::default();
         app.settings.bypass.clear();
-        app.settings.strip_dx7_patch[1] = 0;
-        app.settings.strip_keys_patch[1] = 0;
-        app.settings.strip_dx7_cartridge[1] = String::new();
+        app.settings.rows[1].dx7.patch = 0;
+        app.settings.rows[1].keys.patch = 0;
+        app.settings.rows[1].dx7.cart = String::new();
 
         app.open_project(&doc);
-        assert_eq!(app.settings.strip_phase, want.0, "polarity");
-        assert_eq!(app.settings.strip_to_theory, want.1, "the theory sends");
+        assert_eq!(app.settings.word(|r| r.phase), want.0, "polarity");
+        assert_eq!(app.settings.word(|r| r.theory), want.1, "the theory sends");
         assert_eq!(app.settings.routes, want.2, "the routing");
         assert_eq!(app.settings.insert_keys, want.3, "the sidechain keys");
         assert_eq!(app.settings.bypass, want.4, "the bypasses");
-        assert_eq!(app.settings.strip_dx7_patch, want.5, "the DX7 patches");
-        assert_eq!(app.settings.strip_keys_patch, want.6, "the Keys patches");
-        assert_eq!(app.settings.strip_dx7_cartridge, want.7, "the DX7 cartridges");
+        assert_eq!(instruments(&app.settings), want.5, "the DX7 and Keys patches and cartridges");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -57091,14 +57253,14 @@ mod tests {
         std::fs::write(&doc, serde_json::to_string(&value).expect("json")).expect("write");
 
         // A session with opinions of its own opens it, and keeps every one.
-        app.settings.strip_phase = 0b0110;
-        app.settings.strip_to_theory[1] = true;
+        app.settings.set_word(|r| &mut r.phase, 0b0110);
+        app.settings.rows[1].theory = true;
         app.settings.routes = crate::routing::Routes(vec![crate::routing::Route {
             from: app.row_node(2),
             target: crate::routing::Target::Node(app.row_node(5)),
             gain: 0.25,
         }]);
-        app.settings.strip_dx7_patch[1] = 23;
+        app.settings.rows[1].dx7.patch = 23;
         app.settings.arr_grid_exp = -5;
         app.settings.arr_header_w = 210.0;
         app.settings.arr_visible = 7;
@@ -57106,11 +57268,12 @@ mod tests {
         app.settings.quantize_fit = "stretch".to_owned();
         // The routing by ROW: what "stands" means for a document that does
         // not say, on whatever ids the rows wear after the open.
+        let patches = |s: &Settings| s.rows.iter().map(|r| r.dx7.patch).collect::<Vec<_>>();
         let keep = (
-            app.settings.strip_phase,
-            app.settings.strip_to_theory.clone(),
-            app.settings.routes.to_lanes(app.track_ids()),
-            app.settings.strip_dx7_patch.clone(),
+            app.settings.word(|r| r.phase),
+            app.settings.word(|r| r.theory),
+            app.settings.routes.to_lanes(&app.track_ids()),
+            patches(&app.settings),
         );
         let view_keep = (
             app.settings.arr_grid_exp,
@@ -57120,10 +57283,10 @@ mod tests {
             app.settings.quantize_fit.clone(),
         );
         app.open_project(&doc);
-        assert_eq!(app.settings.strip_phase, keep.0, "polarity was cleared");
-        assert_eq!(app.settings.strip_to_theory, keep.1, "the theory sends were cleared");
-        assert_eq!(app.settings.routes.to_lanes(app.track_ids()), keep.2, "the routing was cleared");
-        assert_eq!(app.settings.strip_dx7_patch, keep.3, "the patches were reset");
+        assert_eq!(app.settings.word(|r| r.phase), keep.0, "polarity was cleared");
+        assert_eq!(app.settings.word(|r| r.theory), keep.1, "the theory sends were cleared");
+        assert_eq!(app.settings.routes.to_lanes(&app.track_ids()), keep.2, "the routing was cleared");
+        assert_eq!(patches(&app.settings), keep.3, "the patches were reset");
         assert_eq!(app.settings.arr_grid_exp, view_keep.0, "the timeline's grid was reset");
         assert!(
             (app.settings.arr_header_w - view_keep.1).abs() < 1e-9,
@@ -57159,20 +57322,16 @@ mod tests {
     /// changed is that it cannot run out.
     #[test]
     fn every_channel_can_take_an_input_because_the_cap_is_the_channel_count() {
-        assert_eq!(
-            recorder::INPUTS,
-            recorder::CHANNELS,
-            "the capture cap and the channel count have parted company; a \
-             channel that cannot reach an input is a track that can be armed \
-             and can never record"
-        );
+        // There is no capture cap left to compare with the desk: the picks
+        // are one per bound track (W5-engine-memory-inputs), and `INPUTS`
+        // went with the fixed desk (W6). What stands is the walk below.
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             app.set_channel_input_spec(n, "");
         }
         // Every channel, bound in turn: each takes the next column and says
         // so. The fifth is the one that used to fall off the end.
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             app.set_channel_input_spec(n, &format!("{n}"));
             assert_eq!(
                 app.channel_kind(n),
@@ -57224,7 +57383,7 @@ mod tests {
 
         app.remove_channel(N);
         assert_eq!(
-            app.settings.channel_inputs[N], "",
+            app.settings.rows[N].input, "",
             "a removed track kept its input, which is the state nothing can repair"
         );
         assert!(!app.channel_used(N), "the slot is still a track");
@@ -57245,12 +57404,12 @@ mod tests {
         // produce one — this is what every project saved while the fault was
         // live looks like.
         let mut hurt = TangentApp::desk_snapshot_of(&app.settings);
-        hurt.kinds[N] = 0;
-        hurt.inputs[N] = "3".to_owned();
-        hurt.tracks_added &= !(1 << N);
+        hurt.rows[N].kind = crate::desk_model::RowKind::from_byte(0);
+        hurt.rows[N].input = "3".to_owned();
+        hurt.set_word(|r| &mut r.added, hurt.word(|r| r.added) & (!(1 << N)));
         app.apply_desk_snapshot(&hurt);
         assert_eq!(
-            app.settings.channel_inputs[N], "",
+            app.settings.rows[N].input, "",
             "a document's orphan input survived the open"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -57287,24 +57446,24 @@ mod tests {
         }
         app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
         app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
-        let armed = app.armed_mask();
-        let muted = app.settings.strip_muted;
-        let soloed = app.settings.strip_soloed;
+        let armed = app.armed_word();
+        let muted = app.settings.word(|r| r.mute);
+        let soloed = app.settings.word(|r| r.solo);
         assert_eq!(armed, 2 | (1 << 3) | (1 << 5), "the arms did not stack");
         app.save_project_doc();
         let doc = app.project_doc.clone();
 
         // The session moves on: everything disarmed, the mute lifted.
-        app.set_armed_mask(0);
+        app.set_armed_word(0);
         app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
         app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
-        assert_eq!(app.armed_mask(), 0);
+        assert_eq!(app.armed_word(), 0);
 
         // Open it again: the desk that was saved is the desk that comes back.
         app.open_project(&doc);
-        assert_eq!(app.armed_mask(), armed, "the project's arms did not come back");
-        assert_eq!(app.settings.strip_muted, muted, "the mute did not come back");
-        assert_eq!(app.settings.strip_soloed, soloed, "the solo did not come back");
+        assert_eq!(app.armed_word(), armed, "the project's arms did not come back");
+        assert_eq!(app.settings.word(|r| r.mute), muted, "the mute did not come back");
+        assert_eq!(app.settings.word(|r| r.solo), soloed, "the solo did not come back");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -57378,42 +57537,42 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         // A row's switch is its row's bit (the specials keep theirs, W5).
         let bit = |n: usize| 1u64 << n;
-        app.settings.strip_muted = 0;
-        app.settings.strip_soloed = 0;
+        app.settings.set_word(|r| &mut r.mute, 0);
+        app.settings.set_word(|r| &mut r.solo, 0);
 
         // Plain presses stack, exactly as the arm's do.
         app.apply_mixer_hit(Hit::Mute(Column::Track(2)), 0.0);
         app.apply_mixer_hit(Hit::Mute(Column::Track(3)), 0.0);
-        assert_eq!(app.settings.strip_muted, bit(2) | bit(3), "plain mutes did not stack");
+        assert_eq!(app.settings.word(|r| r.mute), bit(2) | bit(3), "plain mutes did not stack");
         // …and a second plain press takes just that one back out.
         app.apply_mixer_hit(Hit::Mute(Column::Track(3)), 0.0);
-        assert_eq!(app.settings.strip_muted, bit(2), "a plain mute did not toggle off");
+        assert_eq!(app.settings.word(|r| r.mute), bit(2), "a plain mute did not toggle off");
 
         // SHIFT builds a set and unpicks it, one strip at a time.
         app.shift_down = true;
         app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
-        assert_eq!(app.settings.strip_muted, bit(2) | bit(4), "shift+mute did not add");
+        assert_eq!(app.settings.word(|r| r.mute), bit(2) | bit(4), "shift+mute did not add");
         app.apply_mixer_hit(Hit::Mute(Column::Track(4)), 0.0);
-        assert_eq!(app.settings.strip_muted, bit(2), "shift+mute could not take it back out");
+        assert_eq!(app.settings.word(|r| r.mute), bit(2), "shift+mute could not take it back out");
         app.shift_down = false;
 
         // ALT is THIS STRIP ALONE, and alt on the one already alone clears.
         app.alt_down = true;
         app.apply_mixer_hit(Hit::Mute(Column::Track(5)), 0.0);
-        assert_eq!(app.settings.strip_muted, bit(5), "alt+mute did not stand the rest down");
+        assert_eq!(app.settings.word(|r| r.mute), bit(5), "alt+mute did not stand the rest down");
         app.apply_mixer_hit(Hit::Mute(Column::Track(5)), 0.0);
-        assert_eq!(app.settings.strip_muted, 0, "alt+mute on the lone strip did not clear it");
+        assert_eq!(app.settings.word(|r| r.mute), 0, "alt+mute on the lone strip did not clear it");
 
         // The solo is the same arithmetic over the other mask — exclusive
         // solo being the gesture this whole change is worth having for.
         app.apply_mixer_hit(Hit::Solo(Column::Track(2)), 0.0);
-        assert_eq!(app.settings.strip_soloed, bit(2), "alt+solo is not exclusive");
+        assert_eq!(app.settings.word(|r| r.solo), bit(2), "alt+solo is not exclusive");
         app.apply_mixer_hit(Hit::Solo(Column::Track(6)), 0.0);
-        assert_eq!(app.settings.strip_soloed, bit(6), "alt+solo did not move the solo");
+        assert_eq!(app.settings.word(|r| r.solo), bit(6), "alt+solo did not move the solo");
         app.alt_down = false;
 
         // And the two masks stayed out of each other's way throughout.
-        assert_eq!(app.settings.strip_muted, 0, "soloing moved the mutes");
+        assert_eq!(app.settings.word(|r| r.mute), 0, "soloing moved the mutes");
     }
 
     /// **A plain arm TOGGLES; Shift arms one lane alone; the SILENT arms
@@ -57427,26 +57586,26 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
-        assert_eq!(app.armed_mask(), 2, "the desk opens with the DX7 armed");
+        assert_eq!(app.armed_word(), 2, "the desk opens with the DX7 armed");
 
         // Two fresh tracks, bound one after the other: binds touch NO
         // arms — the DX7's stays the only one standing.
         app.set_channel_input_spec(2, "midi:all");
         app.set_channel_input_spec(3, "midi:all");
-        assert_eq!(app.armed_mask(), 2, "a bind changed the arms");
+        assert_eq!(app.armed_word(), 2, "a bind changed the arms");
 
         // Plain presses STACK — a deliberate multi-lane take…
         app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
         app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             2 | (1 << 2) | (1 << 3),
             "three lanes armed by hand should stay armed"
         );
 
         // …a plain press on an armed lane disarms just that lane…
         app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
-        assert_eq!(app.armed_mask(), 2 | (1 << 2), "the toggle took the wrong lanes");
+        assert_eq!(app.armed_word(), 2 | (1 << 2), "the toggle took the wrong lanes");
 
         // …SHIFT builds a set AND takes lanes back out of it. The owner:
         // "shift multi works but should also be able to turn them off as
@@ -57456,13 +57615,13 @@ mod tests {
         app.shift_down = true;
         app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             2 | (1 << 2) | (1 << 3),
             "shift+arm did not add a lane"
         );
         app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             2 | (1 << 2),
             "shift+arm on an armed lane could not take it back out"
         );
@@ -57471,12 +57630,12 @@ mod tests {
         // …ALT is THIS LANE ALONE…
         app.alt_down = true;
         app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
-        assert_eq!(app.armed_mask(), 1 << 2, "alt+arm did not stand the rest down");
+        assert_eq!(app.armed_word(), 1 << 2, "alt+arm did not stand the rest down");
 
         // …and alt on the lane that is ALREADY alone stands everything down,
         // so the one key both arrives at one lane and leaves with none.
         app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
-        assert_eq!(app.armed_mask(), 0, "alt+arm could not undo itself");
+        assert_eq!(app.armed_word(), 0, "alt+arm could not undo itself");
         app.alt_down = false;
     }
 
@@ -57538,7 +57697,7 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column::Track(2)), 0.0);
         app.alt_down = false;
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             1 << 2,
             "alt+arm spread across the selection, arming the lanes it exists to \
              stand down"
@@ -57546,12 +57705,12 @@ mod tests {
 
         // And SHIFT is one lane too: picking arms out one at a time is what
         // it is for, so a three-strip selection must not flip together.
-        app.set_armed_mask(0);
+        app.set_armed_word(0);
         app.shift_down = true;
         app.apply_mixer_hit(Hit::Arm(Column::Track(3)), 0.0);
         app.shift_down = false;
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             1 << 3,
             "shift+arm flipped the whole selection when the hand meant one of it"
         );
@@ -57691,7 +57850,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::{Column, Strip};
         let (_, mut app) = headless(Caps::DESKTOP);
-        let n = (0..recorder::CHANNELS)
+        let n = (0..crate::desk_lift::V32_CHANNELS)
             .find(|n| !app.channel_used(*n))
             .expect("a fresh desk has an unused channel");
 
@@ -57701,10 +57860,10 @@ mod tests {
         assert!(app.input_menu.is_none(), "adding must not open a menu");
         let at = Strip::Channel(n).index();
         assert!(
-            app.settings.strip_sends[at].abs() < 1e-9,
+            app.settings.strip_send(recorder::StripRef::Row(at)).abs() < 1e-9,
             "a fresh track's send should rest at ZERO - only the shipped DX7 is wired"
         );
-        assert_eq!(app.armed_mask() & (1 << n), 0, "a fresh track armed itself");
+        assert_eq!(app.armed_word() & (1 << n), 0, "a fresh track armed itself");
 
         // The same press on the now-EXISTING track opens the input menu.
         app.apply_mixer_hit(Hit::Add(Column::Track(n)), 0.0);
@@ -57713,16 +57872,21 @@ mod tests {
             "the icon of a bare track did not open the input menu"
         );
 
-        // Ctrl+T's twin lands on the next free slot.
-        let free = (0..recorder::CHANNELS)
-            .find(|m| !app.channel_used(*m))
-            .expect("a slot left");
-        app.add_track_first_free();
-        assert!(app.channel_used(free), "Ctrl+T did not add a track");
+        // Ctrl+T's twin, with nothing selected, makes a track at the END of
+        // the desk (W6: the first row after the last one drawn; it was the
+        // first free slot of a fixed desk), and selects it.
+        app.selected_channel = None;
+        app.selected_tracks.clear();
+        let before = app.counted_tracks();
+        app.add_track();
+        assert_eq!(app.counted_tracks(), before + 1, "Ctrl+T did not add a track");
+        let at = app.selected_row().expect("the new track is not selected");
+        assert!(app.channel_used(at) && at > n, "Ctrl+T's track is not at the end: row {at}");
 
-        // And Remove Track takes the bare bit with it.
+        // And Remove Track takes the bare track with it, row and all (W6).
+        let bare = app.track_id_at(n);
         app.remove_channel(n);
-        assert!(!app.channel_used(n), "removal left the bare track standing");
+        assert_eq!(app.row_of(bare), None, "removal left the bare track standing");
     }
 
     /// **The × empties the channel completely.** Kind, bays, name, colour,
@@ -57736,18 +57900,21 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         // Channel 0 ships used (the DX7). Dress it further, then remove it.
         app.set_insert(0, 1, Some("/x/Grand 8.vst3"));
-        app.settings
-            .strip_names.resize(recorder::CHANNELS, String::new());
-        app.settings.strip_names[0] = "BELL KEYS".to_owned();
-        app.settings.strip_colors[0] = 14;
-        app.settings.strip_muted |= 1;
+        app.settings.rows[0].name = "BELL KEYS".to_owned();
+        app.settings.rows[0].color = 14;
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) | (1));
+        let gone = app.track_id_at(0);
+        let node = crate::desk_id::Node::Track(gone);
         app.apply_mixer_hit(Hit::Remove(Column::Track(0)), 0.0);
-        assert_eq!(app.channel_kind(0), None, "the channel is still a kind");
-        assert_eq!(app.insert(0, 0), None, "bay 0 survived the removal");
-        assert_eq!(app.insert(0, 1), None, "bay 1 survived the removal");
-        assert!(app.settings.strip_names[0].is_empty(), "the name survived");
-        assert_eq!(app.settings.strip_colors[0], 0, "the colour survived");
-        assert_eq!(app.settings.strip_muted & 1, 0, "the mute survived");
+        // **The row itself goes** (W6: Remove deletes the row), so nothing
+        // of it is left for the next track to inherit: no row holds its
+        // identity, and no bay, name, colour or switch is kept by it.
+        assert_eq!(app.row_of(gone), None, "the channel is still on the desk");
+        assert!(
+            !app.settings.plugins.keys().any(|sb| sb.seat.node == node),
+            "a bay survived the removal"
+        );
+        assert!(!app.settings.rows.iter().any(|r| r.name == "BELL KEYS"), "the name survived");
 
         // A column that is NOT a removable channel — the click's — answers a
         // Remove with nothing at all. (The backing file's × lives on the
@@ -57835,8 +58002,8 @@ mod tests {
         );
         // Remembered on the STRIP, because the strip owns the instrument;
         // its neighbours' choices must not move.
-        assert_eq!(app.settings.strip_dx7_patch[1], 12);
-        assert_eq!(app.settings.strip_dx7_patch[0], 0);
+        assert_eq!(app.settings.rows[1].dx7.patch, 12);
+        assert_eq!(app.settings.rows[0].dx7.patch, 0);
 
         // The built-in row. `usize::MAX` is not an index into anything, so it
         // must not be written to the settings as one.
@@ -57851,7 +58018,7 @@ mod tests {
                 index: usize::MAX
             })
         );
-        assert_eq!(app.settings.strip_dx7_patch[1], 0);
+        assert_eq!(app.settings.rows[1].dx7.patch, 0);
     }
 
     /// Put a hand on one of the open picker's rows, or take it off.
@@ -58031,7 +58198,7 @@ mod tests {
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::ChooseStaged { slot: 1, index: 7 })
         );
-        assert_eq!(app.settings.strip_dx7_patch[1], 0);
+        assert_eq!(app.settings.rows[1].dx7.patch, 0);
 
         // Removing goes the same road, and a selection or a mark on a slot
         // the host has since emptied is dropped rather than left pointing at
@@ -58117,8 +58284,8 @@ mod tests {
     #[test]
     fn the_picker_opens_lit_on_the_patch_the_strip_plays() {
         let mut settings = Settings::default();
-        settings.strip_dx7_cartridge[1] = "/somewhere/ROM1A.syx".to_owned();
-        settings.strip_dx7_patch[1] = 12;
+        settings.rows[1].dx7.cart = "/somewhere/ROM1A.syx".to_owned();
+        settings.rows[1].dx7.patch = 12;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
         while app.take_recorder_request().is_some() {}
         app.apply_dialog_action(DialogAction::ShowPatches { slot: 1 });
@@ -59583,7 +59750,7 @@ mod tests {
         // first alt-click used to make TWO — the one under the hand and a
         // node seeded at zero in front of it. See
         // `a_curve_holds_only_the_nodes_that_were_drawn`.
-        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
@@ -59594,7 +59761,7 @@ mod tests {
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
         // Moving it leaves ONE point, not a trail.
-        app.arr_drag_auto_point(0, AutoParam::Gain, i, 9.0, 0.25);
+        app.arr_drag_auto_point(AutoLane::Row(0), AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
         assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
@@ -59602,8 +59769,8 @@ mod tests {
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
-        app.arr_put_auto_point(0, AutoParam::Gain, 12.0, 0.5);
-        app.arr_drag_auto_point(0, AutoParam::Gain, 0, 20.0, 0.1);
+        app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Gain, 12.0, 0.5);
+        app.arr_drag_auto_point(AutoLane::Row(0), AutoParam::Gain, 0, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert!(
@@ -59614,8 +59781,8 @@ mod tests {
 
         // Undrawing every point takes the curve out of the document
         // entirely — an emptied curve is removed, not stored empty.
-        app.arr_remove_auto_point(0, AutoParam::Gain, 20.0);
-        app.arr_remove_auto_point(0, AutoParam::Gain, 12.0);
+        app.arr_remove_auto_point(AutoLane::Row(0), AutoParam::Gain, 20.0);
+        app.arr_remove_auto_point(AutoLane::Row(0), AutoParam::Gain, 12.0);
         assert!(
             app.arrangement.automation.is_empty(),
             "an emptied curve was kept: {:?}",
@@ -59670,22 +59837,22 @@ mod tests {
         app.recorder.position_s = 1.0;
 
         // Nothing is armed until something is actually touched.
-        assert!(!app.arr_auto_writing(0, false), "a latch armed itself");
+        assert!(!app.arr_auto_writing(AutoLane::Row(0), false), "a latch armed itself");
         app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column::Track(0)), 0.6);
         // ...and now it stays armed with the hand off.
-        assert!(app.arr_auto_writing(0, false), "the latch did not hold");
+        assert!(app.arr_auto_writing(AutoLane::Row(0), false), "the latch did not hold");
 
         // The transport stopping releases it. Driven through a real frame,
         // because that is where the edge is looked for.
         app.recorder.playing = false;
         run_frame(&ctx, &mut app);
-        assert!(!app.arr_auto_writing(0, false), "the latch survived the stop");
+        assert!(!app.arr_auto_writing(AutoLane::Row(0), false), "the latch survived the stop");
 
         // A Touch, by contrast, lets go the moment the hand does.
         app.arr_auto_modes.insert(app.owner_at(1), AutoMode::Touch);
         app.recorder.playing = true;
         app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column::Track(1)), 0.6);
-        assert!(!app.arr_auto_writing(1, false), "a Touch latched");
+        assert!(!app.arr_auto_writing(AutoLane::Row(1), false), "a Touch latched");
     }
 
     /// **A pass does not lay down sixty points a second.**
@@ -59759,19 +59926,19 @@ mod tests {
     fn the_engine_is_told_which_lanes_the_curves_must_not_drive() {
         use crate::automation::AutoMode;
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        assert_eq!(app.auto_suspend_mask(), 0, "a fresh song suspends something");
+        assert_eq!(app.auto_suspend_word(), 0, "a fresh song suspends something");
 
         // Off keeps the curve and stops obeying it.
         app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Off);
-        assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Off is not suspended");
+        assert_eq!(app.auto_suspend_word() & (1 << 2), 1 << 2, "Off is not suspended");
         // Read obeys it.
         app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Read);
-        assert_eq!(app.auto_suspend_mask() & (1 << 2), 0, "Read is suspended");
+        assert_eq!(app.auto_suspend_word() & (1 << 2), 0, "Read is suspended");
         // A writing mode suspends, so the curve does not fight the hand.
         app.arr_auto_modes.insert(app.owner_at(2), AutoMode::Write);
-        assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Write is not suspended");
+        assert_eq!(app.auto_suspend_word() & (1 << 2), 1 << 2, "Write is not suspended");
         // ...and nothing else is caught up in it.
-        assert_eq!(app.auto_suspend_mask() & !(1 << 2), 0, "a neighbour was suspended");
+        assert_eq!(app.auto_suspend_word() & !(1 << 2), 0, "a neighbour was suspended");
     }
 
     /// **A dragged point survives the reload.**
@@ -59788,12 +59955,12 @@ mod tests {
     fn dragging_a_point_marks_the_gesture_so_mouse_up_saves_it() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false;
-        let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(AutoLane::Row(0), crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
 
         // The put marks the gesture too, so clear the flag and prove the
         // DRAG sets it on its own.
         app.arr_gesture_dirty = false;
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
+        app.arr_drag_auto_point(AutoLane::Row(0), crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         assert!(
             app.arr_gesture_dirty,
             "the drag did not mark the gesture, so mouse-up will not save it"
@@ -59826,10 +59993,10 @@ mod tests {
         // An automation node: put at the press, carried by the frames, ended
         // by the release.
         let before = app.hist_at;
-        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         assert_eq!(app.hist_at, before, "the press committed the node nobody had let go of");
         for f in 1..=10 {
-            app.arr_drag_auto_point(0, AutoParam::Gain, i, 4.0 + f64::from(f) * 0.1, 0.5);
+            app.arr_drag_auto_point(AutoLane::Row(0), AutoParam::Gain, i, 4.0 + f64::from(f) * 0.1, 0.5);
         }
         release(&mut app);
         assert_eq!(app.hist_at, before + 1, "one node added and placed left {} moments", app.hist_at - before);
@@ -59843,7 +60010,7 @@ mod tests {
         assert_eq!(app.hist_at, before + 1, "one tempo point added and placed left {} moments", app.hist_at - before);
         // A Shift-click that never moves: still one, at the release.
         let before = app.hist_at;
-        app.arr_put_auto_point(0, AutoParam::Gain, 12.0, 0.25).expect("no point landed");
+        app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Gain, 12.0, 0.25).expect("no point landed");
         release(&mut app);
         assert_eq!(app.hist_at, before + 1, "a motionless Shift-click left {} moments", app.hist_at - before);
         // One step back takes the last node off, and leaves the others.
@@ -59865,13 +60032,13 @@ mod tests {
         app.settings.arr_snap = false;
         // The parameter is an ARGUMENT now, not a per-lane mode — a track
         // shows several at once, so there is no "the lane's parameter" to set.
-        app.arr_put_auto_point(0, AutoParam::Mute, 1.0, 1.0);
+        app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Mute, 1.0, 1.0);
         assert_eq!(
             app.arrangement.automation.get(0, AutoParam::Mute).expect("curve").points()[0].shape,
             Shape::Hold,
             "a mute point ramps"
         );
-        app.arr_put_auto_point(1, AutoParam::Gain, 1.0, 1.0);
+        app.arr_put_auto_point(AutoLane::Row(1), AutoParam::Gain, 1.0, 1.0);
         assert_eq!(
             app.arrangement.automation.get(1, AutoParam::Gain).expect("curve").points()[0].shape,
             Shape::Linear,
@@ -59904,26 +60071,26 @@ mod tests {
 
         // Neither: mixing on a stopped transport writes nothing.
         app.recorder.playing = false;
-        app.auto_set_control(0, AutoParam::Gain, 0.7);
+        app.auto_set_control(AutoLane::Row(0), AutoParam::Gain, 0.7);
         assert_eq!(points(&app), 0, "a stopped, unarmed move was written");
 
         // Rolling but NOT armed — the ordinary case, and the one that must
         // stay silent.
         app.recorder.playing = true;
-        app.auto_set_control(0, AutoParam::Gain, 0.6);
+        app.auto_set_control(AutoLane::Row(0), AutoParam::Gain, 0.6);
         assert_eq!(points(&app), 0, "mixing during playback became automation");
 
         // Armed but NOT rolling: setting a level before you start.
         app.recorder.playing = false;
         app.arr_auto_armed.insert(app.auto_row_at(0, AutoParam::Gain));
-        app.auto_set_control(0, AutoParam::Gain, 0.5);
+        app.auto_set_control(AutoLane::Row(0), AutoParam::Gain, 0.5);
         assert_eq!(points(&app), 0, "an armed lane wrote while stopped");
 
         // Both. Now it writes, at the PLAYHEAD rather than wherever the
         // pointer was — ONE point, because nothing is seeded at zero any
         // more. See `a_curve_holds_only_the_nodes_that_were_drawn`.
         app.recorder.playing = true;
-        app.auto_set_control(0, AutoParam::Gain, 0.4);
+        app.auto_set_control(AutoLane::Row(0), AutoParam::Gain, 0.4);
         assert_eq!(points(&app), 1, "an armed, rolling move wrote nothing");
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("a curve");
         assert!(
@@ -60160,8 +60327,9 @@ mod tests {
     /// a note at its own head, plus names for the two lanes.
     fn three_clips_on_two_lanes(app: &mut TangentApp) {
         use crate::arrangement::{ArrClip, ArrNote, ClipKind};
-        app.settings.strip_names =
-            vec![String::new(), "Keys".to_owned(), "Bass".to_owned()];
+        for (row, name) in app.settings.rows.iter_mut().zip(["", "Keys", "Bass"]) {
+            row.name = name.to_owned();
+        }
         let mut mk = |id: u64, lane: usize, at: f64| {
             app.arrangement.clips.push(ArrClip {
                 pedal: Vec::new(),
@@ -61150,42 +61318,42 @@ mod tests {
     fn a_lane_shows_as_many_automation_rows_as_are_ticked() {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        assert!(app.arr_auto_rows(2).is_empty(), "a fresh track shows a row");
+        assert!(app.arr_auto_rows(AutoLane::Row(2)).is_empty(), "a fresh track shows a row");
 
-        app.arr_toggle_automation_param(2, AutoParam::Gain);
-        app.arr_toggle_automation_param(2, AutoParam::Send);
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Send);
         assert_eq!(
-            app.arr_auto_rows(2),
+            app.arr_auto_rows(AutoLane::Row(2)),
             vec![AutoParam::Gain, AutoParam::Send],
             "two ticks should be two rows, in the desk's own order"
         );
         // Row order is stable and matches the menu's, whatever order the
         // boxes were ticked in.
-        app.arr_toggle_automation_param(2, AutoParam::Pan);
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Pan);
         assert_eq!(
-            app.arr_auto_rows(2),
+            app.arr_auto_rows(AutoLane::Row(2)),
             vec![AutoParam::Gain, AutoParam::Pan, AutoParam::Send]
         );
-        assert_eq!(app.arr_auto_param_at(2, 1), Some(AutoParam::Pan));
+        assert_eq!(app.arr_auto_param_at(AutoLane::Row(2), 1), Some(AutoParam::Pan));
 
         // A plugin's parameter sorts after the desk's, by bay then id.
         let fx = AutoParam::Plugin { bay: 1, id: 77 };
-        app.arr_toggle_automation_param(2, fx);
-        assert_eq!(app.arr_auto_rows(2).last(), Some(&fx));
+        app.arr_toggle_automation_param(AutoLane::Row(2), fx);
+        assert_eq!(app.arr_auto_rows(AutoLane::Row(2)).last(), Some(&fx));
 
         // Untick one and only that row goes.
-        app.arr_toggle_automation_param(2, AutoParam::Pan);
-        assert!(!app.arr_auto_is_open(2, AutoParam::Pan));
-        assert!(app.arr_auto_is_open(2, AutoParam::Gain));
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Pan);
+        assert!(!app.arr_auto_is_open(AutoLane::Row(2), AutoParam::Pan));
+        assert!(app.arr_auto_is_open(AutoLane::Row(2), AutoParam::Gain));
 
         // **A row is a VIEW.** Hiding one does not throw its curve out.
-        app.arr_put_auto_point(2, AutoParam::Gain, 1.0, 0.5);
-        app.arr_toggle_automation_param(2, AutoParam::Gain);
-        app.arr_toggle_automation_param(2, AutoParam::Gain);
+        app.arr_put_auto_point(AutoLane::Row(2), AutoParam::Gain, 1.0, 0.5);
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(2), AutoParam::Gain);
         assert!(app.arrangement.automation.get(2, AutoParam::Gain).is_some());
 
         // And one track's rows are its own.
-        assert!(app.arr_auto_rows(3).is_empty(), "the rows leaked to another track");
+        assert!(app.arr_auto_rows(AutoLane::Row(3)).is_empty(), "the rows leaked to another track");
     }
 
     /// A plugin parameter round-trips through the key a document stores.
@@ -61482,7 +61650,7 @@ mod tests {
                 .iter()
                 .find(|n| n.label.contains("mute"))
                 .expect("no mute node on the desk");
-            (mute.id, app.settings.strip_muted)
+            (mute.id, app.settings.word(|r| r.mute))
         };
         ctx.memory_mut(|m| m.request_focus(id));
         pointer_frame(
@@ -61497,7 +61665,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            app.settings.strip_muted, before,
+            app.settings.word(|r| r.mute), before,
             "an arrow key toggled a focused mute"
         );
 
@@ -61515,7 +61683,7 @@ mod tests {
             }],
         );
         assert_ne!(
-            app.settings.strip_muted, before,
+            app.settings.word(|r| r.mute), before,
             "Space on a focused mute did nothing, so the desk is unreachable"
         );
     }
@@ -62355,6 +62523,11 @@ mod tests {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = false;
         app.arrangement_open = true;
+        // The empty lane the desk draws (W6: a vacant row is not drawn): a
+        // placeholder inside the folder above it.
+        app.add_bare_track(3);
+        app.set_is_folder(3, true);
+        app.set_in_folder(4, true);
         let _ = run_frame(&ctx, &mut app);
         let rect = app.arrangement_rect.expect("the arrangement was never drawn");
         // An EMPTY lane, and asserted to be one: the arm under test is the
@@ -63278,7 +63451,7 @@ mod tests {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.dialog = None;
         // A desk with no MIDI track on it: nothing to choose inputs FOR.
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             app.set_channel_input_spec(ch, "");
         }
         app.set_ports(Some(Box::new(Ports::default())));
@@ -63753,7 +63926,7 @@ mod tests {
     fn the_theory_send_ships_on_for_the_keyboards_track_alone() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         assert!(app.to_theory(1), "track two does not reach the theory view");
-        for n in (0..recorder::CHANNELS).filter(|n| *n != 1) {
+        for n in (0..crate::desk_lift::V32_CHANNELS).filter(|n| *n != 1) {
             assert!(!app.to_theory(n), "track {} ships switched on", n + 1);
         }
         // The switch is a saved preference, unlike the arm beside it.
@@ -63761,8 +63934,8 @@ mod tests {
         assert!(app.to_theory(3));
         let json = app.settings.to_json();
         let back = Settings::from_json(&json);
-        assert!(back.strip_to_theory[3], "the switch did not survive a save");
-        assert!(back.strip_to_theory[1], "track two's switch was lost");
+        assert!(back.rows[3].theory, "the switch did not survive a save");
+        assert!(back.rows[1].theory, "track two's switch was lost");
         // And an untouched desk writes nothing, so a fresh file keeps its
         // shape — the rule every additive key here follows.
         let plain = Settings::default();
@@ -63784,6 +63957,8 @@ mod tests {
     #[test]
     fn playback_reaches_the_theory_view_only_where_the_switch_is_on() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
+        // One reading per row, as the host hands them (W6).
+        app.recorder.lane_sounding = vec![0; app.desk_extent()];
         // Track 2 is on out of the box — it carries the DX7; track 3 is not.
         app.recorder.lane_sounding[1] = 1u128 << 60;
         app.recorder.lane_sounding[2] = 1u128 << 72;
@@ -63906,11 +64081,7 @@ mod tests {
             let a = glue_part(app, ClipKind::Audio, 3, 0.0, 2.0, 2.0);
             let b = glue_part(app, ClipKind::Audio, 3, 4.0, 2.0, 2.0);
             app.arr_multi.extend([a, b]);
-            app.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
-                lane: 3,
-                path: "media/frozen-04.wav".into(),
-                len_s: 8.0,
-            });
+            app.settings.rows[3].frozen = Some(crate::desk_model::Frozen { path: "media/frozen-04.wav".into(), len_s: 8.0 });
         }));
     }
 
@@ -63926,11 +64097,7 @@ mod tests {
         let a = glue_part(&mut app, ClipKind::Midi, 3, 0.0, 2.0, 2.0);
         let b = glue_part(&mut app, ClipKind::Midi, 3, 4.0, 2.0, 2.0);
         app.arr_multi.extend([a, b]);
-        app.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
-            lane: 3,
-            path: "media/frozen-04.wav".into(),
-            len_s: 8.0,
-        });
+        app.settings.rows[3].frozen = Some(crate::desk_model::Frozen { path: "media/frozen-04.wav".into(), len_s: 8.0 });
         let before = app.arrangement.clips.clone();
         let said = app.messages.len();
         app.arr_glue_selection();
@@ -64109,6 +64276,12 @@ mod tests {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.arrangement_open = true;
         app.add_bare_track(0);
+        // Lane 3 is the empty row the desk draws (W6: a vacant row is not
+        // drawn): a placeholder inside the folder above it, the indented
+        // plus.
+        app.add_bare_track(2);
+        app.set_is_folder(2, true);
+        app.set_in_folder(3, true);
         let _ = run_frame(&ctx, &mut app);
         let rect = app.arrangement_rect.expect("arrange rect");
         let (row, probes) = {
@@ -64198,7 +64371,7 @@ mod tests {
         let strips = |app: &mut TangentApp| {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            (0..recorder::CHANNELS)
+            (0..crate::desk_lift::V32_CHANNELS)
                 .map(|n| l.strips[recorder::Column::Track(n)].panel)
                 .collect::<Vec<_>>()
         };
@@ -64429,12 +64602,12 @@ mod tests {
         // its name.
         app.snap_into_folder(6, 4);
         assert_eq!(app.folder_children(4), vec![5, 6]);
-        app.settings.strip_names[5] = "EJECTME".to_owned();
+        app.settings.rows[5].name = "EJECTME".to_owned();
         app.set_selected_rows(&[5]);
         app.set_primary_row(Some(5));
         app.eject_from_folder(5);
         assert_eq!(
-            app.settings.strip_names.get(6).map(String::as_str),
+            app.settings.rows.get(6).map(|r| r.name.as_str()),
             Some("EJECTME"),
             "the middle child did not land just below the run"
         );
@@ -64573,6 +64746,11 @@ mod tests {
         let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.arrangement_open = true;
         app.add_bare_track(0);
+        // Lane 3 is the empty row the desk draws (W6: a vacant row is not
+        // drawn): a placeholder inside the folder above it.
+        app.add_bare_track(2);
+        app.set_is_folder(2, true);
+        app.set_in_folder(3, true);
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 500.0));
         app.arrangement_rect = Some(rect);
         let clips = app.arr_clip_views();
@@ -64613,7 +64791,7 @@ mod tests {
     fn a_track_is_carried_by_its_name_and_by_its_number() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         app.arrangement_open = true;
-        app.settings.strip_names = vec!["Rhodes".into()];
+        app.settings.rows[0].name = "Rhodes".into();
         let _ = &ctx;
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 500.0));
         app.arrangement_rect = Some(rect);
@@ -65988,7 +66166,7 @@ mod tests {
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (6.0, 0.6)], "Delete took the wrong nodes");
         assert_eq!(app.channel_used(0), used, "Delete went to the TRACK");
         // **The base stays** even when it is chosen with the rest.
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 0), (0, 0, 1)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 0), (AutoLane::Row(0), 0, 1)]);
         key_with(&ctx, &mut app, egui::Key::Backspace, egui::Modifiers::NONE);
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5)], "the base node was deleted");
     }
@@ -66004,6 +66182,7 @@ mod tests {
         let (ctx, mut app) = auto_bench("autodelheld");
         app.set_primary_row(Some(0));
         assert!(app.channel_used(0));
+        let track = app.track_id_at(0);
         let a = auto_at(&app, 2.0, 0.8);
         press(&ctx, &mut app, a);
         release(&ctx, &mut app, a);
@@ -66026,7 +66205,9 @@ mod tests {
         assert!(app.channel_used(0), "a held Delete removed the TRACK after its nodes");
         let _ = ctx.run(delete(false), |ctx| app.frame(ctx));
         key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
-        assert!(!app.channel_used(0), "a fresh Delete with nothing chosen no longer takes the selected track");
+        // By identity: the track's row goes with it (W6), and the row below
+        // moves up into its place.
+        assert_eq!(app.row_of(track), None, "a fresh Delete with nothing chosen no longer takes the selected track");
     }
 
     /// **A new project lets the automation session go.** Which rows are
@@ -66043,7 +66224,7 @@ mod tests {
         app.set_project_dir(root.join("Projects"));
         app.arr_auto_armed.insert(app.auto_row_at(0, AutoParam::Gain));
         app.arr_auto_bypassed.insert(app.auto_row_at(0, AutoParam::Gain));
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1)]);
         assert!(app.arr_auto_open.contains(&app.auto_row_at(0, AutoParam::Gain)), "fixture: the row is not open");
         app.new_project();
         assert!(app.arr_auto_armed.is_empty(), "a row armed in the last project writes into this one");
@@ -66108,7 +66289,7 @@ mod tests {
         press(&ctx, &mut app, a);
         release(&ctx, &mut app, a);
         let _ = run_frame(&ctx, &mut app);
-        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 1)], "the click did not choose the node");
+        assert_eq!(app.auto_nodes_at(), vec![(AutoLane::Row(0), 0, 1)], "the click did not choose the node");
         assert_eq!(auto_nodes(&app), before, "a click moved the node");
         assert_eq!(app.history.len(), moments, "a click left an undo step");
     }
@@ -66170,7 +66351,7 @@ mod tests {
         drag_through(&ctx, &mut app, from, &via);
         let mut got = app.auto_nodes_at();
         got.sort();
-        assert_eq!(got, vec![(0, 0, 1), (0, 0, 2)], "the box chose the wrong nodes");
+        assert_eq!(got, vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2)], "the box chose the wrong nodes");
         assert!(
             !matches!(app.take_recorder_request(), Some(recorder::RecorderRequest::Locate(_))),
             "a box moved the playhead"
@@ -66234,11 +66415,11 @@ mod tests {
         let from = auto_at(&app, 3.5, 0.95);
         let rect = app.arrangement_rect.expect("drawn");
         drag_through(&ctx, &mut app, from, &[Pos2::new(rect.left() + 10.0, from.y + 60.0)]);
-        assert!(!app.auto_node_chosen(0, 0, 1), "the 2 s node, left of the window, was chosen");
+        assert!(!app.auto_node_chosen(AutoLane::Row(0), 0, 1), "the 2 s node, left of the window, was chosen");
         // The window's own nodes are still the box's to choose.
         let to = auto_at(&app, 5.0, 0.05);
         drag_through(&ctx, &mut app, from, &[to]);
-        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 2)], "the box lost the 4 s node it covers");
+        assert_eq!(app.auto_nodes_at(), vec![(AutoLane::Row(0), 0, 2)], "the box lost the 4 s node it covers");
     }
 
     /// **Copy, click where it should go, paste**: it lands on that row, at
@@ -66293,7 +66474,7 @@ mod tests {
     fn copying_clips_after_nodes_leaves_the_paste_to_the_clips() {
         use crate::arrangement::{ArrClip, ClipKind};
         let (_ctx, mut app) = auto_bench("autoclipslast");
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1)]);
         assert!(app.arr_copy_auto_nodes());
         let id = app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
@@ -66372,7 +66553,7 @@ mod tests {
         release(&ctx, &mut app, a);
         click_with(&ctx, &mut app, b, egui::Modifiers::SHIFT);
         click_with(&ctx, &mut app, a, egui::Modifiers::SHIFT);
-        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 2)], "shift did not take the node back out");
+        assert_eq!(app.auto_nodes_at(), vec![(AutoLane::Row(0), 0, 2)], "shift did not take the node back out");
         key_with(&ctx, &mut app, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.5), (2.0, 0.8), (6.0, 0.6)], "Delete took the un-chosen node");
     }
@@ -66386,7 +66567,7 @@ mod tests {
         let (_ctx, mut app) = auto_bench("autoclipmenu");
         let id = app.arrangement.add_clip(bench_item(1, 1.0));
         let clips = app.arrangement.clips.len();
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1)]);
         app.arr_clip_menu_subject(id);
         app.arr_delete_selected();
         assert_eq!(auto_nodes(&app).len(), 4, "the menu's Delete took a node");
@@ -66462,7 +66643,7 @@ mod tests {
             AutoParam::Gain,
             vec![pt(0.0, 0.5), pt(4.0, 0.8), pt(4.0, 0.2), pt(6.0, 0.6)],
         ));
-        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.4).expect("nothing landed");
+        let i = app.arr_put_auto_point(AutoLane::Row(0), AutoParam::Gain, 4.0, 0.4).expect("nothing landed");
         assert_eq!(auto_nodes(&app)[i], (4.0, 0.4), "the index names another node: {:?}", auto_nodes(&app));
         assert_eq!(auto_nodes(&app)[i - 1], (4.0, 0.8), "the step's arrival was touched");
     }
@@ -66475,15 +66656,15 @@ mod tests {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = auto_bench("autogroupedge");
         // The 2, 4 and 6 s nodes chosen; the one at 6 s carried to 1 s.
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2), (0, 0, 3)]);
-        app.arr_drag_auto_point(0, AutoParam::Gain, 3, 1.0, 0.6);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2), (AutoLane::Row(0), 0, 3)]);
+        app.arr_drag_auto_point(AutoLane::Row(0), AutoParam::Gain, 3, 1.0, 0.6);
         // The group stops when its first node reaches the start — where it
         // meets the base, and carries its value in (no step at zero).
         assert_eq!(auto_nodes(&app), vec![(0.0, 0.8), (2.0, 0.2), (4.0, 0.6)], "the group lost its shape");
         // And in value: pulled down past the floor, the pair keeps its gap.
         let (_ctx, mut app) = auto_bench("autogroupfloor");
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
-        app.arr_drag_auto_point(0, AutoParam::Gain, 1, 2.0, 0.0);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2)]);
+        app.arr_drag_auto_point(AutoLane::Row(0), AutoParam::Gain, 1, 2.0, 0.0);
         let got = auto_nodes(&app);
         assert!((got[1].1 - 0.6).abs() < 1e-9 && got[2].1.abs() < 1e-9, "values merged at the floor: {got:?}");
     }
@@ -66536,8 +66717,8 @@ mod tests {
             AutoParam::Gain,
             vec![pt(2.0, 0.3), pt(2.0, 0.7), pt(6.0, 0.6)],
         ));
-        app.auto_set_base(0, AutoParam::Gain, 0.9);
-        assert_eq!(app.auto_base(0, AutoParam::Gain), 0.9, "{:?}", auto_nodes(&app));
+        app.auto_set_base(AutoLane::Row(0), AutoParam::Gain, 0.9);
+        assert_eq!(app.auto_base(AutoLane::Row(0), AutoParam::Gain), 0.9, "{:?}", auto_nodes(&app));
         assert_eq!(auto_nodes(&app)[1], (2.0, 0.7), "the step's departure moved with the dial");
     }
 
@@ -66549,11 +66730,11 @@ mod tests {
     fn opening_a_row_lets_the_node_choice_go() {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = auto_bench("autorowsel");
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1)]);
-        app.arr_toggle_automation_param(0, AutoParam::Pan);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1)]);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Pan);
         assert!(app.arr_auto_nodes.is_empty(), "the choice outlived the renumbering");
         app.arr_auto_sel = Some((app.owner_at(0), 1));
-        app.arr_close_auto_row(0, 1);
+        app.arr_close_auto_row(AutoLane::Row(0), 1);
         assert!(app.arr_auto_sel.is_none(), "the row choice outlived the renumbering");
     }
 
@@ -66667,7 +66848,7 @@ mod tests {
     #[test]
     fn a_paste_replaces_what_its_span_covers() {
         let (_ctx, mut app) = auto_bench("autospan");
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]); // 2 s and 4 s: a 2 s span
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2)]); // 2 s and 4 s: a 2 s span
         assert!(app.arr_copy_auto_nodes());
         app.recorder.position_s = 3.0;
         app.arr_auto_nodes.clear();
@@ -66689,7 +66870,7 @@ mod tests {
         app.arr_auto_open.insert(app.auto_row_at(0, AutoParam::Pan));
         let pt = |at_s, value| Point { at_s, value, shape: Shape::Linear };
         app.arrangement.automation.set(Curve::sanitised(0, AutoParam::Pan, vec![pt(0.0, 0.5), pt(3.0, 0.1)]));
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 1, 1)]); // volume 2 s (0.8), pan 3 s (0.1)
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 1, 1)]); // volume 2 s (0.8), pan 3 s (0.1)
         let _ = app.arr_copy_auto_nodes();
         app.arr_auto_nodes.clear();
         app.recorder.position_s = 10.0;
@@ -66718,9 +66899,9 @@ mod tests {
     fn a_shape_pasted_onto_a_mute_row_holds() {
         use crate::automation::{AutoParam, Shape};
         let (_ctx, mut app) = auto_bench("autopastemute");
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2)]);
         assert!(app.arr_copy_auto_nodes());
-        app.arr_toggle_automation_param(0, AutoParam::Mute);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Mute);
         app.arr_auto_focus = Some(app.auto_row_at(0, AutoParam::Mute));
         app.recorder.position_s = 8.0;
         assert!(app.arr_paste_auto_nodes());
@@ -66750,7 +66931,7 @@ mod tests {
     #[test]
     fn cmd_a_on_an_empty_slot_opens_nothing() {
         let (ctx, mut app) = auto_bench("autocmdaempty");
-        let empty = (0..recorder::CHANNELS).find(|n| !app.channel_used(*n)).expect("an empty slot");
+        let empty = (0..crate::desk_lift::V32_CHANNELS).find(|n| !app.channel_used(*n)).expect("an empty slot");
         app.set_primary_row(Some(empty));
         key_with(&ctx, &mut app, egui::Key::A, egui::Modifiers::COMMAND);
         assert!(
@@ -67782,7 +67963,7 @@ mod tests {
             s.theme_name = "Rhodes".into();
             s.window_size_percent = 175;
             s.fretboard_capo = 3;
-            s.channel_gains[2] = 0.25;
+            s.rows[2].gain = 0.25;
             s.record_audio_device = Some("Scarlett 18i20".to_owned());
             let (ctx, mut app) = headless_with(Caps::DESKTOP, s.clone());
             app.apply_menu_action(&ctx, MenuAction::Reset(scope));
@@ -67794,7 +67975,7 @@ mod tests {
             assert_eq!(app.settings.theme_name, s.theme_name, "{scope:?} acted anyway");
             assert_eq!(app.settings.window_size_percent, 175, "{scope:?} acted anyway");
             assert_eq!(app.settings.fretboard_capo, 3, "{scope:?} acted anyway");
-            assert_eq!(app.settings.channel_gains[2], 0.25, "{scope:?} acted anyway");
+            assert_eq!(app.settings.rows[2].gain, 0.25, "{scope:?} acted anyway");
             assert_eq!(
                 app.settings.record_audio_device, s.record_audio_device,
                 "{scope:?} acted anyway"
@@ -67847,7 +68028,7 @@ mod tests {
         s.theme_name = "Rhodes".into();
         s.background_color = Rgb { r: 9, g: 9, b: 9 };
         s.record_audio_device = Some("Scarlett 18i20".to_owned());
-        s.channel_gains[2] = 0.25;
+        s.rows[2].gain = 0.25;
         let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
 
         app.apply_menu_action(&ctx, MenuAction::Reset(crate::settings::ResetScope::Colours));
@@ -67861,7 +68042,7 @@ mod tests {
         assert_eq!(app.settings.background_color, fresh.background_color);
         // ...and the expensive things are exactly where they were.
         assert_eq!(app.settings.record_audio_device.as_deref(), Some("Scarlett 18i20"));
-        assert_eq!(app.settings.channel_gains[2], 0.25);
+        assert_eq!(app.settings.rows[2].gain, 0.25);
 
         // The box that reports it offers the way back.
         let Some(Dialog::Confirm { choices, .. }) = app.open_dialog() else {
@@ -68012,7 +68193,7 @@ mod tests {
 
     /// One bay of a `Settings`, the way `TangentApp::insert` reads it.
     fn bay_of(s: &Settings, strip: usize, bay: usize) -> Option<&str> {
-        let sb = crate::desk_legacy::bay_at(&s.track_ids, strip, bay)?;
+        let sb = crate::desk_legacy::bay_at(&s.desk_ids(), strip, bay)?;
         s.plugins.get(&sb).map(String::as_str).filter(|p| !p.is_empty())
     }
 
@@ -68191,11 +68372,11 @@ mod tests {
         // switching off before they can hear what they play.
         let (_ctx, app) = headless_with(Caps::DESKTOP, s.clone());
         assert_eq!(
-            app.armed_mask(),
+            app.armed_word(),
             1 << 1,
             "the record light opens somewhere other than the keyboard's track"
         );
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             assert_eq!(
                 app.to_theory(n),
                 n == 1,
@@ -68204,14 +68385,14 @@ mod tests {
             );
         }
         assert_eq!(
-            (s.strip_muted, s.strip_soloed, s.strip_phase),
+            (s.word(|r| r.mute), s.word(|r| r.solo), s.word(|r| r.phase)),
             (0, 0, 0),
             "a fresh desk opens with a mute, a solo or a polarity flip on"
         );
         // The kit's drum badge rides with the KIT, so the row that plays
         // drums is the row that looks like it.
-        assert_eq!(s.channel_icons[0], 1, "the drum badge is on the wrong row");
-        assert_eq!(s.channel_icons[1], 0, "the keyboard's row wears a badge");
+        assert_eq!(s.rows[0].icon, 1, "the drum badge is on the wrong row");
+        assert_eq!(s.rows[1].icon, 0, "the keyboard's row wears a badge");
     }
 
     /// **One tempo, one source.**
@@ -69868,7 +70049,7 @@ mod tests {").expect("the tests module")];
         if app.license.cheated() {
             return;
         }
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             app.add_bare_track(n);
         }
         app.settings.mixer_visible = 8;
@@ -70786,7 +70967,7 @@ mod tests {").expect("the tests module")];
         assert_eq!(dressed(&app), AMP_PEDALS, "redo brought the amp back without its board");
         app.redo();
         assert_eq!(app.hist_at, top, "the redo tail was cut");
-        assert_ne!(app.settings.tracks_added & (1 << 5), 0, "the track after the amp never came back");
+        assert_ne!(app.settings.word(|r| r.added) & (1 << 5), 0, "the track after the amp never came back");
         // A document whose amp's board was emptied by hand opens as it was
         // left: the apply writes the bays, it does not seat anything.
         for p in 0..AMP_PEDALS {
@@ -71237,7 +71418,7 @@ mod tests {").expect("the tests module")];
         }
         click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
         assert!(app.pedal_stack.is_some(), "no pedal window to reorder under");
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.remove(0);
         order.insert(2, 0);
         app.reorder_channels(&order);
@@ -71381,7 +71562,7 @@ mod tests {").expect("the tests module")];
         let rect = app.mixer_rect.expect("the mixer is not up");
         let v = app.mixer_view();
         let fader = crate::mixer_panel::Layout::new(rect, &v).strips[recorder::Column::Track(0)].fader;
-        let before = app.settings.channel_gains[0];
+        let before = app.settings.rows[0].gain;
         let grab = fader.center();
         press(ctx, app, grab);
         move_to(ctx, app, grab - Vec2::new(0.0, 25.0));
@@ -71396,7 +71577,7 @@ mod tests {").expect("the tests module")];
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        (before, app.settings.channel_gains[0])
+        (before, app.settings.rows[0].gain)
     }
 
     /// **A face open, the desk still live.** The owner's words: keep the
@@ -74944,7 +75125,7 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..recorder::CHANNELS)
+            (0..crate::desk_lift::V32_CHANNELS)
                 .filter(|&i| l.lane_rows[i].is_positive())
                 .collect()
         };
@@ -75003,12 +75184,13 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..recorder::CHANNELS)
+            (0..crate::desk_lift::V32_CHANNELS)
                 .filter(|&i| l.lane_rows[i].is_positive())
                 .collect()
         };
+        let last_drawn = app.desk_index().shown().last().map_or(0, |r| *r as usize);
         assert!(
-            !drawn_at_press.contains(&(app.desk_extent() - 1)),
+            !drawn_at_press.contains(&last_drawn),
             "the fixture drew every lane, so there is nothing to scroll to"
         );
         // Straight down the middle of the field, hard against the bottom.
@@ -75026,7 +75208,9 @@ mod tests {").expect("the tests module")];
         for _ in 0..200 {
             hold_frame(&ctx, &mut app, 0.05);
         }
-        let max = app.desk_extent().saturating_sub(app.arr_visible());
+        // In ranks: the drawn lanes and the trailing add under them, a vacant
+        // row taking no scroll (W6).
+        let max = (app.desk_index().shown_len() + 1).saturating_sub(app.arr_visible());
         assert_eq!(app.arr_lane_scroll, max, "the stack ran past its last lane");
         assert_eq!(
             app.arr_scroll_acc, 0.0,
@@ -75100,7 +75284,7 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..recorder::CHANNELS)
+            (0..crate::desk_lift::V32_CHANNELS)
                 .filter(|&i| l.header_rows[i].panel.is_positive())
                 .collect::<Vec<_>>()
         };
@@ -75196,7 +75380,7 @@ mod tests {").expect("the tests module")];
         let (grab, region, drawn_at_press) = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            let drawn: Vec<usize> = (0..recorder::CHANNELS)
+            let drawn: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS)
                 .filter(|&i| l.strips[recorder::Column::Track(i)].panel.is_positive())
                 .collect();
             (l.strips[recorder::Column::Track(0)].name.center(), l.region, drawn)
@@ -75751,7 +75935,7 @@ mod heart_ring_tests {
         // Travelling BACKWARDS along the diagonal: the colour at phase p and
         // time t is the colour at phase p + d and time t + d's worth. If the
         // sign were the other way this would be phase p - d.
-        let n = f64::from(recorder::CHANNELS as u32);
+        let n = f64::from(crate::desk_lift::V32_CHANNELS as u32);
         let step = f64::from(TangentApp::HEART_CYCLE_S) / n;
         let bands = f64::from(TangentApp::HEART_BANDS);
         let later = app.heart_wave((1.0 / bands) as f32, step);
@@ -75889,27 +76073,26 @@ mod velocity_selection_tests {
     fn painting_and_badging_reach_every_selected_track() {
         use crate::dialogs::DialogAction;
         let (_c, mut app) = headless(Caps::DESKTOP);
+        // Four tracks to select: a range takes the rows the desk draws, and
+        // a vacant row is not one of them (W6).
+        for n in 2..=5 {
+            assert!(app.add_bare_track(n));
+        }
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
         assert_eq!(app.selected_rows(), vec![2, 3, 4, 5]);
 
         app.apply_dialog_action(DialogAction::TrackColor(recorder::StripRef::Row(3), 9));
+        let color = |app: &TangentApp, n: usize| app.settings.rows.get(n).map(|r| r.color);
+        let icon = |app: &TangentApp, n: usize| app.settings.rows.get(n).map(|r| r.icon);
         for n in [2, 3, 4, 5] {
-            assert_eq!(
-                app.settings.strip_colors.get(n).copied(),
-                Some(9),
-                "track {n} was not painted"
-            );
+            assert_eq!(color(&app, n), Some(9), "track {n} was not painted");
         }
-        assert_ne!(app.settings.strip_colors.get(9).copied(), Some(9), "paint escaped the selection");
+        assert_ne!(color(&app, 9), Some(9), "paint escaped the selection");
 
         app.apply_dialog_action(DialogAction::TrackIcon(4, 2));
         for n in [2, 3, 4, 5] {
-            assert_eq!(
-                app.settings.channel_icons.get(n).copied(),
-                Some(2),
-                "track {n} did not take the badge"
-            );
+            assert_eq!(icon(&app, n), Some(2), "track {n} did not take the badge");
         }
 
         // **And the TOP of the table sticks too** - a `.min(3)` clamp here
@@ -75919,11 +76102,7 @@ mod velocity_selection_tests {
             4,
             recorder_panel::ICON_MAX,
         ));
-        assert_eq!(
-            app.settings.channel_icons.get(4).copied(),
-            Some(recorder_panel::ICON_MAX),
-            "the last badge in the table did not stick"
-        );
+        assert_eq!(icon(&app, 4), Some(recorder_panel::ICON_MAX), "the last badge in the table did not stick");
     }
 
     /// A track OUTSIDE any selection is still painted alone.
@@ -75931,16 +76110,16 @@ mod velocity_selection_tests {
     fn painting_an_unselected_track_touches_only_it() {
         use crate::dialogs::DialogAction;
         let (_c, mut app) = headless(Caps::DESKTOP);
+        for n in 2..=5 {
+            assert!(app.add_bare_track(n));
+        }
         app.select_track(2, egui::Modifiers::NONE);
         app.select_track(5, egui::Modifiers::SHIFT);
         app.apply_dialog_action(DialogAction::TrackColor(recorder::StripRef::Row(9), 7));
-        assert_eq!(app.settings.strip_colors.get(9).copied(), Some(7));
+        let color = |app: &TangentApp, n: usize| app.settings.rows.get(n).map(|r| r.color);
+        assert_eq!(color(&app, 9), Some(7));
         for n in [2, 3, 4, 5] {
-            assert_ne!(
-                app.settings.strip_colors.get(n).copied(),
-                Some(7),
-                "track {n} was painted by a menu on another track"
-            );
+            assert_ne!(color(&app, n), Some(7), "track {n} was painted by a menu on another track");
         }
     }
 }
@@ -75969,11 +76148,11 @@ mod folder_tests {
         for is_bits in 0u32..256 {
             for in_bits in 0u32..256 {
                 for ch in 0..8 {
-                    a.settings.strip_is_folder[ch] = is_bits & (1 << ch) != 0;
-                    a.settings.strip_in_folder[ch] = in_bits & (1 << ch) != 0;
+                    a.settings.rows[ch].folder = is_bits & (1 << ch) != 0;
+                    a.settings.rows[ch].in_folder = in_bits & (1 << ch) != 0;
                 }
                 let table = a.folder_parents();
-                for ch in 0..recorder::CHANNELS {
+                for ch in 0..crate::desk_lift::V32_CHANNELS {
                     assert_eq!(
                         table[ch],
                         a.folder_of(ch).map_or(-1, |p| p as i32),
@@ -75994,7 +76173,7 @@ mod folder_tests {
     fn automation_nodes_can_be_chosen_copied_and_pasted() {
         use crate::automation::{AutoParam, Point, Shape};
         let mut app = app();
-        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Gain);
         // Three nodes past the seeded one at zero.
         for (t, v) in [(4.0, 0.2), (8.0, 0.9), (12.0, 0.4)] {
             app.arrangement.automation.entry(0, AutoParam::Gain).put(Point {
@@ -76009,21 +76188,21 @@ mod folder_tests {
         assert_eq!(count(&app), 4, "the fixture is not four nodes");
 
         // **Choosing.** One replaces, shift adds, shift again removes.
-        app.arr_select_auto_node(0, 0, 1);
-        assert_eq!(app.auto_nodes_at(), vec![(0, 0, 1)]);
-        app.arr_toggle_auto_node(0, 0, 2);
+        app.arr_select_auto_node(AutoLane::Row(0), 0, 1);
+        assert_eq!(app.auto_nodes_at(), vec![(AutoLane::Row(0), 0, 1)]);
+        app.arr_toggle_auto_node(AutoLane::Row(0), 0, 2);
         assert_eq!(app.arr_auto_nodes.len(), 2);
-        app.arr_toggle_auto_node(0, 0, 2);
+        app.arr_toggle_auto_node(AutoLane::Row(0), 0, 2);
         assert_eq!(app.arr_auto_nodes.len(), 1, "shift did not take it back out");
         // Choosing a node stands the ROW selection down, so Delete cannot
         // mean two things at once.
-        app.arr_select_auto_row(0, 0);
+        app.arr_select_auto_row(AutoLane::Row(0), 0);
         assert!(app.arr_auto_nodes.is_empty(), "the row did not clear the nodes");
-        app.arr_select_auto_node(0, 0, 1);
+        app.arr_select_auto_node(AutoLane::Row(0), 0, 1);
         assert!(app.arr_auto_sel.is_none(), "the nodes did not clear the row");
 
         // **Copy**, then paste at the playhead onto the same row.
-        app.arr_toggle_auto_node(0, 0, 2);
+        app.arr_toggle_auto_node(AutoLane::Row(0), 0, 2);
         assert!(app.arr_copy_auto_nodes(), "copy found nothing");
         assert_eq!(app.auto_clipboard.len(), 2);
         // Relative to the earliest, so a paste lands where the head is.
@@ -76048,7 +76227,7 @@ mod folder_tests {
         // first: removing one renumbers the rest, so a loop going upwards
         // takes the wrong points from the second one on, and a TIME cannot
         // tell a step's two halves apart.
-        app.arr_auto_nodes = app.auto_nodes_owned(vec![(0, 0, 1), (0, 0, 2)]);
+        app.arr_auto_nodes = app.auto_nodes_owned(vec![(AutoLane::Row(0), 0, 1), (AutoLane::Row(0), 0, 2)]);
         app.arr_delete_auto_nodes();
         assert_eq!(count(&app), 4, "delete took the wrong number of nodes");
         assert!(app.arr_auto_nodes.is_empty(), "the selection outlived the nodes");
@@ -76642,7 +76821,7 @@ mod folder_tests {
         // finding them proves the document's desk landed.
         let mut arr = crate::arrangement::Arrangement::load_from(&doc);
         let mut desk = arr.desk.take().expect("the fixture desk");
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             desk.set_bay(ch * INSERTS, "");
         }
         desk.set_bay(3 * INSERTS, dialogs::DRUMPAD_PATH);
@@ -76726,7 +76905,8 @@ mod folder_tests {
     /// `(s + grown_strips) * 3 + b`, a mute bit at `bit + grown_strips`.
     #[test]
     fn a_desk_from_any_era_opens_at_todays_seats() {
-        use crate::recorder::{CHANNELS, INSERTS};
+        use crate::desk_lift::V32_CHANNELS as CHANNELS;
+        use crate::recorder::INSERTS;
         let grown_from = |ch: usize| CHANNELS - ch;
         // (name, sends, bays, plugin at, mute bit, expected bay, expected bit)
         let eras: [(&str, usize, usize, usize, u64, usize, u64); 3] = [
@@ -76776,7 +76956,7 @@ mod folder_tests {
                 1 << want_bit,
                 "{era}: the mute bit is not at {want_bit}"
             );
-            assert_eq!(app.settings.strip_muted, 0, "{era}: a row took a special's mute");
+            assert_eq!(app.settings.word(|r| r.mute), 0, "{era}: a row took a special's mute");
             let occupied = app.settings.legacy_inserts().iter().filter(|p| !p.is_empty()).count();
             assert_eq!(occupied, 2, "{era}: a lift duplicated or dropped a plugin");
         }
@@ -76932,7 +77112,7 @@ mod folder_tests {
     #[test]
     fn the_undo_form_of_a_kit_is_small_and_lossless() {
         use crate::drumpad::{DrumpadDoc, PadSlot};
-        let mut kits: Vec<DrumpadDoc> = (0..recorder::CHANNELS)
+        let mut kits: Vec<DrumpadDoc> = (0..crate::desk_lift::V32_CHANNELS)
             .map(|_| DrumpadDoc::default())
             .collect();
         kits[3].master = 0.6;
@@ -76949,8 +77129,8 @@ mod folder_tests {
             ..Default::default()
         };
         let text = DrumpadDoc::compact_all(&kits);
-        let back = DrumpadDoc::from_compact_all(&text, recorder::CHANNELS);
-        assert_eq!(back.len(), recorder::CHANNELS);
+        let back = DrumpadDoc::from_compact_all(&text, crate::desk_lift::V32_CHANNELS);
+        assert_eq!(back.len(), crate::desk_lift::V32_CHANNELS);
         assert_eq!(back[3].pads[36].path, "media/kick.wav");
         assert_eq!(back[3].pads[36].name, "Kick");
         assert_eq!(back[3].pads[36].params.choke, 3);
@@ -76968,7 +77148,7 @@ mod folder_tests {
 
         // Rubbish is empty kits, never a panic.
         for bad in ["", "{", "[]", "{\"3\": 7}"] {
-            let out = DrumpadDoc::from_compact_all(bad, recorder::CHANNELS);
+            let out = DrumpadDoc::from_compact_all(bad, crate::desk_lift::V32_CHANNELS);
             assert!(out.iter().all(DrumpadDoc::is_empty), "{bad:?} made pads");
         }
     }
@@ -77078,7 +77258,7 @@ mod folder_tests {
     fn the_base_node_is_the_dials_value_and_survives_a_delete() {
         use crate::automation::{AutoParam, Point, Shape};
         let mut a = app();
-        a.arr_toggle_automation_param(0, AutoParam::Gain);
+        a.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Gain);
         let count = |a: &TangentApp| {
             a.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len())
         };
@@ -77090,11 +77270,11 @@ mod folder_tests {
             value: 0.2,
             shape: Shape::Linear,
         });
-        assert!((a.auto_base(0, AutoParam::Gain) - 0.2).abs() < 1e-9);
+        assert!((a.auto_base(AutoLane::Row(0), AutoParam::Gain) - 0.2).abs() < 1e-9);
 
         // And the dial WRITES it, so the two cannot disagree.
-        a.auto_set_base(0, AutoParam::Gain, 0.8);
-        assert!((a.auto_base(0, AutoParam::Gain) - 0.8).abs() < 1e-9);
+        a.auto_set_base(AutoLane::Row(0), AutoParam::Gain, 0.8);
+        assert!((a.auto_base(AutoLane::Row(0), AutoParam::Gain) - 0.8).abs() < 1e-9);
         assert_eq!(count(&a), 1, "moving the base made a second node");
 
         // A drawn node on top, then alt-delete on the base: refused.
@@ -77104,15 +77284,15 @@ mod folder_tests {
             shape: Shape::Linear,
         });
         assert_eq!(count(&a), 2);
-        a.arr_remove_auto_point(0, AutoParam::Gain, 0.0);
+        a.arr_remove_auto_point(AutoLane::Row(0), AutoParam::Gain, 0.0);
         assert_eq!(count(&a), 2, "the base node was deleted");
         assert!(
-            (a.auto_base(0, AutoParam::Gain) - 0.8).abs() < 1e-9,
+            (a.auto_base(AutoLane::Row(0), AutoParam::Gain) - 0.8).abs() < 1e-9,
             "the base moved when a delete was refused"
         );
 
         // The one that was drawn still goes.
-        a.arr_remove_auto_point(0, AutoParam::Gain, 4.0);
+        a.arr_remove_auto_point(AutoLane::Row(0), AutoParam::Gain, 4.0);
         assert_eq!(count(&a), 1, "a drawn node could not be removed");
     }
 
@@ -77128,16 +77308,16 @@ mod folder_tests {
             path: "media/kick.wav".to_owned(),
             ..Default::default()
         };
-        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_toggle_automation_param(AutoLane::Row(3), AutoParam::Gain);
         a.arrangement.automation.entry(3, AutoParam::Gain).put(Point {
             at_s: 4.0,
             value: 0.2,
             shape: Shape::Linear,
         });
-        assert!(a.arr_auto_is_open(3, AutoParam::Gain));
+        assert!(a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Gain));
 
         // Move 3 up to 1: order[new] = old.
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
@@ -77163,10 +77343,10 @@ mod folder_tests {
             "the curve is now driving whichever track moved into that seat"
         );
         // And the ROW is still open, on the track rather than the seat.
-        assert!(a.arr_auto_is_open(1, AutoParam::Gain), "the row did not follow");
-        assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
+        assert!(a.arr_auto_is_open(AutoLane::Row(1), AutoParam::Gain), "the row did not follow");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Gain), "the row stayed behind");
         // Which the engine agrees with.
-        assert_eq!(a.folder_parents().len(), recorder::CHANNELS);
+        assert_eq!(a.folder_parents().len(), crate::desk_lift::V32_CHANNELS);
     }
 
     /// **Undoing a reorder takes a bypassed row back with its curve.** The
@@ -77182,10 +77362,10 @@ mod folder_tests {
         for n in [1usize, 2, 3] {
             a.add_bare_track(n);
         }
-        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_toggle_automation_param(AutoLane::Row(3), AutoParam::Gain);
         a.arr_auto_bypassed.insert(a.auto_row_at(3, AutoParam::Gain));
         // Move 3 up to 1: order[new] = old.
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
@@ -77204,7 +77384,7 @@ mod folder_tests {
             "the bypassed curve plays after the undo"
         );
         assert!(
-            a.arr_auto_is_open(3, AutoParam::Gain),
+            a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Gain),
             "the open row stayed on the lane the track left"
         );
 
@@ -77231,18 +77411,18 @@ mod folder_tests {
         a.arr_auto_modes.insert(a.owner_at(3), AutoMode::Latch);
         a.arr_auto_latched.insert(a.owner_at(3));
         // Move 3 up to 1: order[new] = old.
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
-        assert_eq!(a.arr_auto_mode(1), AutoMode::Latch, "the mode stayed on the row the track left");
-        assert_eq!(a.arr_auto_mode(3), AutoMode::Read, "the track that took row 3 took its Latch");
+        assert_eq!(a.arr_auto_mode(AutoLane::Row(1)), AutoMode::Latch, "the mode stayed on the row the track left");
+        assert_eq!(a.arr_auto_mode(AutoLane::Row(3)), AutoMode::Read, "the track that took row 3 took its Latch");
         assert!(
             a.arr_auto_latched.contains(&a.owner_at(1)) && !a.arr_auto_latched.contains(&a.owner_at(3)),
             "the latch stayed on the row the track left"
         );
         a.undo();
-        assert_eq!(a.arr_auto_mode(3), AutoMode::Latch, "the undo left the mode on the row it had moved to");
+        assert_eq!(a.arr_auto_mode(AutoLane::Row(3)), AutoMode::Latch, "the undo left the mode on the row it had moved to");
         assert!(a.arr_auto_latched.contains(&a.owner_at(3)), "the undo left the latch on the row it had moved to");
     }
 
@@ -77256,7 +77436,7 @@ mod folder_tests {
         use crate::automation::{AutoParam, Point, Shape};
         let mut a = app();
         a.add_bare_track(3);
-        a.arr_toggle_automation_param(3, AutoParam::Mute);
+        a.arr_toggle_automation_param(AutoLane::Row(3), AutoParam::Mute);
         a.arrangement
             .automation
             .entry(3, AutoParam::Mute)
@@ -77334,7 +77514,7 @@ mod folder_tests {
             a.arrangement.automation.get(3, freq).is_none(),
             "the EQ's frequency curve now rides the compressor's attack"
         );
-        assert!(!a.arr_auto_is_open(3, freq), "the EQ's row stayed open over the compressor's knob");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), freq), "the EQ's row stayed open over the compressor's knob");
         assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, freq)), "the EQ's bypass stayed for the compressor's knob");
         a.undo();
         assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
@@ -77357,18 +77537,18 @@ mod folder_tests {
         let mut a = app();
         a.add_bare_track(3);
         for p in [AutoParam::Mute, AutoParam::Gain] {
-            a.arr_toggle_automation_param(3, p);
+            a.arr_toggle_automation_param(AutoLane::Row(3), p);
             a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
         }
         a.arr_auto_armed.insert(a.auto_row_at(3, AutoParam::Mute));
         a.arr_auto_bypassed.insert(a.auto_row_at(3, AutoParam::Gain));
         a.arr_save_edits();
         a.remove_channel(3);
-        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "fixture: the removal left its row open");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Mute), "fixture: the removal left its row open");
         a.undo();
         assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "fixture: the undo brought no curve back");
         for p in [AutoParam::Mute, AutoParam::Gain] {
-            assert!(a.arr_auto_is_open(3, p), "the undo brought {p:?}'s curve back with its row shut");
+            assert!(a.arr_auto_is_open(AutoLane::Row(3), p), "the undo brought {p:?}'s curve back with its row shut");
         }
         assert!(a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Mute)), "the undo left the row disarmed");
         assert!(
@@ -77376,7 +77556,7 @@ mod folder_tests {
             "the undo brought a bypassed curve back playing"
         );
         a.redo();
-        assert!(!a.arr_auto_is_open(3, AutoParam::Mute), "the redo left a row open under the empty slot");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Mute), "the redo left a row open under the empty slot");
         assert!(!a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Mute)), "the redo left the arm for the next track");
         assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, AutoParam::Gain)), "the redo left the bypass behind");
 
@@ -77394,13 +77574,13 @@ mod folder_tests {
         a.arr_auto_bypassed.insert(a.auto_row_at(3, freq));
         a.arr_save_edits();
         a.set_insert(3, 0, Some("@tangent-comp"));
-        assert!(!a.arr_auto_is_open(3, freq), "fixture: the replace left the EQ's row open");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), freq), "fixture: the replace left the EQ's row open");
         a.undo();
         assert_eq!(a.insert(3, 0), Some("@tangent-eq"), "fixture: the undo did not put the EQ back");
-        assert!(a.arr_auto_is_open(3, freq), "the undo put the EQ's curve back with its row shut");
+        assert!(a.arr_auto_is_open(AutoLane::Row(3), freq), "the undo put the EQ's curve back with its row shut");
         assert!(a.engine_automation().get(3, freq).is_none(), "the undo brought the EQ's bypassed curve back playing");
         a.redo();
-        assert!(!a.arr_auto_is_open(3, freq), "the redo left the EQ's row open over the compressor's knob");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), freq), "the redo left the EQ's row open over the compressor's knob");
         assert!(!a.arr_auto_bypassed.contains(&a.auto_row_at(3, freq)), "the redo left the EQ's bypass on the compressor's knob");
     }
 
@@ -77421,18 +77601,18 @@ mod folder_tests {
         let mut a = app();
         a.add_bare_track(3);
         for p in [AutoParam::Mute, AutoParam::Gain] {
-            a.arr_toggle_automation_param(3, p);
+            a.arr_toggle_automation_param(AutoLane::Row(3), p);
             a.arrangement.automation.entry(3, p).put(Point { at_s: 4.0, value: 1.0, shape: Shape::Hold });
         }
-        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_toggle_automation_param(AutoLane::Row(3), AutoParam::Gain);
         a.arr_save_edits();
-        assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "fixture: Gain's row is open at the removal");
+        assert!(!a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Gain), "fixture: Gain's row is open at the removal");
         a.remove_channel(3);
         a.undo();
         assert!(a.arrangement.automation.get(3, AutoParam::Gain).is_some(), "fixture: the undo brought no curve back");
         // Opened after the undo, on the curve it brought back, and armed:
         // session state, so the redo is still there to take.
-        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arr_toggle_automation_param(AutoLane::Row(3), AutoParam::Gain);
         a.arr_auto_armed.insert(a.auto_row_at(3, AutoParam::Gain));
         a.redo();
         assert!(
@@ -77440,7 +77620,7 @@ mod folder_tests {
             "fixture: the redo did not take the track away again"
         );
         assert!(
-            !a.arr_auto_is_open(3, AutoParam::Gain),
+            !a.arr_auto_is_open(AutoLane::Row(3), AutoParam::Gain),
             "the redo left a row opened after the undo standing under the empty slot"
         );
         assert!(
@@ -77449,7 +77629,7 @@ mod folder_tests {
         );
         a.undo();
         for p in [AutoParam::Mute, AutoParam::Gain] {
-            assert!(a.arr_auto_is_open(3, p), "the undo after the redo brought {p:?}'s row back shut");
+            assert!(a.arr_auto_is_open(AutoLane::Row(3), p), "the undo after the redo brought {p:?}'s row back shut");
         }
         assert!(a.arr_auto_armed.contains(&a.auto_row_at(3, AutoParam::Gain)), "the undo after the redo dropped the arm");
 
@@ -77472,11 +77652,11 @@ mod folder_tests {
         a.set_insert(3, 0, Some("@tangent-comp"));
         a.undo();
         assert!(a.arrangement.automation.get(3, gain).is_some(), "fixture: the undo put the EQ back without its curve");
-        a.arr_toggle_automation_param(3, gain);
+        a.arr_toggle_automation_param(AutoLane::Row(3), gain);
         a.redo();
         assert_eq!(a.insert(3, 0), Some("@tangent-comp"), "fixture: the redo did not seat the compressor again");
         assert!(
-            !a.arr_auto_is_open(3, gain),
+            !a.arr_auto_is_open(AutoLane::Row(3), gain),
             "the redo left the EQ's row, opened after the undo, open over the compressor's knob"
         );
     }
@@ -77531,7 +77711,7 @@ mod folder_tests {
         a.arr_save_edits();
         a.set_insert(3, 0, None);
         assert_eq!(
-            a.auto_param_label(3, freq),
+            a.auto_param_label(AutoLane::Row(3), freq),
             format!("{} (unloaded): parameter 2", insert_chip_name("@tangent-eq")),
             "the curve kept for the EQ is not named for it"
         );
@@ -77542,7 +77722,7 @@ mod folder_tests {
             other,
             vec![Point { at_s: 0.0, value: 0.5, shape: Shape::Linear }],
         ));
-        assert_eq!(a.auto_param_label(3, other), other.label());
+        assert_eq!(a.auto_param_label(AutoLane::Row(3), other), other.label());
     }
 
     /// **A plugin carried to another bay takes its automation along**, and
@@ -77573,7 +77753,7 @@ mod folder_tests {
         assert_eq!(level(&a, 1, 2), Some(0.2), "the EQ's curve did not follow it to bay 2");
         assert_eq!(level(&a, 0, 5), Some(0.7), "the compressor's curve did not follow it to bay 1");
         assert_eq!((level(&a, 0, 2), level(&a, 1, 5)), (None, None), "a curve stayed behind on the bay");
-        assert!(a.arr_auto_is_open(3, at(1, 2)) && !a.arr_auto_is_open(3, at(0, 2)), "the row did not follow its curve");
+        assert!(a.arr_auto_is_open(AutoLane::Row(3), at(1, 2)) && !a.arr_auto_is_open(AutoLane::Row(3), at(0, 2)), "the row did not follow its curve");
         assert_eq!(a.hist_at, before + 1, "the swap left {} moments", a.hist_at - before);
         // A move into an empty bay is the same trade with nobody coming back.
         a.trade_inserts((3, 1), (3, 2));
@@ -77590,16 +77770,16 @@ mod folder_tests {
     fn a_removed_track_leaves_no_pan_or_polarity_for_the_next_one() {
         let mut a = app();
         a.add_bare_track(3);
-        a.settings.channel_pans[3] = -1.0;
-        a.settings.strip_phase |= 1 << 3;
-        a.settings.channel_icons[3] = 5;
+        a.settings.rows[3].pan = -1.0;
+        a.settings.set_word(|r| &mut r.phase, a.settings.word(|r| r.phase) | (1 << 3));
+        a.settings.rows[3].icon = 5;
         a.kit_at_mut(3).pads[36].path = "media/kick.wav".to_owned();
         a.remove_channel(3);
         a.add_bare_track(3);
         let d = Settings::default();
-        assert_eq!(a.settings.channel_pans[3], d.channel_pans[3], "the new track inherited the old one's pan");
-        assert_eq!(a.settings.strip_phase & (1 << 3), 0, "the new track inherited the old one's polarity");
-        assert_eq!(a.settings.channel_icons[3], d.channel_icons[3], "the new track inherited the old one's icon");
+        assert_eq!(a.settings.rows[3].pan, d.rows[3].pan, "the new track inherited the old one's pan");
+        assert_eq!(a.settings.word(|r| r.phase) & (1 << 3), 0, "the new track inherited the old one's polarity");
+        assert_eq!(a.settings.rows[3].icon, d.rows[3].icon, "the new track inherited the old one's icon");
         assert!(a.kit_at(3).is_empty(), "the new track inherited the old one's drum kit");
     }
 
@@ -77627,7 +77807,7 @@ mod folder_tests {
         a.settings.insert_keys.set(master, Some(three));
 
         // Move 3 up to 1: order[new] = old — the kit test's move.
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
@@ -77679,7 +77859,7 @@ mod folder_tests {
     #[test]
     fn a_bypass_follows_its_track_through_a_reorder_and_dies_with_it() {
         use crate::desk_id::{Node, Rack, SeatBay};
-        use crate::recorder::CHANNELS;
+        use crate::desk_lift::V32_CHANNELS as CHANNELS;
         let mut a = app();
         for n in [1usize, 2, 3] {
             a.add_bare_track(n);
@@ -78108,17 +78288,19 @@ mod folder_tests {
         a.set_in_folder(3, true);
         // 4 is outside the group and must be left alone.
         assert_eq!(a.folder_parents()[2], 1);
+        // By identity: Remove deletes the row (W6), so the rows below it
+        // move up one.
+        let (folder, kids, outsider) = (a.track_id_at(1), [a.track_id_at(2), a.track_id_at(3)], a.track_id_at(4));
 
         a.remove_channel(1);
-        assert!(!a.settings.strip_is_folder[1], "the row is still a folder");
-        for ch in [2usize, 3] {
-            assert!(
-                !a.settings.strip_in_folder[ch],
-                "channel {ch} is still foldered under a row that is gone"
-            );
+        assert_eq!(a.row_of(folder), None, "the folder's row is still on the desk");
+        for id in kids {
+            let ch = a.row_of(id).expect("a child went with its folder");
+            assert!(!a.settings.rows[ch].in_folder, "channel {ch} is still foldered under a row that is gone");
+            assert_eq!(a.folder_parents()[ch], -1, "the engine still folds it somewhere");
         }
-        assert_eq!(a.folder_parents()[2], -1, "the engine still folds it somewhere");
-        assert!(!a.settings.strip_in_folder[4], "an outsider was changed");
+        let out = a.row_of(outsider).expect("the outsider went");
+        assert!(!a.settings.rows[out].in_folder, "an outsider was changed");
 
         // **A nested group is handed UP, not cut loose.** Deleting the outer
         // folder should leave its tracks where they visibly are — inside
@@ -78131,12 +78313,14 @@ mod folder_tests {
         b.set_in_folder(1, true);
         b.set_is_folder(1, true);
         b.set_in_folder(2, true);
+        let inner = b.track_id_at(2);
         b.remove_channel(1);
+        let at = b.row_of(inner).expect("the inner group's track went with its folder");
         assert!(
-            b.settings.strip_in_folder[2],
+            b.settings.rows[at].in_folder,
             "an inner group's track was cut loose instead of joining the outer one"
         );
-        assert_eq!(b.folder_parents()[2], 0, "it did not join the outer folder");
+        assert_eq!(b.folder_parents()[at], 0, "it did not join the outer folder");
     }
 
     /// **The master automates like any track.**
@@ -78219,7 +78403,7 @@ mod folder_tests {
         use crate::recorder::Column;
         use crate::app::master_lane;
         let mut a = app();
-        let base = |a: &TangentApp, lane: usize, p: AutoParam| {
+        let base = |a: &TangentApp, lane: AutoLane, p: AutoParam| {
             a.arrangement
                 .automation
                 .get(lane, p)
@@ -78252,7 +78436,7 @@ mod folder_tests {
             shape: Shape::Linear,
         });
         a.apply_mixer_hit(M::Fader(Column::Track(2)), 0.75);
-        let moved = base(&a, 2, AutoParam::Gain).expect("the node vanished");
+        let moved = base(&a, AutoLane::Row(2), AutoParam::Gain).expect("the node vanished");
         assert!((moved - 0.75).abs() < 1.0e-6, "a channel fader left its base behind: {moved}");
 
         // **But a curve somebody DREW is not dragged about by a fader.**
@@ -78269,7 +78453,7 @@ mod folder_tests {
             shape: Shape::Linear,
         });
         a.apply_mixer_hit(M::Fader(Column::Track(3)), 0.75);
-        let kept = base(&a, 3, AutoParam::Gain).expect("the node vanished");
+        let kept = base(&a, AutoLane::Row(3), AutoParam::Gain).expect("the node vanished");
         assert!(
             (kept - 0.2).abs() < 1.0e-6,
             "a fader flattened a drawn curve's first node: {kept}"
@@ -78310,10 +78494,11 @@ mod folder_tests {
     /// something is silently overwriting it, that's a huge problem."
     #[test]
     fn the_template_desk_is_the_shipped_one_whatever_is_on_screen() {
-        use crate::recorder::{Strip, CHANNELS, INSERTS};
+        use crate::desk_lift::V32_CHANNELS as CHANNELS;
+        use crate::recorder::{Strip, INSERTS};
         let d = TangentApp::template_desk();
         // Two rows, and only two: the drums on one, the built-in on two.
-        assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
+        assert_eq!(d.word(|r| r.added), 0b11, "the template is not two tracks");
         let bay = |ch: usize| d.bay(Strip::Channel(ch).index() * INSERTS).unwrap_or("");
         assert_eq!(bay(0), dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
         assert_eq!(bay(1), dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
@@ -78337,7 +78522,7 @@ mod folder_tests {
                 ch + 1
             );
             assert_eq!(
-                d.kinds[ch], shipped.channel_kinds[ch],
+                d.rows[ch].kind_byte(), shipped.rows[ch].kind_byte(),
                 "channel {}'s KIND differs between the template and the shipped desk",
                 ch + 1
             );
@@ -78349,8 +78534,7 @@ mod folder_tests {
         for n in 0..8 {
             a.add_bare_track(n);
         }
-        a.settings.strip_names = vec![String::new(); CHANNELS];
-        a.settings.strip_names[Strip::Channel(3).index()] = "Loud Guitar".to_owned();
+        a.settings.rows[Strip::Channel(3).index()].name = "Loud Guitar".to_owned();
         a.set_insert(Strip::Channel(5).index(), 0, Some("/some/Plugin.vst3"));
         assert_eq!(
             TangentApp::template_desk(),
@@ -78371,13 +78555,13 @@ mod folder_tests {
         for n in [0usize, 1, 2, 3, 4] {
             a.add_bare_track(n);
         }
-        assert_eq!(a.settings.tracks_added & 0b11111, 0b11111);
+        assert_eq!(a.settings.word(|r| r.added) & 0b11111, 0b11111);
 
         // Applying the template's desk leaves exactly its two rows.
         let d = TangentApp::template_desk();
         a.apply_desk_snapshot(&d);
         assert_eq!(
-            a.settings.tracks_added, 0b11,
+            a.settings.word(|r| r.added), 0b11,
             "the previous session's rows survived the template"
         );
 
@@ -78386,8 +78570,8 @@ mod folder_tests {
         arr.desk = Some(d.clone());
         let back = crate::arrangement::Arrangement::from_json(&arr.to_json());
         assert_eq!(
-            back.desk.expect("no desk").tracks_added,
-            d.tracks_added,
+            back.desk.expect("no desk").word(|r| r.added),
+            d.word(|r| r.added),
             "the row count did not survive the file"
         );
 
@@ -78399,7 +78583,7 @@ mod folder_tests {
         older["desk"].as_object_mut().expect("desk").remove("tracks_added");
         let back = crate::arrangement::Arrangement::from_json(&older.to_string());
         assert_eq!(
-            back.desk.expect("no desk").tracks_added,
+            back.desk.expect("no desk").word(|r| r.added),
             0b11,
             "an older document lost the tracks it described"
         );
@@ -78616,11 +78800,7 @@ mod folder_tests {
             ..Default::default()
         });
         let mut desk = TangentApp::template_desk();
-        desk.frozen = Some(vec![crate::arrangement::FrozenLane {
-            lane: 2,
-            path: "media/frozen-02-1.wav".to_owned(),
-            len_s: 1.0,
-        }]);
+        desk.rows[2].frozen = Some(crate::desk_model::Frozen { path: "media/frozen-02-1.wav".to_owned(), len_s: 1.0 });
         doc.desk = Some(desk);
         doc.save_to(&crate::arrangement::doc_in(&template));
 
@@ -78866,7 +79046,7 @@ mod folder_tests {
         let scratch = root.join("Untitled");
         let mut doc = crate::arrangement::Arrangement::default();
         let mut desk = TangentApp::template_desk();
-        for ch in 0..recorder::CHANNELS {
+        for ch in 0..crate::desk_lift::V32_CHANNELS {
             if desk.bay(ch * recorder::INSERTS) == Some(dialogs::DRUMPAD_PATH) {
                 desk.set_bay(ch * recorder::INSERTS, "");
             }
@@ -78878,7 +79058,7 @@ mod folder_tests {
         kit.pads[36].path = "media/Kick.wav".to_owned();
         kit.save_beside(&crate::arrangement::doc_in(&template));
         let mut kits: Vec<crate::drumpad::DrumpadDoc> =
-            (0..recorder::CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
+            (0..crate::desk_lift::V32_CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
         kits[1] = kit;
         crate::drumpad::DrumpadDoc::save_all_beside(&kits, 1, &crate::arrangement::doc_in(&scratch));
         assert!(
@@ -79033,7 +79213,7 @@ mod folder_tests {
         let scratch = projects.join("Untitled");
         app.adopt_template(&template, &scratch);
         assert!(app.drumpad_kits.values().any(|k| !k.is_empty()), "the template's kit did not load");
-        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..crate::desk_lift::V32_CHANNELS).collect();
         order.swap(0, 1);
         app.reorder_channels(&order);
         app.undo();
@@ -79051,7 +79231,7 @@ mod folder_tests {
         let template = root.join(TEMPLATE_SHELF).join("default");
         let scratch = root.join("Untitled");
         let mut kits: Vec<crate::drumpad::DrumpadDoc> =
-            (0..recorder::CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
+            (0..crate::desk_lift::V32_CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
         kits[0].pads[36].path = "media/Kick.wav".to_owned();
         kits[3].pads[40].path = "media/Clap.wav".to_owned();
         crate::drumpad::DrumpadDoc::save_all_beside(&kits, 0, &crate::arrangement::doc_in(&template));
@@ -79082,7 +79262,7 @@ mod folder_tests {
         }
         crate::arrangement::Arrangement::default().save_to(&crate::arrangement::doc_in(&template));
         let mut kits: Vec<crate::drumpad::DrumpadDoc> =
-            (0..recorder::CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
+            (0..crate::desk_lift::V32_CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
         kits[0].pads[36].path = "media/Kick.wav".to_owned();
         kits[3].pads[40].path = "media/Clap.wav".to_owned();
         crate::drumpad::DrumpadDoc::save_all_beside(&kits, 0, &crate::arrangement::doc_in(&template));
@@ -79201,7 +79381,7 @@ mod folder_tests {
         std::fs::create_dir_all(&scratch).expect("scratch");
         let doc = crate::arrangement::doc_in(&scratch);
         let mut kits: Vec<crate::drumpad::DrumpadDoc> =
-            (0..recorder::CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
+            (0..crate::desk_lift::V32_CHANNELS).map(|_| crate::drumpad::DrumpadDoc::default()).collect();
         crate::drumpad::DrumpadDoc::save_all_beside(&kits, 0, &doc);
         assert!(
             TangentApp::scratch_is_disposable(&scratch, &template),
@@ -79367,7 +79547,7 @@ mod folder_tests {
 
     #[test]
     fn cmd_f_folders_a_selection_and_opens_an_empty_one_on_a_free_slot() {
-        use crate::recorder::CHANNELS;
+        use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
         // ── an empty slot ────────────────────────────────────────────────
         let mut a = app();
@@ -79375,7 +79555,7 @@ mod folder_tests {
         a.set_selected_rows(&[6]);
         assert!(!a.channel_used(6), "the fixture's slot 6 is not free");
         assert!(a.make_folder(), "an empty slot refused to become a folder");
-        assert!(a.settings.strip_is_folder[6], "slot 6 is not a folder");
+        assert!(a.settings.rows[6].folder, "slot 6 is not a folder");
         assert!(a.channel_used(6), "the folder is not a row anything draws");
 
         // ── several tracks ───────────────────────────────────────────────
@@ -79390,18 +79570,18 @@ mod folder_tests {
         // The folder sits where the topmost track was, and the run it took
         // in has moved down by one to sit under it.
         let folder = a.selected_row().expect("the folder is not selected");
-        assert!(a.settings.strip_is_folder[folder], "no folder was made");
+        assert!(a.settings.rows[folder].folder, "no folder was made");
         assert_eq!(folder, 2, "the folder did not land above the run");
         for ch in folder + 1..=folder + 3 {
             assert!(
-                a.settings.strip_in_folder[ch],
+                a.settings.rows[ch].in_folder,
                 "channel {ch} was left out of the group"
             );
         }
         // The row below the run is NOT in it: a group is the run it was
         // given, not everything after it.
         assert!(
-            !a.settings.strip_in_folder.get(folder + 4).copied().unwrap_or(false),
+            !a.settings.rows.get(folder + 4).is_some_and(|r| r.in_folder),
             "the group swallowed the row below it"
         );
 
@@ -79429,7 +79609,7 @@ mod folder_tests {
         );
         for ch in 0..CHANNELS {
             assert!(
-                !full.settings.strip_is_folder.get(ch).copied().unwrap_or(false),
+                !full.settings.rows.get(ch).is_some_and(|r| r.folder),
                 "a refused folder still marked channel {ch}"
             );
         }
@@ -79449,26 +79629,26 @@ mod folder_tests {
         assert_eq!(said[0].kind, crate::notify::Kind::Error);
         assert!(full.dialog.is_none(), "the refusal opened a window");
 
-        // ── room under the cap, but no spare row outside the run ─────────
+        // ── room under the cap, and every empty row inside the run ───────
         //
-        // The other refusal, and the one the old line was written for: every
-        // empty row sits between the tracks being grouped, so there is a
-        // track's worth of room and nowhere to put the folder.
+        // The refusal the old line was written for is gone (W6): the folder
+        // is a new row INSERTED above the run, so it needs no spare row
+        // anywhere. A desk whose one empty row sits between the tracks being
+        // grouped groups them, growing by the folder's row.
         let mut holed = app();
         for n in (0..CHANNELS).filter(|n| *n != 5) {
             holed.add_bare_track(n);
         }
+        let width = holed.desk_extent();
         holed.set_selected_rows(&[4, 6]);
         holed.set_primary_row(Some(4));
-        assert!(!holed.make_folder(), "a folder was made with no row outside its run");
-        let said = holed.said().notes();
-        assert_eq!(said.len(), 1, "the refusal did not speak once");
-        assert!(
-            said[0].text.contains("No free row outside the selection"),
-            "the refusal does not say what is missing: {}",
-            said[0].text
-        );
-        assert!(!holed.settings.strip_is_folder.iter().any(|f| *f), "a refused folder marked a row");
+        assert!(holed.make_folder(), "a folder was refused for want of a spare row");
+        assert!(holed.said().notes().is_empty(), "the grouping said something: {:?}", holed.said().notes());
+        assert_eq!(holed.desk_extent(), width + 1, "the folder did not grow the desk by its own row");
+        assert!(holed.settings.rows[4].folder, "the folder is not above the run");
+        for ch in 5..=7 {
+            assert!(holed.settings.rows[ch].in_folder, "row {ch} of the run is not in the folder");
+        }
     }
 
     #[test]
@@ -79539,7 +79719,7 @@ mod folder_tests {
     fn opening_a_lane_lays_one_node_at_the_start_and_the_next_click_makes_two() {
         use crate::automation::{AutoParam, Point, Shape};
         let mut app = app();
-        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Gain);
 
         let pts = app
             .arrangement
@@ -79551,7 +79731,7 @@ mod folder_tests {
         assert_eq!(pts.len(), 1, "a freshly opened lane has {} nodes", pts.len());
         assert!(pts[0].at_s.abs() < 1e-9, "the node is not at the beginning");
         // And it sits where the control already is, so it is inaudible.
-        let resting = app.auto_resting(0, AutoParam::Gain);
+        let resting = app.auto_resting(AutoLane::Row(0), AutoParam::Gain);
         assert!(
             (pts[0].value - resting).abs() < 1e-9,
             "the seeded node is at {} and the fader is at {resting}",
@@ -79571,8 +79751,8 @@ mod folder_tests {
         );
 
         // Closing and reopening must not touch work already done.
-        app.arr_toggle_automation_param(0, AutoParam::Gain);
-        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Gain);
+        app.arr_toggle_automation_param(AutoLane::Row(0), AutoParam::Gain);
         assert_eq!(
             app.arrangement.automation.get(0, AutoParam::Gain).expect("curve").points().len(),
             2,
@@ -79993,10 +80173,10 @@ mod folder_tests {
 
         // Levels the rows can be followed by, since a reorder renames nothing.
         for n in 0..10 {
-            a.settings.channel_gains[n] = 0.05 + n as f64 * 0.05;
+            a.settings.rows[n].gain = 0.05 + n as f64 * 0.05;
         }
         let at = |a: &TangentApp, n: usize| {
-            ((a.settings.channel_gains[n] - 0.05) * 20.0).round() as usize
+            ((a.settings.rows[n].gain - 0.05) * 20.0).round() as usize
         };
 
         a.set_selected_rows(&[4]);
@@ -80095,16 +80275,11 @@ mod folder_tests {
         for n in [2, 3] {
             a.set_in_folder(n, true);
         }
-        // `strip_names` is grown lazily, so it is empty until something
-        // sizes it — the same trap the template test hit.
-        a.settings.strip_names = vec![String::new(); recorder::CHANNELS];
         for n in 0..6 {
-            a.settings.strip_names[recorder::Strip::Channel(n).index()] =
+            a.settings.rows[n].name =
                 format!("t{n}");
         }
-        let name = |a: &TangentApp, n: usize| a.settings.strip_names[
-            recorder::Strip::Channel(n).index()
-        ].clone();
+        let name = |a: &TangentApp, n: usize| a.settings.rows[n].name.clone();
         assert_eq!(a.folder_children(1), vec![2, 3]);
 
         // The whole block is what a drag carries, folder first.
@@ -80184,7 +80359,7 @@ mod folder_tests {
         // Give the tracks distinguishable colours so the permutation is
         // observable — the flags alone cannot prove the right track moved.
         for n in 0..8 {
-            a.settings.strip_colors[n] = (n + 1) as i64;
+            a.settings.rows[n].color = (n + 1) as i64;
         }
         a.toggle_folder(1);
         a.set_in_folder(2, true);
@@ -80193,11 +80368,11 @@ mod folder_tests {
         // Drag track 6 onto folder 1's bottom edge.
         a.snap_into_folder(6, 1);
         // It should now sit at index 3 — after the existing child.
-        assert_eq!(a.settings.strip_colors[3], 7, "track 6 did not land after the child");
+        assert_eq!(a.settings.rows[3].color, 7, "track 6 did not land after the child");
         assert_eq!(a.folder_children(1), vec![2, 3]);
         assert!(a.in_folder(3));
         // And the folder itself is untouched.
-        assert_eq!(a.settings.strip_colors[1], 2);
+        assert_eq!(a.settings.rows[1].color, 2);
         assert!(a.is_folder(1));
     }
 
@@ -80207,10 +80382,11 @@ mod folder_tests {
         let mut a = app();
         a.toggle_folder(1);
         a.toggle_folder(5);
-        let before = a.settings.strip_colors;
+        let colors = |a: &TangentApp| a.settings.rows.iter().map(|r| r.color).collect::<Vec<_>>();
+        let before = colors(&a);
         a.snap_into_folder(5, 1);
         assert!(!a.in_folder(5), "a folder became a child");
-        assert_eq!(a.settings.strip_colors, before, "the desk moved anyway");
+        assert_eq!(colors(&a), before, "the desk moved anyway");
         // And onto itself.
         a.snap_into_folder(1, 1);
         assert!(!a.in_folder(1));
@@ -80251,15 +80427,15 @@ mod folder_tests {
     #[test]
     fn the_per_channel_flags_follow_their_tracks_through_a_reorder() {
         let mut a = app();
-        a.settings.strip_to_theory = vec![false; recorder::CHANNELS];
-        a.settings.strip_to_theory[3] = true;
+        a.settings.rows.iter_mut().for_each(|r| r.theory = false);
+        a.settings.rows[3].theory = true;
         a.toggle_folder(3);
         a.set_in_folder(4, true);
 
         // Move track 3 to the top.
         a.move_channel(3, 0);
-        assert!(a.settings.strip_to_theory[0], "T did not follow its track");
-        assert!(!a.settings.strip_to_theory[3], "T was left behind");
+        assert!(a.settings.rows[0].theory, "T did not follow its track");
+        assert!(!a.settings.rows[3].theory, "T was left behind");
         assert!(a.is_folder(0), "the folder flag did not follow");
         assert!(!a.is_folder(3));
     }
@@ -80272,16 +80448,16 @@ mod folder_tests {
     #[test]
     fn mute_solo_and_polarity_follow_their_tracks_through_a_reorder() {
         let mut a = app();
-        a.settings.strip_muted = 1 << 3;
-        a.settings.strip_soloed = 1 << 3;
-        a.settings.strip_phase = 1 << 3;
+        a.settings.set_word(|r| &mut r.mute, 1 << 3);
+        a.settings.set_word(|r| &mut r.solo, 1 << 3);
+        a.settings.set_word(|r| &mut r.phase, 1 << 3);
 
         // Move track 3 to the top: rows 0 to 2 shift down one.
         a.move_channel(3, 0);
-        assert_eq!(a.settings.strip_muted, 1, "the mute did not follow its track");
-        assert_eq!(a.settings.strip_soloed, 1, "the solo did not follow its track");
+        assert_eq!(a.settings.word(|r| r.mute), 1, "the mute did not follow its track");
+        assert_eq!(a.settings.word(|r| r.solo), 1, "the solo did not follow its track");
         assert_eq!(
-            a.settings.strip_phase, 1,
+            a.settings.word(|r| r.phase), 1,
             "the polarity flip stayed on the row its track left"
         );
     }
@@ -80313,7 +80489,7 @@ mod folder_tests {
         let written = |d: &crate::arrangement::DeskSnap| d.to_value_as(crate::desk_format::Format::current());
         assert_eq!(written(read), written(&snap), "the folders did not survive the document");
         assert!(
-            read.is_folder[1] && read.in_folder[2] && read.in_folder[3] && read.folder_shut[1],
+            read.rows[1].folder && read.rows[2].in_folder && read.rows[3].in_folder && read.rows[1].shut,
             "the folders did not survive the document"
         );
 
@@ -80334,10 +80510,14 @@ mod folder_tests {
 
         // A document written before the folder fields opens flat rather
         // than keeping whatever the live desk had.
-        let mut old = snap.clone();
-        old.is_folder = Vec::new();
-        old.in_folder = Vec::new();
-        old.folder_shut = Vec::new();
+        // In the legacy shape, the only one such a build wrote, with the
+        // three keys taken out.
+        let mut value = snap.to_value_as(crate::desk_format::Format::Legacy);
+        let obj = value.as_object_mut().expect("a desk object");
+        for k in ["is_folder", "in_folder", "folder_shut"] {
+            assert!(obj.remove(k).is_some(), "{k} was never written");
+        }
+        let old = crate::arrangement::DeskSnap::from_value(&value).ok().flatten().expect("the old desk reads");
         b.apply_desk_snapshot(&old);
         assert!(
             !b.is_folder(1) && !b.in_folder(2) && !b.in_folder(3),
@@ -80434,6 +80614,25 @@ mod folder_tests {
         );
     }
 
+    /// **The desk as it is heard, row by row**: each row's mute and solo
+    /// as the engine and the take read them, a folder's reaching its
+    /// children (`strip_heard_muted`, `strip_heard_soloed`). What these
+    /// tests read off the strip-space desk the host was handed, which W6
+    /// retired with the strip space.
+    struct Heard {
+        muted: Vec<bool>,
+        soloed: Vec<bool>,
+    }
+
+    fn heard(app: &TangentApp) -> Heard {
+        let rows = 0..app.desk_extent();
+        let row = recorder::StripRef::Row;
+        Heard {
+            muted: rows.clone().map(|r| app.strip_heard_muted(row(r))).collect(),
+            soloed: rows.map(|r| app.strip_heard_soloed(row(r))).collect(),
+        }
+    }
+
     /// **A muted folder silences its children without muting them.**
     ///
     /// The distinction is the whole feature: the child's own switch stays
@@ -80450,19 +80649,19 @@ mod folder_tests {
         assert_eq!(app.folder_children(1), vec![2, 3]);
 
         // Mute the folder alone.
-        app.settings.strip_muted |= 1 << 1;
-        let desk = app.desk();
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) | (1 << 1));
+        let desk = heard(&app);
         assert!(desk.muted[1], "the folder itself is not muted");
         assert!(desk.muted[2] && desk.muted[3], "the children are still heard");
         assert!(!desk.muted[4], "a track outside the folder was silenced");
 
         // ...and the children's OWN switches never moved.
-        assert_eq!(app.settings.strip_muted & (1 << 2), 0, "a child was muted");
-        assert_eq!(app.settings.strip_muted & (1 << 3), 0, "a child was muted");
+        assert_eq!(app.settings.word(|r| r.mute) & (1 << 2), 0, "a child was muted");
+        assert_eq!(app.settings.word(|r| r.mute) & (1 << 3), 0, "a child was muted");
 
         // Unmuting the folder gives them straight back.
-        app.settings.strip_muted &= !(1 << 1);
-        let desk = app.desk();
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) & (!(1 << 1)));
+        let desk = heard(&app);
         assert!(!desk.muted[2] && !desk.muted[3], "the children stayed silent");
     }
 
@@ -80475,11 +80674,11 @@ mod folder_tests {
         for n in [2_usize, 3] {
             app.set_in_folder(n, true);
         }
-        app.settings.strip_muted |= 1 << 2; // the child, on its own
-        app.settings.strip_muted |= 1 << 1; // then the folder
-        app.settings.strip_muted &= !(1 << 1); // and off again
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) | (1 << 2)); // the child, on its own
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) | (1 << 1)); // then the folder
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) & (!(1 << 1))); // and off again
 
-        let desk = app.desk();
+        let desk = heard(&app);
         assert!(desk.muted[2], "the child's own mute was destroyed");
         assert!(!desk.muted[3], "the other child did not come back");
     }
@@ -80493,11 +80692,11 @@ mod folder_tests {
         for n in [2_usize, 3] {
             app.set_in_folder(n, true);
         }
-        app.settings.strip_soloed |= 1 << 1;
-        let desk = app.desk();
+        app.settings.set_word(|r| &mut r.solo, app.settings.word(|r| r.solo) | (1 << 1));
+        let desk = heard(&app);
         assert!(desk.soloed[1] && desk.soloed[2] && desk.soloed[3]);
         assert!(!desk.soloed[4], "a track outside the folder was soloed");
-        assert_eq!(app.settings.strip_soloed & (1 << 2), 0, "a child's switch moved");
+        assert_eq!(app.settings.word(|r| r.solo) & (1 << 2), 0, "a child's switch moved");
     }
 
     /// Membership drives it, so releasing a track releases its silence.
@@ -80506,10 +80705,10 @@ mod folder_tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         app.toggle_folder(1);
         app.set_in_folder(2, true);
-        app.settings.strip_muted |= 1 << 1;
-        assert!(app.desk().muted[2]);
+        app.settings.set_word(|r| &mut r.mute, app.settings.word(|r| r.mute) | (1 << 1));
+        assert!(heard(&app).muted[2]);
         app.set_in_folder(2, false);
-        assert!(!app.desk().muted[2], "it stayed silent after leaving the folder");
+        assert!(!heard(&app).muted[2], "it stayed silent after leaving the folder");
     }
 
     /// A session with real work in it, settled — a MIDI part on a lane and a
@@ -80587,15 +80786,13 @@ mod folder_tests {
                 a.settings.master_gain = 0.3;
             })),
             ("a channel fader", Box::new(|a: &mut TangentApp| {
-                a.settings.channel_gains[1] = 0.42;
+                a.settings.rows[1].gain = 0.42;
             })),
             ("a strip renamed", Box::new(|a: &mut TangentApp| {
-                // The fixture's names vector is empty, which is what an
-                // untouched desk looks like — naming a strip GROWS it.
-                a.settings.strip_names.push("the kit".into());
+                a.settings.rows[0].name = "the kit".into();
             })),
             ("a strip recoloured", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_colors[0] = 5;
+                a.settings.rows[0].color = 5;
             })),
             ("the click switched on", Box::new(|a: &mut TangentApp| {
                 a.settings.metronome_on = !a.settings.metronome_on;
@@ -80606,10 +80803,10 @@ mod folder_tests {
             // walk is missing from BOTH, and only an edit to that field can
             // say so. Distinct values, so two fields cannot mask each other.
             ("a channel's kind", Box::new(|a: &mut TangentApp| {
-                a.settings.channel_kinds[3] = 2;
+                a.settings.rows[3].kind = crate::desk_model::RowKind::from_byte(2);
             })),
             ("a channel's badge", Box::new(|a: &mut TangentApp| {
-                a.settings.channel_icons[4] = 3;
+                a.settings.rows[4].icon = 3;
             })),
             ("a plugin in a bay", Box::new(|a: &mut TangentApp| {
                 a.settings.set_legacy_insert(3, "/x/eq.vst3");
@@ -80618,19 +80815,29 @@ mod folder_tests {
                 a.settings.set_legacy_insert(4, "  ");
             })),
             ("a send", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_sends[2] = 0.35;
+                a.settings.set_strip_send(recorder::StripRef::Row(2), 0.35);
             })),
             ("a mute", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_muted ^= 1 << 5;
+                a.settings.set_word(|r| &mut r.mute, a.settings.word(|r| r.mute) ^ (1 << 5));
             })),
             ("a solo", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_soloed ^= 1 << 6;
+                a.settings.set_word(|r| &mut r.solo, a.settings.word(|r| r.solo) ^ (1 << 6));
             })),
             ("a pan", Box::new(|a: &mut TangentApp| {
-                a.settings.channel_pans[2] = -0.4;
+                a.settings.rows[2].pan = -0.4;
             })),
             ("an input", Box::new(|a: &mut TangentApp| {
-                a.settings.channel_inputs.push("in 7".into());
+                a.settings.rows[7].input = "in 7".into();
+            })),
+            ("a MIDI device set", Box::new(|a: &mut TangentApp| {
+                a.settings.rows[1].midi.channel = Some(5);
+            })),
+            ("a row arriving", Box::new(|a: &mut TangentApp| {
+                let id = crate::desk_id::TrackId(500);
+                a.settings.rows.push(crate::desk_model::TrackRow::vacant(id));
+            })),
+            ("a row's identity", Box::new(|a: &mut TangentApp| {
+                a.settings.rows[8].id = crate::desk_id::TrackId(501);
             })),
             ("the drum bus", Box::new(|a: &mut TangentApp| {
                 a.settings.drums_gain = 0.55;
@@ -80651,16 +80858,16 @@ mod folder_tests {
                 a.settings.record_time_signature = "7/8".into();
             })),
             ("which rows exist", Box::new(|a: &mut TangentApp| {
-                a.settings.tracks_added ^= 1 << 9;
+                a.settings.set_word(|r| &mut r.added, a.settings.word(|r| r.added) ^ (1 << 9));
             })),
             ("a folder", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_is_folder.push(true);
+                a.settings.rows[0].folder = true;
             })),
             ("what is inside a folder", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_in_folder.push(true);
+                a.settings.rows[1].in_folder = true;
             })),
             ("a shut folder", Box::new(|a: &mut TangentApp| {
-                a.settings.strip_folder_shut.push(true);
+                a.settings.rows[0].shut = true;
             })),
             ("a pad's knob", Box::new(|a: &mut TangentApp| {
                 a.kit_at_mut(0).pads[0].params.gain = 0.5;
@@ -80940,7 +81147,7 @@ mod aspect_snap_tests {
         s.monitor_width = w;
         s.monitor_usable_h = usable_h;
         s.window_size_percent = percent;
-        s.tracks_added = -1;
+        s.set_word(|r| &mut r.added, u64::MAX);
         s
     }
 
@@ -81033,7 +81240,7 @@ mod aspect_snap_tests {
                 r.left() - area.left() < 40.0
                     && area.contains(r.center())
                     && s.parse::<usize>()
-                        .is_ok_and(|n| (1..=recorder::CHANNELS).contains(&n))
+                        .is_ok_and(|n| (1..=crate::desk_lift::V32_CHANNELS).contains(&n))
             })
             .map(|(r, _)| r.top())
             .collect();
@@ -81318,7 +81525,7 @@ mod aspect_snap_tests {
             (5120, 2800, 10, 16, 10, 16),
             (3440, 1400, 10, 16, 10, 16),
         ];
-        let chans = recorder::CHANNELS;
+        let chans = crate::desk_lift::V32_CHANNELS;
         for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {
             let s = desk_on(w, h, 100);
             let ctx = egui::Context::default();
@@ -82012,19 +82219,23 @@ mod perf_probes {
         arr += a.extra.len() * 64;
         let d = &*m.desk;
         let strs = |v: &[String]| v.iter().map(|s| 24 + s.capacity()).sum::<usize>();
+        // The rows (W6), each with what it owns on the heap.
+        let rows = d
+            .rows
+            .iter()
+            .map(|r| {
+                size_of::<crate::desk_model::TrackRow>()
+                    + strs(std::slice::from_ref(&r.name))
+                    + strs(std::slice::from_ref(&r.input))
+                    + strs(&r.midi.devices)
+                    + r.sends.capacity() * size_of::<crate::desk_model::Send>()
+                    + r.dx7.cart.capacity()
+                    + r.keys.params.capacity() * 8
+            })
+            .sum::<usize>();
         let desk = size_of::<crate::arrangement::DeskSnap>()
-            + d.kinds.len()
-            + d.icons.len()
-            + strs(&d.names)
-            + d.colors.len() * 8
-            + d.plugins.values().map(|p| size_of::<(crate::desk_id::SeatBay, String)>() + p.capacity()).sum::<usize>()
-            + d.sends.len() * 8
-            + d.gains.len() * 8
-            + d.pans.len() * 8
-            + strs(&d.inputs)
-            + d.is_folder.len()
-            + d.in_folder.len()
-            + d.folder_shut.len();
+            + rows
+            + d.plugins.values().map(|p| size_of::<(crate::desk_id::SeatBay, String)>() + p.capacity()).sum::<usize>();
         (arr, desk, m.words.len() * 8, m.kits.len())
     }
 
@@ -82568,6 +82779,9 @@ mod arrange_peaks_tests {
         assert!(clips.iter().any(|c| c.id == a && c.peaks.is_some()));
         // A second audio clip pictured the OLD way reopens the host's road.
         app.arrangement.add_clip(an_audio_clip(1, 1.0));
+        // A fixture write past every app road: the mark a gesture or a frame
+        // would have made (the timeline's frame reads the drawn lanes).
+        app.desk_index_dirty();
         let b = app.arrangement.clips[1].id;
         app.clip_infos.insert(
             b,
@@ -83197,15 +83411,19 @@ mod sampler_road_tests {
 }
 
 /// **A door for the HOST's tests onto the automation modes**, which have no
-/// door of their own (see `arr_cycle_auto_mode`): the host's bridge pushes
-/// `auto_suspend_mask` every frame, and a harness that cannot put anything
-/// but the default into that word cannot tell the push from its absence.
+/// door of their own (see `arr_cycle_auto_mode`): the host's bridge reads
+/// `auto_suspended` every frame, and a harness that cannot put anything but
+/// the default into it cannot tell the push from its absence.
 /// Hidden, and named for what it is, rather than `cfg(test)`: a cfg(test)
 /// item in this crate does not exist when the `tangent` crate's tests build.
 impl TangentApp {
     #[doc(hidden)]
-    pub fn set_arr_auto_mode_for_test(&mut self, lane: usize, mode: crate::automation::AutoMode) {
-        if let Some(owner) = self.auto_owner(lane) {
+    pub fn set_arr_auto_mode_for_test(
+        &mut self,
+        lane: impl Into<AutoLane>,
+        mode: crate::automation::AutoMode,
+    ) {
+        if let Some(owner) = self.auto_owner(lane.into()) {
             self.arr_auto_modes.insert(owner, mode);
         }
     }
@@ -83249,7 +83467,9 @@ mod views_windowed_tests {
         assert_eq!(ix.extent(), app.desk_extent(), "{what}: the index is the wrong width");
         let mut rank = 0;
         for row in 0..app.desk_extent() {
-            assert_eq!(ix.hidden(row), app.lane_hidden(row), "{what}: row {row} hidden");
+            // Not drawn: inside a shut folder, or vacant (W6).
+            let vacant = ix.class(row) == crate::desk_index::RowClass::Vacant;
+            assert_eq!(ix.hidden(row), app.lane_hidden(row) || vacant, "{what}: row {row} hidden");
             assert_eq!(ix.parent(row), app.folder_of(row), "{what}: row {row} folder");
             assert_eq!(ix.in_folder(row), app.in_folder(row), "{what}: row {row} in folder");
             assert_eq!(ix.shut(row), app.folder_shut(row), "{what}: row {row} shut");
@@ -83268,7 +83488,7 @@ mod views_windowed_tests {
                 app.row_counted(row),
                 "{what}: row {row} counted"
             );
-            if !app.lane_hidden(row) {
+            if !app.lane_hidden(row) && !vacant {
                 assert_eq!(ix.rank_of(row), Some(rank), "{what}: row {row} rank");
                 rank += 1;
             }
@@ -83459,7 +83679,7 @@ mod views_windowed_tests {
         a.set_channel_kind(10, Some(recorder::ChannelKind::Midi));
         // After the kind: a kind on an empty row makes a track, which wears
         // a new id (`mint_row_id`).
-        let row: Vec<_> = (0..recorder::CHANNELS).map(|n| a.row_node(n)).collect();
+        let row: Vec<_> = (0..crate::desk_lift::V32_CHANNELS).map(|n| a.row_node(n)).collect();
         assert!(a.settings.routes.add(Route::new(row[10], Target::Node(row[11]))));
         a.set_channel_kind(10, None);
         assert!(a.settings.routes.add(Route::new(row[12], Target::Hardware { first: 0, stereo: true })));
@@ -83508,7 +83728,7 @@ mod views_windowed_tests {
     #[test]
     fn the_views_carry_only_their_window() {
         let mut a = app();
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             a.add_bare_track(n);
         }
         a.settings.mixer_visible = 8;
@@ -83639,7 +83859,7 @@ mod views_windowed_tests {
         s.show_welcome = false;
         let (ctx, mut a) = headless_with(Caps::DESKTOP, s);
         a.dialog = None;
-        for n in 0..recorder::CHANNELS {
+        for n in 0..crate::desk_lift::V32_CHANNELS {
             a.add_bare_track(n);
         }
         a.settings.mixer_visible = 8;
@@ -83975,8 +84195,9 @@ mod persist_tests {
         let stock = TangentApp::template_desk();
         let now = app.desk_snapshot();
         assert!(now != outgoing, "the outgoing session's desk is still standing");
-        assert_eq!(now.kinds, stock.kinds, "the session is not on the stock desk");
-        assert_eq!(now.tracks_added, stock.tracks_added, "the outgoing session's added track stands");
+        let kinds = |d: &crate::arrangement::DeskSnap| d.rows.iter().map(|r| r.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(&now), kinds(&stock), "the session is not on the stock desk");
+        assert_eq!(now.word(|r| r.added), stock.word(|r| r.added), "the outgoing session's added track stands");
         assert_eq!(app.project_doc(), Some(scratch.join(crate::arrangement::DOC_NAME).as_path()));
         assert!(!app.arrangement.named);
         assert_eq!(folder_bytes(&template), before, "the refused template was written");
@@ -84011,13 +84232,13 @@ mod persist_tests {
             k
         };
         let lanes = |placed: &[(usize, DrumpadDoc)]| {
-            let mut kits: Vec<DrumpadDoc> = (0..recorder::CHANNELS).map(|_| DrumpadDoc::default()).collect();
+            let mut kits: Vec<DrumpadDoc> = (0..crate::desk_lift::V32_CHANNELS).map(|_| DrumpadDoc::default()).collect();
             for (lane, k) in placed {
                 kits[*lane] = k.clone();
             }
             kits
         };
-        let mut ids = crate::desk_legacy::identity_ids(recorder::CHANNELS);
+        let mut ids = crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS);
         ids[7] = TrackId(32);
         let scratch_doc = crate::arrangement::doc_in(&scratch);
         let write = |kits: &[DrumpadDoc], doc: &std::path::Path| {
@@ -84164,10 +84385,11 @@ mod lane_refs_tests {
     /// **Which pieces of `dress` row `n`'s track wears**, read the way the
     /// rest of the app reads them: by lane, through the doors the views,
     /// the gestures and the host use (the arrangement's own row views, the
-    /// host's `drumpad_lane` and `auto_suspend_mask`), never by poking the
+    /// host's `drumpad_lane` and `auto_suspended`), never by poking the
     /// id-keyed fields with an id.
     fn worn(app: &TangentApp, n: usize) -> Vec<&'static str> {
-        let views = app.auto_views(n);
+        let lane = AutoLane::Row(n);
+        let views = app.auto_views(lane);
         let view = |p: AutoParam| views.iter().find(|v| v.param == p);
         let at = |r: Option<AutoRow>| r.and_then(|r| app.auto_row_lane(r));
         let mut out = Vec::new();
@@ -84181,15 +84403,15 @@ mod lane_refs_tests {
         wear("open rows", view(AutoParam::Gain).is_some() && view(AutoParam::Pan).is_some());
         wear("armed", view(AutoParam::Gain).is_some_and(|v| v.armed));
         wear("bypassed", view(AutoParam::Pan).is_some_and(|v| v.bypassed));
-        wear("mode", app.arr_auto_mode(n) == AutoMode::Latch);
-        wear("latch", app.arr_auto_writing(n, false));
-        wear("suspend bit", app.auto_suspend_mask() & (1u64 << n) != 0);
+        wear("mode", app.arr_auto_mode(lane) == AutoMode::Latch);
+        wear("latch", app.arr_auto_writing(lane, false));
+        wear("suspend bit", app.auto_suspended(lane));
         wear(
             "last value",
-            app.auto_row(n, AutoParam::Gain).and_then(|r| app.arr_auto_last.get(&r)) == Some(&(2.0, 0.25)),
+            app.auto_row(lane, AutoParam::Gain).and_then(|r| app.arr_auto_last.get(&r)) == Some(&(2.0, 0.25)),
         );
-        wear("focus", at(app.arr_auto_focus) == Some((n, AutoParam::Pan)));
-        wear("clipboard aim", at(app.auto_clipboard_from) == Some((n, AutoParam::Gain)));
+        wear("focus", at(app.arr_auto_focus) == Some((lane, AutoParam::Pan)));
+        wear("clipboard aim", at(app.auto_clipboard_from) == Some((lane, AutoParam::Gain)));
         out
     }
 
@@ -84337,9 +84559,10 @@ mod lane_refs_tests {
             Some((0, 7)),
             "the host was sent to the row the source left, not the row it stands on"
         );
-        // A CUT: the source is removed, and its states stay on the files of
-        // the row the removal emptied, which carry them wherever that row
-        // goes - here two rows down - and to a track made on it later.
+        // A CUT: the source is removed, and its row with it (W6: Remove
+        // deletes the row). Its states stay on the shelf under its own bays,
+        // where the host writes them as its lane goes home, so the id form
+        // names it; the lane form answers with rows, and the source has none.
         app.copy_track(0);
         app.remove_channel(0);
         app.move_channel(0, 2);
@@ -84349,18 +84572,16 @@ mod lane_refs_tests {
         assert_eq!(note.map(|(f, t, _)| (f, t)), Some((source, pasted)), "the note lost the removed source");
         assert_eq!(
             app.take_insert_state_copy(),
-            Some((2, 8)),
-            "a cut track's states were looked for anywhere but the row its removal emptied"
+            None,
+            "a cut track's states were looked for on a row it no longer has"
         );
         app.insert_state_copy = note;
         assert_eq!(app.take_insert_state_copy_ids(), Some((source, pasted)), "the id form lost the source");
-        assert!(app.add_bare_track(2), "fixture: the emptied row took no track");
+        // And no track made later takes the cut track's files: a new track
+        // wears a fresh id, never the removed one's.
+        assert_eq!(app.row_of(source), None, "the removed source still has a row");
         app.paste_track(9);
-        assert_eq!(
-            app.take_insert_state_copy(),
-            Some((2, 9)),
-            "a track made on the emptied row took the cut track's files away from the paste"
-        );
+        assert_ne!(app.track_id_at(9), source, "a new track took the cut track's identity");
     }
 
     /// **A dragged drum track reopens with its kit**, in today's bytes and
@@ -84753,13 +84974,13 @@ mod lane_refs_tests {
             from_value: 0.5,
         });
         app.mixer_reorder = Some((2, Pos2::ZERO, true));
-        app.arr_drag = Some(ArrDrag::AutoPoint(2, 0, 0));
+        app.arr_drag = Some(ArrDrag::AutoPoint(AutoLane::Row(2), 0, 0));
         let pt = crate::automation::Point { at_s: 0.0, value: 0.5, shape: crate::automation::Shape::Linear };
         app.arr_auto_drag_from = Some(AutoDragFrom {
-            lead: (2, AutoParam::Gain, 0),
+            lead: (AutoLane::Row(2), AutoParam::Gain, 0),
             lead_at: pt,
-            lead_now: (2, AutoParam::Gain, 0),
-            curves: vec![(2, AutoParam::Gain, vec![pt], vec![0])],
+            lead_now: (AutoLane::Row(2), AutoParam::Gain, 0),
+            curves: vec![(AutoLane::Row(2), AutoParam::Gain, vec![pt], vec![0])],
             grab: None,
             produced: vec![vec![pt]],
         });
@@ -84775,7 +84996,7 @@ mod lane_refs_tests {
             hit: crate::mixer_panel::Hit::Fader(Column::Track(2)),
             travel: None,
         });
-        app.meter_hold = [[0.5; 2]; crate::desk_legacy::V32_STRIPS];
+        app.meter_hold = vec![[0.5; 2]; app.desk_extent()];
     }
 
     /// The row aims `aim` sets that still stand.
@@ -84854,7 +85075,14 @@ mod lane_refs_tests {
     #[test]
     fn structural_edits_let_row_aims_go_and_carry_no_track_state() {
         let src = include_str!("app.rs");
-        for f in ["reorder_channels", "remove_channel_inner", "undo_apply", "inhabit_document", "reopen_remembered_project"] {
+        // **The four structural edits** (W6: insert, remove, permute, and
+        // the append an insert at the end is) each end in `carry_lanes`,
+        // which lets the row aims go; the roads that replace the desk whole
+        // let them go themselves.
+        for f in ["desk_insert", "desk_remove", "desk_permute"] {
+            assert!(body_of(src, f).contains("self.carry_lanes("), "fn {f} changes the desk's shape and carries nothing");
+        }
+        for f in ["carry_lanes", "undo_apply", "inhabit_document", "reopen_remembered_project"] {
             assert!(
                 body_of(src, f).contains("self.on_desk_shape_change();"),
                 "fn {f} changes the desk's shape and lets no row aim go"
@@ -84866,7 +85094,7 @@ mod lane_refs_tests {
             "arr_auto_latched", "arr_auto_last", "auto_clipboard_from", "auto_clipboard_rows",
             "track_clipboard", "insert_state_copy", "carry_automation_rows", "doc_rows",
         ];
-        for f in ["reorder_channels", "open_lane_below", "undo_apply"] {
+        for f in ["reorder_channels", "open_row", "carry_lanes", "undo_apply"] {
             let body = body_of(src, f);
             for field in keyed {
                 // The kits are document state as well as keyed by track: an
@@ -84950,7 +85178,8 @@ mod lane_refs_tests {
         ("pedal_stack", Shape("self.pedal_stack = None;")),
         ("click_moment", Shape("self.click_moment = None;")),
         ("a11y_on", Shape("self.a11y_on = None;")),
-        ("meter_hold", Shape("self.meter_hold = [[0.0; 2]; crate::desk_legacy::V32_STRIPS];")),
+        ("meter_hold", Shape("self.meter_hold.clear();")),
+        ("meter_hold_specials", Exempt("the three specials' held meters, by what each is")),
         ("route_labels", Shape("self.refresh_route_labels();")),
         // ── (a) the seat-keyed fields design 4 handed to W5, by bay ──────
         ("fx_params", Identity),
@@ -85037,14 +85266,6 @@ mod lane_refs_tests {
         ("pad_menu", Exempt("a pad's key")),
         ("pad_carry", Exempt("a pad's key")),
         ("drumpad_num", Exempt("a pad knob being typed")),
-        (
-            "desk_state_perm",
-            Exempt("a permutation - the move itself - for the host to carry plugins by; it names no track (W6 deletes it)"),
-        ),
-        (
-            "perm_since_moment",
-            Exempt("a permutation - the move itself - kept for the moment; it names no track (W6 deletes it)"),
-        ),
         ("arr_multi", Exempt("clip ids")),
         ("arr_sel_seen", Exempt("clip ids")),
         ("arr_clip_menu", Exempt("a clip id")),
@@ -85307,3 +85528,9 @@ mod lane_refs_tests {
 #[cfg(test)]
 #[path = "app_save_tests.rs"]
 mod save_tests;
+
+/// **The desk at every width** (W6-rows-unlimited): the width suites, the
+/// trailing add, the holds and undo across every structural gesture.
+#[cfg(test)]
+#[path = "app_width_tests.rs"]
+mod width_tests;

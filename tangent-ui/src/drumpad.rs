@@ -336,7 +336,7 @@ impl DrumpadDoc {
                 Some(Value::Object(kits)) => Some(kits.keys().filter_map(|k| k.parse().ok()).collect()),
                 _ => None,
             });
-        let ids = named.unwrap_or_else(|| crate::desk_legacy::identity_ids(crate::recorder::CHANNELS));
+        let ids = named.unwrap_or_else(|| crate::desk_legacy::identity_ids(crate::desk_lift::V32_CHANNELS));
         let (kits, _) = Self::load_all_beside_ids(doc, &ids, legacy_lane);
         ids.into_iter().zip(kits).filter(|(_, k)| !k.is_empty()).collect()
     }

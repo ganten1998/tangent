@@ -103,8 +103,10 @@ pub(crate) fn observe_settings(text: &str) -> String {
             )
         ),
         format!("muted {:#x} soloed {:#x} phase {:#x}", strips.muted, strips.soloed, strips.phase),
-        format!("kinds {}", json(&s.channel_kinds[..V32_CHANNELS])),
-        format!("inputs {}", json(&s.channel_inputs)),
+        format!("kinds {}", json(&s.rows[..V32_CHANNELS].iter().map(|r| r.kind_byte()).collect::<Vec<_>>())),
+        // Every row's input: a row always has one, empty for none, where the
+        // legacy list was empty for a file that said nothing.
+        format!("inputs {}", json(&s.rows[..V32_CHANNELS].iter().map(|r| r.input.clone()).collect::<Vec<_>>())),
         format!("shuffles {}", flags.join(" ")),
     ]
     .join("\n")
@@ -119,7 +121,8 @@ pub(crate) fn observe_document(text: &str) -> String {
         .automation
         .curves()
         .iter()
-        .map(|c| format!("{}:{}", c.lane, c.param.key()))
+        // The master's by the lane number its era filed it under.
+        .map(|c| format!("{}:{}", c.lane.index_or(crate::desk_lift::V32_MASTER_LANE), c.param.key()))
         .collect();
     // Joined back into strip space, for `observe_settings`' reason.
     let strips = d.strip_space();
@@ -128,8 +131,13 @@ pub(crate) fn observe_document(text: &str) -> String {
         format!("sends {}", json(&strips.sends)),
         format!("names {}", json(&strips.names)),
         format!("inserts {}", occupied(d.legacy_bays().iter().map(|(b, p)| (*b, p.as_str())))),
-        format!("muted {:#x} soloed {:#x} phase {:?}", strips.muted, strips.soloed, d.phase.map(|_| strips.phase)),
-        format!("tracks_added {:#x} armed {:#x}", d.tracks_added, d.armed),
+        format!(
+            "muted {:#x} soloed {:#x} phase {:?}",
+            strips.muted,
+            strips.soloed,
+            d.says().contains(crate::arrangement::Says::PHASE).then_some(strips.phase)
+        ),
+        format!("tracks_added {:#x} armed {:#x}", d.word(|r| r.added), d.word(|r| r.arm)),
         format!("curves {}", curves.join(" ")),
     ]
     .join("\n")
@@ -156,7 +164,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","","","","","","","","","","","",
 inserts 0=@tangent-drums 3=/x/s1.vst3 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 96=/x/s8.vst3 99=/x/s9.vst3 102=/x/s10.vst3 105=/x/s11.vst3 216=/x/pad0.vst3 223=/x/pad2.vst3 263=/x/pad15.vst3
 muted 0x200000000 soloed 0x8 phase 0x0
 kinds [1,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles v18 v19 v20"#),
     ("settings-v18.json", r#"colors [100,101,102,103,104,105,106,107,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,108,109,110,111]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.09,0.1,0.11]
@@ -164,7 +172,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","","","","","","","","","","","",
 inserts 0=/x/s0.vst3 3=/x/s1.vst3 6=/x/s2.vst3 9=/x/s3.vst3 12=@tangent-drums 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 96=/x/s8.vst3 99=/x/s9.vst3 102=/x/s10.vst3 105=/x/s11.vst3 1647=/x/pad0.vst3 1768=/x/pad40.vst3 2030=/x/pad127.vst3
 muted 0x100000004 soloed 0x400000000 phase 0x0
 kinds [1,1,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles v19 v20"#),
     ("settings-v19.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,116,0,118,0]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.17,0.18,0.19]
@@ -172,7 +180,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 96=/x/s16.vst3 99=/x/s17.vst3 102=/x/s18.vst3 105=/x/s19.vst3 107=/x/s19b2.vst3 108=/x/pad0.vst3 229=/x/pad40.vst3 491=/x/pad127.vst3 493=/x/master-extra.vst3 1278=/x/c3pad5.vst3
 muted 0x200000004 soloed 0x400000020 phase 0x900000000
 kinds [1,1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles v20"#),
     ("settings-v20-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,0,0,0,0,0,0,0,0]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
@@ -180,7 +188,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 72=/x/s24.vst3 75=/x/s25.vst3 78=/x/s26.vst3 81=/x/s27.vst3 83=/x/s27b2.vst3 84=/x/pad0.vst3 205=/x/pad40.vst3 467=/x/pad127.vst3 469=/x/master-extra.vst3 1254=/x/c3pad5.vst3 9302=/x/c23pad127.vst3
 muted 0x2000004 soloed 0x4200000 phase 0x9000008
 kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,1,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles "#),
     ("settings-v20.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.3,0.31,0.32,0.33,0.34,0.35]
@@ -188,7 +196,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 72=/x/s24.vst3 75=/x/s25.vst3 78=/x/s26.vst3 81=/x/s27.vst3 84=/x/s28.vst3 87=/x/s29.vst3 90=/x/s30.vst3 93=/x/s31.vst3 96=/x/s32.vst3 99=/x/s33.vst3 102=/x/s34.vst3 105=/x/s35.vst3 229=/x/pad40.vst3 493=/x/master-extra.vst3 12396=/x/c31pad127.vst3 12416=/x/folder5-extra.vst3 12577=/x/c3pedal6.vst3
 muted 0x200000004 soloed 0x400000000 phase 0x900000000
 kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles "#),
     ("settings-v21.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.3,0.31,0.32,0.33,0.34,0.35]
@@ -196,7 +204,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 96=/x/drumbus.vst3 107=/x/s35b2.vst3 229=/x/pad40.vst3 12416=/x/folder5-extra.vst3
 muted 0x200000000 soloed 0x0 phase 0x800000000
 kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles "#),
     ("settings-v22.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.3,0.31,0.32,0.33,0.34,0.35]
@@ -204,7 +212,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 96=/x/drumbus.vst3 107=/x/s35b2.vst3 12416=/x/folder5-extra.vst3
 muted 0x4 soloed 0x100000000 phase 0x200000000
 kinds [1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs ["midi:all","midi:all","midi:Keystation 88"]
+inputs ["midi:all","midi:all","midi:Keystation 88","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles "#),
     ("daw-3x.json", r#"colors [3,7,16,21,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 sends [1.0,0.4,0.0,0.2,1.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5]
@@ -228,7 +236,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 96=/x/drumbus.vst3 105=/x/Pro-L 2.vst3 217=/x/kick.vst3 887=/x/c2pad2.vst3
 muted 0x200000000 soloed 0x10 phase 0x100000000
 kinds [1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles v20"#),
 ];
 
@@ -290,7 +298,7 @@ names ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11","s12","s13"
 inserts 0=@tangent-drums 3=@tangent-dx7 6=/x/s2.vst3 9=/x/s3.vst3 12=/x/s4.vst3 15=/x/s5.vst3 18=/x/s6.vst3 21=/x/s7.vst3 24=/x/s8.vst3 27=/x/s9.vst3 30=/x/s10.vst3 33=/x/s11.vst3 36=/x/s12.vst3 39=/x/s13.vst3 42=/x/s14.vst3 45=/x/s15.vst3 48=/x/s16.vst3 51=/x/s17.vst3 54=/x/s18.vst3 57=/x/s19.vst3 60=/x/s20.vst3 63=/x/s21.vst3 66=/x/s22.vst3 69=/x/s23.vst3 96=/x/s24.vst3 99=/x/s25.vst3 102=/x/s26.vst3 105=/x/s27.vst3 107=/x/s27b2.vst3 108=/x/pad0.vst3 229=/x/pad40.vst3 491=/x/pad127.vst3 493=/x/master-extra.vst3 1278=/x/c3pad5.vst3 9326=/x/c23pad127.vst3
 muted 0x200000004 soloed 0x400200000 phase 0x900000008
 kinds [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,1,0,0,0,0,0,0,0,0]
-inputs []
+inputs ["","","","","","","","","","","","","","","","","","","","","","","","","","","","","","","",""]
 shuffles v24"#),
     ("doc-v6-27.json", r#"colors [100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,0,0,0,0,0,0,0,0,124,125,126,127]
 sends [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.2,0.21,0.22,0.23,0.24,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.25,0.26,0.27]
@@ -431,7 +439,7 @@ fn a_27_sends_file_lifts() {
     assert_eq!(strips.muted, (1 << 33) | (1 << 2), "the muted click");
     assert_eq!(strips.soloed, (1 << 34) | (1 << 21), "the soloed fx");
     assert_eq!(strips.phase, (1 << 32) | (1 << 35) | (1 << 3), "the inverted drum bus and master");
-    assert_eq!((s.strip_muted, s.strip_soloed, s.strip_phase), (1 << 2, 1 << 21, 1 << 3), "the rows' own switches");
+    assert_eq!((s.word(|r| r.mute), s.word(|r| r.solo), s.word(|r| r.phase)), (1 << 2, 1 << 21, 1 << 3), "the rows' own switches");
     assert!(s.strip_switch(StripRef::Click, StripSwitch::Mute), "the click does not hold its mute");
     assert!(s.strip_switch(StripRef::Fx, StripSwitch::Solo), "the fx return does not hold its solo");
     assert!(
@@ -451,9 +459,14 @@ fn a_27_sends_file_lifts() {
     assert_eq!(seat(32 * 3), Some("/x/drumbus.vst3"));
     assert_eq!(seat(35 * 3 + 2), Some("/x/master.vst3"));
     assert_eq!(doc_strips.muted, (1 << 33) | (1 << 23), "the document's muted click");
-    assert!(d.specials.click.mute && d.muted == 1 << 23, "the document's click does not hold its own mute");
-    let lanes: Vec<(usize, String)> =
-        a.automation.curves().iter().map(|c| (c.lane, c.param.key())).collect();
+    assert!(d.specials.click.mute && d.word(|r| r.mute) == 1 << 23, "the document's click does not hold its own mute");
+    // The master's by the lane number its era filed it under (W6 names it).
+    let lanes: Vec<(usize, String)> = a
+        .automation
+        .curves()
+        .iter()
+        .map(|c| (c.lane.index_or(crate::desk_lift::V32_MASTER_LANE), c.param.key()))
+        .collect();
     assert!(lanes.contains(&(32, "gain".to_owned())), "the master's gain curve: {lanes:?}");
     assert!(lanes.contains(&(32, "pan".to_owned())), "the master's pan curve: {lanes:?}");
     assert!(lanes.contains(&(23, "gain".to_owned())), "channel 23's own curve: {lanes:?}");
@@ -473,7 +486,7 @@ fn a_sixteen_era_phase_inverted_drum_bus_lands_on_strip_32() {
     // what each strip is (W5).
     let strips = s.strip_space();
     assert_eq!(strips.phase, (1 << 32) | (1 << 35), "phase did not follow the drum bus and master");
-    assert_eq!(s.strip_phase, 0, "a row took the drum bus's polarity");
+    assert_eq!(s.word(|r| r.phase), 0, "a row took the drum bus's polarity");
     assert!(
         s.strip_switch(StripRef::Drums, StripSwitch::Phase) && s.strip_switch(StripRef::Master, StripSwitch::Phase),
         "the drum bus and the master do not hold their polarity"
@@ -1066,10 +1079,10 @@ fn production_writes_the_format_2_bytes() {
 fn settings_picture(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = observe_settings(text).lines().take(7).map(str::to_owned).collect();
     let s = Settings::from_json(text);
-    let mut names = s.strip_names;
+    let mut names: Vec<String> = s.rows.iter().map(|r| r.name.clone()).collect();
     names.resize(V32_STRIPS + 1, String::new());
     lines[2] = format!("names {}", json(&names));
-    let mut inputs = s.channel_inputs;
+    let mut inputs: Vec<String> = s.rows.iter().map(|r| r.input.clone()).collect();
     inputs.resize(V32_CHANNELS, String::new());
     lines[6] = format!("inputs {}", json(&inputs));
     lines
@@ -1088,8 +1101,12 @@ fn document_v2(a: &Arrangement) -> String {
 fn observe_document_model(text: &str) -> String {
     let a = Arrangement::from_json(text);
     let d = a.desk.as_ref().expect("a desk");
-    let curves: Vec<String> =
-        a.automation.curves().iter().map(|c| format!("{}:{}", c.lane, c.param.key())).collect();
+    let curves: Vec<String> = a
+        .automation
+        .curves()
+        .iter()
+        .map(|c| format!("{}:{}", c.lane.index_or(crate::desk_lift::V32_MASTER_LANE), c.param.key()))
+        .collect();
     format!("{}\ncurves {}", crate::desk_model::picture(&d.desk_model().model), curves.join(" "))
 }
 
@@ -1140,7 +1157,7 @@ fn a_master_curve_is_persisted_as_the_master() {
     crate::desk_lift::with_v24_lift(|| {
         let (_, text) = DOCUMENTS.iter().find(|(n, _)| *n == "doc-v6-27.json").expect("fixture");
         let legacy = Arrangement::from_json(text);
-        let master = crate::desk_lift::V32_MASTER_LANE;
+        let master = crate::automation::AutoLane::Master;
         let on_master = |a: &Arrangement| a.automation.curves().iter().filter(|c| c.lane == master).count();
         assert!(on_master(&legacy) > 0, "the fixture's lane-24 curve did not read as the master");
         let once = document_v2(&legacy);
@@ -1149,7 +1166,7 @@ fn a_master_curve_is_persisted_as_the_master() {
         let named = curves.iter().filter(|c| c["target"] == "master").count();
         assert_eq!(named, on_master(&legacy), "the master's curves were not written by name");
         assert!(
-            curves.iter().all(|c| c.get("lane") != Some(&Value::from(master as u64))),
+            curves.iter().all(|c| c.get("lane") != Some(&Value::from(crate::desk_lift::V32_MASTER_LANE as u64))),
             "a master curve was written as a lane"
         );
         assert_eq!(on_master(&Arrangement::from_json(&once)), on_master(&legacy));
@@ -1318,13 +1335,19 @@ const FORMAT2_BYTES: [(&str, u64, usize); 17] = [
     ("daw-3x.json", 0x32cb_378d_3f9e_5d6e, 68924),
     ("daw-4x.json", 0x5cb2_3bc0_7ea0_417e, 69320),
     ("daw-5x.json", 0x221a_f6cd_f561_e43c, 70257),
-    ("doc-v4-11.json", 0x75fe_6a61_d6f4_4f52, 66404),
-    ("doc-v5-18.json", 0xe83f_2527_0597_ca23, 67366),
-    ("doc-v5-19.json", 0x24c8_a60c_df96_8da8, 67363),
+    // **The documents read their drum row's badge** (W6): a document from
+    // before the badges derives them as it is read, the drum where the
+    // drumpad stands, where the derivation ran at the apply while the desk
+    // had arrays to leave empty. Each of the six below differs from its
+    // earlier pin by that one `"icon": 1` and nothing else (checked by
+    // reverting it, which gives the earlier pin back byte for byte).
+    ("doc-v4-11.json", 0x5ca1_e730_c50a_a7cd, 66404),
+    ("doc-v5-18.json", 0x8671_a662_6ca4_04b8, 67366),
+    ("doc-v5-19.json", 0xf207_0839_7671_ddb1, 67363),
     // Lifted, as `settings-v20-27.json`. Unlifted: 0xba6f_3803_9396_0a03, 68492.
-    ("doc-v6-27.json", 0x039a_e051_1784_61ce, 68512),
-    ("doc-v6-35.json", 0xb19e_49b7_f61b_6f5e, 69099),
-    ("doc-v7.json", 0x70ed_b76d_6ec3_0318, 69323),
+    ("doc-v6-27.json", 0x243f_e05a_2567_c399, 68512),
+    ("doc-v6-35.json", 0xd16d_ec65_b25c_1213, 69099),
+    ("doc-v7.json", 0x31ec_7056_1847_6121, 69323),
 ];
 
 /// The format-2 bytes this build writes for every legacy fixture, by name.

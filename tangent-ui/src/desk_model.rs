@@ -14,13 +14,14 @@
 //! plugin bay or a route endpoint does so by [`TrackId`] or [`SeatBay`],
 //! which no edit renumbers.
 //!
-//! **Under the live arrays, not yet in place of them (W3).** The settings
-//! file and the document write and read their desk through this model
-//! (`Settings::desk_model`, `DeskSnap::desk_model`, and the inverses
-//! [`V22Desk::into_settings`] and [`V22Desk::into_snap`]), while the live
-//! desk still keeps the dense 32-wide shape ([`V22Desk`]):
-//! [`DeskModel::from_v22`] and [`DeskModel::to_v22`] are the bridge, and a
-//! format-2 file is read onto the dense arrays until W6 retires them.
+//! **Live (W6).** The settings file's desk is [`TrackRow`]s
+//! (`Settings::rows`, with the identity maps beside them), the document's
+//! is too (`DeskSnap::rows`), and every structural edit is one of the four
+//! below, run on the live desk as one model (`Settings::with_model`). The
+//! dense 32-wide shape ([`V22Desk`]) survives only as what the legacy files
+//! are read in: [`DeskModel::from_v22`] reads it onto rows once, under the
+//! identity rule, and nothing writes it back in production (format 2 is the
+//! one writer since `desk_format::WRITE_V8`).
 //!
 //! **What a row does NOT hold.** Clips and curves live in the arrangement,
 //! keyed by lane, and a kit lives in drumpad.json. Those are the positional
@@ -50,12 +51,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::desk_format::Dropped;
-use crate::desk_id::{
-    display_slot, slot_key, Node, Rack, SeatBay, TrackId, BAYS, MAX_ROWS,
-};
+use crate::desk_id::{slot_key, Node, Rack, SeatBay, TrackId, BAYS, MAX_ROWS};
 use crate::desk_legacy::{
-    bind, decode_v32, decode_v32_strip, encode_v32, encode_v32_strip, unbind, LegacyOwner,
-    V32_CHANNELS, V32_STRIPS,
+    bind, decode_v32, decode_v32_strip, encode_v32_strip, LegacyOwner, V32_CHANNELS, V32_STRIPS,
 };
 use crate::desk_lift::DeskEra;
 use crate::dialogs::{KEYS_PARAMS, KEYS_PATCHES};
@@ -255,6 +253,15 @@ impl TrackRow {
             keys: KeysSel::default(),
             frozen: None,
         }
+    }
+}
+
+/// The row's kind as the byte the legacy arrays spelt it (`RowKind::byte`),
+/// for the tests written against those arrays.
+#[cfg(test)]
+impl TrackRow {
+    pub(crate) fn kind_byte(&self) -> u8 {
+        RowKind::byte(self.kind)
     }
 }
 
@@ -1219,121 +1226,55 @@ impl DeskModel {
             ids.push(id);
         }
     }
+}
 
-    /// **The rows as a dense legacy desk**, and the ids in lane order, or
-    /// `None` for a desk past 32 rows, which no dense shape can hold.
-    ///
-    /// Lossy by construction for what the dense shape never had: a send
-    /// other than the post-fader Fx knob, a route or key with a special at
-    /// a track's end, a chain past the second, a key on a pedal or pad.
-    /// None of these can be made while the live desk is dense, so for every
-    /// desk `from_v22` produced, this returns its input. Deleted with the
-    /// dense desk in W6.
-    pub fn to_v22(&self) -> Option<(V22Desk, Vec<TrackId>)> {
-        if self.rows.len() > V32_CHANNELS {
-            return None;
-        }
-        let ids = self.ids();
-        let mut v = V22Desk::vacant();
-        let set = |mask: &mut u64, at: usize, on: bool| {
-            if on {
-                *mask |= 1 << at;
-            }
-        };
-        for (r, row) in self.rows.iter().enumerate() {
-            let TrackRow {
-                id: _,
-                kind,
-                added,
-                icon,
-                name,
-                color,
-                gain,
-                pan,
-                input,
-                midi,
-                mute,
-                solo,
-                phase,
-                arm,
-                theory,
-                folder,
-                in_folder,
-                shut,
-                sends,
-                dx7,
-                keys,
-                frozen,
-            } = row;
-            v.kinds[r] = RowKind::byte(*kind);
-            if *added {
-                v.tracks_added |= 1 << r;
-            }
-            v.icons[r] = *icon;
-            v.names[r] = name.clone();
-            v.colors[r] = *color;
-            v.gains[r] = *gain;
-            v.pans[r] = *pan;
-            v.inputs[r] = input.clone();
-            v.midi_inputs[r] = midi.clone();
-            set(&mut v.muted, r, *mute);
-            set(&mut v.soloed, r, *solo);
-            set(&mut v.phase, r, *phase);
-            if *arm {
-                v.armed |= 1 << r;
-            }
-            v.to_theory[r] = *theory;
-            v.is_folder[r] = *folder;
-            v.in_folder[r] = *in_folder;
-            v.folder_shut[r] = *shut;
-            v.sends[r] = fx_send_level(sends);
-            v.dx7_cartridge[r] = dx7.cart.clone();
-            v.dx7_patch[r] = dx7.patch;
-            v.keys_patch[r] = keys.patch;
-            for (i, p) in keys.params.iter().take(KEYS_SPAN).enumerate() {
-                v.keys_params[r * KEYS_SPAN + i] = *p;
-            }
-            v.frozen[r] = frozen.clone();
-        }
-        crate::desk_legacy::write_specials(
-            &self.specials,
-            &mut v.names,
-            &mut v.colors,
-            &mut v.sends,
-            (&mut v.muted, &mut v.soloed, &mut v.phase),
-        );
-        let flat = |sb: &SeatBay| encode_v32(unbind(sb.seat.node, &ids)?, sb.seat.rack, sb.bay);
-        for (sb, path) in &self.plugins {
-            if let Some(f) = flat(sb) {
-                v.inserts.insert(f, path.clone());
-            }
-        }
-        for sb in &self.bypass {
-            if let Some(f) = flat(sb) {
-                v.bypass.insert((f / BAYS, f % BAYS));
-            }
-        }
-        let lane = |n: Node| match unbind(n, &ids)? {
-            LegacyOwner::Row(r) => Some(r as usize),
-            _ => None,
-        };
-        for e in &self.routes {
-            let target = match e.to {
-                RouteTo::Node(n) => lane(n).map(LaneTarget::Channel),
-                RouteTo::Hardware { first, stereo } => Some(LaneTarget::Hardware { first, stereo }),
-            };
-            if let (Some(from), Some(target)) = (lane(e.from), target) {
-                v.routes.push(LaneRoute { from, target, gain: e.gain });
-            }
-        }
-        for k in &self.keys {
-            let strip = unbind(k.seat.seat.node, &ids).and_then(encode_v32_strip);
-            if let (Some(strip), Some(slot), Some(from)) = (strip, display_slot(k.seat), lane(k.from)) {
-                v.keys.push(LaneKey { strip, slot, from });
-            }
-        }
-        Some((v, ids))
-    }
+/// **The live routing table in the model's spelling**: each route by
+/// identity at both ends, in the order it was made. The live desk keeps it as
+/// `routing::Routes` (the routing dialog's and the engine bridge's shape);
+/// these four are the one road between the two, so a desk read into the
+/// model and written back out names every route and key as it did.
+pub fn route_edges(routes: &crate::routing::Routes) -> Vec<RouteEdge> {
+    use crate::routing::Target;
+    routes
+        .0
+        .iter()
+        .map(|r| RouteEdge {
+            from: r.from,
+            to: match r.target {
+                Target::Node(n) => RouteTo::Node(n),
+                Target::Hardware { first, stereo } => RouteTo::Hardware { first, stereo },
+            },
+            gain: r.gain,
+        })
+        .collect()
+}
+
+/// [`route_edges`]' inverse.
+pub fn routes_of(edges: &[RouteEdge]) -> crate::routing::Routes {
+    use crate::routing::{Route, Target};
+    crate::routing::Routes(
+        edges
+            .iter()
+            .map(|e| Route {
+                from: e.from,
+                target: match e.to {
+                    RouteTo::Node(n) => Target::Node(n),
+                    RouteTo::Hardware { first, stereo } => Target::Hardware { first, stereo },
+                },
+                gain: e.gain,
+            })
+            .collect(),
+    )
+}
+
+/// **The live sidechain keys in the model's spelling**, one per bay.
+pub fn side_keys(keys: &crate::routing::KeyEdges) -> Vec<SideKey> {
+    keys.0.iter().map(|k| SideKey { seat: k.seat, from: k.from }).collect()
+}
+
+/// [`side_keys`]' inverse.
+pub fn key_edges_of(keys: &[SideKey]) -> crate::routing::KeyEdges {
+    crate::routing::KeyEdges(keys.iter().map(|k| crate::routing::KeyEdge { seat: k.seat, from: k.from }).collect())
 }
 
 fn classify(r: &TrackRow, uses: RowUse, holds: bool) -> RowClass {
@@ -1396,10 +1337,12 @@ pub(crate) fn route_text(e: &RouteEdge) -> String {
     }
 }
 
-/// **The dense 32-wide desk**: the per-channel and per-strip arrays the
-/// live `Settings` and `DeskSnap` still keep, at the frozen V32 widths and
-/// no other, so this type means the same thing whatever the live constants
-/// become.
+/// **The dense 32-wide desk**: the per-channel and per-strip arrays every
+/// legacy settings file and document spelt the desk in, at the frozen V32
+/// widths and no other, so this type means the same thing whatever the live
+/// desk becomes. The legacy readers gather a file's lifted arrays into one
+/// of these and read it onto rows ONCE ([`DeskModel::from_v22`], under the
+/// identity rule); nothing live keeps one.
 ///
 /// Channel arrays are [`V32_CHANNELS`] long (`keys_params` that times
 /// [`KEYS_SPAN`]), strip arrays 36 (names, colours) or 35 (sends; the
@@ -1407,8 +1350,7 @@ pub(crate) fn route_text(e: &RouteEdge) -> String {
 /// map, sparse: `inserts[flat] = path`, `bypass` as `(seat, bay)`. Routes
 /// and keys keep their legacy lane and strip numbers.
 ///
-/// [`V22Desk::vacant`] is the canonical empty one; [`DeskModel::to_v22`]
-/// always answers this shape at these lengths.
+/// [`V22Desk::vacant`] is the canonical empty one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct V22Desk {
     pub kinds: Vec<u8>,
@@ -1475,321 +1417,6 @@ impl V22Desk {
             keys: Vec::new(),
         }
     }
-
-    /// **A settings file's desk, dense**: what the legacy chain left in
-    /// `Settings` after it lifted the file onto V32. Arrays shorter than the
-    /// V32 width (a trimmed `channel_midi_inputs`, a short `strip_names`)
-    /// read as vacant past their end; an unset `channel_armed` resolves by
-    /// the shipped rule, as `app::default_armed` does.
-    pub fn from_settings(s: &crate::settings::Settings) -> Self {
-        let mut v = V22Desk::vacant();
-        let ids = s.desk_ids();
-        let armed = s.channel_armed.unwrap_or_else(|| {
-            crate::arrangement::armed_by_default(&s.channel_kinds, |n| {
-                s.row_plugin(n, 0) == Some(crate::dialogs::BUILTIN_PATH)
-            })
-        });
-        fill(&mut v.kinds, &s.channel_kinds);
-        fill(&mut v.icons, &s.channel_icons);
-        fill(&mut v.gains, &s.channel_gains);
-        fill(&mut v.pans, &s.channel_pans);
-        fill(&mut v.inputs, &s.channel_inputs);
-        fill(&mut v.midi_inputs, &s.channel_midi_inputs);
-        v.tracks_added = s.tracks_added as u32;
-        v.armed = armed;
-        fill(&mut v.is_folder, &s.strip_is_folder);
-        fill(&mut v.in_folder, &s.strip_in_folder);
-        fill(&mut v.folder_shut, &s.strip_folder_shut);
-        fill(&mut v.to_theory, &s.strip_to_theory);
-        fill(&mut v.dx7_cartridge, &s.strip_dx7_cartridge);
-        fill(&mut v.dx7_patch, &s.strip_dx7_patch);
-        fill(&mut v.keys_patch, &s.strip_keys_patch);
-        fill(&mut v.keys_params, &s.strip_keys_params);
-        v.frozen = frozen_dense(&s.frozen_lanes);
-        // The rows' strip facts and the specials', joined into the strip
-        // space this shape keeps them in (`Settings::strip_space`).
-        let strips = s.strip_space();
-        fill(&mut v.names, &strips.names);
-        fill(&mut v.colors, &strips.colors);
-        fill(&mut v.sends, &strips.sends);
-        v.muted = strips.muted;
-        v.soloed = strips.soloed;
-        v.phase = strips.phase;
-        (v.inserts, v.bypass) = dense_bays(&s.plugins, &s.bypass, &ids);
-        v.routes = s.routes.to_lanes(&ids).0;
-        v.keys = s.insert_keys.to_lanes(&ids).0;
-        v
-    }
-
-    /// **A document's desk, dense.** A field the snapshot does not SAY
-    /// (`None`, or past the end of a short array) takes `live`'s value,
-    /// which is how `apply_desk_snapshot` treats it: the live desk stands
-    /// for what an older document never wrote. The one exception is the
-    /// snapshot's own: no `frozen` is nothing frozen (see
-    /// `DeskSnap::frozen`).
-    pub fn from_snap(d: &crate::arrangement::DeskSnap, live: &V22Desk) -> Self {
-        let mut v = live.clone();
-        fill(&mut v.kinds, &d.kinds);
-        fill(&mut v.icons, &d.icons);
-        // The rows' strip facts from the front (row r is strip r), then the
-        // specials' at their own strips: a snapshot always says them.
-        fill(&mut v.names, &d.names);
-        fill(&mut v.colors, &d.colors);
-        fill(&mut v.sends, &d.sends);
-        let rows = |mask: u64| crate::desk_legacy::strip_mask_of(mask, |_| false);
-        let (mut muted, mut soloed, mut phase) = (rows(d.muted), rows(d.soloed), rows(d.phase.unwrap_or(0)));
-        crate::desk_legacy::write_specials(
-            &d.specials,
-            &mut v.names,
-            &mut v.colors,
-            &mut v.sends,
-            (&mut muted, &mut soloed, &mut phase),
-        );
-        fill(&mut v.gains, &d.gains);
-        fill(&mut v.pans, &d.pans);
-        fill(&mut v.inputs, &d.inputs);
-        fill(&mut v.midi_inputs, &d.midi_inputs);
-        fill(&mut v.is_folder, &d.is_folder);
-        fill(&mut v.in_folder, &d.in_folder);
-        fill(&mut v.folder_shut, &d.folder_shut);
-        v.muted = muted;
-        v.soloed = soloed;
-        v.tracks_added = d.tracks_added;
-        v.armed = d.armed;
-        let ids = d.ids.rows();
-        (v.inserts, _) = dense_bays(&d.plugins, &BTreeSet::new(), &ids);
-        // Polarity only when the snapshot says it, the rows' and the
-        // specials' together: they were one mask, and a document from before
-        // the key said neither.
-        if d.phase.is_some() {
-            v.phase = phase;
-        }
-        if let Some(t) = &d.to_theory {
-            fill(&mut v.to_theory, t);
-        }
-        if let Some(r) = &d.routes {
-            v.routes = r.to_lanes(&ids).0;
-        }
-        if let Some(k) = &d.insert_keys {
-            v.keys = k.to_lanes(&ids).0;
-        }
-        if let Some(b) = &d.bypass {
-            v.bypass = dense_bays(&BTreeMap::new(), b, &ids).1;
-        }
-        if let Some(i) = &d.instruments {
-            fill(&mut v.dx7_cartridge, &i.dx7_cartridge);
-            fill(&mut v.dx7_patch, &i.dx7_patch);
-            fill(&mut v.keys_patch, &i.keys_patch);
-            fill(&mut v.keys_params, &i.keys_params);
-        }
-        v.frozen = frozen_dense(d.frozen.as_deref().unwrap_or(&[]));
-        v
-    }
-}
-
-impl V22Desk {
-    /// **This dense desk onto a settings' live arrays**: the inverse of
-    /// [`V22Desk::from_settings`], for a format-2 settings file read back
-    /// (W3). Every desk field the settings keep is written, the arm as a
-    /// said mask (`Some`), because a format-2 desk always says.
-    ///
-    /// The freeze is NOT carried: `frozen_lanes` is the document's, never
-    /// the settings file's (see `Settings::frozen_lanes`), so a settings
-    /// desk is written with nothing frozen and read without touching it.
-    pub fn into_settings(self, s: &mut crate::settings::Settings, ids: &[TrackId]) {
-        let V22Desk {
-            kinds,
-            icons,
-            gains,
-            pans,
-            inputs,
-            midi_inputs,
-            tracks_added,
-            armed,
-            is_folder,
-            in_folder,
-            folder_shut,
-            to_theory,
-            dx7_cartridge,
-            dx7_patch,
-            keys_patch,
-            keys_params,
-            frozen: _,
-            names,
-            colors,
-            sends,
-            muted,
-            soloed,
-            phase,
-            inserts,
-            bypass,
-            routes,
-            keys,
-        } = self;
-        fill(&mut s.channel_kinds, &kinds);
-        fill(&mut s.channel_icons, &icons);
-        fill(&mut s.channel_gains, &gains);
-        fill(&mut s.channel_pans, &pans);
-        s.channel_inputs = inputs;
-        s.channel_midi_inputs = midi_inputs;
-        s.tracks_added = i64::from(tracks_added);
-        s.channel_armed = Some(armed);
-        s.strip_is_folder = is_folder;
-        s.strip_in_folder = in_folder;
-        s.strip_folder_shut = folder_shut;
-        s.strip_to_theory = to_theory;
-        s.strip_dx7_cartridge = dx7_cartridge;
-        s.strip_dx7_patch = dx7_patch;
-        s.strip_keys_patch = keys_patch;
-        s.strip_keys_params = keys_params;
-        // Split onto the rows and the specials (`Settings::set_strip_space`).
-        s.set_strip_space(&crate::settings::StripSpace { names, colors, sends, muted, soloed, phase });
-        (s.plugins, s.bypass) = identity_bays(inserts, bypass, ids);
-        s.routes = crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), ids);
-        s.insert_keys = crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), ids);
-    }
-
-    /// **This dense desk onto a document snapshot's strip fields**: the
-    /// inverse of [`V22Desk::from_snap`] for a format-2 document read back
-    /// (W3). Every late field comes back `Some`, because a format-2 desk
-    /// says every one: the live desk stands for none of them. The
-    /// snapshot's scalars (levels, tempo, the rack) are the caller's.
-    pub fn into_snap(self, d: &mut crate::arrangement::DeskSnap) {
-        let V22Desk {
-            kinds,
-            icons,
-            gains,
-            pans,
-            inputs,
-            midi_inputs,
-            tracks_added,
-            armed,
-            is_folder,
-            in_folder,
-            folder_shut,
-            to_theory,
-            dx7_cartridge,
-            dx7_patch,
-            keys_patch,
-            keys_params,
-            frozen,
-            names,
-            colors,
-            sends,
-            muted,
-            soloed,
-            phase,
-            inserts,
-            bypass,
-            routes,
-            keys,
-        } = self;
-        d.kinds = kinds;
-        d.icons = icons;
-        // The rows' strip facts, and the specials' off their own strips.
-        crate::desk_legacy::read_specials(&mut d.specials, &names, &colors, &sends, (muted, soloed, Some(phase)));
-        d.names = crate::desk_legacy::strip_rows(&names);
-        d.colors = crate::desk_legacy::strip_rows(&colors);
-        let ids = d.ids.rows().into_owned();
-        let (plugins, bypass) = identity_bays(inserts, bypass, &ids);
-        d.plugins = plugins;
-        d.sends = crate::desk_legacy::strip_rows(&sends);
-        d.muted = crate::desk_legacy::strip_mask_rows(muted);
-        d.soloed = crate::desk_legacy::strip_mask_rows(soloed);
-        d.gains = gains;
-        d.pans = pans;
-        d.inputs = inputs;
-        d.midi_inputs = midi_inputs;
-        d.tracks_added = tracks_added;
-        d.is_folder = is_folder;
-        d.in_folder = in_folder;
-        d.folder_shut = folder_shut;
-        d.armed = armed;
-        d.phase = Some(crate::desk_legacy::strip_mask_rows(phase));
-        d.to_theory = Some(to_theory);
-        d.routes = Some(crate::routing::Routes::from_lanes(&crate::routing::LaneRoutes(routes), &ids));
-        d.insert_keys = Some(crate::routing::KeyEdges::from_lanes(&crate::routing::LaneKeys(keys), &ids));
-        d.bypass = Some(bypass);
-        d.instruments = Some(crate::arrangement::Instruments {
-            dx7_cartridge,
-            dx7_patch,
-            keys_patch,
-            keys_params,
-        });
-        // The reader's own rule for a frozen row (`DeskSnap::from_value`):
-        // a freeze with no file is not a freeze.
-        d.frozen = Some(
-            frozen
-                .into_iter()
-                .enumerate()
-                .filter_map(|(lane, f)| {
-                    let f = f?;
-                    (!f.path.is_empty() && f.len_s.is_finite()).then(|| {
-                        crate::arrangement::FrozenLane { lane, path: f.path, len_s: f.len_s.max(0.0) }
-                    })
-                })
-                .collect(),
-        );
-    }
-}
-
-/// **A desk's bays by identity, as the dense shape's flat bays and bypass
-/// seats** under row ids `ids` (`desk_legacy::seat_of`): what the legacy
-/// writers and [`DeskModel::from_v22`] read. A bay whose track no row holds
-/// has no flat bay and is left out; the live desk never holds one (the
-/// writer side of design 6.3, `TangentApp::desk_sentinel`).
-fn dense_bays(
-    plugins: &BTreeMap<SeatBay, String>,
-    bypass: &BTreeSet<SeatBay>,
-    ids: &[TrackId],
-) -> (BTreeMap<usize, String>, BTreeSet<(usize, usize)>) {
-    let inserts = plugins
-        .iter()
-        .filter(|(_, p)| !p.is_empty())
-        .filter_map(|(sb, p)| Some((crate::desk_legacy::flat_of(ids, *sb)?, p.clone())))
-        .collect();
-    let bypass = bypass.iter().filter_map(|sb| crate::desk_legacy::seat_of(ids, *sb)).collect();
-    (inserts, bypass)
-}
-
-/// [`dense_bays`]'s inverse: flat bays and bypass seats back to bays by
-/// identity under `ids` (`desk_legacy::bay_at`).
-fn identity_bays(
-    inserts: BTreeMap<usize, String>,
-    bypass: BTreeSet<(usize, usize)>,
-    ids: &[TrackId],
-) -> (BTreeMap<SeatBay, String>, BTreeSet<SeatBay>) {
-    let plugins = inserts
-        .into_iter()
-        .filter(|(_, p)| !p.is_empty())
-        .filter_map(|(flat, p)| Some((crate::desk_legacy::bay_of_flat(ids, flat)?, p)))
-        .collect();
-    let bypass = bypass
-        .into_iter()
-        .filter_map(|(seat, bay)| crate::desk_legacy::bay_at(ids, seat, bay))
-        .collect();
-    (plugins, bypass)
-}
-
-/// Overwrite the front of a dense array with what a source says, leaving
-/// the rest: a source longer than the V32 width is cut at it.
-fn fill<T: Clone>(dst: &mut [T], src: &[T]) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = s.clone();
-    }
-}
-
-/// A frozen-lane list as one entry per V32 channel. The first entry for a
-/// lane wins and a lane past the channels is not a row: the same answer
-/// `TangentApp::lane_frozen`'s `find` gives.
-fn frozen_dense(list: &[crate::arrangement::FrozenLane]) -> Vec<Option<Frozen>> {
-    let mut out = vec![None; V32_CHANNELS];
-    for f in list {
-        if let Some(slot @ None) = out.get_mut(f.lane) {
-            *slot = Some(Frozen { path: f.path.clone(), len_s: f.len_s });
-        }
-    }
-    out
 }
 
 /// **A desk as text, one fact per line, listing only what differs from a
@@ -2298,7 +1925,6 @@ mod tests {
         }
         assert_eq!(m.specials, Specials::default());
         assert_eq!(m.counted(&[]), 0);
-        assert_eq!(m.to_v22(), Some((V22Desk::vacant(), identity_ids(32))));
     }
 
     /// **What the dense shape cannot name is dropped and listed**: a bay
@@ -2369,9 +1995,47 @@ mod tests {
         v.keys.push(KeyEdge { strip: 7, slot: 3, from: 31 });
         let read = DeskModel::from_v22(&v, &identity_ids(32));
         assert!(read.dropped.is_empty(), "{:?}", read.dropped);
-        let (back, ids) = read.model.to_v22().expect("32 rows");
-        assert_eq!(ids, identity_ids(32));
-        assert_eq!(back, v);
+        // **Every field lands on its row**, read field by field: the dense
+        // desk is a read-only shape since the live desk became rows (W6),
+        // so the way back (`to_v22`) is gone and the read is checked against
+        // the arrays it was given instead.
+        let m = &read.model;
+        assert_eq!(m.rows.len(), 32);
+        let bit = |w: u64, r: usize| (w >> r) & 1 == 1;
+        for (r, row) in m.rows.iter().enumerate() {
+            assert_eq!(row.id, t(r as u32));
+            assert_eq!(row.kind, RowKind::from_byte((r % 4) as u8), "row {r} kind");
+            assert_eq!(row.icon, r as u8);
+            assert_eq!(row.gain.to_bits(), (0.01 * r as f64).to_bits());
+            assert_eq!(row.pan, -0.5);
+            assert_eq!(row.input, format!("midi:port{r}"));
+            assert_eq!(row.midi, v.midi_inputs[r]);
+            assert_eq!((row.folder, row.in_folder, row.shut), (r % 5 == 0, r % 5 == 1, r % 10 == 0 && r % 5 == 0));
+            assert_eq!(row.theory, r % 3 == 0);
+            assert_eq!((row.dx7.cart.as_str(), row.dx7.patch), (format!("c{r}.syx").as_str(), r));
+            assert_eq!(row.keys.patch, r % 8);
+            assert_eq!(row.keys.params[r], 0.123);
+            assert_eq!(row.frozen, v.frozen[r]);
+            assert_eq!((row.name.as_str(), row.color), (format!("s{r}").as_str(), 100 + r as i64));
+            assert_eq!(row.added, bit(0xdead_beef, r), "row {r} added");
+            assert_eq!(row.arm, bit(0x8000_0001, r), "row {r} arm");
+            assert_eq!((row.mute, row.solo, row.phase), (bit(0xf_0000_0001, r), bit(0xa_8000_0000, r), bit(0x9_0000_0010, r)));
+            assert_eq!(fx_send_level(&row.sends), if r % 2 == 0 { 0.0 } else { r as f64 / 100.0 }, "row {r} send");
+        }
+        // The specials, off their frozen strips 32..=35.
+        let sp = &m.specials;
+        assert_eq!([sp.drums.name.as_str(), sp.click.name.as_str(), sp.fx.name.as_str(), sp.master.name.as_str()], ["s32", "s33", "s34", "s35"]);
+        assert_eq!([sp.drums.color, sp.click.color, sp.fx.color, sp.master.color], [132, 133, 134, 135]);
+        assert_eq!([sp.drums.mute, sp.click.mute, sp.fx.mute, sp.master.mute], [true, true, true, true]);
+        assert_eq!([sp.drums.solo, sp.click.solo, sp.fx.solo, sp.master.solo], [false, true, false, true]);
+        assert_eq!([sp.drums.phase, sp.click.phase, sp.fx.phase, sp.master.phase], [true, false, false, true]);
+        assert_eq!(fx_send_level(&sp.click.sends), 0.33);
+        // Every seat, bypass, route and key found its row's track.
+        assert_eq!(m.plugins.len(), 11);
+        assert_eq!(m.bypass.len(), 4);
+        assert_eq!(m.routes.len(), 2);
+        assert_eq!(m.keys.len(), 4);
+        assert!(m.check().is_empty());
         // The master's keys sit on the racks its DISPLAYED slots show:
         // slot 1 is the extra rack, slot 4 the original.
         let master_keys: Vec<String> =
@@ -2391,19 +2055,35 @@ mod tests {
         assert_eq!(m.next_id, 132);
         assert_eq!(m.plugins.keys().next().map(ToString::to_string).as_deref(), Some("t131-c0-b0"));
         assert_eq!(route_text(&m.routes[0]), "t131>t130");
-        assert_eq!(m.to_v22().map(|(d, i)| (d == v, i == ids)), Some((true, true)));
     }
 
-    /// Past 32 rows there is no dense shape to answer.
+    /// **The model holds rows past the legacy width**, as many as the desk
+    /// grows to (W6: there is no dense shape to stop at any more), at every
+    /// width the design names, and every structural edit there leaves it
+    /// naming only what is on it.
     #[test]
-    fn a_desk_past_thirty_two_rows_has_no_dense_shape() {
-        let mut m = DeskModel::empty();
-        for n in 0..33 {
-            m.append(TrackRow::vacant(t(n))).expect("append");
+    fn the_model_holds_rows_past_the_legacy_width() {
+        for width in [1usize, 32, 33, 64, 65, 200, 512] {
+            let mut m = DeskModel::empty();
+            for n in 0..width {
+                let at = m.append(TrackRow::vacant(t(n as u32))).expect("append");
+                assert_eq!(at, n);
+            }
+            assert_eq!(m.rows.len(), width);
+            assert_eq!(m.next_id, width as u64);
+            // An insert above the last, a removal above it and a reorder,
+            // each by identity.
+            let last = t(width as u32 - 1);
+            let fresh = t(width as u32);
+            m.insert_rows(0, vec![TrackRow::vacant(fresh)]).expect("insert");
+            assert_eq!(m.row_of(last), Some(width));
+            m.remove_rows(&[0]).expect("remove");
+            assert_eq!(m.row_of(last), Some(width - 1));
+            let order: Vec<usize> = (0..width).rev().collect();
+            m.permute(&order).expect("permute");
+            assert_eq!(m.row_of(last), Some(0));
+            assert!(m.check().is_empty(), "width {width}: {:?}", m.check());
         }
-        assert_eq!(m.to_v22(), None);
-        m.remove_rows(&[32]).expect("remove");
-        assert!(m.to_v22().is_some());
     }
 
     // ── folder runs ──────────────────────────────────────────────────────

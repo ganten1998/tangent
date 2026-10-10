@@ -110,6 +110,31 @@ pub struct StripView<'a> {
     pub bypassed: [bool; INSERTS * 2],
     /// **Frozen** - see `arrangement_panel::LaneView::frozen`. Appended.
     pub frozen: bool,
+    /// **What an empty strip's plus is**: an empty row's, or the desk's one
+    /// trailing add, open or locked. Read only on an `empty` strip.
+    pub plus: Plus,
+}
+
+/// **What the plus on an empty strip or lane is** (docs/design/
+/// unlimited-tracks.md, section 10). Both views draw it and both ask it.
+///
+/// The desk is the list of rows that exist, so the slots it drew past its
+/// tracks (thirty-two of them, most of them plus signs) are gone, and one
+/// plus after the last track is where a new one comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Plus {
+    /// A drawn row with no track on it yet (the indented plus inside a
+    /// folder, a row holding a plugin and nothing else): its number, and a
+    /// plus that makes the track ON it.
+    #[default]
+    Row,
+    /// **The trailing add**: left of the pinned click and master on the
+    /// desk, a row under the last lane on the timeline. No number, since it
+    /// is no row yet; its plus is Add (`TangentApp::add_track`).
+    Trailing,
+    /// The trailing add at the free cap: a padlock where the plus was, and
+    /// its press opens the Supporter Key dialog rather than refusing.
+    Locked,
 }
 
 impl StripView<'_> {
@@ -1670,8 +1695,16 @@ fn run(rect: Rect, visible: usize, shown: usize, scroll_px: f32) -> Option<Run> 
     // RANK among the drawn tracks, so collapsing a folder closes the gap
     // instead of leaving invisible pillars; `shown` is how many there are.
     let shown = shown.max(1);
-    let visible = visible.clamp(1, VISIBLE_MAX).min(fits_across).min(shown);
-    let (unit, pitch) = Layout::metrics(rect, visible);
+    // **Sized by the count asked for, never by the track count** (design
+    // section 10). A desk shorter than the count shows its strips at the
+    // width the count gives them and leaves the rest of the run empty; it
+    // used to divide the run among the tracks there were, which never
+    // showed while every desk drew thirty-two columns and, once vacant rows
+    // were hidden, stretched a fresh desk's two strips and its add across
+    // the whole window.
+    let asked = visible.clamp(1, VISIBLE_MAX).min(fits_across);
+    let visible = asked.min(shown);
+    let (unit, pitch) = Layout::metrics(rect, asked);
     // **Pixels, then a window with a remainder.** The scroll lands wherever
     // the wheel left it; the first fully-or-partly visible column and how
     // much of it hangs off the left edge both fall out of one division. One
@@ -1786,10 +1819,9 @@ impl Layout {
     /// are not columns and must not add scroll range; the app counts them
     /// out before asking (see `mixer_shown_channels`).
     pub fn max_scroll_px(rect: Rect, visible: usize, shown: usize) -> f32 {
-        let shown = shown.max(1);
-        let visible = visible.clamp(1, shown);
-        let (_, pitch) = Self::metrics(rect, visible);
-        (shown.saturating_sub(visible)) as f32 * pitch
+        // The run's own arithmetic, so the wheel's rail and the layout's are
+        // one number (`run` sizes by the count asked for).
+        run(rect, visible, shown, 0.0).map_or(0.0, |r| r.max_px)
     }
 
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
@@ -2514,7 +2546,11 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
             Hit::Add(_) => Node::button(
                 id,
                 r,
-                format!("Add a channel at slot {}", col.row().map_or(0, |row| row + 1)),
+                match s.plus {
+                    Plus::Row => format!("Add a channel at slot {}", col.row().map_or(0, |row| row + 1)),
+                    Plus::Trailing => "Add a track".to_owned(),
+                    Plus::Locked => "Add a track (the free desk is full: a supporter key lifts the limit)".to_owned(),
+                },
             ),
             Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
             Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
@@ -2971,12 +3007,12 @@ fn strip(
     if v.empty {
         // The slot's own NUMBER, so an empty desk still says which column is
         // which — the mixer had none at all, and the arrange view's have been
-        // there all along.
-        let number = match v.strip {
-            Some(Strip::Channel(n)) => Some(n + 1),
+        // there all along. The trailing add is no row yet and has none.
+        let number = match (v.plus, v.strip) {
+            (Plus::Row, Some(Strip::Channel(n))) => Some(n + 1),
             _ => None,
         };
-        empty_slot(painter, l, p, number);
+        empty_slot(painter, l, p, number, v.plus == Plus::Locked);
         return;
     }
     // **A painted channel keeps its own face for the labels.** The whole panel
@@ -3796,7 +3832,7 @@ fn empty_slot_ink(p: &Ink) -> Color32 {
     empty_slot_ink_for(p.face, p.empty_ground)
 }
 
-fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>) {
+fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>, locked: bool) {
     // The empty slot's own ground, cut out of this theme's wood — under the
     // circled plus and the quiet space around it.
     painter.rect_filled(l.panel, 3.0, p.empty_ground);
@@ -3842,6 +3878,10 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>)
     let radius = r.width().min(r.height()) * 0.5 - 1.0;
     let w = (radius * 0.11).clamp(1.2, 2.5);
     painter.circle_stroke(c, radius, Stroke::new(w, ink));
+    if locked {
+        padlock(painter, c, radius, w, ink);
+        return;
+    }
     let arm = radius * 0.45;
     painter.line_segment(
         [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
@@ -3851,6 +3891,28 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>)
         [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
         Stroke::new(w, ink),
     );
+}
+
+/// **A padlock inside the trailing add's ring** ([`Plus::Locked`]): the
+/// free desk is full, and the ring still says the press does something (it
+/// opens the Supporter Key dialog). Drawn, not a glyph, so it needs no font
+/// that has one. Both views draw it.
+pub(crate) fn padlock(painter: &Painter, c: Pos2, radius: f32, w: f32, ink: Color32) {
+    let body = Rect::from_center_size(
+        Pos2::new(c.x, c.y + radius * 0.18),
+        Vec2::new(radius * 0.92, radius * 0.66),
+    );
+    painter.rect_filled(body, radius * 0.08, ink);
+    // The shackle: a half ring standing on the body's top edge.
+    let r = radius * 0.30;
+    let top = body.top();
+    let pts: Vec<Pos2> = (0..=12)
+        .map(|k| {
+            let a = std::f32::consts::PI * (k as f32 / 12.0);
+            Pos2::new(c.x - r * a.cos(), top - r * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(w, ink)));
 }
 
 /// A vertical bar, filling from the bottom.
@@ -4302,7 +4364,7 @@ fn print_on(bg: Color32, p: &Ink) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder::CHANNELS;
+    use crate::desk_lift::V32_CHANNELS as CHANNELS;
 
     /// **The T switch is legible on every theme, lit and at rest.**
     ///
@@ -4424,6 +4486,7 @@ mod tests {
             keyed: [false; INSERTS * 2],
             bypassed: [false; INSERTS * 2],
             frozen: false,
+            plus: Plus::Row,
         }
     }
 
