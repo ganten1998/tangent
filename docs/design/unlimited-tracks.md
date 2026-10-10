@@ -1858,6 +1858,8 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 - **Bit-exactness:** the active-list walk and any fold split render bit-identically to the full serial walk.
 - No benchmark or cargo job runs while the owner listens.
 
+**The quiet window (2026-10-10, from about 11:05, roughly an hour).** The owner closed Tangent, Navicord and every audio app for this lane; the machine is otherwise lightly used (terminal, editor, a browser reading). Build and unit-test first; then run every timed measurement **serially, one cargo process at a time, with nothing else of yours compiling**, release profile, each rung repeated enough to report a median and a spread. Take the carried wave-1 question in the same window: the rtwork LanePool against the serial walk (the two earlier tries were skewed by a busy machine), and say plainly if it is still inconclusive. Record the load average before and after each run in the report; a run with a load average above 2 at its start is re-run, not reported.
+
 ### W8-gates-and-readiness
 
 **Goal.**
