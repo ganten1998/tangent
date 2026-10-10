@@ -357,14 +357,18 @@ pub fn full_build_with(
     Ok(Built { engine: e, bridge })
 }
 
+/// **The stems an export writes, and what each file is called**, by ROW:
+/// only the rows with something to SAY - clips, or an instrument in a bay
+/// (the DX7, the drumpad, an SD3 following the transport). A kind with
+/// neither is an armed input that renders silence offline, and a folder of
+/// silent WAVs reads as a bug. `NN-<track name>.wav`, the name made safe for
+/// a file system. The caller binds each row to its lane through the bridge
+/// at the press (design 7.13: stems bind `(slot, gen)` at the press).
 pub fn stem_files(app: &TangentApp) -> Vec<(usize, String)> {
     let clips = &app.arrangement().clips;
     (0..app.track_ids().len())
         .filter(|&row| {
-            clips.iter().any(|c| c.lane == row)
-                || app.track_ids().get(row).is_some_and(|id| {
-                    (0..tangent_ui::desk_id::BAYS).any(|b| track_bay(app, *id, Rack::Chain(0), b as u8).is_some())
-                })
+            clips.iter().any(|c| c.lane == row) || (0..tangent_ui::desk_id::BAYS).any(|b| app.insert(row, b).is_some())
         })
         .map(|row| {
             let name: String = app
