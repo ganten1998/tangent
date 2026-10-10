@@ -456,6 +456,87 @@ fn write_pending(dir: &Path, set: ShelfShuffles) -> bool {
     serde_json::to_string_pretty(&marker).is_ok_and(|text| write_atomic(&dir.join(SHELF_PENDING_NAME), text.as_bytes()))
 }
 
+/// **A mirror the live shelf owes a project's NEW home**, written down
+/// beside the live shelf: see [`owe_mirror`].
+pub const MIRROR_OWED_NAME: &str = ".states-owed.json";
+
+/// **Write down, BEFORE a save road's document lands in `home`, that the
+/// live shelf in `shelf` is owed to `home`'s `state/`** (design 6.6: "None
+/// of them can leave a plugin at defaults").
+///
+/// Save As and the first save write the document into a folder that has no
+/// `state/` of its own (a copy brings `media/` and nothing else; a folder
+/// born at the chosen place has nothing at all), and the host mirrors the
+/// live shelf into it only after the document has landed. A process killed
+/// between the two left a project whose plugins all opened at their
+/// defaults, while the knobs sat on the live shelf the next launch replaces
+/// with the template's before anybody can open anything. So the road writes
+/// this first, temp and rename: the home, and what its document was before
+/// the save (its bytes' fingerprint, or nothing), so that the launch that
+/// finds it ([`pay_owed_mirror`]) can tell a document the road wrote from
+/// one it never reached. [`mirror_paid`] takes it away once the road has
+/// mirrored. `false` when it did not land.
+pub fn owe_mirror(shelf: &Path, home: &Path) -> bool {
+    let owed = serde_json::json!({
+        "home": home.to_string_lossy(),
+        "before": doc_fingerprint(home),
+    });
+    serde_json::to_string_pretty(&owed).is_ok_and(|text| write_atomic(&shelf.join(MIRROR_OWED_NAME), text.as_bytes()))
+}
+
+/// The road has mirrored (or wrote nothing): no mirror is owed.
+pub fn mirror_paid(shelf: &Path) {
+    let owed = shelf.join(MIRROR_OWED_NAME);
+    fs_call();
+    let _ = std::fs::remove_file(&owed);
+}
+
+/// **A mirror a save road owed and never made, made now** (see
+/// [`owe_mirror`]): at launch, before anything replaces the live shelf, so
+/// the shelf is still the one the dying session wrote its knobs to. Only
+/// when the road's document LANDED (the home's document is there and is
+/// not the one the road found), because a road killed before its write
+/// owes nothing, and a folder that held somebody else's project must not
+/// be handed this session's states. The mirror is the one every save road
+/// makes, by identity, and the document's `legacy_states` marker is then
+/// cleared if the folder is whole, as `copy_states_to_project` clears it.
+/// Answers the home it paid, if any; the record goes either way.
+pub fn pay_owed_mirror(shelf: &Path) -> Option<PathBuf> {
+    let owed = shelf.join(MIRROR_OWED_NAME);
+    let text = std::fs::read_to_string(&owed).ok()?;
+    let record = serde_json::from_str::<Value>(&text).ok();
+    let home = record
+        .as_ref()
+        .and_then(|v| v.get("home"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let before = record.as_ref().and_then(|v| v.get("before")).and_then(Value::as_str).map(str::to_owned);
+    let paid = home.filter(|home| {
+        let doc = tangent_ui::arrangement::doc_in(home);
+        doc.is_file() && doc_fingerprint(home) != before
+    });
+    if let Some(home) = paid.as_deref() {
+        let state = home.join("state");
+        let _ = std::fs::create_dir_all(&state);
+        mirror_shelf(shelf, &ShelfNames::Pstate, &state);
+        let doc = tangent_ui::arrangement::doc_in(home);
+        if let Some(plugins) = doc_plugins(&doc) {
+            clear_legacy_marker(&doc, &plugins);
+        }
+    }
+    mirror_paid(shelf);
+    paid
+}
+
+/// **What `home`'s document is**, as a fingerprint of its bytes (FNV-1a,
+/// 64 bits, in hex): `None` when it has none. Only ever compared with
+/// itself, across one save.
+fn doc_fingerprint(home: &Path) -> Option<String> {
+    let bytes = std::fs::read(tangent_ui::arrangement::doc_in(home)).ok()?;
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+    Some(format!("{hash:016x}"))
+}
+
 /// **The plugins a document ON DISK names**, by bay: its format-2 desk's
 /// `plugins` object. `None` for a file that is not a format-2 document (a
 /// legacy one cannot carry the marker), or one that will not parse.
@@ -1129,7 +1210,8 @@ mod tests {
     /// 6.6, the scan half; every test above audits the files). The legacy
     /// names exist in exactly one place, this module, which only READS
     /// them: every `remove_file` and `rename` in it acts on an identity name,
-    /// a temp or a marker; and no other host source spells the legacy
+    /// a temp or a marker (the conversion's pending one, or the record of a
+    /// mirror a save road owes); and no other host source spells the legacy
     /// prefix except the template copy that SKIPS such files.
     #[test]
     fn no_new_build_path_renames_or_deletes_a_legacy_sidecar() {
@@ -1140,7 +1222,7 @@ mod tests {
             let end = me[at..].find('\n').map_or(me.len(), |n| at + n);
             let call = &me[line..end];
             assert!(
-                ["state_file_name(", "&tmp", "&pending", "tmp, path"].iter().any(|ok| call.contains(ok)),
+                ["state_file_name(", "&tmp", "&pending", "&owed", "tmp, path"].iter().any(|ok| call.contains(ok)),
                 "shelf.rs removes or renames something that may be a legacy sidecar: `{}`",
                 call.trim()
             );
@@ -1325,6 +1407,130 @@ mod tests {
             let _ = std::fs::remove_dir_all(&project);
             let _ = std::fs::remove_dir_all(&live);
         }
+    }
+
+    /// **A kill between a NEW home's document and its mirror reopens with
+    /// every state** (W4-integrate, done-when "Save-road crashes", for the
+    /// two roads that move a session to a new folder: Save As and the first
+    /// save). Their folder holds no `state/` until the host mirrors the live
+    /// shelf into it after the document lands, and the relaunch replaces
+    /// that shelf with the template's before anything can be opened, so a
+    /// kill between the two used to leave every plugin of the new project at
+    /// its defaults. The host writes the owed mirror down first
+    /// (`DesktopApp::owe_states_to_new_home`), to the home the app says the
+    /// save will choose (`TangentApp::save_choice_dir`), and the relaunch
+    /// pays it before it opens anything (`pay_owed_mirror`).
+    ///
+    /// Driven through the app's own saves, each killed after its document
+    /// lands: Save As of a legacy project into a new folder and into an
+    /// existing one (the wrap), the first save of a kept project (a copy),
+    /// of an unnamed scratch that is real (moved, `state/` and all), and of
+    /// one never written (born at the chosen place). Each time the folder
+    /// the app chose is the one `save_choice_dir` named, the relaunch
+    /// mirrors into it, the marker goes when the folder is whole, and every
+    /// plugin of the reopened document finds the knobs it was PLAYING (the
+    /// live shelf's, not the last save's). A road killed before its document
+    /// lands owes nothing: the relaunch writes nothing into the folder,
+    /// which here holds somebody else's project.
+    #[test]
+    fn a_kill_between_a_new_homes_document_and_its_mirror_reopens_with_every_state() {
+        use tangent_ui::ports::SavePurpose;
+        #[derive(Clone, Copy, Debug)]
+        enum Road {
+            SaveAs,
+            SaveAsWrapped,
+            FirstKept,
+            FirstMoved,
+            FirstNeverWritten,
+        }
+        let ctx = egui::Context::default();
+        let (_, text) = DOCUMENTS[3];
+        for road in [Road::SaveAs, Road::SaveAsWrapped, Road::FirstKept, Road::FirstMoved, Road::FirstNeverWritten] {
+            let tag = format!("{road:?}");
+            let (doc, _, _) = a_legacy_project("new-home", text);
+            let root = doc.parent().expect("the project").to_path_buf();
+            let mut app = tangent_ui::app::TangentApp::with_license(
+                &ctx,
+                Settings::default(),
+                Caps::PLUGIN,
+                crate::composite::tiers::free("shelf"),
+            );
+            match road {
+                Road::FirstKept => {
+                    // A kept project: its document says somebody saved it.
+                    let mut a = Arrangement::load_from(&doc);
+                    a.named = true;
+                    a.save_to(&doc);
+                    app.open_project(&doc);
+                }
+                Road::FirstNeverWritten => {
+                    // A scratch adopted from the project as a stencil,
+                    // aimed at a folder that does not exist yet.
+                    app.adopt_template(&root, &root.join("never-written"));
+                }
+                _ => app.open_project(&doc),
+            }
+            // The live shelf: what every plugin of the session is PLAYING.
+            let live = scratch("new-home-live");
+            let playing = crate::engine_bridge::desk_bays(&app);
+            let keeps = stateful(&playing);
+            assert!(keeps.len() > 1, "{tag}: fixture: no plugin keeps a state");
+            for (sb, bundle) in &keeps {
+                assert!(write_state_in(&live, *sb, bundle, format!("live {sb}").as_bytes()), "a live state");
+            }
+            let away = scratch("new-home-target");
+            let (purpose, target) = match road {
+                Road::SaveAs => (SavePurpose::ProjectCopy, away.join("Copy")),
+                // An existing folder: the save wraps the project in its own.
+                Road::SaveAsWrapped => (SavePurpose::ProjectCopy, away.clone()),
+                _ => (SavePurpose::ProjectFirst, away.join("Kept.tan")),
+            };
+            // The road, as `owe_states_to_new_home` and the chore run it.
+            let home = app.save_choice_dir(purpose, &target).unwrap_or_else(|| panic!("{tag}: no home"));
+            assert!(owe_mirror(&live, &home), "{tag}: the owed mirror was not written down");
+            app.finish_save_choice(purpose, &target);
+            // Killed here: no mirror, no clear.
+            let landed = app.project_doc().and_then(Path::parent).map(Path::to_path_buf);
+            assert_eq!(landed.as_deref(), Some(home.as_path()), "{tag}: the save chose another home than it said");
+            assert!(tangent_ui::arrangement::doc_in(&home).is_file(), "{tag}: the document did not land");
+            let unprotected = shelf_states(&home.join("state"));
+            assert!(
+                keeps.iter().any(|(sb, _)| !unprotected.contains(sb)),
+                "{tag}: fixture: the new home already held every state before the relaunch"
+            );
+            // The relaunch.
+            assert_eq!(pay_owed_mirror(&live), Some(home.clone()), "{tag}: the relaunch paid no mirror");
+            assert!(!live.join(MIRROR_OWED_NAME).exists(), "{tag}: the owed mirror outlived its payment");
+            let reopened = Arrangement::load_from(&tangent_ui::arrangement::doc_in(&home));
+            let desk = reopened.desk.as_ref().expect("a desk");
+            assert_eq!(desk.legacy_states.0, None, "{tag}: a whole folder kept its marker");
+            let back = scratch("new-home-back");
+            mirror_shelf(&home.join("state"), &ShelfNames::for_marker(desk.legacy_states.0), &back);
+            for (sb, bundle) in stateful(&desk.desk_model().model.plugins) {
+                assert_eq!(
+                    read_state(&back, sb, &bundle),
+                    Some(format!("live {sb}").into_bytes()),
+                    "{tag}: {sb} ({bundle}) reopened without the knobs it was playing"
+                );
+            }
+            for dir in [&root, &live, &away, &back] {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+
+        // Killed BEFORE the document lands: nothing is owed, and a folder
+        // holding somebody else's project is left as it was.
+        let (doc, _, _) = a_legacy_project("new-home-early", text);
+        let theirs = doc.parent().expect("their project").to_path_buf();
+        let before = files(&theirs.join("state"));
+        let live = scratch("new-home-early-live");
+        assert!(write_state_in(&live, SeatBay::new(Node::Master, Rack::Chain(0), 0), "/x/m.vst3", b"live"), "a state");
+        assert!(owe_mirror(&live, &theirs), "the owed mirror was not written down");
+        assert_eq!(pay_owed_mirror(&live), None, "a mirror was paid for a document the road never wrote");
+        assert_eq!(files(&theirs.join("state")), before, "the relaunch wrote into a folder the save never reached");
+        assert!(!live.join(MIRROR_OWED_NAME).exists(), "the record outlived the relaunch");
+        let _ = std::fs::remove_dir_all(&theirs);
+        let _ = std::fs::remove_dir_all(&live);
     }
 
     /// **A kill between the document write and the mirror reopens with

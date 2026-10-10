@@ -11988,6 +11988,38 @@ impl DesktopApp {
         self.copy_states_to_project();
     }
 
+    /// **The two roads that move a session into a NEW home, made safe to
+    /// kill before their mirror** (design 6.6: "None of them can leave a
+    /// plugin at defaults"): Save As and the first save.
+    ///
+    /// The app writes the document into the panel's folder, which holds no
+    /// `state/` of its own (a copy brings the document and `media/`; a home
+    /// born at the chosen place brings nothing), and the mirror that gives it
+    /// one runs here after the document has landed. A kill between the two
+    /// left a project whose every plugin opened at its defaults, and the
+    /// knobs were nowhere a relaunch could reach: the launch stands on the
+    /// template and mirrors ITS shelf onto the live one before anybody can
+    /// open anything. So, before the save runs:
+    ///
+    /// - the live knobs go onto the live shelf FIRST, rather than after the
+    ///   document as they did: asking every plugin for its state is the step
+    ///   a crashing plugin takes the process down in, and before the
+    ///   document it costs the save nothing;
+    /// - the mirror owed to the home the app will choose
+    ///   (`TangentApp::save_choice_dir`) is written down beside the live
+    ///   shelf, and the launch that finds it standing pays it before the
+    ///   template replaces that shelf (`shelf::pay_owed_mirror`).
+    ///
+    /// The road takes the record away once it has mirrored
+    /// (`shelf::mirror_paid`).
+    #[cfg(feature = "recorder")]
+    fn owe_states_to_new_home(&mut self, purpose: tangent_ui::ports::SavePurpose, path: &std::path::Path) {
+        self.save_plugin_states();
+        if let Some(home) = self.app.save_choice_dir(purpose, path) {
+            crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home);
+        }
+    }
+
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
     /// project has no state for loses its global sidecar too — the last
     /// session's reverb tail must not leak into this one's fresh plugin.
@@ -20026,6 +20058,14 @@ impl DesktopApp {
                     me.app.take_desk_state_shift_v20(),
                 );
             }
+            // **A save that died between its document and its mirror is
+            // finished now**, while the live shelf still holds the knobs the
+            // dying session wrote there: the open below stands on the
+            // template and replaces that shelf with the template's. See
+            // `owe_states_to_new_home`.
+            if let Some(home) = crate::shelf::pay_owed_mirror(&crate::shelf::global_dir()) {
+                log::info!("plugin states: mirrored into {} for a save that did not finish", home.display());
+            }
         }
         #[cfg(feature = "recorder")]
         me.open_project_at_launch();
@@ -22359,8 +22399,12 @@ impl DesktopApp {
             Chore::FinishFreeze => self.finish_freeze(),
             Chore::RescanPlugins => self.rescan_plugins(),
             Chore::SaveCopy(path) => {
-                self.app
-                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectCopy, &path);
+                let purpose = tangent_ui::ports::SavePurpose::ProjectCopy;
+                // The knobs onto the live shelf, and the mirror owed to the
+                // copy's home written down, BEFORE its document lands there:
+                // see `owe_states_to_new_home`.
+                self.owe_states_to_new_home(purpose, &path);
+                self.app.finish_save_choice(purpose, &path);
                 // **And the plugins' knobs go with the copy.** The app copies
                 // the document and `media/`; the state shelf is the host's,
                 // and a copy without one opened with every plugin at its
@@ -22368,25 +22412,26 @@ impl DesktopApp {
                 // shelf, deliberately, so a missing shelf is a cleared desk.
                 // Shelved the way a Save shelves them, into the project that
                 // is now open, which is the copy.
-                self.save_plugin_states();
                 self.copy_states_to_project();
+                crate::shelf::mirror_paid(&crate::shelf::global_dir());
             }
             Chore::SaveFirst(path) => {
-                self.app
-                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectFirst, &path);
-                // The same three things a Save does, in the same order, now
-                // that the session has a folder to shelve into. `named` is
-                // the app's word that the move happened — a refused save
-                // (the template shelf) leaves it false and says nothing here,
-                // having said why already.
+                let purpose = tangent_ui::ports::SavePurpose::ProjectFirst;
+                self.owe_states_to_new_home(purpose, &path);
+                self.app.finish_save_choice(purpose, &path);
+                // The same three things a Save does, now that the session has
+                // a folder to shelve into (the knobs went onto the live shelf
+                // above). `named` is the app's word that the move happened —
+                // a refused save (the template shelf) leaves it false and
+                // says nothing here, having said why already.
                 if self.app.arrangement().named {
-                    self.save_plugin_states();
                     self.copy_states_to_project();
                     self.app.notify(
                         Kind::Success,
                         format!("Project saved - {}", self.app.project_name()),
                     );
                 }
+                crate::shelf::mirror_paid(&crate::shelf::global_dir());
             }
             // The pass's one receipt is the finish's own, stems and all.
             Chore::FinishBounce {
@@ -36274,6 +36319,52 @@ mod sidecar_walk_probe {
             convert < owed && otherwise.is_some_and(|e| e < taken),
             "the shuffle flags are taken whether or not the conversion finished"
         );
+    }
+
+    /// **The two roads to a NEW home write their owed mirror down before
+    /// their document lands, and the launch pays one before it opens
+    /// anything** (design 6.6; the mechanism and its crash test are
+    /// `shelf`'s, `a_kill_between_a_new_homes_document_and_its_mirror_reopens_with_every_state`).
+    /// Save As and the first save ask the plugins for their states and write
+    /// the owed mirror down first, then let the app write the document,
+    /// then mirror, and only then take the record away; the launch pays a
+    /// record still standing after the shelf's conversion and before the
+    /// template replaces the live shelf. A source scan, because `DesktopApp`
+    /// cannot be built in a test.
+    #[test]
+    fn a_new_homes_mirror_is_owed_before_its_document_and_paid_at_launch() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn run_chore_now(").expect("run_chore_now");
+        let chores = &src[at..at + src[at..].find("\n    fn ").expect("its end")];
+        for arm in ["Chore::SaveCopy(path) => {", "Chore::SaveFirst(path) => {"] {
+            let body = &chores[chores.find(arm).unwrap_or_else(|| panic!("{arm} is gone"))..];
+            let body = &body[..body.find("\n            }\n").expect("the arm's end")];
+            let owe = body.find("self.owe_states_to_new_home(purpose, &path);").expect("the mirror is owed");
+            let save = body.find("self.app.finish_save_choice(purpose, &path);").expect("the save");
+            let mirror = body.find("self.copy_states_to_project();").expect("the mirror");
+            let paid = body.find("crate::shelf::mirror_paid(&crate::shelf::global_dir());").expect("the record goes");
+            assert!(owe < save && save < mirror && mirror < paid, "{arm} lands its document before its mirror is owed");
+            assert!(
+                !body.contains("self.save_plugin_states();"),
+                "{arm} asks the plugins for their states after the document lands"
+            );
+        }
+        let at = src.find("fn owe_states_to_new_home(").expect("owe_states_to_new_home");
+        let owe = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+        let knobs = owe.find("self.save_plugin_states();").expect("the knobs go onto the live shelf");
+        let home = owe.find("self.app.save_choice_dir(purpose, path)").expect("the app names the home");
+        let record = owe.find("crate::shelf::owe_mirror(&crate::shelf::global_dir(), &home);").expect("the record");
+        assert!(knobs < home && home < record, "the record is written before the knobs are on the live shelf");
+        let new_at = src
+            .find("    pub fn new(\n        cc: &eframe::CreationContext<'_>,")
+            .expect("DesktopApp::new");
+        let new = &src[new_at..];
+        let convert = new.find("crate::shelf::convert_global_shelf(shuffles)").expect("the conversion");
+        let pay = new.find("crate::shelf::pay_owed_mirror(&crate::shelf::global_dir())").expect("the launch pays");
+        let open = new.find("me.open_project_at_launch();").expect("the launch opens a project");
+        assert!(convert < pay && pay < open, "an owed mirror is paid after the launch's template replaced the live shelf");
+        assert_eq!(src.matches("crate::shelf::pay_owed_mirror(").count(), 1, "an owed mirror is paid on more than one road");
     }
 
     /// **A shelf written before the seat space grew converts to its bays.**
