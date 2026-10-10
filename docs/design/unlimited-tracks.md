@@ -1708,7 +1708,7 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 **Recorded by the W6-rows-unlimited fix round (2026-10-10):**
 - *Deviation: a vacant row keeps an engine lane* (sections 3 and 7.9 say it gets none), so the words every engine is told stay the ones `bridge.json` pins. Consequence: on a desk whose 32 legacy rows all hold lanes (the shipped desk), a row inserted between two others lands past slot 31 live, while an export, built fresh with row r at slot r, puts it on its row's slot. A new track on a reused hidden row is not affected: the bridge takes the lowest free slot below 32 first and waits for one on its way home before any slot past them (`Bridge::install`), so it takes its row's slot, the export's.
 - *Automation plays at every slot* (closes the MERGE-ME on `SlotAutomation`): `AutoNow` is one row per spine slot (`Wide::auto`), filled by a walk of the curves; the generation table is as wide as the widest slot a curve names; `param_slot` files a plugin curve on a lane past 31 on its own chain seats; `DeskLanes::suspend` takes every slot; and a Mute curve on a lane past 31 reaches `resolve_heard`.
-- *Still bound to the legacy slots (open):* a lane past slot 31 lacks these, live and in an export: a drum lane's pad effect racks (the MERGE-ME on `PadBank`, a sparse pad-seat range); routes, sends and sidechain keys (W6-engine-buses-sends' MERGE-MEs); a sampler bay's sample (the renderer's `sampler_samples` is 32 long and `DesktopApp::sampler_bays_of` walks the legacy slots, live and for the export's mirror); and the automation overlay on an open face (the seat-form adapters, `open_face_seats`).
+- *Still bound to the legacy slots (open; W7-slot-gaps owns every item):* a lane past slot 31 lacks these, live and in an export: a drum lane's pad effect racks (the MERGE-ME on `PadBank`, a sparse pad-seat range); sidechain keys (routes and sends past 31 sound since the wave-6 merge f470356; keys are unverified); a sampler bay's sample (the renderer's `sampler_samples` is 32 long and `DesktopApp::sampler_bays_of` walks the legacy slots, live and for the export's mirror); and the automation overlay on an open face (the seat-form adapters, `open_face_seats`).
 - *Holds:* a paste, a drawn MIDI item, or a `.mid` dropped or picked that would give an empty row a kind or an input asks the hold before its moment and changes nothing (`paste_held`, `midi_bind_hold_line`).
 ### W6-engine-buses-sends
 
@@ -1776,6 +1776,21 @@ Supporters (key or Konami) are unlimited end to end; free stays at 32.
 - **Free tier:** a free desk at 32 tracks creates 100 buses and 1,000 sends.
 - **Cycles:** the picker refuses a new cycle, while a legacy saved cycle opens and sounds the same (golden).
 - **Endpoints:** route, send and key endpoints survive reorder and delete.
+
+### W7-slot-gaps
+
+**Added 2026-10-10 at the wave-6 merge.** Everything a lane at slot 32 or above still lacks, live and in an export, plus the bus lane's mixing leftovers. A paid desk must not have a track 33 that is quietly less of a track than track 1.
+
+1. **Pad effect racks past slot 31.** The MERGE-ME on `PadBank`: `RackOwner::Lane` `seat()` returns None for pads past slot 31; `first_drum_lane` and `pad_racks_live` filter to slots below CHANNELS. Give pads a sparse seat range (created on first use, design 7's lazy pads), named by SeatBay on the shelf like every other bay.
+2. **A sampler bay's sample past slot 31.** `Renderer::sampler_samples` is CHANNELS long and `DesktopApp::sampler_bays_of` walks only LEGACY_LANES slots, live and in the export's `mirror_sampler_samples`.
+3. **The automation overlay on an open built-in face past slot 31.** `open_face_seats` goes through the legacy seat map; retire the remaining C11 seat-form adapters on TangentApp with it (W5/W6 carry-in list).
+4. **Sidechain keys past slot 31.** Prove a key from lane 40 to a compressor on lane 33 (and to a bus) sounds and lands on no other lane; fix if not.
+5. **The send knob as a plan entry (from W6-engine-buses-sends).** Carry each strip's knob as its post-fader Fx entry (or carry no entry) and write knob moves through `Engine::set_send_level(SendFrom::Lane(slot), SendTo::Fx, level)`; `AutoParam::SendTo` maps onto `SendCurve`s; `Bridge::publish` carries send levels between plans, not only route gains. Coordinate with W7-buses-ui, which builds the send UI on top: this lane owns the bridge and engine half.
+6. **Mixing leftovers (from W6-engine-buses-sends):** the dry stem of a node with a delay line is early by the main-path wait; a bare drum bus or click sending to a lookahead bus has no rank in the compensation graph; prove or fix each with a test. (A track in a folder that is also routed into a bus is summed by both, the old fold rule: leave it, but pin it with a test so a change is deliberate.)
+
+**Files.** tangent/src/instrument.rs (pads, sampler, keys, PDC), tangent/src/engine_bridge.rs and tangent/src/desktop.rs (sampler walk, send levels), tangent-ui/src/app.rs (face overlay, adapters). Coordinate with W7-buses-ui on app.rs and the bridge.
+
+**Done when.** A width test at slots {31, 32, 33, 40, 200} gives each item the same behaviour as on lane 1, live and in an export, each failing with its fix reverted; the full gate is green.
 
 ### W7-scale-and-budgets
 
